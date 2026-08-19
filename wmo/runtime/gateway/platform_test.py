@@ -153,6 +153,34 @@ def test_opaque_secret_reference_rejects_raw_key_material(raw_value: str) -> Non
         )
 
 
+def test_opaque_secret_reference_requires_scheme_specific_locator_syntax() -> None:
+    """Each secret source accepts identifiers, not arbitrary credential strings."""
+    assert (
+        OpaqueSecretReference(
+            scheme=OpaqueSecretScheme.EXTERNAL_STORE,
+            reference="vault://team/openai",
+        ).reference
+        == "vault://team/openai"
+    )
+    assert (
+        OpaqueSecretReference(
+            scheme=OpaqueSecretScheme.PROVIDER_MANAGED,
+            reference="aws-default-chain",
+        ).reference
+        == "aws-default-chain"
+    )
+    with pytest.raises(ValidationError, match="environment"):
+        OpaqueSecretReference(
+            scheme=OpaqueSecretScheme.ENVIRONMENT,
+            reference="actual-secret-value",
+        )
+    with pytest.raises(ValidationError, match="locator URI"):
+        OpaqueSecretReference(
+            scheme=OpaqueSecretScheme.EXTERNAL_STORE,
+            reference="actual-secret-value",
+        )
+
+
 def _authorization() -> AuthorizationSnapshot:
     """Create one valid frozen authority for platform contract tests."""
     return AuthorizationSnapshot(

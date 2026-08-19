@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Annotated, Literal, Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
-from pydantic import AwareDatetime, Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256
 from wmo.common.models.catalog import BillingSource, GatewayEquivalenceCertification
@@ -49,16 +51,39 @@ class OpaqueSecretReference(ContractModel):
     scheme: OpaqueSecretScheme
     reference: str = Field(min_length=1, max_length=1_024)
 
-    @field_validator("reference")
-    @classmethod
-    def _reject_secret_material(cls, value: str) -> str:
-        """Reject common raw-key shapes and non-display-safe locators."""
-        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+    @model_validator(mode="after")
+    def _require_locator_syntax(self) -> OpaqueSecretReference:
+        """Require scheme-specific locator syntax that cannot be a bare credential."""
+        if any(ord(character) < 32 or ord(character) == 127 for character in self.reference):
             raise ValueError("secret references must not contain control characters")
-        lowered = value.lower()
+        lowered = self.reference.lower()
         if lowered.startswith("wmo_vk_") or lowered.startswith("sk-"):
             raise ValueError("secret references must identify a locator, not raw key material")
-        return value
+        if self.scheme is OpaqueSecretScheme.ENVIRONMENT:
+            if re.fullmatch(r"[A-Z_][A-Z0-9_]*", self.reference) is None:
+                raise ValueError("environment secret references must name one variable")
+            return self
+        if self.scheme is OpaqueSecretScheme.EXTERNAL_STORE:
+            parsed = urlsplit(self.reference)
+            if (
+                not parsed.scheme
+                or not parsed.netloc
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("external secret references must be credential-free locator URIs")
+            return self
+        if (
+            re.fullmatch(
+                r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*",
+                self.reference,
+            )
+            is None
+        ):
+            raise ValueError("provider-managed secret references must use an opaque identifier")
+        return self
 
 
 class OrganizationRecord(ContractModel):

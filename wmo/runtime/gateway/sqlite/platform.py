@@ -7,19 +7,14 @@ from datetime import datetime
 from pathlib import Path
 
 from wmo.common.core.artifacts import stable_id
-from wmo.common.models import BillingSource, ConnectionConfig
+from wmo.common.models import ConnectionConfig
 from wmo.common.models.gateway_catalog import NormalizedGatewayCatalog
 from wmo.runtime.gateway.budgets import (
     BudgetScope,
     BudgetScopeKind,
     SQLiteBudgetStore,
 )
-from wmo.runtime.gateway.contracts import (
-    DirectTarget,
-    GatewayFailureClass,
-    GatewayUsage,
-    ProjectTarget,
-)
+from wmo.runtime.gateway.contracts import GatewayFailureClass, GatewayUsage, ProjectTarget
 from wmo.runtime.gateway.ledger import SQLiteAttemptLedger
 from wmo.runtime.gateway.platform import (
     ActivateAliasRevisionCommand,
@@ -55,7 +50,6 @@ from wmo.runtime.gateway.platform import (
     OrganizationRecord,
     ProviderConnectionMutationCommand,
     ProviderConnectionRevision,
-    ProviderRevisionBinding,
     SetMonthlyBudgetCommand,
     UpsertProviderConnectionCommand,
     UsageAttribution,
@@ -63,7 +57,30 @@ from wmo.runtime.gateway.platform import (
     VirtualKeyRecord,
 )
 from wmo.runtime.gateway.sqlite.migrations import connect_database
-from wmo.runtime.gateway.sqlite.provider_authority import ProviderConnectionBinding
+from wmo.runtime.gateway.sqlite.platform_records import (
+    alias_record as _alias_record,
+)
+from wmo.runtime.gateway.sqlite.platform_records import (
+    key_record as _key_record,
+)
+from wmo.runtime.gateway.sqlite.platform_records import (
+    optional_int as _optional_int,
+)
+from wmo.runtime.gateway.sqlite.platform_records import (
+    provider_binding as _provider_binding,
+)
+from wmo.runtime.gateway.sqlite.platform_records import (
+    require_reservation_replay as _require_reservation_replay,
+)
+from wmo.runtime.gateway.sqlite.platform_records import (
+    require_settlement_replay as _require_settlement_replay,
+)
+from wmo.runtime.gateway.sqlite.platform_records import (
+    required_datetime as _datetime,
+)
+from wmo.runtime.gateway.sqlite.platform_records import (
+    reservation_record as _reservation_record,
+)
 from wmo.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
 
@@ -174,7 +191,7 @@ class SQLiteGatewayPlatform:
                 raise ValueError(
                     "SQLite provider connections currently require an environment secret reference"
                 )
-            changed, _authority = self.control.upsert_provider_connection(
+            changed, authority = self.control.upsert_provider_connection(
                 organization_id=command.organization_id,
                 connection_id=command.connection_id,
                 revision_id=command.revision_id,
@@ -187,6 +204,8 @@ class SQLiteGatewayPlatform:
                 ),
                 replace=command.replace,
             )
+            if not changed and authority.revision_id != command.revision_id:
+                raise ValueError("provider connection replay names a different immutable revision")
             action = NaturalMutationAction.UPSERT_PROVIDER_CONNECTION
         else:
             changed = self.control.disable_provider_connection(
@@ -219,7 +238,20 @@ class SQLiteGatewayPlatform:
         )
         if existing is not None:
             self._require_alias_replay(existing, command=command)
-            changed = False
+            alias_enabled = bool(existing["active"])
+            if alias_enabled and str(existing["active_revision_id"]) != command.revision_id:
+                raise ValueError("alias activation replay names a historical inactive revision")
+            changed = not alias_enabled
+            if changed:
+                if isinstance(command.target, ProjectTarget):
+                    raise ValueError(
+                        "disabled project alias revisions require a new activation revision"
+                    )
+                changed = self._reactivate_alias_revision(
+                    organization_id=command.organization_id,
+                    alias_id=command.alias_id,
+                    revision_id=command.revision_id,
+                )
         else:
             self._ensure_catalog_snapshot(command=command)
             try:
@@ -506,14 +538,23 @@ class SQLiteGatewayPlatform:
         self,
         request: AttemptReservationRequest,
     ) -> AttemptReservationRecord:
-        """Forward to the existing atomic budget and attempt transaction."""
-        attempt_id = self.attempts.start_attempt(
-            snapshot=request.snapshot,
-            deployment=request.deployment,
-            attempt_ordinal=request.attempt_ordinal,
-            route_depth=request.route_depth,
-            maximum_cost_micro_usd=request.maximum_cost_micro_usd,
-        )
+        """Reserve once or replay the exact natural request-ordinal identity."""
+        existing = self._attempt_for_reservation(request)
+        if existing is not None:
+            return _require_reservation_replay(existing, request=request)
+        try:
+            attempt_id = self.attempts.start_attempt(
+                snapshot=request.snapshot,
+                deployment=request.deployment,
+                attempt_ordinal=request.attempt_ordinal,
+                route_depth=request.route_depth,
+                maximum_cost_micro_usd=request.maximum_cost_micro_usd,
+            )
+        except sqlite3.IntegrityError:
+            concurrent = self._attempt_for_reservation(request)
+            if concurrent is None:
+                raise
+            return _require_reservation_replay(concurrent, request=request)
         return self._reservation(
             organization_id=request.organization_id,
             attempt_id=attempt_id,
@@ -656,7 +697,7 @@ class SQLiteGatewayPlatform:
         row: sqlite3.Row,
         *,
         command: ActivateAliasRevisionCommand,
-    ) -> None:
+    ) -> AliasRevisionRecord:
         """Reject reuse of an alias revision ID with different immutable input."""
         record = _alias_record(row, organization_id=command.organization_id)
         expected_bindings = tuple(
@@ -691,6 +732,85 @@ class SQLiteGatewayPlatform:
             or actual_bindings != expected_bindings
         ):
             raise ValueError("alias revision ID was reused with different input")
+        return record
+
+    def _reactivate_alias_revision(
+        self,
+        *,
+        organization_id: str,
+        alias_id: str,
+        revision_id: str,
+    ) -> bool:
+        """Conditionally reactivate a disabled revision with current provider bindings."""
+        connection = connect_database(
+            self.database_path,
+            busy_timeout_ms=self._busy_timeout_ms,
+        )
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            alias = connection.execute(
+                """
+                SELECT active, active_revision_id FROM gateway_aliases
+                WHERE organization_id = ? AND alias_id = ?
+                """,
+                (organization_id, alias_id),
+            ).fetchone()
+            if alias is None:
+                raise ValueError("alias revision cannot be reactivated")
+            current_revision = str(alias["active_revision_id"])
+            if bool(alias["active"]):
+                if current_revision == revision_id:
+                    connection.rollback()
+                    return False
+                raise ValueError("alias activation advanced to another revision")
+            if current_revision != revision_id:
+                raise ValueError("disabled alias no longer points at the requested revision")
+            bindings = connection.execute(
+                """
+                SELECT b.connection_id, b.connection_revision_id,
+                       b.connection_sha256, c.active, c.active_revision_id,
+                       r.connection_sha256 AS current_sha256
+                FROM alias_revision_provider_connections AS b
+                LEFT JOIN provider_connections AS c
+                  ON c.organization_id = b.organization_id
+                 AND c.connection_id = b.connection_id
+                LEFT JOIN provider_connection_revisions AS r
+                  ON r.organization_id = c.organization_id
+                 AND r.connection_id = c.connection_id
+                 AND r.revision_id = c.active_revision_id
+                WHERE b.organization_id = ? AND b.alias_id = ?
+                  AND b.alias_revision_id = ?
+                """,
+                (organization_id, alias_id, revision_id),
+            ).fetchall()
+            for binding in bindings:
+                if (
+                    not bool(binding["active"])
+                    or str(binding["active_revision_id"]) != str(binding["connection_revision_id"])
+                    or str(binding["current_sha256"]) != str(binding["connection_sha256"])
+                ):
+                    raise ValueError(
+                        "alias revision provider bindings are no longer active and current"
+                    )
+            result = connection.execute(
+                """
+                UPDATE gateway_aliases
+                SET active = 1, active_revision_id = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+                WHERE organization_id = ? AND alias_id = ? AND active = 0
+                  AND active_revision_id = ?
+                """,
+                (revision_id, organization_id, alias_id, revision_id),
+            )
+            if result.rowcount != 1:
+                raise ValueError("alias revision cannot be reactivated")
+            connection.commit()
+            return True
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _ensure_catalog_snapshot(self, *, command: ActivateAliasRevisionCommand) -> None:
         """Register a missing exact snapshot while preserving replay safety."""
@@ -811,6 +931,32 @@ class SQLiteGatewayPlatform:
             raise ValueError("attempt does not belong to the requested organization")
         return rows[0]
 
+    def _attempt_for_reservation(
+        self,
+        request: AttemptReservationRequest,
+    ) -> sqlite3.Row | None:
+        """Read one attempt by its tenant, request, and physical ordinal."""
+        rows = self._rows(
+            """
+            SELECT a.*, r.identity_id, r.key_id, r.alias_id, r.alias_revision_id,
+                   r.api_surface, r.canonical_request_sha256,
+                   r.caller_operation_sha256,
+                   r.terminal_state AS request_terminal_state
+            FROM gateway_attempts AS a
+            JOIN gateway_requests AS r
+              ON r.organization_id = a.organization_id AND r.request_id = a.request_id
+            WHERE a.organization_id = ? AND a.request_id = ? AND a.attempt_ordinal = ?
+            """,
+            (
+                request.organization_id,
+                request.snapshot.authorization.request_id,
+                str(request.attempt_ordinal),
+            ),
+        )
+        if len(rows) > 1:
+            raise RuntimeError("attempt reservation natural key is not unique")
+        return None if not rows else rows[0]
+
     def _reservation(
         self,
         *,
@@ -837,142 +983,6 @@ class SQLiteGatewayPlatform:
             return tuple(connection.execute(query, parameters).fetchall())
         finally:
             connection.close()
-
-
-def _key_record(
-    row: sqlite3.Row,
-    *,
-    organization_id: str,
-    now: datetime,
-) -> VirtualKeyRecord:
-    """Decode one durable key row without touching fingerprint material."""
-    expires_at = _optional_datetime(row["expires_at"])
-    revoked_at = _optional_datetime(row["revoked_at"])
-    return VirtualKeyRecord(
-        organization_id=organization_id,
-        identity_id=str(row["identity_id"]),
-        key_id=str(row["key_id"]),
-        prefix=str(row["prefix"]),
-        active=revoked_at is None and (expires_at is None or expires_at > now),
-        expires_at=expires_at,
-        revoked_at=revoked_at,
-        created_at=_datetime(row["created_at"]),
-        last_used_at=_optional_datetime(row["last_used_at"]),
-    )
-
-
-def _provider_binding(binding: ProviderRevisionBinding) -> ProviderConnectionBinding:
-    """Convert one neutral provider binding to the existing SQLite contract."""
-    return ProviderConnectionBinding(
-        connection_id=binding.connection_id,
-        connection_revision_id=binding.connection_revision_id,
-        connection_sha256=binding.connection_sha256,
-    )
-
-
-def _require_settlement_replay(
-    settlement: AttemptSettlementRecord,
-    *,
-    request: AttemptSettlementRequest,
-) -> None:
-    """Reject a replay whose accounting evidence differs from durable settlement."""
-    event_failure = None if request.terminal_event is None else request.terminal_event.failure
-    failure = request.failure or event_failure
-    usage = None if request.terminal_event is None else request.terminal_event.usage
-    if failure is not None:
-        state = (
-            AttemptTerminalState.CANCELLED
-            if failure.failure_class is GatewayFailureClass.CANCELLED
-            else AttemptTerminalState.FAILED
-        )
-        failure_class = failure.failure_class
-    else:
-        if request.terminal_event is None:
-            raise ValueError("attempt settlement needs a terminal event or failure")
-        state = AttemptTerminalState(request.terminal_event.kind.value)
-        failure_class = None
-    usage_source = AttemptUsageSource.OBSERVED if usage is not None else AttemptUsageSource.UNKNOWN
-    if (
-        settlement.state is not state
-        or settlement.failure_class is not failure_class
-        or settlement.usage != usage
-        or settlement.usage_source is not usage_source
-    ):
-        raise ValueError("attempt settlement replay differs from durable accounting evidence")
-
-
-def _alias_record(row: sqlite3.Row, *, organization_id: str) -> AliasRevisionRecord:
-    """Decode one immutable alias revision and discriminated target."""
-    target = (
-        DirectTarget(pool_id=str(row["pool_id"]))
-        if str(row["target_kind"]) == "direct"
-        else ProjectTarget(
-            project_ref=str(row["project_ref"]),
-            activation_ref=str(row["activation_ref"]),
-            catalog_sha256=str(row["catalog_sha256"]),
-        )
-    )
-    return AliasRevisionRecord(
-        organization_id=organization_id,
-        alias_id=str(row["alias_id"]),
-        alias_name=str(row["alias_name"]),
-        revision_id=str(row["revision_id"]),
-        revision_number=int(row["revision_number"]),
-        target=target,
-        snapshot_ref=str(row["snapshot_ref"]),
-        catalog_sha256=str(row["catalog_sha256"]),
-        refusal_failover=bool(row["refusal_failover"]),
-        active=bool(row["active"]) and str(row["active_revision_id"]) == str(row["revision_id"]),
-        created_at=_datetime(row["created_at"]),
-    )
-
-
-def _reservation_record(
-    row: sqlite3.Row,
-    *,
-    organization_id: str,
-) -> AttemptReservationRecord:
-    """Decode one reservation from the existing atomic attempt row."""
-    return AttemptReservationRecord(
-        organization_id=organization_id,
-        attempt_id=str(row["attempt_id"]),
-        request_id=str(row["request_id"]),
-        identity_id=str(row["identity_id"]),
-        alias_id=str(row["alias_id"]),
-        alias_revision_id=str(row["alias_revision_id"]),
-        catalog_sha256=str(row["catalog_sha256"]),
-        pool_id=str(row["pool_id"]),
-        exact_model_id=str(row["exact_model_id"]),
-        deployment_id=str(row["deployment_id"]),
-        provider=str(row["provider"]),
-        billing_source=BillingSource(str(row["billing_source"])),
-        input_rate=_optional_int(row["input_rate"]),
-        cached_input_rate=_optional_int(row["cached_input_rate"]),
-        output_rate=_optional_int(row["output_rate"]),
-        reasoning_rate=_optional_int(row["reasoning_rate"]),
-        attempt_ordinal=int(row["attempt_ordinal"]),
-        route_depth=int(row["route_depth"]),
-        period=str(row["budget_period_start"])[:7],
-        reserved_micro_usd=_optional_int(row["budget_reserved_micro_usd"]),
-        started_at=_datetime(row["started_at"]),
-    )
-
-
-def _datetime(value: object) -> datetime:
-    """Parse one required SQLite timestamp."""
-    if value is None:
-        raise RuntimeError("required platform timestamp is missing")
-    return datetime.fromisoformat(str(value))
-
-
-def _optional_datetime(value: object) -> datetime | None:
-    """Parse one optional SQLite timestamp."""
-    return None if value is None else datetime.fromisoformat(str(value))
-
-
-def _optional_int(value: object) -> int | None:
-    """Decode one optional SQLite integer."""
-    return None if value is None else int(str(value))
 
 
 __all__ = ["SQLiteGatewayPlatform"]

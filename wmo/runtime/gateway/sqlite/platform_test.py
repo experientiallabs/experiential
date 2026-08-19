@@ -49,6 +49,7 @@ from wmo.runtime.gateway import (
     OrganizationIdentityKeyAuthority,
     ProviderConnectionMutationAuthority,
     ProviderConnectionRevisionAuthority,
+    ProviderRevisionBinding,
     RevokeAliasGrantCommand,
     RoutingMutationAuthority,
     RoutingRevisionAuthority,
@@ -276,6 +277,10 @@ def test_naturally_idempotent_mutations_are_tenant_scoped_and_unreceipted(
     )
     assert platform.mutate_provider_connection(provider).changed
     assert not platform.mutate_provider_connection(provider).changed
+    with pytest.raises(ValueError, match="different immutable revision"):
+        platform.mutate_provider_connection(
+            provider.model_copy(update={"revision_id": "provider-revision-two"})
+        )
     assert platform.provider_connection_revisions(organization_id="org-two") == ()
     assert not platform.mutate_provider_connection(
         DisableProviderConnectionCommand(
@@ -340,6 +345,12 @@ def test_naturally_idempotent_mutations_are_tenant_scoped_and_unreceipted(
     disable = DisableAliasCommand(organization_id="org-one", alias_id="coding")
     assert platform.mutate_alias(disable).changed
     assert not platform.mutate_alias(disable).changed
+    assert platform.mutate_alias(alias).changed
+    assert platform.alias_revisions(organization_id="org-one")[0].active
+    replacement = alias.model_copy(update={"revision_id": "alias-revision-two"})
+    assert platform.mutate_alias(replacement).changed
+    with pytest.raises(ValueError, match="historical inactive revision"):
+        platform.mutate_alias(alias)
 
     with sqlite3.connect(platform.database_path) as database:
         assert database.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
@@ -371,6 +382,52 @@ def test_concurrent_alias_replay_converges_on_one_revision(tmp_path: Path) -> No
 
     assert sorted(outcomes) == [False, True]
     assert len(platform.alias_revisions(organization_id="org-one")) == 1
+
+
+def test_alias_reactivation_requires_current_provider_bindings(tmp_path: Path) -> None:
+    """A disabled direct alias cannot revive a disabled or revised connection."""
+    platform = _platform(tmp_path)
+    provider = UpsertProviderConnectionCommand(
+        organization_id="org-one",
+        connection_id="openai",
+        revision_id="provider-revision-one",
+        provider="openai",
+        secret_reference=OpaqueSecretReference(
+            scheme=OpaqueSecretScheme.ENVIRONMENT,
+            reference="OPENAI_API_KEY",
+        ),
+    )
+    assert platform.mutate_provider_connection(provider).changed
+    authority = platform.provider_connection_revisions(organization_id="org-one")[0]
+    alias = ActivateAliasRevisionCommand(
+        organization_id="org-one",
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="alias-revision-one",
+        target=DirectTarget(pool_id="coding-pool"),
+        snapshot_ref="catalog-one",
+        catalog_sha256=_DIGEST,
+        provider_connections=(
+            ProviderRevisionBinding(
+                connection_id=authority.connection_id,
+                connection_revision_id=authority.revision_id,
+                connection_sha256=authority.connection_sha256,
+            ),
+        ),
+    )
+    assert platform.mutate_alias(alias).changed
+    assert platform.mutate_alias(
+        DisableAliasCommand(organization_id="org-one", alias_id="coding")
+    ).changed
+    assert platform.mutate_provider_connection(
+        DisableProviderConnectionCommand(
+            organization_id="org-one",
+            connection_id="openai",
+        )
+    ).changed
+
+    with pytest.raises(ValueError, match="no longer active and current"):
+        platform.mutate_alias(alias)
 
 
 def test_revision_reads_forward_existing_sqlite_authority(tmp_path: Path) -> None:
@@ -505,6 +562,47 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
             maximum_cost_micro_usd=100,
         )
     )
+    assert (
+        platform.reserve_attempt(
+            AttemptReservationRequest(
+                organization_id="org-one",
+                snapshot=snapshot,
+                deployment=deployment,
+                attempt_ordinal=0,
+                route_depth=0,
+                maximum_cost_micro_usd=100,
+            )
+        )
+        == reservation
+    )
+    with pytest.raises(ValueError, match="differs from durable accounting input"):
+        platform.reserve_attempt(
+            AttemptReservationRequest(
+                organization_id="org-one",
+                snapshot=snapshot,
+                deployment=deployment,
+                attempt_ordinal=0,
+                route_depth=0,
+                maximum_cost_micro_usd=101,
+            )
+        )
+    with pytest.raises(ValueError, match="differs from durable accounting input"):
+        platform.reserve_attempt(
+            AttemptReservationRequest(
+                organization_id="org-one",
+                snapshot=snapshot,
+                deployment=deployment.model_copy(
+                    update={
+                        "gateway": deployment.gateway.model_copy(
+                            update={"pricing_source": "changed"}
+                        )
+                    }
+                ),
+                attempt_ordinal=0,
+                route_depth=0,
+                maximum_cost_micro_usd=100,
+            )
+        )
     settlement = platform.settle_attempt(
         AttemptSettlementRequest(
             organization_id="org-one",
