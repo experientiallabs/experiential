@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -37,7 +36,7 @@ from wmo.common.models import (
     Usage,
 )
 from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
-from wmo.common.routing import FrozenEmbedding, FrozenEmbeddingSet, KnnGuard, RouterFeatureExtractor
+from wmo.common.routing import KnnGuard
 from wmo.common.tasks import load_task_set
 from wmo.optimize.router.composition import (
     ApprovedRouterReview,
@@ -52,6 +51,7 @@ from wmo.optimize.router.composition_test import (
     _resolved,
     _snapshot,
 )
+from wmo.optimize.router.fit.workflow_test import _persist_embeddings
 from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
 from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
@@ -153,7 +153,12 @@ class _EvidenceSetupSupplier:
                 envelope=pricing,
                 files={"pricing.json": pricing},
             )
-            _persist_release_embeddings(project, tasks, self.revision)
+        embedding_set_id = _persist_embeddings(
+            project.artifacts,
+            tasks,
+            completed.task_set,
+            code_revision=self.revision,
+        )
         production = EvaluationProtocol(
             protocol_id="w16-production-protocol",
             evidence_source="production",
@@ -179,7 +184,7 @@ class _EvidenceSetupSupplier:
             observed_cells=tuple(observed),
             production_protocol=production,
             simulation_protocol=world,
-            embedding_set_id="embeddings-a",
+            embedding_set_id=embedding_set_id,
             fit_rag_input=completed.fit_rag,
             pricing_snapshot_id="w16-pricing",
             incumbent_alias="candidate-baseline",
@@ -636,32 +641,6 @@ class _EvidenceReviewSupplier:
                 files={"calibration.json": calibration},
             )
         return ApprovedRouterReview(rubric_id="rubric-a", calibration_id="calibration-a")
-
-
-def _persist_release_embeddings(project: ProjectStore, tasks, revision: str) -> None:  # noqa: ANN001
-    """Persist exact local vectors with release-checkout provenance."""
-    extractor = RouterFeatureExtractor()
-    embeddings = FrozenEmbeddingSet(
-        schema_version=1,
-        created_at=_TIME,
-        code_revision=revision,
-        embedding_set_id="embeddings-a",
-        embedder_alias="embedder",
-        embedder=_snapshot("embedder"),
-        embeddings=tuple(
-            FrozenEmbedding(
-                text_sha256=hashlib.sha256(extractor.from_task(task).encode()).hexdigest(),
-                values=(1.0, 0.0),
-            )
-            for task in tasks
-        ),
-    )
-    project.artifacts.write_json(
-        artifact_id=embeddings.embedding_set_id,
-        artifact_type="router-embeddings",
-        envelope=embeddings,
-        files={"embeddings.json": embeddings},
-    )
 
 
 def _dispatch_counts(

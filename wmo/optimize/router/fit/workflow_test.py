@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -29,17 +29,20 @@ from wmo.common.evaluations.evidence import (
 from wmo.common.judging import DimensionJudgment, Judgment
 from wmo.common.models import (
     CandidateTokenPrice,
+    Embedding,
+    EmbeddingClient,
     OperationEconomics,
     PricingSnapshot,
     RoutedCandidateSnapshot,
 )
 from wmo.common.project import ProjectConfig, ProjectStore
 from wmo.common.routing import (
-    FrozenEmbedding,
-    FrozenEmbeddingSet,
     KnnGuard,
     RouterFeatureExtractor,
+    persist_router_embeddings,
+    router_embedding_reservation,
 )
+from wmo.common.tasks import TaskCase
 from wmo.optimize.router.activation import load_project_router
 from wmo.optimize.router.fit.workflow import (
     EvaluationInputs,
@@ -129,7 +132,7 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
     fit = tuple(_task(f"task-fit-{index:02d}", partition="fit") for index in range(10))
     held_out = tuple(_task(f"task-held-{index:02d}", partition="held_out") for index in range(2))
     tasks = (*fit, *held_out)
-    _persist_task_set(store, "task-set-workflow", tasks)
+    task_set_input = _persist_task_set(store, "task-set-workflow", tasks)
     calibration_input = _persist_calibration(
         store,
         fit_lineages=tuple(task.lineage_group_id for task in fit),
@@ -221,7 +224,7 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
         evidence_by_task[cell.task_id].model_copy(update={"cell_id": cell.cell_id})
         for cell in plan.cells
     )
-    _persist_embeddings(store, tasks)
+    embedding_set_id = _persist_embeddings(store, tasks, task_set_input)
     protocols = (production_protocol,)
     return project, RouterOptimizationConfig(
         fit=EvaluationInputs(
@@ -244,7 +247,7 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
                 == "held_out"
             ),
         ),
-        embedding_set_id="embeddings-a",
+        embedding_set_id=embedding_set_id,
         incumbent_alias="candidate-a",
         pricing_snapshot_id="pricing-a",
         guard=KnnGuard(
@@ -283,27 +286,42 @@ def _persist_pricing(store) -> None:  # noqa: ANN001 - focused fixture
     )
 
 
-def _persist_embeddings(store, tasks) -> None:  # noqa: ANN001 - focused fixture
-    """Persist exact local vectors for every request-visible task feature."""
-    extractor = RouterFeatureExtractor()
-    embeddings = FrozenEmbeddingSet(
-        schema_version=1,
-        created_at=_TIME,
-        code_revision="test-revision",
-        embedding_set_id="embeddings-a",
+class _ExactEmbeddingClient:
+    """Return unit vectors without a network or provider client."""
+
+    def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Return one exact local vector for every requested feature."""
+        return tuple(Embedding(values=(1.0, 0.0)) for _ in texts)
+
+
+def _persist_embeddings(
+    store,  # noqa: ANN001 - focused fixture
+    tasks: tuple[TaskCase, ...],
+    task_set_input: ArtifactInput,
+    *,
+    code_revision: str = "test-revision",
+) -> str:
+    """Persist reserved local vectors for every request-visible task feature."""
+    embedder = _snapshot("embedder")
+    texts = tuple(dict.fromkeys(RouterFeatureExtractor().from_task(task) for task in tasks))
+    reservation = router_embedding_reservation(
+        model=embedder,
+        input_usd_per_million_tokens=2,
+        maximum_attempts_per_feature=1,
+        maximum_input_tokens_per_feature=10_000,
+        feature_count=len(texts),
+    )
+    artifact = persist_router_embeddings(
+        store,
+        task_set_input=task_set_input,
+        tasks=tasks,
         embedder_alias="embedder",
-        embedder=_snapshot("embedder"),
-        embeddings=tuple(
-            FrozenEmbedding(
-                text_sha256=hashlib.sha256(extractor.from_task(task).encode()).hexdigest(),
-                values=(1.0, 0.0),
-            )
-            for task in tasks
-        ),
+        embedder=embedder,
+        client=cast(EmbeddingClient, _ExactEmbeddingClient()),
+        reservation=reservation,
+        active_input_usd_per_million_tokens=2,
+        active_maximum_attempts_per_feature=1,
+        created_at=_TIME,
+        code_revision=code_revision,
     )
-    store.write_json(
-        artifact_id=embeddings.embedding_set_id,
-        artifact_type="router-embeddings",
-        envelope=embeddings,
-        files={"embeddings.json": embeddings},
-    )
+    return artifact.embedding_set_id
