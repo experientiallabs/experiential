@@ -53,9 +53,11 @@ def test_load_router_uses_the_normal_gateway_application_and_revokes_its_key(
         *,
         policy_id: str | None,
         project_loader: object,
+        environment: object,
+        runtime_catalog: object,
     ) -> ProjectGatewayAlias:
         """Return one already activated project-backed alias."""
-        del project_loader
+        del environment, project_loader, runtime_catalog
         prepared.append((project, root, policy_id))
         return ProjectGatewayAlias(
             alias=project,

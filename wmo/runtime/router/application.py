@@ -166,6 +166,8 @@ def load_router(
         root,
         policy_id=policy_id,
         project_loader=project_loader,
+        environment=environment,
+        runtime_catalog=runtime_catalog,
     )
     manager = GatewayManagement(root)
     key_id = f"python-{uuid4().hex}"

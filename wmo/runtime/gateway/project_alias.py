@@ -47,6 +47,8 @@ def prepare_project_gateway_alias(
     *,
     policy_id: str | None,
     project_loader: ProjectAliasLoader,
+    environment: Mapping[str, str] | None = None,
+    runtime_catalog: RuntimeModelCatalog | None = None,
 ) -> ProjectGatewayAlias:
     """Activate one project as a gateway alias whose only work is selection.
 
@@ -55,6 +57,8 @@ def prepare_project_gateway_alias(
         root: WMO artifact and gateway root.
         policy_id: Optional exact frozen router policy.
         project_loader: Verified selection-only runtime loader.
+        environment: Optional provider environment used by compatibility clients.
+        runtime_catalog: Optional preconstructed catalog used by deterministic callers.
 
     Returns:
         Exact alias, identity, and policy authority for the shared gateway.
@@ -63,7 +67,13 @@ def prepare_project_gateway_alias(
     if not manager.initialized:
         manager.initialize()
     manager.migrate_legacy_provider_connections()
-    runtime = project_loader(project, root, policy_id=policy_id)
+    runtime = project_loader(
+        project,
+        root,
+        policy_id=policy_id,
+        environment=environment,
+        runtime_catalog=runtime_catalog,
+    )
     serving_connections = {
         item.connection_id: item.config for item in manager.provider_connections()
     }
