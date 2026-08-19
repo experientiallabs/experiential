@@ -34,8 +34,9 @@ _TRACES_PATH = "traces.jsonl"
 _ISSUES_PATH = "normalization-issues.json"
 _TRACE_DATASET_PATH = "trace-dataset.json"
 MODEL_IDENTITY_EVIDENCE_PATH = "model-identity-evidence.json"
-_LEGACY_TRACE_DATASET_FILES = frozenset({_ISSUES_PATH, _TRACE_DATASET_PATH, _TRACES_PATH})
-_TRACE_DATASET_FILES = frozenset((*_LEGACY_TRACE_DATASET_FILES, MODEL_IDENTITY_EVIDENCE_PATH))
+_TRACE_DATASET_FILES = frozenset(
+    {_ISSUES_PATH, _TRACE_DATASET_PATH, _TRACES_PATH, MODEL_IDENTITY_EVIDENCE_PATH}
+)
 
 
 @dataclass(frozen=True)
@@ -112,26 +113,15 @@ def persist_trace_dataset(
     source, semantic_convention_version = _shared_source(traces)
     traces_payload = canonical_jsonl_bytes(traces)
     issues_payload = _issues_bytes(result.issues)
-    identity_evidence = (
-        complete_model_identity_evidence(traces, result.identity_evidence)
-        if result.include_identity_evidence
-        else None
-    )
-    if identity_evidence is not None:
-        require_model_identity_evidence_matches_traces(traces, identity_evidence)
-    identity_payload = (
-        None if identity_evidence is None else canonical_json_bytes(identity_evidence)
-    )
-    if not result.include_identity_evidence and result.identity_evidence is not None:
-        raise ValueError("identity evidence cannot be supplied when persistence is disabled")
+    identity_evidence = complete_model_identity_evidence(traces, result.identity_evidence)
+    require_model_identity_evidence_matches_traces(traces, identity_evidence)
+    identity_payload = canonical_json_bytes(identity_evidence)
     resolved_dataset_id = dataset_id or current_trace_dataset_id(
         source=source,
         semantic_convention_version=semantic_convention_version,
         traces_sha256=hashlib.sha256(traces_payload).hexdigest(),
         issues_sha256=hashlib.sha256(issues_payload).hexdigest(),
-        identity_evidence_sha256=(
-            None if identity_payload is None else hashlib.sha256(identity_payload).hexdigest()
-        ),
+        identity_evidence_sha256=hashlib.sha256(identity_payload).hexdigest(),
         code_revision=code_revision,
     )
     dataset = TraceDataset(
@@ -152,9 +142,8 @@ def persist_trace_dataset(
         _TRACES_PATH: traces_payload,
         _ISSUES_PATH: issues_payload,
         _TRACE_DATASET_PATH: canonical_json_bytes(dataset),
+        MODEL_IDENTITY_EVIDENCE_PATH: identity_payload,
     }
-    if identity_payload is not None:
-        files[MODEL_IDENTITY_EVIDENCE_PATH] = identity_payload
     existing, manifest = store.write_or_replay(
         artifact_id=dataset.dataset_id,
         artifact_type=_TRACE_DATASET_ARTIFACT_TYPE,
@@ -172,7 +161,7 @@ def current_trace_dataset_id(
     semantic_convention_version: str,
     traces_sha256: str,
     issues_sha256: str,
-    identity_evidence_sha256: str | None = None,
+    identity_evidence_sha256: str,
     code_revision: str,
 ) -> str:
     """Return the current automatic trace-dataset content identity.
@@ -182,23 +171,23 @@ def current_trace_dataset_id(
         semantic_convention_version: Convention used to interpret source model spans.
         traces_sha256: Digest of canonical normalized trace JSONL.
         issues_sha256: Digest of the complete normalization issue report.
-        identity_evidence_sha256: Optional digest of complete model-span provenance. Omission
-            selects the compatible identity form without a provenance component.
+        identity_evidence_sha256: Digest of complete model-span provenance.
         code_revision: Exact producer revision.
 
     Returns:
         Stable current trace-dataset artifact identity.
     """
-    semantic = {
-        "source": source.model_dump(mode="json"),
-        "semantic_convention_version": semantic_convention_version,
-        "traces_sha256": traces_sha256,
-        "issues_sha256": issues_sha256,
-        "code_revision": code_revision,
-    }
-    if identity_evidence_sha256 is not None:
-        semantic["identity_evidence_sha256"] = identity_evidence_sha256
-    return stable_id("trace-dataset", semantic)
+    return stable_id(
+        "trace-dataset",
+        {
+            "source": source.model_dump(mode="json"),
+            "semantic_convention_version": semantic_convention_version,
+            "traces_sha256": traces_sha256,
+            "issues_sha256": issues_sha256,
+            "code_revision": code_revision,
+            "identity_evidence_sha256": identity_evidence_sha256,
+        },
+    )
 
 
 def verify_current_trace_dataset(
@@ -207,7 +196,6 @@ def verify_current_trace_dataset(
 ) -> None:
     """Verify the exact current automatic dataset shape and content identity.
 
-    Generic trace-dataset loading remains compatible with older and explicitly named artifacts.
     Completed build lineage evidence uses this stricter boundary because its parent dataset must be
     reproducible from current canonical source evidence.
 
@@ -226,7 +214,7 @@ def verify_current_trace_dataset(
             f"trace dataset {dataset.dataset_id} must not have artifact inputs"
         )
     paths = {entry.path for entry in stored.manifest.files}
-    if paths not in {_LEGACY_TRACE_DATASET_FILES, _TRACE_DATASET_FILES}:
+    if paths != _TRACE_DATASET_FILES:
         raise ArtifactCorruptionError(
             f"trace dataset {dataset.dataset_id} does not have the exact current-build file set"
         )
@@ -267,7 +255,7 @@ def verify_current_trace_dataset(
         raise ArtifactCorruptionError(
             f"trace dataset {dataset.dataset_id} exclusion count differs from its issue evidence"
         )
-    identity_evidence = read_trace_model_identity_evidence(store, loaded)
+    read_trace_model_identity_evidence(store, loaded)
     for trace in loaded.traces:
         if (
             trace.source.identity != dataset.source
@@ -281,13 +269,9 @@ def verify_current_trace_dataset(
         semantic_convention_version=dataset.semantic_convention_version,
         traces_sha256=hashlib.sha256(traces_payload).hexdigest(),
         issues_sha256=hashlib.sha256(issues_payload).hexdigest(),
-        identity_evidence_sha256=(
-            None
-            if identity_evidence is None
-            else hashlib.sha256(
-                store.read_bytes(dataset.dataset_id, MODEL_IDENTITY_EVIDENCE_PATH)
-            ).hexdigest()
-        ),
+        identity_evidence_sha256=hashlib.sha256(
+            store.read_bytes(dataset.dataset_id, MODEL_IDENTITY_EVIDENCE_PATH)
+        ).hexdigest(),
         code_revision=dataset.code_revision,
     )
     if dataset.dataset_id != expected_id:
@@ -323,24 +307,26 @@ def _canonical_trace_payload(loaded: LoadedTraceDataset) -> bytes:
 def read_trace_model_identity_evidence(
     store: ArtifactStore,
     loaded: LoadedTraceDataset,
-) -> TraceModelIdentityEvidenceSet | None:
-    """Read and verify optional model-span provenance from a loaded trace dataset.
+) -> TraceModelIdentityEvidenceSet:
+    """Read and verify model-span provenance from a loaded trace dataset.
 
     Args:
         store: Project-local immutable artifact store.
         loaded: Digest-verified trace dataset and records.
 
     Returns:
-        Complete current provenance, or ``None`` for a compatible dataset without the payload.
+        Complete current provenance for every model span.
 
     Raises:
-        ArtifactCorruptionError: The payload is malformed, noncanonical, incomplete, extra, or
-            differs from its exact trace span snapshots.
+        ArtifactCorruptionError: The payload is absent, malformed, noncanonical, incomplete, extra,
+            or differs from its exact trace span snapshots.
     """
     stored = store.read(loaded.dataset.dataset_id)
     paths = {entry.path for entry in stored.manifest.files}
     if MODEL_IDENTITY_EVIDENCE_PATH not in paths:
-        return None
+        raise ArtifactCorruptionError(
+            f"trace dataset {loaded.dataset.dataset_id} is missing model identity evidence"
+        )
     payload_bytes = store.read_bytes(
         loaded.dataset.dataset_id,
         MODEL_IDENTITY_EVIDENCE_PATH,

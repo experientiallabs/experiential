@@ -13,7 +13,7 @@ from wmo.common.models import (
     RoutedCandidateSnapshot,
     ToolCall,
 )
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router import RouterModelCapabilityError
 from wmo.runtime.router.runtime import RouterRuntime
 from wmo.runtime.router.runtime_test import _Catalog, _fixture, _request, _runtime
@@ -100,7 +100,8 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
             """Return the frozen model and capabilities for an alias."""
             return snapshots[alias], capabilities[alias]
 
-        def resolve(self, alias: str) -> ResolvedModel:
+        def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+            del role
             """Resolve an alias to the shared test client and frozen metadata.
 
             Args:

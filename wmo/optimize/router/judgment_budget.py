@@ -25,12 +25,13 @@ from wmo.common.evaluations.evidence import (
 from wmo.common.judging import Judge, Judgment
 from wmo.common.progress import ProgressHook, report
 from wmo.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
-from wmo.common.rollouts import RolloutArtifact, StopReason, unknown_spend_failure
+from wmo.common.rollouts import RolloutArtifact, StopReason
 from wmo.optimize.router.errors import (
     JudgeDispatchExhaustedError,
     JudgeTranscriptAdmissionError,
     RouterCompositionError,
 )
+from wmo.simulation.engines.text.resume import reexecutable_dispatch_failure
 
 if TYPE_CHECKING:
     from wmo.optimize.router.composition import ApprovedRouterReview, RouterEvaluationSetup
@@ -509,6 +510,13 @@ def complete_cell_evidence(
     exhausted, becomes one durable structured exclusion so the run and every replay continue
     past that cell with its rollout excluded from judged evidence.
 
+    A simulated cell whose latest rollout is a dispatch failure that resume would still
+    supersede with a fresh attempt stays unbound, so exact plan coverage fails and the caller
+    resumes simulation. A terminally failed cell, one whose retry generations are exhausted or
+    whose failure is not retryable, binds its final failed rollout as unjudged evidence: the
+    cell counts as covered, is excluded from judging and fitting inputs, keeps its conservative
+    charge, and replays deterministically without new dispatches.
+
     Judgments draw from the shared provider pool as reconciled actual spend, never a planning
     estimate. An exhausted dispatch may have billed every bounded attempt without returning
     usable output, so its exclusion charges the conservative retry-bound request cost against
@@ -555,7 +563,7 @@ def complete_cell_evidence(
     for cell in cells:
         if cell.execution != "observed":
             simulated = rollouts_by_cell.get(cell.cell_id)
-            if simulated is not None and unknown_spend_failure(simulated.failure):
+            if simulated is not None and reexecutable_dispatch_failure(simulated):
                 continue
         rollout_id = (
             cell.observed_rollout_id

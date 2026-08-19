@@ -122,7 +122,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
 
 def test_completion_support_preserves_provider_identity_for_existing_traces() -> None:
     """Completion eligibility is frozen separately without orphaning old trace snapshots."""
-    legacy_payload = {
+    identity_payload = {
         "supports_tools": False,
         "supports_embeddings": False,
         "context_window_tokens": None,
@@ -132,7 +132,7 @@ def test_completion_support_preserves_provider_identity_for_existing_traces() ->
     supported = ModelCapabilities(supports_completions=True)
     unsupported = ModelCapabilities(supports_completions=False)
 
-    assert unknown.identity_sha256() == sha256_json(legacy_payload)
+    assert unknown.identity_sha256() == sha256_json(identity_payload)
     assert supported.identity_sha256() == unsupported.identity_sha256()
     assert supported.identity_sha256() == unknown.identity_sha256()
     pinned_sampling = ModelCapabilities(supports_temperature=False, reasoning_effort="xhigh")

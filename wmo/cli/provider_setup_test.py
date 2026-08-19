@@ -283,7 +283,7 @@ def test_explicit_providers_skip_the_opening_list_and_still_discover_models(
 
     console, catalog = _setup(
         root,
-        "1,3\n\n1\n1\n1\ny\n",
+        "1,3\n\n1\n\n1\n\n1\ny\n",
         monkeypatch=monkeypatch,
         options=options,
     )
@@ -508,7 +508,7 @@ def test_router_candidate_picker_discovers_only_eligible_completion_models(
 
     picked = run_router_candidate_picker(
         catalog,
-        console=ScriptedConsole("1\n\n1,2\n\n1\n"),
+        console=ScriptedConsole("1\n\n1,2\n\n\n\n1\n"),
         lister=_FakeLister(),
         environment={"OPENAI_API_KEY": "openai-secret"},
     )
@@ -538,7 +538,9 @@ def test_interactive_setup_saves_providers_models_and_roles_it_derived(
     """
     root = tmp_path / ".wmo"
 
-    console, catalog = _setup(root, "1\n\n1,2,3\n\n1\n1\n1\n1,2\n\n1\ny\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(
+        root, "1\n\n1,2,3\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n", monkeypatch=monkeypatch
+    )
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -555,6 +557,10 @@ def test_interactive_setup_saves_providers_models_and_roles_it_derived(
     assert luna.supports_tools
     assert luna.context_window_tokens == 1_050_000
     assert luna.input_cost_per_million_tokens_usd == 0.2
+    assert luna.reasoning_effort == "medium"
+    embedder = saved.models["text-embedding-3-small"].capabilities
+    assert embedder is not None
+    assert embedder.reasoning_effort is None
     assert "internal-preview-model" not in {model.model for model in saved.models.values()}
     persisted = (root / "models.toml").read_text(encoding="utf-8")
     assert "OPENAI_API_KEY" in persisted
@@ -576,7 +582,7 @@ def test_interactive_final_rejection_writes_no_catalog(
     """
     root = tmp_path / ".wmo"
 
-    console, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\nn\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "1\n\n1,3\n\n1\n\n1\n\n1\nn\n", monkeypatch=monkeypatch)
 
     assert catalog is None
     assert "Configuration summary" in console.output
@@ -625,7 +631,7 @@ def test_back_from_the_model_screen_reselects_providers_without_losing_answers(
 
     console, catalog = _setup(
         root,
-        "1\n\nb\n2\n\nall\n\n1\n1\n1\n1,2\n\n1\ny\n",
+        "1\n\nb\n2\n\nall\n\n1\n\n1\n\n1\n1,2\n\n\n1\ny\n",
         monkeypatch=monkeypatch,
         lister=lister,
     )
@@ -668,7 +674,7 @@ def test_rerunning_setup_preserves_unrelated_models_and_router_state(
         ),
     )
 
-    _, catalog = _setup(root, "2\n\n2,4\n\n1\n1\n1\n\ny\n", monkeypatch=monkeypatch)
+    _, catalog = _setup(root, "2\n\n2,4\n\n1\n\n1\n\n1\n\n\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -707,7 +713,7 @@ def test_setup_preserves_entries_owned_by_providers_it_does_not_configure(
         ),
     )
 
-    console, catalog = _setup(root, "1\n\n1,3\n\n1\n1\n1\ny\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "1\n\n1,3\n\n1\n\n1\n\n1\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -1019,7 +1025,7 @@ def test_role_flags_preselect_the_roles_the_picker_offers(
 
     _, catalog = _setup(
         root,
-        "1\n\n1,2,3\n\n\n\n\n\ny\n",
+        "1\n\n1,2,3\n\n\n\n\n\n\n\ny\n",
         monkeypatch=monkeypatch,
         options=options,
     )

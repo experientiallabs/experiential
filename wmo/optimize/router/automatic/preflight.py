@@ -809,6 +809,11 @@ def _verify_manual_judge_chain(
 ) -> None:
     """Cross-bind the selected audit to its exact setup and approved calibration lineage.
 
+    The audit budget reserves only the provider calls consented for its own invocation. A
+    calibration resumed from persisted trace reviews reserves fewer calls than the recorded
+    judgment probes, so the budget must never reserve more calls than the recorded probes and
+    its estimate must match its own reserved call count exactly.
+
     Args:
         project: Project-local immutable artifact store.
         state: Mutable review pointers selected for automatic optimization.
@@ -870,7 +875,7 @@ def _verify_manual_judge_chain(
         or report.judge_prompt_sha256 != calibration.judge_prompt_sha256
         or provisional.judge_prompt_id != calibration.judge_prompt_id
         or provisional.judge_prompt_sha256 != calibration.judge_prompt_sha256
-        or audit.budget.call_count != sum(len(item.probes) for item in audit.judgments)
+        or audit.budget.call_count > sum(len(item.probes) for item in audit.judgments)
         or not math.isclose(
             audit.budget.estimated_cost_usd,
             expected_estimate,
@@ -936,12 +941,12 @@ def _observed_traces(
         problems: Mutable aggregate preflight failures.
         tasks: Verified representative tasks.
         traces: Verified normalized production traces.
-        identity_evidence: Verified model-span digest provenance, if the dataset carries it.
+        identity_evidence: Verified model-span digest provenance, when a completed build exists.
         candidates: Exact selected candidate identities.
     Returns:
         One deterministic exact-match trace per attributable fit lineage.
     """
-    if not tasks or not traces or not candidates:
+    if not tasks or not traces or not candidates or identity_evidence is None:
         return ()
     try:
         attributions = resolve_router_observed_attributions(

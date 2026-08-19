@@ -269,7 +269,16 @@ uv run pytest -q
     turn and address them immediately: fix valid findings, reply on the thread, and resolve
     it. Do not wait for `/ready-for-merge` to start that loop.
 
-14. **All visuals follow the brand system.** Research figures, README/docs images, frontends, and
+14. **No silent legacy, shims, or backwards compatibility.** Any legacy path, shim,
+    compatibility constant, migration branch, deprecated alias, versioned fallback, or other
+    backwards-compatibility mechanism must be reported explicitly and approved before it lands.
+    These are costly decisions: they grow the codebase and its complexity permanently. The
+    project does not guarantee those contracts right now; with few users we stay flexible and
+    remove as much of that weight as we can, because once there are real users the flexibility
+    disappears. The default is a hard cutover: stale persisted contracts fail closed and require
+    a fresh setup, with no migration path, unless a human explicitly approves one.
+
+15. **All visuals follow the brand system.** Research figures, README/docs images, frontends, and
     any UI must look clean and minimal — Vercel/Notion/Apple-like: white background, generous
     whitespace, no chartjunk, left-aligned titles, hairline grids. All accents come from the brand
     palette; do not introduce ad-hoc colors:

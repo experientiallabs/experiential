@@ -134,7 +134,7 @@ def _scalar_request(system_text: str) -> ModelRequest:
             ModelMessage(role="user", content="unused"),
         ),
         temperature=0.0,
-        maximum_output_tokens=4_096,
+        maximum_output_tokens=16_384,
     )
 
 
@@ -249,6 +249,7 @@ def test_null_rationale_probe_persists_and_replays(tmp_path: Path) -> None:
         reference_input=None,
         created_at=_TIME,
         code_revision="test-revision",
+        maximum_output_tokens=16_384,
     ).complete(request)
     replay_client = _NullRationaleClient(setup.judge_model)
     replay = TemplateJudgeClient(
@@ -262,6 +263,7 @@ def test_null_rationale_probe_persists_and_replays(tmp_path: Path) -> None:
         reference_input=None,
         created_at=datetime(2026, 8, 13, 1, tzinfo=UTC),
         code_revision="test-revision",
+        maximum_output_tokens=16_384,
     )
     second = replay.complete(request)
 

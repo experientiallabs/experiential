@@ -28,7 +28,7 @@ from wmo.common.project import (
     ProjectModelConfiguration,
     ProjectStore,
 )
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.simulation.engines.text.prompt import WORLD_MODEL_TEXT_SYSTEM_PROMPT
 from wmo.simulation.retrieval import RAGEmbedderBinding, RAGMatch, RAGQuery, TraceRAGRetriever
 from wmo.simulation.world_model.application import (
@@ -137,7 +137,8 @@ class _Catalog:
         self.embedder = embedder
         self.resolved: list[str] = []
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        del role
         """Resolve only the configured world-model alias.
 
         Args:
@@ -149,7 +150,14 @@ class _Catalog:
         self.resolved.append(alias)
         return self.world
 
-    def preflight(self, alias: str, requirement: object) -> ResolvedModel:
+    def preflight(
+        self,
+        alias: str,
+        requirement: object,
+        *,
+        role: CatalogRoleName | None = None,
+    ) -> ResolvedModel:
+        del role
         """Resolve the configured embedder after recording capability preflight.
 
         Args:

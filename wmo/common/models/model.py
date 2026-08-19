@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from enum import StrEnum
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import Field, JsonValue, field_validator, model_validator
 
@@ -13,6 +13,18 @@ from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha
 from wmo.common.tasks import ToolSchema
 
 ModelAlias = ArtifactId
+
+ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
+
+DEFAULT_REASONING_EFFORT: Final[ReasoningEffort] = "medium"
+"""Reasoning effort pinned by default for models known to accept the parameter.
+
+OpenAI documents ``medium`` as the balanced default effort and recommends lowering effort for
+latency- and throughput-sensitive workloads, so provider setup pins ``medium`` on every
+reasoning-capable model unless the user picks a different effort for that entry. Every request
+through the resolved client, serving and optimization alike, uses the entry's pinned effort;
+models without a pinned effort never receive the parameter.
+"""
 
 
 class BillingSource(StrEnum):
@@ -272,7 +284,7 @@ class ModelCapabilities(ContractModel):
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True
-    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
+    reasoning_effort: ReasoningEffort | None = None
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)

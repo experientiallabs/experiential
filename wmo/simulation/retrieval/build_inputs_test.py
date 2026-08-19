@@ -720,25 +720,25 @@ def test_binding_loader_rejects_rehashed_extra_task_set_file(tmp_path: Path) -> 
         load_completed_build_rag_lineage_bindings(store, completed)
 
 
-def test_legacy_task_set_loads_but_complete_binding_loader_is_actionable(tmp_path: Path) -> None:
-    """Preserve legacy TaskSet loading while requiring rebuild for refresh bindings.
+def test_named_task_set_loads_but_complete_binding_loader_is_actionable(tmp_path: Path) -> None:
+    """Generic TaskSet loading accepts an explicit ID; refresh bindings still require rebuild.
 
     Args:
         tmp_path: Pytest-owned project root.
     """
     store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="support"))
     build = _build(store)
-    legacy = persist_task_set(
+    named = persist_task_set(
         build.mining,
         store,
-        task_set_id="legacy-task-set",
+        task_set_id="named-task-set",
         created_at=_TIME,
-        code_revision="legacy-revision",
+        code_revision="named-revision",
     )
 
-    assert legacy.task_set_id == "legacy-task-set"
+    assert named.task_set_id == "named-task-set"
     with pytest.raises(ArtifactCorruptionError, match="rebuild the project"):
-        load_task_set_lineage_bindings(store, legacy.task_set_id)
+        load_task_set_lineage_bindings(store, named.task_set_id)
 
 
 @pytest.mark.parametrize("replacement_trace_ids", [(), ("trace-terminal", "extra-trace")])

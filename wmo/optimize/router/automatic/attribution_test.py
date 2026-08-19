@@ -121,8 +121,8 @@ def test_unique_inferred_mapping_omits_ambiguous_aliases_and_revision_drift() ->
     )
 
 
-def test_unspecified_and_legacy_identity_require_full_snapshot_equality() -> None:
-    """Direct and legacy records never receive provider/model-only inference."""
+def test_unspecified_identity_requires_full_snapshot_equality() -> None:
+    """Direct records never receive provider/model-only inference."""
     recorded = _model("openai", "gpt-test", None, "a", "b")
     trace = _trace((recorded,))
     candidates = _candidates(recorded, _model("anthropic", "other", None, "c", "d"))
@@ -133,22 +133,15 @@ def test_unspecified_and_legacy_identity_require_full_snapshot_equality() -> Non
         _evidence(trace, capabilities="unspecified", connection="unspecified"),
         candidates,
     )[0]
-    legacy = resolve_router_observed_attributions(
-        (_task(trace),),
-        (trace,),
-        None,
-        candidates,
-    )[0]
 
     assert unspecified.match_kind == "strict_snapshot"
-    assert legacy.match_kind == "strict_snapshot"
 
     changed = recorded.model_copy(update={"connection_sha256": "e" * 64})
     assert (
         resolve_router_observed_attributions(
             (_task(trace),),
             (trace,),
-            None,
+            _evidence(trace, capabilities="unspecified", connection="unspecified"),
             _candidates(changed, _model("anthropic", "other", None, "c", "d")),
         )
         == ()

@@ -248,8 +248,8 @@ def build(
             non_interactive=no_interactive,
         ):
             return
-        resolved_world = runtime_catalog.resolve(selected.world_model)
-        runtime_catalog.resolve(selected.judge)
+        resolved_world = runtime_catalog.resolve(selected.world_model, role="world_model")
+        runtime_catalog.resolve(selected.judge, role="judge")
         resolved_embedder = runtime_catalog.preflight(
             selected.embedder,
             CapabilityRequirement(requires_embeddings=True),

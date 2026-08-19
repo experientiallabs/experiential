@@ -21,12 +21,52 @@ from wmo.common.models import (
     ModelResponse,
     ModelSnapshot,
 )
-from wmo.runtime.models.providers.base import ProviderHttpClient
+from wmo.runtime.models.providers.base import (
+    DEFAULT_TIMEOUT_SECONDS,
+    MAXIMUM_COMPLETION_TIMEOUT_SECONDS,
+    ProviderHttpClient,
+    completion_timeout_seconds,
+)
 from wmo.runtime.models.providers.transport import (
     JsonHttpResponse,
     JsonHttpTransport,
     ScriptedJsonTransport,
 )
+
+
+class _TimeoutRecordingTransport(ScriptedJsonTransport):
+    """Scripted transport that also records the timeout given to every POST."""
+
+    def __init__(self, responses: list[JsonHttpResponse]) -> None:
+        """Store the scripted answers and start an empty timeout log.
+
+        Args:
+            responses: Responses to return, consumed in order.
+        """
+        super().__init__(responses)
+        self.timeouts: list[float] = []
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        """Record the per-attempt timeout, then delegate to the scripted answer.
+
+        Args:
+            url: Absolute provider endpoint URL.
+            headers: Request headers sent by the caller.
+            payload: JSON request object sent by the caller.
+            timeout_seconds: Bounded per-attempt timeout given by the client.
+
+        Returns:
+            The next scripted response.
+        """
+        self.timeouts.append(timeout_seconds)
+        return super().post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
 
 
 def _ok_transport() -> ScriptedJsonTransport:
@@ -125,3 +165,43 @@ def test_complete_reports_an_observed_nonnegative_latency() -> None:
     assert latency is not None
     assert latency.provenance == "observed"
     assert latency.value >= 0.0
+
+
+def test_completion_timeout_keeps_the_configured_floor_for_small_or_absent_budgets() -> None:
+    """Requests without a large output budget keep the configured per-attempt timeout."""
+    assert completion_timeout_seconds(DEFAULT_TIMEOUT_SECONDS, None) == DEFAULT_TIMEOUT_SECONDS
+    assert completion_timeout_seconds(DEFAULT_TIMEOUT_SECONDS, 1000) == DEFAULT_TIMEOUT_SECONDS
+
+
+def test_completion_timeout_scales_with_the_requested_output_budget() -> None:
+    """A 16000-token request gets a proportionally longer bounded attempt timeout."""
+    assert completion_timeout_seconds(DEFAULT_TIMEOUT_SECONDS, 16_000) == pytest.approx(480.0)
+
+
+def test_completion_timeout_caps_the_scaled_value_at_the_module_ceiling() -> None:
+    """No output budget can push the derived attempt timeout past the finite ceiling."""
+    derived = completion_timeout_seconds(DEFAULT_TIMEOUT_SECONDS, 10_000_000)
+    assert derived == MAXIMUM_COMPLETION_TIMEOUT_SECONDS
+
+
+def test_completion_timeout_never_reduces_an_explicitly_configured_timeout() -> None:
+    """An operator floor above the scaled value and the ceiling is respected exactly."""
+    assert completion_timeout_seconds(900.0, 16_000) == 900.0
+    assert completion_timeout_seconds(120.0, 1000) == 120.0
+
+
+def test_complete_passes_the_derived_timeout_to_the_transport() -> None:
+    """The completion template posts each attempt under the token-scaled timeout."""
+    transport = _TimeoutRecordingTransport(
+        [
+            JsonHttpResponse(status_code=200, body={"answer": "ok"}),
+            JsonHttpResponse(status_code=200, body={"answer": "ok"}),
+        ]
+    )
+    client = _client(transport)
+    message = ModelMessage(role="user", content="hi")
+
+    client.complete(ModelRequest(messages=(message,), maximum_output_tokens=16_000))
+    client.complete(ModelRequest(messages=(message,)))
+
+    assert transport.timeouts == [pytest.approx(480.0), DEFAULT_TIMEOUT_SECONDS]

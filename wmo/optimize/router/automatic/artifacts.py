@@ -316,7 +316,7 @@ def _candidate_bindings(
 def _runtime_capability_bindings(
     preflight: AutomaticRouterPreflight,
 ) -> tuple[RuntimeCandidateCapability, ...]:
-    """Build runtime-owned candidate bindings without extending the legacy policy.
+    """Build runtime-owned candidate bindings from the confirmed catalog selection.
 
     Args:
         preflight: Verified catalog and selected candidate identities.

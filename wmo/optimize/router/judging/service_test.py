@@ -71,7 +71,7 @@ from wmo.optimize.router.judging.service import (
     prepare_manual_judge_calibration,
     prepare_manual_judge_setup,
 )
-from wmo.runtime.models.registry import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models.registry import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.mining.service import MiningSpec
@@ -145,7 +145,8 @@ class _RuntimeCatalog:
         self.resolved = resolved
         self.preflight_calls = 0
 
-    def preflight(self, alias: str) -> ResolvedModel:
+    def preflight(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        del role
         """Return the fake judge only for its configured alias.
 
         Args:
@@ -895,7 +896,7 @@ def test_estimate_uses_catalog_prices_and_records_provenance(tmp_path: Path) -> 
     assert budget.output_usd_per_million_tokens == 2.0
     assert budget.pricing_source is PricingSource.CONFIGURED
     assert budget.call_count == 3
-    assert budget.estimated_cost_usd == pytest.approx(0.110592)
+    assert budget.estimated_cost_usd == pytest.approx(0.331776)
 
 
 def test_estimate_fails_when_the_ceiling_cannot_admit_the_sample(tmp_path: Path) -> None:
@@ -1027,7 +1028,8 @@ def test_calibration_reports_then_approves_and_replays_without_calls(tmp_path: P
     assert reviewed.approved_calibration is None
     assert reviewed.provider_calls_made == 3
     assert len(client.requests) == 3
-    assert reviewed.report.worst_disagreements
+    assert reviewed.report.worst_disagreements == ()
+    assert reviewed.report.out_of_fold_predictions
 
     approved = calibrate_manual_judge(
         store,
