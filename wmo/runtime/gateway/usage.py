@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from html import escape
+from typing import Literal
 
 from pydantic import Field
 
 from wmo.common.core.artifacts import ContractModel
-from wmo.runtime.gateway.ledger import IdentityUsage, SQLiteAttemptLedger, UsageTerminalCount
+from wmo.runtime.gateway.ledger import (
+    BillingSourceUsage,
+    IdentityUsage,
+    SQLiteAttemptLedger,
+    UsageTerminalCount,
+)
 
 
 class GatewayUsageTotals(ContractModel):
@@ -28,10 +34,11 @@ class GatewayUsageTotals(ContractModel):
 class GatewayUsageReport(ContractModel):
     """Versioned aggregate and per-identity attributed usage report."""
 
-    schema_version: int = Field(default=1, frozen=True)
+    schema_version: Literal[2] = 2
     organization_id: str
     totals: GatewayUsageTotals
     identities: tuple[IdentityUsage, ...]
+    by_billing_source: tuple[BillingSourceUsage, ...]
     cost_description: str = "attributed estimated cost, not provider invoice cost"
 
 
@@ -51,7 +58,12 @@ def read_usage_report(
     Returns:
         Versioned aggregate and per-identity usage.
     """
-    identities = ledger.usage(organization_id=organization_id, identity_id=identity_id)
+    snapshot = ledger.usage_snapshot(
+        organization_id=organization_id,
+        identity_id=identity_id,
+    )
+    identities = snapshot.identities
+    by_billing_source = snapshot.by_billing_source
     terminal: dict[str, int] = {}
     for identity in identities:
         for count in identity.terminal_counts:
@@ -77,6 +89,7 @@ def read_usage_report(
         organization_id=organization_id,
         totals=totals,
         identities=identities,
+        by_billing_source=by_billing_source,
     )
 
 
@@ -105,6 +118,20 @@ def usage_html(report: GatewayUsageReport) -> str:
         "</tr>"
         for item in report.identities
     )
+    source_rows = "".join(
+        "<tr>"
+        f"<td>{escape(item.billing_source.value)}</td>"
+        f"<td>{item.attempts}</td>"
+        f"<td>{item.input_tokens}</td>"
+        f"<td>{item.cached_input_tokens}</td>"
+        f"<td>{item.output_tokens}</td>"
+        f"<td>{item.reasoning_tokens}</td>"
+        f"<td>{item.known_estimated_cost_micro_usd}</td>"
+        f"<td>{item.unknown_cost_attempts}</td>"
+        f"<td>{escape(_source_terminal_summary(item))}</td>"
+        "</tr>"
+        for item in report.by_billing_source
+    )
     totals = report.totals
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
@@ -124,12 +151,25 @@ def usage_html(report: GatewayUsageReport) -> str:
         "<th>Reasoning tokens</th><th>Known micro-USD</th>"
         "<th>Unknown-cost attempts</th><th>Total latency ms</th>"
         "<th>Terminal states</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table></body></html>"
+        f"<tbody>{rows}</tbody></table>"
+        "<h2>Attempts by billing source</h2>"
+        "<table><thead><tr><th>Billing source</th><th>Attempts</th>"
+        "<th>Input tokens</th><th>Cached input</th><th>Output tokens</th>"
+        "<th>Reasoning tokens</th><th>Known micro-USD</th>"
+        "<th>Unknown-cost attempts</th><th>Terminal states</th></tr></thead>"
+        f"<tbody>{source_rows}</tbody></table></body></html>"
     )
 
 
 def _terminal_summary(usage: IdentityUsage) -> str:
     """Return stable terminal-state counts for one HTML table cell."""
+    if not usage.terminal_counts:
+        return "none"
+    return ", ".join(f"{count.state}: {count.attempts}" for count in usage.terminal_counts)
+
+
+def _source_terminal_summary(usage: BillingSourceUsage) -> str:
+    """Return stable terminal-state counts for one billing-source table cell."""
     if not usage.terminal_counts:
         return "none"
     return ", ".join(f"{count.state}: {count.attempts}" for count in usage.terminal_counts)

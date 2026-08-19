@@ -221,14 +221,15 @@ class GatewayExecutionStream:
                 and self._refusal_failover
                 and not self._committed
             ):
-                current.withheld_refusals.append(event)
-                current.withheld_refusal_bytes += len((event.text_delta or "").encode("utf-8"))
+                event_bytes = len((event.text_delta or "").encode("utf-8"))
                 if (
-                    current.withheld_refusal_bytes > _MAX_WITHHELD_REFUSAL_BYTES
-                    or len(current.withheld_refusals) > _MAX_WITHHELD_REFUSAL_EVENTS
+                    current.withheld_refusal_bytes + event_bytes > _MAX_WITHHELD_REFUSAL_BYTES
+                    or len(current.withheld_refusals) + 1 > _MAX_WITHHELD_REFUSAL_EVENTS
                 ):
-                    self._commit_withheld_refusal(current)
+                    self._commit_withheld_refusal(current, event)
                     return self._outward(self._pending_outward.popleft())
+                current.withheld_refusals.append(event)
+                current.withheld_refusal_bytes += event_bytes
                 continue
             if current.withheld_refusals and event.kind in _SEMANTIC_EVENTS:
                 self._commit_withheld_refusal(current, event)

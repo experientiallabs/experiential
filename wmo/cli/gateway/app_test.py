@@ -17,6 +17,7 @@ from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
+from wmo.cli.gateway import app as gateway_cli_app
 from wmo.cli.gateway import key_output as gateway_key_output
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
@@ -170,7 +171,7 @@ def test_noninteractive_management_story_emits_stable_secret_safe_json(
     assert usage.exit_code == 0, usage.output
     assert raw_key not in key_list.stdout
     assert raw_key not in usage.stdout
-    assert json.loads(usage.stdout)["schema_version"] == 1
+    assert json.loads(usage.stdout)["schema_version"] == 2
 
     readiness = runner.invoke(
         app,

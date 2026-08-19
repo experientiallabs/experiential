@@ -71,10 +71,15 @@ result can advance to the next certified deployment, while mixed semantic output
 commits and flushes the original route. Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 
-Each physical attempt records its own provider, model, usage, latency, terminal state, and estimated
-cost attribution. The parent request terminalizes once after success, final failure, cancellation,
-disconnect, or crash reconciliation. Unknown prices remain unknown instead of being treated as
-zero or copied across deployments.
+Each physical attempt records its own provider, model, usage, latency, terminal state, estimated
+cost attribution, and frozen credential-ownership billing source. Later catalog activation and
+process restart never rewrite that source. Schema-v1/v2 attempt rows migrate explicitly as
+`customer_managed`; current dispatches persist either `host_managed` or `customer_managed` before
+network work. The public usage report conserves physical attempt, token, cost, unknown-cost, and
+terminal totals across those source buckets without partitioning logical request counts. The parent
+request terminalizes once after success, final failure, cancellation, disconnect, or crash
+reconciliation. Unknown prices remain unknown instead of being treated as zero or copied across
+deployments.
 
 ## OpenAI-compatible protocol
 
@@ -98,9 +103,10 @@ or eviction returns an explicit unavailable error and never reconstructs content
 
 SQLite stores hashes, frozen authority, route identity, state transitions, token counts, latency,
 and estimated cost. It never stores prompts, responses, raw tool arguments, raw virtual keys, or
-provider secrets. `GET /usage` and `GET /usage.json` are two renderings of the same versioned report
-and expose only aggregate and per-identity accounting. Estimated cost is attribution, not a provider
-invoice.
+provider secrets. `GET /usage` and `GET /usage.json` are two renderings of the same schema-v2 report
+and expose only aggregate, per-identity, and physical-attempt `by_billing_source` accounting.
+Source buckets conserve attempt, token, known-cost, unknown-cost, and terminal-state totals but do
+not partition logical request counts. Estimated cost is attribution, not a provider invoice.
 
 The process owns readiness from preflight through bounded drain. New work is rejected after drain
 starts. Admitted tasks, upstream streams, disconnect cleanup, replay ownership, continuation state,

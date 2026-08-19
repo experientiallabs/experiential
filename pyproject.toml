@@ -53,6 +53,9 @@ exclude = ["**/*_test.py", "wmo/conftest.py"]
 include = [
     "/wmo",
     "/assets",
+    "/docs/reference/gateway-architecture.md",
+    "/docs/release-scope.md",
+    "/docs/usage.md",
     "/README.md",
     "/pyproject.toml",
     "/conftest.py",

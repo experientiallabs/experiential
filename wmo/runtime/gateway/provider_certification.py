@@ -84,7 +84,7 @@ class ProviderCertificationMatrix(ContractModel):
         return sha256_json(self)
 
 
-_EVALUATED_AT = datetime(2026, 8, 18, tzinfo=UTC)
+_EVALUATED_AT = datetime(2026, 8, 19, tzinfo=UTC)
 _CLIENT_SDK = "openai==3.0.0"
 _GATEWAY_API_SURFACES = ("chat.completions", "responses")
 _PROVIDER_API_SURFACES = {
@@ -102,7 +102,12 @@ _OPENAI_EVIDENCE = (
     "wmo/runtime/models/providers/native_test.py",
     "wmo/runtime/models/providers/streaming_test.py",
 )
-_ANTHROPIC_EVIDENCE = _OPENAI_EVIDENCE
+_ANTHROPIC_EVIDENCE = (
+    "wmo/runtime/models/providers/native_test.py",
+    "wmo/runtime/models/providers/streaming_test.py",
+    "wmo/runtime/models/providers/streaming_test.py::"
+    "test_anthropic_text_stream_emits_text_usage_and_completion",
+)
 _OPENAI_COMPATIBLE_EVIDENCE = (
     "wmo/runtime/models/providers/openai_compatible_test.py",
     "wmo/runtime/models/providers/streaming_test.py",

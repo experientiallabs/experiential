@@ -251,6 +251,162 @@ def test_attempt_retains_dispatch_billing_source_after_catalog_change(tmp_path: 
     assert row == (BillingSource.HOST_MANAGED.value, "completed")
 
 
+def test_usage_billing_source_buckets_conserve_physical_attempt_totals(tmp_path: Path) -> None:
+    """Source buckets conserve attempts, usage, cost, unknowns, and terminal states."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+
+    host_authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("host-attempt"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=host_authorization)
+    host_attempt = ledger.start_attempt(
+        snapshot=_execution(host_authorization),
+        deployment=_deployment(billing_source=BillingSource.HOST_MANAGED),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=host_attempt,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=3, output_tokens=2),
+        ),
+        failure=None,
+    )
+
+    customer_authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("customer-attempt"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=customer_authorization)
+    customer_attempt = ledger.start_attempt(
+        snapshot=_execution(customer_authorization),
+        deployment=_deployment(
+            priced=False,
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+        ),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=customer_attempt,
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider unavailable",
+        ),
+    )
+
+    buckets = ledger.usage_by_billing_source(organization_id="org-one")
+
+    assert [bucket.billing_source for bucket in buckets] == [
+        BillingSource.CUSTOMER_MANAGED,
+        BillingSource.HOST_MANAGED,
+    ]
+    customer, host = buckets
+    assert customer.attempts == 1
+    assert customer.unknown_cost_attempts == 1
+    assert [(item.state, item.attempts) for item in customer.terminal_counts] == [("failed", 1)]
+    assert host.attempts == 1
+    assert host.input_tokens == 3
+    assert host.output_tokens == 2
+    assert host.known_estimated_cost_micro_usd == 14
+    assert host.unknown_cost_attempts == 0
+    assert [(item.state, item.attempts) for item in host.terminal_counts] == [("completed", 1)]
+
+
+def test_usage_snapshot_conserves_source_totals_during_concurrent_wal_settlement(
+    tmp_path: Path,
+) -> None:
+    """Concurrent settlement cannot split identity and source report snapshots."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    attempts: list[str] = []
+    for index in range(24):
+        authorization = store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(f"concurrent-usage-{index}"),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+        ledger.accept_request(authorization=authorization)
+        attempts.append(
+            ledger.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(
+                    billing_source=(
+                        BillingSource.HOST_MANAGED
+                        if index % 2 == 0
+                        else BillingSource.CUSTOMER_MANAGED
+                    )
+                ),
+                attempt_ordinal=0,
+                route_depth=0,
+            )
+        )
+
+    def settle_attempts() -> None:
+        """Settle every dispatched attempt while readers hold independent WAL snapshots."""
+        for attempt_id in attempts:
+            ledger.finish_attempt(
+                attempt_id=attempt_id,
+                terminal_event=GatewayEvent(
+                    kind=GatewayEventKind.COMPLETED,
+                    sequence_number=1,
+                    usage=GatewayUsage(input_tokens=3, output_tokens=2),
+                ),
+                failure=None,
+            )
+            time.sleep(0.001)
+
+    def assert_conservation() -> None:
+        """Require every metric and terminal state to reconcile inside one read."""
+        snapshot = ledger.usage_snapshot(organization_id="org-one")
+        identity = snapshot.identities[0]
+        sources = snapshot.by_billing_source
+        assert identity.attempts == sum(item.attempts for item in sources)
+        for field_name in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "known_estimated_cost_micro_usd",
+            "unknown_cost_attempts",
+        ):
+            assert getattr(identity, field_name) == sum(
+                getattr(item, field_name) for item in sources
+            )
+        identity_terminals = {item.state: item.attempts for item in identity.terminal_counts}
+        source_terminals: dict[str, int] = {}
+        for source in sources:
+            for item in source.terminal_counts:
+                source_terminals[item.state] = source_terminals.get(item.state, 0) + item.attempts
+        assert identity_terminals == source_terminals
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        settlement = executor.submit(settle_attempts)
+        for _index in range(100):
+            assert_conservation()
+            if settlement.done():
+                break
+        settlement.result(timeout=5)
+
+    final = ledger.usage_snapshot(organization_id="org-one")
+    assert sum(item.attempts for item in final.identities[0].terminal_counts) == len(attempts)
+    assert sum(
+        terminal.attempts
+        for source in final.by_billing_source
+        for terminal in source.terminal_counts
+    ) == len(attempts)
+
+
 def test_unknown_prices_remain_unknown_instead_of_zero(tmp_path: Path) -> None:
     """Observed token usage with absent rates increments unknown-cost accounting."""
     clock = FakeLedgerClock()

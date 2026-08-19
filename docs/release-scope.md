@@ -19,7 +19,8 @@ on the exact release checkout.
   Responses, with both stream and non-stream requests. HTML and JSON usage are checked for the same
   per-identity accounting values. The same lane measures default SDK retries against physical
   attempts, provider-authentication fallback, refusal policy, post-commit no-switch, restart and
-  replay behavior, revocation, cancellation, WAL mode, and cost attribution.
+  replay behavior, revocation, cancellation, WAL mode, and mixed `host_managed`/
+  `customer_managed` cost attribution that remains frozen across restart and catalog replacement.
 - Deterministic source-level certification additionally covers selection-only project routing,
   authentication-circuit open/skip/recovery, concurrent multi-identity key revocation and alias
   revision activation, and atomic rollback of a failed legacy SQLite migration.

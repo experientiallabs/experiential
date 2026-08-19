@@ -33,8 +33,11 @@ provider call, and requires an explicit provider environment reference, exact mo
 grant, and virtual key. `wmo run --non-interactive --json` returns `gateway_not_initialized` plus
 exact next commands on an empty root. `wmo run --check` validates local readiness without binding.
 The gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets to SQLite.
-`GET /usage` and `GET /usage.json` show only per-identity counts, token usage, latency, terminal
-states, and attributed estimated cost. Estimated cost is not provider invoice cost.
+`GET /usage` and `GET /usage.json` expose the same schema-v2 content-free overall and per-identity
+counts, token usage, latency, terminal states, and attributed estimated cost. Their attempt-only
+`by_billing_source` buckets conserve attempts, tokens, known cost, unknown-cost attempts, and
+terminal states across `host_managed` and `customer_managed`; logical request counts are not
+partitioned. Estimated cost is not provider invoice cost.
 
 One-time virtual-key material appears only in the successful key-issue receipt or a newly created
 mode-`0600` output file. Human key issuance on a non-terminal requires `--json` or `--output`.
@@ -57,6 +60,12 @@ pool member must resolve to the same exact model identity. Retryable transport, 
 and malformed precommit failures may advance through the certified order. Refusal fallback requires
 the explicit `--refusal-failover` option and is persisted on that alias revision. No failure can
 switch providers after outward text, refusal, or tool-call output commits the response.
+
+Direct deployments declare `--billing-source host_managed` or `customer_managed`. The selected
+value is frozen on each physical attempt before dispatch and remains unchanged across catalog
+replacement and restart. Usage JSON and HTML expose content-free physical-attempt buckets by source;
+they do not partition logical request counts. Legacy schema-v1/v2 attempts migrate explicitly as
+`customer_managed`.
 
 Official OpenAI SDK clients use the issued virtual key and loopback base URL:
 

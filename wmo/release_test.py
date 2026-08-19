@@ -53,9 +53,11 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "wmo/common/models/model.py",
         "wmo/runtime/environments/local.py",
         "wmo/runtime/gateway/lifecycle.py",
+        "wmo/runtime/gateway/ledger.py",
         "wmo/runtime/gateway/openai/requests.py",
         "wmo/runtime/gateway/provider_certification.py",
         "wmo/runtime/gateway/service.py",
+        "wmo/runtime/gateway/usage.py",
         "wmo/runtime/models/registry.py",
         "wmo/runtime/router/application.py",
         "wmo/simulation/comparison.py",
@@ -74,6 +76,9 @@ REQUIRED_SDIST_MEMBERS = frozenset(
     {
         "README.md",
         "assets/wmo-workflow.png",
+        "docs/reference/gateway-architecture.md",
+        "docs/release-scope.md",
+        "docs/usage.md",
         "pyproject.toml",
         "wmo/optimize/router/automatic/service.py",
         "wmo/optimize/router/composition.py",
@@ -224,6 +229,9 @@ def _tracked_sdist_members() -> frozenset[str]:
             ".gitignore",
             "README.md",
             "assets",
+            "docs/reference/gateway-architecture.md",
+            "docs/release-scope.md",
+            "docs/usage.md",
             "pyproject.toml",
             "conftest.py",
             "wmo",
@@ -438,22 +446,48 @@ def _installed_release_driver() -> None:
     import stat
     import threading
     from collections import Counter
+    from collections.abc import Sequence
     from datetime import UTC, datetime
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     import httpx
+    import numpy as np
     import openai
+    import uvicorn
     from openai import AsyncOpenAI, OpenAI
     from openai.types.responses import FunctionToolParam
 
     import wmo
+    from wmo.cli.gateway.catalog import (
+        upsert_certified_pool,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+    from wmo.cli.gateway.key_output import key_output_marker_path
     from wmo.common.models import (
+        BillingSource,
         ConnectionConfig,
+        Embedding,
         EmbeddingCostReservation,
+        GatewayDeploymentCapabilities,
+        GatewayEquivalenceCertification,
+        GatewayTokenPrices,
         ModelCapabilities,
+        ModelRequest,
+        ModelResponse,
+        ModelSnapshot,
+        RoutedCandidateSnapshot,
         load_model_catalog,
     )
     from wmo.common.project import ProjectStore, artifact_input
+    from wmo.common.routing import KnnGuard, KnnRouterPolicy
+    from wmo.common.routing.bank import (
+        CandidateEvidenceCount,
+        KnnBankManifest,
+        KnnEvidenceBank,
+        bank_bytes,
+    )
+    from wmo.common.routing.features import ROUTER_FEATURE_SCHEMA_SHA256
     from wmo.optimize.model.sft import (
         RuntimeInteractionExampleSource,
         load_sft_model_optimization_config,
@@ -463,8 +497,16 @@ def _installed_release_driver() -> None:
     from wmo.optimize.model.sft.selection import load_latest_sft_model_optimization
     from wmo.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
     from wmo.optimize.router.judging.service import prepare_manual_judge_calibration
-    from wmo.runtime.models import CapabilityRequirement, RuntimeModelCatalog
+    from wmo.runtime.gateway.lifecycle import load_local_gateway
+    from wmo.runtime.gateway.management import GatewayManagement
+    from wmo.runtime.models import (
+        CapabilityRequirement,
+        CatalogRoleName,
+        ResolvedModel,
+        RuntimeModelCatalog,
+    )
     from wmo.runtime.router import (
+        RouterRuntime,
         RuntimeAcceptedEvent,
         RuntimeCompletedEvent,
         RuntimeInteractionJournal,
@@ -530,6 +572,161 @@ def _installed_release_driver() -> None:
             with self._lock:
                 return tuple(dict(item) for item in self.requests)
 
+    class InstalledProjectClient:
+        """Deterministic selection client that forbids router-owned completion."""
+
+        def __init__(self) -> None:
+            """Initialize selection and completion counters."""
+            self.embed_calls = 0
+            self.complete_calls = 0
+
+        def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
+            """Return one stable feature embedding for learned selection."""
+            assert len(texts) == 1
+            self.embed_calls += 1
+            return (Embedding(values=(1.0, 0.0)),)
+
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            """Reject completion because the gateway owns physical provider work."""
+            del request
+            self.complete_calls += 1
+            raise AssertionError("project router completion must remain unused")
+
+    class InstalledProjectCatalog:
+        """Resolve frozen selection-only models without provider network work."""
+
+        def __init__(
+            self,
+            snapshots: dict[str, ModelSnapshot],
+            client: InstalledProjectClient,
+        ) -> None:
+            """Bind exact snapshots and the deterministic selection client."""
+            self._snapshots = snapshots
+            self._client = client
+
+        def resolve(
+            self,
+            alias: str,
+            *,
+            role: CatalogRoleName | None = None,
+        ) -> ResolvedModel:
+            """Return one candidate or embedder binding by frozen alias."""
+            del role
+            snapshot = self._snapshots[alias]
+            capabilities = ModelCapabilities(
+                supports_embeddings=alias == "embedder",
+            )
+            return ResolvedModel(
+                alias=alias,
+                snapshot=snapshot,
+                capabilities=capabilities,
+                client=self._client,
+                embedding_client=(self._client if capabilities.supports_embeddings else None),
+            )
+
+    def installed_project_runtime() -> tuple[RouterRuntime, InstalledProjectClient]:
+        """Build one real packaged RouterRuntime for installed selection-only evidence."""
+        digest = "a" * 64
+        created_at = datetime(2026, 8, 19, tzinfo=UTC)
+        snapshots: dict[str, ModelSnapshot] = {}
+        for alias in ("baseline", "cheap", "embedder"):
+            capabilities = ModelCapabilities(supports_embeddings=alias == "embedder")
+            snapshots[alias] = ModelSnapshot(
+                provider="installed-fixture",
+                model_id=alias,
+                revision="fixture",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities_sha256=capabilities.identity_sha256(),
+                connection_sha256="b" * 64,
+            )
+        bank = KnnEvidenceBank(
+            task_ids=tuple(f"task-{index}" for index in range(8)),
+            candidate_aliases=("baseline", "cheap"),
+            embeddings=np.asarray(((1.0, 0.0),) * 8, dtype=np.float32),
+            scores=np.asarray(((0.4, 1.0),) * 8, dtype=np.float32),
+            candidate_costs=np.asarray(((0.5, 0.1),) * 8, dtype=np.float64),
+            score_counts=np.ones((8, 2), dtype=np.int32),
+            cost_counts=np.ones((8, 2), dtype=np.int32),
+            workload_weights=np.ones(8, dtype=np.float64),
+            novelty_floor=0.5,
+        )
+        bank_sha256 = hashlib.sha256(bank_bytes(bank)).hexdigest()
+        manifest = KnnBankManifest(
+            schema_version=1,
+            created_at=created_at,
+            code_revision=release_revision,
+            bank_artifact_id="installed-project-bank",
+            fit_evaluation_id="installed-project-fit",
+            evaluation_plan_id="installed-project-plan",
+            evaluation_plan_sha256=digest,
+            task_set_id="installed-project-tasks",
+            task_set_sha256=digest,
+            task_ids=bank.task_ids,
+            candidate_aliases=bank.candidate_aliases,
+            evaluation_protocols_sha256=digest,
+            embedder_alias="embedder",
+            embedder=snapshots["embedder"],
+            feature_extractor_id="request-visible-v2",
+            feature_schema_sha256=ROUTER_FEATURE_SCHEMA_SHA256,
+            pricing_snapshot_id="installed-project-pricing",
+            pricing_snapshot_sha256=digest,
+            bank_sha256=bank_sha256,
+            embedding_dimension=2,
+            novelty_floor=0.5,
+            evidence_counts=tuple(
+                CandidateEvidenceCount(
+                    candidate_alias=alias,
+                    scored_task_count=8,
+                    costed_task_count=8,
+                )
+                for alias in bank.candidate_aliases
+            ),
+        )
+        policy = KnnRouterPolicy(
+            schema_version=1,
+            created_at=created_at,
+            code_revision=release_revision,
+            policy_id="installed-project-policy",
+            baseline_alias="baseline",
+            candidates=tuple(
+                RoutedCandidateSnapshot(alias=alias, model=snapshots[alias])
+                for alias in bank.candidate_aliases
+            ),
+            embedder_alias="embedder",
+            embedder=snapshots["embedder"],
+            feature_extractor_id=manifest.feature_extractor_id,
+            feature_schema_sha256=manifest.feature_schema_sha256,
+            pricing_snapshot_id=manifest.pricing_snapshot_id,
+            pricing_snapshot_sha256=manifest.pricing_snapshot_sha256,
+            bank_artifact_id=manifest.bank_artifact_id,
+            bank_sha256=bank_sha256,
+            guard=KnnGuard(
+                maximum_neighbors=8,
+                minimum_paired_observations=8,
+                relative_similarity_threshold=0.95,
+                uncertainty_multiplier=0.5,
+                quality_tolerance=0,
+            ),
+            fit_evaluation_id=manifest.fit_evaluation_id,
+            evaluation_plan_id=manifest.evaluation_plan_id,
+            evaluation_plan_sha256=manifest.evaluation_plan_sha256,
+            task_set_id=manifest.task_set_id,
+            task_set_sha256=manifest.task_set_sha256,
+            evaluation_protocols_sha256=manifest.evaluation_protocols_sha256,
+            judgment_status="provisional",
+        )
+        client = InstalledProjectClient()
+        runtime = RouterRuntime(
+            policy,
+            manifest,
+            bank,
+            cast(RuntimeModelCatalog, InstalledProjectCatalog(snapshots, client)),
+            pricing_snapshot_id=manifest.pricing_snapshot_id,
+            pricing_snapshot_sha256=manifest.pricing_snapshot_sha256,
+            pricing_candidate_aliases=manifest.candidate_aliases,
+        )
+        return runtime, client
+
     state = ProviderState()
 
     class ProviderHandler(BaseHTTPRequestHandler):
@@ -568,10 +765,10 @@ def _installed_release_driver() -> None:
                 self.send_error(400)
                 return
             ordinal = state.append(self.path, payload)
-            if payload.get("model") == "gateway-primary-model":
+            if payload.get("model") in {"gateway-primary-model", "project-primary-model"}:
                 self._send_primary_gateway_stream(payload, ordinal=ordinal)
                 return
-            if payload.get("model") == "gateway-secondary-model":
+            if payload.get("model") in {"gateway-secondary-model", "project-secondary-model"}:
                 self._send_gateway_stream(payload, ordinal=ordinal)
                 return
             if self.path.endswith("/embeddings"):
@@ -704,7 +901,10 @@ def _installed_release_driver() -> None:
                                             "type": "function",
                                             "function": {
                                                 "name": "lookup_ticket",
-                                                "arguments": '{"ticket":"tool-argument-canary"}',
+                                                "arguments": json.dumps(
+                                                    {"ticket": tool_argument_canary},
+                                                    separators=(",", ":"),
+                                                ),
                                             },
                                         }
                                     ],
@@ -715,6 +915,11 @@ def _installed_release_driver() -> None:
                     },
                 )
             else:
+                content = (
+                    project_response_canary
+                    if project_prompt_canary in json.dumps(payload, sort_keys=True)
+                    else response_canary
+                )
                 choices = (
                     {
                         "choices": [
@@ -722,7 +927,7 @@ def _installed_release_driver() -> None:
                                 "index": 0,
                                 "delta": {
                                     "role": "assistant",
-                                    "content": "gateway-response-canary",
+                                    "content": content,
                                 },
                                 "finish_reason": "stop",
                             }
@@ -764,6 +969,9 @@ def _installed_release_driver() -> None:
             ):
                 self._send_retryable_failure()
                 return
+            if "project-prompt-canary-P9" in prompt:
+                self._send_retryable_failure()
+                return
             if "provider-auth-input-canary-P9" in prompt:
                 body = b'{"error":{"message":"fixture credential rejected"}}'
                 self.send_response(401)
@@ -794,7 +1002,7 @@ def _installed_release_driver() -> None:
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": "postcommit-response-canary-P9"},
+                                    "delta": {"content": postcommit_response_canary},
                                     "finish_reason": None,
                                 }
                             ]
@@ -811,7 +1019,7 @@ def _installed_release_driver() -> None:
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": "cancellation-response-canary-P9"},
+                                    "delta": {"content": cancellation_response_canary},
                                     "finish_reason": None,
                                 }
                             ]
@@ -1110,6 +1318,45 @@ def _installed_release_driver() -> None:
             digest.update(b"\0")
         return digest.hexdigest()
 
+    def gateway_attempt_rows(database: Path) -> tuple[dict[str, object], ...]:
+        """Read stable content-free attempt evidence from the installed database.
+
+        Args:
+            database: Gateway SQLite path.
+
+        Returns:
+            Attempt rows ordered by durable creation identity.
+        """
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT attempt_id, request_id, attempt_ordinal, route_depth,
+                       deployment_id, billing_source, state, failure_class,
+                       input_tokens, cached_input_tokens, output_tokens,
+                       reasoning_tokens, estimated_cost_micro_usd
+                FROM gateway_attempts
+                ORDER BY started_at, request_id, attempt_ordinal, attempt_id
+                """
+            ).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def frozen_billing_evidence(
+        rows: tuple[dict[str, object], ...],
+    ) -> dict[str, tuple[object, object]]:
+        """Index immutable billing source and cost by physical attempt.
+
+        Args:
+            rows: Content-free attempt rows.
+
+        Returns:
+            Billing source and attributed cost keyed by attempt ID.
+        """
+        return {
+            str(row["attempt_id"]): (row["billing_source"], row["estimated_cost_micro_usd"])
+            for row in rows
+        }
+
     def unused_loopback_port() -> int:
         """Reserve and release one currently unused loopback TCP port."""
         with socket.socket() as probe:
@@ -1189,6 +1436,7 @@ def _installed_release_driver() -> None:
         return stdout, stderr
 
     gateway_root = execution_root / "gateway-empty"
+    gateway_database = gateway_root / "gateway" / "gateway.db"
     empty_gateway = run_cli(
         "run",
         "--root",
@@ -1211,18 +1459,21 @@ def _installed_release_driver() -> None:
     )
     assert json.loads(initialized_gateway.stdout)["schema_version"] == 1
 
-    provider_secret = "provider-secret-canary-P9"
-    prompt_canary = "prompt-content-canary-P9"
-    response_canary = "gateway-response-canary"
-    tool_argument_canary = "tool-argument-canary"
-    invalid_key_canary = "invalid-virtual-key-canary-P9"
-    refusal_input_canary = "refusal-input-canary-P9"
-    auth_input_canary = "provider-auth-input-canary-P9"
-    sdk_retry_input_canary = "sdk-retry-input-canary-P9"
-    postcommit_input_canary = "postcommit-input-canary-P9"
-    postcommit_response_canary = "postcommit-response-canary-P9"
-    cancellation_input_canary = "cancellation-input-canary-P9"
-    cancellation_response_canary = "cancellation-response-canary-P9"
+    canary_suffix = hashlib.sha256(str(execution_root).encode()).hexdigest()[:16]
+    provider_secret = f"provider-secret-canary-P9-{canary_suffix}"
+    prompt_canary = f"prompt-content-canary-P9-{canary_suffix}"
+    response_canary = f"gateway-response-canary-{canary_suffix}"
+    tool_argument_canary = f"tool-argument-canary-{canary_suffix}"
+    invalid_key_canary = f"invalid-virtual-key-canary-P9-{canary_suffix}"
+    refusal_input_canary = f"refusal-input-canary-P9-{canary_suffix}"
+    auth_input_canary = f"provider-auth-input-canary-P9-{canary_suffix}"
+    sdk_retry_input_canary = f"sdk-retry-input-canary-P9-{canary_suffix}"
+    postcommit_input_canary = f"postcommit-input-canary-P9-{canary_suffix}"
+    postcommit_response_canary = f"postcommit-response-canary-P9-{canary_suffix}"
+    cancellation_input_canary = f"cancellation-input-canary-P9-{canary_suffix}"
+    cancellation_response_canary = f"cancellation-response-canary-P9-{canary_suffix}"
+    project_prompt_canary = f"project-prompt-canary-P9-{canary_suffix}"
+    project_response_canary = f"project-response-canary-P9-{canary_suffix}"
     child_environment["P9_LOOPBACK_PROVIDER_KEY"] = provider_secret
     provider_commands = (
         (
@@ -1265,9 +1516,9 @@ def _installed_release_driver() -> None:
         assert json.loads(receipt.stdout)["schema_version"] == 1
 
     catalog_sha256 = ""
-    for alias, deployment in (
-        ("primary", "gateway-primary:gateway-primary-model"),
-        ("secondary", "gateway-secondary:gateway-secondary-model"),
+    for alias, deployment, billing_source in (
+        ("primary", "gateway-primary:gateway-primary-model", "host_managed"),
+        ("secondary", "gateway-secondary:gateway-secondary-model", "customer_managed"),
     ):
         receipt = run_cli(
             "config",
@@ -1296,6 +1547,8 @@ def _installed_release_driver() -> None:
             "3000000",
             "--pricing-source",
             "deterministic loopback fixture",
+            "--billing-source",
+            billing_source,
             "--root",
             str(gateway_root),
             "--non-interactive",
@@ -1367,7 +1620,10 @@ def _installed_release_driver() -> None:
         receipt = run_cli(*command)
         assert json.loads(receipt.stdout)["schema_version"] == 1
 
-    key_output = execution_root / "gateway-virtual-key.txt"
+    key_output_directory = execution_root / "gateway-key-output"
+    key_output_directory.mkdir(mode=0o700)
+    assert stat.S_IMODE(key_output_directory.stat().st_mode) == 0o700
+    key_output = key_output_directory / "key.txt"
     issue_receipt = run_cli(
         "config",
         "gateway",
@@ -1387,6 +1643,21 @@ def _installed_release_driver() -> None:
     assert raw_key.startswith("wmo_vk_")
     assert stat.S_IMODE(key_output.stat().st_mode) == 0o600
     assert raw_key not in issue_receipt.stdout
+
+    def assert_key_and_canaries_confined() -> None:
+        """Require one authorized key output and no duplicate secret or content artifact."""
+        assert not key_output_marker_path(key_output).exists()
+        assert tuple(key_output.parent.glob(f".{key_output.name}.*.reserve")) == ()
+        forbidden = raw_key.encode()
+        entries = tuple(key_output_directory.iterdir())
+        assert entries == (key_output,)
+        assert all(
+            forbidden not in path.read_bytes()
+            for path in entries
+            if path != key_output and path.is_file() and not path.is_symlink()
+        )
+
+    assert_key_and_canaries_confined()
 
     gateway_process, gateway_port, base_url = start_gateway(gateway_root)
     gateway_stdout_parts: list[str] = []
@@ -1409,6 +1680,9 @@ def _installed_release_driver() -> None:
         assert default_refusal.json()["choices"][0]["message"]["refusal"] == "policy refusal"
         assert state.count_containing("gateway-secondary-model") == 0
 
+        auth_attempt_ids = {
+            str(row["attempt_id"]) for row in gateway_attempt_rows(gateway_database)
+        }
         auth_secondary = state.count_containing("gateway-secondary-model")
         auth_fallback = httpx.post(
             f"{base_url}/chat/completions",
@@ -1422,6 +1696,25 @@ def _installed_release_driver() -> None:
         auth_fallback.raise_for_status()
         assert auth_fallback.json()["choices"][0]["message"]["content"] == response_canary
         assert state.count_containing("gateway-secondary-model") == auth_secondary + 1
+        auth_attempts = tuple(
+            row
+            for row in gateway_attempt_rows(gateway_database)
+            if str(row["attempt_id"]) not in auth_attempt_ids
+        )
+        assert len(auth_attempts) == 2
+        assert len({row["request_id"] for row in auth_attempts}) == 1
+        assert [row["attempt_ordinal"] for row in auth_attempts] == [0, 1]
+        assert [row["route_depth"] for row in auth_attempts] == [0, 1]
+        assert [row["billing_source"] for row in auth_attempts] == [
+            "host_managed",
+            "customer_managed",
+        ]
+        assert [row["state"] for row in auth_attempts] == ["failed", "completed"]
+        assert auth_attempts[0]["failure_class"] == "provider_authentication"
+        assert auth_attempts[0]["estimated_cost_micro_usd"] is None
+        assert auth_attempts[1]["input_tokens"] == 3
+        assert auth_attempts[1]["output_tokens"] == 2
+        assert auth_attempts[1]["estimated_cost_micro_usd"] == 7
 
         with OpenAI(api_key=raw_key, base_url=base_url, timeout=10) as client:
             assert [model.id for model in client.models.list().data] == ["coding"]
@@ -1471,7 +1764,9 @@ def _installed_release_driver() -> None:
             assert tool_chat.choices[0].message.tool_calls
             tool_call = tool_chat.choices[0].message.tool_calls[0]
             assert tool_call.type == "function"
-            assert tool_call.function.arguments == ('{"ticket":"tool-argument-canary"}')
+            assert tool_call.function.arguments == json.dumps(
+                {"ticket": tool_argument_canary}, separators=(",", ":")
+            )
 
         async def exercise_async_gateway() -> None:
             """Run all async SDK stream and non-stream gateway quadrants."""
@@ -1515,7 +1810,11 @@ def _installed_release_driver() -> None:
         matrix_stdout, matrix_stderr = stop_gateway(gateway_process)
         gateway_stdout_parts.append(matrix_stdout)
         gateway_stderr_parts.append(matrix_stderr)
+        frozen_before_restart = frozen_billing_evidence(gateway_attempt_rows(gateway_database))
         gateway_process, gateway_port, base_url = start_gateway(gateway_root)
+        assert frozen_billing_evidence(gateway_attempt_rows(gateway_database)) == (
+            frozen_before_restart
+        )
 
         usage_before_retry = httpx.get(
             f"http://127.0.0.1:{gateway_port}/usage.json",
@@ -1597,7 +1896,6 @@ def _installed_release_driver() -> None:
         assert keyed_replay.content == keyed_first.content
         assert len(state.snapshot()) == physical_before_replay
 
-        gateway_database = gateway_root / "gateway" / "gateway.db"
         with sqlite3.connect(gateway_database) as connection:
             assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         assert gateway_database.with_name("gateway.db-wal").exists()
@@ -1620,6 +1918,7 @@ def _installed_release_driver() -> None:
         gateway_stderr_parts.append(first_stderr)
         gateway_process, gateway_port, base_url = start_gateway(gateway_root)
         provider_before_restart_replay = len(state.snapshot())
+        attempts_before_restart_replay = gateway_attempt_rows(gateway_database)
         restart_replay = httpx.post(
             f"{base_url}/chat/completions",
             headers=keyed_headers,
@@ -1629,6 +1928,7 @@ def _installed_release_driver() -> None:
         assert restart_replay.status_code == 409
         assert restart_replay.json()["error"]["code"] == "idempotency_replay_unavailable"
         assert len(state.snapshot()) == provider_before_restart_replay
+        assert gateway_attempt_rows(gateway_database) == attempts_before_restart_replay
         error_bodies.append(restart_replay.text)
 
         cancellation_secondary = state.count_containing("gateway-secondary-model")
@@ -1687,6 +1987,11 @@ def _installed_release_driver() -> None:
         )
         opted_catalog_sha256 = json.loads(opted_policy.stdout)["data"]["catalog_sha256"]
         assert opted_catalog_sha256 != catalog_sha256
+        billing_after_pool_replace = frozen_billing_evidence(gateway_attempt_rows(gateway_database))
+        assert {
+            attempt_id: billing_after_pool_replace[attempt_id]
+            for attempt_id in frozen_before_restart
+        } == frozen_before_restart
         gateway_process, gateway_port, base_url = start_gateway(gateway_root)
         opted_secondary = state.count_containing("gateway-secondary-model")
         opted_refusal = httpx.post(
@@ -1731,6 +2036,7 @@ def _installed_release_driver() -> None:
         usage_json_body = usage_json_response.text
         usage_html_body = usage_html_response.text
         usage_payload = usage_json_response.json()
+        assert usage_payload["schema_version"] == 2
         identity_usage = usage_payload["identities"][0]
         assert usage_payload["totals"]["requests"] >= 14
         assert usage_payload["totals"]["attempts"] > usage_payload["totals"]["requests"]
@@ -1741,6 +2047,71 @@ def _installed_release_driver() -> None:
         assert terminal_counts["completed"] >= 10
         assert terminal_counts["failed"] >= 2
         assert terminal_counts["cancelled"] >= 1
+        attempt_rows = gateway_attempt_rows(gateway_database)
+        billing_sources = {str(row["billing_source"]) for row in attempt_rows}
+        assert billing_sources == {"customer_managed", "host_managed"}
+        assert (
+            sum(cast(int | None, row["input_tokens"]) or 0 for row in attempt_rows)
+            == (usage_payload["totals"]["input_tokens"])
+        )
+        assert (
+            sum(cast(int | None, row["cached_input_tokens"]) or 0 for row in attempt_rows)
+            == (usage_payload["totals"]["cached_input_tokens"])
+        )
+        assert (
+            sum(cast(int | None, row["output_tokens"]) or 0 for row in attempt_rows)
+            == (usage_payload["totals"]["output_tokens"])
+        )
+        assert (
+            sum(cast(int | None, row["reasoning_tokens"]) or 0 for row in attempt_rows)
+            == (usage_payload["totals"]["reasoning_tokens"])
+        )
+        assert (
+            sum(cast(int | None, row["estimated_cost_micro_usd"]) or 0 for row in attempt_rows)
+            == (usage_payload["totals"]["known_estimated_cost_micro_usd"])
+        )
+        assert (
+            sum(row["estimated_cost_micro_usd"] is None for row in attempt_rows)
+            == (usage_payload["totals"]["unknown_cost_attempts"])
+        )
+        source_buckets = usage_payload["by_billing_source"]
+        assert [bucket["billing_source"] for bucket in source_buckets] == [
+            "customer_managed",
+            "host_managed",
+        ]
+        for bucket in source_buckets:
+            billing_source = bucket["billing_source"]
+            source_rows = tuple(
+                row for row in attempt_rows if row["billing_source"] == billing_source
+            )
+            assert source_rows
+            assert all(row["state"] != "dispatched" for row in source_rows)
+            assert bucket["attempts"] == len(source_rows)
+            assert bucket["input_tokens"] == sum(
+                cast(int | None, row["input_tokens"]) or 0 for row in source_rows
+            )
+            assert bucket["cached_input_tokens"] == sum(
+                cast(int | None, row["cached_input_tokens"]) or 0 for row in source_rows
+            )
+            assert bucket["output_tokens"] == sum(
+                cast(int | None, row["output_tokens"]) or 0 for row in source_rows
+            )
+            assert bucket["reasoning_tokens"] == sum(
+                cast(int | None, row["reasoning_tokens"]) or 0 for row in source_rows
+            )
+            assert bucket["known_estimated_cost_micro_usd"] == sum(
+                cast(int | None, row["estimated_cost_micro_usd"]) or 0 for row in source_rows
+            )
+            assert bucket["unknown_cost_attempts"] == sum(
+                row["estimated_cost_micro_usd"] is None for row in source_rows
+            )
+            expected_source_terminals = {
+                state: sum(row["state"] == state for row in source_rows)
+                for state in sorted({str(row["state"]) for row in source_rows})
+            }
+            assert {
+                item["state"]: item["attempts"] for item in bucket["terminal_counts"]
+            } == expected_source_terminals
         expected_cells = (
             identity_usage["identity_id"],
             identity_usage["requests"],
@@ -1756,8 +2127,25 @@ def _installed_release_driver() -> None:
                 f"{item['state']}: {item['attempts']}" for item in identity_usage["terminal_counts"]
             ),
         )
+        expected_source_cells = tuple(
+            value
+            for bucket in source_buckets
+            for value in (
+                bucket["billing_source"],
+                bucket["attempts"],
+                bucket["input_tokens"],
+                bucket["cached_input_tokens"],
+                bucket["output_tokens"],
+                bucket["reasoning_tokens"],
+                bucket["known_estimated_cost_micro_usd"],
+                bucket["unknown_cost_attempts"],
+                ", ".join(
+                    f"{item['state']}: {item['attempts']}" for item in bucket["terminal_counts"]
+                ),
+            )
+        )
         assert tuple(re.findall(r"<td>(.*?)</td>", usage_html_body)) == tuple(
-            str(value) for value in expected_cells
+            str(value) for value in (*expected_cells, *expected_source_cells)
         )
 
         invalid_auth = httpx.get(
@@ -1795,6 +2183,158 @@ def _installed_release_driver() -> None:
         gateway_stdout, gateway_stderr = stop_gateway(gateway_process)
         gateway_stdout_parts.append(gateway_stdout)
         gateway_stderr_parts.append(gateway_stderr)
+
+    project_root = execution_root / "gateway-project"
+    project_manager = GatewayManagement(project_root)
+    project_manager.initialize()
+    for alias in ("cheap", "baseline"):
+        upsert_connection(
+            project_root,
+            name=f"project-{alias}",
+            connection=ConnectionConfig(
+                provider="openai-compatible",
+                base_url=provider_url,
+                api_key_env="P9_LOOPBACK_PROVIDER_KEY",
+            ),
+            replace=False,
+        )
+    project_catalog = None
+    for alias, provider_model, billing_source in (
+        ("cheap", "project-primary-model", BillingSource.HOST_MANAGED),
+        ("baseline", "project-secondary-model", BillingSource.CUSTOMER_MANAGED),
+    ):
+        project_catalog, _snapshot, _changed = upsert_singleton_deployment(
+            project_root,
+            deployment_alias=alias,
+            connection_name=f"project-{alias}",
+            provider_model=provider_model,
+            exact_model_id="project-exact-model",
+            revision=None,
+            capabilities=ModelCapabilities(),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            prices=GatewayTokenPrices(
+                input_micro_usd_per_million_tokens=1_000_000,
+                output_micro_usd_per_million_tokens=2_000_000,
+            ),
+            pricing_source="installed project fixture",
+            billing_source=billing_source,
+            replace=False,
+        )
+    assert project_catalog is not None
+    project_catalog, project_snapshot, _changed = upsert_certified_pool(
+        project_root,
+        pool_id="project-pool",
+        exact_model_id="project-exact-model",
+        deployment_aliases=("cheap", "baseline"),
+        certification=GatewayEquivalenceCertification(
+            certification_id="installed-project-certification",
+            provenance="installed deterministic exact-model fixture",
+            evidence_sha256="c" * 64,
+            certified_at=datetime(2026, 8, 19, tzinfo=UTC),
+        ),
+        expected_catalog_sha256=project_catalog.identity_sha256(),
+        replace=False,
+    )
+    project_manager.activate_project_alias(
+        alias_id="project-coding",
+        alias_name="project-coding",
+        revision_id="installed-project-revision",
+        project_ref="installed-project",
+        activation_ref="installed-project-policy",
+        snapshot_ref=f"catalog-snapshots/{project_snapshot.name}",
+        catalog_sha256=project_catalog.identity_sha256(),
+    )
+    project_manager.create_identity(identity_id="project-identity", display_name="Project")
+    project_manager.add_grant(identity_id="project-identity", alias_id="project-coding")
+    project_key = project_manager.issue_key(
+        identity_id="project-identity",
+        key_id="project-key",
+    ).raw_key
+    learned_runtime, learned_client = installed_project_runtime()
+
+    def load_installed_project(
+        project: str,
+        root: Path,
+        *,
+        policy_id: str,
+        runtime_catalog: RuntimeModelCatalog,
+    ) -> RouterRuntime:
+        """Inject one real installed selection runtime without project completion."""
+        del root, runtime_catalog
+        assert project == "installed-project"
+        assert policy_id == "installed-project-policy"
+        return learned_runtime
+
+    project_provider_before_load = state.snapshot()
+    project_primary_before = state.count_containing("project-primary-model")
+    project_secondary_before = state.count_containing("project-secondary-model")
+    installed_project_gateway = load_local_gateway(
+        project_root,
+        graceful_timeout_seconds=2,
+        environment={"P9_LOOPBACK_PROVIDER_KEY": provider_secret},
+        project_loader=load_installed_project,
+    )
+    assert state.snapshot() == project_provider_before_load
+    project_port = unused_loopback_port()
+    project_server = uvicorn.Server(
+        uvicorn.Config(
+            installed_project_gateway.app,
+            host="127.0.0.1",
+            port=project_port,
+            log_level="critical",
+            access_log=False,
+        )
+    )
+    project_thread = threading.Thread(target=project_server.run, daemon=True)
+    project_thread.start()
+    project_deadline = time.monotonic() + 20
+    while not project_server.started and time.monotonic() < project_deadline:
+        time.sleep(0.01)
+    assert project_server.started
+    assert state.snapshot() == project_provider_before_load
+    try:
+        with OpenAI(
+            api_key=project_key,
+            base_url=f"http://127.0.0.1:{project_port}/v1",
+            timeout=10,
+        ) as client:
+            project_response = client.chat.completions.create(
+                model="project-coding",
+                messages=[{"role": "user", "content": project_prompt_canary}],
+            )
+        assert project_response.choices[0].message.content == project_response_canary
+    finally:
+        project_server.should_exit = True
+        project_thread.join(timeout=10)
+    assert not project_thread.is_alive()
+    assert state.count_containing("project-primary-model") == project_primary_before + 2
+    assert state.count_containing("project-secondary-model") == project_secondary_before + 1
+    assert learned_client.embed_calls == 1
+    assert learned_client.complete_calls == 0
+    assert learned_runtime.records_decisions is False
+    assert not (project_root / "projects").exists()
+    with sqlite3.connect(project_manager.database_path) as connection:
+        project_attempts = connection.execute(
+            """
+            SELECT attempt_ordinal, route_depth, exact_model_id, billing_source, state
+            FROM gateway_attempts ORDER BY attempt_ordinal
+            """
+        ).fetchall()
+    assert project_attempts == [
+        (0, 0, "project-exact-model", "host_managed", "failed"),
+        (1, 0, "project-exact-model", "host_managed", "failed"),
+        (2, 1, "project-exact-model", "customer_managed", "completed"),
+    ]
+    _assert_gateway_canaries_absent(
+        project_root,
+        channels={},
+        canaries=(
+            project_key,
+            provider_secret,
+            project_prompt_canary,
+            project_response_canary,
+        ),
+    )
     gateway_stdout = "".join(gateway_stdout_parts)
     gateway_stderr = "".join(gateway_stderr_parts)
     assert (gateway_root / "gateway" / "gateway.db").is_file()
@@ -2434,6 +2974,7 @@ def _installed_release_driver() -> None:
                 for input_item in manifest.inputs:
                     input_manifest = project_store.artifacts.read(input_item.artifact_id).manifest
                     assert artifact_input(input_manifest) == input_item
+        assert_key_and_canaries_confined()
     finally:
         server.shutdown()
         server.server_close()
@@ -2672,6 +3213,8 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     assert "wmo config gateway pool certify" in usage
     assert "wmo run --root ROOT" in usage
     assert "OpenAI `3.0.0`" in usage
+    assert "schema-v2" in usage
+    assert "by_billing_source" in usage
     assert "wmo optimize route" not in usage.replace("wmo optimize router", "")
 
     scope = (docs / "release-scope.md").read_text(encoding="utf-8")
@@ -2691,6 +3234,8 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     assert "POST /v1/chat/completions" in architecture
     assert "POST /v1/responses" in architecture
     assert "provider_certification.py" in architecture
+    assert "schema-v2" in architecture
+    assert "by_billing_source" in architecture
     assert "inert contracts" not in architecture
     assert "does not claim that a gateway server" not in architecture
 

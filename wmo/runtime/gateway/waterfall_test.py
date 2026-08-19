@@ -463,6 +463,67 @@ def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> No
 
 
 @pytest.mark.parametrize(
+    "refusals",
+    [
+        ("r" * 65_536,),
+        ("a" * 32_768, "b" * 32_768),
+        tuple("" for _index in range(256)),
+    ],
+)
+def test_refusal_buffer_accepts_exact_byte_and_event_bounds(
+    refusals: tuple[str, ...],
+) -> None:
+    """Exact refusal bounds remain precommit and can advance without exposure."""
+
+    async def scenario() -> tuple[list[GatewayEvent], int]:
+        """Complete one exactly bounded refusal-only route and its fallback."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        first_events = tuple(
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=index,
+                text_delta=text,
+            )
+            for index, text in enumerate(refusals)
+        ) + (
+            GatewayEvent(
+                kind=GatewayEventKind.USAGE,
+                sequence_number=len(refusals),
+                usage=GatewayUsage(input_tokens=5, output_tokens=2),
+            ),
+            GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=len(refusals) + 1,
+            ),
+        )
+        second_provider = _ScriptedProvider([_completed_stream("bounded fallback")])
+        executor = _executor(
+            (first, second),
+            {
+                first.source_alias: _ScriptedProvider([_WaterfallStream(first_events)]),
+                second.source_alias: second_provider,
+            },
+            _WaterfallLedger(),
+            maximum_same_deployment_attempts=1,
+        )
+        stream = await executor.start(
+            route=_route((first, second), refusal_failover=True),
+            request=_request(),
+        )
+        return [event async for event in stream], len(second_provider.idempotency_keys)
+
+    events, fallback_count = asyncio.run(scenario())
+
+    assert [event.kind for event in events] == [
+        GatewayEventKind.TEXT_DELTA,
+        GatewayEventKind.COMPLETED,
+    ]
+    assert events[0].text_delta == "bounded fallback"
+    assert fallback_count == 1
+
+
+@pytest.mark.parametrize(
     "first_events",
     [
         (
@@ -472,6 +533,19 @@ def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> No
                 text_delta="r" * 70_000,
             ),
             GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+        ),
+        (
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=0,
+                text_delta="a" * 32_768,
+            ),
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=1,
+                text_delta="b" * 32_769,
+            ),
+            GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=2),
         ),
         (
             GatewayEvent(
@@ -526,6 +600,11 @@ def test_refusal_buffer_overflow_or_mixed_output_commits_without_failover(
     events, fallback_count = asyncio.run(scenario())
 
     assert [event.kind for event in events] == [event.kind for event in first_events]
+    assert [
+        event.text_delta for event in events if event.kind is GatewayEventKind.REFUSAL_DELTA
+    ] == [
+        event.text_delta for event in first_events if event.kind is GatewayEventKind.REFUSAL_DELTA
+    ]
     assert fallback_count == 0
 
 

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import threading
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -69,7 +72,7 @@ def test_local_gateway_preflights_real_state_and_serves_health_and_usage(
 
     assert runtime.state.ready is False
     assert usage.status_code == 200
-    assert usage.json()["schema_version"] == 1
+    assert usage.json()["schema_version"] == 2
     assert usage.json()["identities"][0]["identity_id"] == "default"
     assert page.status_code == 200
     assert "provider-secret-canary" not in page.text
@@ -262,6 +265,129 @@ def test_project_certified_pool_preflight_resolves_all_siblings_and_reloads(
     assert manager.aliases()[0].target_kind == "project"
 
 
+def test_real_project_selection_dispatches_frozen_pool_without_router_completion(
+    tmp_path: Path,
+) -> None:
+    """Real lifecycle uses RouterRuntime selection only, then owns provider fallback."""
+    from wmo.runtime.router.runtime_test import _runtime
+
+    dispatched: list[str] = []
+
+    class ProjectProviderHandler(BaseHTTPRequestHandler):
+        """Serve one precommit failure followed by deterministic Chat SSE."""
+
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            """Suppress nondeterministic loopback server logs."""
+            del format, args
+
+        def do_POST(self) -> None:
+            """Record exact model dispatch and return failure or successful stream."""
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length))
+            model = str(payload["model"])
+            dispatched.append(model)
+            if model == "cheap-model":
+                body = b'{"error":{"message":"temporary project route failure"}}'
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            assert model == "baseline-model"
+            body = b"".join(
+                (
+                    b'data: {"choices":[{"index":0,"delta":{"content":'
+                    b'"project-response-canary"},"finish_reason":"stop"}]}\n\n',
+                    b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n',
+                    b"data: [DONE]\n\n",
+                )
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ProjectProviderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_port}/v1"
+        manager, raw_key = _configured_project_pool(
+            tmp_path,
+            deployment_aliases=("cheap", "baseline"),
+            base_url=base_url,
+        )
+        project_runtime, project_client = _runtime()
+
+        def load_project(
+            project: str,
+            root: Path,
+            *,
+            policy_id: str,
+            runtime_catalog: RuntimeModelCatalog,
+        ) -> RouterRuntime:
+            """Inject one real frozen runtime without completing through it."""
+            del root, runtime_catalog
+            assert project == "project-one"
+            assert policy_id == "activation-one"
+            return project_runtime
+
+        runtime = load_local_gateway(
+            tmp_path,
+            graceful_timeout_seconds=1,
+            environment={
+                "CHEAP_PROVIDER_KEY": "available",
+                "BASELINE_PROVIDER_KEY": "available",
+            },
+            project_loader=load_project,
+        )
+        with TestClient(runtime.app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {raw_key}"},
+                json={
+                    "model": "coding",
+                    "messages": [{"role": "user", "content": "project-prompt-canary"}],
+                },
+            )
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == ("project-response-canary")
+        assert dispatched == ["cheap-model", "cheap-model", "baseline-model"]
+        assert project_client.embed_calls == 1
+        assert project_client.complete_calls == 0
+        assert project_runtime.records_decisions is False
+        with sqlite3.connect(manager.database_path) as connection:
+            attempts = connection.execute(
+                """
+                SELECT attempt_ordinal, route_depth, exact_model_id, state
+                FROM gateway_attempts ORDER BY attempt_ordinal
+                """
+            ).fetchall()
+            retained_content = connection.execute(
+                "SELECT SUM(content_retained) FROM gateway_attempts"
+            ).fetchone()[0]
+        assert attempts == [
+            (0, 0, "model-revision-exact", "failed"),
+            (1, 0, "model-revision-exact", "failed"),
+            (2, 1, "model-revision-exact", "completed"),
+        ]
+        assert retained_content == 0
+        durable = manager.database_path.read_bytes()
+        wal = manager.database_path.with_name("gateway.db-wal")
+        if wal.exists():
+            durable += wal.read_bytes()
+        assert b"project-prompt-canary" not in durable
+        assert b"project-response-canary" not in durable
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_project_certified_pool_is_unavailable_when_any_sibling_cannot_resolve(
     tmp_path: Path,
 ) -> None:
@@ -329,33 +455,34 @@ def _configured_gateway(root: Path) -> tuple[GatewayManagement, str]:
     return manager, issued.raw_key
 
 
-def _configured_project_pool(root: Path) -> tuple[GatewayManagement, str]:
+def _configured_project_pool(
+    root: Path,
+    *,
+    deployment_aliases: tuple[str, str] = ("primary", "secondary"),
+    base_url: str = "http://127.0.0.1:9/v1",
+) -> tuple[GatewayManagement, str]:
     """Create one project alias whose candidate belongs to a certified ordered pool."""
     manager = GatewayManagement(root)
     manager.initialize()
-    for name, credential_env in (
-        ("primary-provider", "PRIMARY_PROVIDER_KEY"),
-        ("secondary-provider", "SECONDARY_PROVIDER_KEY"),
-    ):
+    for deployment_alias in deployment_aliases:
+        name = f"{deployment_alias}-provider"
+        credential_env = f"{deployment_alias.upper()}_PROVIDER_KEY"
         upsert_connection(
             root,
             name=name,
             connection=ConnectionConfig(
                 provider="openai-compatible",
-                base_url="http://127.0.0.1:9/v1",
+                base_url=base_url,
                 api_key_env=credential_env,
             ),
             replace=False,
         )
     normalized = None
-    for deployment_alias, connection_name in (
-        ("primary", "primary-provider"),
-        ("secondary", "secondary-provider"),
-    ):
+    for deployment_alias in deployment_aliases:
         normalized, _snapshot, _changed = upsert_singleton_deployment(
             root,
             deployment_alias=deployment_alias,
-            connection_name=connection_name,
+            connection_name=f"{deployment_alias}-provider",
             provider_model=f"{deployment_alias}-model",
             exact_model_id="model-revision-exact",
             revision=None,
@@ -370,7 +497,7 @@ def _configured_project_pool(root: Path) -> tuple[GatewayManagement, str]:
         root,
         pool_id="certified-pool",
         exact_model_id="model-revision-exact",
-        deployment_aliases=("primary", "secondary"),
+        deployment_aliases=deployment_aliases,
         certification=GatewayEquivalenceCertification(
             certification_id="certification-one",
             provenance="operator-reviewed deployment manifests",
