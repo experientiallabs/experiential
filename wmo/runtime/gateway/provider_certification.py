@@ -1,4 +1,4 @@
-"""Dated, secret-free certification matrix for later gateway provider adapters."""
+"""Dated, secret-free certification matrix for launch gateway provider adapters."""
 
 from __future__ import annotations
 
@@ -34,6 +34,9 @@ class ProviderCertificationCell(ContractModel):
     """One dated provider-capability result with reviewable local evidence."""
 
     provider: str = Field(min_length=1, max_length=64)
+    provider_api_surface: str = Field(min_length=1, max_length=128)
+    client_sdk: str = Field(min_length=1, max_length=64)
+    gateway_api_surfaces: tuple[str, ...] = Field(min_length=1)
     capability: ProviderCapability
     result: ProviderCertificationResult
     evaluated_at: datetime
@@ -57,7 +60,15 @@ class ProviderCertificationMatrix(ContractModel):
         Raises:
             ValueError: A provider-capability pair repeats or is absent.
         """
-        providers = {"azure", "bedrock", "gemini", "openrouter"}
+        providers = {
+            "anthropic",
+            "azure",
+            "bedrock",
+            "gemini",
+            "openai",
+            "openai-compatible",
+            "openrouter",
+        }
         expected = {
             (provider, capability) for provider in providers for capability in ProviderCapability
         }
@@ -74,8 +85,28 @@ class ProviderCertificationMatrix(ContractModel):
 
 
 _EVALUATED_AT = datetime(2026, 8, 18, tzinfo=UTC)
+_CLIENT_SDK = "openai==3.0.0"
+_GATEWAY_API_SURFACES = ("chat.completions", "responses")
+_PROVIDER_API_SURFACES = {
+    "anthropic": "messages SSE",
+    "azure": "chat.completions SSE",
+    "bedrock": "ConverseStream EventStream",
+    "gemini": "streamGenerateContent SSE",
+    "openai": "responses SSE",
+    "openai-compatible": "chat.completions SSE",
+    "openrouter": "chat.completions SSE",
+}
 _GEMINI_EVIDENCE = ("wmo/runtime/models/providers/gemini_streaming_test.py",)
 _BEDROCK_EVIDENCE = ("wmo/runtime/models/providers/bedrock_streaming_test.py",)
+_OPENAI_EVIDENCE = (
+    "wmo/runtime/models/providers/native_test.py",
+    "wmo/runtime/models/providers/streaming_test.py",
+)
+_ANTHROPIC_EVIDENCE = _OPENAI_EVIDENCE
+_OPENAI_COMPATIBLE_EVIDENCE = (
+    "wmo/runtime/models/providers/openai_compatible_test.py",
+    "wmo/runtime/models/providers/streaming_test.py",
+)
 _COMPATIBLE_EVIDENCE = (
     "wmo/runtime/models/providers/later_provider_streaming_test.py",
     "wmo/runtime/models/providers/streaming_test.py",
@@ -104,6 +135,9 @@ def _cell(
     """
     return ProviderCertificationCell(
         provider=provider,
+        provider_api_surface=_PROVIDER_API_SURFACES[provider],
+        client_sdk=_CLIENT_SDK,
+        gateway_api_surfaces=_GATEWAY_API_SURFACES,
         capability=capability,
         result=result,
         evaluated_at=_EVALUATED_AT,
@@ -192,10 +226,41 @@ def _compatible_provider_cells(provider: str) -> tuple[ProviderCertificationCell
     return tuple(cells)
 
 
+def _launch_provider_cells(
+    provider: str,
+    evidence: tuple[str, ...],
+) -> tuple[ProviderCertificationCell, ...]:
+    """Return direct launch-provider fixture results plus the unrun live cell.
+
+    Args:
+        provider: OpenAI, Anthropic, or generic OpenAI-compatible identifier.
+        evidence: Deterministic provider-specific fixture paths.
+
+    Returns:
+        Complete capability cells for the launch adapter.
+    """
+    cells: list[ProviderCertificationCell] = []
+    for capability in ProviderCapability:
+        if capability is ProviderCapability.CREDENTIAL_GATED_LIVE:
+            result = ProviderCertificationResult.NOT_RUN_REQUIRES_CREDENTIALS
+            limitation = "No provider credential was available in the deterministic lane."
+        else:
+            result = ProviderCertificationResult.PROVIDER_FIXTURE_PASS
+            limitation = None
+        cells.append(_cell(provider, capability, result, evidence, limitation=limitation))
+    return tuple(cells)
+
+
 PROVIDER_CERTIFICATION_MATRIX = ProviderCertificationMatrix(
     cells=tuple(
         sorted(
             (
+                *_launch_provider_cells("openai", _OPENAI_EVIDENCE),
+                *_launch_provider_cells("anthropic", _ANTHROPIC_EVIDENCE),
+                *_launch_provider_cells(
+                    "openai-compatible",
+                    _OPENAI_COMPATIBLE_EVIDENCE,
+                ),
                 *_native_provider_cells("gemini", _GEMINI_EVIDENCE),
                 *_native_provider_cells("bedrock", _BEDROCK_EVIDENCE),
                 *_compatible_provider_cells("azure"),

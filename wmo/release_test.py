@@ -434,6 +434,7 @@ def _installed_release_driver() -> None:
     import json
     import math
     import socket
+    import sqlite3
     import stat
     import threading
     from collections import Counter
@@ -512,6 +513,18 @@ def _installed_release_driver() -> None:
             with self._lock:
                 return Counter(str(item["path"]) for item in self.requests)
 
+        def count_containing(self, value: str) -> int:
+            """Count requests whose canonical record contains one marker.
+
+            Args:
+                value: Marker expected in a request path or payload.
+
+            Returns:
+                Number of matching physical provider requests.
+            """
+            with self._lock:
+                return sum(value in json.dumps(item, sort_keys=True) for item in self.requests)
+
         def snapshot(self) -> tuple[dict[str, object], ...]:
             """Return a detached ordered copy of recorded provider requests."""
             with self._lock:
@@ -520,7 +533,7 @@ def _installed_release_driver() -> None:
     state = ProviderState()
 
     class ProviderHandler(BaseHTTPRequestHandler):
-        """Minimal OpenAI-compatible handler for deterministic zero-price evidence."""
+        """Minimal multi-protocol handler for deterministic gateway evidence."""
 
         protocol_version = "HTTP/1.0"
 
@@ -555,7 +568,10 @@ def _installed_release_driver() -> None:
                 self.send_error(400)
                 return
             ordinal = state.append(self.path, payload)
-            if payload.get("model") == "gateway-model":
+            if payload.get("model") == "gateway-primary-model":
+                self._send_primary_gateway_stream(payload, ordinal=ordinal)
+                return
+            if payload.get("model") == "gateway-secondary-model":
                 self._send_gateway_stream(payload, ordinal=ordinal)
                 return
             if self.path.endswith("/embeddings"):
@@ -723,6 +739,131 @@ def _installed_release_driver() -> None:
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_primary_gateway_stream(
+            self,
+            payload: dict[str, object],
+            *,
+            ordinal: int,
+        ) -> None:
+            """Return deterministic compatible SSE failures and committed output.
+
+            Args:
+                payload: Gateway-normalized compatible request.
+                ordinal: Stable provider request ordinal.
+            """
+            prompt = json.dumps(payload, sort_keys=True)
+            if "prompt-content-canary-P9" in prompt or "tool-argument-canary" in prompt:
+                body = b'{"error":{"message":"temporary fixture failure"}}'
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if "refusal-input-canary-P9" in prompt:
+                frames: tuple[dict[str, object], ...] = (
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"refusal": "policy refusal"},
+                                "finish_reason": "content_filter",
+                            }
+                        ],
+                    },
+                )
+                self._send_sse_frames(frames, done=True)
+                return
+            if "postcommit-input-canary-P9" in prompt:
+                frames = cast(
+                    tuple[dict[str, object], ...],
+                    (
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": "postcommit-response-canary-P9"},
+                                    "finish_reason": None,
+                                }
+                            ]
+                        },
+                    ),
+                )
+                self._send_sse_frames(frames)
+                return
+            if "cancellation-input-canary-P9" in prompt:
+                first = cast(
+                    tuple[dict[str, object], ...],
+                    (
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": "cancellation-response-canary-P9"},
+                                    "finish_reason": None,
+                                }
+                            ]
+                        },
+                    ),
+                )
+                terminal = cast(
+                    tuple[dict[str, object], ...],
+                    (
+                        {
+                            "choices": [],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+                        },
+                    ),
+                )
+                self._send_sse_frames(
+                    first,
+                    trailing=terminal,
+                    pause_seconds=1.0,
+                    done=True,
+                )
+                return
+            raise AssertionError(f"unexpected primary gateway request {ordinal}")
+
+        def _send_sse_frames(
+            self,
+            frames: tuple[dict[str, object], ...],
+            *,
+            trailing: tuple[dict[str, object], ...] = (),
+            pause_seconds: float = 0,
+            done: bool = False,
+        ) -> None:
+            """Write deterministic SSE frames with an optional cancellation window.
+
+            Args:
+                frames: Frames written and flushed immediately.
+                trailing: Frames written after the optional pause.
+                pause_seconds: Delay before trailing frames.
+                done: Whether to append the compatible terminal sentinel.
+            """
+            first = b"".join(
+                f"data: {json.dumps(frame, separators=(',', ':'))}\n\n".encode() for frame in frames
+            )
+            remainder = b"".join(
+                f"data: {json.dumps(frame, separators=(',', ':'))}\n\n".encode()
+                for frame in trailing
+            )
+            if done:
+                remainder += b"data: [DONE]\n\n"
+            body = first + remainder
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(first)
+            self.wfile.flush()
+            if pause_seconds:
+                time.sleep(pause_seconds)
+            if remainder:
+                try:
+                    self.wfile.write(remainder)
+                except BrokenPipeError:
+                    pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
     server.daemon_threads = True
@@ -904,6 +1045,7 @@ def _installed_release_driver() -> None:
 
     support_trace_ids = write_traces(traces, 10, terminal_last_trace=True)
     write_traces(one_trace, 1)
+    cli_transcripts: list[str] = []
 
     def run_cli(*arguments: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
         """Run the installed CLI without a terminal and validate its exit status.
@@ -928,6 +1070,7 @@ def _installed_release_driver() -> None:
             f"CLI exit {result.returncode}, expected {expected}: {arguments}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
+        cli_transcripts.extend((result.stdout, result.stderr))
         return result
 
     def directory_digest(path: Path) -> str:
@@ -975,6 +1118,56 @@ def _installed_release_driver() -> None:
                 time.sleep(0.05)
         raise AssertionError(f"wmo run did not listen on port {port}")
 
+    def start_gateway(root: Path) -> tuple[subprocess.Popen[str], int, str]:
+        """Start one installed gateway subprocess on an unused loopback port.
+
+        Args:
+            root: Configured gateway root.
+
+        Returns:
+            Process, selected port, and OpenAI-compatible base URL.
+        """
+        port = unused_loopback_port()
+        process = subprocess.Popen(
+            [
+                str(executable),
+                "run",
+                "--root",
+                str(root),
+                "--port",
+                str(port),
+                "--non-interactive",
+                "--graceful-timeout",
+                "2",
+            ],
+            cwd=execution_root,
+            env=child_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        wait_for_loopback(port, process)
+        return process, port, f"http://127.0.0.1:{port}/v1"
+
+    def stop_gateway(process: subprocess.Popen[str]) -> tuple[str, str]:
+        """Stop one gateway process and return its complete observable output.
+
+        Args:
+            process: Live or already terminated gateway process.
+
+        Returns:
+            Complete stdout and stderr text.
+        """
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 0, stdout + stderr
+        return stdout, stderr
+
     gateway_root = execution_root / "gateway-empty"
     empty_gateway = run_cli(
         "run",
@@ -1003,14 +1196,19 @@ def _installed_release_driver() -> None:
     response_canary = "gateway-response-canary"
     tool_argument_canary = "tool-argument-canary"
     invalid_key_canary = "invalid-virtual-key-canary-P9"
+    refusal_input_canary = "refusal-input-canary-P9"
+    postcommit_input_canary = "postcommit-input-canary-P9"
+    postcommit_response_canary = "postcommit-response-canary-P9"
+    cancellation_input_canary = "cancellation-input-canary-P9"
+    cancellation_response_canary = "cancellation-response-canary-P9"
     child_environment["P9_LOOPBACK_PROVIDER_KEY"] = provider_secret
-    gateway_commands = (
+    provider_commands = (
         (
             "config",
             "gateway",
             "provider",
             "add",
-            "gateway-loopback",
+            "gateway-primary",
             "--provider",
             "openai-compatible",
             "--credential-env",
@@ -1025,18 +1223,100 @@ def _installed_release_driver() -> None:
         (
             "config",
             "gateway",
-            "alias",
-            "create",
-            "coding",
-            "--deployment",
-            "gateway-loopback:gateway-model",
-            "--exact-model",
-            "gateway-model-revision",
+            "provider",
+            "add",
+            "gateway-secondary",
+            "--provider",
+            "openai-compatible",
+            "--credential-env",
+            "P9_LOOPBACK_PROVIDER_KEY",
+            "--base-url",
+            provider_url,
             "--root",
             str(gateway_root),
             "--non-interactive",
             "--json",
         ),
+    )
+    for command in provider_commands:
+        receipt = run_cli(*command)
+        assert json.loads(receipt.stdout)["schema_version"] == 1
+
+    catalog_sha256 = ""
+    for alias, deployment in (
+        ("primary", "gateway-primary:gateway-primary-model"),
+        ("secondary", "gateway-secondary:gateway-secondary-model"),
+    ):
+        receipt = run_cli(
+            "config",
+            "gateway",
+            "alias",
+            "create",
+            alias,
+            "--deployment",
+            deployment,
+            "--exact-model",
+            "gateway-model-revision",
+            "--supports-tools",
+            "--supports-structured-output",
+            "--supports-developer-messages",
+            "--supports-strict-tools",
+            "--supports-parallel-tool-calls",
+            "--maximum-output-tokens",
+            "4096",
+            "--input-price",
+            "1000000",
+            "--cached-input-price",
+            "500000",
+            "--output-price",
+            "2000000",
+            "--reasoning-price",
+            "3000000",
+            "--pricing-source",
+            "deterministic loopback fixture",
+            "--root",
+            str(gateway_root),
+            "--non-interactive",
+            "--json",
+        )
+        catalog_sha256 = json.loads(receipt.stdout)["data"]["catalog_sha256"]
+
+    for alias, revision, refusal_failover in (("coding", "installed-pool-revision", False),):
+        command = [
+            "config",
+            "gateway",
+            "pool",
+            "certify",
+            alias,
+            "--deployment-alias",
+            "primary",
+            "--deployment-alias",
+            "secondary",
+            "--exact-model",
+            "gateway-model-revision",
+            "--certification-id",
+            f"{alias}-certification",
+            "--provenance",
+            "installed-wheel deterministic loopback",
+            "--evidence-sha256",
+            "a" * 64,
+            "--certified-at",
+            "2026-08-19T00:00:00Z",
+            "--expected-catalog-sha256",
+            catalog_sha256,
+            "--revision",
+            revision,
+            "--root",
+            str(gateway_root),
+            "--non-interactive",
+            "--json",
+        ]
+        if refusal_failover:
+            command.append("--refusal-failover")
+        receipt = run_cli(*command)
+        catalog_sha256 = json.loads(receipt.stdout)["data"]["catalog_sha256"]
+
+    authority_commands = (
         (
             "config",
             "gateway",
@@ -1061,7 +1341,7 @@ def _installed_release_driver() -> None:
             "--json",
         ),
     )
-    for command in gateway_commands:
+    for command in authority_commands:
         receipt = run_cli(*command)
         assert json.loads(receipt.stdout)["schema_version"] == 1
 
@@ -1086,34 +1366,27 @@ def _installed_release_driver() -> None:
     assert stat.S_IMODE(key_output.stat().st_mode) == 0o600
     assert raw_key not in issue_receipt.stdout
 
-    gateway_port = unused_loopback_port()
-    gateway_process = subprocess.Popen(
-        [
-            str(executable),
-            "run",
-            "--root",
-            str(gateway_root),
-            "--port",
-            str(gateway_port),
-            "--non-interactive",
-            "--graceful-timeout",
-            "2",
-        ],
-        cwd=execution_root,
-        env=child_environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    gateway_stdout = ""
-    gateway_stderr = ""
+    gateway_process, gateway_port, base_url = start_gateway(gateway_root)
+    gateway_stdout_parts: list[str] = []
+    gateway_stderr_parts: list[str] = []
     usage_json_body = ""
     usage_html_body = ""
     error_bodies: list[str] = []
-    base_url = f"http://127.0.0.1:{gateway_port}/v1"
     try:
-        wait_for_loopback(gateway_port, gateway_process)
         assert openai.__version__ == "3.0.0"
+        default_refusal = httpx.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": refusal_input_canary}],
+            },
+            timeout=10,
+        )
+        default_refusal.raise_for_status()
+        assert default_refusal.json()["choices"][0]["message"]["refusal"] == "policy refusal"
+        assert state.count_containing("gateway-secondary-model") == 0
+
         with OpenAI(api_key=raw_key, base_url=base_url, timeout=10) as client:
             assert [model.id for model in client.models.list().data] == ["coding"]
             chat = client.chat.completions.create(
@@ -1198,6 +1471,191 @@ def _installed_release_driver() -> None:
 
         asyncio.run(exercise_async_gateway())
 
+        primary_requests = state.count_containing("gateway-primary-model")
+        secondary_requests = state.count_containing("gateway-secondary-model")
+        assert primary_requests >= 2
+        assert secondary_requests == 9
+
+        matrix_stdout, matrix_stderr = stop_gateway(gateway_process)
+        gateway_stdout_parts.append(matrix_stdout)
+        gateway_stderr_parts.append(matrix_stderr)
+        gateway_process, gateway_port, base_url = start_gateway(gateway_root)
+
+        postcommit_secondary = state.count_containing("gateway-secondary-model")
+        with httpx.stream(
+            "POST",
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": postcommit_input_canary}],
+                "stream": True,
+            },
+            timeout=10,
+        ) as postcommit:
+            assert postcommit.status_code == 200
+            postcommit_body = "".join(postcommit.iter_text())
+        assert postcommit_response_canary in postcommit_body
+        assert state.count_containing("gateway-secondary-model") == postcommit_secondary
+
+        postcommit_stdout, postcommit_stderr = stop_gateway(gateway_process)
+        gateway_stdout_parts.append(postcommit_stdout)
+        gateway_stderr_parts.append(postcommit_stderr)
+        gateway_process, gateway_port, base_url = start_gateway(gateway_root)
+
+        keyed_headers = {
+            "Authorization": f"Bearer {raw_key}",
+            "Idempotency-Key": "installed-restart-operation",
+        }
+        keyed_request = {
+            "model": "coding",
+            "messages": [{"role": "user", "content": prompt_canary}],
+        }
+        keyed_first = httpx.post(
+            f"{base_url}/chat/completions",
+            headers=keyed_headers,
+            json=keyed_request,
+            timeout=10,
+        )
+        keyed_first.raise_for_status()
+        physical_before_replay = len(state.snapshot())
+        keyed_replay = httpx.post(
+            f"{base_url}/chat/completions",
+            headers=keyed_headers,
+            json=keyed_request,
+            timeout=10,
+        )
+        keyed_replay.raise_for_status()
+        assert keyed_replay.content == keyed_first.content
+        assert len(state.snapshot()) == physical_before_replay
+
+        gateway_database = gateway_root / "gateway" / "gateway.db"
+        with sqlite3.connect(gateway_database) as connection:
+            assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert gateway_database.with_name("gateway.db-wal").exists()
+
+        invalid_request = httpx.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": prompt_canary}],
+                "n": 2,
+            },
+            timeout=5,
+        )
+        assert invalid_request.status_code == 400
+        error_bodies.append(invalid_request.text)
+
+        first_stdout, first_stderr = stop_gateway(gateway_process)
+        gateway_stdout_parts.append(first_stdout)
+        gateway_stderr_parts.append(first_stderr)
+        gateway_process, gateway_port, base_url = start_gateway(gateway_root)
+        provider_before_restart_replay = len(state.snapshot())
+        restart_replay = httpx.post(
+            f"{base_url}/chat/completions",
+            headers=keyed_headers,
+            json=keyed_request,
+            timeout=10,
+        )
+        assert restart_replay.status_code == 409
+        assert restart_replay.json()["error"]["code"] == "idempotency_replay_unavailable"
+        assert len(state.snapshot()) == provider_before_restart_replay
+        error_bodies.append(restart_replay.text)
+
+        cancellation_secondary = state.count_containing("gateway-secondary-model")
+        with httpx.stream(
+            "POST",
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": cancellation_input_canary}],
+                "stream": True,
+            },
+            timeout=10,
+        ) as cancellation:
+            assert cancellation.status_code == 200
+            for line in cancellation.iter_lines():
+                if cancellation_response_canary in line:
+                    break
+            else:
+                raise AssertionError("gateway cancellation stream produced no semantic output")
+        assert state.count_containing("gateway-secondary-model") == cancellation_secondary
+
+        second_stdout, second_stderr = stop_gateway(gateway_process)
+        gateway_stdout_parts.append(second_stdout)
+        gateway_stderr_parts.append(second_stderr)
+        opted_policy = run_cli(
+            "config",
+            "gateway",
+            "pool",
+            "certify",
+            "coding",
+            "--deployment-alias",
+            "primary",
+            "--deployment-alias",
+            "secondary",
+            "--exact-model",
+            "gateway-model-revision",
+            "--certification-id",
+            "coding-refusal-certification",
+            "--provenance",
+            "installed-wheel deterministic loopback refusal policy",
+            "--evidence-sha256",
+            "b" * 64,
+            "--certified-at",
+            "2026-08-19T00:00:01Z",
+            "--expected-catalog-sha256",
+            catalog_sha256,
+            "--revision",
+            "installed-refusal-revision",
+            "--replace",
+            "--refusal-failover",
+            "--root",
+            str(gateway_root),
+            "--non-interactive",
+            "--json",
+        )
+        opted_catalog_sha256 = json.loads(opted_policy.stdout)["data"]["catalog_sha256"]
+        assert opted_catalog_sha256 != catalog_sha256
+        gateway_process, gateway_port, base_url = start_gateway(gateway_root)
+        opted_secondary = state.count_containing("gateway-secondary-model")
+        opted_refusal = httpx.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": refusal_input_canary}],
+            },
+            timeout=10,
+        )
+        opted_refusal.raise_for_status()
+        assert opted_refusal.json()["choices"][0]["message"]["refusal"] == "policy refusal"
+        assert state.count_containing("gateway-secondary-model") == opted_secondary
+
+        revoked = run_cli(
+            "config",
+            "gateway",
+            "key",
+            "revoke",
+            "installed-key",
+            "--root",
+            str(gateway_root),
+            "--non-interactive",
+            "--json",
+        )
+        assert json.loads(revoked.stdout)["changed"] is True
+        provider_before_revoke = len(state.snapshot())
+        revoked_auth = httpx.get(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            timeout=5,
+        )
+        assert revoked_auth.status_code == 401
+        assert len(state.snapshot()) == provider_before_revoke
+        error_bodies.append(revoked_auth.text)
+
         usage_json_response = httpx.get(f"http://127.0.0.1:{gateway_port}/usage.json", timeout=5)
         usage_html_response = httpx.get(f"http://127.0.0.1:{gateway_port}/usage", timeout=5)
         usage_json_response.raise_for_status()
@@ -1206,7 +1664,15 @@ def _installed_release_driver() -> None:
         usage_html_body = usage_html_response.text
         usage_payload = usage_json_response.json()
         identity_usage = usage_payload["identities"][0]
-        assert usage_payload["totals"]["requests"] == 9
+        assert usage_payload["totals"]["requests"] >= 14
+        assert usage_payload["totals"]["attempts"] > usage_payload["totals"]["requests"]
+        assert usage_payload["totals"]["known_estimated_cost_micro_usd"] > 0
+        terminal_counts = {
+            item["state"]: item["attempts"] for item in usage_payload["totals"]["terminal_counts"]
+        }
+        assert terminal_counts["completed"] >= 10
+        assert terminal_counts["failed"] >= 2
+        assert terminal_counts["cancelled"] >= 1
         expected_cells = (
             identity_usage["identity_id"],
             identity_usage["requests"],
@@ -1233,21 +1699,10 @@ def _installed_release_driver() -> None:
         )
         assert invalid_auth.status_code == 401
         error_bodies.append(invalid_auth.text)
-        invalid_request = httpx.post(
-            f"{base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {raw_key}"},
-            json={
-                "model": "coding",
-                "messages": [{"role": "user", "content": prompt_canary}],
-                "n": 2,
-            },
-            timeout=5,
-        )
-        assert invalid_request.status_code == 400
-        error_bodies.append(invalid_request.text)
         _assert_gateway_canaries_absent(
             gateway_root,
             channels={
+                "cli": "".join(cli_transcripts),
                 "http_errors": "".join(error_bodies),
                 "usage_html": usage_html_body,
                 "usage_json": usage_json_body,
@@ -1259,21 +1714,25 @@ def _installed_release_driver() -> None:
                 response_canary,
                 tool_argument_canary,
                 invalid_key_canary,
+                refusal_input_canary,
+                postcommit_input_canary,
+                postcommit_response_canary,
+                cancellation_input_canary,
+                cancellation_response_canary,
             ),
         )
     finally:
-        gateway_process.send_signal(signal.SIGINT)
-        try:
-            gateway_stdout, gateway_stderr = gateway_process.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            gateway_process.kill()
-            gateway_stdout, gateway_stderr = gateway_process.communicate(timeout=5)
-    assert gateway_process.returncode == 0, gateway_stdout + gateway_stderr
+        gateway_stdout, gateway_stderr = stop_gateway(gateway_process)
+        gateway_stdout_parts.append(gateway_stdout)
+        gateway_stderr_parts.append(gateway_stderr)
+    gateway_stdout = "".join(gateway_stdout_parts)
+    gateway_stderr = "".join(gateway_stderr_parts)
     assert (gateway_root / "gateway" / "gateway.db").is_file()
     assert tuple((gateway_root / "gateway" / "catalog-snapshots").glob("*.json"))
     _assert_gateway_canaries_absent(
         gateway_root,
         channels={
+            "cli": "".join(cli_transcripts),
             "http_errors": "".join(error_bodies),
             "stderr": gateway_stderr,
             "stdout": gateway_stdout,
@@ -1287,6 +1746,11 @@ def _installed_release_driver() -> None:
             response_canary,
             tool_argument_canary,
             invalid_key_canary,
+            refusal_input_canary,
+            postcommit_input_canary,
+            postcommit_response_canary,
+            cancellation_input_canary,
+            cancellation_response_canary,
         ),
     )
 

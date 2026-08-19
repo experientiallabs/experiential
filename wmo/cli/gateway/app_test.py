@@ -57,6 +57,12 @@ def test_gateway_help_tree_is_exact_and_every_node_renders() -> None:
     runner = CliRunner()
     paths = [["config", "gateway"]]
     paths.extend(["config", "gateway", name] for name in EXPECTED_GATEWAY_GROUPS)
+    paths.extend(["config", "gateway", name] for name in EXPECTED_GATEWAY_COMMANDS)
+    paths.extend(
+        ["config", "gateway", group, command]
+        for group, commands in EXPECTED_GATEWAY_GROUPS.items()
+        for command in commands
+    )
     for path in paths:
         result = runner.invoke(app, [*path, "--help"])
         assert result.exit_code == 0, result.output

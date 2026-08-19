@@ -1,4 +1,4 @@
-"""Tests for the honest later-provider certification artifact."""
+"""Tests for the honest launch-provider certification artifact."""
 
 from __future__ import annotations
 
@@ -12,10 +12,24 @@ from wmo.runtime.gateway.provider_certification import (
 
 
 def test_provider_matrix_is_complete_deterministic_and_secret_free() -> None:
-    """Every later-provider cell is labeled and the artifact round-trips exactly."""
+    """Every launch-provider cell is labeled and the artifact round-trips exactly."""
     matrix = PROVIDER_CERTIFICATION_MATRIX
 
-    assert len(matrix.cells) == 4 * len(ProviderCapability)
+    assert len(matrix.cells) == 7 * len(ProviderCapability)
+    assert {cell.provider for cell in matrix.cells} == {
+        "anthropic",
+        "azure",
+        "bedrock",
+        "gemini",
+        "openai",
+        "openai-compatible",
+        "openrouter",
+    }
+    assert {cell.client_sdk for cell in matrix.cells} == {"openai==3.0.0"}
+    assert {cell.gateway_api_surfaces for cell in matrix.cells} == {
+        ("chat.completions", "responses")
+    }
+    assert all(cell.provider_api_surface for cell in matrix.cells)
     assert matrix.identity_sha256() == PROVIDER_CERTIFICATION_MATRIX.identity_sha256()
     assert ProviderCertificationMatrix.model_validate_json(matrix.model_dump_json()) == matrix
     assert_secret_free(matrix.model_dump(mode="json"))
@@ -30,9 +44,12 @@ def test_provider_matrix_does_not_claim_unperformed_live_credentials() -> None:
     )
 
     assert {cell.provider for cell in live_cells} == {
+        "anthropic",
         "azure",
         "bedrock",
         "gemini",
+        "openai",
+        "openai-compatible",
         "openrouter",
     }
     assert all(
