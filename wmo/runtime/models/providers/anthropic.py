@@ -15,6 +15,8 @@ from wmo.common.models import (
     ToolChoice,
     Usage,
 )
+from wmo.runtime.gateway.contracts import GatewayRequest
+from wmo.runtime.models.providers.async_transport import RequestDeadline
 from wmo.runtime.models.providers.base import (
     DEFAULT_MAXIMUM_OUTPUT_TOKENS,
     ProviderHttpClient,
@@ -27,6 +29,10 @@ from wmo.runtime.models.providers.errors import (
     require_integer,
     require_object,
     require_string,
+)
+from wmo.runtime.models.providers.streaming import (
+    NormalizedProviderStream,
+    start_anthropic_messages_stream,
 )
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
@@ -141,6 +147,40 @@ def anthropic_messages_response(
 
 class AnthropicClient(ProviderHttpClient):
     """Calls one Anthropic Messages model, which intentionally has no embedding method."""
+
+    async def stream(
+        self,
+        request: GatewayRequest,
+        *,
+        deadline: RequestDeadline,
+        idempotency_key: str,
+    ) -> NormalizedProviderStream:
+        """Start one true native Messages stream under the gateway deadline.
+
+        Args:
+            request: Canonical streaming gateway request.
+            deadline: Immutable request-wide deadline.
+            idempotency_key: Stable identity for safe pre-commit opening retries.
+
+        Returns:
+            A cancellable provider-neutral event stream.
+
+        Raises:
+            ValueError: The canonical request did not ask for streaming.
+        """
+        if not request.stream:
+            raise ValueError("gateway provider stream requires request.stream")
+        return await start_anthropic_messages_stream(
+            self._transport,
+            f"{self._base_url}/{self._request_path(self._completion_path())}",
+            headers=self._headers(),
+            request=request,
+            model_id=self._model.model_id,
+            deadline=deadline,
+            idempotency_key=idempotency_key,
+            retry_policy=self._retry_policy,
+            timeout_seconds=self._timeout_seconds,
+        )
 
     def _headers(self) -> dict[str, str]:
         """Build native Anthropic Messages headers with the versioned API key scheme."""

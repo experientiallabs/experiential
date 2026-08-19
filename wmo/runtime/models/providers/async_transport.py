@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
@@ -127,6 +127,40 @@ class AsyncJsonHttpTransport(Protocol):
         ...
 
 
+@runtime_checkable
+class AsyncHttpByteStream(Protocol):
+    """One open provider response whose body is consumed incrementally."""
+
+    @property
+    def status_code(self) -> int:
+        """Return the provider HTTP status without reading response content."""
+        ...
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        """Yield response bytes in upstream order without buffering the body."""
+        ...
+
+    async def aclose(self) -> None:
+        """Close the active response and any transport-owned client."""
+        ...
+
+
+@runtime_checkable
+class AsyncStreamingHttpTransport(Protocol):
+    """Cancellable transport seam for one incrementally consumed JSON request."""
+
+    async def stream(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> AsyncHttpByteStream:
+        """Open one bounded response stream without reading its body."""
+        ...
+
+
 class HttpxAsyncJsonTransport:
     """Production async transport backed by ``httpx.AsyncClient``."""
 
@@ -221,6 +255,90 @@ class HttpxAsyncJsonTransport:
         except httpx.TransportError as exc:
             raise ProviderTransportError("provider transport request failed") from exc
         return _decoded_response(response)
+
+    async def stream(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> AsyncHttpByteStream:
+        """Open one cancellable HTTP response without buffering provider events.
+
+        Args:
+            url: Absolute provider endpoint URL.
+            headers: Provider headers, including resolved authentication.
+            payload: Complete JSON request body.
+            timeout_seconds: Remaining bound for opening the response.
+
+        Returns:
+            An open byte stream whose lifecycle belongs to the caller.
+
+        Raises:
+            ProviderTransportError: The request cannot establish a response stream.
+        """
+        client = self._client or httpx.AsyncClient()
+        owns_client = self._client is None
+        try:
+            request = client.build_request(
+                "POST",
+                url,
+                headers=dict(headers),
+                json=payload,
+                timeout=timeout_seconds,
+            )
+            response = await client.send(request, stream=True)
+        except httpx.TimeoutException as exc:
+            if owns_client:
+                await client.aclose()
+            raise ProviderTransportError("provider request timed out") from exc
+        except httpx.TransportError as exc:
+            if owns_client:
+                await client.aclose()
+            raise ProviderTransportError("provider transport request failed") from exc
+        except BaseException:
+            if owns_client:
+                await client.aclose()
+            raise
+        return _HttpxByteStream(response, client if owns_client else None)
+
+
+class _HttpxByteStream:
+    """Incremental HTTPX response that closes an optionally owned client exactly once."""
+
+    def __init__(
+        self,
+        response: httpx.Response,
+        owned_client: httpx.AsyncClient | None,
+    ) -> None:
+        """Bind one response and its optional short-lived client.
+
+        Args:
+            response: Open streaming HTTPX response.
+            owned_client: Client created for this response, or ``None`` when caller-owned.
+        """
+        self._response = response
+        self._owned_client = owned_client
+        self._closed = False
+
+    @property
+    def status_code(self) -> int:
+        """Return the response status without consuming the provider body."""
+        return self._response.status_code
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        """Yield decoded-transfer bytes directly from HTTPX."""
+        return self._response.aiter_bytes()
+
+    async def aclose(self) -> None:
+        """Close the response and transport-owned client idempotently."""
+        if self._closed:
+            return
+        self._closed = True
+        await self._response.aclose()
+        if self._owned_client is not None:
+            await self._owned_client.aclose()
 
 
 class SyncJsonTransportAdapter:
