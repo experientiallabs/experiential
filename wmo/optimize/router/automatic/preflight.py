@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from wmo.common.core.artifacts import ArtifactInput, Sha256, sha256_json
 from wmo.common.judging import CalibrationReport, JudgeCalibration, verify_persisted_calibration
@@ -20,6 +21,7 @@ from wmo.common.models import (
     load_model_catalog,
     router_candidate_prices,
     validate_router_candidate_selection,
+    verify_completion_reservation,
 )
 from wmo.common.project import (
     ProjectBuildArtifacts,
@@ -46,9 +48,11 @@ from wmo.optimize.router.automatic.reservations import (
 )
 from wmo.optimize.router.judging.artifacts import read_audit
 from wmo.optimize.router.judging.contracts import (
+    JudgeSetupArtifact,
     ManualJudgeCalibrationAudit,
     ManualJudgeReviewState,
     ManualJudgeSetupArtifact,
+    ProvisionalJudgeSetupArtifact,
 )
 from wmo.runtime.agents import agent_factory_sha256
 from wmo.runtime.models import RuntimeModelCatalog
@@ -93,6 +97,17 @@ class AutomaticRouterOptions:
 
 
 @dataclass(frozen=True)
+class HostedAutomaticJudgeEvidence:
+    """Prebuilt machine-only judge contract used by the noninteractive hosted path."""
+
+    setup: ProvisionalJudgeSetupArtifact
+    setup_input: ArtifactInput
+    calibration_id: str
+    calibration_input: ArtifactInput
+    request_reservation: CompletionCostReservation
+
+
+@dataclass(frozen=True)
 class AutomaticRouterPreflight:
     """Verified read-only inputs ready for post-consent artifact and provider work."""
 
@@ -109,10 +124,10 @@ class AutomaticRouterPreflight:
     judge_model: ModelSnapshot
     embedder_alias: str
     embedder: ModelSnapshot
-    setup: ManualJudgeSetupArtifact
+    setup: JudgeSetupArtifact
     setup_input: ArtifactInput
-    judge_audit: ManualJudgeCalibrationAudit
-    judge_audit_input: ArtifactInput
+    judge_audit: ManualJudgeCalibrationAudit | None
+    judge_audit_input: ArtifactInput | None
     approved_calibration_id: str
     approved_calibration_input: ArtifactInput
     tasks: tuple[TaskCase, ...]
@@ -126,6 +141,7 @@ class AutomaticRouterPreflight:
     judge_completion_reservation: CompletionCostReservation
     judge_provider_call_count: int
     judge_reservation_cost_usd: float
+    judgment_status: Literal["provisional", "human_calibrated"]
     remaining_simulation_cost_usd: float
     agent_factory_sha256: Sha256
     simulation_configuration_sha256: Sha256
@@ -136,6 +152,7 @@ def preflight_automatic_router(
     selection: RouterCandidateSelection,
     *,
     catalog_override: ModelCatalog | None = None,
+    hosted_judge: HostedAutomaticJudgeEvidence | None = None,
     options: AutomaticRouterOptions,
 ) -> AutomaticRouterPreflight:
     """Verify every local prerequisite and report all failures before credentials or writes.
@@ -144,6 +161,7 @@ def preflight_automatic_router(
         project: Existing project whose completed build will be optimized.
         selection: Explicit candidates and incumbent collected for this optimize run.
         catalog_override: Confirmed prospective catalog before its atomic post-consent write.
+        hosted_judge: Optional machine-only provisional evidence for the hosted workflow.
         options: Bounded provider, evidence, retry, and concurrency controls.
 
     Returns:
@@ -182,20 +200,41 @@ def preflight_automatic_router(
         _require_completion_economics(problems, catalog, judge_alias, "judge")
     if embedder_alias is not None:
         _require_embedder_economics(problems, catalog, embedder_alias)
-    (
-        setup,
-        setup_input,
-        audit,
-        audit_input,
-        approved_calibration_id,
-        approved_calibration_input,
-    ) = _manual_judge_inputs(
-        problems,
-        project,
-        completed,
-        judge_alias,
-        judge,
-    )
+    if hosted_judge is None:
+        (
+            setup,
+            setup_input,
+            audit,
+            audit_input,
+            approved_calibration_id,
+            approved_calibration_input,
+        ) = _manual_judge_inputs(
+            problems,
+            project,
+            completed,
+            judge_alias,
+            judge,
+        )
+        judgment_status: Literal["provisional", "human_calibrated"] = "human_calibrated"
+    else:
+        (
+            setup,
+            setup_input,
+            approved_calibration_id,
+            approved_calibration_input,
+        ) = _hosted_judge_inputs(
+            problems,
+            project,
+            completed,
+            judge_alias,
+            judge,
+            hosted_judge,
+            catalog,
+            options,
+        )
+        audit = None
+        audit_input = None
+        judgment_status = "provisional"
     tasks, traces, identity_evidence = _build_evidence(problems, project, completed)
     observed = _observed_traces(
         problems,
@@ -208,6 +247,7 @@ def preflight_automatic_router(
         agent_identity = agent_factory_sha256(
             config.agent,
             maximum_model_calls=options.maximum_model_calls,
+            system_prompt=(config.system.system_prompt if config.system is not None else None),
         )
     except ValueError as exc:
         problems.append(f"agent runtime: {exc}")
@@ -259,12 +299,16 @@ def preflight_automatic_router(
             estimated_input_tokens=estimated_input_tokens,
             maximum_output_tokens=options.simulation_maximum_output_tokens,
         )
-    judge_request = judge_completion_reservation(
-        problems,
-        catalog=catalog,
-        judge_alias=judge_alias,
-        judge=judge,
-        audit=audit,
+    judge_request = (
+        judge_completion_reservation(
+            problems,
+            catalog=catalog,
+            judge_alias=judge_alias,
+            judge=judge,
+            audit=audit,
+        )
+        if hosted_judge is None
+        else hosted_judge.request_reservation
     )
     judge_provider_call_count = options.maximum_judgments * (
         2 if setup is not None and setup.prompt_template.response_shape == "pairwise" else 1
@@ -286,7 +330,6 @@ def preflight_automatic_router(
     assert judge_alias is not None and judge is not None
     assert embedder_alias is not None and embedder is not None
     assert setup is not None and setup_input is not None
-    assert audit is not None and audit_input is not None
     assert approved_calibration_id is not None and approved_calibration_input is not None
     assert agent_identity is not None
     assert reservation is not None and query_reservation is not None
@@ -333,6 +376,7 @@ def preflight_automatic_router(
         judge_completion_reservation=judge_request,
         judge_provider_call_count=judge_provider_call_count,
         judge_reservation_cost_usd=judge_reservation_cost_usd,
+        judgment_status=judgment_status,
         remaining_simulation_cost_usd=remaining_cost_usd,
         agent_factory_sha256=agent_identity,
         simulation_configuration_sha256=sha256_json(
@@ -590,6 +634,94 @@ def _missing_prices(capabilities: ModelCapabilities | None) -> tuple[str, ...]:
         )
         if getattr(capabilities, name) is None
     )
+
+
+def _hosted_judge_inputs(
+    problems: list[str],
+    project: ProjectStore,
+    completed: ProjectBuildArtifacts | None,
+    judge_alias: str | None,
+    judge_model: ModelSnapshot | None,
+    evidence: HostedAutomaticJudgeEvidence,
+    catalog: ModelCatalog,
+    options: AutomaticRouterOptions,
+) -> tuple[
+    ProvisionalJudgeSetupArtifact | None,
+    ArtifactInput | None,
+    str | None,
+    ArtifactInput | None,
+]:
+    """Verify machine-only setup, provisional calibration, and request reservation.
+
+    Args:
+        problems: Mutable aggregate preflight problem list.
+        project: Project-local immutable artifact store.
+        completed: Selected completed build, if present.
+        judge_alias: Project-frozen judge alias, if available.
+        judge_model: Static current judge snapshot, if available.
+        evidence: Hosted provisional setup and request reservation.
+        catalog: Active transient model catalog.
+        options: Active retry and request controls.
+
+    Returns:
+        Verified setup, setup pointer, calibration ID, and calibration pointer.
+    """
+    try:
+        setup_stored = project.artifacts.read(evidence.setup_input.artifact_id)
+        if setup_stored.manifest.artifact_type != "provisional-judge-setup":
+            raise ValueError("setup pointer is not machine-only provisional judge evidence")
+        if artifact_input(setup_stored.manifest) != evidence.setup_input:
+            raise ValueError("setup manifest digest changed")
+        persisted = ProvisionalJudgeSetupArtifact.model_validate_json(
+            project.artifacts.read_bytes(evidence.setup_input.artifact_id, "setup.json")
+        )
+        if persisted != evidence.setup or persisted.setup_id != evidence.setup_input.artifact_id:
+            raise ValueError("setup payload differs from its selected artifact")
+        calibration, calibration_input = verify_persisted_calibration(
+            project,
+            evidence.calibration_id,
+        )
+        if calibration_input != evidence.calibration_input:
+            raise ValueError("provisional calibration manifest digest changed")
+        if calibration.status != "provisional" or calibration.label_count != 0:
+            raise ValueError("hosted judge calibration must remain zero-label provisional evidence")
+        if completed is None or (
+            persisted.trace_dataset != completed.trace_dataset
+            or persisted.task_set != completed.task_set
+        ):
+            raise ValueError("provisional judge setup differs from the completed build")
+        if judge_alias is None or persisted.judge_alias != judge_alias:
+            raise ValueError("provisional judge alias differs from the Project role")
+        if judge_model is None or persisted.judge_model != judge_model:
+            raise ValueError("provisional judge model differs from the active snapshot")
+        if (
+            calibration.rubric_id != persisted.rubric.artifact_id
+            or calibration.judge_model != persisted.judge_model
+            or calibration.judge_prompt_id != persisted.prompt_template.prompt.prompt_id
+            or calibration.judge_prompt_sha256 != persisted.prompt_template.prompt.sha256
+        ):
+            raise ValueError("provisional calibration differs from its machine-only setup")
+        configured = project.load_project().hosted_judge
+        if configured is None or (
+            configured.setup != evidence.setup_input
+            or configured.calibration != evidence.calibration_input
+            or configured.status != "provisional"
+        ):
+            raise ValueError("Project does not select this provisional judge evidence")
+        record = catalog.models.get(judge_alias)
+        capabilities = record.capabilities if record is not None else None
+        if capabilities is None:
+            raise ValueError("judge capability declaration is absent")
+        verify_completion_reservation(
+            evidence.request_reservation,
+            model=persisted.judge_model,
+            capabilities=capabilities,
+            maximum_attempts=options.completion_maximum_attempts,
+        )
+        return persisted, evidence.setup_input, calibration.calibration_id, calibration_input
+    except (OSError, ValueError) as exc:
+        problems.append(f"hosted provisional judge: {exc}")
+        return None, None, None, None
 
 
 def _manual_judge_inputs(

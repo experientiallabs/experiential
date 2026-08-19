@@ -10,7 +10,13 @@ from wmo.common.judging.evidence import (
     DEFAULT_JUDGE_OUTPUT_TOKENS,
     visible_rollout_evidence,
 )
-from wmo.common.models import AssistantAction, ModelSnapshot, OperationEconomics, ToolCall
+from wmo.common.models import (
+    AssistantAction,
+    BillingSource,
+    ModelSnapshot,
+    OperationEconomics,
+    ToolCall,
+)
 from wmo.common.rollouts import (
     ProductionSimulatorSnapshot,
     RolloutArtifact,
@@ -29,6 +35,7 @@ def _model() -> ModelSnapshot:
     return ModelSnapshot(
         provider="fake",
         model_id="candidate-model",
+        billing_source=BillingSource.HOST_MANAGED,
         capabilities_sha256=_DIGEST,
         connection_sha256=_DIGEST,
     )

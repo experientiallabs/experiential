@@ -418,10 +418,10 @@ def _resolve_span(
     if evidence is not None and evidence.model != model:
         raise RouterAttributionError(f"span {span_id!r} evidence differs from its model snapshot")
     if "unspecified" in {capabilities, connection}:
-        matches = tuple(item for item in candidates if item.model == model)
+        matches = tuple(item for item in candidates if _same_generator_model(item.model, model))
         mode: AttributionMatchKind = "strict_snapshot"
     elif capabilities == connection == "declared":
-        matches = tuple(item for item in candidates if item.model == model)
+        matches = tuple(item for item in candidates if _same_generator_model(item.model, model))
         mode = "declared_exact"
     else:
         matches = tuple(
@@ -455,6 +455,31 @@ def _resolve_span(
         connection=connection,
     )
     return matches[0], mode, attributed
+
+
+def _same_generator_model(left: ModelSnapshot, right: ModelSnapshot) -> bool:
+    """Compare exact generator identity without conflating it with the current payer.
+
+    Args:
+        left: Candidate catalog model resolved for the current hosted Project.
+        right: Historical model identity recorded on an uploaded trace.
+
+    Returns:
+        Whether provider, model, revision, capability, and connection identities all match.
+    """
+    return (
+        left.provider,
+        left.model_id,
+        left.revision,
+        left.capabilities_sha256,
+        left.connection_sha256,
+    ) == (
+        right.provider,
+        right.model_id,
+        right.revision,
+        right.capabilities_sha256,
+        right.connection_sha256,
+    )
 
 
 def _verify_attribution_inputs(

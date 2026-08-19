@@ -22,32 +22,56 @@ from wmo.common.core.artifacts import (
     FailureAttribution,
     FailureCode,
     StructuredFailure,
+    canonical_json_bytes,
     stable_id,
 )
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    NumericMeasurement,
     OperationEconomics,
     RoutedCandidateSnapshot,
+    ToolCall,
+    Usage,
 )
 from wmo.common.project import ProjectPaths
 from wmo.common.routing import RouterFeatureExtractor, RoutingDecision
+from wmo.runtime.router.economics import (
+    RoutedProviderComponent,
+    RoutedProviderOperation,
+    RoutedSpendDisposition,
+    routed_completion_economics,
+    routed_spend_ledger,
+)
 from wmo.runtime.router.journal import (
-    JournaledRouterRuntime,
+    JournalClaim,
     RuntimeAcceptance,
     RuntimeAcceptedEvent,
     RuntimeAttemptFailedEvent,
+    RuntimeCompletedEvent,
     RuntimeIdempotencyConflictError,
+    RuntimeInteractionFailedError,
+    RuntimeInteractionIdentity,
     RuntimeInteractionInProgressError,
     RuntimeInteractionJournal,
     RuntimeJournalError,
     _completed_event,
+    _failed_event,
     _interaction_identity,
 )
-from wmo.runtime.router.runtime import RoutedModelResponse, RouterRuntime
+from wmo.runtime.router.journal_service import JournaledRouterRuntime
+from wmo.runtime.router.journal_spend import direct_not_incurred_operation
+from wmo.runtime.router.runtime import (
+    BillingSourceEconomics,
+    RoutedCompletionEconomics,
+    RoutedModelResponse,
+    RouterModelCapabilityError,
+    RouterRuntime,
+)
 
 _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 13, tzinfo=UTC)
@@ -55,6 +79,7 @@ _TIME = datetime(2026, 8, 13, tzinfo=UTC)
 
 def _snapshot() -> ModelSnapshot:
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="gpt-test",
         capabilities_sha256=_DIGEST,
@@ -72,6 +97,157 @@ def _response() -> ModelResponse:
         model=_snapshot(),
         economics=OperationEconomics(),
     )
+
+
+def _economics() -> RoutedCompletionEconomics:
+    """Return deterministic alias-free economics for one fake routed response."""
+    return routed_completion_economics(
+        (
+            _operation(
+                ordinal=1,
+                component=RoutedProviderComponent.ROUTER_EMBEDDING,
+                source=BillingSource.HOST_MANAGED,
+                disposition=RoutedSpendDisposition.LOCALLY_PRICED,
+                input_tokens=5,
+            ),
+            _operation(
+                ordinal=2,
+                component=RoutedProviderComponent.SELECTED_CANDIDATE,
+                source=BillingSource.CUSTOMER_MANAGED,
+                disposition=RoutedSpendDisposition.OBSERVED,
+                input_tokens=7,
+            ),
+        )
+    )
+
+
+def _operation(
+    *,
+    ordinal: int,
+    component: RoutedProviderComponent,
+    source: BillingSource,
+    disposition: RoutedSpendDisposition,
+    input_tokens: int,
+) -> RoutedProviderOperation:
+    """Build deterministic alias-free provider operation evidence for journal tests."""
+    return RoutedProviderOperation(
+        operation_id=f"routed-operation-{ordinal:020x}",
+        operation_ordinal=ordinal,
+        component=component,
+        billing_source=source,
+        disposition=disposition,
+        operation_count=(0 if disposition == RoutedSpendDisposition.DEFINITELY_NOT_INCURRED else 1),
+        economics=OperationEconomics(
+            usage=Usage(input_tokens=input_tokens, output_tokens=0),
+            cost_usd=NumericMeasurement(
+                value=input_tokens / 1_000_000,
+                provenance="estimated",
+            ),
+        ),
+    )
+
+
+def test_reloaded_claim_matches_request_after_raw_arguments_are_not_persisted(
+    tmp_path: Path,
+) -> None:
+    """A reloaded retry compares durable semantics and retains fresh provider bytes.
+
+    Args:
+        tmp_path: Pytest-owned project root.
+    """
+    journal = RuntimeInteractionJournal(
+        ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
+    )
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="Look up the ticket"),
+            ModelMessage(
+                role="assistant",
+                assistant_action=AssistantAction(
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-1",
+                            name="lookup_ticket",
+                            arguments={"priority": 1, "ticket_id": "42"},
+                            raw_arguments='{ "ticket_id": "42", "priority": 1 }',
+                        ),
+                    )
+                ),
+            ),
+        )
+    )
+    identity = _interaction_identity("support-agent", "raw-arguments-key", request, None)
+    claim = _accept(journal, identity, now=_TIME)
+
+    assert claim.status == "dispatch"
+    assert claim.accepted is not None
+    _reserve_candidate(journal, claim.accepted, now=_TIME)
+    journal.record_failure(
+        claim.accepted,
+        StructuredFailure(
+            code=FailureCode.TIMEOUT,
+            message="provider timed out",
+            retryable=True,
+            attribution=FailureAttribution.MODEL,
+        ),
+        failed_at=_TIME + timedelta(seconds=1),
+    )
+    reloaded = RuntimeInteractionJournal(
+        ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
+    )
+    retried = reloaded.claim(
+        _interaction_identity("support-agent", "raw-arguments-key", request, None),
+        now=_TIME + timedelta(seconds=2),
+        stale_after=timedelta(seconds=30),
+    )
+
+    assert retried.status == "dispatch"
+    assert retried.accepted is not None
+    retried_call = retried.accepted.identity.request.messages[1].assistant_action
+    assert retried_call is not None
+    assert retried_call.tool_calls[0].raw_arguments == '{ "ticket_id": "42", "priority": 1 }'
+    persisted = reloaded.read_events()
+    persisted_action = (
+        cast(RuntimeAcceptedEvent, persisted[-1]).identity.request.messages[1].assistant_action
+    )
+    assert persisted_action is not None
+    assert persisted_action.tool_calls[0].raw_arguments is None
+    _reserve_candidate(reloaded, retried.accepted, now=_TIME + timedelta(seconds=2))
+    completed = reloaded.record_completed(
+        retried.accepted,
+        _response(),
+        candidate_operation=_operation(
+            ordinal=retried.accepted.spend.operation_count + 1,
+            component=RoutedProviderComponent.SELECTED_CANDIDATE,
+            source=BillingSource.CUSTOMER_MANAGED,
+            disposition=RoutedSpendDisposition.OBSERVED,
+            input_tokens=11,
+        ),
+        completed_at=_TIME + timedelta(seconds=3),
+    )
+    assert completed.event == "completed"
+    with pytest.raises(RuntimeIdempotencyConflictError):
+        reloaded.claim(
+            _interaction_identity(
+                "support-agent",
+                "raw-arguments-key",
+                request.model_copy(update={"maximum_output_tokens": 2}),
+                None,
+            ),
+            now=_TIME + timedelta(seconds=4),
+            stale_after=timedelta(seconds=30),
+        )
+    with pytest.raises(RuntimeIdempotencyConflictError):
+        reloaded.claim(
+            _interaction_identity(
+                "support-agent",
+                "raw-arguments-key",
+                request,
+                "different-caller-lineage",
+            ),
+            now=_TIME + timedelta(seconds=4),
+            stale_after=timedelta(seconds=30),
+        )
 
 
 def _decision(lineage_id: str, request: ModelRequest | None = None) -> RoutingDecision:
@@ -99,6 +275,84 @@ def _decision(lineage_id: str, request: ModelRequest | None = None) -> RoutingDe
     )
 
 
+def _acceptance(identity: RuntimeInteractionIdentity) -> RuntimeAcceptance:
+    """Build deterministic mixed-source route pins for a journal interaction."""
+    decision = _decision(identity.lineage_id, identity.request)
+    return RuntimeAcceptance(
+        decision=decision,
+        selected_alias=decision.selected_alias,
+        selected_model=_snapshot(),
+        router_embedding_billing_source=BillingSource.HOST_MANAGED,
+        policy_input=ArtifactInput(
+            artifact_id=decision.policy_id,
+            sha256=decision.policy_sha256,
+        ),
+    )
+
+
+def _accept(
+    journal: RuntimeInteractionJournal,
+    identity: RuntimeInteractionIdentity,
+    *,
+    now: datetime,
+) -> JournalClaim:
+    """Reserve, settle, and durably accept one deterministic initial selection."""
+    embedding = BillingSourceEconomics(
+        billing_source=BillingSource.HOST_MANAGED,
+        economics=_operation(
+            ordinal=1,
+            component=RoutedProviderComponent.ROUTER_EMBEDDING,
+            source=BillingSource.HOST_MANAGED,
+            disposition=RoutedSpendDisposition.LOCALLY_PRICED,
+            input_tokens=5,
+        ).economics,
+    )
+    reserved = journal.reserve_selection(
+        identity,
+        embedding,
+        now=now,
+        stale_after=timedelta(seconds=1),
+    )
+    assert reserved.reservation is not None
+    return journal.record_acceptance(
+        identity,
+        _acceptance(identity),
+        reserved.reservation,
+        _operation(
+            ordinal=1,
+            component=RoutedProviderComponent.ROUTER_EMBEDDING,
+            source=BillingSource.HOST_MANAGED,
+            disposition=RoutedSpendDisposition.LOCALLY_PRICED,
+            input_tokens=5,
+        ),
+        accepted_at=now,
+    )
+
+
+def _reserve_candidate(
+    journal: RuntimeInteractionJournal,
+    accepted: RuntimeAcceptedEvent,
+    *,
+    now: datetime,
+) -> None:
+    """Persist one deterministic candidate reservation for a low-level journal test."""
+    claim = journal.reserve_candidate(
+        accepted,
+        BillingSourceEconomics(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            economics=_operation(
+                ordinal=accepted.spend.operation_count + 1,
+                component=RoutedProviderComponent.SELECTED_CANDIDATE,
+                source=BillingSource.CUSTOMER_MANAGED,
+                disposition=RoutedSpendDisposition.RESERVED,
+                input_tokens=11,
+            ).economics,
+        ),
+        now=now,
+    )
+    assert claim.status == "dispatch"
+
+
 class _FakeRuntime:
     """Small deterministic runtime with a shareable target-call counter."""
 
@@ -109,6 +363,8 @@ class _FakeRuntime:
         delay: float = 0.0,
         selection_delay: float = 0.0,
         selection_hook: Callable[[], None] | None = None,
+        completion_hook: Callable[[], None] | None = None,
+        candidate_reservation_error: Exception | None = None,
         fail_once: bool = False,
     ) -> None:
         """Configure deterministic selection, completion, delay, and failure behavior.
@@ -118,6 +374,8 @@ class _FakeRuntime:
             delay: Seconds to pause each target completion.
             selection_delay: Seconds to pause each routing selection.
             selection_hook: Optional synchronous callback invoked during selection.
+            completion_hook: Optional synchronous callback invoked at candidate dispatch.
+            candidate_reservation_error: Optional provider-free predispatch validation failure.
             fail_once: Whether the first target completion raises a timeout.
         """
         self.policy = SimpleNamespace(
@@ -127,10 +385,26 @@ class _FakeRuntime:
         self.delay = delay
         self.selection_delay = selection_delay
         self.selection_hook = selection_hook
+        self.completion_hook = completion_hook
+        self.candidate_reservation_error = candidate_reservation_error
         self.fail_once = fail_once
         self.select_calls = 0
         self.complete_calls = 0
         self.decisions: list[RoutingDecision] = []
+
+    def embedding_reservation(self, request: ModelRequest) -> BillingSourceEconomics:
+        """Return deterministic host-managed preselection economics."""
+        del request
+        return BillingSourceEconomics(
+            billing_source=BillingSource.HOST_MANAGED,
+            economics=_operation(
+                ordinal=1,
+                component=RoutedProviderComponent.ROUTER_EMBEDDING,
+                source=BillingSource.HOST_MANAGED,
+                disposition=RoutedSpendDisposition.LOCALLY_PRICED,
+                input_tokens=5,
+            ).economics,
+        )
 
     def select(self, request: ModelRequest, *, episode_id: str | None = None) -> RoutingDecision:
         """Return a deterministic decision after the configured selection delay.
@@ -153,6 +427,45 @@ class _FakeRuntime:
         self.decisions.append(decision)
         return decision
 
+    def selection_operation(
+        self,
+        request: ModelRequest,
+        *,
+        episode_id: str,
+        decision: RoutingDecision,
+    ) -> RoutedProviderOperation:
+        """Return deterministic successful embedding evidence for one selection."""
+        del request, episode_id, decision
+        return _operation(
+            ordinal=1,
+            component=RoutedProviderComponent.ROUTER_EMBEDDING,
+            source=BillingSource.HOST_MANAGED,
+            disposition=RoutedSpendDisposition.LOCALLY_PRICED,
+            input_tokens=5,
+        )
+
+    def candidate_reservation(
+        self,
+        request: ModelRequest,
+        *,
+        episode_id: str,
+        decision: RoutingDecision,
+    ) -> BillingSourceEconomics:
+        """Return deterministic customer-managed candidate reservation economics."""
+        del request, episode_id, decision
+        if self.candidate_reservation_error is not None:
+            raise self.candidate_reservation_error
+        return BillingSourceEconomics(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            economics=_operation(
+                ordinal=2,
+                component=RoutedProviderComponent.SELECTED_CANDIDATE,
+                source=BillingSource.CUSTOMER_MANAGED,
+                disposition=RoutedSpendDisposition.RESERVED,
+                input_tokens=11,
+            ).economics,
+        )
+
     def complete(
         self,
         request: ModelRequest,
@@ -165,6 +478,8 @@ class _FakeRuntime:
         assert decision is not None
         assert provider_idempotency_key is not None
         self.complete_calls += 1
+        if self.completion_hook is not None:
+            self.completion_hook()
         if self.counter is not None:
             with self.counter.get_lock():
                 self.counter.value += 1
@@ -173,7 +488,11 @@ class _FakeRuntime:
         if self.fail_once:
             self.fail_once = False
             raise TimeoutError("secret provider detail")
-        return RoutedModelResponse(decision=decision, response=_response())
+        return RoutedModelResponse(
+            decision=decision,
+            response=_response(),
+            economics=_economics(),
+        )
 
 
 def _service(
@@ -252,6 +571,293 @@ def test_completed_interaction_replays_after_restart_without_provider_or_selecti
         "accepted",
         "completed",
     ]
+
+
+def test_embedding_and_candidate_reservations_are_durable_before_provider_calls(
+    tmp_path: Path,
+) -> None:
+    """Persist exact mixed-source reservations before either provider-backed operation."""
+    root = tmp_path / ".wmo"
+    journal = RuntimeInteractionJournal(ProjectPaths(root=root, project_id="support-agent"))
+    observed: list[tuple[RoutedProviderComponent, BillingSource, RoutedSpendDisposition]] = []
+
+    def inspect_embedding_reservation() -> None:
+        """Capture the checkpoint already durable when selection enters the embedder."""
+        event = journal.read_spend_events()[-1]
+        observed.append(
+            (event.operation.component, event.operation.billing_source, event.operation.disposition)
+        )
+
+    def inspect_candidate_reservation() -> None:
+        """Capture the checkpoint already durable when candidate dispatch begins."""
+        event = journal.read_spend_events()[-1]
+        observed.append(
+            (event.operation.component, event.operation.billing_source, event.operation.disposition)
+        )
+
+    runtime = _FakeRuntime(
+        selection_hook=inspect_embedding_reservation,
+        completion_hook=inspect_candidate_reservation,
+    )
+    result = JournaledRouterRuntime(cast(RouterRuntime, runtime), journal).complete(
+        _request(), idempotency_key="reservation-order-key"
+    )
+
+    assert observed == [
+        (
+            RoutedProviderComponent.ROUTER_EMBEDDING,
+            BillingSource.HOST_MANAGED,
+            RoutedSpendDisposition.RESERVED,
+        ),
+        (
+            RoutedProviderComponent.SELECTED_CANDIDATE,
+            BillingSource.CUSTOMER_MANAGED,
+            RoutedSpendDisposition.RESERVED,
+        ),
+    ]
+    assert result.economics.operation_count == 2
+    assert tuple(item.billing_source for item in result.economics.by_billing_source) == (
+        BillingSource.CUSTOMER_MANAGED,
+        BillingSource.HOST_MANAGED,
+    )
+    durable_payload = journal.spend_path.read_text(encoding="utf-8")
+    assert "reservation-order-key" not in durable_payload
+    assert "candidate-a" not in durable_payload
+    assert "host-model" not in durable_payload
+    assert '"host_managed"' in durable_payload
+    assert '"customer_managed"' in durable_payload
+
+
+def test_stale_preselection_reservation_survives_new_process_replay(tmp_path: Path) -> None:
+    """Count an abandoned embedding reservation as ambiguous before selecting again."""
+    root = tmp_path / ".wmo"
+    journal = RuntimeInteractionJournal(ProjectPaths(root=root, project_id="support-agent"))
+    request = _request()
+    identity = _interaction_identity("support-agent", "embedding-crash-key", request, None)
+    initial_runtime = _FakeRuntime()
+    initial = journal.reserve_selection(
+        identity,
+        initial_runtime.embedding_reservation(request),
+        now=_TIME,
+        stale_after=timedelta(seconds=1),
+    )
+    assert initial.status == "dispatch"
+
+    restarted_runtime = _FakeRuntime()
+    restarted = JournaledRouterRuntime(
+        cast(RouterRuntime, restarted_runtime),
+        RuntimeInteractionJournal(ProjectPaths(root=root, project_id="support-agent")),
+        clock=lambda: _TIME + timedelta(seconds=2),
+        stale_after_seconds=1,
+    )
+    result = restarted.complete(request, idempotency_key="embedding-crash-key")
+
+    assert restarted_runtime.select_calls == restarted_runtime.complete_calls == 1
+    assert [item.disposition for item in result.economics.operations] == [
+        RoutedSpendDisposition.RESERVED_AMBIGUOUS,
+        RoutedSpendDisposition.LOCALLY_PRICED,
+        RoutedSpendDisposition.OBSERVED,
+    ]
+    assert result.economics.operation_count == 3
+    assert result.economics.router_embedding.economics.usage == Usage(
+        input_tokens=10,
+        output_tokens=0,
+    )
+
+
+def test_stale_candidate_reservation_survives_new_process_replay(tmp_path: Path) -> None:
+    """Carry possible candidate spend through stale reclaim without re-embedding."""
+    root = tmp_path / ".wmo"
+    journal = RuntimeInteractionJournal(ProjectPaths(root=root, project_id="support-agent"))
+    request = _request()
+    identity = _interaction_identity("support-agent", "candidate-crash-key", request, None)
+    accepted_claim = _accept(journal, identity, now=_TIME)
+    assert accepted_claim.accepted is not None
+    _reserve_candidate(journal, accepted_claim.accepted, now=_TIME)
+
+    restarted_runtime = _FakeRuntime()
+    restarted = JournaledRouterRuntime(
+        cast(RouterRuntime, restarted_runtime),
+        RuntimeInteractionJournal(ProjectPaths(root=root, project_id="support-agent")),
+        clock=lambda: _TIME + timedelta(seconds=2),
+        stale_after_seconds=1,
+    )
+    result = restarted.complete(request, idempotency_key="candidate-crash-key")
+
+    assert restarted_runtime.select_calls == 0
+    assert restarted_runtime.complete_calls == 1
+    assert [item.disposition for item in result.economics.operations] == [
+        RoutedSpendDisposition.LOCALLY_PRICED,
+        RoutedSpendDisposition.RESERVED_AMBIGUOUS,
+        RoutedSpendDisposition.OBSERVED,
+    ]
+    assert result.economics.operation_count == 3
+    assert result.economics.router_embedding.economics.usage == Usage(
+        input_tokens=5,
+        output_tokens=0,
+    )
+
+
+def test_candidate_predispatch_failure_is_durably_not_incurred(tmp_path: Path) -> None:
+    """Expose permanent failure spend while proving candidate dispatch never occurred."""
+    runtime = _FakeRuntime(
+        candidate_reservation_error=RouterModelCapabilityError("unsupported candidate")
+    )
+    service = _service(tmp_path / ".wmo", runtime)
+
+    with pytest.raises(RuntimeInteractionFailedError) as initial:
+        service.complete(_request(), idempotency_key="predispatch-failure-key")
+
+    failed = cast(RuntimeAttemptFailedEvent, service.journal.read_events()[-1])
+    with pytest.raises(RuntimeInteractionFailedError) as replayed:
+        service.complete(_request(), idempotency_key="predispatch-failure-key")
+
+    assert failed.failure.code == FailureCode.UNSUPPORTED
+    assert initial.value.failure == replayed.value.failure == failed.failure
+    assert initial.value.spend == replayed.value.spend == failed.spend
+    assert not initial.value.retryable
+    assert failed.spend.operation_count == 1
+    assert [item.disposition for item in failed.spend.operations] == [
+        RoutedSpendDisposition.LOCALLY_PRICED,
+        RoutedSpendDisposition.DEFINITELY_NOT_INCURRED,
+    ]
+    assert runtime.complete_calls == 0
+    assert runtime.select_calls == 1
+    assert "candidate-a" not in failed.spend.model_dump_json()
+
+
+def test_candidate_reservation_cannot_be_rewritten_as_not_incurred(tmp_path: Path) -> None:
+    """Reject a recomputed main event that erases a durable candidate dispatch hazard."""
+    journal = RuntimeInteractionJournal(
+        ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
+    )
+    identity = _interaction_identity("support-agent", "reserved-candidate-key", _request(), None)
+    claim = _accept(journal, identity, now=_TIME)
+    assert claim.accepted is not None
+    _reserve_candidate(journal, claim.accepted, now=_TIME)
+    not_incurred = direct_not_incurred_operation(
+        interaction_id=claim.accepted.interaction_id,
+        operation_ordinal=2,
+        component=RoutedProviderComponent.SELECTED_CANDIDATE,
+        billing=BillingSourceEconomics(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            economics=OperationEconomics(),
+        ),
+    )
+    forged = _failed_event(
+        claim.accepted,
+        StructuredFailure(
+            code=FailureCode.UNSUPPORTED,
+            message="forged pre-dispatch failure",
+            retryable=False,
+            attribution=FailureAttribution.MODEL,
+        ),
+        spend=routed_spend_ledger((*claim.accepted.spend.operations, not_incurred)),
+        ordinal=2,
+        failed_at=_TIME + timedelta(seconds=1),
+    )
+    journal.path.write_bytes(
+        canonical_json_bytes(claim.accepted) + b"\n" + canonical_json_bytes(forged) + b"\n"
+    )
+
+    with pytest.raises(RuntimeJournalError, match="not-incurred candidate"):
+        journal.read_events()
+
+
+@pytest.mark.parametrize("reopen", [False, True])
+def test_retryable_candidate_predispatch_failure_advances_operation_ordinal(
+    tmp_path: Path,
+    *,
+    reopen: bool,
+) -> None:
+    """Allocate retry spend after a proven non-dispatch in one or a restarted process."""
+    paths = ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
+    journal = RuntimeInteractionJournal(paths)
+    identity = _interaction_identity("support-agent", "predispatch-retry-key", _request(), None)
+    first = _accept(journal, identity, now=_TIME)
+    assert first.accepted is not None
+    failed = journal.record_failure(
+        first.accepted,
+        StructuredFailure(
+            code=FailureCode.TIMEOUT,
+            message="provider-free predispatch timeout",
+            retryable=True,
+            attribution=FailureAttribution.MODEL,
+        ),
+        failed_at=_TIME + timedelta(seconds=1),
+    )
+    assert isinstance(failed, RuntimeAttemptFailedEvent)
+    if reopen:
+        journal = RuntimeInteractionJournal(paths)
+    retry = journal.claim(
+        identity,
+        now=_TIME + timedelta(seconds=2),
+        stale_after=timedelta(seconds=1),
+    )
+    assert retry.accepted is not None
+    reservation = journal.reserve_candidate(
+        retry.accepted,
+        BillingSourceEconomics(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            economics=_economics().selected_candidate.economics,
+        ),
+        now=_TIME + timedelta(seconds=2),
+    )
+    assert reservation.reservation is not None
+    assert reservation.reservation.operation.operation_ordinal == 3
+    assert (
+        reservation.reservation.operation.operation_id != failed.spend.operations[-1].operation_id
+    )
+    completed = journal.record_completed(
+        retry.accepted,
+        _response(),
+        candidate_operation=_economics().operations[-1],
+        completed_at=_TIME + timedelta(seconds=3),
+    )
+    assert isinstance(completed, RuntimeCompletedEvent)
+    assert [item.disposition for item in completed.economics.operations] == [
+        RoutedSpendDisposition.LOCALLY_PRICED,
+        RoutedSpendDisposition.DEFINITELY_NOT_INCURRED,
+        RoutedSpendDisposition.OBSERVED,
+    ]
+
+
+def test_settled_selection_history_rejects_changed_identity_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Reject same-key request drift before a new reservation or selection provider call."""
+    paths = ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
+    journal = RuntimeInteractionJournal(paths)
+    first_request = _request("Original")
+    identity = _interaction_identity("support-agent", "settled-selection-key", first_request, None)
+    runtime = _FakeRuntime()
+    reservation = journal.reserve_selection(
+        identity,
+        runtime.embedding_reservation(first_request),
+        now=_TIME,
+        stale_after=timedelta(seconds=1),
+    )
+    assert reservation.reservation is not None
+    journal.record_selection_failure(
+        identity,
+        reservation.reservation,
+        failed_at=_TIME + timedelta(seconds=1),
+    )
+    restarted = JournaledRouterRuntime(
+        cast(RouterRuntime, runtime),
+        RuntimeInteractionJournal(paths),
+        clock=lambda: _TIME + timedelta(seconds=2),
+        stale_after_seconds=1,
+    )
+
+    with pytest.raises(RuntimeIdempotencyConflictError):
+        restarted.complete(
+            _request("Changed"),
+            idempotency_key="settled-selection-key",
+        )
+
+    assert runtime.select_calls == runtime.complete_calls == 0
+    assert len(restarted.journal.read_spend_events()) == 2
 
 
 def test_concurrent_runtime_instances_select_and_dispatch_once(tmp_path: Path) -> None:
@@ -405,15 +1011,23 @@ def test_provider_failure_has_no_target_and_retry_reuses_pinned_decision(tmp_pat
     runtime = _FakeRuntime(fail_once=True)
     service = _service(tmp_path / ".wmo", runtime)
 
-    with pytest.raises(TimeoutError, match="secret provider detail"):
+    with pytest.raises(RuntimeInteractionFailedError) as initial:
         service.complete(_request(), idempotency_key="retry-key")
     events = service.journal.read_events()
     assert [event.event for event in events] == ["accepted", "attempt_failed"]
     failed = cast(RuntimeAttemptFailedEvent, events[-1])
     assert failed.retryable
+    assert initial.value.failure == failed.failure
+    assert initial.value.spend == failed.spend
+    assert initial.value.retryable
     assert failed.failure.message == "routed model provider attempt failed"
     assert "response" not in failed.model_dump(mode="json")
     assert "secret provider detail" not in service.journal.path.read_text(encoding="utf-8")
+    assert failed.spend.operation_count == 2
+    assert [item.disposition for item in failed.spend.operations] == [
+        RoutedSpendDisposition.LOCALLY_PRICED,
+        RoutedSpendDisposition.RESERVED_AMBIGUOUS,
+    ]
 
     result = service.complete(_request(), idempotency_key="retry-key")
     retried = service.journal.read_events()
@@ -425,6 +1039,16 @@ def test_provider_failure_has_no_target_and_retry_reuses_pinned_decision(tmp_pat
         "completed",
     ]
     assert runtime.select_calls == 1
+    assert result.economics.operation_count == 3
+    assert [item.disposition for item in result.economics.operations] == [
+        RoutedSpendDisposition.LOCALLY_PRICED,
+        RoutedSpendDisposition.RESERVED_AMBIGUOUS,
+        RoutedSpendDisposition.OBSERVED,
+    ]
+    assert tuple(item.billing_source for item in result.economics.by_billing_source) == (
+        BillingSource.CUSTOMER_MANAGED,
+        BillingSource.HOST_MANAGED,
+    )
     assert (
         cast(RuntimeAcceptedEvent, retried[0]).acceptance.decision
         == cast(RuntimeAcceptedEvent, retried[2]).acceptance.decision
@@ -523,22 +1147,11 @@ def test_stale_attempt_gets_failure_then_retry_with_original_route(tmp_path: Pat
     )
     request = _request()
     identity = _interaction_identity("support-agent", "stale-key", request, None)
-    decision = _decision(identity.lineage_id)
-    acceptance = RuntimeAcceptance(
-        decision=decision,
-        selected_alias=decision.selected_alias,
-        selected_model=_snapshot(),
-        policy_input=ArtifactInput(artifact_id=decision.policy_id, sha256=decision.policy_sha256),
-    )
-    first = journal.claim(
-        identity,
-        acceptance,
-        now=_TIME,
-        stale_after=timedelta(seconds=1),
-    )
+    first = _accept(journal, identity, now=_TIME)
+    assert first.accepted is not None
+    _reserve_candidate(journal, first.accepted, now=_TIME)
     retry = journal.claim(
         identity,
-        None,
         now=_TIME + timedelta(seconds=2),
         stale_after=timedelta(seconds=1),
     )
@@ -560,45 +1173,47 @@ def test_original_provider_success_wins_after_concurrent_stale_takeover(tmp_path
     )
     request = _request()
     identity = _interaction_identity("support-agent", "takeover-key", request, None)
-    decision = _decision(identity.lineage_id)
-    acceptance = RuntimeAcceptance(
-        decision=decision,
-        selected_alias=decision.selected_alias,
-        selected_model=_snapshot(),
-        policy_input=ArtifactInput(artifact_id=decision.policy_id, sha256=decision.policy_sha256),
-    )
-    original = journal.claim(
-        identity,
-        acceptance,
-        now=_TIME,
-        stale_after=timedelta(seconds=1),
-    )
+    original = _accept(journal, identity, now=_TIME)
+    assert original.accepted is not None
+    _reserve_candidate(journal, original.accepted, now=_TIME)
     replacement = journal.claim(
         identity,
-        None,
         now=_TIME + timedelta(seconds=2),
         stale_after=timedelta(seconds=1),
     )
     assert original.accepted is not None
     assert replacement.accepted is not None
+    _reserve_candidate(
+        journal,
+        replacement.accepted,
+        now=_TIME + timedelta(seconds=2),
+    )
 
     winning = journal.record_completed(
         original.accepted,
         _response(),
+        candidate_operation=_economics().operations[-1],
         completed_at=_TIME + timedelta(seconds=3),
     )
     replay = journal.claim(
         identity,
-        None,
         now=_TIME + timedelta(seconds=4),
         stale_after=timedelta(seconds=1),
     )
 
     assert replay.status == "completed"
     assert replay.completed == winning
+    assert isinstance(winning, RuntimeCompletedEvent)
+    assert [item.disposition for item in winning.economics.operations] == [
+        RoutedSpendDisposition.LOCALLY_PRICED,
+        RoutedSpendDisposition.OBSERVED,
+        RoutedSpendDisposition.RESERVED_AMBIGUOUS,
+    ]
+    assert winning.economics.operation_count == 3
     replacement_observed = journal.record_completed(
         replacement.accepted,
         _response().model_copy(update={"output": AssistantAction(content="replacement")}),
+        candidate_operation=_economics().operations[-1],
         completed_at=_TIME + timedelta(seconds=5),
     )
     assert replacement_observed == winning
@@ -617,27 +1232,17 @@ def test_replacement_permanent_failure_wins_over_late_original_success(tmp_path:
     )
     request = _request()
     identity = _interaction_identity("support-agent", "permanent-key", request, None)
-    decision = _decision(identity.lineage_id)
-    acceptance = RuntimeAcceptance(
-        decision=decision,
-        selected_alias=decision.selected_alias,
-        selected_model=_snapshot(),
-        policy_input=ArtifactInput(artifact_id=decision.policy_id, sha256=decision.policy_sha256),
-    )
-    original = journal.claim(
-        identity,
-        acceptance,
-        now=_TIME,
-        stale_after=timedelta(seconds=1),
-    )
+    original = _accept(journal, identity, now=_TIME)
+    assert original.accepted is not None
+    _reserve_candidate(journal, original.accepted, now=_TIME)
     replacement = journal.claim(
         identity,
-        None,
         now=_TIME + timedelta(seconds=2),
         stale_after=timedelta(seconds=1),
     )
     assert original.accepted is not None
     assert replacement.accepted is not None
+    _reserve_candidate(journal, replacement.accepted, now=_TIME + timedelta(seconds=2))
     permanent = StructuredFailure(
         code=FailureCode.PROVIDER,
         message="routed model provider attempt failed permanently",
@@ -653,13 +1258,13 @@ def test_replacement_permanent_failure_wins_over_late_original_success(tmp_path:
     observed = journal.record_completed(
         original.accepted,
         _response(),
+        candidate_operation=_economics().operations[-1],
         completed_at=_TIME + timedelta(seconds=4),
     )
 
     assert observed == terminal
     failed_claim = journal.claim(
         identity,
-        None,
         now=_TIME + timedelta(seconds=5),
         stale_after=timedelta(seconds=1),
     )
@@ -674,6 +1279,9 @@ def test_replacement_permanent_failure_wins_over_late_original_success(tmp_path:
     corrupted_completion = _completed_event(
         original.accepted,
         _response(),
+        routed_completion_economics(
+            (*original.accepted.spend.operations, _economics().operations[-1])
+        ),
         ordinal=5,
         completed_at=_TIME + timedelta(seconds=4),
     )
@@ -689,21 +1297,9 @@ def test_live_attempt_wait_is_bounded_and_retryable(tmp_path: Path) -> None:
     )
     request = _request()
     identity = _interaction_identity("support-agent", "live-key", request, None)
-    decision = _decision(identity.lineage_id)
-    journal.claim(
-        identity,
-        RuntimeAcceptance(
-            decision=decision,
-            selected_alias=decision.selected_alias,
-            selected_model=_snapshot(),
-            policy_input=ArtifactInput(
-                artifact_id=decision.policy_id,
-                sha256=decision.policy_sha256,
-            ),
-        ),
-        now=_TIME,
-        stale_after=timedelta(hours=1),
-    )
+    accepted_claim = _accept(journal, identity, now=_TIME)
+    assert accepted_claim.accepted is not None
+    _reserve_candidate(journal, accepted_claim.accepted, now=_TIME)
     service = JournaledRouterRuntime(
         cast(RouterRuntime, _FakeRuntime()),
         journal,
@@ -780,12 +1376,15 @@ def test_append_retries_directory_fsync_after_first_creation_failure(
     )
     request = _request()
     identity = _interaction_identity("support-agent", "fsync-retry-key", request, None)
-    decision = _decision(identity.lineage_id)
-    acceptance = RuntimeAcceptance(
-        decision=decision,
-        selected_alias=decision.selected_alias,
-        selected_model=_snapshot(),
-        policy_input=ArtifactInput(artifact_id=decision.policy_id, sha256=decision.policy_sha256),
+    embedding = BillingSourceEconomics(
+        billing_source=BillingSource.HOST_MANAGED,
+        economics=_operation(
+            ordinal=1,
+            component=RoutedProviderComponent.ROUTER_EMBEDDING,
+            source=BillingSource.HOST_MANAGED,
+            disposition=RoutedSpendDisposition.LOCALLY_PRICED,
+            input_tokens=5,
+        ).economics,
     )
     directory_failures = 0
     successful_directory_fsyncs = 0
@@ -802,24 +1401,24 @@ def test_append_retries_directory_fsync_after_first_creation_failure(
 
     monkeypatch.setattr(os, "fsync", fail_first_directory_fsync)
     with pytest.raises(RuntimeJournalError, match="cannot persist runtime journal directory"):
-        journal.claim(
+        journal.reserve_selection(
             identity,
-            acceptance,
+            embedding,
             now=_TIME,
             stale_after=timedelta(seconds=1),
         )
 
-    retry = journal.claim(
+    retry = journal.reserve_selection(
         identity,
-        None,
+        embedding,
         now=_TIME + timedelta(seconds=2),
         stale_after=timedelta(seconds=1),
     )
 
     assert retry.status == "dispatch"
     assert successful_directory_fsyncs >= 8
-    assert [event.event for event in journal.read_events()] == [
-        "accepted",
-        "attempt_failed",
-        "accepted",
+    assert [event.operation.disposition for event in journal.read_spend_events()] == [
+        RoutedSpendDisposition.RESERVED,
+        RoutedSpendDisposition.RESERVED_AMBIGUOUS,
+        RoutedSpendDisposition.RESERVED,
     ]

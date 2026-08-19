@@ -25,12 +25,20 @@ from wmo.common.models import (
     ToolCall,
     Usage,
 )
+from wmo.runtime.gateway.contracts import GatewayRequest
+from wmo.runtime.models.providers.async_transport import AsyncJsonHttpTransport, RequestDeadline
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
 from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
     ProviderResponseError,
     ProviderRetryableResponseError,
 )
 from wmo.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
+from wmo.runtime.models.providers.streaming import (
+    NormalizedProviderStream,
+    start_openai_responses_stream,
+)
 from wmo.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -142,7 +150,10 @@ def openai_responses_response(
                 if isinstance(part, ResponseOutputText):
                     text_parts.append(part.text)
                 elif isinstance(part, ResponseOutputRefusal):
-                    text_parts.append(part.refusal)
+                    raise ProviderRefusalError(
+                        provider="openai",
+                        signal=ProviderRefusalSignal.PROVIDER_REFUSAL,
+                    )
                 else:
                     raise ProviderResponseError(
                         f"OpenAI Responses output[{index}] has unsupported content type "
@@ -182,7 +193,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
         model: ModelSnapshot,
         api_key: str,
         base_url: str = OPENAI_BASE_URL,
-        transport: JsonHttpTransport | None = None,
+        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         supports_temperature: bool = True,
@@ -212,6 +223,44 @@ class OpenAIClient(OpenAIEmbeddingMixin):
         )
         self._supports_temperature = supports_temperature
         self._reasoning_effort = reasoning_effort
+
+    async def stream(
+        self,
+        request: GatewayRequest,
+        *,
+        deadline: RequestDeadline,
+        idempotency_key: str,
+        retry_policy: RetryPolicy | None = None,
+    ) -> NormalizedProviderStream:
+        """Start one true native Responses stream under the gateway deadline.
+
+        Args:
+            request: Canonical streaming gateway request.
+            deadline: Immutable request-wide deadline.
+            idempotency_key: Stable identity for safe pre-commit opening retries.
+            retry_policy: Optional caller-owned physical dispatch limit.
+
+        Returns:
+            A cancellable provider-neutral event stream.
+
+        Raises:
+            ValueError: The canonical request did not ask for streaming.
+        """
+        if not request.stream:
+            raise ValueError("gateway provider stream requires request.stream")
+        return await start_openai_responses_stream(
+            self._transport,
+            f"{self._base_url}/{self._request_path(self._completion_path())}",
+            headers=self._headers(),
+            request=request,
+            model_id=self._model.model_id,
+            deadline=deadline,
+            idempotency_key=idempotency_key,
+            retry_policy=retry_policy or self._retry_policy,
+            timeout_seconds=self._timeout_seconds,
+            supports_temperature=self._supports_temperature,
+            reasoning_effort=self._reasoning_effort,
+        )
 
     def _completion_path(self) -> str:
         """Return the native non-streaming Responses route."""
@@ -260,7 +309,7 @@ def _responses_items_for_message(message: ModelMessage) -> list[JsonObject]:
                 "type": "function_call",
                 "call_id": call.call_id,
                 "name": call.name,
-                "arguments": json.dumps(call.arguments),
+                "arguments": call.arguments_json(),
             }
             for call in action.tool_calls
         )
@@ -282,7 +331,12 @@ def _tool_call(item: ResponseFunctionToolCall, index: int) -> ToolCall:
             f"OpenAI Responses output[{index}].arguments must decode to an object"
         )
     try:
-        return ToolCall(call_id=item.call_id, name=item.name, arguments=arguments)
+        return ToolCall(
+            call_id=item.call_id,
+            name=item.name,
+            arguments=arguments,
+            raw_arguments=item.arguments,
+        )
     except ValidationError as exc:
         raise ProviderResponseError(
             f"OpenAI Responses output[{index}] tool call is incomplete"

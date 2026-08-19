@@ -15,6 +15,7 @@ from wmo.common.judging.lm_test import _axis_schema
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelCapabilities,
     ModelMessage,
     ModelRequest,
@@ -54,6 +55,7 @@ def _response(content: str) -> ModelResponse:
     return ModelResponse(
         output=AssistantAction(content=content),
         model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="bedrock",
             model_id="judge-model",
             capabilities_sha256=sha256_json(ModelCapabilities()),

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.core.hashing import signed_token_embedding
 from wmo.common.models import (
+    BillingSource,
     Embedding,
     EmbeddingClient,
     ModelCapabilities,
@@ -94,6 +95,7 @@ def default_rag_embedder(
             provider="local",
             model_id=f"wmo-hashing-v1-{dimensions}",
             revision="1",
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             capabilities_sha256=capabilities.identity_sha256(),
             connection_sha256=sha256_json(identity),
         ),

@@ -37,6 +37,7 @@ from wmo.common.judging import (
 )
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     EmbeddingCostReservation,
     ModelRequest,
     ModelResponse,
@@ -135,6 +136,7 @@ def _inputs(*values: ArtifactInput) -> tuple[ArtifactInput, ...]:
 def _model(model_id: str = "judge-model") -> ModelSnapshot:
     """Build one fixed resolved model identity for local immutable test evidence."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=model_id,
         capabilities_sha256=_DIGEST,

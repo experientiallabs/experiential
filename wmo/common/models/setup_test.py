@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -102,7 +103,9 @@ def test_setup_preserves_unrelated_models_and_router_candidates(tmp_path: Path) 
         tmp_path: Temporary root containing preserved catalog roles.
     """
     path = tmp_path / "models.toml"
-    candidate = ModelRecord(connection="router", model="vendor/candidate")
+    candidate = ModelRecord(
+        billing_source=BillingSource.CUSTOMER_MANAGED, connection="router", model="vendor/candidate"
+    )
     existing = ModelCatalog(
         connections={
             "router": ConnectionConfig(

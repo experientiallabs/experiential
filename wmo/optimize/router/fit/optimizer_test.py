@@ -9,11 +9,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import pytest
 
 from wmo.common.core.artifacts import (
     ArtifactInput,
+    FailureCode,
     SourceIdentity,
+    StructuredFailure,
     canonical_json_bytes,
     stable_id,
 )
@@ -51,9 +54,10 @@ from wmo.common.rollouts import (
     StopReason,
 )
 from wmo.common.routing import KnnGuard
-from wmo.common.routing.bank import load_knn_bank
+from wmo.common.routing.bank import KnnEvidenceBank, load_knn_bank
 from wmo.common.tasks import TaskCase, TaskSet, ToolSchema
 from wmo.optimize.router import RouterOptimizationError, RouterOptimizationSpec, RouterOptimizer
+from wmo.optimize.router.fit.optimizer import choose_baseline
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -218,6 +222,167 @@ def test_optimizer_locks_fit_policy_then_reports_held_out_with_separate_spend(
             created_at=_TIME,
             code_revision="test-revision",
         )
+
+
+def _coverage_bank(scores: np.ndarray) -> KnnEvidenceBank:
+    """Build one minimal valid two-candidate bank around explicit sparse scores.
+
+    Args:
+        scores: Task-by-candidate score matrix with ``NaN`` marking missing evidence.
+
+    Returns:
+        Deterministic bank whose only varying evidence is the supplied score matrix.
+    """
+    task_count = scores.shape[0]
+    return KnnEvidenceBank(
+        task_ids=tuple(f"task-{index}" for index in range(task_count)),
+        candidate_aliases=("candidate-baseline", "candidate-cheap"),
+        embeddings=np.tile(np.array([1.0, 0.0]), (task_count, 1)),
+        scores=scores,
+        candidate_costs=np.full(scores.shape, 0.1, dtype=np.float64),
+        score_counts=(~np.isnan(scores)).astype(np.int32),
+        cost_counts=np.ones(scores.shape, dtype=np.int32),
+        workload_weights=np.ones(task_count),
+        novelty_floor=0.5,
+    )
+
+
+def test_choose_baseline_tolerates_partial_incumbent_coverage() -> None:
+    """A named incumbent missing scores on a strict fit-task subset stays usable."""
+    scores = np.array([[0.5, 1.0], [np.nan, 1.0], [0.5, np.nan]], dtype=np.float32)
+    bank = _coverage_bank(scores)
+
+    selection = choose_baseline(bank, incumbent_alias="candidate-baseline")
+
+    assert selection.alias == "candidate-baseline"
+    assert selection.uncovered_task_ids == ("task-1",)
+    with pytest.raises(RouterOptimizationError, match="conservative fallback"):
+        choose_baseline(bank, incumbent_alias=None)
+
+
+def test_choose_baseline_fails_closed_on_zero_incumbent_coverage() -> None:
+    """An incumbent without score evidence on any fit task cannot anchor a policy."""
+    scores = np.array([[np.nan, 1.0], [np.nan, 1.0]], dtype=np.float32)
+
+    with pytest.raises(RouterOptimizationError, match="zero fit tasks"):
+        choose_baseline(_coverage_bank(scores), incumbent_alias="candidate-baseline")
+
+
+def test_fit_freezes_partial_incumbent_coverage_and_uncovered_tasks_into_the_policy(
+    tmp_path: Path,
+) -> None:
+    """Fitting proceeds past missing incumbent cells and persists the uncovered tasks."""
+    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
+    fit = tuple(_task(f"task-fit-{index:02d}", "fit") for index in range(8))
+    held_out = tuple(_task(f"task-held-{index:02d}", "held_out") for index in range(2))
+    all_tasks = (*fit, *held_out)
+    failed_cells = frozenset({(fit[3].task_id, "candidate-baseline")})
+    task_input = _persist_task_set(store, all_tasks, task_set_id="task-set-a")
+    pricing_input = _persist_pricing(store)
+    plan_input = _persist_plan(
+        store, all_tasks, task_input, pricing_input, failed_cells=failed_cells
+    )
+    calibration_input = _persist_calibration(store, fit, held_out)
+    evaluation_inputs = tuple(
+        sorted(
+            (calibration_input, plan_input, pricing_input, task_input),
+            key=lambda item: item.artifact_id,
+        )
+    )
+    fit_evaluation_id = _persist_evaluation(
+        store,
+        fit,
+        "task-set-a",
+        plan_input,
+        evaluation_inputs,
+        failed_cells=failed_cells,
+    )
+    embedder = _LockCheckingEmbedder(store, fit_count=len(fit))
+    spec = RouterOptimizationSpec(
+        fit_evaluation_id=fit_evaluation_id,
+        incumbent_alias="candidate-baseline",
+        embedder_alias="embedder",
+        embedder=_snapshot("embedder"),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256=pricing_input.sha256,
+        guard=KnnGuard(
+            maximum_neighbors=8,
+            minimum_paired_observations=8,
+            relative_similarity_threshold=0.95,
+            uncertainty_multiplier=0.5,
+            quality_tolerance=0.0,
+        ),
+        judgment_status="provisional",
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+    optimizer = RouterOptimizer(store, embedder)
+
+    locked = optimizer.fit(spec)
+    replayed = optimizer.fit(spec)
+
+    assert locked.policy.baseline_alias == "candidate-baseline"
+    assert locked.policy.baseline_uncovered_fit_task_ids == (fit[3].task_id,)
+    assert locked.bank.task_ids == tuple(task.task_id for task in fit)
+    assert replayed == locked
+    stored = store.read(locked.policy.policy_id)
+    assert stored.manifest.artifact_type == "router-policy"
+
+
+def test_fit_fails_closed_when_the_incumbent_has_zero_fit_coverage(tmp_path: Path) -> None:
+    """An incumbent whose every fit cell failed cannot produce a policy."""
+    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
+    fit = tuple(_task(f"task-fit-{index:02d}", "fit") for index in range(8))
+    held_out = tuple(_task(f"task-held-{index:02d}", "held_out") for index in range(2))
+    all_tasks = (*fit, *held_out)
+    failed_cells = frozenset({(task.task_id, "candidate-baseline") for task in fit})
+    task_input = _persist_task_set(store, all_tasks, task_set_id="task-set-a")
+    pricing_input = _persist_pricing(store)
+    plan_input = _persist_plan(
+        store, all_tasks, task_input, pricing_input, failed_cells=failed_cells
+    )
+    calibration_input = _persist_calibration(store, fit, held_out)
+    evaluation_inputs = tuple(
+        sorted(
+            (calibration_input, plan_input, pricing_input, task_input),
+            key=lambda item: item.artifact_id,
+        )
+    )
+    fit_evaluation_id = _persist_evaluation(
+        store,
+        fit,
+        "task-set-a",
+        plan_input,
+        evaluation_inputs,
+        failed_cells=failed_cells,
+    )
+    embedder = _LockCheckingEmbedder(store, fit_count=len(fit))
+    spec = RouterOptimizationSpec(
+        fit_evaluation_id=fit_evaluation_id,
+        incumbent_alias="candidate-baseline",
+        embedder_alias="embedder",
+        embedder=_snapshot("embedder"),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256=pricing_input.sha256,
+        guard=KnnGuard(
+            maximum_neighbors=8,
+            minimum_paired_observations=8,
+            relative_similarity_threshold=0.95,
+            uncertainty_multiplier=0.5,
+            quality_tolerance=0.0,
+        ),
+        judgment_status="provisional",
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+
+    with pytest.raises(RouterOptimizationError, match="zero fit tasks"):
+        RouterOptimizer(store, embedder).fit(spec)
+
+    assert not any(
+        store.read(artifact_id).manifest.artifact_type == "router-policy"
+        for artifact_id in store.list_ids()
+    )
 
 
 def test_fit_rejects_missing_wrong_type_invented_or_candidate_drifted_pricing(
@@ -691,6 +856,7 @@ def _persist_evaluation(
     protocol_pricing_id: str = "pricing-a",
     candidates: tuple[RoutedCandidateSnapshot, ...] | None = None,
     omit_last_row: bool = False,
+    failed_cells: frozenset[tuple[str, str]] = frozenset(),
 ) -> str:
     """Persist a complete observed matrix with candidate and run costs kept separate."""
     protocol = EvaluationProtocol(
@@ -703,7 +869,9 @@ def _persist_evaluation(
         pricing_snapshot_id=protocol_pricing_id,
     )
     rows = tuple(
-        _row(task, alias, protocol)
+        _failed_row(task, alias, protocol)
+        if (task.task_id, alias) in failed_cells
+        else _row(task, alias, protocol)
         for task in tasks
         for alias in ("candidate-baseline", "candidate-cheap")
     )
@@ -784,6 +952,29 @@ def _row(
     )
 
 
+def _failed_row(
+    task: TaskCase,
+    alias: str,
+    protocol: EvaluationProtocol,
+) -> EvaluationRow:
+    """Create one terminally failed simulated row without score or judgment evidence."""
+    suffix = f"{task.task_id}-{alias}"
+    return EvaluationRow(
+        cell_id=f"cell-{suffix}",
+        task_id=task.task_id,
+        candidate_alias=alias,
+        repeat=0,
+        protocol_id=protocol.protocol_id,
+        source_run_id=f"run-{suffix}",
+        purpose=task.partition,
+        status="failed",
+        error=StructuredFailure(
+            code=FailureCode.PROVIDER,
+            message="text world model failed the pinned transition contract",
+        ),
+    )
+
+
 def _persist_task_set(
     store: ArtifactStore,
     tasks: tuple[TaskCase, ...],
@@ -815,6 +1006,8 @@ def _persist_plan(
     tasks: tuple[TaskCase, ...],
     task_input: ArtifactInput,
     pricing_input: ArtifactInput,
+    *,
+    failed_cells: frozenset[tuple[str, str]] = frozenset(),
 ) -> ArtifactInput:
     """Persist the one exact plan shared by sealed fit and held-out evaluations."""
     cells = tuple(
@@ -824,8 +1017,10 @@ def _persist_plan(
             candidate_alias=alias,
             repeat=0,
             purpose=task.partition,
-            execution="observed",
-            observed_rollout_id=f"rollout-{task.task_id}-{alias}",
+            execution="simulate" if (task.task_id, alias) in failed_cells else "observed",
+            observed_rollout_id=(
+                None if (task.task_id, alias) in failed_cells else f"rollout-{task.task_id}-{alias}"
+            ),
         )
         for task in tasks
         for alias in ("candidate-baseline", "candidate-cheap")

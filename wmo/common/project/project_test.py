@@ -92,6 +92,21 @@ def test_provider_free_contract_keeps_settings_and_stage_ownership_minimal() -> 
         ProjectConfig(project_id="missing-settings", provider_free_stage=stage)
 
 
+def test_project_config_has_one_optional_project_scoped_catalog_pointer() -> None:
+    """Provider-free Projects need no catalog while configured Projects bind one artifact."""
+    pointer = ArtifactInput(artifact_id="project-model-catalog", sha256=_DIGEST)
+
+    provider_free = ProjectConfig(
+        project_id="provider-free",
+        trace_preparation=ProjectTracePreparationSettings(source_kind="otlp"),
+    )
+    configured = ProjectConfig(project_id="configured", model_catalog=pointer)
+
+    assert provider_free.model_catalog is None
+    assert configured.model_catalog == pointer
+    assert "model_catalog" in ProjectConfig.model_fields
+
+
 def test_project_config_round_trip_preserves_safe_local_metadata(tmp_path: Path) -> None:
     """Project TOML contains customer wiring metadata but no provider credential references."""
     path = tmp_path / "project.toml"

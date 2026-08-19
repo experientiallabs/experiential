@@ -19,18 +19,26 @@ from wmo.common.models import (
     ToolChoice,
     Usage,
 )
+from wmo.runtime.gateway.contracts import GatewayRequest
+from wmo.runtime.models.providers.async_transport import RequestDeadline
 from wmo.runtime.models.providers.base import (
     DEFAULT_MAXIMUM_OUTPUT_TOKENS,
     ProviderHttpClient,
 )
 from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
     ProviderResponseError,
     require_array,
     require_integer,
     require_object,
     require_string,
 )
+from wmo.runtime.models.providers.gemini_streaming import start_gemini_generate_stream
 from wmo.runtime.models.providers.openai_compatible import normalize_embedding_vector
+from wmo.runtime.models.providers.streaming import NormalizedProviderStream
+from wmo.runtime.models.providers.transport import RetryPolicy
+from wmo.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -110,6 +118,9 @@ def gemini_generate_response(
     if not candidates:
         raise ProviderResponseError("Gemini response has no candidates")
     candidate = require_object(candidates[0], "Gemini candidates[0]")
+    refusal_signal = _gemini_refusal_signal(candidate.get("finishReason"))
+    if refusal_signal is not None:
+        raise ProviderRefusalError(provider="gemini", signal=refusal_signal)
     content = require_object(candidate.get("content"), "Gemini candidates[0].content")
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
@@ -141,6 +152,41 @@ def gemini_generate_response(
 
 class GeminiClient(ProviderHttpClient):
     """Calls one explicit Gemini model through its native REST protocol."""
+
+    async def stream(
+        self,
+        request: GatewayRequest,
+        *,
+        deadline: RequestDeadline,
+        idempotency_key: str,
+        retry_policy: RetryPolicy | None = None,
+    ) -> NormalizedProviderStream:
+        """Start one native Gemini SSE stream under the gateway deadline.
+
+        Args:
+            request: Canonical streaming gateway request.
+            deadline: Immutable request-wide deadline.
+            idempotency_key: Stable identity for this deployment operation.
+            retry_policy: Optional caller-owned physical dispatch limit.
+
+        Returns:
+            A cancellable provider-neutral event stream.
+        """
+        model_id = _path_model_id(self._model.model_id)
+        return await start_gemini_generate_stream(
+            self._transport,
+            f"{self._base_url}/models/{model_id}:streamGenerateContent?alt=sse",
+            headers=self._headers(),
+            payload=gemini_generate_request(
+                self._model.model_id,
+                gateway_model_request(request),
+            ),
+            request=request,
+            deadline=deadline,
+            idempotency_key=idempotency_key,
+            retry_policy=retry_policy or self._retry_policy,
+            timeout_seconds=self._timeout_seconds,
+        )
 
     def _headers(self) -> dict[str, str]:
         """Build native Gemini headers using the goog API key scheme."""
@@ -288,3 +334,21 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
 def _path_model_id(model_id: str) -> str:
     """Remove the optional wire prefix before placing a model in a Gemini path."""
     return model_id.removeprefix("models/")
+
+
+def _gemini_refusal_signal(value: object) -> ProviderRefusalSignal | None:
+    """Map a Gemini finish reason to a content-free refusal category.
+
+    Args:
+        value: Provider-reported candidate finish reason.
+
+    Returns:
+        A normalized refusal signal, or ``None`` for ordinary terminal reasons.
+    """
+    if value in {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"}:
+        return ProviderRefusalSignal.SAFETY
+    if value == "RECITATION":
+        return ProviderRefusalSignal.COPYRIGHT
+    if value == "SPII":
+        return ProviderRefusalSignal.SENSITIVE_INFORMATION
+    return None

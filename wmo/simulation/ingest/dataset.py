@@ -125,7 +125,7 @@ def persist_trace_dataset(
         code_revision=code_revision,
     )
     dataset = TraceDataset(
-        schema_version=1,
+        schema_version=2,
         created_at=created_at,
         code_revision=code_revision,
         source=source,
@@ -233,7 +233,7 @@ def verify_current_trace_dataset(
         raise ArtifactCorruptionError(
             f"trace dataset {dataset.dataset_id} envelope is not canonical current-build JSON"
         )
-    if traces_payload != canonical_jsonl_bytes(loaded.traces):
+    if traces_payload != _canonical_trace_payload(loaded):
         raise ArtifactCorruptionError(
             f"trace dataset {dataset.dataset_id} records are not canonical current-build JSONL"
         )
@@ -279,6 +279,29 @@ def verify_current_trace_dataset(
             f"trace dataset {dataset.dataset_id} is not a current content-addressed build dataset; "
             "rebuild the project before refreshing runtime retrieval evidence"
         )
+
+
+def _canonical_trace_payload(loaded: LoadedTraceDataset) -> bytes:
+    """Return exact canonical bytes for current or migrated schema-v1 trace records.
+
+    Args:
+        loaded: Verified dataset and current typed trace records.
+
+    Returns:
+        Canonical payload in the owning dataset schema. Only schema v1 removes the billing
+        field that its narrow loader migration supplied.
+    """
+    if loaded.dataset.schema_version == 2:
+        return canonical_jsonl_bytes(loaded.traces)
+    legacy_records = []
+    for trace in loaded.traces:
+        record = trace.model_dump(mode="json")
+        for span in record["spans"]:
+            model = span.get("model")
+            if isinstance(model, dict):
+                model.pop("billing_source", None)
+        legacy_records.append(record)
+    return canonical_jsonl_bytes(legacy_records)
 
 
 def read_trace_model_identity_evidence(

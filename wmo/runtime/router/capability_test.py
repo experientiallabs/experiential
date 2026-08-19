@@ -10,6 +10,7 @@ import pytest
 
 from wmo.common.core.artifacts import canonical_json_bytes
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -53,6 +54,7 @@ def _catalog(*, supports_completions: bool) -> RuntimeModelCatalog:
             },
             models={
                 alias: ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="provider",
                     model=f"model-{alias}",
                     capabilities=capabilities,

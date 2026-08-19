@@ -95,7 +95,7 @@ def persist_runtime_rag_dataset(
         sha256=sha256_json([item.model_dump(mode="json") for item in ordered_inputs]),
     )
     content = {
-        "schema_version": 1,
+        "schema_version": 2,
         "inputs": [item.model_dump(mode="json") for item in ordered_inputs],
         "code_revision": code_revision,
         "source": source.model_dump(mode="json"),
@@ -109,7 +109,7 @@ def persist_runtime_rag_dataset(
     }
     dataset_id = stable_id("trace-dataset", content)
     dataset = TraceDataset(
-        schema_version=1,
+        schema_version=2,
         created_at=created_at,
         inputs=ordered_inputs,
         code_revision=code_revision,

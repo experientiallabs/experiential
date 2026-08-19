@@ -40,6 +40,7 @@ from wmo.common.judging import (
 from wmo.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelClient,
     ModelRequest,
     ModelResponse,
@@ -88,6 +89,7 @@ class _FakeJudgeClient:
 
 def _model() -> ModelSnapshot:
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fake",
         model_id="judge-model",
         capabilities_sha256=_DIGEST,
@@ -383,6 +385,7 @@ def test_lm_judge_fails_closed_for_malformed_and_unsupported_outputs(
             clock=lambda: _TIME,
         ).judge_persisted(store, **source_ids)
     wrong_model = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fake",
         model_id="other-judge",
         capabilities_sha256=_DIGEST,

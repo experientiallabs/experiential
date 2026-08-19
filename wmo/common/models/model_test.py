@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     Embedding,
     ModelCapabilities,
     ModelFinishReason,
@@ -18,6 +19,7 @@ from wmo.common.models import (
     NumericMeasurement,
     OperationEconomics,
     RoutedCandidateSnapshot,
+    ToolCall,
     ToolChoice,
     Usage,
     combine_economics,
@@ -35,9 +37,21 @@ def test_actions_need_payload_and_measurements_are_finite() -> None:
         NumericMeasurement(value=float("inf"), provenance="observed")
 
 
+def test_current_model_snapshot_requires_explicit_billing_source() -> None:
+    """A newly frozen model identity cannot silently infer the credential owner."""
+    with pytest.raises(ValidationError, match="billing_source"):
+        ModelSnapshot(  # ty: ignore[missing-argument]
+            provider="openai",
+            model_id="fixture",
+            capabilities_sha256=_CAPABILITIES_DIGEST,
+            connection_sha256="b" * 64,
+        )
+
+
 def test_completed_factory_prefers_served_identity_and_maps_the_length_limit() -> None:
     """The shared factory keeps served identity, observed latency, and the finish reason."""
     configured = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="configured-model",
         capabilities_sha256=_CAPABILITIES_DIGEST,
@@ -131,14 +145,15 @@ def test_completion_support_preserves_provider_identity_for_existing_traces() ->
         )
 
 
-def test_routed_candidate_payload_reserializes_byte_for_byte() -> None:
-    """Automatic capability freezing cannot add fields to the candidate contract."""
+def test_routed_candidate_payload_serializes_explicit_billing_source() -> None:
+    """Automatic capability freezing retains the model billing source byte for byte."""
     payload = {
         "alias": "candidate-a",
         "model": {
             "provider": "openai",
             "model_id": "model-a",
             "revision": None,
+            "billing_source": "host_managed",
             "capabilities_sha256": "a" * 64,
             "connection_sha256": "b" * 64,
         },
@@ -156,6 +171,34 @@ def test_model_messages_reject_tool_and_assistant_fields_on_the_wrong_roles() ->
         ModelMessage(role="user", assistant_action=AssistantAction(content="wrong"))
     with pytest.raises(ValidationError, match="tool messages require tool_call_id"):
         ModelMessage(role="tool", content="missing linkage")
+
+
+def test_tool_call_preserves_optional_raw_arguments_without_changing_legacy_payloads() -> None:
+    """Raw provider JSON replays exactly but stays outside semantic artifact payloads."""
+    legacy = ToolCall(call_id="call-1", name="lookup", arguments={"a": 1, "b": 2})
+    retained = ToolCall(
+        call_id="call-1",
+        name="lookup",
+        arguments={"a": 1, "b": 2},
+        raw_arguments='{ "b": 2, "a": 1 }',
+    )
+
+    assert legacy.model_dump(mode="json") == {
+        "call_id": "call-1",
+        "name": "lookup",
+        "arguments": {"a": 1, "b": 2},
+    }
+    assert legacy.arguments_json(sort_keys=True, compact=True) == '{"a":1,"b":2}'
+    assert retained.arguments_json() == '{ "b": 2, "a": 1 }'
+    assert retained.arguments_json(sort_keys=True, compact=True) == '{"a":1,"b":2}'
+    assert retained.model_dump(mode="json") == legacy.model_dump(mode="json")
+    with pytest.raises(ValidationError, match="must match parsed"):
+        ToolCall(
+            call_id="call-1",
+            name="lookup",
+            arguments={"a": 1},
+            raw_arguments='{"a":2}',
+        )
 
 
 def test_combine_economics_reports_partial_totals_only_when_asked() -> None:

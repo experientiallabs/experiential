@@ -16,7 +16,13 @@ from wmo.common.core.artifacts import FailureCode, StructuredFailure
 UNKNOWN_DISPATCH_RESERVED_COST_KEY = "unknown_dispatch_reserved_cost_usd"
 """Failure-detail key holding the conservative worst-case charge for an unknown dispatch."""
 
-_DISPATCH_FAILURE_PHASE = "candidate_or_world_model"
+_RETRYABLE_DISPATCH_PHASES = frozenset({"candidate_or_world_model", "world_model_protocol"})
+"""Persisted failure phases whose retryable provider failures resume may re-execute.
+
+Candidate or world-model transport dispatches and stochastic world-model protocol
+outputs both fail for reasons that say nothing deterministic about the episode, so a
+fresh sample of the same cell is meaningful evidence.
+"""
 
 
 def unknown_spend_failure(failure: StructuredFailure | None) -> bool:
@@ -60,11 +66,11 @@ def unknown_dispatch_reserved_cost_usd(failure: StructuredFailure | None) -> flo
 
 
 def retryable_dispatch_failure(failure: StructuredFailure | None) -> bool:
-    """Return whether a persisted provider dispatch failure is transport-retryable.
+    """Return whether a persisted provider dispatch failure is stochastically retryable.
 
-    Only candidate or world-model dispatch failures qualify, and only when the
-    persisted failure is marked retryable. Budget, validation, and stale-lease
-    failures never qualify.
+    Only candidate or world-model transport dispatch failures and world-model protocol
+    output failures qualify, and only when the persisted failure is marked retryable.
+    Budget, validation, and stale-lease failures never qualify.
 
     Args:
         failure: Structured failure retained by a rollout artifact, or ``None``.
@@ -76,6 +82,6 @@ def retryable_dispatch_failure(failure: StructuredFailure | None) -> bool:
         return False
     if failure.code != FailureCode.PROVIDER:
         return False
-    if failure.details.get("phase") != _DISPATCH_FAILURE_PHASE:
+    if failure.details.get("phase") not in _RETRYABLE_DISPATCH_PHASES:
         return False
     return failure.retryable

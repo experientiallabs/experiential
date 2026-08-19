@@ -295,9 +295,10 @@ def _execution_matches(
         preflight.completed_build.fit_rag,
         preflight.completed_build.world_model,
         preflight.setup_input,
-        preflight.judge_audit_input,
         preflight.approved_calibration_input,
     }
+    if preflight.judge_audit_input is not None:
+        required_inputs.add(preflight.judge_audit_input)
     return (
         execution.code_revision == code_revision
         and expected_candidates == actual_candidates

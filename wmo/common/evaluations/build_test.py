@@ -33,6 +33,7 @@ from wmo.common.evaluations.evidence import (
 from wmo.common.evaluations.fidelity import build_fidelity_report
 from wmo.common.judging import DimensionJudgment, DimensionScoreMap, JudgeCalibration, Judgment
 from wmo.common.models import (
+    BillingSource,
     CandidateTokenPrice,
     ModelSnapshot,
     NumericMeasurement,
@@ -660,6 +661,7 @@ def _store(root: Path) -> ArtifactStore:
 def _snapshot(alias: str, *, connection: str = "b" * 64) -> ModelSnapshot:
     """Create one secret-free resolved model snapshot."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=alias,
         revision="fixture",

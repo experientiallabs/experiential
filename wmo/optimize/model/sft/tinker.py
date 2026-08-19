@@ -12,7 +12,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
-from wmo.common.core.artifacts import canonical_json_bytes
 from wmo.common.models import AssistantAction, NumericMeasurement, ToolCall
 from wmo.optimize.model.sft.contracts import (
     AssistantActionEvent,
@@ -336,7 +335,7 @@ def _tool_call(call: ToolCall) -> TinkerToolCall:
         "id": call.call_id,
         "function": {
             "name": call.name,
-            "arguments": canonical_json_bytes(call.arguments).decode("utf-8"),
+            "arguments": call.arguments_json(sort_keys=True, compact=True),
         },
     }
 

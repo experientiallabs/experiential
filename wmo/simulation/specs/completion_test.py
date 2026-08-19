@@ -10,6 +10,7 @@ import pytest
 
 from wmo.common.core.artifacts import canonical_json_bytes
 from wmo.common.models import (
+    BillingSource,
     CompletionCostReservation,
     ModelSnapshot,
     completion_cost_reservation,
@@ -35,6 +36,7 @@ def _model(model_id: str) -> ModelSnapshot:
         Stable model snapshot for a completion reservation.
     """
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id=model_id,
         capabilities_sha256="a" * 64,

@@ -15,6 +15,7 @@ import pytest
 from wmo.common.core.artifacts import FailureAttribution, FailureCode
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
@@ -29,9 +30,10 @@ from wmo.runtime.agents.pi import (
     PiRuntimePreflightError,
     PiTranscriptError,
     _episode_from_pi_events,
-    _model_messages_from_pi,
+    _normalize_pi_chat_payload,
 )
 from wmo.runtime.environments import EnvironmentSession, Observation
+from wmo.runtime.openai_protocol import decode_chat, model_request
 
 _DETERMINISTIC_EVENT_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -313,6 +315,7 @@ class _Model:
                 ),
             ),
             model=ModelSnapshot(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 provider="fixture",
                 model_id="fixture-model",
                 capabilities_sha256=_DIGEST,
@@ -567,28 +570,34 @@ def test_pi_bridge_messages_tolerate_openai_wire_variations() -> None:
     The strict served-router schema would reject these; the bridge must not abort the
     episode on OpenAI-legal payload variations Pi is free to emit.
     """
-    messages = _model_messages_from_pi(
-        {
-            "messages": [
-                {"role": "user", "content": "run the task", "name": "pi-user"},
-                {"role": "assistant", "content": "on it", "refusal": None},
+    request = model_request(
+        decode_chat(
+            _normalize_pi_chat_payload(
                 {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
+                    "model": "wmo-injected-model",
+                    "messages": [
+                        {"role": "user", "content": "run the task", "name": "pi-user"},
+                        {"role": "assistant", "content": "on it", "refusal": None},
                         {
-                            "id": "call-1",
-                            "type": "function",
-                            "function": {"name": "read", "arguments": "{}"},
-                            "index": 0,
-                        }
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {"name": "read", "arguments": "{}"},
+                                    "index": 0,
+                                }
+                            ],
+                        },
+                        {"role": "tool", "content": "ok", "tool_call_id": "call-1"},
+                        {"role": "user", "content": "finish up", "tool_calls": None},
                     ],
-                },
-                {"role": "tool", "content": "ok", "tool_call_id": "call-1"},
-                {"role": "user", "content": "finish up", "tool_calls": None},
-            ]
-        }
+                }
+            )
+        ).request
     )
+    messages = request.messages
 
     assert [message.role for message in messages] == [
         "user",

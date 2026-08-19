@@ -2,6 +2,11 @@
 
 from wmo.common.models.catalog import (
     ConnectionConfig,
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
+    GatewayEquivalenceCertification,
+    GatewayPoolRecord,
+    GatewayTokenPrices,
     ModelCatalog,
     ModelCatalogError,
     ModelRecord,
@@ -11,6 +16,10 @@ from wmo.common.models.catalog import (
     write_model_catalog,
 )
 from wmo.common.models.client import EmbeddingClient, IdempotentModelClient, ModelClient
+from wmo.common.models.connection_authoring import (
+    ProviderConnectionAuthoringError,
+    configure_provider_connections,
+)
 from wmo.common.models.discovery import (
     DiscoveredModel,
     PricingSource,
@@ -22,10 +31,20 @@ from wmo.common.models.discovery import (
     served_roles,
     serves_role,
 )
+from wmo.common.models.gateway_catalog import (
+    DeploymentId,
+    ExactModelDeployment,
+    ExactModelId,
+    ExactModelPool,
+    ExactModelPoolId,
+    NormalizedGatewayCatalog,
+    normalize_gateway_catalog,
+)
 from wmo.common.models.known_models import KnownModel, known_model_metadata
 from wmo.common.models.model import (
     DEFAULT_REASONING_EFFORT,
     AssistantAction,
+    BillingSource,
     Embedding,
     ModelAlias,
     ModelCapabilities,
@@ -78,14 +97,25 @@ from wmo.common.models.structured import structured_json_text
 
 __all__ = [
     "AssistantAction",
+    "BillingSource",
     "CandidateTokenPrice",
     "CompletionCostReservation",
     "ConnectionConfig",
+    "DeploymentId",
     "DiscoveredModel",
     "Embedding",
     "EmbeddingClient",
     "DEFAULT_REASONING_EFFORT",
     "EmbeddingCostReservation",
+    "ExactModelDeployment",
+    "ExactModelId",
+    "ExactModelPool",
+    "ExactModelPoolId",
+    "GatewayDeploymentCapabilities",
+    "GatewayDeploymentMetadata",
+    "GatewayEquivalenceCertification",
+    "GatewayPoolRecord",
+    "GatewayTokenPrices",
     "IdempotentModelClient",
     "KnownModel",
     "ModelCatalog",
@@ -102,10 +132,12 @@ __all__ = [
     "ModelSnapshot",
     "NumericMeasurement",
     "ReasoningEffort",
+    "NormalizedGatewayCatalog",
     "OperationEconomics",
     "PricingSnapshot",
     "PricingSource",
     "ProviderConnection",
+    "ProviderConnectionAuthoringError",
     "ProviderModelSelection",
     "ProviderSetup",
     "ProviderSetupError",
@@ -125,12 +157,14 @@ __all__ = [
     "completion_cost_reservation",
     "completion_request_cost_usd",
     "configure_provider_catalog",
+    "configure_provider_connections",
     "configure_router_candidates",
     "derive_connection_name",
     "derive_model_alias",
     "known_model_metadata",
     "load_model_catalog",
     "load_pricing_snapshot",
+    "normalize_gateway_catalog",
     "persist_pricing_snapshot",
     "reconcile_completion_economics",
     "resolve_discovered_model",

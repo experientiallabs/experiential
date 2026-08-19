@@ -15,6 +15,7 @@ import pytest
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -100,6 +101,7 @@ class _EchoClient(ProviderHttpClient):
 def _snapshot() -> ModelSnapshot:
     """Build an immutable identity fixture for the echo client."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="echo",
         model_id="echo-1",
         revision="fixture-revision",
@@ -202,4 +204,7 @@ def test_complete_passes_the_derived_timeout_to_the_transport() -> None:
     client.complete(ModelRequest(messages=(message,), maximum_output_tokens=16_000))
     client.complete(ModelRequest(messages=(message,)))
 
-    assert transport.timeouts == [pytest.approx(480.0), DEFAULT_TIMEOUT_SECONDS]
+    assert transport.timeouts == [
+        pytest.approx(480.0),
+        pytest.approx(DEFAULT_TIMEOUT_SECONDS),
+    ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -46,6 +47,7 @@ def _catalog(
         },
         models={
             "judge-main": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 connection="openai-main",
                 model=model,
                 capabilities=capabilities,

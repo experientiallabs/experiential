@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan, EvaluationProtocol
-from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot, RoutedCandidateSnapshot
 from wmo.common.routing import KnnGuard
 from wmo.optimize.router.composition import RouterEvaluationSetup
 from wmo.optimize.router.evaluation.simulation_spec import build_router_simulation_spec
@@ -26,6 +26,7 @@ def _snapshot(alias: str) -> ModelSnapshot:
         Snapshot with fixed capability and connection digests.
     """
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=alias,
         revision="fixture",

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -56,13 +57,22 @@ def _catalog() -> ModelCatalog:
         connections={"provider": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")},
         models={
             "candidate-a": ModelRecord(
-                connection="provider", model="a", capabilities=_capabilities()
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="provider",
+                model="a",
+                capabilities=_capabilities(),
             ),
             "candidate-b": ModelRecord(
-                connection="provider", model="b", capabilities=_capabilities()
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="provider",
+                model="b",
+                capabilities=_capabilities(),
             ),
             "world": ModelRecord(
-                connection="provider", model="world", capabilities=ModelCapabilities()
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="provider",
+                model="world",
+                capabilities=ModelCapabilities(),
             ),
         },
         roles=ModelRoles(world_model="world"),
@@ -175,8 +185,13 @@ def test_provider_and_router_candidate_setup_is_atomic_on_validation_failure(
         update={
             "models": {
                 **_catalog().models,
-                "judge": ModelRecord(connection="provider", model="judge"),
+                "judge": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="provider",
+                    model="judge",
+                ),
                 "embedder": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="provider",
                     model="embedder",
                     capabilities=ModelCapabilities(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from wmo.common.models import (
+    BillingSource,
     ModelCapabilities,
     ModelMessage,
     ModelRequest,
@@ -53,6 +54,7 @@ def test_reserved_judge_prices_openai_usage_without_observed_cost() -> None:
     full reserved output budget, not the hard admission ceiling.
     """
     model = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="judge-model",
         capabilities_sha256="a" * 64,
@@ -130,6 +132,7 @@ def test_reserved_judge_prices_openai_usage_without_observed_cost() -> None:
 def test_reserved_judge_rejects_an_over_ceiling_transcript_without_a_provider_call() -> None:
     """An over-ceiling request raises the typed admission error before any provider dispatch."""
     model = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="judge-model",
         capabilities_sha256="a" * 64,
@@ -175,6 +178,7 @@ def test_reserved_judge_rejects_an_over_ceiling_transcript_without_a_provider_ca
 def test_reserved_judge_prices_an_exhausted_empty_output_dispatch_conservatively() -> None:
     """An exhausted empty-output dispatch surfaces its conservative retry-bound spend."""
     model = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="judge-model",
         capabilities_sha256="a" * 64,

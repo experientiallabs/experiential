@@ -16,10 +16,15 @@ from wmo.common.models import (
 from wmo.runtime.models.providers.anthropic import (
     AnthropicClient,
     anthropic_messages_request,
+    anthropic_messages_response,
 )
-from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
-from wmo.runtime.models.providers.gemini import GeminiClient
-from wmo.runtime.models.providers.openai import OpenAIClient
+from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
+    ProviderRetryableResponseError,
+)
+from wmo.runtime.models.providers.gemini import GeminiClient, gemini_generate_response
+from wmo.runtime.models.providers.openai import OpenAIClient, openai_responses_response
 from wmo.runtime.models.providers.openai_compatible import OpenRouterClient
 from wmo.runtime.models.providers.openai_compatible_test import _request, _snapshot
 from wmo.runtime.models.providers.tinker_sampling import (
@@ -113,7 +118,12 @@ def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity()
     assert isinstance(client, EmbeddingClient)
     assert response.model.model_id == "gpt-5.4-2026-08-11"
     assert response.output.tool_calls == (
-        ToolCall(call_id="call-new", name="create_ticket", arguments={"priority": "urgent"}),
+        ToolCall(
+            call_id="call-new",
+            name="create_ticket",
+            arguments={"priority": "urgent"},
+            raw_arguments='{"priority":"urgent"}',
+        ),
     )
     assert response.economics.usage == Usage(
         input_tokens=13,
@@ -470,6 +480,10 @@ def test_openai_reasoning_only_output_is_retried_and_a_later_answer_completes() 
 
     assert response.output.content == "ok"
     assert len(transport.requests) == 2
+    assert (
+        transport.requests[0].headers["Idempotency-Key"]
+        == transport.requests[1].headers["Idempotency-Key"]
+    )
 
 
 def test_openai_reasoning_only_output_surfaces_a_retryable_error_after_exhaustion() -> None:
@@ -487,3 +501,62 @@ def test_openai_reasoning_only_output_surfaces_a_retryable_error_after_exhaustio
         client.complete(_request())
 
     assert len(transport.requests) == 2
+
+
+def test_native_provider_refusals_are_typed_without_exposing_refusal_text() -> None:
+    """OpenAI, Anthropic, and Gemini preserve content-free refusal signals."""
+    openai_canary = "openai-refusal-canary"
+    with pytest.raises(ProviderRefusalError) as openai_error:
+        openai_responses_response(
+            {
+                "id": "resp_refusal",
+                "object": "response",
+                "created_at": 1.0,
+                "status": "completed",
+                "model": "gpt-fixture",
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_refusal",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "refusal", "refusal": openai_canary}],
+                    }
+                ],
+            },
+            configured_model=_snapshot("openai", "gpt-fixture"),
+            latency_seconds=0.1,
+        )
+    assert openai_error.value.signal is ProviderRefusalSignal.PROVIDER_REFUSAL
+    assert openai_canary not in str(openai_error.value)
+
+    with pytest.raises(ProviderRefusalError) as anthropic_error:
+        anthropic_messages_response(
+            {
+                "content": [{"type": "text", "text": "anthropic-refusal-canary"}],
+                "stop_reason": "refusal",
+            },
+            configured_model=_snapshot("anthropic", "claude-fixture"),
+            latency_seconds=0.1,
+        )
+    assert anthropic_error.value.signal is ProviderRefusalSignal.PROVIDER_REFUSAL
+    assert "anthropic-refusal-canary" not in str(anthropic_error.value)
+
+    with pytest.raises(ProviderRefusalError) as gemini_error:
+        gemini_generate_response(
+            {
+                "candidates": [
+                    {
+                        "finishReason": "SAFETY",
+                        "content": {"parts": [{"text": "gemini-refusal-canary"}]},
+                    }
+                ]
+            },
+            configured_model=_snapshot("gemini", "gemini-fixture"),
+            latency_seconds=0.1,
+        )
+    assert gemini_error.value.signal is ProviderRefusalSignal.SAFETY
+    assert "gemini-refusal-canary" not in str(gemini_error.value)

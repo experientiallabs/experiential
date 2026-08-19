@@ -9,6 +9,7 @@ from wmo.common.core.artifacts import ArtifactInput, sorted_unique_inputs
 from wmo.common.evaluations import ObservedProductionCell
 from wmo.common.models import (
     CandidateTokenPrice,
+    ModelCatalog,
     PricingSnapshot,
     load_model_catalog,
     persist_pricing_snapshot,
@@ -59,6 +60,7 @@ def materialize_automatic_router_artifacts(
     runtime_catalog: RuntimeModelCatalog,
     *,
     attribution_input: ArtifactInput,
+    catalog_override: ModelCatalog | None = None,
     router_embedding_maximum_attempts: int,
     completion_maximum_attempts: int,
     maximum_provider_cost_usd: float,
@@ -72,6 +74,7 @@ def materialize_automatic_router_artifacts(
         preflight: Aggregate read-only prerequisite and reservation result.
         runtime_catalog: Credential-capable resolver over the just-persisted catalog.
         attribution_input: Immutable real-overlap attribution persisted after consent.
+        catalog_override: Transient hosted catalog that must never be written into Project state.
         router_embedding_maximum_attempts: Active embedding retry ceiling.
         completion_maximum_attempts: Active completion retry ceiling.
         maximum_provider_cost_usd: Exact operator-approved shared provider ceiling.
@@ -84,7 +87,7 @@ def materialize_automatic_router_artifacts(
     Raises:
         ValueError: Catalog state, credentials, model identity, or replay evidence differs.
     """
-    active_catalog = load_model_catalog(project.model_catalog_path)
+    active_catalog = catalog_override or load_model_catalog(project.model_catalog_path)
     if active_catalog != preflight.catalog:
         raise ValueError("persisted model catalog differs from the confirmed router preflight")
     resolved_embedder = runtime_catalog.preflight(
@@ -151,14 +154,21 @@ def materialize_automatic_router_artifacts(
         code_revision=code_revision,
     )
     runtime_capability_input = capability_contract_input(project.artifacts, runtime_capabilities)
+    judge_inputs = (
+        (preflight.setup_input, preflight.approved_calibration_input)
+        if preflight.judge_audit_input is None
+        else (
+            preflight.setup_input,
+            preflight.judge_audit_input,
+            preflight.approved_calibration_input,
+        )
+    )
     execution_inputs = sorted_unique_inputs(
         preflight.completed_build.trace_dataset,
         preflight.completed_build.task_set,
         preflight.completed_build.fit_rag,
         preflight.completed_build.world_model,
-        preflight.setup_input,
-        preflight.judge_audit_input,
-        preflight.approved_calibration_input,
+        *judge_inputs,
         attribution_input,
         pricing_input,
         embedding_input,

@@ -22,6 +22,7 @@ from wmo.common.core.artifacts import (
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     EmbeddingCostReservation,
     ModelSnapshot,
     OperationEconomics,
@@ -709,6 +710,7 @@ def _task(task_id: str, partition: Literal["fit", "held_out"] = "held_out") -> T
 def _candidate() -> ModelSnapshot:
     """Return the exact candidate identity shared by both evidence modes."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id="candidate-a",
         revision="v1",
@@ -720,6 +722,7 @@ def _candidate() -> ModelSnapshot:
 def _world_model() -> ModelSnapshot:
     """Return the exact text simulator model identity."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id="world-model-a",
         revision="v1",

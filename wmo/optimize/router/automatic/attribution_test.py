@@ -7,7 +7,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from wmo.common.core.artifacts import JsonObject, SourceIdentity
-from wmo.common.models import ConnectionConfig, ModelSnapshot, RoutedCandidateSnapshot
+from wmo.common.models import (
+    BillingSource,
+    ConnectionConfig,
+    ModelSnapshot,
+    RoutedCandidateSnapshot,
+)
 from wmo.common.tasks import TaskCase
 from wmo.common.traces import Trace, TraceSource, TraceSpan
 from wmo.optimize.router.automatic.attribution import (
@@ -16,6 +21,7 @@ from wmo.optimize.router.automatic.attribution import (
 )
 from wmo.simulation.ingest.model_identity import (
     CAPABILITIES_DIGEST_ATTRIBUTE,
+    CONNECTION_DIGEST_ATTRIBUTE,
     IdentityComponentProvenance,
     TraceModelIdentityEvidence,
     TraceModelIdentityEvidenceSet,
@@ -142,6 +148,41 @@ def test_unspecified_identity_requires_full_snapshot_equality() -> None:
     )
 
 
+def test_trace_generator_identity_does_not_conflate_historical_and_current_payers() -> None:
+    """A current host-paid binding may match the same customer-attributed trace generator."""
+    recorded = _model("openai", "gpt-test", None, "a", "b")
+    current = recorded.model_copy(update={"billing_source": BillingSource.HOST_MANAGED})
+    trace = _trace((recorded,))
+    declared_trace = _trace(
+        (recorded,),
+        attributes=(
+            {
+                CAPABILITIES_DIGEST_ATTRIBUTE: recorded.capabilities_sha256,
+                CONNECTION_DIGEST_ATTRIBUTE: recorded.connection_sha256,
+            },
+        ),
+    )
+    candidates = _candidates(current, _model("anthropic", "other", None, "c", "d"))
+
+    strict = resolve_router_observed_attributions(
+        (_task(trace),),
+        (trace,),
+        _evidence(trace, capabilities="unspecified", connection="unspecified"),
+        candidates,
+    )[0]
+    declared = resolve_router_observed_attributions(
+        (_task(declared_trace),),
+        (declared_trace,),
+        _evidence(declared_trace, capabilities="declared", connection="declared"),
+        candidates,
+    )[0]
+
+    assert strict.candidate_model.billing_source == BillingSource.HOST_MANAGED
+    assert strict.match_kind == "strict_snapshot"
+    assert declared.candidate_model.billing_source == BillingSource.HOST_MANAGED
+    assert declared.match_kind == "declared_exact"
+
+
 def test_multi_span_trace_requires_one_candidate_alias() -> None:
     """Multiple model spans may agree on one alias but can never cross aliases."""
     first = _fallback_model("openai", "gpt-a", None)
@@ -240,6 +281,7 @@ def _fallback_model(provider: str, model_id: str, revision: str | None) -> Model
         Inferred capability and standard-connection snapshot.
     """
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider=provider,
         model_id=model_id,
         revision=revision,
@@ -270,6 +312,7 @@ def _model(
         Exact test model snapshot.
     """
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider=provider,
         model_id=model_id,
         revision=revision,

@@ -276,6 +276,25 @@ def load_grounded_world_model_artifact(
     return _load_verified_artifact(store, world_model_input)
 
 
+def verify_grounded_world_model_artifact(
+    store: ArtifactStore,
+    world_model_input: ArtifactInput,
+) -> GroundedWorldModelArtifact:
+    """Load and verify one persisted grounded world-model artifact without a client.
+
+    Args:
+        store: Project-local immutable artifact store.
+        world_model_input: Exact selected grounded world-model manifest pointer.
+
+    Returns:
+        Fully verified, content-addressed grounded world-model envelope.
+
+    Raises:
+        ValueError: The manifest, envelope, model, prompt, or content identity differs.
+    """
+    return load_grounded_world_model_artifact(store, world_model_input)
+
+
 def bind_fit_grounded_world_model(
     store: ArtifactStore,
     world_model_input: ArtifactInput,

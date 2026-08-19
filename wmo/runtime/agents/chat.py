@@ -12,23 +12,31 @@ from wmo.runtime.agents.interface import AgentEpisode
 from wmo.runtime.environments import EnvironmentSession, Observation
 
 _DEFAULT_MAXIMUM_MODEL_CALLS = 50
+_MAXIMUM_SYSTEM_PROMPT_CHARACTERS = 20_000
 
 
 class ChatAgentRuntime:
     """Run a bounded assistant and task-tool loop through WMO's canonical model boundary."""
 
-    def __init__(self, *, maximum_model_calls: int = _DEFAULT_MAXIMUM_MODEL_CALLS) -> None:
+    def __init__(
+        self,
+        *,
+        maximum_model_calls: int = _DEFAULT_MAXIMUM_MODEL_CALLS,
+        system_prompt: str | None = None,
+    ) -> None:
         """Configure the hard model-call ceiling for each isolated episode.
 
         Args:
             maximum_model_calls: Positive maximum number of model requests in one episode.
+            system_prompt: Optional canonical instruction prepended to every candidate request.
 
         Raises:
-            ValueError: The ceiling is not positive.
+            ValueError: The ceiling or optional system prompt is invalid.
         """
-        if maximum_model_calls <= 0:
-            raise ValueError("maximum_model_calls must be positive")
+        if not 1 <= maximum_model_calls <= 64:
+            raise ValueError("maximum_model_calls must be between 1 and 64")
         self._maximum_model_calls = maximum_model_calls
+        self._system_prompt = normalize_chat_system_prompt(system_prompt)
 
     def run(
         self,
@@ -50,7 +58,12 @@ class ChatAgentRuntime:
         Raises:
             ValueError: The model invokes a tool outside the task-visible schemas.
         """
-        messages = [ModelMessage(role="user", content=_task_prompt(task))]
+        messages = (
+            [ModelMessage(role="system", content=self._system_prompt)]
+            if self._system_prompt is not None
+            else []
+        )
+        messages.append(ModelMessage(role="user", content=_task_prompt(task)))
         events: list[RolloutSpan] = []
         usages: list[Usage] = []
         visible_tools = {tool.name for tool in task.tools}
@@ -120,6 +133,28 @@ class ChatAgentRuntime:
             stop_reason=StopReason.MAXIMUM_STEPS,
             usage=_combined_usage(usages),
         )
+
+
+def normalize_chat_system_prompt(value: str | None) -> str | None:
+    """Return one canonical optional built-in instruction or reject an unsafe shape.
+
+    Args:
+        value: Optional system prompt supplied by Project setup.
+
+    Returns:
+        Trimmed prompt or ``None`` when no hosted system was selected.
+
+    Raises:
+        ValueError: The prompt is blank or exceeds the shared Project contract.
+    """
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("system_prompt must not be blank")
+    if len(normalized) > _MAXIMUM_SYSTEM_PROMPT_CHARACTERS:
+        raise ValueError("system_prompt exceeds 20000 characters")
+    return normalized
 
 
 def _task_prompt(task: TaskCase) -> str:

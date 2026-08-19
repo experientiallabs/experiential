@@ -1,4 +1,4 @@
-"""Frozen online router runtime and loopback HTTP adapter."""
+"""Frozen project-selection runtime for gateway-backed aliases."""
 
 from __future__ import annotations
 
@@ -6,16 +6,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from wmo.runtime.router.application import (
-        RouterApplicationError as RouterApplicationError,
-    )
-    from wmo.runtime.router.application import (
-        create_project_completion_service as create_project_completion_service,
-    )
-    from wmo.runtime.router.application import (
-        create_project_router_app as create_project_router_app,
-    )
-    from wmo.runtime.router.endpoint import create_router_endpoint as create_router_endpoint
+    from wmo.runtime.router.errors import RouterApplicationError as RouterApplicationError
 
 from wmo.runtime.router.completion import (
     JournaledRouterCompletionService,
@@ -24,8 +15,15 @@ from wmo.runtime.router.completion import (
     RouterCompletionInProgressError,
     RouterCompletionService,
 )
+from wmo.runtime.router.economics import (
+    BillingSourceEconomics,
+    RoutedCompletionEconomics,
+    RoutedProviderComponent,
+    RoutedProviderOperation,
+    RoutedSpendDisposition,
+    RoutedSpendLedger,
+)
 from wmo.runtime.router.journal import (
-    JournaledRouterRuntime,
     RuntimeAcceptedEvent,
     RuntimeAttemptFailedEvent,
     RuntimeCompletedEvent,
@@ -36,6 +34,7 @@ from wmo.runtime.router.journal import (
     RuntimeJournalError,
     RuntimeJournalEvent,
 )
+from wmo.runtime.router.journal_service import JournaledRouterRuntime
 from wmo.runtime.router.runtime import (
     RoutedModelResponse,
     RouterEpisodeConflictError,
@@ -56,13 +55,16 @@ from wmo.runtime.router.snapshot import (
 )
 
 _SERVER_EXPORT_MODULES = {
-    "RouterApplicationError": "wmo.runtime.router.application",
-    "create_project_completion_service": "wmo.runtime.router.application",
-    "create_project_router_app": "wmo.runtime.router.application",
-    "create_router_endpoint": "wmo.runtime.router.endpoint",
+    "RouterApplicationError": "wmo.runtime.router.errors",
 }
 
 __all__ = [
+    "BillingSourceEconomics",
+    "RoutedCompletionEconomics",
+    "RoutedProviderComponent",
+    "RoutedProviderOperation",
+    "RoutedSpendDisposition",
+    "RoutedSpendLedger",
     "RoutedModelResponse",
     "JournaledRouterRuntime",
     "JournaledRouterCompletionService",
@@ -92,10 +94,7 @@ __all__ = [
     "load_runtime_trace_snapshot",
     "routed_task_text",
     "seal_runtime_trace_snapshot",
-    "create_router_endpoint",
     "RouterApplicationError",
-    "create_project_completion_service",
-    "create_project_router_app",
 ]
 
 

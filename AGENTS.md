@@ -58,8 +58,10 @@ uv run pytest -q
   World-model fidelity testing is a separately invoked common-evaluation mode with no authority
   over router fitting or runtime activation. Its reports contain measurements only and never carry
   an approval, denial, gate, threshold, or decision.
-- `wmo run PROJECT --root ROOT --port PORT [--ghost]` loads one frozen policy and exposes OpenAI Chat
-  Completions, Responses, and Models routes on loopback. Public request and response types come
+- `wmo run` starts the initialized authenticated multi-alias gateway on loopback.
+  `wmo run PROJECT --root ROOT --port PORT [--ghost]` retains the single-project compatibility
+  server. Both expose OpenAI Chat Completions, Responses, and Models routes. Public request and
+  response types come
   from the official OpenAI SDK. Chat retries use the standard `Idempotency-Key`; Responses
   continuations use `previous_response_id`. WMO never joins unrelated Chat callers by transcript
   prefix and requires no proprietary request fields or headers. Durable journaling is the default;
@@ -71,8 +73,9 @@ uv run pytest -q
 - Agent execution code lives under `wmo/runtime/`: whole-episode customer agents, executable
   environments, model clients, and frozen router execution. Optimization may depend on runtime;
   runtime code must not depend on simulation or optimization algorithms.
-- `wmo run` serves only a frozen local router policy. Simulation callers choose an `AgentRuntime`
-  and `EnvironmentRuntime` directly, in process.
+- No-argument `wmo run` serves only explicit active gateway aliases. The legacy project form serves
+  one frozen router policy. Simulation callers choose an `AgentRuntime` and `EnvironmentRuntime`
+  directly, in process.
 - Local Pi and process-environment adapters execute external code on the user's machine only when
   a caller explicitly selects them. Preserve bounded processes, the explicit working directory,
   and fail-closed support checks.
@@ -99,13 +102,15 @@ uv run pytest -q
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
 - The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
-  to `router` and `model`; the config group is locked to `budget`, `judge`, `providers`, and
-  `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
+  to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
+  and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
 - Every paid CLI command uses `wmo.cli.consent.require_spend_consent` after a credential-free
   conservative estimate and before credential or provider-client construction. The setting in
   `.wmo/settings.toml` is a hard per-command ceiling. Estimates at or below half run automatically,
   higher in-budget estimates need explicit confirmation, and `--yes` never overrides the ceiling.
+- Long-lived gateway serving is exempt from one-shot spend consent. Startup performs no provider
+  call; every later request requires key-derived authority and content-free attempt accounting.
 - `wmo optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
   It never builds a dataset, creates teacher rollouts, changes routing roles, or launches a
   simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
@@ -172,6 +177,11 @@ uv run pytest -q
    Provider execution belongs under `wmo/runtime/models/providers/`. Common, runtime, and simulation
    must not import optimize. Keep the locked CLI small and do not return production modules to the
    flat `wmo/` namespace.
+   Provider-neutral gateway request, stream-event, target, and persistence interfaces live under
+   `wmo/runtime/gateway/`. `lifecycle.py` composes them only for the explicit local launch. Exact
+   deployment metadata and singleton catalog normalization live under `wmo/common/models/`.
+   Gateway-only protocol and integer-pricing fields must not be added to `ModelCapabilities`:
+   its existing identity digest remains frozen for router artifact compatibility.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.

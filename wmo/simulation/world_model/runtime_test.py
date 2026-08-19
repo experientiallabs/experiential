@@ -14,6 +14,7 @@ import pytest
 from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes, sha256_json
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     Embedding,
     ModelCapabilities,
     ModelRequest,
@@ -141,6 +142,7 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
     )
     capabilities = ModelCapabilities(supports_embeddings=True)
     embedding_snapshot = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id="embed",
         capabilities_sha256=sha256_json(capabilities),
@@ -158,6 +160,7 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
         included_partitions=frozenset({"fit", "held_out"}),
     )
     world_snapshot = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id="world",
         capabilities_sha256=sha256_json(ModelCapabilities()),

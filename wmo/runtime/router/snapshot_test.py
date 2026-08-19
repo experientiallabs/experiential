@@ -20,10 +20,12 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    NumericMeasurement,
     OperationEconomics,
     Usage,
 )
@@ -35,6 +37,14 @@ from wmo.common.project import (
 )
 from wmo.common.routing import RouterFeatureExtractor, RoutingDecision
 from wmo.common.traces import load_trace_dataset
+from wmo.runtime.router.economics import (
+    BillingSourceEconomics,
+    RoutedCompletionEconomics,
+    RoutedProviderComponent,
+    RoutedProviderOperation,
+    RoutedSpendDisposition,
+    routed_completion_economics,
+)
 from wmo.runtime.router.journal import (
     RuntimeAcceptance,
     RuntimeAcceptedEvent,
@@ -63,6 +73,7 @@ def _snapshot(*, model_id: str = "gpt-test") -> ModelSnapshot:
         Deterministic model snapshot with fixed capability and connection digests.
     """
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id=model_id,
         capabilities_sha256=_DIGEST,
@@ -102,6 +113,37 @@ def _response(*, model: ModelSnapshot | None = None, content: str = "Done") -> M
         model=model or _snapshot(),
         economics=OperationEconomics(
             usage=Usage(input_tokens=12, output_tokens=3, cached_input_tokens=2)
+        ),
+    )
+
+
+def _economics() -> RoutedCompletionEconomics:
+    """Return deterministic billing attribution for a completed fixture response."""
+    return routed_completion_economics(
+        (
+            _operation(1, RoutedProviderComponent.ROUTER_EMBEDDING),
+            _operation(2, RoutedProviderComponent.SELECTED_CANDIDATE),
+        )
+    )
+
+
+def _operation(
+    ordinal: int,
+    component: RoutedProviderComponent,
+    *,
+    disposition: RoutedSpendDisposition = RoutedSpendDisposition.LOCALLY_PRICED,
+) -> RoutedProviderOperation:
+    """Build deterministic customer-managed provider operation evidence."""
+    return RoutedProviderOperation(
+        operation_id=f"routed-operation-{ordinal:020x}",
+        operation_ordinal=ordinal,
+        component=component,
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        disposition=disposition,
+        operation_count=(0 if disposition == RoutedSpendDisposition.DEFINITELY_NOT_INCURRED else 1),
+        economics=OperationEconomics(
+            usage=Usage(input_tokens=ordinal, output_tokens=0),
+            cost_usd=NumericMeasurement(value=ordinal / 1_000_000, provenance="estimated"),
         ),
     )
 
@@ -176,19 +218,32 @@ def _accept(
         conversation_id,
     )
     decision = _decision(identity.lineage_id, routed_request)
-    claim = journal.claim(
+    embedding = BillingSourceEconomics(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        economics=_operation(1, RoutedProviderComponent.ROUTER_EMBEDDING).economics,
+    )
+    reserved = journal.reserve_selection(
+        identity,
+        embedding,
+        now=now,
+        stale_after=timedelta(minutes=5),
+    )
+    assert reserved.reservation is not None
+    claim = journal.record_acceptance(
         identity,
         RuntimeAcceptance(
             decision=decision,
             selected_alias=decision.selected_alias,
             selected_model=_snapshot(),
+            router_embedding_billing_source=BillingSource.CUSTOMER_MANAGED,
             policy_input=ArtifactInput(
                 artifact_id=decision.policy_id,
                 sha256=decision.policy_sha256,
             ),
         ),
-        now=now,
-        stale_after=timedelta(minutes=5),
+        reserved.reservation,
+        _operation(1, RoutedProviderComponent.ROUTER_EMBEDDING),
+        accepted_at=now,
     )
     assert claim.accepted is not None
     return claim.accepted
@@ -223,12 +278,32 @@ def _complete(
         conversation_id=conversation_id,
         now=now,
     )
+    _reserve_candidate(journal, accepted, now=now)
     journal.record_completed(
         accepted,
         response or _response(),
+        candidate_operation=_economics().operations[-1],
         completed_at=now + timedelta(seconds=1),
     )
     return accepted
+
+
+def _reserve_candidate(
+    journal: RuntimeInteractionJournal,
+    accepted: RuntimeAcceptedEvent,
+    *,
+    now: datetime,
+) -> None:
+    """Persist one deterministic candidate reservation before low-level completion."""
+    claim = journal.reserve_candidate(
+        accepted,
+        BillingSourceEconomics(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            economics=_operation(2, RoutedProviderComponent.SELECTED_CANDIDATE).economics,
+        ),
+        now=now,
+    )
+    assert claim.status == "dispatch"
 
 
 def _artifact_bytes(store: ArtifactStore, artifact_id: str) -> dict[str, bytes]:
@@ -513,8 +588,8 @@ def test_dataset_replay_rejects_envelope_fields_outside_its_identity(
     dataset = json.loads(dataset_path.read_bytes())
     manifest = json.loads(manifest_path.read_bytes())
     if mutation == "schema-version":
-        dataset["schema_version"] = 2
-        manifest["schema_version"] = 2
+        dataset["schema_version"] = 1
+        manifest["schema_version"] = 1
     elif mutation == "traces-path":
         dataset["traces_path"] = "alternate-traces.jsonl"
     elif mutation == "semantic-convention":
@@ -573,6 +648,7 @@ def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
         request=request,
         conversation_id="customer-thread",
     )
+    _reserve_candidate(journal, first, now=_TIME)
     journal.record_failure(
         first,
         StructuredFailure(
@@ -591,14 +667,15 @@ def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
     )
     retry = journal.claim(
         identity,
-        None,
         now=_TIME + timedelta(seconds=2),
         stale_after=timedelta(minutes=5),
     )
     assert retry.accepted is not None
+    _reserve_candidate(journal, retry.accepted, now=_TIME + timedelta(seconds=2))
     journal.record_completed(
         retry.accepted,
         _response(content="Use the reset link."),
+        candidate_operation=_economics().operations[-1],
         completed_at=_TIME + timedelta(seconds=3),
     )
 
@@ -607,6 +684,7 @@ def test_retry_success_is_one_target_and_failures_remain_prefix_provenance(
         key="permanent-key",
         now=_TIME + timedelta(seconds=4),
     )
+    _reserve_candidate(journal, permanent, now=_TIME + timedelta(seconds=4))
     journal.record_failure(
         permanent,
         StructuredFailure(
@@ -661,6 +739,7 @@ def test_late_original_success_preserves_failure_and_superseded_retry(tmp_path: 
     journal, store = _journal_and_store(tmp_path)
     request = _request("Summarize the account")
     original = _accept(journal, key="late-key", request=request)
+    _reserve_candidate(journal, original, now=_TIME)
     journal.record_failure(
         original,
         StructuredFailure(
@@ -674,7 +753,6 @@ def test_late_original_success_preserves_failure_and_superseded_retry(tmp_path: 
     identity = _interaction_identity(journal.project_id, "late-key", request, None)
     replacement = journal.claim(
         identity,
-        None,
         now=_TIME + timedelta(seconds=2),
         stale_after=timedelta(minutes=5),
     )
@@ -682,6 +760,7 @@ def test_late_original_success_preserves_failure_and_superseded_retry(tmp_path: 
     journal.record_completed(
         original,
         _response(content="Account summary"),
+        candidate_operation=_economics().operations[-1],
         completed_at=_TIME + timedelta(seconds=3),
     )
 
@@ -869,6 +948,7 @@ def test_empty_or_failed_only_prefix_has_no_canonical_target_dataset(tmp_path: P
         )
 
     accepted = _accept(journal, key="failed-only")
+    _reserve_candidate(journal, accepted, now=_TIME)
     journal.record_failure(
         accepted,
         StructuredFailure(

@@ -10,6 +10,7 @@ import pytest
 from wmo.common.core.artifacts import ArtifactInput, JsonObject
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     CompletionCostReservation,
     EmbeddingCostReservation,
     ModelCapabilities,
@@ -89,6 +90,7 @@ class _Retriever:
 
 def _snapshot(name: str) -> ModelSnapshot:
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=name,
         capabilities_sha256="a" * 64,

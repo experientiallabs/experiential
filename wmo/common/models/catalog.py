@@ -5,12 +5,14 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
+from typing import Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
-from pydantic import Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
+    ArtifactId,
     ArtifactInput,
     ContractModel,
     JsonObject,
@@ -21,7 +23,12 @@ from wmo.common.core.artifacts import (
     validate_artifact_id,
 )
 from wmo.common.core.files import write_text_atomic
-from wmo.common.models.model import ModelCapabilities, ModelSnapshot, ReasoningEffort
+from wmo.common.models.model import (
+    BillingSource,
+    ModelCapabilities,
+    ModelSnapshot,
+    ReasoningEffort,
+)
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
@@ -171,6 +178,87 @@ class SFTModelProvenance(ContractModel):
     sampling_handle_sha256: Sha256
 
 
+class GatewayDeploymentCapabilities(ContractModel):
+    """Gateway protocol capabilities declared for one provider deployment.
+
+    These fields are intentionally separate from ``ModelCapabilities``. The latter participates
+    in frozen optimizer and runtime identities, while this declaration can evolve with the
+    gateway protocol without invalidating existing router artifacts.
+    """
+
+    supports_developer_messages: bool = False
+    supports_streaming: bool = False
+    supports_streaming_tool_arguments: bool = False
+    supports_strict_tools: bool = False
+    supports_parallel_tool_calls: bool = False
+    supports_structured_text: bool = False
+    supports_stop_sequences: bool = False
+    reports_refusals: bool = False
+    reports_cached_input_tokens: bool = False
+    reports_reasoning_tokens: bool = False
+
+
+class GatewayTokenPrices(ContractModel):
+    """Integer gateway attribution rates for one provider deployment.
+
+    Values are micro-USD per million provider-reported tokens. ``None`` means the rate is unknown;
+    it must never be interpreted as zero. Existing optimizer float pricing remains unchanged.
+    """
+
+    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+
+
+class GatewayDeploymentMetadata(ContractModel):
+    """Optional gateway-only metadata authored beside one existing model record."""
+
+    exact_model_id: ArtifactId | None = None
+    capabilities: GatewayDeploymentCapabilities = Field(
+        default_factory=GatewayDeploymentCapabilities
+    )
+    prices: GatewayTokenPrices = Field(default_factory=GatewayTokenPrices)
+    pricing_source: str | None = Field(default=None, min_length=1, max_length=512)
+    pricing_effective_at: AwareDatetime | None = None
+
+
+class GatewayEquivalenceCertification(ContractModel):
+    """Operator-authored evidence that deployments serve one exact model revision."""
+
+    authority: Literal["operator"] = "operator"
+    certification_id: ArtifactId
+    provenance: str = Field(min_length=1, max_length=2_048)
+    evidence_sha256: Sha256
+    certified_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _require_safe_provenance(self) -> GatewayEquivalenceCertification:
+        """Reject credential-like or control-bearing equivalence provenance."""
+        try:
+            assert_secret_free(self.model_dump(mode="json"))
+        except SecretBoundaryError as exc:
+            raise ValueError("equivalence provenance must be secret-free") from exc
+        if any(ord(character) < 32 for character in self.provenance):
+            raise ValueError("equivalence provenance must be display-safe")
+        return self
+
+
+class GatewayPoolRecord(ContractModel):
+    """Authored ordered deployments explicitly certified as one exact model."""
+
+    exact_model_id: ArtifactId
+    deployment_aliases: tuple[ArtifactId, ...] = Field(min_length=2)
+    equivalence: GatewayEquivalenceCertification
+
+    @model_validator(mode="after")
+    def _require_unique_deployments(self) -> GatewayPoolRecord:
+        """Reject repeated deployment aliases inside one equivalence pool."""
+        if len(set(self.deployment_aliases)) != len(self.deployment_aliases):
+            raise ValueError("gateway pool deployment aliases must not repeat")
+        return self
+
+
 class ModelRecord(ContractModel):
     """A stable local alias, exact capability snapshot, and provider-side model name.
 
@@ -182,7 +270,9 @@ class ModelRecord(ContractModel):
     connection: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=2_048)
     revision: str | None = Field(default=None, max_length=256)
+    billing_source: BillingSource
     capabilities: ModelCapabilities | None = None
+    gateway: GatewayDeploymentMetadata | None = None
     sft_provenance: SFTModelProvenance | None = None
 
     @model_validator(mode="after")
@@ -199,10 +289,14 @@ class ModelRecord(ContractModel):
                     "connection": self.connection,
                     "model": self.model,
                     "revision": self.revision,
+                    "billing_source": self.billing_source.value,
                     "capabilities": (
                         self.capabilities.model_dump(mode="json")
                         if self.capabilities is not None
                         else None
+                    ),
+                    "gateway": (
+                        self.gateway.model_dump(mode="json") if self.gateway is not None else None
                     ),
                     "sft_provenance": (
                         self.sft_provenance.model_dump(mode="json")
@@ -267,10 +361,19 @@ class ModelRoles(ContractModel):
 class ModelCatalog(ContractModel):
     """The local model aliases, connection metadata, and project role assignments."""
 
-    schema_version: int = Field(default=1, ge=1)
+    schema_version: Literal[2] = 2
     connections: dict[str, ConnectionConfig]
     models: dict[str, ModelRecord]
+    gateway_pools: dict[str, GatewayPoolRecord] = Field(default_factory=dict)
     roles: ModelRoles = Field(default_factory=ModelRoles)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _require_integer_schema_version(cls, value: object) -> object:
+        """Reject boolean and floating-point lookalikes at the version boundary."""
+        if type(value) is not int:
+            raise ValueError("model catalog schema_version must be an integer")
+        return value
 
     @field_validator("connections")
     @classmethod
@@ -286,10 +389,18 @@ class ModelCatalog(ContractModel):
     @field_validator("models")
     @classmethod
     def _require_valid_model_aliases(cls, value: dict[str, ModelRecord]) -> dict[str, ModelRecord]:
-        if not value:
-            raise ValueError("models.toml needs at least one model alias")
         for alias in value:
             validate_artifact_id(alias)
+        return value
+
+    @field_validator("gateway_pools")
+    @classmethod
+    def _require_valid_gateway_pool_names(
+        cls, value: dict[str, GatewayPoolRecord]
+    ) -> dict[str, GatewayPoolRecord]:
+        """Validate authored pool identifiers before cross-reference checks."""
+        for pool_id in value:
+            validate_artifact_id(pool_id)
         return value
 
     @model_validator(mode="after")
@@ -325,6 +436,29 @@ class ModelCatalog(ContractModel):
             raise ValueError(f"roles name unknown model aliases: {', '.join(unknown_aliases)}")
         if self.roles.incumbent is not None and self.roles.incumbent not in self.roles.candidates:
             raise ValueError("incumbent must also appear in roles.candidates")
+        pooled_aliases: set[str] = set()
+        for pool_id, pool in self.gateway_pools.items():
+            for alias in pool.deployment_aliases:
+                if alias in pooled_aliases:
+                    raise ValueError(
+                        f"gateway deployment alias {alias!r} appears in more than one pool"
+                    )
+                pooled_aliases.add(alias)
+                record = self.models.get(alias)
+                if record is None:
+                    raise ValueError(
+                        f"gateway pool {pool_id!r} names unknown model alias {alias!r}"
+                    )
+                connection = self.connections[record.connection]
+                if connection.provider == "tinker" or record.sft_provenance is not None:
+                    raise ValueError(
+                        f"gateway pool {pool_id!r} cannot contain training handle {alias!r}"
+                    )
+                if record.gateway is None or record.gateway.exact_model_id != pool.exact_model_id:
+                    raise ValueError(
+                        f"gateway pool {pool_id!r} requires alias {alias!r} to declare exact "
+                        "model identity"
+                    )
         return self
 
 
@@ -348,9 +482,55 @@ def load_model_catalog(path: Path) -> ModelCatalog:
     except tomllib.TOMLDecodeError as exc:
         raise ModelCatalogError(f"model catalog is invalid TOML: {path}") from exc
     try:
-        return ModelCatalog.model_validate(raw_catalog)
+        return ModelCatalog.model_validate(_migrate_legacy_model_catalog(raw_catalog))
     except ValueError as exc:
         raise ModelCatalogError(f"model catalog is invalid: {exc}") from exc
+
+
+def _migrate_legacy_model_catalog(raw_catalog: JsonObject) -> JsonObject:
+    """Upgrade only schema-v1 local catalogs with conservative customer-owned billing.
+
+    Args:
+        raw_catalog: Parsed secret-free TOML payload.
+
+    Returns:
+        A schema-v2 payload. Current schema records are returned unchanged so a missing
+        ``billing_source`` remains a validation error.
+    """
+    raw_version = raw_catalog.get("schema_version", 1)
+    if type(raw_version) is not int or raw_version != 1:
+        return raw_catalog
+    payload = cast(JsonObject, dict(raw_catalog))
+    models = raw_catalog.get("models")
+    if isinstance(models, dict):
+        migrated_models: JsonObject = {}
+        for alias, value in models.items():
+            if isinstance(value, dict):
+                record = cast(JsonObject, dict(value))
+                if "billing_source" in record:
+                    raise ValueError(
+                        "schema-v1 model record must not declare current billing_source"
+                    )
+                record["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
+                provenance = record.get("sft_provenance")
+                if isinstance(provenance, dict):
+                    migrated_provenance = cast(JsonObject, dict(provenance))
+                    base_model = provenance.get("base_model")
+                    if isinstance(base_model, dict):
+                        migrated_base = cast(JsonObject, dict(base_model))
+                        if "billing_source" in migrated_base:
+                            raise ValueError(
+                                "schema-v1 SFT base model must not declare current billing_source"
+                            )
+                        migrated_base["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
+                        migrated_provenance["base_model"] = migrated_base
+                    record["sft_provenance"] = migrated_provenance
+                migrated_models[str(alias)] = record
+            else:
+                migrated_models[str(alias)] = value
+        payload["models"] = migrated_models
+    payload["schema_version"] = 2
+    return payload
 
 
 def write_model_catalog(path: Path, catalog: ModelCatalog) -> None:

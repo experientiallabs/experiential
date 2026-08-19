@@ -11,6 +11,7 @@ from wmo.common.core.artifacts import stable_id
 from wmo.common.evaluations import EvaluationPlan, EvaluationProtocol
 from wmo.common.models import (
     ModelCatalog,
+    OperationEconomics,
     ProviderSetup,
     configure_provider_catalog_with_router_candidates,
     configure_router_candidates,
@@ -28,6 +29,7 @@ from wmo.optimize.router.automatic.judge import AutomaticRouterJudge, ReservedJu
 from wmo.optimize.router.automatic.preflight import (
     AutomaticRouterOptions,
     AutomaticRouterPreflight,
+    HostedAutomaticJudgeEvidence,
     preflight_automatic_router,
 )
 from wmo.optimize.router.composition import (
@@ -36,9 +38,11 @@ from wmo.optimize.router.composition import (
     RouterCompositionBudget,
     RouterCompositionResult,
     RouterEvaluationSetup,
+    RouterPolicyLock,
     RouterWorkflowServices,
     compose_router,
 )
+from wmo.optimize.router.fit.workflow import RouterFitWorkflowResult
 from wmo.runtime.agents import (
     AgentFactory,
     preflight_agent_factory,
@@ -70,6 +74,18 @@ class AutomaticRouterError(ValueError):
     """Automatic router composition failed at a consent or immutable binding boundary."""
 
 
+HostedPolicyCheckpoint = Callable[
+    [
+        RouterPolicyLock,
+        RouterFitWorkflowResult,
+        AutomaticRouterPreflight,
+        AutomaticRouterArtifacts,
+        tuple[OperationEconomics, ...],
+    ],
+    None,
+]
+
+
 @dataclass(frozen=True)
 class AutomaticRouterResult:
     """Verified preflight, immutable execution contract, and completed router chain."""
@@ -77,6 +93,7 @@ class AutomaticRouterResult:
     preflight: AutomaticRouterPreflight
     artifacts: AutomaticRouterArtifacts
     composition: RouterCompositionResult
+    judge_economics: tuple[OperationEconomics, ...]
 
 
 @dataclass(frozen=True)
@@ -100,6 +117,10 @@ def optimize_project_router(
     code_revision: str,
     phase_hook: Callable[[str], None] | None = None,
     progress: ProgressHook | None = None,
+    policy_lock_hook: Callable[[RouterPolicyLock, RouterFitWorkflowResult], None] | None = None,
+    hosted_policy_checkpoint: HostedPolicyCheckpoint | None = None,
+    hosted_judge: HostedAutomaticJudgeEvidence | None = None,
+    transient_catalog: bool = False,
 ) -> AutomaticRouterResult:
     """Optimize a router from one completed project with no workflow config file.
 
@@ -113,6 +134,11 @@ def optimize_project_router(
         code_revision: Exact producer revision.
         phase_hook: Optional local phase-order observer.
         progress: Optional observer of truthful stage names and exact unit counts.
+        policy_lock_hook: Optional hosted checkpoint invoked at the immutable fit lock.
+        hosted_policy_checkpoint: Rich hosted-only durable checkpoint with preflight, immutable
+            inputs, and reconciled judge economics available before held-out work.
+        hosted_judge: Optional machine-only provisional judge evidence.
+        transient_catalog: Avoid every root-global catalog read or write for hosted execution.
 
     Returns:
         Complete preflight, execution contract, optimized policy, report, and runtime.
@@ -126,22 +152,27 @@ def optimize_project_router(
         project,
         candidate_plan.selection,
         catalog_override=candidate_plan.prospective_catalog,
+        hosted_judge=hosted_judge,
         options=options,
     )
     if not provider_spend_consented:
         raise AutomaticRouterError(
             "router optimization requires explicit consent for the full provider-spend ceiling"
         )
-    verify_router_candidate_catalog_state(
-        project.model_catalog_path,
-        candidate_plan.expected_catalog_sha256,
-    )
+    if not transient_catalog:
+        verify_router_candidate_catalog_state(
+            project.model_catalog_path,
+            candidate_plan.expected_catalog_sha256,
+        )
     resolved_catalog = runtime_catalog.with_catalog(candidate_plan.prospective_catalog)
     agent_factory = _resolve_agent_factory(preflight, options)
     resolved = _resolve_all_models(preflight, resolved_catalog, options)
-    configured = persist_router_candidate_setup(project, candidate_plan)
-    if configured != candidate_plan.prospective_catalog:
-        raise AutomaticRouterError("persisted router candidate catalog differs from confirmation")
+    if not transient_catalog:
+        configured = persist_router_candidate_setup(project, candidate_plan)
+        if configured != candidate_plan.prospective_catalog:
+            raise AutomaticRouterError(
+                "persisted router candidate catalog differs from confirmation"
+            )
     _attribution, attribution_input = persist_router_observed_attribution_set(
         project.artifacts,
         trace_dataset=preflight.completed_build.trace_dataset,
@@ -157,6 +188,7 @@ def optimize_project_router(
         preflight,
         resolved_catalog,
         attribution_input=attribution_input,
+        catalog_override=(candidate_plan.prospective_catalog if transient_catalog else None),
         router_embedding_maximum_attempts=options.router_embedding_maximum_attempts,
         completion_maximum_attempts=options.completion_maximum_attempts,
         maximum_provider_cost_usd=options.maximum_provider_cost_usd,
@@ -175,6 +207,20 @@ def optimize_project_router(
         options,
         progress=progress,
     )
+
+    def checkpoint(lock: RouterPolicyLock, fit: RouterFitWorkflowResult) -> None:
+        """Forward the immutable policy lock to each requested checkpoint observer."""
+        if policy_lock_hook is not None:
+            policy_lock_hook(lock, fit)
+        if hosted_policy_checkpoint is not None:
+            hosted_policy_checkpoint(
+                lock,
+                fit,
+                preflight,
+                artifacts,
+                judge.provider_economics,
+            )
+
     composition = compose_router(
         project,
         TraceNormalizationResult(
@@ -196,11 +242,17 @@ def optimize_project_router(
         code_revision=code_revision,
         phase_hook=phase_hook,
         progress=progress,
+        policy_lock_hook=(
+            checkpoint
+            if policy_lock_hook is not None or hosted_policy_checkpoint is not None
+            else None
+        ),
     )
     return AutomaticRouterResult(
         preflight=preflight,
         artifacts=artifacts,
         composition=composition,
+        judge_economics=judge.provider_economics,
     )
 
 
@@ -383,6 +435,11 @@ def _resolve_agent_factory(
         factory = resolve_agent_factory(
             preflight.project_config.agent,
             maximum_model_calls=options.maximum_model_calls,
+            system_prompt=(
+                preflight.project_config.system.system_prompt
+                if preflight.project_config.system is not None
+                else None
+            ),
         )
         preflight_agent_factory(factory)
         return factory
@@ -522,7 +579,7 @@ def _workflow_services(
                 quality_tolerance=0.02,
             ),
             incumbent_alias=preflight.incumbent_alias,
-            judgment_status="human_calibrated",
+            judgment_status=preflight.judgment_status,
             world_model_settings=WorldModelSettings(
                 world_model_alias=preflight.world_model_alias,
                 grounded_world_model_input=preflight.completed_build.world_model,

@@ -8,13 +8,14 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.common.judging import DimensionJudgment, Judgment
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 
 _DIGEST = "a" * 64
 
 
 def _judge_model() -> ModelSnapshot:
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="gpt-5.4-mini",
         capabilities_sha256=_DIGEST,

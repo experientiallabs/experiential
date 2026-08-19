@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Sequence
 from enum import StrEnum
 from typing import Final, Literal
 
-from pydantic import Field, JsonValue, field_validator, model_validator
+from pydantic import (
+    Field,
+    JsonValue,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
 from wmo.common.tasks import ToolSchema
 
 ModelAlias = ArtifactId
+_JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 
 ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
 
@@ -27,6 +36,13 @@ models without a pinned effort never receive the parameter.
 """
 
 
+class BillingSource(StrEnum):
+    """Credential owner responsible for one provider-backed model operation."""
+
+    HOST_MANAGED = "host_managed"
+    CUSTOMER_MANAGED = "customer_managed"
+
+
 class ModelSnapshot(ContractModel):
     """Resolved model identity captured at an immutable artifact boundary.
 
@@ -37,6 +53,7 @@ class ModelSnapshot(ContractModel):
     provider: str = Field(min_length=1, max_length=128)
     model_id: str = Field(min_length=1, max_length=512)
     revision: str | None = Field(default=None, max_length=256)
+    billing_source: BillingSource
     capabilities_sha256: Sha256
     connection_sha256: Sha256
 
@@ -160,11 +177,59 @@ def _sum_measurements(
 
 
 class ToolCall(ContractModel):
-    """One complete tool invocation emitted by an assistant."""
+    """One complete tool invocation emitted by an assistant.
+
+    ``arguments`` retains the existing parsed-object contract used by environments and
+    optimization artifacts. ``raw_arguments`` optionally preserves the exact provider-emitted
+    JSON string for immediate protocol replay. It is deliberately excluded from model
+    serialization so provider formatting cannot affect immutable artifacts, lineage, or
+    deduplication.
+    """
 
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     arguments: JsonObject = Field(default_factory=dict)
+    raw_arguments: str | None = Field(
+        default=None,
+        max_length=4_000_000,
+        exclude=True,
+    )
+
+    @model_validator(mode="after")
+    def _require_matching_raw_arguments(self) -> ToolCall:
+        """Require retained raw JSON to decode to the existing parsed object.
+
+        Returns:
+            The validated tool call.
+
+        Raises:
+            ValueError: Raw arguments are invalid JSON, not an object, or change the parsed value.
+        """
+        if self.raw_arguments is None:
+            return self
+        try:
+            parsed = _JSON_OBJECT_ADAPTER.validate_json(self.raw_arguments)
+        except ValidationError as exc:
+            raise ValueError("raw tool arguments must encode one JSON object") from exc
+        if parsed != self.arguments:
+            raise ValueError("raw tool arguments must match parsed tool arguments")
+        return self
+
+    def arguments_json(self, *, sort_keys: bool = False, compact: bool = False) -> str:
+        """Return provider-order raw JSON or encode the parsed object for one caller.
+
+        Args:
+            sort_keys: Whether fallback encoding sorts object keys.
+            compact: Whether fallback encoding omits insignificant separators.
+
+        Returns:
+            Exact retained JSON when present and no canonicalization was requested. Otherwise,
+            encoded parsed arguments honoring the requested canonicalization options.
+        """
+        if self.raw_arguments is not None and not sort_keys and not compact:
+            return self.raw_arguments
+        separators = (",", ":") if compact else None
+        return json.dumps(self.arguments, sort_keys=sort_keys, separators=separators)
 
 
 class AssistantAction(ContractModel):

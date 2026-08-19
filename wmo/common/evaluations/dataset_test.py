@@ -17,7 +17,7 @@ from wmo.common.evaluations import (
     FidelityPair,
     FidelityReport,
 )
-from wmo.common.models import ModelSnapshot, RoutedCandidateSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot, RoutedCandidateSnapshot
 
 _DIGEST = "a" * 64
 
@@ -64,6 +64,7 @@ def _manifest() -> EvaluationDatasetManifest:
     candidate = RoutedCandidateSnapshot(
         alias="candidate-economy",
         model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="openai",
             model_id="gpt-5.4-mini",
             capabilities_sha256=_DIGEST,
@@ -76,6 +77,7 @@ def _manifest() -> EvaluationDatasetManifest:
         agent_id="customer-agent",
         simulator_id="world-model-v1",
         world_model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="openai",
             model_id="gpt-5.4-mini",
             capabilities_sha256=_DIGEST,

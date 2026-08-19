@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
-from fastapi.testclient import TestClient
 
 import wmo
 from wmo.common.evaluations import EvaluationPlan, EvaluationProtocol, ObservedProductionCell
@@ -26,6 +26,7 @@ from wmo.common.models import (
     EmbeddingCostReservation,
     ModelClient,
     ModelFinishReason,
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     NumericMeasurement,
@@ -36,7 +37,7 @@ from wmo.common.models import (
     Usage,
 )
 from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
-from wmo.common.routing import KnnGuard
+from wmo.common.routing import FrozenEmbedding, FrozenEmbeddingSet, KnnGuard, RouterFeatureExtractor
 from wmo.common.tasks import load_task_set
 from wmo.optimize.router.composition import (
     ApprovedRouterReview,
@@ -51,11 +52,9 @@ from wmo.optimize.router.composition_test import (
     _resolved,
     _snapshot,
 )
-from wmo.optimize.router.fit.workflow_test import _persist_embeddings
 from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
 from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
-from wmo.runtime.router.application import create_project_router_app
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
@@ -153,12 +152,7 @@ class _EvidenceSetupSupplier:
                 envelope=pricing,
                 files={"pricing.json": pricing},
             )
-        embedding_set_id = _persist_embeddings(
-            project.artifacts,
-            tasks,
-            completed.task_set,
-            code_revision=self.revision,
-        )
+            _persist_release_embeddings(project, tasks, self.revision)
         production = EvaluationProtocol(
             protocol_id="w16-production-protocol",
             evidence_source="production",
@@ -184,7 +178,7 @@ class _EvidenceSetupSupplier:
             observed_cells=tuple(observed),
             production_protocol=production,
             simulation_protocol=world,
-            embedding_set_id=embedding_set_id,
+            embedding_set_id="embeddings-a",
             fit_rag_input=completed.fit_rag,
             pricing_snapshot_id="w16-pricing",
             incumbent_alias="candidate-baseline",
@@ -514,29 +508,22 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert len(telemetry_delivered) == 1
     assert len(telemetry_attempts) == 2
 
-    app = create_project_router_app("w16-router", result.runtime)
-    http = TestClient(app)
-    payload = {
-        "model": "w16-router",
-        "messages": [{"role": "user", "content": "Resolve customer case 17"}],
-    }
-    first_http = http.post("/v1/chat/completions", json=payload)
-    second_http = http.post(
-        "/v1/chat/completions",
-        json={
-            **payload,
-            "messages": [
-                *payload["messages"],
-                {"role": "user", "content": "Continue with the same customer case"},
-            ],
-        },
+    first_selection = result.runtime.select(
+        ModelRequest(messages=(ModelMessage(role="user", content="Resolve customer case 17"),)),
+        episode_id="case-17",
     )
-    assert first_http.status_code == second_http.status_code == 200
-    assert first_http.headers["X-WMO-Routed-Model"] == second_http.headers["X-WMO-Routed-Model"]
-    assert first_http.json()["object"] == second_http.json()["object"] == "chat.completion"
-    assert runtime_catalog.clients["embedder"].embed_calls == 2
-    assert sum(client.complete_calls for client in runtime_catalog.clients.values()) == 2
-    assert "routing_decision" not in first_http.text
+    second_selection = result.runtime.select(
+        ModelRequest(
+            messages=(
+                ModelMessage(role="user", content="Resolve customer case 17"),
+                ModelMessage(role="user", content="Continue with the same customer case"),
+            )
+        ),
+        episode_id="case-17",
+    )
+    assert first_selection.selected_alias == second_selection.selected_alias
+    assert runtime_catalog.clients["embedder"].embed_calls == 1
+    assert sum(client.complete_calls for client in runtime_catalog.clients.values()) == 0
     provenance = verify_release_evidence(
         project.artifacts,
         expected_revision=revision,
@@ -641,6 +628,32 @@ class _EvidenceReviewSupplier:
                 files={"calibration.json": calibration},
             )
         return ApprovedRouterReview(rubric_id="rubric-a", calibration_id="calibration-a")
+
+
+def _persist_release_embeddings(project: ProjectStore, tasks, revision: str) -> None:  # noqa: ANN001
+    """Persist exact local vectors with release-checkout provenance."""
+    extractor = RouterFeatureExtractor()
+    embeddings = FrozenEmbeddingSet(
+        schema_version=3,
+        created_at=_TIME,
+        code_revision=revision,
+        embedding_set_id="embeddings-a",
+        embedder_alias="embedder",
+        embedder=_snapshot("embedder"),
+        embeddings=tuple(
+            FrozenEmbedding(
+                text_sha256=hashlib.sha256(extractor.from_task(task).encode()).hexdigest(),
+                values=(1.0, 0.0),
+            )
+            for task in tasks
+        ),
+    )
+    project.artifacts.write_json(
+        artifact_id=embeddings.embedding_set_id,
+        artifact_type="router-embeddings",
+        envelope=embeddings,
+        files={"embeddings.json": embeddings},
+    )
 
 
 def _dispatch_counts(

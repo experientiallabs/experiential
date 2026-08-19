@@ -7,12 +7,13 @@ from typing import Protocol
 
 from wmo.common.core.artifacts import StructuredFailure
 from wmo.common.models import ModelRequest
+from wmo.runtime.router.economics import RoutedSpendLedger
 from wmo.runtime.router.journal import (
-    JournaledRouterRuntime,
     RuntimeIdempotencyConflictError,
     RuntimeInteractionFailedError,
     RuntimeInteractionInProgressError,
 )
+from wmo.runtime.router.journal_service import JournaledRouterRuntime
 from wmo.runtime.router.runtime import RoutedModelResponse, RouterRuntime
 
 
@@ -27,10 +28,17 @@ class RouterCompletionInProgressError(RuntimeError):
 class RouterCompletionFailedError(RuntimeError):
     """A durable interaction has a stable terminal provider failure."""
 
-    def __init__(self, failure: StructuredFailure) -> None:
-        """Initialize the error with its durable structured failure."""
+    def __init__(self, failure: StructuredFailure, spend: RoutedSpendLedger) -> None:
+        """Initialize the error with safe failure and exact alias-free spend.
+
+        Args:
+            failure: Durable redacted provider failure.
+            spend: Source-attributed cumulative accounting through the failed attempt.
+        """
         super().__init__(failure.message)
         self.failure = failure
+        self.spend = spend
+        self.retryable = failure.retryable
 
 
 class RouterCompletionService(Protocol):
@@ -100,7 +108,7 @@ class JournaledRouterCompletionService:
         except RuntimeInteractionInProgressError as exc:
             raise RouterCompletionInProgressError(str(exc)) from exc
         except RuntimeInteractionFailedError as exc:
-            raise RouterCompletionFailedError(exc.failure) from exc
+            raise RouterCompletionFailedError(exc.failure, exc.spend) from exc
 
 
 def complete_router_request(

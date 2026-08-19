@@ -21,6 +21,7 @@ from wmo.common.core.artifacts import (
 from wmo.common.models import CompletionCostReservation, ModelSnapshot
 from wmo.common.project import ArtifactStore, artifact_input
 from wmo.common.routing import (
+    ReservedFrozenEmbeddingSet,
     RouterEmbeddingReservation,
     load_frozen_embedding_set,
 )
@@ -303,7 +304,8 @@ def load_router_execution_contract(
         raise ValueError("router execution contract differs from its manifest")
     embedding_set = load_frozen_embedding_set(store, value.router_embedding_input.artifact_id)
     if (
-        artifact_input(store.read(value.router_embedding_input.artifact_id).manifest)
+        not isinstance(embedding_set, ReservedFrozenEmbeddingSet)
+        or artifact_input(store.read(value.router_embedding_input.artifact_id).manifest)
         != value.router_embedding_input
         or embedding_set.reservation != value.router_embedding_reservation
     ):

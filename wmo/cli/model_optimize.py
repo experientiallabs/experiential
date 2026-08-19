@@ -16,6 +16,7 @@ from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.core.artifacts import Sha256, sha256_json
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     ModelCatalog,
     ModelCatalogError,
@@ -487,7 +488,11 @@ def _persist_tinker_selection(
         typer.BadParameter: A concurrent writer changed a confirmed connection or alias.
     """
     desired_connection = ConnectionConfig(provider="tinker", api_key_env=api_key_env)
-    desired_record = ModelRecord(connection=connection_name, model=resolved_model)
+    desired_record = ModelRecord(
+        connection=connection_name,
+        model=resolved_model,
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+    )
     with file_write_lock(store.model_catalog_path, what="the local model catalog"):
         current = load_model_catalog(store.model_catalog_path)
         drifted = sha256_json(current) != observed_catalog_sha256

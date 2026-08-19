@@ -19,7 +19,7 @@ from tempfile import TemporaryDirectory
 from typing import cast
 from urllib.parse import unquote, urlparse
 
-from pydantic import ConfigDict, TypeAdapter, ValidationError, field_validator
+from pydantic import TypeAdapter, ValidationError
 
 from wmo.common.core.artifacts import (
     FailureAttribution,
@@ -30,8 +30,6 @@ from wmo.common.core.artifacts import (
 from wmo.common.models import (
     AssistantAction,
     ModelClient,
-    ModelMessage,
-    ModelRequest,
     ModelResponse,
     ToolCall,
 )
@@ -39,68 +37,29 @@ from wmo.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from wmo.common.tasks import TaskCase, ToolSchema
 from wmo.runtime.agents.interface import AgentEpisode
 from wmo.runtime.environments import EnvironmentSession, Observation
-from wmo.runtime.router.endpoint import (
-    HttpFunctionCall,
-    HttpMessage,
-    HttpTextPart,
-    HttpToolCall,
-    chat_completion,
-    model_messages,
+from wmo.runtime.gateway.contracts import GatewayRequest
+from wmo.runtime.openai_protocol import decode_chat, model_request, model_response_events
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
+from wmo.runtime.openai_protocol.response import completed_body
+from wmo.runtime.openai_protocol.streaming import ChatSseEncoder
+
+_PI_CHAT_FIELDS = frozenset(
+    {
+        "model",
+        "messages",
+        "tools",
+        "tool_choice",
+        "temperature",
+        "max_tokens",
+        "max_completion_tokens",
+        "parallel_tool_calls",
+        "stream",
+        "stream_options",
+        "stop",
+    }
 )
-from wmo.runtime.router.streaming import chat_stream
 
 _JSON_OBJECT = TypeAdapter(JsonObject)
-
-
-class _PiToolFunction(HttpFunctionCall):
-    """Pi-tolerant function payload: unknown keys are ignored and absent arguments mean `{}`.
-
-    The installed Pi CLI is versioned independently, so the bridge accepts every OpenAI-legal
-    message the router's strict public schema would reject rather than aborting the episode.
-    """
-
-    model_config = ConfigDict(extra="ignore")
-
-    arguments: str = "{}"
-
-
-class _PiToolCall(HttpToolCall):
-    """Pi-tolerant assistant tool call carrying the tolerant function payload."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    function: _PiToolFunction
-
-
-class _PiTextPart(HttpTextPart):
-    """Pi-tolerant text content part: unknown keys are ignored."""
-
-    model_config = ConfigDict(extra="ignore")
-
-
-class _PiMessage(HttpMessage):
-    """Pi-tolerant OpenAI message: unknown keys are ignored and a null tool_calls means none."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    content: str | tuple[_PiTextPart, ...] | None = None
-    tool_calls: tuple[_PiToolCall, ...] = ()
-
-    @field_validator("tool_calls", mode="before")
-    @classmethod
-    def _null_tool_calls_mean_none(cls, value: object) -> object:
-        """Treat an explicit `"tool_calls": null` exactly like an absent list.
-
-        Args:
-            value: Raw wire value for the tool_calls field.
-
-        Returns:
-            An empty tuple for null, otherwise the value unchanged.
-        """
-        return () if value is None else value
-
-
-_HTTP_MESSAGES = TypeAdapter(tuple[_PiMessage, ...])
 _DETERMINISTIC_EVENT_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _WMO_PI_PROVIDER = "wmo-injected"
 _WMO_PI_MODEL = "wmo-injected-model"
@@ -317,14 +276,16 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
             cwd=root,
         )
 
-    def complete_model(self, payload: JsonObject) -> ModelResponse:
+    def complete_model(self, payload: JsonObject) -> tuple[GatewayRequest, ModelResponse]:
         """Convert one Pi OpenAI-compatible request and call the WMO-injected model client."""
-        request = ModelRequest(
-            messages=_model_messages_from_pi(payload),
-            tools=self._task.tools,
-        )
+        try:
+            serving_request = decode_chat(_normalize_pi_chat_payload(payload)).request
+        except OpenAIProtocolError as exc:
+            raise _PiBridgeError(f"Pi model bridge request is invalid: {exc.detail.code}") from exc
+        request = model_request(serving_request).model_copy(update={"tools": self._task.tools})
         with self._model_lock:
-            return self._model_context.run(self._model.complete, request)
+            response = self._model_context.run(self._model.complete, request)
+        return serving_request, response
 
     def execute_tool(self, tool_name: str, payload: JsonObject) -> Observation:
         """Execute one Pi extension tool through WMO's supplied environment session."""
@@ -402,20 +363,28 @@ class _PiBridgeRequestHandler(BaseHTTPRequestHandler):
 
     def _write_completion(self, payload: JsonObject) -> None:
         """Return a model response in the OpenAI-compatible shape Pi's custom provider uses."""
-        response = self._bridge.complete_model(payload)
-        completion = chat_completion(
-            _WMO_PI_MODEL, response.output, response, idempotency_key="wmo-pi-bridge"
-        )
-        if payload.get("stream") is True:
-            body = "".join(chat_stream(completion)).encode("utf-8")
+        request, response = self._bridge.complete_model(payload)
+        events = model_response_events(response)
+        if request.stream:
+            encoder = ChatSseEncoder(
+                request_id="wmo-pi-bridge",
+                model=_WMO_PI_MODEL,
+                created_at=0,
+                include_usage=request.include_usage,
+            )
+            frames = list(encoder.start())
+            for event in events:
+                frames.extend(encoder.feed(event))
+            body = "".join(frames).encode("utf-8")
             self._write_body(HTTPStatus.OK, "text/event-stream", body)
             return
-        body_object = completion.model_dump(mode="json", exclude_none=True)
-        for choice in body_object.get("choices", ()):
-            if isinstance(choice, dict) and isinstance(choice.get("message"), dict):
-                # Real OpenAI completions always carry the content key, null for tool-call-only
-                # replies; a strict Pi-side parser must not lose it to exclude_none.
-                choice["message"].setdefault("content", None)
+        body_object = completed_body(
+            request=request,
+            request_id="wmo-pi-bridge",
+            model=_WMO_PI_MODEL,
+            created_at=0,
+            events=events,
+        )
         self._write_body(
             HTTPStatus.OK,
             "application/json",
@@ -536,24 +505,56 @@ def _invoke_installed_pi(
     return result.stdout
 
 
-def _model_messages_from_pi(payload: JsonObject) -> tuple[ModelMessage, ...]:
-    """Map Pi's OpenAI-compatible request messages to WMO's canonical request shape.
+def _normalize_pi_chat_payload(payload: JsonObject) -> JsonObject:
+    """Narrow independent Pi request quirks before shared protocol decoding.
 
     Args:
         payload: Parsed JSON body of one Pi chat-completions bridge request.
 
     Returns:
-        Canonical model messages in Pi's request order.
+        One strict Chat Completions object accepted by the shared decoder.
 
     Raises:
-        _PiBridgeError: The messages are absent, empty, or not valid OpenAI chat messages.
+        _PiBridgeError: The request contains malformed messages or tool calls.
     """
-    if not payload.get("messages"):
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
         raise _PiBridgeError("Pi model bridge request requires a non-empty messages list")
-    try:
-        return model_messages(_HTTP_MESSAGES.validate_python(payload["messages"]))
-    except ValueError as exc:
-        raise _PiBridgeError(f"Pi model bridge request has invalid messages: {exc}") from exc
+    normalized_messages: list[JsonObject] = []
+    for raw_message in messages:
+        if not isinstance(raw_message, dict):
+            raise _PiBridgeError("Pi model bridge messages must be objects")
+        message: JsonObject = {
+            key: value
+            for key, value in raw_message.items()
+            if key in {"role", "content", "tool_call_id"}
+        }
+        raw_calls = raw_message.get("tool_calls")
+        calls: list[JsonObject] = []
+        if raw_calls is not None:
+            if not isinstance(raw_calls, list):
+                raise _PiBridgeError("Pi assistant tool_calls must be a list or null")
+            for raw_call in raw_calls:
+                if not isinstance(raw_call, dict) or not isinstance(raw_call.get("function"), dict):
+                    raise _PiBridgeError("Pi assistant tool calls must be function objects")
+                function = cast(dict[str, object], raw_call["function"])
+                calls.append(
+                    {
+                        "id": raw_call.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": function.get("name"),
+                            "arguments": function.get("arguments", "{}"),
+                        },
+                    }
+                )
+        if calls:
+            message["tool_calls"] = calls
+        normalized_messages.append(message)
+    normalized = {key: value for key, value in payload.items() if key in _PI_CHAT_FIELDS}
+    normalized.setdefault("model", _WMO_PI_MODEL)
+    normalized["messages"] = normalized_messages
+    return normalized
 
 
 def _episode_from_pi_events(output: str) -> AgentEpisode:

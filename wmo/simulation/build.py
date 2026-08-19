@@ -33,7 +33,11 @@ from wmo.common.project import (
 from wmo.common.project.project import require_durable_source_id
 from wmo.common.release_revision import installed_release_revision
 from wmo.common.tasks import TaskSet
-from wmo.simulation.ingest.dataset import PersistedTraceDataset, persist_trace_dataset
+from wmo.common.traces import load_trace_dataset
+from wmo.simulation.ingest.dataset import (
+    PersistedTraceDataset,
+    persist_trace_dataset,
+)
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.ingest.sources import load_trace_source
 from wmo.simulation.mining.bindings import (
@@ -200,6 +204,63 @@ def load_project_provider_free_stage(
     return stage
 
 
+def provider_free_build_review(store: ProjectStore) -> BuildReviewReadiness:
+    """Reconstruct the exact provider-free review handoff after late hosted setup.
+
+    Args:
+        store: Project with selected provider-free trace and task artifacts.
+
+    Returns:
+        Manifest-bound readiness record accepted by completed-build selection.
+
+    Raises:
+        ValueError: Preparation settings, source evidence, or selected pointers are inconsistent.
+    """
+    config = store.load_project()
+    stage = config.provider_free_stage
+    settings = config.trace_preparation
+    if stage is None or settings is None:
+        raise ValueError("hosted build requires selected provider-free trace evidence")
+    trace_stored = store.artifacts.read(stage.trace_dataset.artifact_id)
+    task_stored = store.artifacts.read(stage.task_set.artifact_id)
+    if artifact_input(trace_stored.manifest) != stage.trace_dataset:
+        raise ValueError("provider-free trace manifest changed before hosted build")
+    if artifact_input(task_stored.manifest) != stage.task_set:
+        raise ValueError("provider-free task manifest changed before hosted build")
+    loaded = load_trace_dataset(store.artifacts, stage.trace_dataset.artifact_id)
+    source = loaded.dataset.source
+    if source is None:
+        raise ValueError("provider-free trace dataset has no durable source identity")
+    mining_spec = MiningSpec(
+        fit_task_budget=settings.fit_task_budget,
+        held_out_task_budget=settings.held_out_task_budget,
+    )
+    provider_free_config = _provider_free_review_config(config)
+    binding = {
+        "schema_version": 1,
+        "status": "proposals_pending",
+        "trace_dataset": stage.trace_dataset.model_dump(mode="json"),
+        "task_set": stage.task_set.model_dump(mode="json"),
+        "project_config": provider_free_config.model_dump(mode="json"),
+        "source": source.model_dump(mode="json"),
+        "mining_spec": mining_spec.model_dump(mode="json"),
+        "descriptor_embedder": "hashing-descriptor-v1",
+        "descriptor_dimensions": settings.descriptor_dimensions,
+        "code_revision": task_stored.manifest.code_revision,
+        "paid_calls_made": 0,
+    }
+    return BuildReviewReadiness(
+        readiness_id=_build_review_id(binding),
+        trace_dataset=stage.trace_dataset,
+        task_set=stage.task_set,
+        project_config=provider_free_config,
+        source=source,
+        mining_spec=mining_spec,
+        descriptor_dimensions=settings.descriptor_dimensions,
+        code_revision=task_stored.manifest.code_revision,
+    )
+
+
 def _initialize_provider_free_project(
     root: Path,
     project: str,
@@ -341,7 +402,7 @@ def build_project(
     task_input = artifact_input(task_stored.manifest)
     if artifacts.task_set.inputs != (trace_input,):
         raise ValueError("loaded task set does not bind the exact trace dataset manifest")
-    project_config = store.load_project().model_copy(update={"build": None})
+    project_config = _provider_free_review_config(store.load_project())
     source = artifacts.trace_dataset.dataset.source
     if source is None:
         raise ValueError("completed trace dataset has no immutable source identity")
@@ -371,6 +432,26 @@ def build_project(
         code_revision=code_revision,
     )
     return ProjectBuild(artifacts=artifacts, review=review)
+
+
+def _provider_free_review_config(config: ProjectConfig) -> ProjectConfig:
+    """Remove completed hosted-stage pointers from deterministic build-review identity.
+
+    Args:
+        config: Current Project configuration before or after hosted stage selection.
+
+    Returns:
+        Valid Project configuration retaining setup while omitting provider-backed results.
+    """
+    return config.model_copy(
+        update={
+            "build": None,
+            "build_spend_ledger": None,
+            "hosted_judge": None,
+            "router_policy": None,
+            "router_report": None,
+        }
+    )
 
 
 def select_completed_build(

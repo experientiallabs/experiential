@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 from wmo.cli import judge_config as judge_config_module
 from wmo.cli.app import app
 from wmo.common.models import (
+    BillingSource,
     ModelCapabilities,
     ModelCatalog,
     ModelRecord,
@@ -111,6 +112,7 @@ def _priced_catalog() -> ModelCatalog:
             "models": {
                 **catalog.models,
                 "judge-main": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection=record.connection,
                     model=record.model,
                     capabilities=ModelCapabilities(
@@ -393,6 +395,7 @@ def test_setup_output_is_plain_language_and_hides_execution_internals(
 def _model() -> ModelSnapshot:
     """Return one exact secret-free judge identity."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="judge-model",
         revision=None,

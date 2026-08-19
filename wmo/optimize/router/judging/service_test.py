@@ -33,6 +33,7 @@ from wmo.common.judging import (
 from wmo.common.judging.judgment import Judgment
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -218,6 +219,7 @@ class _StructuredJudgeClient:
 def _model() -> ModelSnapshot:
     """Return the exact snapshot produced by the local catalog fixture."""
     return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="openai",
         model_id="judge-model",
         capabilities_sha256=_capabilities_digest(),
@@ -246,6 +248,7 @@ def _catalog() -> ModelCatalog:
         },
         models={
             "judge-main": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 connection="openai-main",
                 model="judge-model",
                 capabilities=ModelCapabilities(),
@@ -870,6 +873,7 @@ def test_estimate_uses_catalog_prices_and_records_provenance(tmp_path: Path) -> 
         update={
             "models": {
                 "judge-main": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="openai-main",
                     model="judge-model",
                     capabilities=ModelCapabilities(

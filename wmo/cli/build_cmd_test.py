@@ -21,6 +21,7 @@ from wmo.cli.provider_setup_test import _FakeLister as _SetupLister
 from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     Embedding,
     ModelCapabilities,
@@ -79,26 +80,33 @@ def _attribute(key: str, value: str) -> dict[str, object]:
     return {"key": key, "value": {"stringValue": value}}
 
 
-def _otlp_export(tmp_path: Path, count: int = 1) -> Path:
+def _otlp_export(
+    tmp_path: Path,
+    count: int = 1,
+    *,
+    distinct_lineages: bool = True,
+) -> Path:
     """Write real two-turn traces with one observed assistant-to-user transition each.
 
     Args:
         tmp_path: Temporary directory receiving the trace export.
-        count: Number of independent trace lineages to write.
+        count: Number of traces to write.
+        distinct_lineages: Whether each trace receives distinct lineage attributes.
 
     Returns:
         Path to the completed OTLP JSON export.
     """
     records = []
     for index in range(count):
+        lineage_index = index if distinct_lineages else 0
         trace_id = f"{index + 1:032x}"
         base = 1_760_000_000_000_000_000 + index * 10_000_000_000
         common = [
             _attribute("gen_ai.operation.name", "chat"),
             _attribute("gen_ai.provider.name", "openai"),
             _attribute("gen_ai.request.model", "gpt-test"),
-            _attribute("wmo.customer.id", f"customer-{index}"),
-            _attribute("wmo.conversation.id", f"conversation-{index}"),
+            _attribute("wmo.customer.id", f"customer-{lineage_index}"),
+            _attribute("wmo.conversation.id", f"conversation-{lineage_index}"),
         ]
         records.extend(
             (
@@ -112,7 +120,14 @@ def _otlp_export(tmp_path: Path, count: int = 1) -> Path:
                     + [
                         _attribute(
                             "gen_ai.input.messages",
-                            json.dumps([{"role": "user", "content": f"Support request {index}"}]),
+                            json.dumps(
+                                [
+                                    {
+                                        "role": "user",
+                                        "content": f"Support request {lineage_index}",
+                                    }
+                                ]
+                            ),
                         ),
                         _attribute(
                             "gen_ai.output.messages",
@@ -133,7 +148,10 @@ def _otlp_export(tmp_path: Path, count: int = 1) -> Path:
                             json.dumps(
                                 [
                                     {"role": "assistant", "content": "What account email?"},
-                                    {"role": "user", "content": f"customer-{index}@example.test"},
+                                    {
+                                        "role": "user",
+                                        "content": f"customer-{lineage_index}@example.test",
+                                    },
                                 ]
                             ),
                         ),
@@ -250,6 +268,7 @@ class _RuntimeCatalog:
             capabilities = ModelCapabilities(maximum_output_tokens=16_000)
             embedding = None
         snapshot = ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             provider="fixture",
             model_id=f"fixture-{alias}",
             capabilities_sha256=sha256_json(capabilities),
@@ -284,12 +303,18 @@ def _catalog(root: Path) -> None:
             },
             models={
                 "world": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="fixture",
                     model="world-id",
                     capabilities=ModelCapabilities(maximum_output_tokens=16_000),
                 ),
-                "judge": ModelRecord(connection="fixture", model="judge-id"),
+                "judge": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="fixture",
+                    model="judge-id",
+                ),
                 "embed": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="fixture",
                     model="embed-id",
                     capabilities=ModelCapabilities(
@@ -993,15 +1018,24 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     assert recovered_review["unrelated_review_state"] == {"preserve": True}
 
 
-@pytest.mark.parametrize("count", [2, 100, 1_001])
-def test_build_accepts_trace_counts_outside_or_inside_guidance(tmp_path: Path, count: int) -> None:
-    """The 100 to 1,000 range is guidance and never a validity gate.
+@pytest.mark.parametrize(
+    ("count", "distinct_lineages"),
+    ((2, True), (100, True), (1_001, False)),
+)
+def test_build_accepts_trace_counts_outside_or_inside_guidance(
+    tmp_path: Path,
+    count: int,
+    *,
+    distinct_lineages: bool,
+) -> None:
+    """Trace-count recommendations remain guidance rather than validity gates.
 
     Args:
         tmp_path: Temporary project and trace root.
         count: Parameterized positive trace count.
+        distinct_lineages: Whether each trace receives distinct lineage attributes.
     """
-    source = _otlp_export(tmp_path, count=count)
+    source = _otlp_export(tmp_path, count=count, distinct_lineages=distinct_lineages)
     root = tmp_path / ".wmo"
     root.mkdir()
     _catalog(root)
@@ -1090,12 +1124,18 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
         connections={"fixture": ConnectionConfig(provider="openai", api_key_env="FIXTURE_API_KEY")},
         models={
             "world": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 connection="fixture",
                 model="world-id",
                 capabilities=ModelCapabilities(maximum_output_tokens=16_000),
             ),
-            "judge": ModelRecord(connection="fixture", model="judge-id"),
+            "judge": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="fixture",
+                model="judge-id",
+            ),
             "embed": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 connection="fixture",
                 model="embed-id",
                 capabilities=ModelCapabilities(

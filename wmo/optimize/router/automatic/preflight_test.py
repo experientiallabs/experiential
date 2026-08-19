@@ -8,6 +8,7 @@ import pytest
 
 import wmo.runtime.models.registry as model_registry
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     ModelCapabilities,
     ModelCatalog,
@@ -136,10 +137,16 @@ def _catalog() -> ModelCatalog:
         connections={"openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")},
         models={
             "candidate-a": ModelRecord(
-                connection="openai", model="candidate-a", capabilities=capabilities
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="openai",
+                model="candidate-a",
+                capabilities=capabilities,
             ),
             "candidate-b": ModelRecord(
-                connection="openai", model="candidate-b", capabilities=capabilities
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="openai",
+                model="candidate-b",
+                capabilities=capabilities,
             ),
         },
     )
