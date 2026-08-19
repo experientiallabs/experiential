@@ -9,6 +9,7 @@ import pytest
 
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -43,6 +44,7 @@ def _response() -> ModelResponse:
         configured_model=ModelSnapshot(
             provider="fixture",
             model_id="fixture-model",
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             revision="fixture-revision",
             capabilities_sha256="a" * 64,
             connection_sha256="b" * 64,
