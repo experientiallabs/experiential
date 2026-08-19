@@ -34,13 +34,16 @@ from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUn
 from exp.runtime.gateway.sqlite.provider_authority import ProviderConnectionBinding
 from exp.runtime.gateway.sqlite.store import OperationOutcomeUnknownError, SQLiteGatewayStore
 
-EXPECTED_GATEWAY_COMMANDS = {"init", "status", "usage"}
+# call, models, and key check are the deliberate caller-side additions for the agent
+# core loop against a live gateway: one-shot completion, caller-view discovery, and
+# raw-key validation. They widen the locked gateway tree on purpose; see caller.py.
+EXPECTED_GATEWAY_COMMANDS = {"call", "init", "models", "status", "usage"}
 EXPECTED_GATEWAY_GROUPS = {
     "alias": {"create", "disable", "list", "update"},
     "budget": {"list", "remaining", "set"},
     "grant": {"add", "list", "remove"},
     "identity": {"create", "disable", "list", "update"},
-    "key": {"issue", "list", "revoke"},
+    "key": {"check", "issue", "list", "revoke"},
     "pool": {"certify"},
     "provider": {"add", "disable", "list", "remove", "update"},
 }

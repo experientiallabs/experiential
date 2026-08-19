@@ -12,6 +12,7 @@ from rich.console import Console
 
 from exp.cli.gateway.alias import alias_app
 from exp.cli.gateway.budget import budget_app
+from exp.cli.gateway.caller import caller_call, caller_key_check, caller_models
 from exp.cli.gateway.key_output import (
     KeyOutputOutcomeUnknownError,
     KeyOutputRecoveryError,
@@ -42,6 +43,9 @@ gateway_app.add_typer(key_app, name="key")
 gateway_app.add_typer(alias_app, name="alias")
 gateway_app.add_typer(pool_app, name="pool")
 gateway_app.add_typer(grant_app, name="grant")
+gateway_app.command("call")(caller_call)
+gateway_app.command("models")(caller_models)
+key_app.command("check")(caller_key_check)
 
 _console = Console()
 _JSON_OPTION = typer.Option(False, "--json", help="Write one versioned JSON document to stdout.")

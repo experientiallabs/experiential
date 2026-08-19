@@ -10,6 +10,9 @@ The root surface is deliberately small:
 | `exp run --root ROOT [--check]` | Validate or start the initialized authenticated multi-alias gateway on loopback. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp run PROJECT --root ROOT [--ghost]` | Activate a frozen policy as one project-backed alias and launch the normal gateway. | The same authenticated OpenAI endpoint and SQLite accounting as no-argument `exp run`. |
 | `exp config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, certified exact-model pools, monthly limits, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
+| `exp config gateway call ALIAS PROMPT [--json]` | Send one chat completion to a live gateway as a caller, streaming text to stdout. | One HTTP request against the running gateway; no local state. |
+| `exp config gateway models [--json]` | List the aliases a live gateway grants to the presented key (caller view of `GET /v1/models`). | One HTTP request against the running gateway; no local state. |
+| `exp config gateway key check [--json]` | Validate one raw virtual key against a live gateway and print its granted aliases without storing the key. | One HTTP request against the running gateway; no local state. |
 | `exp config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. | Local `.exp/models.toml`. |
 | `exp config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command. | Local `.exp/settings.toml`. |
 | `exp config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.exp/settings.toml`. |
