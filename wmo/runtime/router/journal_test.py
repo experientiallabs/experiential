@@ -36,6 +36,7 @@ from wmo.common.models import (
     OperationEconomics,
     RoutedCandidateSnapshot,
     Usage,
+    ToolCall,
 )
 from wmo.common.project import ProjectPaths
 from wmo.common.routing import RouterFeatureExtractor, RoutingDecision
@@ -144,6 +145,62 @@ def _operation(
             ),
         ),
     )
+
+
+def test_completion_matches_accepted_attempt_after_raw_arguments_are_not_persisted(
+    tmp_path: Path,
+) -> None:
+    """Execution-only provider bytes cannot break a durable attempt's completion handshake.
+
+    Args:
+        tmp_path: Pytest-owned project root.
+    """
+    journal = RuntimeInteractionJournal(
+        ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
+    )
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="Look up the ticket"),
+            ModelMessage(
+                role="assistant",
+                assistant_action=AssistantAction(
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-1",
+                            name="lookup_ticket",
+                            arguments={"priority": 1, "ticket_id": "42"},
+                            raw_arguments='{ "ticket_id": "42", "priority": 1 }',
+                        ),
+                    )
+                ),
+            ),
+        )
+    )
+    identity = _interaction_identity("support-agent", "raw-arguments-key", request, None)
+    decision = _decision(identity.lineage_id, request)
+    claim = journal.claim(
+        identity,
+        RuntimeAcceptance(
+            decision=decision,
+            selected_alias=decision.selected_alias,
+            selected_model=_snapshot(),
+            policy_input=ArtifactInput(
+                artifact_id=decision.policy_id,
+                sha256=decision.policy_sha256,
+            ),
+        ),
+        now=_TIME,
+        stale_after=timedelta(seconds=30),
+    )
+
+    assert claim.accepted is not None
+    completed = journal.record_completed(
+        claim.accepted,
+        _response(),
+        completed_at=_TIME + timedelta(seconds=1),
+    )
+
+    assert completed.event == "completed"
 
 
 def _decision(lineage_id: str, request: ModelRequest | None = None) -> RoutingDecision:

@@ -623,13 +623,16 @@ class RuntimeInteractionJournal:
             spend_events = list(self._read_spend_unlocked())
             _validate_combined_spend(events, spend_events)
             state = validate_events(events).get(accepted.interaction_id)
-            if state is None or accepted not in events:
+            if state is None or not any(
+                isinstance(event, RuntimeAcceptedEvent) and _same_accepted_event(event, accepted)
+                for event in events
+            ):
                 raise RuntimeJournalError(
                     "cannot fail an interaction attempt that was not accepted"
                 )
             if isinstance(state.terminal, RuntimeCompletedEvent):
                 return state.terminal
-            if state.accepted != accepted:
+            if not _same_accepted_event(state.accepted, accepted):
                 prior = _attempt_failure(events, accepted)
                 if prior is None:
                     raise RuntimeJournalError("superseded attempt has no durable failure")
@@ -681,7 +684,10 @@ class RuntimeInteractionJournal:
             spend_events = list(self._read_spend_unlocked())
             _validate_combined_spend(events, spend_events)
             state = validate_events(events).get(accepted.interaction_id)
-            if state is None or accepted not in events:
+            if state is None or not any(
+                isinstance(event, RuntimeAcceptedEvent) and _same_accepted_event(event, accepted)
+                for event in events
+            ):
                 raise RuntimeJournalError(
                     "cannot complete an interaction attempt that was not accepted"
                 )
@@ -692,7 +698,7 @@ class RuntimeInteractionJournal:
                 and not state.terminal.retryable
             ):
                 return state.terminal
-            if state.accepted != accepted:
+            if not _same_accepted_event(state.accepted, accepted):
                 prior = _attempt_failure(events, accepted)
                 if prior is None or not prior.retryable:
                     raise RuntimeJournalError(
@@ -954,6 +960,11 @@ def _attempt_failure(
         ):
             return event
     return None
+
+
+def _same_accepted_event(first: RuntimeAcceptedEvent, second: RuntimeAcceptedEvent) -> bool:
+    """Compare durable accepted-attempt content without execution-only model fields."""
+    return first.model_dump(mode="json") == second.model_dump(mode="json")
 
 
 def _require_timezone(value: datetime) -> None:
