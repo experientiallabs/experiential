@@ -96,6 +96,9 @@ if TYPE_CHECKING:
     from wmo.optimize.router.spend import ProviderSpendEntry as ProviderSpendEntry
     from wmo.optimize.router.spend import ProviderSpendLedger as ProviderSpendLedger
     from wmo.optimize.router.spend import ProviderSpendStatus as ProviderSpendStatus
+    from wmo.runtime.gateway.composition import GatewayRuntime as GatewayRuntime
+    from wmo.runtime.gateway.composition import GatewayRuntimeConfig as GatewayRuntimeConfig
+    from wmo.runtime.gateway.composition import create_gateway_runtime as create_gateway_runtime
     from wmo.runtime.models import RuntimeModelCatalog as RuntimeModelCatalog
     from wmo.runtime.router.economics import (
         BillingSourceEconomics as BillingSourceEconomics,
@@ -153,6 +156,9 @@ _EXPORT_MODULES = {
     "ResolvedDiscoveredModel": "wmo.common.models",
     "resolve_discovered_model": "wmo.common.models",
     "RuntimeModelCatalog": "wmo.runtime.models",
+    "GatewayRuntime": "wmo.runtime.gateway.composition",
+    "GatewayRuntimeConfig": "wmo.runtime.gateway.composition",
+    "create_gateway_runtime": "wmo.runtime.gateway.composition",
     "ExportedProjectBundle": "wmo.common.project",
     "export_project_bundle": "wmo.common.project",
     "restore_project_bundle": "wmo.common.project",

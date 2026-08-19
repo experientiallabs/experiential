@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Protocol, cast
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
 from filelock import FileLock, Timeout
 
 from wmo.common.core.artifacts import sha256_json
@@ -19,6 +18,12 @@ from wmo.common.models import (
     ModelCatalog,
     NormalizedGatewayCatalog,
     normalize_gateway_catalog,
+)
+from wmo.runtime.gateway.composition import (
+    GatewayLifecycleState,
+    GatewayRuntime,
+    GatewayRuntimeConfig,
+    create_gateway_runtime,
 )
 from wmo.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -37,9 +42,9 @@ from wmo.runtime.gateway.routing import (
     GatewayRoutingError,
     RouterProjectTargetResolver,
 )
-from wmo.runtime.gateway.service import GatewayService, create_gateway_app
+from wmo.runtime.gateway.service import GatewayService
 from wmo.runtime.gateway.sqlite.store import SQLiteGatewayStore, SystemGatewayClock
-from wmo.runtime.gateway.usage import read_usage_report, usage_html
+from wmo.runtime.gateway.usage import read_usage_report
 from wmo.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from wmo.runtime.models.credentials import ModelCredentialError
 from wmo.runtime.router.errors import RouterApplicationError
@@ -65,22 +70,44 @@ class ProjectLoader(Protocol):
         ...
 
 
-@dataclass
-class GatewayLifecycleState:
-    """Mutable process-local health state exposed only through loopback routes."""
-
-    ready: bool = False
-
-
 @dataclass(frozen=True)
 class LocalGatewayRuntime:
     """Fully composed local service and its loopback application."""
 
-    app: FastAPI
-    service: GatewayService
-    state: GatewayLifecycleState
+    runtime: GatewayRuntime
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
+
+    @property
+    def app(self) -> FastAPI:
+        """Return the shared managed FastAPI application."""
+        return self.runtime.app
+
+    @property
+    def service(self) -> GatewayService:
+        """Return the shared injected gateway service."""
+        return self.runtime.service
+
+    @property
+    def state(self) -> GatewayLifecycleState:
+        """Return the shared process-local readiness state."""
+        return self.runtime.state
+
+    async def preflight(self) -> ExecutionSnapshot:
+        """Preflight the shared gateway composition seam."""
+        return await self.runtime.preflight()
+
+    async def readiness(self) -> bool:
+        """Return current shared runtime readiness."""
+        return await self.runtime.readiness()
+
+    async def drain(self, *, timeout_seconds: float | None = None) -> bool:
+        """Drain the shared runtime within the selected bound."""
+        return await self.runtime.drain(timeout_seconds=timeout_seconds)
+
+    async def shutdown(self) -> bool:
+        """Shut down the shared runtime within its local bound."""
+        return await self.runtime.shutdown()
 
 
 @dataclass(frozen=True)
@@ -277,79 +304,24 @@ def load_local_gateway(
         )
         for item in readiness
     )
-    service = GatewayService(
-        control_store=_ReadyControlStore(store=store, authorities=ready_authorities),
+    runtime = create_gateway_runtime(
+        config=GatewayRuntimeConfig(
+            graceful_timeout_seconds=graceful_timeout_seconds,
+            title="WMO local gateway",
+        ),
+        authority=_ReadyControlStore(store=store, authorities=ready_authorities),
         ledger=ledger,
         routes=routes,
         executor=executor,
         clock=SystemGatewayClock(),
-        readiness_probe=readiness_probe,
-    )
-    state = GatewayLifecycleState()
-    app = _create_managed_app(
-        service,
-        ledger=ledger,
-        organization_id=manager.organization_id,
-        state=state,
-        graceful_timeout_seconds=graceful_timeout_seconds,
+        readiness=readiness_probe,
+        usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
     )
     return LocalGatewayRuntime(
-        app=app,
-        service=service,
-        state=state,
+        runtime=runtime,
         reconciled_expired_requests=expired,
         reconciled_unknown_attempts=unknown,
     )
-
-
-def _create_managed_app(
-    service: GatewayService,
-    *,
-    ledger: SQLiteAttemptLedger,
-    organization_id: str,
-    state: GatewayLifecycleState,
-    graceful_timeout_seconds: float,
-) -> FastAPI:
-    """Wrap the authenticated data plane with loopback health and usage routes."""
-
-    @asynccontextmanager
-    async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
-        """Own readiness and bounded drain for the ASGI server lifetime."""
-        await service.preflight()
-        state.ready = True
-        try:
-            yield
-        finally:
-            state.ready = False
-            await service.drain(timeout_seconds=graceful_timeout_seconds)
-
-    application = FastAPI(title="WMO local gateway", lifespan=lifespan)
-
-    @application.get("/health/live")
-    async def health_live() -> JSONResponse:
-        """Return liveness after the loopback listener can reach this process."""
-        return JSONResponse({"status": "live"})
-
-    @application.get("/health/ready")
-    async def health_ready() -> JSONResponse:
-        """Return readiness only while the service accepts new requests."""
-        status = 200 if state.ready else 503
-        return JSONResponse({"status": "ready" if state.ready else "not_ready"}, status_code=status)
-
-    @application.get("/usage.json")
-    async def usage_json() -> JSONResponse:
-        """Return versioned content-free usage on loopback."""
-        report = read_usage_report(ledger, organization_id=organization_id)
-        return JSONResponse(report.model_dump(mode="json"))
-
-    @application.get("/usage")
-    async def usage_page() -> HTMLResponse:
-        """Return the minimal content-free loopback usage page."""
-        report = read_usage_report(ledger, organization_id=organization_id)
-        return HTMLResponse(usage_html(report))
-
-    application.mount("/", create_gateway_app(service))
-    return application
 
 
 def _granted_active_aliases(manager: GatewayManagement) -> tuple[GatewayAliasView, ...]:

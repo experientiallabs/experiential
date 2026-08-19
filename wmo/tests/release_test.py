@@ -53,6 +53,7 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "wmo/common/judging/review.py",
         "wmo/common/models/model.py",
         "wmo/runtime/environments/local.py",
+        "wmo/runtime/gateway/composition.py",
         "wmo/runtime/gateway/lifecycle.py",
         "wmo/runtime/gateway/budgets.py",
         "wmo/runtime/gateway/ledger.py",

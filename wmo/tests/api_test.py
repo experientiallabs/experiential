@@ -61,6 +61,11 @@ from wmo.optimize.router.hosted import (
     run_hosted_router_workflow,
 )
 from wmo.optimize.router.spend import ProviderSpendEntry, ProviderSpendLedger
+from wmo.runtime.gateway.composition import (
+    GatewayRuntime,
+    GatewayRuntimeConfig,
+    create_gateway_runtime,
+)
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.economics import (
     BillingSourceEconomics,
@@ -149,6 +154,14 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.ResolvedDiscoveredModel is ResolvedDiscoveredModel
     assert wmo.resolve_discovered_model is resolve_discovered_model
     assert wmo.RuntimeModelCatalog is RuntimeModelCatalog
+    assert wmo.GatewayRuntime is GatewayRuntime
+    assert wmo.GatewayRuntimeConfig is GatewayRuntimeConfig
+    assert wmo.create_gateway_runtime is create_gateway_runtime
+    assert {
+        "GatewayRuntime",
+        "GatewayRuntimeConfig",
+        "create_gateway_runtime",
+    }.issubset(wmo.__all__)
     assert "ledger" in signature(FileHostedAttemptAuthorityStore.commit_stage).parameters
     assert wmo.ProviderSpendLedger is ProviderSpendLedger
     assert wmo.ProviderSpendEntry is ProviderSpendEntry
