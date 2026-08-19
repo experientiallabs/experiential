@@ -212,10 +212,13 @@ def commit_manual_judge_setup(
         confirmed: Explicit confirmation of judge, rubric, template, mapping, and schema.
 
     Returns:
-        Immutable setup artifact, including an idempotent exact replay.
+        Immutable setup artifact, including an idempotent exact replay. When the only
+        difference from the saved setup is an advanced template version, the setup is
+        replaced and calibration restarts under the current evidence rendering.
 
     Raises:
-        ManualJudgeError: Confirmation is absent or the project/build changed before commit.
+        ManualJudgeError: Confirmation is absent, the project/build changed before commit,
+            or the plan names a different finalized contract.
     """
     if not confirmed:
         raise ManualJudgeError("judge setup requires explicit confirmation before writing")
@@ -250,6 +253,8 @@ def commit_manual_judge_setup(
             and saved_rubric.dimensions == plan.dimensions
         )
         if not same_contract:
+            if _is_template_version_upgrade(saved, plan, saved_rubric, saved_rubric_input):
+                return _adopt_current_template_version(store, plan, saved)
             raise ManualJudgeError("project already has a different finalized judge setup")
         return saved
     review = RubricReview.open(
@@ -290,6 +295,89 @@ def commit_manual_judge_setup(
         trace_dataset=plan.build.trace_dataset,
         task_set=plan.build.task_set,
         rubric=rubric_input,
+        previews=plan.previews,
+    )
+    setup_input = _write_setup(store, setup)
+    write_review_state(store, ManualJudgeReviewState(setup=setup_input))
+    return setup
+
+
+def _is_template_version_upgrade(
+    saved: ManualJudgeSetupArtifact,
+    plan: ManualJudgeSetupPlan,
+    saved_rubric: Rubric,
+    saved_rubric_input: ArtifactInput,
+) -> bool:
+    """Report whether the plan only advances a saved setup to the current template version.
+
+    Args:
+        saved: Existing finalized setup persisted under an earlier template version.
+        plan: Confirmed replacement plan built from the same project evidence.
+        saved_rubric: Rubric loaded from the saved setup pointer.
+        saved_rubric_input: Verified manifest pointer of the saved rubric.
+
+    Returns:
+        True when every other contract field matches and only the template version moves
+        from 2 to 3.
+    """
+    return (
+        saved.prompt_template.template_version == "2"
+        and plan.prompt_template
+        == saved.prompt_template.model_copy(update={"template_version": "3"})
+        and saved.project_id == plan.project_id
+        and saved.judge_alias == plan.judge_alias
+        and saved.judge_model == plan.judge_model
+        and saved.trace_dataset == plan.build.trace_dataset
+        and saved.task_set == plan.build.task_set
+        and saved.previews == plan.previews
+        and saved_rubric_input == saved.rubric
+        and saved_rubric.dimensions == plan.dimensions
+    )
+
+
+def _adopt_current_template_version(
+    store: ProjectStore,
+    plan: ManualJudgeSetupPlan,
+    saved: ManualJudgeSetupArtifact,
+) -> ManualJudgeSetupArtifact:
+    """Replace a version 2 setup with its version 3 equivalent and restart calibration.
+
+    The saved setup, its probes, and any approved audit stay immutable in the artifact
+    store. Review state moves to the new setup with no drafts, audit, or approval, so
+    calibration and production judging proceed only under the version 3 evidence
+    projection the operator just confirmed.
+
+    Args:
+        store: Project-local artifact and mutable review store.
+        plan: Confirmed plan whose template only advances the version.
+        saved: Existing finalized setup persisted under template version 2.
+
+    Returns:
+        The newly persisted setup bound to the current template version.
+    """
+    setup_id = stable_id(
+        "manual-judge-setup",
+        {
+            "project_id": plan.project_id,
+            "judge_alias": plan.judge_alias,
+            "judge_model": plan.judge_model.model_dump(mode="json"),
+            "prompt_template": plan.prompt_template.model_dump(mode="json"),
+            "inputs": [item.model_dump(mode="json") for item in saved.inputs],
+        },
+    )
+    setup = ManualJudgeSetupArtifact(
+        schema_version=1,
+        created_at=plan.created_at,
+        inputs=saved.inputs,
+        code_revision=plan.code_revision,
+        setup_id=setup_id,
+        project_id=plan.project_id,
+        judge_alias=plan.judge_alias,
+        judge_model=plan.judge_model,
+        prompt_template=plan.prompt_template,
+        trace_dataset=plan.build.trace_dataset,
+        task_set=plan.build.task_set,
+        rubric=saved.rubric,
         previews=plan.previews,
     )
     setup_input = _write_setup(store, setup)
