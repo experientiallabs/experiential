@@ -55,6 +55,7 @@ def test_opt_in_replay_joins_inflight_replays_completion_and_rejects_body_drift(
         )
         await owner.complete(response)
         assert await join.result() == response
+        await owner.abandon()
         replay = await store.claim(key)
         assert replay.kind == ReplayClaimKind.REPLAY
         assert await replay.result() == response

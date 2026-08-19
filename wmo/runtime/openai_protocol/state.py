@@ -215,13 +215,12 @@ class BoundedReplayStore:
             self._evict_completed()
 
     async def _abandon(self, key: ReplayKey, future: asyncio.Future[CachedResponse]) -> None:
-        """Remove one matching in-flight entry and cancel its joiners."""
+        """Remove matching in-flight work without erasing a published result."""
         async with self._lock:
             entry = self._entries.get(key)
-            if entry is not None and entry.future is future:
+            if entry is not None and entry.future is future and not future.done():
                 self._entries.pop(key)
-                if not future.done():
-                    future.cancel()
+                future.cancel()
 
     def _expire(self, now: float) -> None:
         """Drop completed expired entries without evicting active work."""

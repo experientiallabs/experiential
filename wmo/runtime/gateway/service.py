@@ -424,6 +424,7 @@ class GatewayService:
         )
         capture = bytearray()
         replayable = True
+        replay_completed = False
         retainable = True
         terminal = False
         terminal_frames: list[bytes] = []
@@ -482,6 +483,7 @@ class GatewayService:
                             body=bytes(capture),
                         )
                     )
+                    replay_completed = True
                 else:
                     await lease.abandon()
                     if terminal:
@@ -496,7 +498,7 @@ class GatewayService:
         except BaseException as exc:
             if not terminal:
                 await _settle_stream_quietly(stream, exc)
-            if lease is not None:
+            if lease is not None and not replay_completed:
                 await _abandon_quietly(lease)
             raise
         finally:

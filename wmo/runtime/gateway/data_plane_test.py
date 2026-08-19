@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from datetime import UTC, datetime
 from typing import cast
 
@@ -1031,5 +1031,47 @@ def test_keyed_stream_capture_overflow_never_exposes_success_before_redispatch(
             assert captured.value.detail.code == "idempotency_replay_unavailable"
             assert b"response.completed" not in emitted
             assert len(provider.streams) == expected_dispatches
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_terminal_delivery_preserves_completed_keyed_replay() -> None:
+    """Closing after visible stream success cannot erase the completed replay."""
+
+    async def scenario() -> None:
+        """Close terminal delivery, then replay without a second provider dispatch."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TEXT_DELTA,
+                        sequence_number=0,
+                        text_delta="hello",
+                    ),
+                    GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+                )
+            )
+        )
+        service, _control, _ledger, _proof = _service(provider)
+        decoded = decode_responses(
+            {"model": "public-model", "input": "hello", "stream": True},
+            idempotency_key="terminal-delivery-operation",
+        )
+
+        response = await service.complete(raw_key="caller-secret", decoded=decoded)
+        assert isinstance(response, StreamingResponse)
+        iterator = cast(AsyncGenerator[bytes, None], response.body_iterator)
+        emitted = bytearray()
+        async for frame in iterator:
+            emitted.extend(frame)
+            if b"response.completed" in frame:
+                await iterator.aclose()
+                break
+
+        assert b"response.completed" in emitted
+        replay = await service.complete(raw_key="caller-secret", decoded=decoded)
+        assert replay.status_code == 200
+        assert b"response.completed" in replay.body
+        assert len(provider.streams) == 1
 
     asyncio.run(scenario())
