@@ -36,7 +36,18 @@ add_deferred_typer(
     module="wmo.cli.gateway.app",
     attr="gateway_app",
     help="Manage the local authenticated model gateway.",
-    known_names=("init", "status", "provider", "identity", "key", "alias", "grant", "usage"),
+    known_names=(
+        "init",
+        "status",
+        "provider",
+        "identity",
+        "key",
+        "alias",
+        "pool",
+        "budget",
+        "grant",
+        "usage",
+    ),
 )
 _console = Console(theme=WMO_THEME)
 _CONNECTION_JSON_OPTION = typer.Option(

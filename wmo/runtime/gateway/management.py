@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import Field
 
 from wmo.common.core.artifacts import ContractModel, stable_id
 from wmo.common.models import ConnectionConfig, ModelCatalog, load_model_catalog
-from wmo.runtime.gateway.auth import IssuedVirtualKey
+from wmo.runtime.gateway.auth import IssuedVirtualKey, utc_text
 from wmo.runtime.gateway.contracts import DirectTarget, ProjectTarget
 from wmo.runtime.gateway.sqlite import key_delivery
 from wmo.runtime.gateway.sqlite.migrations import connect_database
@@ -603,7 +603,7 @@ class GatewayManagement:
                 (
                     self.organization_id,
                     self.organization_id,
-                    datetime.now().astimezone().isoformat(),
+                    utc_text(datetime.now(UTC)),
                     self.organization_id,
                     self.organization_id,
                     self.organization_id,

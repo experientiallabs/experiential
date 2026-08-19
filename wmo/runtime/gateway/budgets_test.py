@@ -442,10 +442,10 @@ def test_limit_created_midflight_adopts_and_settles_existing_reservation(
     assert settled.remaining_micro_usd == 980
 
 
-def test_crash_recovery_retains_reservation_and_idempotent_settlement_charges_once(
+def test_crash_recovery_settles_reservation_and_idempotent_settlement_charges_once(
     tmp_path: Path,
 ) -> None:
-    """Unknown dispatches keep their maximum while repeated settlement cannot double-charge."""
+    """Unknown dispatches settle at their maximum while settlement cannot double-charge."""
     clock = _Clock()
     store, ledger, budgets, key = _authority(tmp_path, clock)
     budgets.set_limit(
@@ -465,7 +465,8 @@ def test_crash_recovery_retains_reservation_and_idempotent_settlement_charges_on
     clock.advance(timedelta(seconds=31))
     assert ledger.reconcile_crashed_requests(cleanup_grace=timedelta(0)) == (0, 1)
     after_crash = budgets.remaining(organization_id="org", period="2026-08")[0]
-    assert after_crash.reserved_micro_usd == 100
+    assert after_crash.reserved_micro_usd == 0
+    assert after_crash.settled_micro_usd == 100
     assert after_crash.remaining_micro_usd == 400
 
     _request_two, second_snapshot = _accepted(store, ledger, clock, key, "settle-once")
@@ -486,8 +487,8 @@ def test_crash_recovery_retains_reservation_and_idempotent_settlement_charges_on
 
     remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
     assert remaining.charged_micro_usd == 120
-    assert remaining.reserved_micro_usd == 100
-    assert remaining.settled_micro_usd == 20
+    assert remaining.reserved_micro_usd == 0
+    assert remaining.settled_micro_usd == 120
     assert remaining.remaining_micro_usd == 380
 
 

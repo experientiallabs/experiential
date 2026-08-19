@@ -356,6 +356,70 @@ def test_missing_candidates_use_configured_provider_picker_without_raw_prompts(
     assert "candidate-b" in plan.prospective_catalog.models
 
 
+def test_prospective_catalog_merges_candidate_reasoning_efforts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Picked efforts join retained efforts of still-selected candidates in the plan.
+
+    Args:
+        tmp_path: Temporary root containing the shared catalog.
+        monkeypatch: Replace provider discovery with a deterministic picker result.
+    """
+    path = tmp_path / "models.toml"
+    catalog = _catalog().model_copy(
+        update={
+            "models": {
+                "candidate-a": _catalog().models["candidate-a"],
+                "world": _catalog().models["world"],
+            },
+            "roles": ModelRoles(
+                candidates=("candidate-a", "world"),
+                incumbent="candidate-a",
+                candidate_reasoning_efforts={"candidate-a": "low", "world": "medium"},
+            ),
+        }
+    )
+    write_model_catalog(path, catalog)
+    new_connection = ProviderConnection(
+        name="new",
+        provider="openai",
+        api_key_env="OPENAI_API_KEY",
+    )
+    new_model = _candidate_model("candidate-b").model_copy(update={"connection": "new"})
+
+    def picker(*args: object, **kwargs: object) -> RouterCandidatePickerResult:
+        """Return a selection carrying one explicit reasoning effort."""
+        del args, kwargs
+        return RouterCandidatePickerResult(
+            selection=RouterCandidateSelection(
+                candidates=("candidate-a", "candidate-b"),
+                incumbent="candidate-a",
+                candidate_reasoning_efforts={"candidate-b": "high"},
+            ),
+            candidate_models=(new_model,),
+            connections=(new_connection,),
+        )
+
+    monkeypatch.setattr(router_candidates, "run_router_candidate_picker", picker)
+    monkeypatch.setattr(Confirm, "ask", lambda *args, **kwargs: True)
+
+    plan = collect_router_candidates(
+        path,
+        catalog,
+        candidates=(),
+        incumbent=None,
+        non_interactive=False,
+        console=_console(),
+    )
+
+    assert plan.prospective_catalog.roles.candidates == ("candidate-a", "candidate-b")
+    assert plan.prospective_catalog.roles.candidate_reasoning_efforts == {
+        "candidate-a": "low",
+        "candidate-b": "high",
+    }
+
+
 def test_interactive_confirmation_cannot_retarget_an_existing_alias(tmp_path: Path) -> None:
     """Interactive collection rejects replacement metadata before presenting a summary.
 

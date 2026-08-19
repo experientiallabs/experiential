@@ -97,7 +97,7 @@ def test_router_embedding_reservation_is_admitted_before_other_provider_work() -
     assert remaining == 0
     assert problems == [
         "the router embedding reservation consumes the entire provider spend ceiling; "
-        "increase --maximum-simulation-cost-usd or lower a request/retry ceiling"
+        "increase --maximum-provider-cost-usd or lower a request/retry ceiling"
     ]
 
 

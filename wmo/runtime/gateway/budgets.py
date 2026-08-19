@@ -12,7 +12,7 @@ from pathlib import Path
 from pydantic import Field, model_validator
 
 from wmo.common.core.artifacts import ContractModel, canonical_json_bytes, stable_id
-from wmo.common.models.gateway_catalog import ExactModelDeployment
+from wmo.common.models.gateway_catalog import ExactModelDeployment, NormalizedGatewayCatalog
 from wmo.runtime.gateway.auth import utc_text
 from wmo.runtime.gateway.contracts import GatewayRequest
 from wmo.runtime.gateway.interfaces import GatewayClock
@@ -268,8 +268,8 @@ class SQLiteBudgetStore:
             raise RuntimeError("monthly budget disappeared inside its transaction")
         return _limit_from_row(row)
 
-    @staticmethod
     def _require_scope_authority(
+        self,
         connection: sqlite3.Connection,
         *,
         organization_id: str,
@@ -302,6 +302,46 @@ class SQLiteBudgetStore:
             ).fetchone()
             if alias is None:
                 raise ValueError("budget alias is not active")
+        if scope.pool_id is not None:
+            assert scope.alias_id is not None
+            catalog = self._active_alias_catalog(
+                connection,
+                organization_id=organization_id,
+                alias_id=scope.alias_id,
+            )
+            pools = {pool.pool_id: pool for pool in catalog.pools}
+            pool = pools.get(scope.pool_id)
+            if pool is None:
+                raise ValueError("budget pool is not in the alias catalog")
+            if scope.deployment_id is not None and scope.deployment_id not in pool.deployment_ids:
+                raise ValueError("budget deployment is not in the alias pool")
+
+    def _active_alias_catalog(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        organization_id: str,
+        alias_id: str,
+    ) -> NormalizedGatewayCatalog:
+        """Load the normalized catalog pinned by one alias's active revision."""
+        row = connection.execute(
+            """
+            SELECT r.snapshot_ref FROM gateway_aliases AS a
+            JOIN alias_revisions AS r
+              ON r.organization_id = a.organization_id
+             AND r.alias_id = a.alias_id
+             AND r.revision_id = a.active_revision_id
+            WHERE a.organization_id = ? AND a.alias_id = ?
+            """,
+            (organization_id, alias_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("budget alias has no active revision")
+        snapshot = self.database_path.parent / str(row["snapshot_ref"])
+        try:
+            return NormalizedGatewayCatalog.model_validate_json(snapshot.read_bytes())
+        except (OSError, ValueError) as exc:
+            raise ValueError("budget alias catalog snapshot is unreadable") from exc
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:

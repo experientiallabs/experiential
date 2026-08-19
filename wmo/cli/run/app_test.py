@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
@@ -150,4 +151,41 @@ def test_no_argument_noninteractive_run_returns_stable_empty_state_json(tmp_path
     payload = json.loads(result.stdout)
     assert payload["error"]["code"] == "gateway_not_initialized"
     assert payload["error"]["next_commands"][0].startswith("wmo config gateway init")
+    assert not (tmp_path / "gateway").exists()
+
+
+def test_uninitialized_run_survives_a_closed_stdin_tty_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stdin whose isatty raises still yields the stable empty-state guidance.
+
+    Args:
+        tmp_path: Uninitialized WMO root.
+        monkeypatch: Replaces stdin with a stream that rejects terminal probes.
+    """
+    from wmo.cli.run.app import _run_gateway
+
+    class _ClosedStdin:
+        """Stream stub whose terminal probe raises like a closed file."""
+
+        def isatty(self) -> bool:
+            """Raise the closed-stream error a detached stdin produces."""
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr("sys.stdin", _ClosedStdin())
+    with pytest.raises(typer.Exit) as excinfo:
+        _run_gateway(
+            project=None,
+            root=tmp_path,
+            policy=None,
+            port=8000,
+            ghost=False,
+            non_interactive=False,
+            json_output=False,
+            check=True,
+            graceful_timeout=1.0,
+        )
+
+    assert excinfo.value.exit_code == 2
     assert not (tmp_path / "gateway").exists()

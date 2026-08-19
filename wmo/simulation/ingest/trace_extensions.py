@@ -302,8 +302,7 @@ def collect_outcome(
 
     Args:
         attributes_by_span: Canonical span attributes in trace order.
-        failures: Structured span failures observed in this trace, in order. Sources without
-            span-failure fallback semantics pass an empty sequence.
+        failures: Structured span failures observed in this trace, in order.
         error_type: Source-specific validation exception type.
 
     Returns:

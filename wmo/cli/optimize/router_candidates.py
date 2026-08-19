@@ -236,12 +236,19 @@ def collect_router_candidates(
     problems = validate_router_candidate_selection(prospective, selection)
     if problems:
         raise typer.BadParameter("router candidate setup is incomplete: " + "; ".join(problems))
+    retained_efforts = {
+        alias: effort
+        for alias, effort in prospective.roles.candidate_reasoning_efforts.items()
+        if alias in selection.candidates
+    }
+    retained_efforts.update(selection.candidate_reasoning_efforts)
     prospective = prospective.model_copy(
         update={
             "roles": prospective.roles.model_copy(
                 update={
                     "candidates": selection.candidates,
                     "incumbent": selection.incumbent,
+                    "candidate_reasoning_efforts": retained_efforts,
                 }
             )
         }

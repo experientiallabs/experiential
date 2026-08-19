@@ -392,7 +392,10 @@ def _normalize_trace_group(
         keys=("gen_ai.tool.definitions", REQUEST_TOOLS_KEY),
         error_type=OtlpTraceFormatError,
     )
-    outcome = collect_outcome(all_attributes, failures=(), error_type=OtlpTraceFormatError)
+    span_failures = tuple(span.failure for span in normalized_spans if span.failure is not None)
+    outcome = collect_outcome(
+        all_attributes, failures=span_failures, error_type=OtlpTraceFormatError
+    )
     return Trace(
         trace_id=trace_id,
         conversation_id=conversation_id,

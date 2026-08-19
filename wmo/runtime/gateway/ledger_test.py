@@ -742,6 +742,7 @@ def test_crash_reconciliation_waits_for_deadline_and_cleanup_bound(tmp_path: Pat
         deployment=_deployment(),
         attempt_ordinal=0,
         route_depth=0,
+        maximum_cost_micro_usd=250,
     )
 
     clock.advance(12)
@@ -772,6 +773,12 @@ def test_crash_reconciliation_waits_for_deadline_and_cleanup_bound(tmp_path: Pat
             == 1
         )
         assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone()[0] == 2
+        assert connection.execute(
+            """
+            SELECT budget_reserved_micro_usd, budget_settled_micro_usd
+            FROM gateway_attempts WHERE state = 'unknown_after_crash'
+            """
+        ).fetchone() == (250, 250)
     finally:
         connection.close()
 

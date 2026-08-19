@@ -745,7 +745,7 @@ def remaining_simulation_budget(
     if remaining <= 0:
         problems.append(
             "the router embedding reservation consumes the entire provider spend ceiling; "
-            "increase --maximum-simulation-cost-usd or lower a request/retry ceiling"
+            "increase --maximum-provider-cost-usd or lower a request/retry ceiling"
         )
         return 0.0
     return remaining

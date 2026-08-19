@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 from pathlib import Path
 
 import typer
+from rich.console import Console
 
+from wmo.cli.shared.consent import can_prompt
 from wmo.cli.shared.options import ROOT_OPTION, usage_error
 
 _LOOPBACK_HOST = "127.0.0.1"
@@ -116,7 +117,7 @@ def _run_gateway(
         with usage_error(ValueError):
             compatibility = prepare_project_gateway(project, root, policy_id=policy)
     elif not manager.initialized:
-        if non_interactive or json_output or not sys.stdin.isatty() or not sys.stdout.isatty():
+        if non_interactive or json_output or not can_prompt(Console()):
             _gateway_not_initialized(json_output=json_output)
         with usage_error(ValueError):
             setup = interactive_gateway_setup(root)

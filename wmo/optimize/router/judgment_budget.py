@@ -674,7 +674,7 @@ def complete_cell_evidence(
                     spend_ceiling_crossed(
                         stop_on_overspend,
                         "reconciled provider spend reached the shared ceiling before judgment "
-                        "dispatch; increase --maximum-simulation-cost-usd and rerun to resume",
+                        "dispatch; increase --maximum-provider-cost-usd and rerun to resume",
                         f"reconciled judge spend ${judge_spend_usd:.4f} reached the shared "
                         f"authorized remainder ${remaining_cost_usd:.4f}",
                     )

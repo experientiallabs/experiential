@@ -482,7 +482,7 @@ class SQLiteAttemptLedger:
                     expired_requests += 1
             attempt_rows = connection.execute(
                 """
-                SELECT a.attempt_id, a.request_id, r.deadline_at
+                SELECT a.attempt_id, a.request_id, a.budget_reserved_micro_usd, r.deadline_at
                 FROM gateway_attempts AS a
                 JOIN gateway_requests AS r ON r.request_id = a.request_id
                 WHERE a.state = 'dispatched'
@@ -492,14 +492,20 @@ class SQLiteAttemptLedger:
                 deadline = datetime.fromisoformat(str(attempt["deadline_at"]))
                 if deadline + cleanup_grace > now:
                     continue
+                reserved = _optional_int(attempt["budget_reserved_micro_usd"])
                 connection.execute(
                     """
                     UPDATE gateway_attempts
                     SET state = 'unknown_after_crash', terminal_at = ?,
-                        usage_source = 'unknown'
+                        usage_source = 'unknown', budget_settled_micro_usd = ?
                     WHERE attempt_id = ? AND state = 'dispatched'
                     """,
-                    (utc_text(now), str(attempt["attempt_id"])),
+                    (utc_text(now), reserved, str(attempt["attempt_id"])),
+                )
+                settle_attempt_budgets(
+                    connection,
+                    attempt_id=str(attempt["attempt_id"]),
+                    settled_micro_usd=reserved,
                 )
                 connection.execute(
                     """

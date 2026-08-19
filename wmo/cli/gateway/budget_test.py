@@ -9,6 +9,11 @@ import click
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
+from wmo.common.models.gateway_catalog import (
+    ExactModelDeployment,
+    ExactModelPool,
+    NormalizedGatewayCatalog,
+)
 from wmo.runtime.gateway.contracts import DirectTarget
 from wmo.runtime.gateway.management import GatewayManagement
 
@@ -21,6 +26,28 @@ def _configured(root: Path) -> GatewayManagement:
     manager.initialize()
     store = manager.require_initialized()
     manager.create_identity(identity_id="identity-one", display_name="Identity")
+    catalog = NormalizedGatewayCatalog(
+        deployments=(
+            ExactModelDeployment(
+                deployment_id="azure-primary",
+                source_alias="azure-primary",
+                exact_model_id="exact-one",
+                connection="connection-one",
+                provider="openai-compatible",
+                provider_model="provider-model",
+                connection_sha256="b" * 64,
+                capabilities_sha256="c" * 64,
+            ),
+        ),
+        pools=(
+            ExactModelPool(
+                pool_id="pool-one",
+                exact_model_id="exact-one",
+                deployment_ids=("azure-primary",),
+            ),
+        ),
+    )
+    (manager.state_dir / "snapshot-one").write_text(catalog.model_dump_json())
     store.register_catalog_snapshot(
         organization_id=manager.organization_id,
         snapshot_ref="snapshot-one",
@@ -151,3 +178,46 @@ def test_interactive_set_prompts_while_noninteractive_missing_values_fail(tmp_pa
     assert missing.exit_code == 2
     normalized = " ".join(click.unstyle(missing.output).replace("│", " ").split())
     assert "--period is required" in normalized
+
+
+def test_budget_set_rejects_scopes_outside_the_alias_active_catalog(tmp_path: Path) -> None:
+    """Pool and deployment scopes must exist in the alias's active revision snapshot."""
+    _configured(tmp_path)
+    runner = CliRunner()
+
+    def _set(arguments: list[str]) -> str:
+        result = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "budget",
+                "set",
+                "--period",
+                "2026-08",
+                *arguments,
+                "--limit-micro-usd",
+                "1000",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+            ],
+        )
+        assert result.exit_code == 2, result.output
+        return " ".join(click.unstyle(result.output).replace("│", " ").split())
+
+    unknown_pool = _set(["--scope", "pool", "--alias", "coding", "--pool", "pool-two"])
+    assert "budget pool is not in the alias catalog" in unknown_pool
+    unknown_deployment = _set(
+        [
+            "--scope",
+            "deployment",
+            "--alias",
+            "coding",
+            "--pool",
+            "pool-one",
+            "--deployment",
+            "azure-secondary",
+        ]
+    )
+    assert "budget deployment is not in the alias pool" in unknown_deployment

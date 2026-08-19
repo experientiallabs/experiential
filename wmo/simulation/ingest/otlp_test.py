@@ -254,6 +254,27 @@ def test_normalizes_w3c_genai_trace_and_wmo_outcome_extensions() -> None:
     assert trace.spans[1].parent_span_id == _CALL_SPAN_ID
 
 
+def test_failed_span_without_outcome_extensions_yields_failure_outcome() -> None:
+    """A span-level OTLP error becomes the trace failure outcome when none is declared."""
+    payload = _payload()
+    attributes = cast(list[dict[str, object]], _span(payload, 0)["attributes"])
+    attributes[:] = [
+        attribute
+        for attribute in attributes
+        if not str(attribute["key"]).startswith("wmo.outcome.")
+    ]
+    _span(payload, 1)["status"] = {"code": 2, "message": "tool crashed"}
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.issues == ()
+    trace = result.traces[0]
+    assert trace.outcome is not None
+    assert trace.outcome.status == "failure"
+    assert trace.outcome.failure is not None
+    assert trace.outcome.failure.message == "tool crashed"
+
+
 def test_otlp_retains_a_declared_model_connection_digest() -> None:
     """An exporter can retain exact secret-free connection evidence without an endpoint URL."""
     payload = _payload()

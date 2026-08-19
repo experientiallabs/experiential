@@ -62,3 +62,22 @@ def test_every_paid_command_exposes_deterministic_agent_flags(argv: list[str]) -
     assert result.exit_code == 0, result.output
     assert "--yes" in help_text
     assert "--non-interactive" in help_text
+
+
+def test_config_gateway_deferred_names_match_real_gateway_commands() -> None:
+    """The deferred gateway group advertises exactly the registered subcommands."""
+    from typing import cast
+
+    import click
+    from typer.main import get_command
+
+    from wmo.cli.gateway.app import gateway_app
+
+    root_group = cast(click.Group, get_command(app))
+    config_group = cast(click.Group, root_group.commands["config"])
+    gateway_group = cast(click.Group, config_group.commands["gateway"])
+    deferred_names = set(gateway_group.list_commands(cast(click.Context, None)))
+    real_names = set(cast(click.Group, get_command(gateway_app)).commands)
+
+    assert deferred_names == real_names
+    assert {"pool", "budget"}.issubset(deferred_names)

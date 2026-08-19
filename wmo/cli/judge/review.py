@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
@@ -14,6 +13,7 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.cli.judge.trace_viewer import view_trace_proposal
 from wmo.cli.judge.transcript import render_field, render_trace, span_evidence_text
+from wmo.cli.shared.consent import can_prompt
 from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.traces import TraceSpan
 from wmo.optimize.router.judging.contracts import (
@@ -224,7 +224,7 @@ def _interactive_viewer_available(console: Console) -> bool:
     Returns:
         True when both the console and stdin are interactive terminals.
     """
-    return console.is_terminal and sys.stdin.isatty()
+    return can_prompt(console)
 
 
 def _render_axis_proposals(
