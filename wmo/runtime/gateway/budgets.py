@@ -363,15 +363,25 @@ def maximum_attempt_cost_micro_usd(
     if output_tokens is None:
         return None
     prices = deployment.gateway.prices
-    input_rates = [prices.input_micro_usd_per_million_tokens]
-    output_rates = [prices.output_micro_usd_per_million_tokens]
     capabilities = deployment.gateway.capabilities
+    required_rates = [
+        prices.input_micro_usd_per_million_tokens,
+        prices.output_micro_usd_per_million_tokens,
+    ]
     if capabilities.reports_cached_input_tokens:
-        input_rates.append(prices.cached_input_micro_usd_per_million_tokens)
+        required_rates.append(prices.cached_input_micro_usd_per_million_tokens)
     if capabilities.reports_reasoning_tokens:
-        output_rates.append(prices.reasoning_micro_usd_per_million_tokens)
-    if any(rate is None for rate in (*input_rates, *output_rates)):
+        required_rates.append(prices.reasoning_micro_usd_per_million_tokens)
+    if any(rate is None for rate in required_rates):
         return None
+    input_rates = (
+        prices.input_micro_usd_per_million_tokens,
+        prices.cached_input_micro_usd_per_million_tokens,
+    )
+    output_rates = (
+        prices.output_micro_usd_per_million_tokens,
+        prices.reasoning_micro_usd_per_million_tokens,
+    )
     numerator = input_tokens * sum(rate or 0 for rate in input_rates)
     numerator += output_tokens * sum(rate or 0 for rate in output_rates)
     maximum = (numerator + 999_999) // 1_000_000

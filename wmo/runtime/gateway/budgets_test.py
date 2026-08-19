@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from wmo.common.core.artifacts import canonical_json_bytes
 from wmo.common.models import ModelCapabilities
 from wmo.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
 from wmo.common.models.gateway_catalog import ExactModelDeployment
@@ -173,6 +174,24 @@ def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_cl
         }
     )
     assert maximum_attempt_cost_micro_usd(request, unrepresentable) is None
+    all_prices = _deployment().model_copy(
+        update={
+            "gateway": _deployment().gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_000_000,
+                        cached_input_micro_usd_per_million_tokens=3_000_000,
+                        output_micro_usd_per_million_tokens=2_000_000,
+                        reasoning_micro_usd_per_million_tokens=4_000_000,
+                    )
+                }
+            )
+        }
+    )
+    assert all_prices.gateway.capabilities.reports_cached_input_tokens is False
+    assert all_prices.gateway.capabilities.reports_reasoning_tokens is False
+    all_dimensions = maximum_attempt_cost_micro_usd(request, all_prices)
+    assert all_dimensions is not None and all_dimensions > known
     assert (
         maximum_attempt_cost_micro_usd(
             request.model_copy(update={"maximum_output_tokens": None}),
@@ -220,6 +239,64 @@ def test_concurrent_identity_reservations_never_exceed_hard_limit(tmp_path: Path
     assert rejected == 5
     remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
     assert remaining.reserved_micro_usd == 500
+    assert remaining.remaining_micro_usd == 0
+
+
+def test_configured_optional_prices_are_reserved_even_when_reporting_hints_are_false(
+    tmp_path: Path,
+) -> None:
+    """Provider usage cannot settle cached or reasoning cost above its reservation."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    deployment = _deployment().model_copy(
+        update={
+            "gateway": _deployment().gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_000_000,
+                        cached_input_micro_usd_per_million_tokens=3_000_000,
+                        output_micro_usd_per_million_tokens=2_000_000,
+                        reasoning_micro_usd_per_million_tokens=4_000_000,
+                    )
+                }
+            )
+        }
+    )
+    request, snapshot = _accepted(store, ledger, clock, key, "all-price-dimensions")
+    maximum = maximum_attempt_cost_micro_usd(request, deployment)
+    assert maximum is not None
+    budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_micro_usd=maximum,
+    )
+    attempt = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_micro_usd=maximum,
+    )
+    input_ceiling = len(canonical_json_bytes(request))
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=0,
+            usage=GatewayUsage(
+                input_tokens=input_ceiling,
+                cached_input_tokens=input_ceiling,
+                output_tokens=16,
+                reasoning_tokens=16,
+            ),
+        ),
+        failure=None,
+    )
+
+    remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
+    assert remaining.reserved_micro_usd == 0
+    assert remaining.settled_micro_usd == maximum
     assert remaining.remaining_micro_usd == 0
 
 
