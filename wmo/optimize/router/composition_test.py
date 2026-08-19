@@ -62,7 +62,7 @@ from wmo.optimize.router.composition import (
 from wmo.optimize.router.evaluation.spend import observed_rollout_spend
 from wmo.optimize.router.fit.workflow_test import _persist_embeddings, _persist_pricing
 from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.runtime_test import _Client, _request
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.engines.text import simulator as text_simulator_module
@@ -202,7 +202,8 @@ class _Catalog:
         """Return one alias snapshot and its deterministic capabilities."""
         return self.snapshots[alias], _capabilities(alias)
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        del role
         """Resolve one alias to the shared deterministic client."""
         snapshot, capabilities = self.snapshot(alias)
         return ResolvedModel(

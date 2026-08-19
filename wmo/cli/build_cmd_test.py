@@ -35,7 +35,7 @@ from wmo.common.models import (
 )
 from wmo.common.project import ArtifactCorruptionError, ProjectStore, ProjectStoreError
 from wmo.common.traces import load_trace_dataset
-from wmo.runtime.models import ResolvedModel
+from wmo.runtime.models import CatalogRoleName, ResolvedModel
 from wmo.simulation.ingest.dataset import read_trace_model_identity_evidence
 from wmo.simulation.retrieval import load_rag_index
 from wmo.simulation.world_model import GroundedWorldModelArtifact
@@ -212,7 +212,14 @@ class _RuntimeCatalog:
         resolved = self._resolved(alias)
         return resolved.snapshot, resolved.capabilities
 
-    def preflight(self, alias: str, _requirement: object | None = None) -> ResolvedModel:
+    def preflight(
+        self,
+        alias: str,
+        _requirement: object | None = None,
+        *,
+        role: CatalogRoleName | None = None,
+    ) -> ResolvedModel:
+        del role
         """Return exact static identities with alias-specific capabilities.
 
         Args:
@@ -250,7 +257,8 @@ class _RuntimeCatalog:
         )
         return ResolvedModel(alias, snapshot, capabilities, self._completion, embedding)
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        del role
         """Reuse local preflight for roles with no extra capability requirement.
 
         Args:
@@ -334,7 +342,7 @@ def test_first_build_provider_flags_skip_the_opening_list(
             "--provider",
             "openai",
         ],
-        input="1,3\n\n1\n1\n1\n\ny\n",
+        input="1,3\n\n1\n\n1\n\n1\ny\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -399,7 +407,7 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     result = _RUNNER.invoke(
         app,
         ["build", "support", str(source), "--root", str(root)],
-        input="1\n\n1,3\n\n1\n1\n1\n\ny\n",
+        input="1\n\n1,3\n\n1\n\n1\n\n1\ny\n",
     )
 
     assert result.exit_code == 0, result.output

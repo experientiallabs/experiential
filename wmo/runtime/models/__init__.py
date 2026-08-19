@@ -2,6 +2,7 @@
 
 from wmo.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
 from wmo.runtime.models.registry import (
+    CatalogRoleName,
     ModelConnectionError,
     ResolvedModel,
     RuntimeModelCatalog,
@@ -9,6 +10,7 @@ from wmo.runtime.models.registry import (
 
 __all__ = [
     "CapabilityRequirement",
+    "CatalogRoleName",
     "ModelCapabilityError",
     "ModelConnectionError",
     "ResolvedModel",

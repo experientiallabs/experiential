@@ -13,7 +13,7 @@ from wmo.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
-from wmo.common.models.model import ModelCapabilities
+from wmo.common.models.model import ModelCapabilities, ReasoningEffort
 from wmo.common.models.pricing import CandidateTokenPrice
 from wmo.common.models.setup import (
     ProviderModelSelection,
@@ -49,10 +49,15 @@ def router_candidate_capabilities_sha256(capabilities: ModelCapabilities) -> Sha
 
 
 class RouterCandidateSelection(ContractModel):
-    """Explicit ordered router candidates and the quality incumbent among them."""
+    """Explicit ordered router candidates and the quality incumbent among them.
+
+    Each candidate alias may carry its own reasoning-effort choice for candidate-role calls.
+    An absent entry means that candidate keeps its catalog capability pin unchanged.
+    """
 
     candidates: tuple[str, ...] = Field(min_length=2)
     incumbent: str = Field(min_length=1, max_length=128)
+    candidate_reasoning_efforts: dict[str, ReasoningEffort] = Field(default_factory=dict)
 
     @field_validator("candidates")
     @classmethod
@@ -84,6 +89,11 @@ class RouterCandidateSelection(ContractModel):
         """
         if self.incumbent not in self.candidates:
             raise ValueError("router incumbent must also be a selected candidate")
+        unknown = sorted(set(self.candidate_reasoning_efforts).difference(self.candidates))
+        if unknown:
+            raise ValueError(
+                "candidate_reasoning_efforts name unselected candidates: " + ", ".join(unknown)
+            )
         return self
 
 
@@ -261,8 +271,18 @@ def _apply_router_candidate_selection(
         raise RouterCandidateSetupError(
             "router candidate setup is incomplete:\n- " + "\n- ".join(problems)
         )
+    retained = {
+        alias: effort
+        for alias, effort in catalog.roles.candidate_reasoning_efforts.items()
+        if alias in selection.candidates
+    }
+    retained.update(selection.candidate_reasoning_efforts)
     roles = catalog.roles.model_copy(
-        update={"candidates": selection.candidates, "incumbent": selection.incumbent}
+        update={
+            "candidates": selection.candidates,
+            "incumbent": selection.incumbent,
+            "candidate_reasoning_efforts": retained,
+        }
     )
     return catalog.model_copy(update={"roles": roles})
 
