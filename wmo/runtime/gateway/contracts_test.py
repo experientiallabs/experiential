@@ -8,9 +8,6 @@ from pydantic import ValidationError
 from wmo.common.models.model import ToolCall
 from wmo.runtime.gateway.contracts import (
     AuthorizationSnapshot,
-    CompatibilityDisposition,
-    CompatibilityField,
-    CompatibilityManifest,
     DirectTarget,
     ExecutionSnapshot,
     GatewayApiSurface,
@@ -90,28 +87,11 @@ def test_raw_tool_argument_delta_accepts_non_json_fragments_in_order() -> None:
         )
 
 
-def test_targets_and_compatibility_manifest_are_closed_and_deterministic() -> None:
-    """Target variants discriminate cleanly and public field decisions cannot conflict."""
+def test_targets_discriminate_cleanly() -> None:
+    """Target variants expose their discriminator for closed routing decisions."""
     target = DirectTarget(pool_id="coding")
-    manifest = CompatibilityManifest(
-        schema_version=1,
-        surface=GatewayApiSurface.CHAT_COMPLETIONS,
-        fields=(
-            CompatibilityField(
-                field_path="messages",
-                disposition=CompatibilityDisposition.SUPPORTED,
-            ),
-        ),
-    )
 
     assert target.kind == "direct"
-    assert CompatibilityManifest.model_validate_json(manifest.model_dump_json()) == manifest
-    with pytest.raises(ValidationError, match="must be unique"):
-        CompatibilityManifest(
-            schema_version=1,
-            surface=GatewayApiSurface.CHAT_COMPLETIONS,
-            fields=(manifest.fields[0], manifest.fields[0]),
-        )
 
 
 def test_project_authorization_precedes_route_bound_execution() -> None:

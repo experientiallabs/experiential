@@ -20,8 +20,6 @@ from pydantic import (
 from wmo.common.core.artifacts import ContractModel, JsonObject
 from wmo.common.models.model import ToolCall
 from wmo.runtime.gateway.contracts import (
-    CompatibilityDisposition,
-    CompatibilityManifest,
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
@@ -30,11 +28,7 @@ from wmo.runtime.gateway.contracts import (
     StructuredTextFormat,
 )
 from wmo.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
-from wmo.runtime.openai_protocol.manifest import (
-    CHAT_MANIFEST,
-    RESPONSES_MANIFEST,
-    disposition_map,
-)
+from wmo.runtime.openai_protocol.manifest import CHAT_ACCEPTED_FIELDS, RESPONSES_ACCEPTED_FIELDS
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
 _RESPONSES_OFFICIAL = TypeAdapter(ResponseCreateParams)
@@ -263,7 +257,7 @@ def decode_chat(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    _validate_manifest(payload, CHAT_MANIFEST)
+    _validate_accepted_fields(payload, CHAT_ACCEPTED_FIELDS)
     _validate_official(_CHAT_OFFICIAL, payload)
     request = _validate_wire(_ChatRequest, payload)
     operation = _caller_operation(idempotency_key, client_request_id)
@@ -319,7 +313,7 @@ def decode_responses(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    _validate_manifest(payload, RESPONSES_MANIFEST)
+    _validate_accepted_fields(payload, RESPONSES_ACCEPTED_FIELDS)
     _validate_official(_RESPONSES_OFFICIAL, payload)
     request = _validate_wire(_ResponsesRequest, payload)
     operation = _caller_operation(idempotency_key, client_request_id)
@@ -347,12 +341,10 @@ def decode_responses(
     return DecodedGatewayRequest(alias=request.model, request=canonical)
 
 
-def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:
+def _validate_accepted_fields(payload: JsonObject, accepted: frozenset[str]) -> None:
     """Reject unsupported and unknown top-level fields before responder work."""
-    decisions = disposition_map(manifest)
     for field in payload:
-        disposition = decisions.get(field)
-        if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
+        if field not in accepted:
             raise unsupported_field(field)
 
 

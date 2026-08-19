@@ -14,7 +14,6 @@ from wmo.common.judging import (
     render_rubric_table,
     score_bounds,
 )
-from wmo.optimize.router.judging.contracts import JudgePromptTemplate
 from wmo.optimize.router.judging.service import ManualJudgeSetupPlan
 from wmo.optimize.router.judging.template_bind import bind_prompt_template
 
@@ -59,25 +58,6 @@ def replace_setup_axes(
         raise ValueError("a rubric must contain at least one axis")
     template = bind_prompt_template(plan.prompt_template, dimensions)
     return replace(plan, dimensions=dimensions, prompt_template=template)
-
-
-def rebind_prompt_template(
-    template: JudgePromptTemplate,
-    dimensions: tuple[RubricDimension, ...],
-) -> JudgePromptTemplate:
-    """Bind a prompt contract to the shared inclusive axis range.
-
-    Args:
-        template: Current prompt contract.
-        dimensions: Replacement ordered axes.
-
-    Returns:
-        The rebound prompt contract used by setup and the editor.
-
-    Raises:
-        ValueError: The axes are empty, mixed, or a custom projection leaves the range.
-    """
-    return bind_prompt_template(template, dimensions)
 
 
 def maybe_edit_setup_plan(plan: ManualJudgeSetupPlan, *, console: Console) -> ManualJudgeSetupPlan:
@@ -188,11 +168,6 @@ def build_axis(
         max_score=max_score,
         anchors=anchors,
     )
-
-
-def axis_score_choices(axis: RubricDimension) -> str:
-    """Return the inclusive range shown next to a calibration score prompt."""
-    return f"{axis.min_score}-{axis.max_score}"
 
 
 def _select_axis(

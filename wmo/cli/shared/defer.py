@@ -54,9 +54,7 @@ class DeferredTyperGroup(TyperGroup):
         """Return known command names without loading the deferred application."""
         if self._real is not None:
             return self._ensure().list_commands(ctx)
-        if self._known_names:
-            return list(self._known_names)
-        return self._ensure().list_commands(ctx)
+        return list(self._known_names)
 
     def get_command(self, ctx: _click.Context, cmd_name: str) -> _click.Command | None:
         """Load the deferred application and resolve one command."""
@@ -70,7 +68,7 @@ def add_deferred_typer(
     module: str,
     attr: str,
     help: str,
-    known_names: tuple[str, ...] = (),
+    known_names: tuple[str, ...],
     no_args_is_help: bool = True,
 ) -> None:
     """Register a named sub-app whose module loads only on first use.

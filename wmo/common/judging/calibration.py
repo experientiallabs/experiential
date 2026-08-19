@@ -236,33 +236,6 @@ class JudgeCalibrationService:
         )
         return self.write_calibration(store, report=stored_report, calibration=calibration)
 
-    def insufficient_calibration(
-        self, store: ProjectStore, report: CalibrationReport
-    ) -> JudgeCalibration:
-        """Create a persisted-report-bound calibration that remains visibly insufficient.
-
-        Args:
-            store: Project store that owns the exact completed calibration report.
-            report: Persisted insufficient report whose maps remain unavailable for final use.
-
-        Returns:
-            A report-bound calibration with its status left as ``insufficient``.
-
-        Raises:
-            CalibrationError: The report is absent, is not insufficient, or has no human labels.
-        """
-        stored_report, report_input = _require_persisted_report(store, report)
-        if stored_report.status != "insufficient" or stored_report.eligible_label_count == 0:
-            raise CalibrationError(
-                "insufficient calibration requires a nonzero insufficient report"
-            )
-        return calibration_from_report(
-            stored_report,
-            report_input=report_input,
-            status="insufficient",
-            approved_at=None,
-        )
-
     def approve(
         self,
         store: ProjectStore,

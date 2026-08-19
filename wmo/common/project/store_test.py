@@ -207,16 +207,6 @@ def test_artifact_round_trip_is_digest_verified_and_immutable(tmp_path: Path) ->
     assert stored.manifest == manifest
     assert artifact_input(manifest).artifact_id == "task-set-v1"
     assert store.artifacts.read_bytes("task-set-v1", "tasks.json") == b'{"task_ids":["task-1"]}'
-    jsonl_manifest = store.artifacts.write_jsonl(
-        artifact_id="traces-v1",
-        artifact_type="trace-set",
-        envelope=_envelope(),
-        files={"traces.jsonl": ({"trace_id": "trace-1"}, {"trace_id": "trace-2"})},
-    )
-    assert jsonl_manifest.files[0].path == "traces.jsonl"
-    assert store.artifacts.read_bytes("traces-v1", "traces.jsonl") == (
-        b'{"trace_id":"trace-1"}\n{"trace_id":"trace-2"}\n'
-    )
     with pytest.raises(ArtifactAlreadyExistsError, match="immutable"):
         store.artifacts.write_json(
             artifact_id="task-set-v1",
@@ -291,7 +281,7 @@ def test_corruption_and_crash_do_not_create_valid_partial_artifacts(
         envelope=_envelope(),
         files={"tasks.json": {"task_ids": ["task-1"]}},
     )
-    store.paths.artifact_file("task-set-v1", "tasks.json").write_text(
+    (store.paths.artifact_directory("task-set-v1") / "tasks.json").write_text(
         '{"task_ids":["task-2"]}', encoding="utf-8"
     )
     with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
@@ -323,7 +313,7 @@ def test_read_bytes_rechecks_the_exact_file_snapshot_after_full_verification(
         envelope=_envelope(),
         files={"tasks.json": {"task_ids": ["task-1"]}},
     )
-    target = store.paths.artifact_file("task-set-v1", "tasks.json")
+    target = store.paths.artifact_directory("task-set-v1") / "tasks.json"
     verified_read = store.artifacts.read
 
     def replace_after_verification(artifact_id: str) -> project_store_module.StoredArtifact:
@@ -348,7 +338,7 @@ def test_read_bytes_rejects_a_symlink_swapped_after_full_verification(
         envelope=_envelope(),
         files={"tasks.json": {"task_ids": ["task-1"]}},
     )
-    target = store.paths.artifact_file("task-set-v1", "tasks.json")
+    target = store.paths.artifact_directory("task-set-v1") / "tasks.json"
     outside = tmp_path / "outside.json"
     outside.write_bytes(b'{"task_ids":["outside"]}')
     verified_read = store.artifacts.read

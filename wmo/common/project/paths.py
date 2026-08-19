@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from wmo.common.core.artifacts import validate_artifact_file_path, validate_artifact_id
+from wmo.common.core.artifacts import validate_artifact_id
 
 
 class ProjectPathError(ValueError):
@@ -87,33 +87,3 @@ class ProjectPaths:
             The path beneath this project's artifact directory.
         """
         return self.artifacts_directory / validate_local_id(artifact_id, label="artifact ID")
-
-    def artifact_file(self, artifact_id: str, relative_path: str) -> Path:
-        """Return a safe data-file path inside one immutable artifact directory.
-
-        Args:
-            artifact_id: Stable local artifact identifier.
-            relative_path: Relative POSIX path owned by the artifact.
-
-        Returns:
-            A checked descendant path.
-
-        Raises:
-            ProjectPathError: If the artifact ID or relative path is unsafe.
-        """
-        directory = self.artifact_directory(artifact_id)
-        try:
-            relative = validate_artifact_file_path(relative_path)
-        except ValueError as exc:
-            raise ProjectPathError(str(exc)) from exc
-        candidate = directory.joinpath(*relative.parts)
-        _assert_descendant(candidate, directory)
-        return candidate
-
-
-def _assert_descendant(candidate: Path, directory: Path) -> None:
-    """Reject a resolved path that escapes its intended directory."""
-    resolved_directory = directory.resolve()
-    resolved_candidate = candidate.resolve()
-    if not resolved_candidate.is_relative_to(resolved_directory):
-        raise ProjectPathError(f"artifact file path escapes {directory}")

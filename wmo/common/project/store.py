@@ -6,7 +6,7 @@ import hashlib
 import os
 import shutil
 import stat
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -23,7 +23,6 @@ from wmo.common.core.artifacts import (
     assert_secret_free,
     assert_text_secret_free,
     canonical_json_bytes,
-    canonical_jsonl_bytes,
     envelope_matches_manifest,
     validate_artifact_file_path,
 )
@@ -206,45 +205,6 @@ class ArtifactStore:
             except SecretBoundaryError as exc:
                 raise ArtifactStoreError(str(exc)) from exc
             serialized_files[relative_path] = canonical_json_bytes(value)
-        return self.write(
-            artifact_id=artifact_id,
-            artifact_type=artifact_type,
-            envelope=envelope,
-            files=serialized_files,
-        )
-
-    def write_jsonl(
-        self,
-        *,
-        artifact_id: str,
-        artifact_type: str,
-        envelope: ArtifactEnvelope,
-        files: Mapping[str, Sequence[BaseModel | JsonValue]],
-    ) -> ArtifactManifest:
-        """Persist deterministic secret-free JSONL records as one immutable artifact.
-
-        Args:
-            artifact_id: New stable artifact identifier.
-            artifact_type: Stable domain type for the manifest.
-            envelope: Shared immutable provenance.
-            files: Ordered structured records keyed by their JSONL file paths.
-
-        Returns:
-            The completed digest-verified manifest.
-
-        Raises:
-            ArtifactStoreError: A file is not JSONL or one record violates the secret boundary.
-        """
-        serialized_files: dict[str, bytes] = {}
-        for relative_path, records in files.items():
-            if Path(relative_path).suffix != ".jsonl":
-                raise ArtifactStoreError("write_jsonl requires .jsonl data-file paths")
-            for record in records:
-                try:
-                    assert_secret_free(record)
-                except SecretBoundaryError as exc:
-                    raise ArtifactStoreError(str(exc)) from exc
-            serialized_files[relative_path] = canonical_jsonl_bytes(records)
         return self.write(
             artifact_id=artifact_id,
             artifact_type=artifact_type,

@@ -54,8 +54,6 @@ _ALLOWED_EVENT_PROPERTIES: dict[str, frozenset[str]] = {
     "wmo router completed": frozenset(
         {
             "success",
-            "fit_cell_count",
-            "heldout_cell_count",
             "candidate_count",
             "duration_seconds",
         }
@@ -95,8 +93,6 @@ _COUNT_PROPERTIES = frozenset(
         "llm_call_count",
         "input_tokens",
         "output_tokens",
-        "fit_cell_count",
-        "heldout_cell_count",
         "candidate_count",
         "rollout_count",
         "train_example_count",
@@ -136,19 +132,6 @@ class BuildTelemetryStats:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
-
-
-def capture(
-    event: str,
-    properties: TelemetryProperties | None = None,
-    *,
-    root: str | Path = ARTIFACT_DIR,
-) -> bool:
-    """Send one anonymous metadata-only event. Returns False when skipped or failed."""
-    safe_properties = _sanitize_properties(event, properties)
-    if safe_properties is None or not _enabled(root):
-        return False
-    return _capture_sanitized(event, safe_properties, root=root)
 
 
 def capture_completion_once(

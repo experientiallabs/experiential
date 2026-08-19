@@ -16,10 +16,6 @@ from wmo.common.models.catalog import (
     write_model_catalog,
 )
 from wmo.common.models.client import EmbeddingClient, IdempotentModelClient, ModelClient
-from wmo.common.models.connection_authoring import (
-    ProviderConnectionAuthoringError,
-    configure_provider_connections,
-)
 from wmo.common.models.discovery import (
     DiscoveredModel,
     PricingSource,
@@ -141,7 +137,6 @@ __all__ = [
     "PricingSnapshot",
     "PricingSource",
     "ProviderConnection",
-    "ProviderConnectionAuthoringError",
     "ProviderModelSelection",
     "ProviderSetup",
     "ProviderSetupError",
@@ -162,7 +157,6 @@ __all__ = [
     "completion_cost_reservation",
     "completion_request_cost_usd",
     "configure_provider_catalog",
-    "configure_provider_connections",
     "configure_router_candidates",
     "derive_connection_name",
     "derive_model_alias",

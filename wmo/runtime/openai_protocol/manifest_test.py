@@ -1,42 +1,52 @@
-"""Tests for the executable closed OpenAI compatibility manifests."""
+"""Tests for the closed accepted-field sets of both OpenAI surfaces."""
 
 from __future__ import annotations
 
-import pytest
-
-from wmo.runtime.gateway.contracts import CompatibilityDisposition, CompatibilityManifest
-from wmo.runtime.openai_protocol.manifest import (
-    CHAT_MANIFEST,
-    RESPONSES_MANIFEST,
-    disposition_map,
-)
+from wmo.runtime.openai_protocol.manifest import CHAT_ACCEPTED_FIELDS, RESPONSES_ACCEPTED_FIELDS
 
 
-@pytest.mark.parametrize(
-    ("manifest", "field"),
-    tuple(
-        (manifest, item.field_path)
-        for manifest in (CHAT_MANIFEST, RESPONSES_MANIFEST)
-        for item in manifest.fields
-        if item.disposition != CompatibilityDisposition.UNSUPPORTED
-    ),
-)
-def test_every_accepted_field_has_one_executable_manifest_decision(
-    manifest: CompatibilityManifest, field: str
-) -> None:
-    """Every accepted field is explicit and unique rather than SDK-version widened."""
-    assert field in disposition_map(manifest)
+def test_chat_accepted_fields_pin_the_closed_surface() -> None:
+    """The Chat Completions gateway surface accepts exactly these top-level fields."""
+    assert CHAT_ACCEPTED_FIELDS == frozenset(
+        {
+            "model",
+            "messages",
+            "max_tokens",
+            "max_completion_tokens",
+            "stop",
+            "temperature",
+            "stream",
+            "stream_options",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "response_format",
+            "metadata",
+        }
+    )
 
 
-def test_manifests_classify_explicit_exclusions() -> None:
+def test_responses_accepted_fields_pin_the_closed_surface() -> None:
+    """The Responses gateway surface accepts exactly these top-level fields."""
+    assert RESPONSES_ACCEPTED_FIELDS == frozenset(
+        {
+            "model",
+            "input",
+            "instructions",
+            "previous_response_id",
+            "max_output_tokens",
+            "temperature",
+            "stream",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "text",
+            "metadata",
+        }
+    )
+
+
+def test_explicit_exclusions_stay_outside_both_surfaces() -> None:
     """Multimodal, hosted, background, logprob, and multi-choice features stay excluded."""
-    chat = disposition_map(CHAT_MANIFEST)
-    responses = disposition_map(RESPONSES_MANIFEST)
-    assert chat["audio"] == CompatibilityDisposition.UNSUPPORTED
-    assert chat["n"] == CompatibilityDisposition.UNSUPPORTED
-    assert chat["logprobs"] == CompatibilityDisposition.UNSUPPORTED
-    assert chat["top_p"] == CompatibilityDisposition.SUPPORTED
-    assert responses["background"] == CompatibilityDisposition.UNSUPPORTED
-    assert responses["conversation"] == CompatibilityDisposition.UNSUPPORTED
-    assert responses["include"] == CompatibilityDisposition.UNSUPPORTED
-    assert responses["top_p"] == CompatibilityDisposition.UNSUPPORTED
+    assert {"audio", "n", "logprobs"}.isdisjoint(CHAT_ACCEPTED_FIELDS)
+    assert {"background", "conversation", "include"}.isdisjoint(RESPONSES_ACCEPTED_FIELDS)

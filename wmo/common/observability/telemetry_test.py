@@ -11,7 +11,7 @@ import pytest
 
 import wmo.common.observability.telemetry as telemetry
 from wmo.common.config.settings import set_telemetry_enabled
-from wmo.common.observability.telemetry import capture, capture_completion_once
+from wmo.common.observability.telemetry import capture_completion_once
 
 
 class _FakePosthog:
@@ -51,8 +51,9 @@ def test_capture_posts_anonymous_metadata_event(
     monkeypatch.setenv("WMO_TELEMETRY", "1")
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
 
-    assert capture(
+    assert capture_completion_once(
         "wmo simulation completed",
+        "simulation-report-abc123",
         {
             "success": True,
             "rollout_count": 1,
@@ -97,9 +98,10 @@ def test_capture_honors_explicit_posthog_host_override(
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_override")
     monkeypatch.setenv("WMO_POSTHOG_HOST", "https://eu.i.posthog.com/")
 
-    assert capture(
+    assert capture_completion_once(
         "wmo router completed",
-        {"success": True, "fit_cell_count": 1},
+        "router-report-abc123",
+        {"success": True, "candidate_count": 1},
         root=tmp_path / ".wmo",
     )
 
@@ -116,7 +118,7 @@ def test_capture_respects_project_opt_out(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
 
-    assert capture("wmo build completed", root=root) is False
+    assert capture_completion_once("wmo build completed", "task-set-abc123", {}, root=root) is False
     assert clients == []
 
 
@@ -133,7 +135,12 @@ def test_capture_skips_when_settings_file_cannot_be_read(
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
 
-    assert capture("wmo build completed", root=tmp_path / ".wmo") is False
+    assert (
+        capture_completion_once(
+            "wmo build completed", "task-set-abc123", {}, root=tmp_path / ".wmo"
+        )
+        is False
+    )
     assert clients == []
 
 
@@ -143,7 +150,12 @@ def test_do_not_track_wins_over_env_enable(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setenv("WMO_TELEMETRY", "1")
     monkeypatch.setenv("DO_NOT_TRACK", "1")
 
-    assert capture("wmo build completed", root=tmp_path / ".wmo") is False
+    assert (
+        capture_completion_once(
+            "wmo build completed", "task-set-abc123", {}, root=tmp_path / ".wmo"
+        )
+        is False
+    )
     assert clients == []
 
 
@@ -159,7 +171,12 @@ def test_capture_uses_unknown_version_when_distribution_metadata_is_missing(
     monkeypatch.setenv("WMO_TELEMETRY", "1")
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
 
-    assert capture("wmo build completed", root=tmp_path / ".wmo")
+    assert capture_completion_once(
+        "wmo build completed",
+        "task-set-abc123",
+        {},
+        root=tmp_path / ".wmo",
+    )
 
     assert len(clients) == 1
     _event, kwargs = clients[0].calls[0]
@@ -175,8 +192,9 @@ def test_capture_rejects_unapproved_events_and_unsafe_properties(
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
 
     assert (
-        capture(
+        capture_completion_once(
             "wmo build completed",
+            "task-set-abc123",
             {
                 "prompt": "customer prompt",
                 "trace": "raw trace content",
@@ -192,10 +210,32 @@ def test_capture_rejects_unapproved_events_and_unsafe_properties(
         )
         is False
     )
-    assert capture("wmo arbitrary event", {"input_trace_count": 1}, root=tmp_path / ".wmo") is False
-    assert capture("wmo eval completed", {"success": True}, root=tmp_path / ".wmo") is False
     assert (
-        capture("wmo generated step completed", {"success": True}, root=tmp_path / ".wmo") is False
+        capture_completion_once(
+            "wmo arbitrary event",
+            "task-set-abc123",
+            {"input_trace_count": 1},
+            root=tmp_path / ".wmo",
+        )
+        is False
+    )
+    assert (
+        capture_completion_once(
+            "wmo eval completed",
+            "task-set-abc123",
+            {"success": True},
+            root=tmp_path / ".wmo",
+        )
+        is False
+    )
+    assert (
+        capture_completion_once(
+            "wmo generated step completed",
+            "task-set-abc123",
+            {"success": True},
+            root=tmp_path / ".wmo",
+        )
+        is False
     )
     assert clients == []
 
@@ -225,8 +265,9 @@ def test_capture_isolates_posthog_delivery_failures(
     monkeypatch.setenv("WMO_POSTHOG_PROJECT_API_KEY", "phc_test")
 
     assert (
-        capture(
+        capture_completion_once(
             "wmo simulation completed",
+            "simulation-report-abc123",
             {"success": False, "rollout_count": 0},
             root=tmp_path / ".wmo",
         )

@@ -32,6 +32,7 @@ from wmo.common.judging import (
     verify_persisted_calibration,
     write_router_lineage_split,
 )
+from wmo.common.judging.calibration_assembly import calibration_from_report
 from wmo.common.models import (
     AssistantAction,
     BillingSource,
@@ -595,7 +596,12 @@ def test_two_label_human_calibration_requires_persisted_risk_acceptance(tmp_path
     insufficient = service.write_calibration(
         graph.store,
         report=report,
-        calibration=service.insufficient_calibration(graph.store, report),
+        calibration=calibration_from_report(
+            report,
+            report_input=artifact_input(graph.store.artifacts.read(report.report_id).manifest),
+            status="insufficient",
+            approved_at=None,
+        ),
     )
     source_observation = graph.observations[0]
     rejected_client = _FakeJudgeClient(_model(), json.dumps({"dimensions": []}))
@@ -885,7 +891,7 @@ def test_missing_hash_mismatched_wrong_type_and_altered_inputs_fail_closed(tmp_p
                 created_at=_TIME,
                 code_revision="calibration-revision",
             )
-    rollout_path = graph.store.paths.artifact_file("rollout-01", "rollout.json")
+    rollout_path = graph.store.paths.artifact_directory("rollout-01") / "rollout.json"
     rollout_path.write_text("{}", encoding="utf-8")
     with pytest.raises(CalibrationError, match="missing or corrupt"):
         _build(graph)
