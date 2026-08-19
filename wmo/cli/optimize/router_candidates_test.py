@@ -10,13 +10,18 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm
 
-from wmo.cli.optimize import router_candidate_setup
-from wmo.cli.optimize.router_candidate_setup import collect_router_candidate_setup
-from wmo.cli.picker import PickerAction, PickerOption, PickerResult
-from wmo.cli.provider_setup import RouterCandidatePickerResult
+from wmo.cli.optimize import router_candidates
+from wmo.cli.optimize.router_candidates import (
+    RouterCandidatePickerResult,
+    collect_router_candidates,
+    run_router_candidate_picker,
+)
+from wmo.cli.shared.picker import PickerAction, PickerOption, PickerResult
+from wmo.cli.shared.picker_test import ScriptedConsole
 from wmo.common.models import (
     BillingSource,
     ConnectionConfig,
+    DiscoveredModel,
     ModelCapabilities,
     ModelCatalog,
     ModelRecord,
@@ -27,6 +32,70 @@ from wmo.common.models import (
     configure_router_candidates,
     write_model_catalog,
 )
+from wmo.runtime.models.providers import ProviderEndpoint
+
+
+class _FakeLister:
+    """Provider listing seam for router candidate discovery tests."""
+
+    def list_models(self, endpoint: ProviderEndpoint) -> tuple[DiscoveredModel, ...]:
+        """Return completion, embedding, and unverified model rows.
+
+        Args:
+            endpoint: Provider endpoint selected by the discovery flow.
+
+        Returns:
+            Models published by the deterministic OpenAI fixture.
+        """
+        assert endpoint.provider == "openai"
+        return (
+            DiscoveredModel(provider="openai", model="gpt-5.6-luna"),
+            DiscoveredModel(provider="openai", model="gpt-5.6-terra"),
+            DiscoveredModel(provider="openai", model="text-embedding-3-small"),
+            DiscoveredModel(provider="openai", model="internal-preview-model"),
+        )
+
+
+def test_router_candidate_picker_discovers_only_eligible_completion_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The router flow reuses provider discovery and hides embedding/unverified rows.
+
+    Args:
+        monkeypatch: Patch fixture supplying the configured provider credential.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    connection = ConnectionConfig(provider="tinker", api_key_env="TINKER_API_KEY")
+    catalog = ModelCatalog(
+        connections={"custom": connection},
+        models={
+            "world": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="custom",
+                model="world",
+            )
+        },
+        roles=ModelRoles(world_model="world"),
+    )
+
+    picked = run_router_candidate_picker(
+        catalog,
+        console=ScriptedConsole("1\n\n1,2\n\n\n\n1\n"),
+        lister=_FakeLister(),
+        environment={"OPENAI_API_KEY": "openai-secret"},
+    )
+
+    assert picked is not None
+    assert picked.selection.candidates == ("gpt-5-6-luna", "gpt-5-6-terra")
+    assert picked.selection.incumbent == "gpt-5-6-luna"
+    assert tuple(model.alias for model in picked.candidate_models) == (
+        "gpt-5-6-luna",
+        "gpt-5-6-terra",
+    )
+    assert all(model.capabilities.supports_completions for model in picked.candidate_models)
+    assert picked.connections == (
+        ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),
+    )
 
 
 def test_noninteractive_requires_two_candidates_and_incumbent_without_writing(
@@ -43,7 +112,7 @@ def test_noninteractive_requires_two_candidates_and_incumbent_without_writing(
     before = path.read_bytes()
 
     with pytest.raises(typer.BadParameter) as error:
-        collect_router_candidate_setup(
+        collect_router_candidates(
             path,
             catalog,
             candidates=("candidate-a",),
@@ -74,7 +143,7 @@ def test_noninteractive_reuses_one_complete_persisted_selection(tmp_path: Path) 
     )
     write_model_catalog(path, catalog)
 
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         path,
         catalog,
         candidates=(),
@@ -116,7 +185,7 @@ def test_interactive_collection_requires_final_confirmation(
     monkeypatch.setattr(Confirm, "ask", reject_summary)
 
     with pytest.raises(typer.Abort):
-        collect_router_candidate_setup(
+        collect_router_candidates(
             path,
             catalog,
             candidates=(),
@@ -171,12 +240,12 @@ def test_back_from_incumbent_keeps_the_candidates_just_chosen(
         del args, kwargs
         return False
 
-    monkeypatch.setattr(router_candidate_setup, "choose_many", scripted_candidates)
-    monkeypatch.setattr(router_candidate_setup, "choose_one", scripted_incumbent)
+    monkeypatch.setattr(router_candidates, "choose_many", scripted_candidates)
+    monkeypatch.setattr(router_candidates, "choose_one", scripted_incumbent)
     monkeypatch.setattr(Confirm, "ask", reject_summary)
 
     with pytest.raises(typer.Abort):
-        collect_router_candidate_setup(
+        collect_router_candidates(
             path,
             catalog,
             candidates=(),
@@ -208,7 +277,7 @@ def test_first_optimize_can_define_candidates_from_existing_connections(tmp_path
     before = path.read_bytes()
     definitions = (_candidate_model("candidate-a"), _candidate_model("candidate-b"))
 
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         path,
         catalog,
         candidates=(),
@@ -234,7 +303,7 @@ def test_missing_candidates_use_configured_provider_picker_without_raw_prompts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A missing candidate role delegates discovery and selection to provider setup ownership.
+    """A missing candidate role uses optimize-owned selection over provider discovery.
 
     Args:
         tmp_path: Temporary root containing the shared catalog.
@@ -269,10 +338,10 @@ def test_missing_candidates_use_configured_provider_picker_without_raw_prompts(
             connections=(new_connection,),
         )
 
-    monkeypatch.setattr(router_candidate_setup, "run_router_candidate_picker", picker)
+    monkeypatch.setattr(router_candidates, "run_router_candidate_picker", picker)
     monkeypatch.setattr(Confirm, "ask", lambda *args, **kwargs: True)
 
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         path,
         catalog,
         candidates=("candidate-a",),
@@ -300,7 +369,7 @@ def test_interactive_confirmation_cannot_retarget_an_existing_alias(tmp_path: Pa
     before = path.read_bytes()
 
     with pytest.raises(typer.BadParameter, match="use a new alias"):
-        collect_router_candidate_setup(
+        collect_router_candidates(
             path,
             catalog,
             candidates=("candidate-a", "candidate-b"),

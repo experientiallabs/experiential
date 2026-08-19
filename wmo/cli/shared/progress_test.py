@@ -7,7 +7,7 @@ import io
 import pytest
 from rich.console import Console
 
-from wmo.cli.progress import progress_display, qualified
+from wmo.cli.shared.progress import progress_display, qualified
 from wmo.common.progress import ProgressEvent
 
 

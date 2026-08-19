@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.cli.model_picker import (
+from wmo.cli.providers.model_picker import (
     assign_roles,
     build_result,
     configured_models,
@@ -12,14 +12,14 @@ from wmo.cli.model_picker import (
     render_summary,
     select_models,
 )
-from wmo.cli.picker_test import ScriptedConsole
-from wmo.cli.provider_picker import (
+from wmo.cli.providers.provider_picker import (
     AvailableModel,
     PreparedEndpoint,
     SetupCancelled,
     SetupRoleInputs,
     SetupSession,
 )
+from wmo.cli.shared.picker_test import ScriptedConsole
 from wmo.common.models import (
     BillingSource,
     DiscoveredModel,

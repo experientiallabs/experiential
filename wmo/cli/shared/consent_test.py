@@ -11,8 +11,8 @@ import pytest
 import typer
 from rich.console import Console
 
-from wmo.cli import consent as consent_module
-from wmo.cli.consent import NO_CONSENT_EXIT_CODE, can_prompt, require_spend_consent
+from wmo.cli.shared import consent as consent_module
+from wmo.cli.shared.consent import NO_CONSENT_EXIT_CODE, can_prompt, require_spend_consent
 from wmo.common.config.settings import set_maximum_command_cost_usd
 
 

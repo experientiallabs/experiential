@@ -14,7 +14,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
-from wmo.cli import judge_review as review_module
+from wmo.cli.judge import review as review_module
 from wmo.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
 from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.judging.judgment import Judgment

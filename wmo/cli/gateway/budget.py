@@ -8,7 +8,7 @@ from pathlib import Path
 import typer
 
 from wmo.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
-from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.shared.options import ROOT_OPTION, usage_error
 from wmo.runtime.gateway.budgets import (
     BudgetScope,
     BudgetScopeKind,

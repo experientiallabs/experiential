@@ -18,8 +18,7 @@ from typing import get_args
 from rich.console import Console
 from rich.prompt import Confirm
 
-from wmo.cli.picker import PickerAction, PickerOption, choose_many, choose_one
-from wmo.cli.provider_picker import (
+from wmo.cli.providers.provider_picker import (
     CREDENTIAL_NOTE,
     AvailableModel,
     PreparedEndpoint,
@@ -31,6 +30,7 @@ from wmo.cli.provider_picker import (
     ask_price,
     ask_text,
 )
+from wmo.cli.shared.picker import PickerAction, PickerOption, choose_many, choose_one
 from wmo.common.models import (
     ModelCapabilities,
     ModelRecord,

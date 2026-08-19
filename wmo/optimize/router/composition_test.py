@@ -8,7 +8,7 @@ from typing import cast
 
 import pytest
 
-from wmo.cli.build_cmd import _lineage_bindings
+from wmo.cli.build.app import _lineage_bindings
 from wmo.common.core.artifacts import (
     ArtifactInput,
     FailureAttribution,

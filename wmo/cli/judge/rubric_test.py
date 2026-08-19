@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 from rich.console import Console
 
-from wmo.cli.judge_rubric import (
+from wmo.cli.judge.rubric import (
     axis_score_choices,
     build_axis,
     edit_rubric_axes,

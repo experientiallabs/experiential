@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from wmo.cli import provider_picker
-from wmo.cli.picker import PickerKey
-from wmo.cli.picker_test import ScriptedConsole
-from wmo.cli.provider_picker import (
+from wmo.cli.providers import provider_picker
+from wmo.cli.providers.provider_picker import (
     SetupCancelled,
     SetupSession,
     credential_hint,
@@ -16,6 +14,8 @@ from wmo.cli.provider_picker import (
     resolve_setup_providers,
     select_providers,
 )
+from wmo.cli.shared.picker import PickerKey
+from wmo.cli.shared.picker_test import ScriptedConsole
 from wmo.common.models import DiscoveredModel, PricingSource, ProviderConnection, SetupRole
 from wmo.runtime.models.providers import ProviderEndpoint, ProviderListingError
 

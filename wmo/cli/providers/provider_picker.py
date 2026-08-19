@@ -17,7 +17,7 @@ from getpass import getpass
 from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
-from wmo.cli.picker import (
+from wmo.cli.shared.picker import (
     PickerAction,
     PickerKeyReader,
     PickerOption,

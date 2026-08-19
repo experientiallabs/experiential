@@ -7,8 +7,8 @@ import io
 import pytest
 from rich.console import Console
 
-from wmo.cli import trace_viewer
-from wmo.cli.judge_review_test import _proposal, _trace
+from wmo.cli.judge import trace_viewer
+from wmo.cli.judge.review_test import _proposal, _trace
 
 
 def _plain(renderable: object) -> str:

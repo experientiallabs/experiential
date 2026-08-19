@@ -12,8 +12,8 @@ from rich.console import Console
 from rich.markup import escape
 from rich.prompt import Confirm, IntPrompt, Prompt
 
-from wmo.cli.judge_transcript import render_field, render_trace, span_evidence_text
-from wmo.cli.trace_viewer import view_trace_proposal
+from wmo.cli.judge.trace_viewer import view_trace_proposal
+from wmo.cli.judge.transcript import render_field, render_trace, span_evidence_text
 from wmo.common.judging import Rubric, RubricDimension
 from wmo.common.traces import TraceSpan
 from wmo.optimize.router.judging.contracts import (

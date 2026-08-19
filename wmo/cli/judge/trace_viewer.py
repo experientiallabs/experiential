@@ -24,7 +24,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from wmo.cli.judge_transcript import (
+from wmo.cli.judge.transcript import (
     assistant_completion,
     jsonish_text,
     model_display_name,

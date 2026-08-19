@@ -13,8 +13,8 @@ from click import unstyle
 from rich.console import Console
 from typer.testing import CliRunner
 
-from wmo.cli import judge_config as judge_config_module
 from wmo.cli.app import app
+from wmo.cli.judge import app as judge_app_module
 from wmo.common.models import (
     BillingSource,
     ModelCapabilities,
@@ -132,9 +132,9 @@ def test_interactive_judge_setup_accepts_enter_as_confirmation(
     store = _built_store(tmp_path)
     _write_catalog(store.paths.root, _catalog())
     monkeypatch.setenv("WMO_RELEASE_REVISION", "a" * 40)
-    monkeypatch.setattr(judge_config_module, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(judge_app_module, "can_prompt", lambda _console: True)
     monkeypatch.setattr(
-        judge_config_module,
+        judge_app_module,
         "maybe_edit_setup_plan",
         lambda plan, *, console: plan,
     )
@@ -160,9 +160,9 @@ def test_interactive_judge_setup_preserves_explicit_n_decline(
     store = _built_store(tmp_path)
     _write_catalog(store.paths.root, _catalog())
     monkeypatch.setenv("WMO_RELEASE_REVISION", "a" * 40)
-    monkeypatch.setattr(judge_config_module, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(judge_app_module, "can_prompt", lambda _console: True)
     monkeypatch.setattr(
-        judge_config_module,
+        judge_app_module,
         "maybe_edit_setup_plan",
         lambda plan, *, console: plan,
     )
@@ -223,9 +223,9 @@ def test_interactive_completed_calibration_accepts_enter_as_approval(
     assert len(client.requests) == 3
 
     monkeypatch.setenv("WMO_RELEASE_REVISION", "a" * 40)
-    monkeypatch.setattr(judge_config_module, "can_prompt", lambda _console: True)
+    monkeypatch.setattr(judge_app_module, "can_prompt", lambda _console: True)
     monkeypatch.setattr(
-        judge_config_module,
+        judge_app_module,
         "RuntimeModelCatalog",
         lambda _catalog: runtime,
     )
@@ -355,7 +355,7 @@ def test_setup_output_is_plain_language_and_hides_execution_internals(
     """Default setup shows identity, full anchors, and tasks without prompt machinery."""
     buffer = io.StringIO()
     monkeypatch.setattr(
-        judge_config_module,
+        judge_app_module,
         "_console",
         Console(file=buffer, width=42, color_system=None),
     )
@@ -373,7 +373,7 @@ def test_setup_output_is_plain_language_and_hides_execution_internals(
         ),
     )
 
-    judge_config_module._render_setup(plan)
+    judge_app_module._render_setup(plan)
 
     output = buffer.getvalue()
     compact = " ".join(output.split())

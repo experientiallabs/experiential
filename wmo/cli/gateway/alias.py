@@ -8,7 +8,7 @@ from pathlib import Path
 import typer
 
 from wmo.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
-from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.shared.options import ROOT_OPTION, usage_error
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.core.locks import FileLockTimeout
 from wmo.common.models import (

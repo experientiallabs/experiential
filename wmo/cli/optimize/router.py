@@ -9,10 +9,10 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from wmo.cli.consent import can_prompt, require_spend_consent
-from wmo.cli.optimize.router_candidate_setup import collect_router_candidate_setup
-from wmo.cli.options import ROOT_OPTION, usage_error
-from wmo.cli.progress import progress_display
+from wmo.cli.optimize.router_candidates import collect_router_candidates
+from wmo.cli.shared.consent import can_prompt, require_spend_consent
+from wmo.cli.shared.options import ROOT_OPTION, usage_error
+from wmo.cli.shared.progress import progress_display
 from wmo.common.models import ProviderModelSelection, load_model_catalog
 from wmo.common.observability.telemetry import capture_completion_once
 from wmo.common.project import ProjectStore
@@ -125,7 +125,7 @@ def router(
             ProviderModelSelection.model_validate_json(value)
             for value in tuple(candidate_model or ())
         )
-        candidate_plan = collect_router_candidate_setup(
+        candidate_plan = collect_router_candidates(
             store.model_catalog_path,
             catalog,
             candidates=tuple(candidate or ()),

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import typer
 
-from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.shared.options import ROOT_OPTION, usage_error
 
 _LOOPBACK_HOST = "127.0.0.1"
 _POLICY_OPTION = typer.Option(

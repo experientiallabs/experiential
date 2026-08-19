@@ -11,11 +11,11 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm
 
-from wmo.cli.consent import can_prompt, require_spend_consent
-from wmo.cli.judge_review import build_manual_judge_reviewer
-from wmo.cli.judge_rubric import maybe_edit_setup_plan
-from wmo.cli.judge_transcript import model_display_name
-from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.judge.review import build_manual_judge_reviewer
+from wmo.cli.judge.rubric import maybe_edit_setup_plan
+from wmo.cli.judge.transcript import model_display_name
+from wmo.cli.shared.consent import can_prompt, require_spend_consent
+from wmo.cli.shared.options import ROOT_OPTION, usage_error
 from wmo.common.config import resolve_command_budget_usd
 from wmo.common.judging import Rubric, RubricDimension, render_rubric_table, score_bounds
 from wmo.common.judging.provenance import read_artifact_json

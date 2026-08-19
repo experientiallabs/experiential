@@ -8,7 +8,7 @@ from collections.abc import Callable
 import pytest
 from rich.console import Console
 
-from wmo.cli.picker_view import PickerMode, PickerRow, picker_view
+from wmo.cli.shared.picker_view import PickerMode, PickerRow, picker_view
 
 
 def _terminal(*, width: int = 100, height: int = 24) -> Console:

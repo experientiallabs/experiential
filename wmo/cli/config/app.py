@@ -7,9 +7,9 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from wmo.cli.defer import add_deferred_typer
-from wmo.cli.options import ROOT_OPTION, usage_error
-from wmo.cli.provider_setup import ProviderSetupOptions, run_provider_setup
+from wmo.cli.providers.setup import ProviderSetupOptions, run_provider_setup
+from wmo.cli.shared.defer import add_deferred_typer
+from wmo.cli.shared.options import ROOT_OPTION, usage_error
 from wmo.common.config import (
     ARTIFACT_DIR,
     load_settings,
@@ -24,7 +24,7 @@ config_app = typer.Typer(help="Manage project-local wmo settings.", no_args_is_h
 add_deferred_typer(
     config_app,
     name="judge",
-    module="wmo.cli.judge_config",
+    module="wmo.cli.judge.app",
     attr="judge_app",
     help="Set up and manually calibrate a project judge.",
     known_names=("setup", "calibrate"),

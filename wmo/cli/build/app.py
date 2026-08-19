@@ -9,15 +9,15 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from wmo.cli.consent import can_prompt, require_spend_consent
-from wmo.cli.options import ROOT_OPTION, usage_error
-from wmo.cli.progress import progress_display, qualified
-from wmo.cli.provider_picker import resolve_setup_providers
-from wmo.cli.provider_setup import (
+from wmo.cli.providers.provider_picker import resolve_setup_providers
+from wmo.cli.providers.setup import (
     ProviderSetupOptions,
     provider_setup_json_examples,
     run_provider_setup,
 )
+from wmo.cli.shared.consent import can_prompt, require_spend_consent
+from wmo.cli.shared.options import ROOT_OPTION, usage_error
+from wmo.cli.shared.progress import progress_display, qualified
 from wmo.common.core.money import exact_usd
 from wmo.common.models import (
     ModelCapabilities,

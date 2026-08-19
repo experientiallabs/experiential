@@ -11,8 +11,8 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm, FloatPrompt, Prompt
 
-from wmo.cli.consent import can_prompt, require_spend_consent
-from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.shared.consent import can_prompt, require_spend_consent
+from wmo.cli.shared.options import ROOT_OPTION, usage_error
 from wmo.common.core.artifacts import Sha256, sha256_json
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import (

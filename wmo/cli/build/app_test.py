@@ -13,11 +13,11 @@ from click import unstyle
 from pydantic import JsonValue
 from typer.testing import CliRunner
 
-import wmo.cli.build_cmd as build_command
-import wmo.cli.consent as consent_module
+import wmo.cli.build.app as build_command
+import wmo.cli.shared.consent as consent_module
 import wmo.simulation.build as simulation_build
 from wmo.cli.app import app
-from wmo.cli.provider_setup_test import _FakeLister as _SetupLister
+from wmo.cli.providers.setup_test import _FakeLister as _SetupLister
 from wmo.common.config.settings import set_maximum_command_cost_usd
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
@@ -335,8 +335,8 @@ def _fake_runtime_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     Args:
         monkeypatch: Pytest patch fixture replacing provider-backed seams.
     """
-    monkeypatch.setattr("wmo.cli.build_cmd.RuntimeModelCatalog", _RuntimeCatalog)
-    monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
+    monkeypatch.setattr("wmo.cli.build.app.RuntimeModelCatalog", _RuntimeCatalog)
+    monkeypatch.setattr("wmo.cli.build.app.capture_build_completed", lambda **_kwargs: None)
 
 
 def test_first_build_provider_flags_skip_the_opening_list(
@@ -352,9 +352,9 @@ def test_first_build_provider_flags_skip_the_opening_list(
     source = _otlp_export(tmp_path)
     root = tmp_path / ".wmo"
     lister = _SetupLister()
-    monkeypatch.setattr("wmo.cli.build_cmd.can_prompt", lambda _console: True)
+    monkeypatch.setattr("wmo.cli.build.app.can_prompt", lambda _console: True)
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
-    monkeypatch.setattr("wmo.cli.provider_setup.HttpProviderModelLister", lambda: lister)
+    monkeypatch.setattr("wmo.cli.providers.setup.HttpProviderModelLister", lambda: lister)
 
     result = _RUNNER.invoke(
         app,
@@ -425,9 +425,9 @@ def test_first_build_configures_providers_and_models_through_the_picker(
     source = _otlp_export(tmp_path)
     root = tmp_path / ".wmo"
     lister = _SetupLister()
-    monkeypatch.setattr("wmo.cli.build_cmd.can_prompt", lambda _console: True)
+    monkeypatch.setattr("wmo.cli.build.app.can_prompt", lambda _console: True)
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
-    monkeypatch.setattr("wmo.cli.provider_setup.HttpProviderModelLister", lambda: lister)
+    monkeypatch.setattr("wmo.cli.providers.setup.HttpProviderModelLister", lambda: lister)
 
     result = _RUNNER.invoke(
         app,
@@ -502,7 +502,7 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
         """
         raise AssertionError("exact replay must not rebuild provider-backed RAG artifacts")
 
-    monkeypatch.setattr("wmo.cli.build_cmd._build_grounded_artifacts", forbid_rebuild)
+    monkeypatch.setattr("wmo.cli.build.app._build_grounded_artifacts", forbid_rebuild)
     replay = _RUNNER.invoke(app, ["build", "support", str(source), "--root", str(root)])
     assert replay.exit_code == 0, replay.output
     assert "embedding spend ceiling: $0.000000" in replay.output
@@ -611,7 +611,7 @@ def test_build_package_upgrade_creates_new_immutable_graph(
         """
         raise AssertionError("exact upgraded replay must not rebuild provider-backed artifacts")
 
-    monkeypatch.setattr("wmo.cli.build_cmd._build_grounded_artifacts", forbid_rebuild)
+    monkeypatch.setattr("wmo.cli.build.app._build_grounded_artifacts", forbid_rebuild)
     replay_result = _RUNNER.invoke(
         app,
         ["build", "support", str(source), "--root", str(root)],
@@ -1147,7 +1147,7 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
         roles=ModelRoles(world_model="world", judge="judge", embedder="embed"),
     )
 
-    monkeypatch.setattr("wmo.cli.build_cmd.can_prompt", lambda _console: True)
+    monkeypatch.setattr("wmo.cli.build.app.can_prompt", lambda _console: True)
 
     def configure(path: Path, *_args: object, **_kwargs: object) -> ModelCatalog:
         """Persist the fixture catalog as the simulated interactive setup result.
@@ -1163,7 +1163,7 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
         write_model_catalog(path / "models.toml", catalog)
         return catalog
 
-    monkeypatch.setattr("wmo.cli.build_cmd.run_provider_setup", configure)
+    monkeypatch.setattr("wmo.cli.build.app.run_provider_setup", configure)
 
     result = _RUNNER.invoke(
         app,

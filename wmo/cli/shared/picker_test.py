@@ -8,7 +8,7 @@ from collections.abc import Callable
 import pytest
 from rich.console import Console
 
-from wmo.cli.picker import (
+from wmo.cli.shared.picker import (
     PickerAction,
     PickerEvent,
     PickerKey,
@@ -267,7 +267,7 @@ def _picker_script(body: str) -> str:
     """
     return (
         "from rich.console import Console\n"
-        "from wmo.cli.picker import PickerOption, choose_many, choose_one\n"
+        "from wmo.cli.shared.picker import PickerOption, choose_many, choose_one\n"
         "console = Console()\n"
         f"{body}\n"
         'print("RESULT:" + ",".join(result.values) + "|" + str(result.action), flush=True)\n'
@@ -627,7 +627,7 @@ def test_an_exception_during_a_screen_restores_the_terminal(
     script = (
         "import signal, sys, termios\n"
         "from rich.console import Console\n"
-        "from wmo.cli.picker import PickerOption, choose_many\n"
+        "from wmo.cli.shared.picker import PickerOption, choose_many\n"
         "def fail(signum, frame):\n"
         '    """Interrupt the blocked key read with a failure.\n\n'
         "    Args:\n"

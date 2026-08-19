@@ -1,7 +1,7 @@
 """Selection prompts shared by interactive CLI setup screens.
 
 Every provider, model, role, and candidate screen is keyboard driven on a real terminal: Up and
-Down move focus inside one region redrawn in place by ``wmo.cli.picker_view``, Space or Enter
+Down move focus inside one region redrawn in place by ``wmo.cli.shared.picker_view``, Space or Enter
 toggles a row on a multi-select screen whose Complete row submits, and Enter confirms the focused
 row on a single-select screen. Slash opens a search line that narrows long lists as the user
 types: Backspace edits the query, Enter keeps the matches, and Esc clears the search. A console
@@ -25,7 +25,7 @@ from functools import partial
 from rich.console import Console
 from rich.markup import escape
 
-from wmo.cli.picker_view import PickerMode, PickerRow, picker_view
+from wmo.cli.shared.picker_view import PickerMode, PickerRow, picker_view
 
 _BACK_WORDS = frozenset({"b", "back"})
 _CANCEL_WORDS = frozenset({"q", "quit", "cancel"})

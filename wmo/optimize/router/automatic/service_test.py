@@ -19,8 +19,8 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
-from wmo.cli.build_cmd import _build_grounded_artifacts
-from wmo.cli.optimize.router_candidate_setup import collect_router_candidate_setup
+from wmo.cli.build.app import _build_grounded_artifacts
+from wmo.cli.optimize.router_candidates import collect_router_candidates
 from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes
 from wmo.common.models import (
     AssistantAction,
@@ -294,7 +294,7 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=candidate_order,
@@ -580,7 +580,7 @@ def test_replay_restores_discovered_candidate_records_before_reporting_success(
     )
     monkeypatch.setattr(
         router_app,
-        "collect_router_candidate_setup",
+        "collect_router_candidates",
         lambda *_args, **_kwargs: replay_plan,
     )
     before_credentials = state.credential_resolutions
@@ -628,7 +628,7 @@ def test_automatic_router_refuses_spend_before_credentials_calls_or_writes(
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -733,7 +733,7 @@ def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution
     """
     store, catalog, state = _completed_project(tmp_path, inferred_identity=True)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -780,7 +780,7 @@ def test_duplicate_candidate_identities_fail_before_stateful_boundaries(tmp_path
             }
         }
     )
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         ambiguous,
         candidates=("candidate-a", "candidate-b"),
@@ -829,7 +829,7 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -943,7 +943,7 @@ def test_completed_custom_agent_replay_does_not_import_or_construct_factory(
         ),
     )
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -1003,7 +1003,7 @@ def test_automatic_router_rejects_confirmed_catalog_drift_before_credentials(
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -1103,7 +1103,7 @@ def test_automatic_router_rejects_substituted_manual_judge_audit_before_calls(
     )
     substituted_input = artifact_input(store.artifacts.read(substituted.audit_id).manifest)
     write_review_state(store, selected.model_copy(update={"audit": substituted_input}))
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -1249,7 +1249,7 @@ def test_preflight_accepts_calibration_resumed_after_a_failed_first_pass(
         reviewer=_accept,
     )
     assert result.approved_calibration is not None
-    candidate_plan = collect_router_candidate_setup(
+    candidate_plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -1289,7 +1289,7 @@ def test_runtime_activation_rejects_automatic_contract_tamper_before_credentials
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
