@@ -771,6 +771,12 @@ def _installed_release_driver() -> None:
             if payload.get("model") in {"gateway-secondary-model", "project-secondary-model"}:
                 self._send_gateway_stream(payload, ordinal=ordinal)
                 return
+            if payload.get("stream") is True and payload.get("model") in {
+                "core-model",
+                "candidate-b-model",
+            }:
+                self._send_gateway_stream(payload, ordinal=ordinal)
+                return
             if self.path.endswith("/embeddings"):
                 values = payload.get("input", [])
                 texts = [values] if isinstance(values, str) else list(values)
@@ -915,11 +921,13 @@ def _installed_release_driver() -> None:
                     },
                 )
             else:
-                content = (
-                    project_response_canary
-                    if project_prompt_canary in json.dumps(payload, sort_keys=True)
-                    else response_canary
-                )
+                serialized = json.dumps(payload, sort_keys=True)
+                if project_prompt_canary in serialized:
+                    content = project_response_canary
+                elif "Duplicate routed example" in serialized:
+                    content = "Duplicate routed target"
+                else:
+                    content = response_canary
                 choices = (
                     {
                         "choices": [
