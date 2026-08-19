@@ -8,7 +8,6 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
 
 import numpy as np
 
@@ -45,6 +44,7 @@ from wmo.runtime.router.economics import (
     routed_completion_economics,
     zero_operation_economics,
 )
+from wmo.runtime.router.runtime_selection import PreparedSelection, retained_selection
 from wmo.runtime.router.runtime_support import (
     candidate_completion_economics as _candidate_completion_economics,
 )
@@ -100,14 +100,7 @@ class RoutedModelResponse(ContractModel):
 DecisionSink = Callable[[RoutingDecision], None]
 
 
-@dataclass(frozen=True)
-class _PreparedSelection:
-    """One unretained decision and its exact physical embedding evidence."""
-
-    decision: RoutingDecision
-    request_key: tuple[Sha256, Sha256]
-    economics: OperationEconomics
-    disposition: RoutedSpendDisposition
+_PreparedSelection = PreparedSelection
 
 
 class RouterRuntime:
@@ -324,67 +317,26 @@ class RouterRuntime:
         if episode_id is not None and (not episode_id.strip() or len(episode_id) > 512):
             raise ValueError("episode_id must be 1 to 512 non-blank characters")
         identity = episode_id or f"request-{uuid.uuid4().hex}"
-        identity_sha256 = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        feature = self._extractor.from_request(request)
-        request_sha256 = hashlib.sha256(feature.encode("utf-8")).hexdigest()
-        request_key = (identity_sha256, request_sha256)
         if not retain:
             return self._select_unretained(request, episode_id=identity).decision
-        while True:
-            with self._episode_lock:
-                self._expire_decisions()
-                existing = self._request_decisions.get(request_key)
-                if existing is not None:
-                    self._request_decisions.move_to_end(request_key)
-                    return existing
-                episode_decision = self._episode_decisions.get(identity_sha256)
-                if episode_decision is not None:
-                    decision = _sticky_decision(episode_decision, request_sha256)
-                    return self._publish_decision(
-                        request=request,
-                        decision=decision,
-                        request_key=request_key,
-                        identity=identity,
-                        embedding_economics=zero_operation_economics(),
-                        embedding_disposition=RoutedSpendDisposition.DEFINITELY_NOT_INCURRED,
-                    )
-                waiter = self._selection_inflight.get(request_key)
-                if waiter is None:
-                    if len(self._selection_inflight) >= self._decision_capacity:
-                        raise RouterRuntimeIntegrityError(
-                            "router selection admission capacity is exhausted"
-                        )
-                    waiter = threading.Event()
-                    self._selection_inflight[request_key] = waiter
-                    break
-            waiter.wait()
-        try:
-            prepared = self._select_unretained(request, episode_id=identity)
-            proposed = prepared.decision
-            with self._episode_lock:
-                self._expire_decisions()
-                existing = self._request_decisions.get(request_key)
-                if existing is not None:
-                    return existing
-                episode_decision = self._episode_decisions.get(identity_sha256)
-                decision = (
-                    _sticky_decision(episode_decision, request_sha256)
-                    if episode_decision is not None
-                    else proposed
-                )
-                return self._publish_decision(
-                    request=request,
-                    decision=decision,
-                    request_key=request_key,
-                    identity=identity,
-                    embedding_economics=prepared.economics,
-                    embedding_disposition=prepared.disposition,
-                )
-        finally:
-            with self._episode_lock:
-                completed = self._selection_inflight.pop(request_key, None)
-                if completed is not None:
-                    completed.set()
+        return self._select_retained(request, episode_id=identity).decision
+
+    def _select_retained(
+        self,
+        request: ModelRequest,
+        *,
+        episode_id: str,
+    ) -> _PreparedSelection:
+        """Return one retained decision with detached exact embedding evidence.
+
+        Args:
+            request: Provider-neutral request visible to selection.
+            episode_id: Exact non-empty sticky identity for this selection.
+
+        Returns:
+            Retained decision plus the physical evidence incurred by its selection.
+        """
+        return retained_selection(self, request, episode_id=episode_id)
 
     def _select_unretained(
         self,
@@ -636,13 +588,20 @@ class RouterRuntime:
         Raises:
             ValueError: A supplied decision does not bind this request, episode, or policy.
         """
-        selected = decision or self.select(request, episode_id=episode_id)
+        prepared: _PreparedSelection | None = None
+        if decision is None:
+            identity = episode_id or f"request-{uuid.uuid4().hex}"
+            prepared = self._select_retained(request, episode_id=identity)
+            selected = prepared.decision
+        else:
+            selected = decision
         if provider_idempotency_key is not None:
             _validate_idempotency_key(provider_idempotency_key)
         resolved, embedding_economics, embedding_disposition = self._prepare_completion(
             request,
             episode_id=episode_id,
             decision=selected,
+            prepared=prepared,
         )
         client = resolved.client
         if provider_idempotency_key is not None and isinstance(client, IdempotentModelClient):
@@ -681,6 +640,7 @@ class RouterRuntime:
         *,
         episode_id: str | None,
         decision: RoutingDecision,
+        prepared: _PreparedSelection | None = None,
     ) -> tuple[ResolvedModel, OperationEconomics, RoutedSpendDisposition]:
         """Validate request pins and capability before candidate provider dispatch."""
         selected = decision
@@ -700,38 +660,44 @@ class RouterRuntime:
         ):
             raise ValueError("routing decision does not match this policy, request, or episode")
         self._require_bank_integrity()
-        with self._episode_lock:
-            self._expire_decisions()
-            request_key = (expected_episode_sha256, request_sha256)
-            cached = self._request_decisions.get(request_key)
-            episode_decision = self._episode_decisions.get(expected_episode_sha256)
-            if cached is None:
-                if selected.decision_id != _decision_content_id(selected):
-                    raise ValueError(
-                        "routing decision does not match this policy, request, or episode"
+        request_key = (expected_episode_sha256, request_sha256)
+        if prepared is not None:
+            if prepared.request_key != request_key or prepared.decision != selected:
+                raise ValueError("prepared routing decision does not match this request")
+            embedding_economics = prepared.economics
+            embedding_disposition = prepared.disposition
+        else:
+            with self._episode_lock:
+                self._expire_decisions()
+                cached = self._request_decisions.get(request_key)
+                episode_decision = self._episode_decisions.get(expected_episode_sha256)
+                if cached is None:
+                    if selected.decision_id != _decision_content_id(selected):
+                        raise ValueError(
+                            "routing decision does not match this policy, request, or episode"
+                        )
+                    if (
+                        episode_decision is not None
+                        and episode_decision.selected_alias != selected.selected_alias
+                    ):
+                        raise ValueError("routing decision conflicts with the cached episode model")
+                    if episode_decision is None:
+                        self._insert_episode(expected_episode_sha256, selected)
+                    self._insert_request(
+                        request_key,
+                        selected,
+                        zero_operation_economics(),
+                        RoutedSpendDisposition.DEFINITELY_NOT_INCURRED,
                     )
-                if (
-                    episode_decision is not None
-                    and episode_decision.selected_alias != selected.selected_alias
-                ):
-                    raise ValueError("routing decision conflicts with the cached episode model")
-                if episode_decision is None:
-                    self._insert_episode(expected_episode_sha256, selected)
-                self._insert_request(
-                    request_key,
-                    selected,
-                    zero_operation_economics(),
-                    RoutedSpendDisposition.DEFINITELY_NOT_INCURRED,
+                    cached = selected
+                if cached != selected:
+                    raise ValueError("routing decision is not the exact cached episode decision")
+                embedding_economics = self._request_embedding_economics.get(
+                    request_key, zero_operation_economics()
                 )
-                cached = selected
-            if cached != selected:
-                raise ValueError("routing decision is not the exact cached episode decision")
-            embedding_economics = self._request_embedding_economics.get(
-                request_key, zero_operation_economics()
-            )
-            embedding_disposition = self._request_embedding_dispositions.get(
-                request_key, RoutedSpendDisposition.DEFINITELY_NOT_INCURRED
-            )
+                embedding_disposition = self._request_embedding_dispositions.get(
+                    request_key, RoutedSpendDisposition.DEFINITELY_NOT_INCURRED
+                )
         resolved = self._resolve(selected.selected_alias)
         if _requires_tool_protocol(request) and not resolved.capabilities.supports_tools:
             raise RouterModelCapabilityError(

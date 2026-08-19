@@ -39,7 +39,7 @@ from wmo.common.models import (
     Usage,
 )
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
-from wmo.common.routing import KnnGuard, KnnRouterPolicy, RoutingDecision
+from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import (
     CandidateEvidenceCount,
     KnnBankManifest,
@@ -66,6 +66,7 @@ from wmo.runtime.router.economics import (
     RoutedProviderComponent,
     RoutedSpendDisposition,
 )
+from wmo.runtime.router.runtime import _PreparedSelection  # noqa: PLC2701
 from wmo.runtime.router.runtime_support import sticky_decision
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
@@ -807,8 +808,8 @@ def test_cached_selection_and_completion_reuse_sealed_activation_without_rehashi
     assert runtime.select(request, episode_id="episode-a") == decision
 
 
-def test_complete_survives_concurrent_lru_eviction_of_its_internal_selection() -> None:
-    """A valid internally selected decision remains consumable after bounded cache eviction."""
+def test_complete_survives_concurrent_repopulation_after_internal_selection_eviction() -> None:
+    """A valid in-flight selection survives conflicting same-episode repopulation."""
     policy, manifest, bank, snapshots, client = _fixture()
     runtime = RouterRuntime(
         policy,
@@ -820,24 +821,32 @@ def test_complete_survives_concurrent_lru_eviction_of_its_internal_selection() -
         pricing_candidate_aliases=manifest.candidate_aliases,
         decision_capacity=1,
     )
-    original_select = runtime.select
+    original_select = runtime._select_retained  # noqa: SLF001 - concurrency boundary regression.
 
-    def select_then_evict(
+    def select_then_repopulate(
         request: ModelRequest,
         *,
-        episode_id: str | None = None,
-        retain: bool = True,
-    ) -> RoutingDecision:
-        """Evict the returned decision before ``complete`` reaches its cache check."""
-        selected = original_select(request, episode_id=episode_id, retain=retain)
+        episode_id: str,
+    ) -> _PreparedSelection:
+        """Evict and replace the returned episode before completion validation."""
+        prepared = original_select(request, episode_id=episode_id)
         original_select(_request(tool_name="evict"), episode_id="other-episode")
-        return selected
+        client.embedding_values = ()
+        replacement = original_select(
+            _request(tool_name="repopulate"),
+            episode_id=episode_id,
+        )
+        client.embedding_values = (Embedding(values=(1.0, 0.0)),)
+        assert prepared.decision.selected_alias == "cheap"
+        assert replacement.decision.selected_alias == "baseline"
+        return prepared
 
-    runtime.__dict__["select"] = select_then_evict
+    runtime.__dict__["_select_retained"] = select_then_repopulate
 
     result = runtime.complete(_request(), episode_id="episode-a")
 
     assert result.decision.episode_id_sha256 == hashlib.sha256(b"episode-a").hexdigest()
+    assert result.decision.selected_alias == "cheap"
     assert client.complete_calls == 1
 
 
