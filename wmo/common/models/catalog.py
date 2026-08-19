@@ -223,6 +223,42 @@ class GatewayDeploymentMetadata(ContractModel):
     pricing_effective_at: AwareDatetime | None = None
 
 
+class GatewayEquivalenceCertification(ContractModel):
+    """Operator-authored evidence that deployments serve one exact model revision."""
+
+    authority: Literal["operator"] = "operator"
+    certification_id: ArtifactId
+    provenance: str = Field(min_length=1, max_length=2_048)
+    evidence_sha256: Sha256
+    certified_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _require_safe_provenance(self) -> GatewayEquivalenceCertification:
+        """Reject credential-like or control-bearing equivalence provenance."""
+        try:
+            assert_secret_free(self.model_dump(mode="json"))
+        except SecretBoundaryError as exc:
+            raise ValueError("equivalence provenance must be secret-free") from exc
+        if any(ord(character) < 32 for character in self.provenance):
+            raise ValueError("equivalence provenance must be display-safe")
+        return self
+
+
+class GatewayPoolRecord(ContractModel):
+    """Authored ordered deployments explicitly certified as one exact model."""
+
+    exact_model_id: ArtifactId
+    deployment_aliases: tuple[ArtifactId, ...] = Field(min_length=2)
+    equivalence: GatewayEquivalenceCertification
+
+    @model_validator(mode="after")
+    def _require_unique_deployments(self) -> GatewayPoolRecord:
+        """Reject repeated deployment aliases inside one equivalence pool."""
+        if len(set(self.deployment_aliases)) != len(self.deployment_aliases):
+            raise ValueError("gateway pool deployment aliases must not repeat")
+        return self
+
+
 class ModelRecord(ContractModel):
     """A stable local alias, exact capability snapshot, and provider-side model name.
 
@@ -328,6 +364,7 @@ class ModelCatalog(ContractModel):
     schema_version: Literal[2] = 2
     connections: dict[str, ConnectionConfig]
     models: dict[str, ModelRecord]
+    gateway_pools: dict[str, GatewayPoolRecord] = Field(default_factory=dict)
     roles: ModelRoles = Field(default_factory=ModelRoles)
 
     @field_validator("schema_version", mode="before")
@@ -354,6 +391,16 @@ class ModelCatalog(ContractModel):
     def _require_valid_model_aliases(cls, value: dict[str, ModelRecord]) -> dict[str, ModelRecord]:
         for alias in value:
             validate_artifact_id(alias)
+        return value
+
+    @field_validator("gateway_pools")
+    @classmethod
+    def _require_valid_gateway_pool_names(
+        cls, value: dict[str, GatewayPoolRecord]
+    ) -> dict[str, GatewayPoolRecord]:
+        """Validate authored pool identifiers before cross-reference checks."""
+        for pool_id in value:
+            validate_artifact_id(pool_id)
         return value
 
     @model_validator(mode="after")
@@ -389,6 +436,29 @@ class ModelCatalog(ContractModel):
             raise ValueError(f"roles name unknown model aliases: {', '.join(unknown_aliases)}")
         if self.roles.incumbent is not None and self.roles.incumbent not in self.roles.candidates:
             raise ValueError("incumbent must also appear in roles.candidates")
+        pooled_aliases: set[str] = set()
+        for pool_id, pool in self.gateway_pools.items():
+            for alias in pool.deployment_aliases:
+                if alias in pooled_aliases:
+                    raise ValueError(
+                        f"gateway deployment alias {alias!r} appears in more than one pool"
+                    )
+                pooled_aliases.add(alias)
+                record = self.models.get(alias)
+                if record is None:
+                    raise ValueError(
+                        f"gateway pool {pool_id!r} names unknown model alias {alias!r}"
+                    )
+                connection = self.connections[record.connection]
+                if connection.provider == "tinker" or record.sft_provenance is not None:
+                    raise ValueError(
+                        f"gateway pool {pool_id!r} cannot contain training handle {alias!r}"
+                    )
+                if record.gateway is None or record.gateway.exact_model_id != pool.exact_model_id:
+                    raise ValueError(
+                        f"gateway pool {pool_id!r} requires alias {alias!r} to declare exact "
+                        "model identity"
+                    )
         return self
 
 
