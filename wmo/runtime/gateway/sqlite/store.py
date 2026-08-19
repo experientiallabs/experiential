@@ -71,6 +71,10 @@ class OperationOutcomeUnknownError(GatewayStoreError):
         )
 
 
+class KeyIssuanceCommitError(GatewayStoreError):
+    """A virtual-key transaction was proven not to have committed."""
+
+
 class SystemGatewayClock:
     """Production wall and monotonic clock implementation."""
 
@@ -336,7 +340,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         if outcome is False:
             if delivery_cleanup is not None:
                 delivery_cleanup()
-            raise commit_error
+            raise KeyIssuanceCommitError("virtual key issuance did not commit") from commit_error
         raise OperationOutcomeUnknownError(issued=issued) from commit_error
 
     def revoke_virtual_key(self, *, organization_id: str, key_id: str) -> bool:

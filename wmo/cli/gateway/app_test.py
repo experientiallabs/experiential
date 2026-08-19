@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from wmo.cli.app import app
 from wmo.cli.gateway import app as gateway_cli_app
 from wmo.runtime.gateway.auth import IssuedVirtualKey, issue_key_material
 from wmo.runtime.gateway.management import GatewayManagement
-from wmo.runtime.gateway.sqlite.store import OperationOutcomeUnknownError
+from wmo.runtime.gateway.sqlite.store import OperationOutcomeUnknownError, SQLiteGatewayStore
 
 
 def test_noninteractive_management_story_emits_stable_secret_safe_json(
@@ -314,3 +315,77 @@ def test_unknown_key_commit_emits_content_free_recovery_and_retains_output(
     assert raw_key not in result.stdout
     assert output.read_text(encoding="utf-8").strip() == raw_key
     assert output.stat().st_mode & 0o777 == 0o600
+
+
+def test_definite_key_commit_failure_is_content_free_and_removes_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proven rollback returns a stable CLI error without secret or SQLite detail.
+
+    Args:
+        tmp_path: Pytest-owned gateway root and key-output directory.
+        monkeypatch: Scoped commit-failure injection.
+    """
+    runner = CliRunner()
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+    manager.create_identity(identity_id="default", display_name="Default")
+    output = tmp_path / "issued-key"
+    original_connect = SQLiteGatewayStore._connect
+
+    class FailedCommitConnection:
+        """Delegate transaction work while rejecting COMMIT before it takes effect."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            """Wrap one configured SQLite connection."""
+            self.connection = connection
+
+        def execute(
+            self,
+            statement: str,
+            parameters: tuple[object, ...] = (),
+        ) -> sqlite3.Cursor:
+            """Raise a secret-bearing SQLite error before the commit is applied."""
+            if statement == "COMMIT":
+                raise sqlite3.OperationalError("injected database detail")
+            return self.connection.execute(statement, parameters)
+
+    @contextmanager
+    def failed_commit(store: SQLiteGatewayStore) -> Iterator[FailedCommitConnection]:
+        """Yield one connection whose transaction is proven absent after close."""
+        with original_connect(store) as connection:
+            yield FailedCommitConnection(connection)
+
+    monkeypatch.setattr(SQLiteGatewayStore, "_connect", failed_commit)
+    result = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "key",
+            "issue",
+            "default",
+            "--key-id",
+            "key-one",
+            "--operation-id",
+            "operation-one",
+            "--root",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2
+    error_output = result.output + result.stderr
+    assert "virtual key issuance did not commit" in error_output
+    assert "injected database detail" not in error_output
+    assert "Traceback" not in error_output
+    assert "wmo_vk_" not in error_output
+    assert not output.exists()
+    assert tuple(tmp_path.glob(".issued-key.*.tmp")) == ()
+    assert manager.keys() == ()
+    with sqlite3.connect(manager.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
