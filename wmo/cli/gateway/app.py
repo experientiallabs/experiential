@@ -22,7 +22,7 @@ from wmo.cli.gateway.key_output import (
 from wmo.cli.gateway.pool import pool_app
 from wmo.cli.gateway.provider import provider_app
 from wmo.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
-from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.cli.shared.options import ROOT_OPTION, usage_error
 from wmo.common.core.artifacts import JsonObject
 from wmo.runtime.gateway.ledger import SQLiteAttemptLedger
 from wmo.runtime.gateway.management import GatewayManagement

@@ -272,9 +272,9 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     pinned_traces: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Walk build, setup, labeling, calibration, and approval on the pinned public export."""
-    monkeypatch.setattr("wmo.cli.build_cmd.RuntimeModelCatalog", _RuntimeCatalog)
-    monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
-    monkeypatch.setattr("wmo.cli.judge_config.RuntimeModelCatalog", _RuntimeCatalog)
+    monkeypatch.setattr("wmo.cli.build.app.RuntimeModelCatalog", _RuntimeCatalog)
+    monkeypatch.setattr("wmo.cli.build.app.capture_build_completed", lambda **_kwargs: None)
+    monkeypatch.setattr("wmo.cli.judge.app.RuntimeModelCatalog", _RuntimeCatalog)
     _RuntimeCatalog.judge_clients = []
     _RuntimeCatalog.judge_fail_after = None
     root = tmp_path / ".wmo"

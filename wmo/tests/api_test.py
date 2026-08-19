@@ -7,7 +7,7 @@ import sys
 from inspect import signature
 
 import wmo
-import wmo.cli.router_app as router_cli
+import wmo.cli.optimize.router as router_cli
 import wmo.common.evaluations as evaluations
 from wmo.common.evaluations import (
     FidelityReport,

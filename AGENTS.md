@@ -33,6 +33,19 @@ uv run pytest -q
 - The root CLI command set is exact: `build`, `config`, `optimize`, and `run`;
   `wmo/cli/app_test.py` and the release tests enforce the current command and distribution shape.
 
+## CLI package ownership
+
+- `wmo/cli/app.py` owns root command composition only. Command implementations live in the
+  `build/`, `config/`, `judge/`, `optimize/`, `run/`, and `gateway/` packages.
+- `wmo/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
+  commands. Command-specific orchestration stays with its command package. In particular,
+  router-candidate collection belongs to `wmo/cli/optimize/`.
+- `wmo/cli/shared/` owns reusable terminal, Typer, consent, picker, and progress primitives. It
+  must not import command packages. `wmo/cli/providers/` may import `shared/`, but it must not
+  import command packages.
+- Keep the `wmo/cli/` root closed to new command implementation modules. Package-wide CLI tests
+  may live in `wmo/cli/tests/`; module tests stay beside the module they cover.
+
 ## Evidence, simulation, and routing lifecycle
 
 - `wmo/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
@@ -107,7 +120,7 @@ uv run pytest -q
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
-- Every paid CLI command uses `wmo.cli.consent.require_spend_consent` after a credential-free
+- Every paid CLI command uses `wmo.cli.shared.consent.require_spend_consent` after a credential-free
   conservative estimate and before credential or provider-client construction. The setting in
   `.wmo/settings.toml` is a hard per-command ceiling. Estimates at or below half run automatically,
   higher in-budget estimates need explicit confirmation, and `--yes` never overrides the ceiling.
