@@ -73,9 +73,20 @@ from wmo.optimize.router.automatic.service import (
 )
 from wmo.optimize.router.composition import RouterCandidateSetupPlan
 from wmo.optimize.router.judging.artifacts import read_audit, write_audit, write_review_state
-from wmo.optimize.router.judging.contracts import ManualJudgeLabel, ManualJudgeReviewState
+from wmo.optimize.router.judging.contracts import (
+    ManualJudgeAxisDecision,
+    ManualJudgeError,
+    ManualJudgeLabel,
+    ManualJudgeReviewState,
+)
+from wmo.optimize.router.judging.labels import calibration_sample_digest
+from wmo.optimize.router.judging.review import (
+    ManualJudgeTraceProposal,
+    completed_trace_review_count,
+)
 from wmo.optimize.router.judging.service import (
     calibrate_manual_judge,
+    calibration_sample,
     commit_manual_judge_setup,
     estimate_manual_judge_budget,
     prepare_manual_judge_calibration,
@@ -1127,6 +1138,139 @@ def test_automatic_router_rejects_substituted_manual_judge_audit_before_calls(
     assert tuple(state.completion_calls) == before_completion
     assert tuple(state.embedding_calls) == before_embedding
     assert store.artifacts.list_ids() == before_artifacts
+
+
+def test_preflight_accepts_calibration_resumed_after_a_failed_first_pass(
+    tmp_path: Path,
+) -> None:
+    """Approve a calibration resumed from a failed first pass, then pass router preflight.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+    """
+    store, catalog, state = _completed_project(tmp_path)
+    setup_plan = prepare_manual_judge_setup(
+        store,
+        catalog,
+        preview_count=1,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    commit_manual_judge_setup(store, setup_plan, confirmed=True)
+    plan = prepare_manual_judge_calibration(store, sample_size=2)
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    budget = estimate_manual_judge_budget(
+        plan,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=2.0,
+        maximum_input_tokens_per_call=32_768,
+        maximum_cost_usd=1.0,
+    )
+    reviewed_positions: list[int] = []
+
+    def _accept(proposal: ManualJudgeTraceProposal) -> tuple[ManualJudgeAxisDecision, ...]:
+        """Accept every proposed axis unchanged.
+
+        Args:
+            proposal: Persisted configured-judge proposal for the current trace.
+
+        Returns:
+            One explicit acceptance per proposed rubric axis.
+        """
+        return tuple(
+            ManualJudgeAxisDecision(dimension_id=item.dimension_id, accepted=True)
+            for item in proposal.judgment.dimensions
+        )
+
+    def _fail_on_second(
+        proposal: ManualJudgeTraceProposal,
+    ) -> tuple[ManualJudgeAxisDecision, ...]:
+        """Accept the first trace, then fail like a correction missing its judgment.
+
+        Args:
+            proposal: Persisted configured-judge proposal for the current trace.
+
+        Returns:
+            One explicit acceptance per proposed rubric axis for the first trace only.
+
+        Raises:
+            ManualJudgeError: The reviewer reaches any trace after the first.
+        """
+        reviewed_positions.append(proposal.position)
+        if len(reviewed_positions) > 1:
+            raise ManualJudgeError(
+                "a corrected score requires --judgment TRACE:dim=CORRECTED_JUDGMENT"
+            )
+        return _accept(proposal)
+
+    with pytest.raises(ManualJudgeError, match="corrected score requires"):
+        calibrate_manual_judge(
+            store,
+            runtime,
+            plan,
+            (),
+            budget,
+            spend_consented=True,
+            approve=True,
+            accept_insufficient_labels=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+            reviewer=_fail_on_second,
+        )
+
+    plan = prepare_manual_judge_calibration(store, sample_size=2)
+    reviewed = completed_trace_review_count(
+        store,
+        plan.setup,
+        calibration_sample_digest(plan.setup, calibration_sample(plan)),
+    )
+    assert reviewed == 1
+    resumed_budget = estimate_manual_judge_budget(
+        plan,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=2.0,
+        maximum_input_tokens_per_call=32_768,
+        maximum_cost_usd=1.0,
+        completed_review_count=reviewed,
+    )
+    result = calibrate_manual_judge(
+        store,
+        runtime,
+        plan,
+        (),
+        resumed_budget,
+        spend_consented=True,
+        approve=True,
+        accept_insufficient_labels=True,
+        created_at=_TIME + timedelta(minutes=1),
+        code_revision=_REVISION,
+        reviewer=_accept,
+    )
+    assert result.approved_calibration is not None
+    candidate_plan = collect_router_candidate_setup(
+        store.model_catalog_path,
+        catalog,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    preflight = preflight_automatic_router(
+        store,
+        candidate_plan.selection,
+        catalog_override=candidate_plan.prospective_catalog,
+        options=AutomaticRouterOptions(
+            maximum_provider_cost_usd=25.0,
+            maximum_judgments=20,
+            maximum_model_calls=1,
+            simulation_maximum_output_tokens=8_000,
+        ),
+    )
+
+    assert preflight.approved_calibration_input == result.approved_calibration
+    assert preflight.judge_audit.budget.call_count == 1
+    assert sum(len(item.probes) for item in preflight.judge_audit.judgments) == 2
 
 
 @pytest.mark.parametrize("tamper", ["execution", "policy"])
