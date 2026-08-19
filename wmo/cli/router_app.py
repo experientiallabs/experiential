@@ -177,7 +177,10 @@ def router(
     ):
         _console.print("Router optimization was not started.")
         return
-    with usage_error(OSError, ValueError), progress_display(_console) as progress:
+    with (
+        usage_error(OSError, ValueError),
+        progress_display(_console, single_line=True) as progress,
+    ):
         result = optimize_project_router(
             store,
             candidate_plan,
@@ -198,8 +201,7 @@ def router(
         },
         root=root,
     )
-    _console.print(f"policy: {result.composition.optimization.optimization.policy.policy_id}")
-    _console.print(f"report: {result.composition.optimization.optimization.report.report_id}")
+    _console.print("[green]Complete[/green]")
 
 
 def _render_preflight(

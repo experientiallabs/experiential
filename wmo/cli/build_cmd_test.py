@@ -518,7 +518,7 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     monkeypatch.setattr("wmo.cli.build_cmd._build_grounded_artifacts", forbid_rebuild)
     replay = _RUNNER.invoke(app, ["build", "support", "--traces", str(source), "--root", str(root)])
     assert replay.exit_code == 0, replay.output
-    assert "embedding spend ceiling $0.000000" in replay.output
+    assert "Complete" in replay.output
 
     swapped = config.build.model_copy(
         update={
@@ -1411,7 +1411,7 @@ def test_exact_replay_has_zero_calls_and_no_prompt(
     assert replay.exit_code == 0, replay.output
     output = unstyle(replay.output)
     assert "reuse exact completed indexes, $0.000000 new spend" in output
-    assert "embedding spend ceiling $0.000000" in output
+    assert "Complete" in output
     assert "Proceed?" not in output
     assert _RESOLVE_CALLS == []
     assert ProjectStore(root, "support").load_project().build == first_build

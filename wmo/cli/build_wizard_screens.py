@@ -16,7 +16,6 @@ from rich.prompt import Prompt
 from wmo.common.models import ModelCatalog
 from wmo.common.project import ProjectModelConfiguration
 from wmo.common.tasks import TaskCase
-from wmo.optimize.router.automatic.replay import AutomaticRouterReplay
 from wmo.simulation.build import ProjectBuild
 from wmo.simulation.ingest.sources import CANONICAL_TRACE_SOURCES
 
@@ -133,23 +132,11 @@ def select_trace(initial_source: str, *, console: Console) -> tuple[str, Path]:
         return source, path
 
 
-def render_completed_replay(
-    project: str,
-    replay: AutomaticRouterReplay,
-    *,
-    console: Console,
-) -> None:
+def render_completed_replay(*, console: Console) -> None:
     """Render one verified completed chain without opening planning or consent.
 
     Args:
-        project: Local project identifier.
-        replay: Exact completed router and report identities.
         console: Terminal receiving the replay summary.
     """
     console.print("[green]\u2713[/green] reused every verified project artifact")
-    console.print(f"  router  {replay.policy_id}")
-    console.print(f"  report  {replay.report_id}")
-    console.print(f"  next    wmo run {project}")
-    if replay.judgment_status == "provisional":
-        console.print(f"  optional wmo config judge calibrate {project}")
-        console.print(f"  after approval wmo build {project}")
+    console.print("[green]Complete[/green]")

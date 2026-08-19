@@ -360,19 +360,13 @@ def build(
                 progress=progress,
             )
         built = completion.artifacts
-        reused = completion.reused
     _capture_local_build_telemetry(
         completed.artifacts,
         root=root,
         indexed_steps=_rag_transition_count(store, built.serving_rag.artifact_id),
         duration_seconds=time.monotonic() - started,
     )
-    _render_completed_build(
-        completed,
-        built=built,
-        estimate=0.0 if reused else estimate,
-        project=project,
-    )
+    _render_completed_build(completed, project=project)
 
 
 def _load_or_setup_catalog(
@@ -718,6 +712,9 @@ def _complete_grounded_build(
         top_k=top_k,
     )
     reused = built is not None
+    if built is not None:
+        report(progress, "serving index", detail="reused")
+        report(progress, "fit-only index", detail="reused")
     if built is None and not provider_spend_authorized:
         raise ValueError("grounded build provider work requires explicit authorization")
     if built is None:
@@ -952,16 +949,12 @@ def _render_preflight(
 def _render_completed_build(
     completed: ProjectBuild,
     *,
-    built: ProjectBuildArtifacts,
-    estimate: float,
     project: str,
 ) -> None:
-    """Present exact accepted, excluded, split, and grounded artifact identities.
+    """Present the compact accepted, excluded, and split summary with the next command.
 
     Args:
         completed: Persisted project build and mining results.
-        built: Exact completed grounded-artifact pointers.
-        estimate: Conservative provider embedding spend ceiling.
         project: Local project identifier used in the next recommended command.
     """
     dataset = completed.artifacts.trace_dataset.dataset
@@ -977,8 +970,5 @@ def _render_completed_build(
         f"[green]\u2713[/green] split {sum(task.partition == 'fit' for task in tasks)} fit / "
         f"{sum(task.partition == 'held_out' for task in tasks)} held out"
     )
-    _console.print(f"[green]\u2713[/green] serving RAG {built.serving_rag.artifact_id}")
-    _console.print(f"[green]\u2713[/green] fit RAG {built.fit_rag.artifact_id}")
-    _console.print(f"[green]\u2713[/green] world model {built.world_model.artifact_id}")
-    _console.print(f"[dim]embedding spend ceiling ${estimate:.6f}[/dim]")
+    _console.print("[green]Complete[/green]")
     _console.print(f"next: wmo optimize router {project}")

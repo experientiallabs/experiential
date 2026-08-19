@@ -368,18 +368,11 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     assert printed.count("Authorize wmo build support") == 1
     assert "Judge syllabus" in printed
     assert "Human calibration is optional" not in printed
-    assert "next            wmo run support" in printed
-    assert "optional        wmo config judge calibrate support" in printed
-    for label in (
-        "serving RAG",
-        "fit RAG",
-        "simulation",
-        "syllabus",
-        "calibration",
-        "router",
-        "report",
-    ):
-        assert label in printed
+    assert "Complete" in printed
+    completion_tail = printed[printed.rindex("Complete") :]
+    assert completion_tail.strip() == "Complete"
+    for label in ("serving RAG", "fit RAG"):
+        assert label not in printed
     assert "openai-secret" not in printed
     assert "openai-secret" not in (root / "models.toml").read_text(encoding="utf-8")
     store = wizard.ProjectStore(root, "support")
@@ -498,7 +491,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
     )
     assert replay.exit_code == 0, replay.output
     assert "reused every verified project artifact" in unstyle(replay.output)
-    assert "next    wmo run support" in unstyle(replay.output)
+    assert "Complete" in unstyle(replay.output)
     assert "wmo config judge calibrate support" not in unstyle(replay.output)
     assert lister.requests == ["openai"]
     assert state.credential_resolutions == completed_credentials
@@ -870,7 +863,7 @@ def test_approved_calibration_resume_builds_human_calibrated_successor(
     )
 
     assert result.exit_code == 0, result.output
-    assert "human_calibrated" in unstyle(result.output)
+    assert "Complete" in unstyle(result.output)
     policies = []
     for artifact_id in store.artifacts.list_ids():
         if store.artifacts.read(artifact_id).manifest.artifact_type != "router-policy":
@@ -1189,11 +1182,10 @@ def test_completed_replay_skips_every_prompt_and_provider_stage(
 
     printed = unstyle(output.getvalue())
     assert "reused every verified project artifact" in printed
-    assert "policy-a" in printed
-    assert "report-a" in printed
-    assert "next    wmo run support" in printed
-    assert "wmo config judge calibrate support" in printed
-    assert "after approval wmo build support" in printed
+    assert "Complete" in printed
+    assert "policy-a" not in printed
+    assert "report-a" not in printed
+    assert "wmo config judge calibrate support" not in printed
 
 
 def test_completed_replay_rejects_role_override_before_replay_probe(

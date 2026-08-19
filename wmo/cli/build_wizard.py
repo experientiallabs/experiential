@@ -29,6 +29,7 @@ from wmo.cli.build_wizard_screens import (
     select_workflow as _select_workflow,
 )
 from wmo.cli.consent import require_spend_consent
+from wmo.cli.progress import progress_display
 from wmo.common.core.money import exact_usd
 from wmo.common.models import (
     ModelCatalog,
@@ -126,7 +127,7 @@ def run_build_wizard(
     )
     replay = _completed_replay(root, project, code_revision=code_revision)
     if replay is not None:
-        _render_completed_replay(project, replay, console=console)
+        _render_completed_replay(console=console)
         return
     selection = _select_workflow(console=console)
     existing = _completed_build_plan(
@@ -212,18 +213,20 @@ def run_build_wizard(
             runtime_catalog,
             plan.selected,
         )
-        _complete_grounded_build(
-            ProjectStore(root, project),
-            plan.completed,
-            selected=plan.selected,
-            runtime_catalog=runtime_catalog,
-            world_snapshot=world_snapshot,
-            embedder_snapshot=embedder_snapshot,
-            top_k=top_k,
-            estimate=plan.build_estimate_usd,
-            maximum_build_cost_usd=maximum_build_cost_usd,
-            provider_spend_authorized=True,
-        )
+        with progress_display(console) as progress:
+            _complete_grounded_build(
+                ProjectStore(root, project),
+                plan.completed,
+                selected=plan.selected,
+                runtime_catalog=runtime_catalog,
+                world_snapshot=world_snapshot,
+                embedder_snapshot=embedder_snapshot,
+                top_k=top_k,
+                estimate=plan.build_estimate_usd,
+                maximum_build_cost_usd=maximum_build_cost_usd,
+                provider_spend_authorized=True,
+                progress=progress,
+            )
     else:
         console.print(
             f"[bold]1/{total_stages} Simulation and RAG indexes[/bold] [green]reused[/green]"
@@ -279,31 +282,18 @@ def run_build_wizard(
             "automatic router cost plan changed after the grounded build; rerun wmo build"
         )
     console.print(f"[bold]4/{total_stages} Router optimization[/bold]")
-    result = optimize_project_router(
-        store,
-        candidate_plan,
-        RuntimeModelCatalog(catalog),
-        options=options,
-        provider_spend_consented=True,
-        created_at=datetime.now(UTC),
-        code_revision=code_revision,
-    )
-    policy = result.composition.optimization.optimization.policy
-    report = result.composition.optimization.optimization.report
+    with progress_display(console, single_line=True) as progress:
+        optimize_project_router(
+            store,
+            candidate_plan,
+            RuntimeModelCatalog(catalog),
+            options=options,
+            provider_spend_consented=True,
+            created_at=datetime.now(UTC),
+            code_revision=code_revision,
+            progress=progress,
+        )
     console.print("[green]Complete[/green]")
-    selected_build = store.load_project().build
-    assert selected_build is not None
-    console.print(f"  serving RAG     {selected_build.serving_rag.artifact_id}")
-    console.print(f"  fit RAG         {selected_build.fit_rag.artifact_id}")
-    console.print(f"  simulation      {selected_build.world_model.artifact_id}")
-    console.print(f"  syllabus        {preflight.setup.rubric.artifact_id}")
-    console.print(f"  calibration     {preflight.calibration_id} ({preflight.judgment_status})")
-    console.print(f"  router          {policy.policy_id} ({policy.judgment_status})")
-    console.print(f"  report          {report.report_id}")
-    console.print(f"  next            wmo run {project}")
-    if preflight.judgment_status == "provisional":
-        console.print(f"  optional        wmo config judge calibrate {project}")
-        console.print(f"  after approval  wmo build {project}")
 
 
 def _ensure_judge_calibration(
