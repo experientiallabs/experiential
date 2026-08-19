@@ -495,7 +495,7 @@ def calibrate_manual_judge(
         save_label_draft(store, setup, sample_sha256, supplied_labels, created_at)
         reviewer = reviewer_from_labels(setup, supplied_labels)
     elif supplied_labels:
-        raise ManualJudgeError("supply either a review callback or legacy labels, not both")
+        raise ManualJudgeError("supply either a review callback or supplied labels, not both")
     calls_per_trace = 2 if setup.prompt_template.response_shape == "pairwise" else 1
     expected_calls = (len(plan.traces) - len(completed_reviews)) * (calls_per_trace)
     total_calls = len(plan.traces) * calls_per_trace

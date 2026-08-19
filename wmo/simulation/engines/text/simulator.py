@@ -58,7 +58,6 @@ from wmo.simulation.engines.text.grounding import (
     load_completion_contract,
     load_simulation_task_set,
     require_grounding_settings,
-    unknown_dispatch_worst_case_usd,
     verify_fit_retriever,
 )
 from wmo.simulation.engines.text.leases import (
@@ -122,7 +121,7 @@ class WorldModelSimulator:
         world_models: Independently resolved world-model providers keyed by local alias.
         grounded_world_models: Artifact-bound fit-only executors keyed by world-model alias.
         agent_factory: Creates an isolated customer-agent runtime for each episode worker.
-        completion_contract_input: Optional exact automatic-simulation reservation artifact.
+        completion_contract_input: Exact automatic-simulation reservation artifact.
         redacted_field_names: Project-configured labels removed before evidence persists.
         clock: Time source for artifact and span timestamps.
         monotonic: Monotonic time source for orchestration latency measurements.
@@ -143,7 +142,7 @@ class WorldModelSimulator:
         world_models: Mapping[str, ResolvedModel],
         grounded_world_models: Mapping[str, GroundedWorldModel],
         agent_factory: Callable[[], AgentRuntime],
-        completion_contract_input: ArtifactInput | None = None,
+        completion_contract_input: ArtifactInput,
         redacted_field_names: tuple[str, ...] = (),
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -163,7 +162,7 @@ class WorldModelSimulator:
             world_models: Remote world-model aliases resolved through the canonical runtime package.
             grounded_world_models: Persisted fit-bound executors for those world models.
             agent_factory: Per-episode customer-agent construction seam.
-            completion_contract_input: Optional exact completion reservation manifest.
+            completion_contract_input: Exact completion reservation manifest.
             redacted_field_names: Local field labels removed before artifact persistence.
             clock: Time source, injectable for deterministic tests.
             monotonic: Duration source, injectable for deterministic tests.
@@ -304,10 +303,7 @@ class WorldModelSimulator:
             raise SimulationConfigurationError(
                 "simulation spec inputs must include the exact task-set manifest reference"
             )
-        if (
-            self._completion_contract_input is not None
-            and self._completion_contract_input not in spec.inputs
-        ):
+        if self._completion_contract_input not in spec.inputs:
             raise SimulationConfigurationError(
                 "simulation spec inputs omit the exact completion reservation contract"
             )
@@ -599,15 +595,7 @@ class WorldModelSimulator:
         for cell_id, binding in bindings.items():
             cell = next(item for item in self._plan.cells if item.cell_id == cell_id)
             rollouts.extend(persisted_cell_attempts(self._store, cell, binding, pins))
-        return known_total_spend(
-            rollouts,
-            unknown_dispatch_fallback_usd=lambda rollout: unknown_dispatch_worst_case_usd(
-                self._completion_contract,
-                rollout.simulation_binding.candidate_alias
-                if rollout.simulation_binding is not None
-                else None,
-            ),
-        )
+        return known_total_spend(rollouts)
 
     def _execute_cell(
         self,
@@ -701,11 +689,7 @@ class WorldModelSimulator:
             query_embedding=settings.query_embedding,
             candidate_request=candidate_request,
             world_model_request=world_request,
-            completion_maximum_attempts=(
-                self._completion_contract.maximum_attempts
-                if self._completion_contract is not None
-                else 1
-            ),
+            completion_maximum_attempts=self._completion_contract.maximum_attempts,
             maximum_cost_usd=maximum_cell_cost_usd,
             stop_on_overspend=spec.stop_on_overspend,
             maximum_steps=spec.maximum_steps,

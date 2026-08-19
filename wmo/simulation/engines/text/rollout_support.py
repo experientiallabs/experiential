@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import datetime
 from typing import cast
 
@@ -103,24 +103,17 @@ def normalize_text_tool_failure(episode: AgentEpisode) -> StructuredFailure | No
 
 def known_total_spend(
     rollouts: Sequence[RolloutArtifact],
-    *,
-    unknown_dispatch_fallback_usd: Callable[[RolloutArtifact], float | None] | None = None,
 ) -> float | None:
     """Return total conservative provider spend, or ``None`` if any episode is unpriced.
 
     Args:
         rollouts: Completed text-simulation rollout artifacts to total.
-        unknown_dispatch_fallback_usd: Optional persisted worst-case charge for unknown-spend
-            evidence that predates per-failure reservation persistence.
 
     Returns:
         The known conservative provider spend, or ``None`` when any billed call is not priced
         and has no persisted worst-case reservation.
     """
-    values = tuple(
-        rollout_spend(rollout, unknown_dispatch_fallback_usd=unknown_dispatch_fallback_usd)
-        for rollout in rollouts
-    )
+    values = tuple(rollout_spend(rollout) for rollout in rollouts)
     if any(value is None for value in values):
         return None
     return sum(cast(float, value) for value in values)
@@ -128,8 +121,6 @@ def known_total_spend(
 
 def rollout_spend(
     rollout: RolloutArtifact,
-    *,
-    unknown_dispatch_fallback_usd: Callable[[RolloutArtifact], float | None] | None = None,
 ) -> float | None:
     """Return reconciled provider cost without treating unknown dispatches as free.
 
@@ -139,8 +130,6 @@ def rollout_spend(
 
     Args:
         rollout: Completed text-simulation rollout whose recorded calls are inspected.
-        unknown_dispatch_fallback_usd: Optional persisted worst-case charge for unknown-spend
-            evidence that predates per-failure reservation persistence.
 
     Returns:
         Observed candidate and world-model cost plus conservative retrieval and reservation
@@ -149,8 +138,6 @@ def rollout_spend(
     reserved: float | None = None
     if unknown_spend_failure(rollout.failure):
         reserved = unknown_dispatch_reserved_cost_usd(rollout.failure)
-        if reserved is None and unknown_dispatch_fallback_usd is not None:
-            reserved = unknown_dispatch_fallback_usd(rollout)
         if reserved is None:
             return None
     roles = (

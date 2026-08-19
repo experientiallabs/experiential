@@ -76,6 +76,7 @@ from wmo.simulation.engines.text import simulator as text_simulator_module
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
+    _persist_completion_contract,
     _response,
     _ScriptedClient,
 )
@@ -379,6 +380,7 @@ class _SetupSupplier:
                     maximum_input_tokens=10_000,
                 ),
             ),
+            simulation_completion_input=_persist_completion_contract(project.artifacts),
             agent_id="agent-a",
             seed=7,
             maximum_steps=2,
@@ -542,6 +544,7 @@ class _SimulatorFactory:
                 )
             },
             agent_factory=_OneTurnAgent,
+            completion_contract_input=_persist_completion_contract(project.artifacts),
             clock=lambda: _TIME,
             monotonic=lambda: 1.0,
         )
@@ -933,7 +936,7 @@ def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
     def failing_admission(
         settings: WorldModelSettings,
         *,
-        completion_contract: SimulationCompletionContract | None,
+        completion_contract: SimulationCompletionContract,
         remaining_cost_usd: float,
         stop_on_overspend: bool = True,
     ) -> StructuredFailure | None:

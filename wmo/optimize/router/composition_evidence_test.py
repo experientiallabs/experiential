@@ -59,6 +59,7 @@ from wmo.runtime.router.application import create_project_router_app
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
+    _persist_completion_contract,
     _response,
     _ScriptedClient,
 )
@@ -202,6 +203,10 @@ class _EvidenceSetupSupplier:
                     maximum_input_tokens=10_000,
                 ),
             ),
+            simulation_completion_input=_persist_completion_contract(
+                project.artifacts,
+                candidate_aliases=("candidate-baseline", "candidate-economy"),
+            ),
             agent_id="agent-a",
             seed=16,
             maximum_steps=2,
@@ -284,6 +289,10 @@ class _EvidenceSimulatorFactory:
                 )
             },
             agent_factory=_OneTurnAgent,
+            completion_contract_input=_persist_completion_contract(
+                project.artifacts,
+                candidate_aliases=("candidate-baseline", "candidate-economy"),
+            ),
             clock=lambda: _TIME,
             monotonic=lambda: 1.0,
         )
@@ -622,6 +631,8 @@ class _EvidenceReviewSupplier:
                 score_maps=(
                     DimensionScoreMap(
                         dimension_id="dimension-a",
+                        min_score=0,
+                        max_score=5,
                         calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
                     ),
                 ),

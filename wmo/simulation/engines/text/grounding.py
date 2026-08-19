@@ -10,9 +10,6 @@ from wmo.common.core.artifacts import (
 )
 from wmo.common.models import (
     CompletionCostReservation,
-    EmbeddingCostReservation,
-    NumericMeasurement,
-    OperationEconomics,
     verify_completion_reservation,
 )
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
@@ -29,22 +26,20 @@ from wmo.simulation.specs import (
 
 
 def load_completion_contract(
-    store: ArtifactStore, contract_input: ArtifactInput | None
-) -> SimulationCompletionContract | None:
-    """Load the exact optional completion reservation artifact.
+    store: ArtifactStore, contract_input: ArtifactInput
+) -> SimulationCompletionContract:
+    """Load the exact completion reservation artifact.
 
     Args:
         store: Project-local immutable artifact store.
         contract_input: Expected immutable contract manifest.
 
     Returns:
-        Verified completion contract, or ``None`` for v1 simulation callers.
+        Verified completion contract.
 
     Raises:
         SimulationConfigurationError: The artifact is missing, corrupt, or hash-mismatched.
     """
-    if contract_input is None:
-        return None
     try:
         contract, persisted_input = load_simulation_completion_contract(
             store, contract_input.artifact_id
@@ -174,91 +169,27 @@ def require_grounding_settings(
     return settings
 
 
-def maximum_query_reservation(
-    reservation: EmbeddingCostReservation,
-) -> OperationEconomics:
-    """Return the retry-inclusive maximum spend reserved for one retrieval query.
-
-    Args:
-        reservation: Persisted price, retry ceiling, and maximum query-token count.
-
-    Returns:
-        Estimated economics for the largest allowed query and every allowed retry.
-    """
-    cost = (
-        reservation.maximum_input_tokens
-        * reservation.maximum_attempts
-        * reservation.input_usd_per_million_tokens
-        / 1_000_000
-    )
-    return OperationEconomics(cost_usd=NumericMeasurement(value=cost, provenance="estimated"))
-
-
-def query_reservation_failure(
-    reservation: EmbeddingCostReservation,
-    remaining_cost_usd: float,
-    *,
-    stop_on_overspend: bool = True,
-) -> StructuredFailure | None:
-    """Reject retrieval dispatch only when stop mode finds the remainder exhausted.
-
-    The worst-case query reservation is a planning value and never gates dispatch on its own:
-    an episode with real budget remaining always admits its next query. By default the
-    authorized run also admits queries after the remainder is exhausted; stop mode returns a
-    structured budget failure instead.
-
-    Args:
-        reservation: Persisted worst-case query-embedding reservation.
-        remaining_cost_usd: Reconciled provider budget available to the cell.
-        stop_on_overspend: When true, an exhausted remainder blocks the next query.
-
-    Returns:
-        Structured budget failure when stop mode finds no reconciled spend remaining,
-        otherwise ``None``.
-
-    Raises:
-        SimulationConfigurationError: The reservation unexpectedly has no estimated cost.
-    """
-    economics = maximum_query_reservation(reservation)
-    cost = economics.cost_usd
-    if cost is None:  # pragma: no cover - maximum_query_reservation always prices the call
-        raise SimulationConfigurationError("query-embedding reservation has unknown cost")
-    if remaining_cost_usd > 0 or not stop_on_overspend:
-        return None
-    return StructuredFailure(
-        code=FailureCode.BUDGET,
-        message="reconciled provider spend has exhausted the remaining retrieval ceiling",
-        attribution=FailureAttribution.MODEL,
-        details={
-            "phase": "query_embedding_reservation",
-            "remaining_cost_usd": remaining_cost_usd,
-        },
-    )
-
-
 def completion_reservations(
-    contract: SimulationCompletionContract | None,
+    contract: SimulationCompletionContract,
     *,
     candidate_alias: str,
     candidate: ResolvedModel,
     world_model: ResolvedModel,
-) -> tuple[CompletionCostReservation | None, CompletionCostReservation | None]:
+) -> tuple[CompletionCostReservation, CompletionCostReservation]:
     """Resolve and verify exact candidate and world request ceilings.
 
     Args:
-        contract: Frozen automatic-simulation reservations, or ``None`` for v1 callers.
+        contract: Frozen automatic-simulation reservations.
         candidate_alias: Evaluation cell candidate alias.
         candidate: Active exact candidate model.
         world_model: Active exact world model.
 
     Returns:
-        Candidate and world request reservations, or two ``None`` values for legacy settings.
+        Candidate and world request reservations.
 
     Raises:
         SimulationConfigurationError: A reservation is absent or differs from active metadata.
     """
-    if contract is None:
-        return None, None
     if contract.world_model_alias != world_model.alias:
         raise SimulationConfigurationError(
             "completion reservation contract selects a different world-model alias"
@@ -290,7 +221,7 @@ def completion_reservations(
 
 
 def unknown_dispatch_worst_case_usd(
-    contract: SimulationCompletionContract | None,
+    contract: SimulationCompletionContract,
     candidate_alias: str | None,
 ) -> float | None:
     """Return the persisted retry-inclusive worst case for one ambiguous provider dispatch.
@@ -300,14 +231,14 @@ def unknown_dispatch_worst_case_usd(
     ceilings from the frozen completion contract.
 
     Args:
-        contract: Frozen automatic-simulation reservations, or ``None`` for v1 callers.
+        contract: Frozen automatic-simulation reservations.
         candidate_alias: Candidate alias bound to the failed cell, or ``None`` when unknown.
 
     Returns:
         The combined candidate and world-model retry-inclusive maximum, or ``None`` when the
-        contract or the alias reservation is unavailable.
+        alias reservation is unavailable.
     """
-    if contract is None or candidate_alias is None:
+    if candidate_alias is None:
         return None
     candidates = {item.candidate_alias: item.request for item in contract.candidate_requests}
     candidate = candidates.get(candidate_alias)
@@ -322,7 +253,7 @@ def unknown_dispatch_worst_case_usd(
 def episode_reservation_failure(
     settings: WorldModelSettings,
     *,
-    completion_contract: SimulationCompletionContract | None,
+    completion_contract: SimulationCompletionContract,
     remaining_cost_usd: float,
     stop_on_overspend: bool = True,
 ) -> StructuredFailure | None:
@@ -336,7 +267,7 @@ def episode_reservation_failure(
 
     Args:
         settings: Frozen retrieval and completion reservations.
-        completion_contract: Frozen completion reservations, or ``None`` for v1 callers.
+        completion_contract: Frozen completion reservations.
         remaining_cost_usd: Reconciled cell budget remaining under the durable lease.
         stop_on_overspend: When true, an exhausted remainder blocks the next episode.
 
@@ -349,10 +280,6 @@ def episode_reservation_failure(
     query = settings.query_embedding
     if query is None:  # pragma: no cover - grounding settings require it
         raise SimulationConfigurationError("query-embedding reservation is missing")
-    if completion_contract is None:
-        return query_reservation_failure(
-            query, remaining_cost_usd, stop_on_overspend=stop_on_overspend
-        )
     if remaining_cost_usd > 0 or not stop_on_overspend:
         return None
     return StructuredFailure(

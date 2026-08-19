@@ -76,11 +76,6 @@ from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
 from wmo.simulation.build import ProjectBuild
 from wmo.simulation.engines.text.bindings import rollout_id_for_binding
-from wmo.simulation.engines.text.errors import SimulationConfigurationError
-from wmo.simulation.engines.text.grounding import (
-    load_completion_contract,
-    unknown_dispatch_worst_case_usd,
-)
 from wmo.simulation.engines.text.resume import reexecutable_dispatch_failure
 from wmo.simulation.engines.text.rollout_support import rollout_spend
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
@@ -151,7 +146,7 @@ class RouterEvaluationSetup(ContractModel):
     incumbent_alias: ArtifactId | None = None
     judgment_status: Literal["provisional", "human_calibrated"]
     world_model_settings: WorldModelSettings
-    simulation_completion_input: ArtifactInput | None = None
+    simulation_completion_input: ArtifactInput
     agent_id: str = Field(min_length=1, max_length=256)
     seed: int
     maximum_steps: int = Field(gt=0)
@@ -614,24 +609,12 @@ def _superseded_attempt_spend(
     binding = rollout.simulation_binding
     if binding is None:
         raise RouterCompositionError("retried simulation rollout lacks its cell binding")
-    try:
-        contract = load_completion_contract(project.artifacts, setup.simulation_completion_input)
-    except SimulationConfigurationError as exc:
-        raise RouterCompositionError(str(exc)) from exc
     charges = []
     for attempt in range(rollout.retry_attempt):
         prior, _input = read_rollout(
             project.artifacts, rollout_id_for_binding(binding, attempt=attempt)
         )
-        spend = rollout_spend(
-            prior,
-            unknown_dispatch_fallback_usd=lambda item: unknown_dispatch_worst_case_usd(
-                contract,
-                item.simulation_binding.candidate_alias
-                if item.simulation_binding is not None
-                else None,
-            ),
-        )
+        spend = rollout_spend(prior)
         if spend is None:
             raise RouterCompositionError(
                 "superseded simulation attempt spend cannot be reconciled conservatively"

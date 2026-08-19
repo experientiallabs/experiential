@@ -193,18 +193,18 @@ class FrozenEmbeddingClient(EmbeddingClient):
 
 def load_frozen_embedding_set(
     store: ArtifactStore, artifact_id: ArtifactId
-) -> FrozenEmbeddingSet | ReservedFrozenEmbeddingSet:
-    """Load one manifest-verified completed router embedding artifact.
+) -> ReservedFrozenEmbeddingSet:
+    """Load one manifest-verified reserved router embedding artifact.
 
     Args:
         store: Project-local immutable artifact store.
         artifact_id: Router-embedding artifact identity.
 
     Returns:
-        Parsed frozen embedding set.
+        Parsed reserved frozen embedding set.
 
     Raises:
-        ValueError: The artifact type, payload, or bound identity is invalid.
+        ValueError: The artifact type, payload, schema, or bound identity is invalid.
     """
     stored = store.read(artifact_id)
     if stored.manifest.artifact_type != "router-embeddings":
@@ -216,32 +216,26 @@ def load_frozen_embedding_set(
         raise ValueError("router embedding payload is not valid JSON") from exc
     if not isinstance(raw, dict):
         raise ValueError("router embedding payload must be a JSON object")
-    schema_version = raw.get("schema_version")
-    value: FrozenEmbeddingSet | ReservedFrozenEmbeddingSet = (
-        ReservedFrozenEmbeddingSet.model_validate_json(payload)
-        if schema_version == 2
-        else FrozenEmbeddingSet.model_validate_json(payload)
-    )
-    if value.schema_version not in {1, 2}:
+    if raw.get("schema_version") != 2:
         raise ValueError("router embedding set schema version is unsupported")
+    value = ReservedFrozenEmbeddingSet.model_validate_json(payload)
     if value.embedding_set_id != artifact_id:
         raise ValueError("router embedding set identity differs from its artifact")
     if not envelope_matches_manifest(value, stored.manifest):
         raise ValueError("router embedding payload differs from its artifact manifest")
     for item in value.embeddings:
         Embedding(values=item.values)
-    if isinstance(value, ReservedFrozenEmbeddingSet):
-        if len(value.inputs) != 1:
-            raise ValueError("router embedding set needs one exact task-set input")
-        expected_id = _router_embedding_set_id(
-            task_set_input=value.inputs[0],
-            embedder_alias=value.embedder_alias,
-            embedder=value.embedder,
-            reservation=value.reservation,
-            feature_digests=tuple(item.text_sha256 for item in value.embeddings),
-        )
-        if expected_id != artifact_id:
-            raise ValueError("router embedding set content identity is invalid")
+    if len(value.inputs) != 1:
+        raise ValueError("router embedding set needs one exact task-set input")
+    expected_id = _router_embedding_set_id(
+        task_set_input=value.inputs[0],
+        embedder_alias=value.embedder_alias,
+        embedder=value.embedder,
+        reservation=value.reservation,
+        feature_digests=tuple(item.text_sha256 for item in value.embeddings),
+    )
+    if expected_id != artifact_id:
+        raise ValueError("router embedding set content identity is invalid")
     return value
 
 
@@ -390,8 +384,7 @@ def persist_router_embeddings(
     if destination.exists():
         existing = load_frozen_embedding_set(store, embedding_set_id)
         if (
-            not isinstance(existing, ReservedFrozenEmbeddingSet)
-            or existing.inputs != (task_set_input,)
+            existing.inputs != (task_set_input,)
             or existing.embedder_alias != embedder_alias
             or existing.embedder != embedder
             or existing.reservation != reservation

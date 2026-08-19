@@ -478,11 +478,16 @@ def _completion_reservation(alias: str) -> CompletionCostReservation:
     )
 
 
-def _persist_completion_contract(store: ArtifactStore) -> ArtifactInput:
+def _persist_completion_contract(
+    store: ArtifactStore,
+    *,
+    candidate_aliases: tuple[str, ...] = ("candidate-a", "candidate-b"),
+) -> ArtifactInput:
     """Persist the complete candidate and world reservation fixture.
 
     Args:
         store: Project-local artifact store.
+        candidate_aliases: Candidate aliases that need request reservations.
 
     Returns:
         Exact completion-contract manifest input.
@@ -490,15 +495,12 @@ def _persist_completion_contract(store: ArtifactStore) -> ArtifactInput:
     _contract, contract_input = persist_simulation_completion_contract(
         store,
         inputs=(),
-        candidate_requests=(
+        candidate_requests=tuple(
             CandidateCompletionReservation(
-                candidate_alias="candidate-a",
-                request=_completion_reservation("candidate-a"),
-            ),
-            CandidateCompletionReservation(
-                candidate_alias="candidate-b",
-                request=_completion_reservation("candidate-b"),
-            ),
+                candidate_alias=alias,
+                request=_completion_reservation(alias),
+            )
+            for alias in candidate_aliases
         ),
         world_model_alias="world-model-a",
         world_model_request=_completion_reservation("world-model-a"),
@@ -546,6 +548,7 @@ def _spec(
     plan_input: ArtifactInput,
     task_set_input: ArtifactInput,
     cells: tuple[str, ...],
+    store: ArtifactStore,
     *,
     fit_rag_input: ArtifactInput | None = None,
     completion_contract_input: ArtifactInput | None = None,
@@ -558,9 +561,10 @@ def _spec(
         plan_input: Exact persisted evaluation-plan pointer.
         task_set_input: Exact persisted task-set pointer.
         cells: Ordered evaluation-cell identities selected for execution.
+        store: Project-local artifact store used to persist the reservation contract.
         fit_rag_input: Optional explicit fit-only RAG pointer.
         query_embedding: Optional explicit query-embedding reservation.
-        completion_contract_input: Optional exact completion reservation artifact.
+        completion_contract_input: Exact completion reservation artifact, or a persisted default.
         **updates: Additional specification fields overriding fixture defaults.
 
     Returns:
@@ -568,9 +572,8 @@ def _spec(
     """
     rag_input = fit_rag_input or _fit_rag_input()
     grounded_input = _grounded_world_model_input()
-    inputs = [plan_input, task_set_input, rag_input, grounded_input]
-    if completion_contract_input is not None:
-        inputs.append(completion_contract_input)
+    contract_input = completion_contract_input or _persist_completion_contract(store)
+    inputs = [plan_input, task_set_input, rag_input, grounded_input, contract_input]
     values: dict[str, object] = {
         "schema_version": 1,
         "created_at": _TIME,
@@ -627,7 +630,7 @@ def _simulator(
         agent_factory: Factory creating one isolated agent runtime per episode.
         fit_retriever: Optional exact read-only fit retriever.
         fit_rag_input: Optional explicit fit-only RAG pointer.
-        completion_contract_input: Optional exact completion reservation artifact.
+        completion_contract_input: Exact completion reservation artifact, or a persisted default.
 
     Returns:
         Fully bound text-world-model simulator.
@@ -635,6 +638,7 @@ def _simulator(
     retriever = fit_retriever or _FitRetriever(_fit_rag_input())
     rag_input = fit_rag_input or retriever.rag_input
     typed_retriever = cast(TraceRAGRetriever, retriever)
+    contract_input = completion_contract_input or _persist_completion_contract(store)
     return WorldModelSimulator(
         store=store,
         evaluation_plan=plan,
@@ -654,7 +658,7 @@ def _simulator(
             "world-model-a": _grounded_world_model(world_client, typed_retriever)
         },
         agent_factory=agent_factory,
-        completion_contract_input=completion_contract_input,
+        completion_contract_input=contract_input,
         clock=lambda: _TIME,
         monotonic=lambda: 1.0,
     )
@@ -696,7 +700,7 @@ def test_text_simulation_persists_separate_economics_and_resumes_without_duplica
         world_client,
         fit_retriever=retriever,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a",))
+    spec = _spec(plan_input, task_set_input, ("cell-a",), store)
 
     artifact_set = simulator.run(spec)
     rollout_id = artifact_set.artifact_ids[0]
@@ -798,7 +802,7 @@ def test_persisted_rollout_redacts_generated_secrets_and_records_audit_count(
         world_client,
         fit_retriever=_FitRetriever(_fit_rag_input()),
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a",))
+    spec = _spec(plan_input, task_set_input, ("cell-a",), store)
 
     artifact_set = simulator.run(spec)
     rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
@@ -879,6 +883,7 @@ def test_persisted_fit_rag_grounds_active_simulation_and_replay_has_zero_dispatc
         plan_input,
         task_set_input,
         ("cell-a",),
+        store,
         fit_rag_input=fit_rag_input,
         query_embedding=reservation,
     )
@@ -957,6 +962,7 @@ def test_worst_case_query_reservation_never_blocks_an_episode_with_spend_remaini
             plan_input,
             task_set_input,
             ("cell-a",),
+            store,
             world_model=settings,
             maximum_cost_usd=0.1,
         )
@@ -1030,6 +1036,7 @@ def test_expensive_episode_estimate_dispatches_until_actual_spend_reaches_the_ce
             plan_input,
             task_set_input,
             ("cell-a",),
+            store,
             world_model=settings,
             completion_contract_input=completion_input,
             maximum_cost_usd=0.1,
@@ -1096,7 +1103,7 @@ def test_query_embedding_catalog_drift_blocks_every_dispatch(
     artifacts_before = store.list_ids()
 
     with pytest.raises(SimulationConfigurationError, match=message):
-        simulator.run(_spec(plan_input, task_set_input, ("cell-a",), world_model=settings))
+        simulator.run(_spec(plan_input, task_set_input, ("cell-a",), store, world_model=settings))
 
     assert store.list_ids() == artifacts_before
     assert candidate_client.requests == []
@@ -1131,7 +1138,7 @@ def test_text_simulation_records_tool_tasks_and_context_overflow_as_failed_cells
         world_client,
         candidate_context_window=16_000,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"))
+    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), store)
 
     artifact_set = simulator.run(spec)
     tool_rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
@@ -1166,7 +1173,7 @@ def test_text_simulation_normalizes_agent_tool_attempts_to_unsupported_cells(
         agent_factory=_ToolAttemptAgent,
     )
 
-    artifact_set = simulator.run(_spec(plan_input, task_set_input, ("cell-a",)))
+    artifact_set = simulator.run(_spec(plan_input, task_set_input, ("cell-a",), store))
     rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
 
     assert rollout.failure is not None
@@ -1206,6 +1213,7 @@ def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path
         plan_input,
         task_set_input,
         ("cell-a", "cell-b"),
+        store,
         maximum_cost_usd=0.5,
         stop_on_overspend=True,
     )
@@ -1260,6 +1268,7 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
         plan_input,
         task_set_input,
         ("cell-a", "cell-b"),
+        store,
         maximum_cost_usd=1.0,
         stop_on_overspend=True,
     )
@@ -1329,6 +1338,7 @@ def test_invalid_production_usage_charges_reservation_and_admits_later_paid_cell
         plan_input,
         task_set_input,
         ("cell-a", "cell-b"),
+        store,
         completion_contract_input=completion_input,
         maximum_cost_usd=1.0,
     )
@@ -1389,6 +1399,7 @@ def test_resume_reexecutes_retryable_transport_failure_as_new_immutable_attempt(
         plan_input,
         task_set_input,
         ("cell-a",),
+        store,
         completion_contract_input=completion_input,
         maximum_cost_usd=1.0,
     )
@@ -1444,6 +1455,7 @@ def test_persistent_transport_failure_stops_at_the_attempt_cap_and_replays(
         plan_input,
         task_set_input,
         ("cell-a",),
+        store,
         completion_contract_input=completion_input,
         maximum_cost_usd=10.0,
     )
@@ -1507,6 +1519,7 @@ def test_retrieval_dispatch_failure_persists_a_zero_incremental_reservation(
         plan_input,
         task_set_input,
         ("cell-a",),
+        store,
         completion_contract_input=completion_input,
         maximum_cost_usd=10.0,
     )
@@ -1560,6 +1573,7 @@ def test_prior_attempt_reservation_charges_the_ceiling_before_retry(tmp_path: Pa
         plan_input,
         task_set_input,
         ("cell-a",),
+        store,
         completion_contract_input=completion_input,
         maximum_cost_usd=0.4 * call_reservation,
         stop_on_overspend=True,
@@ -1610,6 +1624,7 @@ def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: P
             plan_input,
             task_set_input,
             ("cell-a", "cell-b"),
+            store,
             maximum_cost_usd=0.01,
             stop_on_overspend=True,
         )
@@ -1662,6 +1677,7 @@ def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_pers
         plan_input,
         task_set_input,
         ("cell-a", "cell-b"),
+        store,
         maximum_cost_usd=1.0,
         stop_on_overspend=True,
     )
@@ -1783,6 +1799,7 @@ def test_text_simulation_serializes_finite_cost_admission(tmp_path: Path) -> Non
         plan_input,
         task_set_input,
         tuple(cell.cell_id for cell in cells),
+        store,
         maximum_concurrency=2,
     )
 
@@ -1829,7 +1846,7 @@ def test_text_simulation_continues_after_agent_completion_until_world_terminal(
         world_client,
     )
 
-    artifact_set = simulator.run(_spec(plan_input, task_set_input, ("cell-a",)))
+    artifact_set = simulator.run(_spec(plan_input, task_set_input, ("cell-a",), store))
     rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
 
     assert rollout.stop_reason == StopReason.COMPLETED
@@ -1880,7 +1897,7 @@ def test_text_simulation_turn_exhaustion_is_a_judgeable_outcome_without_failure(
         world_client,
     )
 
-    artifact_set = simulator.run(_spec(plan_input, task_set_input, ("cell-a",)))
+    artifact_set = simulator.run(_spec(plan_input, task_set_input, ("cell-a",), store))
     rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
 
     assert rollout.stop_reason == StopReason.MAXIMUM_STEPS
@@ -1907,7 +1924,7 @@ def test_text_simulation_cross_runner_claim_prevents_duplicate_paid_calls(tmp_pa
             )
         ]
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a",))
+    spec = _spec(plan_input, task_set_input, ("cell-a",), store)
     first = _simulator(store, plan, plan_input, task_set_input, candidate_client, world_client)
     second = _simulator(store, plan, plan_input, task_set_input, candidate_client, world_client)
 
@@ -1938,7 +1955,7 @@ def test_text_simulation_live_hung_claim_times_out_without_calls_or_result_artif
         candidate_client,
         world_client,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a",), maximum_cost_usd=1.0)
+    spec = _spec(plan_input, task_set_input, ("cell-a",), store, maximum_cost_usd=1.0)
     cells, world_model, grounded_world_model = simulator._validate_spec_and_bindings(spec)
     canonical_spec, spec_input = persist_canonical_specification(store, spec)
     resolution, resolution_input, bindings = simulator._persist_resolution(
@@ -2008,6 +2025,7 @@ def test_two_finite_budget_runners_complete_each_cell_exactly_once(tmp_path: Pat
         plan_input,
         task_set_input,
         ("cell-a", "cell-b"),
+        store,
         maximum_cost_usd=0.5,
     )
     runners = (

@@ -176,26 +176,32 @@ def test_direct_model_spans_persist_explicit_unspecified_provenance(tmp_path: Pa
     assert evidence.records[0].connection == "unspecified"
 
 
-def test_strict_loader_preserves_legacy_dataset_without_identity_payload(tmp_path: Path) -> None:
-    """A verified legacy current dataset remains readable with no inferred provenance."""
-    trace = _modeled_trace()
+def test_current_dataset_identity_includes_revision_and_identity_evidence(
+    tmp_path: Path,
+) -> None:
+    """Current content-addressed IDs include producer revision and identity evidence."""
     store = _store(tmp_path, "project-a")
     persisted = persist_trace_dataset(
-        TraceNormalizationResult(
-            traces=(trace,),
-            issues=(),
-            include_identity_evidence=False,
-        ),
+        TraceNormalizationResult(traces=(_modeled_trace(),), issues=()),
         store,
         created_at=datetime(2026, 8, 11, tzinfo=UTC),
         code_revision="test-revision",
     )
+    assert persisted.dataset.source is not None
+    historical_id = stable_id(
+        "trace-dataset",
+        {
+            "source": persisted.dataset.source.model_dump(mode="json"),
+            "semantic_convention_version": persisted.dataset.semantic_convention_version,
+            "traces_sha256": persisted.dataset.traces_sha256,
+            "issues_sha256": persisted.dataset.issues_sha256,
+        },
+    )
     loaded = load_trace_dataset(store, persisted.dataset.dataset_id)
 
+    assert persisted.dataset.dataset_id != historical_id
     verify_current_trace_dataset(store, loaded)
-
-    assert read_trace_model_identity_evidence(store, loaded) is None
-    assert MODEL_IDENTITY_EVIDENCE_PATH not in {item.path for item in persisted.manifest.files}
+    assert read_trace_model_identity_evidence(store, loaded).records
 
 
 def test_persist_rejects_incomplete_or_extra_supplied_model_identity(tmp_path: Path) -> None:
@@ -418,40 +424,6 @@ def test_persist_trace_dataset_rejects_changed_evidence_under_explicit_id(
             code_revision="test-revision",
             dataset_id="trace-dataset-explicit",
         )
-
-
-def test_load_trace_dataset_accepts_pre_revision_identity(tmp_path: Path) -> None:
-    """The loader keeps accepting artifacts whose historical ID omitted producer revision."""
-    result = TraceNormalizationResult(traces=(_trace(1),), issues=())
-    probe = persist_trace_dataset(
-        result,
-        _store(tmp_path / "probe", "project-a"),
-        created_at=datetime(2026, 8, 11, tzinfo=UTC),
-        code_revision="test-revision",
-    )
-    assert probe.dataset.source is not None
-    legacy_id = stable_id(
-        "trace-dataset",
-        {
-            "source": probe.dataset.source.model_dump(mode="json"),
-            "semantic_convention_version": probe.dataset.semantic_convention_version,
-            "traces_sha256": probe.dataset.traces_sha256,
-            "issues_sha256": probe.dataset.issues_sha256,
-        },
-    )
-    legacy_store = _store(tmp_path / "legacy", "project-a")
-    legacy = persist_trace_dataset(
-        result,
-        legacy_store,
-        created_at=datetime(2026, 8, 11, tzinfo=UTC),
-        code_revision="test-revision",
-        dataset_id=legacy_id,
-    )
-
-    loaded = load_trace_dataset(legacy_store, legacy_id)
-
-    assert loaded.dataset == legacy.dataset
-    assert loaded.traces == legacy.traces
 
 
 def test_persist_trace_dataset_rejects_mixed_raw_source_provenance(tmp_path: Path) -> None:

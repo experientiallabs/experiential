@@ -93,6 +93,9 @@ def _plan_and_setup() -> tuple[EvaluationPlan, EvaluationCell, RouterEvaluationS
             grounded_world_model_input=ArtifactInput(artifact_id="world-model-a", sha256=_DIGEST),
             prompt_version="text-world-model-v1",
         ),
+        simulation_completion_input=ArtifactInput(
+            artifact_id="completion-contract-a", sha256=_DIGEST
+        ),
         agent_id="agent-a",
         seed=7,
         maximum_steps=2,

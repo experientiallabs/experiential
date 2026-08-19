@@ -61,6 +61,7 @@ from wmo.simulation.engines.text.simulator_test import (
     _FitRetriever,
     _grounded_world_model,
     _grounded_world_model_input,
+    _persist_completion_contract,
     _response,
     _ScriptedClient,
     _snapshot,
@@ -145,6 +146,7 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
     )
     text_plan, text_plan_input = _persist_plan(store, tasks, task_input, "text", revision)
     sandbox_plan, sandbox_plan_input = _persist_plan(store, tasks, task_input, "sandbox", revision)
+    completion_input = _persist_completion_contract(store)
     text_spec = _spec(
         text_plan,
         text_plan_input,
@@ -153,6 +155,7 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
         revision,
         fit_rag_input=fit_rag_input,
         grounded_world_model_input=grounded_world_model_input,
+        completion_contract_input=completion_input,
     )
     sandbox_spec = _spec(
         sandbox_plan,
@@ -207,6 +210,7 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
             )
         },
         agent_factory=_TextComparisonAgent,
+        completion_contract_input=completion_input,
         clock=lambda: _EVIDENCE_AT,
         monotonic=lambda: 1.0,
     )
@@ -469,6 +473,7 @@ def _spec(
     *,
     fit_rag_input: ArtifactInput | None = None,
     grounded_world_model_input: ArtifactInput | None = None,
+    completion_contract_input: ArtifactInput | None = None,
 ) -> SimulationSpec:
     """Return one executable specification without pre-persisting outputs.
 
@@ -480,19 +485,23 @@ def _spec(
         revision: Exact source revision bound to created artifacts.
         fit_rag_input: Exact persisted fit-only RAG pointer for world-model mode.
         grounded_world_model_input: Exact persisted grounded runtime pointer.
+        completion_contract_input: Exact completion reservation for world-model mode.
 
     Returns:
         Finite specification bound to the selected plan and task set.
     """
     rag_input = fit_rag_input or _fit_rag_input()
     grounded_input = grounded_world_model_input or _grounded_world_model_input()
+    extras = (rag_input, grounded_input)
+    if mode is SimulationMode.WORLD_MODEL and completion_contract_input is not None:
+        extras = (*extras, completion_contract_input)
     return SimulationSpec(
         schema_version=1,
         created_at=_EVIDENCE_AT,
         inputs=_inputs(
             plan_input,
             task_input,
-            *((rag_input, grounded_input) if mode is SimulationMode.WORLD_MODEL else ()),
+            *(extras if mode is SimulationMode.WORLD_MODEL else ()),
         ),
         code_revision=revision,
         simulation_id=f"w16-{mode.value}-simulation",

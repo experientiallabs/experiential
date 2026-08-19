@@ -90,17 +90,12 @@ def _unknown_dispatch_charge(rollout: RolloutArtifact) -> float:
         rollout: Failed evidence whose dispatched spend is permanently ambiguous.
 
     Returns:
-        The reservation persisted with the failure, or the durable sandbox episode ceiling
-        for environment dispatches that predate per-failure reservation persistence.
+        The reservation persisted with the failure.
 
     Raises:
         RouterCompositionError: No durable worst-case reservation was persisted.
     """
     reserved = unknown_dispatch_reserved_cost_usd(rollout.failure)
-    if reserved is None and rollout.evidence_source == "sandbox":
-        binding = rollout.sandbox_binding
-        if binding is not None:
-            reserved = binding.environment_maximum_episode_cost_usd
     if reserved is None:
         raise RouterCompositionError(
             "simulation rollout has unknown dispatched spend and no persisted reservation"

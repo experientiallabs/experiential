@@ -71,7 +71,7 @@ def _catalog(*, supports_completions: bool) -> RuntimeModelCatalog:
 def _bindings(
     catalog: RuntimeModelCatalog,
 ) -> tuple[tuple[RuntimeCandidateCapability, ...], tuple[RoutedCandidateSnapshot, ...]]:
-    """Build matching runtime and legacy policy candidate bindings."""
+    """Build matching runtime and frozen policy candidate bindings."""
     runtime = []
     policy = []
     for alias in ("candidate-a", "candidate-b"):

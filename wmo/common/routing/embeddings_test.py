@@ -239,29 +239,28 @@ def test_router_embedding_rejects_symlinked_coordination_ancestor_before_dispatc
     assert tuple(sorted(path.name for path in external.iterdir())) == before
 
 
-def test_legacy_frozen_embedding_payload_reserializes_without_v2_fields() -> None:
-    """Loading a v1 embedding set preserves its exact serialized field set."""
-    payload = {
-        "schema_version": 1,
-        "created_at": "2026-08-12T00:00:00Z",
-        "inputs": [],
-        "code_revision": "legacy",
-        "source": None,
-        "embedding_set_id": "legacy-embeddings",
-        "embedder_alias": "embedder",
-        "embedder": {
-            "provider": "fixture",
-            "model_id": "embedder",
-            "revision": None,
-            "capabilities_sha256": _DIGEST,
-            "connection_sha256": _DIGEST,
-        },
-        "embeddings": [{"text_sha256": _DIGEST, "values": [1.0, 0.0]}],
-    }
+def test_router_embedding_loader_rejects_schema_version_one(tmp_path: Path) -> None:
+    """Persisted router embeddings must use the reserved schema, not the prior envelope."""
+    project, _task, model = _project_task_model(tmp_path)
+    payload = FrozenEmbeddingSet(
+        schema_version=1,
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+        inputs=(_artifact_input(),),
+        code_revision="test",
+        embedding_set_id="schema-v1-embeddings",
+        embedder_alias="embedder",
+        embedder=model,
+        embeddings=(FrozenEmbedding(text_sha256=_DIGEST, values=(1.0, 0.0)),),
+    )
+    project.artifacts.write_json(
+        artifact_id=payload.embedding_set_id,
+        artifact_type="router-embeddings",
+        envelope=payload,
+        files={"embeddings.json": payload},
+    )
 
-    restored = FrozenEmbeddingSet.model_validate(payload)
-
-    assert restored.model_dump(mode="json") == payload
+    with pytest.raises(ValueError, match="schema version is unsupported"):
+        load_frozen_embedding_set(project.artifacts, payload.embedding_set_id)
 
 
 def test_router_embedding_under_reservation_fails_before_dispatch(tmp_path: Path) -> None:
@@ -446,8 +445,15 @@ def test_router_embedding_loader_rejects_manifest_envelope_drift(tmp_path: Path)
         tmp_path: Temporary initialized project root.
     """
     project, _task, model = _project_task_model(tmp_path)
-    payload = FrozenEmbeddingSet(
-        schema_version=1,
+    reservation = router_embedding_reservation(
+        model=model,
+        input_usd_per_million_tokens=2,
+        maximum_attempts_per_feature=2,
+        maximum_input_tokens_per_feature=10_000,
+        feature_count=1,
+    )
+    payload = ReservedFrozenEmbeddingSet(
+        schema_version=2,
         created_at=datetime(2026, 8, 12, tzinfo=UTC),
         inputs=(_artifact_input(),),
         code_revision="payload",
@@ -455,6 +461,8 @@ def test_router_embedding_loader_rejects_manifest_envelope_drift(tmp_path: Path)
         embedder_alias="embedder",
         embedder=model,
         embeddings=(FrozenEmbedding(text_sha256=_DIGEST, values=(1.0, 0.0)),),
+        embedding_dimension=2,
+        reservation=reservation,
     )
     envelope = payload.model_copy(update={"code_revision": "manifest"})
     project.artifacts.write_json(

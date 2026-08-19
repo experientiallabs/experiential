@@ -62,16 +62,14 @@ def build_router_simulation_spec(
         "stop_on_overspend": stop_on_overspend,
         "code_revision": code_revision,
     }
-    if setup.simulation_completion_input is not None:
-        binding["simulation_completion"] = setup.simulation_completion_input.model_dump(mode="json")
+    binding["simulation_completion"] = setup.simulation_completion_input.model_dump(mode="json")
     spec_inputs = [
         plan_input,
         task_input,
         setup.fit_rag_input,
         setup.world_model_settings.grounded_world_model_input,
+        setup.simulation_completion_input,
     ]
-    if setup.simulation_completion_input is not None:
-        spec_inputs.append(setup.simulation_completion_input)
     return SimulationSpec(
         schema_version=1,
         created_at=created_at,
