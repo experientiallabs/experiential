@@ -1,0 +1,207 @@
+"""Dated, secret-free certification matrix for later gateway provider adapters."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from enum import StrEnum
+
+from pydantic import Field, model_validator
+
+from wmo.common.core.artifacts import ContractModel, Sha256, sha256_json
+
+
+class ProviderCapability(StrEnum):
+    """Provider adapter behaviors tracked by the launch certification matrix."""
+
+    TEXT_STREAM = "text_stream"
+    TOOL_ARGUMENT_STREAM = "tool_argument_stream"
+    USAGE = "usage"
+    CANCELLATION = "cancellation"
+    REFUSAL = "refusal"
+    CREDENTIAL_GATED_LIVE = "credential_gated_live"
+
+
+class ProviderCertificationResult(StrEnum):
+    """Evidence level for one provider and capability cell."""
+
+    PROVIDER_FIXTURE_PASS = "provider_fixture_pass"
+    INHERITED_COMPATIBLE_FIXTURE_PASS = "inherited_compatible_fixture_pass"
+    NOT_RUN_REQUIRES_CREDENTIALS = "not_run_requires_credentials"
+    UNSUPPORTED = "unsupported"
+
+
+class ProviderCertificationCell(ContractModel):
+    """One dated provider-capability result with reviewable local evidence."""
+
+    provider: str = Field(min_length=1, max_length=64)
+    capability: ProviderCapability
+    result: ProviderCertificationResult
+    evaluated_at: datetime
+    evidence: tuple[str, ...] = Field(min_length=1)
+    limitation: str | None = Field(default=None, min_length=1, max_length=512)
+
+
+class ProviderCertificationMatrix(ContractModel):
+    """Complete later-provider matrix that cannot omit an unsupported capability."""
+
+    schema_version: int = Field(default=1, frozen=True)
+    cells: tuple[ProviderCertificationCell, ...]
+
+    @model_validator(mode="after")
+    def _require_complete_unique_matrix(self) -> ProviderCertificationMatrix:
+        """Require exactly one result for every tracked provider-capability pair.
+
+        Returns:
+            The validated complete matrix.
+
+        Raises:
+            ValueError: A provider-capability pair repeats or is absent.
+        """
+        providers = {"azure", "bedrock", "gemini", "openrouter"}
+        expected = {
+            (provider, capability) for provider in providers for capability in ProviderCapability
+        }
+        actual = {(cell.provider, cell.capability) for cell in self.cells}
+        if len(actual) != len(self.cells):
+            raise ValueError("provider certification cells must not repeat")
+        if actual != expected:
+            raise ValueError("provider certification matrix must label every tracked cell")
+        return self
+
+    def identity_sha256(self) -> Sha256:
+        """Return the deterministic digest of the dated certification artifact."""
+        return sha256_json(self)
+
+
+_EVALUATED_AT = datetime(2026, 8, 18, tzinfo=UTC)
+_GEMINI_EVIDENCE = ("wmo/runtime/models/providers/gemini_streaming_test.py",)
+_BEDROCK_EVIDENCE = ("wmo/runtime/models/providers/bedrock_streaming_test.py",)
+_COMPATIBLE_EVIDENCE = (
+    "wmo/runtime/models/providers/later_provider_streaming_test.py",
+    "wmo/runtime/models/providers/streaming_test.py",
+)
+
+
+def _cell(
+    provider: str,
+    capability: ProviderCapability,
+    result: ProviderCertificationResult,
+    evidence: tuple[str, ...],
+    *,
+    limitation: str | None = None,
+) -> ProviderCertificationCell:
+    """Build one consistently dated secret-free matrix cell.
+
+    Args:
+        provider: Stable gateway provider identifier.
+        capability: Adapter behavior represented by this cell.
+        result: Honest evidence level reached by the current tree.
+        evidence: Repository paths containing deterministic verification.
+        limitation: Optional explicit boundary on the claimed behavior.
+
+    Returns:
+        Typed certification cell.
+    """
+    return ProviderCertificationCell(
+        provider=provider,
+        capability=capability,
+        result=result,
+        evaluated_at=_EVALUATED_AT,
+        evidence=evidence,
+        limitation=limitation,
+    )
+
+
+def _native_provider_cells(
+    provider: str,
+    evidence: tuple[str, ...],
+) -> tuple[ProviderCertificationCell, ...]:
+    """Return native provider fixture results plus the unrun live cell.
+
+    Args:
+        provider: Gemini or Bedrock provider identifier.
+        evidence: Provider-specific deterministic fixture path.
+
+    Returns:
+        Complete capability cells for the native adapter.
+    """
+    cells: list[ProviderCertificationCell] = []
+    for capability in ProviderCapability:
+        if capability is ProviderCapability.CREDENTIAL_GATED_LIVE:
+            cells.append(
+                _cell(
+                    provider,
+                    capability,
+                    ProviderCertificationResult.NOT_RUN_REQUIRES_CREDENTIALS,
+                    evidence,
+                    limitation="No provider credential was available in the deterministic lane.",
+                )
+            )
+            continue
+        if provider == "gemini" and capability is ProviderCapability.TOOL_ARGUMENT_STREAM:
+            cells.append(
+                _cell(
+                    provider,
+                    capability,
+                    ProviderCertificationResult.UNSUPPORTED,
+                    evidence,
+                    limitation=(
+                        "Gemini supplies a structured complete function argument object, not "
+                        "provider-byte incremental argument fragments."
+                    ),
+                )
+            )
+            continue
+        cells.append(
+            _cell(
+                provider,
+                capability,
+                ProviderCertificationResult.PROVIDER_FIXTURE_PASS,
+                evidence,
+            )
+        )
+    return tuple(cells)
+
+
+def _compatible_provider_cells(provider: str) -> tuple[ProviderCertificationCell, ...]:
+    """Return inherited compatible-stream results without claiming a live run.
+
+    Args:
+        provider: Azure or OpenRouter provider identifier.
+
+    Returns:
+        Complete capability cells for the compatible adapter.
+    """
+    cells: list[ProviderCertificationCell] = []
+    for capability in ProviderCapability:
+        if capability is ProviderCapability.CREDENTIAL_GATED_LIVE:
+            result = ProviderCertificationResult.NOT_RUN_REQUIRES_CREDENTIALS
+            limitation = "No provider credential was available in the deterministic lane."
+        else:
+            result = ProviderCertificationResult.INHERITED_COMPATIBLE_FIXTURE_PASS
+            limitation = "Behavior is inherited from the generic compatible adapter fixtures."
+        cells.append(
+            _cell(
+                provider,
+                capability,
+                result,
+                _COMPATIBLE_EVIDENCE,
+                limitation=limitation,
+            )
+        )
+    return tuple(cells)
+
+
+PROVIDER_CERTIFICATION_MATRIX = ProviderCertificationMatrix(
+    cells=tuple(
+        sorted(
+            (
+                *_native_provider_cells("gemini", _GEMINI_EVIDENCE),
+                *_native_provider_cells("bedrock", _BEDROCK_EVIDENCE),
+                *_compatible_provider_cells("azure"),
+                *_compatible_provider_cells("openrouter"),
+            ),
+            key=lambda cell: (cell.provider, cell.capability.value),
+        )
+    )
+)
