@@ -3,21 +3,17 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
-from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import JsonValue
 
-from wmo.common.core.artifacts import JsonObject, SourceIdentity
+from wmo.common.core.artifacts import SourceIdentity
 from wmo.common.models import ConnectionConfig
 from wmo.common.traces import Trace
 from wmo.simulation.ingest.otlp import normalize_otlp_payload
 from wmo.simulation.ingest.posthog import (
-    PostHogPullRequest,
     load_posthog_file,
     normalize_posthog_payload,
-    pull_posthog_traces,
 )
 from wmo.simulation.mining.descriptors import routing_descriptor
 
@@ -537,150 +533,3 @@ def test_posthog_retains_trace_facts_declared_on_non_span_events() -> None:
     assert trace.outcome is not None
     assert trace.outcome.status == "success"
     assert trace.outcome.outcome_name == "reservation_cancelled"
-
-
-class _FakeResponse:
-    """Deterministic successful HTTP response for the authorized pull seam."""
-
-    def __init__(self, events: tuple[dict[str, JsonValue], ...] | None = None) -> None:
-        self._events = events
-
-    def raise_for_status(self) -> None:
-        """Model a successful PostHog query response."""
-
-    def json(self) -> JsonValue:
-        """Return matched HogQL AI-event rows in the official result-array shape."""
-        events = self._events or tuple(_posthog_events())
-        return {
-            "results": [
-                [
-                    event["event"],
-                    event["properties"],
-                    event["timestamp"],
-                    event.get("uuid", f"event-{index:04d}"),
-                ]
-                for index, event in enumerate(events)
-            ],
-            "columns": ["event", "properties", "timestamp", "uuid"],
-        }
-
-
-class _FakeClient:
-    """Captures the request without making a network call."""
-
-    def __init__(self, response: _FakeResponse | None = None) -> None:
-        self.url = ""
-        self.headers: Mapping[str, str] = {}
-        self.body: JsonObject = {}
-        self.timeout = 0.0
-        self._response = response or _FakeResponse()
-
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        json: JsonObject,
-        timeout: float,
-    ) -> _FakeResponse:
-        """Capture the bounded HogQL request and return deterministic source rows."""
-        self.url = url
-        self.headers = headers
-        self.body = json
-        self.timeout = timeout
-        return self._response
-
-
-def test_authorized_hogql_pull_uses_injected_client_and_source_converter() -> None:
-    client = _FakeClient()
-
-    result = pull_posthog_traces(
-        PostHogPullRequest(
-            project_id="42",
-            api_key="fixture-key",
-            host="https://eu.posthog.com",
-            since=datetime(2025, 10, 9, tzinfo=UTC),
-        ),
-        client=client,
-    )
-
-    assert result.issues == ()
-    assert len(result.traces) == 1
-    assert client.url == "https://eu.posthog.com/api/projects/42/query/"
-    assert dict(client.headers) == {"Authorization": "Bearer fixture-key"}
-    assert client.timeout == 60.0
-    query = client.body["query"]
-    assert isinstance(query, dict)
-    query_text = query["query"]
-    assert isinstance(query_text, str)
-    assert "select event, properties, timestamp, uuid" in query_text
-    assert "event like '$ai_%'" in query_text
-    assert "order by timestamp asc, uuid asc" in query_text
-
-
-def test_authorized_hogql_pull_keeps_uuid_timestamp_ties_fifo_deterministic() -> None:
-    events = _posthog_events()
-    generation_properties = _event_properties(events[0])
-    generation_properties["$ai_output_choices"] = [
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "function": {
-                        "name": "cancel_reservation",
-                        "arguments": {"reservation_id": "R-17"},
-                    }
-                },
-                {
-                    "function": {
-                        "name": "cancel_reservation",
-                        "arguments": {"reservation_id": "R-18"},
-                    }
-                },
-            ],
-        }
-    ]
-    first_result_properties = _event_properties(events[1])
-    first_result_properties.pop("$ai_tool_call_id")
-    events.insert(
-        2,
-        {
-            "event": "$ai_span",
-            "timestamp": "2025-10-09T08:53:20Z",
-            "properties": {
-                "$ai_trace_id": _TRACE_ID,
-                "$ai_span_id": "tool-2",
-                "$ai_parent_id": "generation-1",
-                "$ai_span_name": "cancel_reservation",
-                "$ai_input_state": {"reservation_id": "R-18"},
-                "$ai_output_state": "Reservation cancelled",
-            },
-        },
-    )
-    for index, event in enumerate(events, start=1):
-        event["timestamp"] = "2025-10-09T08:53:20Z"
-        event["uuid"] = f"event-{index:04d}"
-    response = _FakeResponse(tuple(reversed(events)))
-    request = PostHogPullRequest(
-        project_id="42",
-        api_key="fixture-key",
-        host="https://eu.posthog.com",
-    )
-
-    first = pull_posthog_traces(request, client=_FakeClient(response))
-    second = pull_posthog_traces(request, client=_FakeClient(response))
-
-    assert first == second
-    trace = first.traces[0]
-    assert [span.name for span in trace.spans] == [
-        "agent.model_call",
-        "agent.model_call",
-        "agent.tool_call",
-        "agent.tool_call",
-        "agent.trace",
-    ]
-    tool_spans = [span for span in trace.spans if span.name == "agent.tool_call"]
-    assert [span.attributes["gen_ai.tool.call.id"] for span in tool_spans] == [
-        "posthog-call-generation-1-0",
-        "posthog-call-generation-1-1",
-    ]

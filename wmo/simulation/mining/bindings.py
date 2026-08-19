@@ -250,8 +250,7 @@ def load_task_set_lineage_bindings(
     paths = {entry.path for entry in stored.manifest.files}
     if LINEAGE_BINDINGS_PATH not in paths:
         raise ArtifactCorruptionError(
-            f"task set {task_set_id} has no complete lineage bindings; rebuild the project "
-            "before refreshing runtime retrieval evidence"
+            f"task set {task_set_id} has no complete lineage bindings; rebuild the project"
         )
     loaded_tasks = load_task_set(store, task_set_id)
     _require_task_set_manifest_matches_envelope(stored.manifest, loaded_tasks.task_set)

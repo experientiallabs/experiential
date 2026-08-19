@@ -277,7 +277,7 @@ def verify_current_trace_dataset(
     if dataset.dataset_id != expected_id:
         raise ArtifactCorruptionError(
             f"trace dataset {dataset.dataset_id} is not a current content-addressed build dataset; "
-            "rebuild the project before refreshing runtime retrieval evidence"
+            "rebuild the project"
         )
 
 

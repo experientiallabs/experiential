@@ -22,30 +22,6 @@ from wmo.simulation.retrieval.contracts import (
 _TOOL_OPERATION = "execute_tool"
 
 
-def extract_fit_transitions(
-    traces: Sequence[Trace],
-    lineage_bindings: Sequence[RAGLineageBinding],
-) -> tuple[RAGTransition, ...]:
-    """Extract only fit-side real action-to-following-observation transitions.
-
-    Args:
-        traces: Verified canonical traces from immutable real-source datasets.
-        lineage_bindings: Frozen leakage-safe assignment for every supplied trace.
-
-    Returns:
-        Deterministically ordered fit transitions. Terminal assistant messages without a real
-        subsequent user or environment observation are intentionally absent.
-
-    Raises:
-        ValueError: Trace identities and lineage bindings differ or repeat.
-    """
-    return extract_real_transitions(
-        traces,
-        lineage_bindings,
-        included_partitions=frozenset({"fit"}),
-    )
-
-
 def extract_real_transitions(
     traces: Sequence[Trace],
     lineage_bindings: Sequence[RAGLineageBinding],

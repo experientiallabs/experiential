@@ -170,7 +170,7 @@ def _verify_sources(
         stored = store.read(source.artifact_input.artifact_id)
         if artifact_input(stored.manifest) != source.artifact_input:
             raise ArtifactCorruptionError("RAG source manifest digest no longer matches")
-        if stored.manifest.artifact_type != "trace-dataset" or source.kind != "trace_dataset":
+        if stored.manifest.artifact_type != "trace-dataset":
             raise ArtifactCorruptionError("RAG source is not a supported real trace dataset")
         loaded = load_trace_dataset(store, source.artifact_input.artifact_id)
         if (

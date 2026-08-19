@@ -35,7 +35,7 @@ class RealTraceSourceIdentity(SourceIdentity):
 class RAGSourceRef(ContractModel):
     """Exact verified real-trace artifact consumed by one RAG index."""
 
-    kind: Literal["trace_dataset", "runtime_trace_snapshot"]
+    kind: Literal["trace_dataset"]
     artifact_input: ArtifactInput
     source: RealTraceSourceIdentity
     records_sha256: Sha256

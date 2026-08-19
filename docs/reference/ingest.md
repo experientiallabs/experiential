@@ -57,15 +57,3 @@ replay verifies and reuses completed indexes with no provider call. Anonymous ag
 product telemetry may send after successful persistence unless the user runs
 `wmo config telemetry disable`. Telemetry does not include prompts, traces, paths, model names, or
 customer content.
-
-## Authorized PostHog HogQL pull
-
-The CLI deliberately reads only local exports. An authorized Python caller may instead import
-`PostHogPullRequest` and `pull_posthog_traces` from `wmo.simulation.ingest`. The request defaults to
-a bounded 1,000-row query and may set another positive limit through 10,000. The caller may inject a
-deterministic HTTP client; otherwise the function owns one bounded `httpx.Client`. The HTTPS host
-and credential are explicit request values or resolved from the focused PostHog environment
-settings. The query orders by `timestamp, uuid`, applies the same canonical converter as local
-export ingestion, and returns normalized traces plus retained issues. This does not weaken the
-`wmo build` local-file boundary and requires separate authorization for the customer PostHog
-project.

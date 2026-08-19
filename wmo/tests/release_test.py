@@ -3177,10 +3177,6 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     assert "inert contracts" not in architecture
     assert "does not claim that a gateway server" not in architecture
 
-    ingest = (docs / "reference" / "ingest.md").read_text(encoding="utf-8")
-    assert "PostHogPullRequest" in ingest
-    assert "pull_posthog_traces" in ingest
-
 
 if __name__ == "__main__" and os.environ.get("WMO_INSTALLED_RELEASE_EVIDENCE") == "1":
     _installed_release_driver()

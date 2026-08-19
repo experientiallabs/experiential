@@ -21,10 +21,8 @@ from wmo.simulation.ingest.otlp import (
 from wmo.simulation.ingest.phoenix import PHOENIX_SOURCE
 from wmo.simulation.ingest.posthog import (
     PostHogPullError,
-    PostHogPullRequest,
     load_posthog_file,
     normalize_posthog_payload,
-    pull_posthog_traces,
 )
 from wmo.simulation.ingest.sources import (
     CANONICAL_TRACE_SOURCES,
@@ -46,7 +44,6 @@ __all__ = [
     "PHOENIX_SOURCE",
     "PersistedTraceDataset",
     "PostHogPullError",
-    "PostHogPullRequest",
     "TraceNormalizationIssue",
     "TraceNormalizationResult",
     "TraceSourceError",
@@ -60,5 +57,4 @@ __all__ = [
     "normalize_otlp_payload",
     "normalize_posthog_payload",
     "persist_trace_dataset",
-    "pull_posthog_traces",
 ]

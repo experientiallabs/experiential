@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -9,18 +10,28 @@ import pytest
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
+    ArtifactInput,
     FailureAttribution,
     FailureCode,
     SourceIdentity,
     StructuredFailure,
+    stable_id,
 )
 from wmo.common.models import (
     AssistantAction,
+    BillingSource,
     ModelFinishReason,
     ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+    NumericMeasurement,
+    OperationEconomics,
     ToolCall,
+    Usage,
 )
 from wmo.common.project import ProjectConfig, ProjectStore
+from wmo.common.routing import RouterFeatureExtractor, RoutingDecision
 from wmo.optimize.model.sft import (
     AssistantActionEvent,
     RuntimeInteractionExampleSource,
@@ -33,11 +44,215 @@ from wmo.optimize.model.sft import (
     load_verified_sft_dataset,
     write_sft_dataset,
 )
-from wmo.runtime.router import RuntimeInteractionJournal
+from wmo.runtime.router import RuntimeAcceptedEvent, RuntimeInteractionJournal
+from wmo.runtime.router.economics import (
+    BillingSourceEconomics,
+    RoutedProviderComponent,
+    RoutedProviderOperation,
+    RoutedSpendDisposition,
+)
+from wmo.runtime.router.journal import RuntimeAcceptance, _interaction_identity
 from wmo.runtime.router.snapshot import seal_runtime_trace_snapshot
-from wmo.simulation.retrieval.refresh_test import _accept, _complete, _request
 
+_DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 14, tzinfo=UTC)
+
+
+def _model() -> ModelSnapshot:
+    """Build the fixed routed-model snapshot used by journal fixtures."""
+    return ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        provider="openai",
+        model_id="gpt-test",
+        capabilities_sha256=_DIGEST,
+        connection_sha256="b" * 64,
+    )
+
+
+def _request(*messages: ModelMessage) -> ModelRequest:
+    """Build one deterministic routed request from exact visible messages.
+
+    Args:
+        messages: Complete visible conversation passed to the routed model.
+
+    Returns:
+        Immutable provider-neutral request.
+    """
+    return ModelRequest(messages=messages)
+
+
+def _operation(
+    ordinal: int,
+    component: RoutedProviderComponent,
+) -> RoutedProviderOperation:
+    """Build deterministic customer-managed operation evidence."""
+    return RoutedProviderOperation(
+        operation_id=f"routed-operation-{ordinal:020x}",
+        operation_ordinal=ordinal,
+        component=component,
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        disposition=RoutedSpendDisposition.LOCALLY_PRICED,
+        operation_count=1,
+        economics=OperationEconomics(
+            usage=Usage(input_tokens=ordinal, output_tokens=0),
+            cost_usd=NumericMeasurement(value=ordinal / 1_000_000, provenance="estimated"),
+        ),
+    )
+
+
+def _decision(lineage_id: str, request: ModelRequest) -> RoutingDecision:
+    """Build a content-addressed routing decision for one accepted request.
+
+    Args:
+        lineage_id: Hashed conversation lineage bound by the journal.
+        request: Exact request whose routing feature is selected.
+
+    Returns:
+        Deterministic single-candidate routing decision.
+    """
+    feature = RouterFeatureExtractor().from_request(request)
+    material = {
+        "policy_id": "router-policy-a",
+        "policy_sha256": _DIGEST,
+        "request_sha256": hashlib.sha256(
+            feature.encode("utf-8"), usedforsecurity=False
+        ).hexdigest(),
+        "episode_id_sha256": hashlib.sha256(
+            lineage_id.encode("utf-8"), usedforsecurity=False
+        ).hexdigest(),
+        "selected_alias": "candidate-a",
+        "baseline_alias": "candidate-a",
+        "neighbor_count": 2,
+        "paired_count": 2,
+        "best_similarity": 1.0,
+        "estimated_quality_difference": None,
+        "uncertainty": None,
+        "fallback_reason": None,
+    }
+    return RoutingDecision(
+        decision_id=stable_id("routing-decision", material),
+        **material,
+    )
+
+
+def _accept(
+    journal: RuntimeInteractionJournal,
+    *,
+    key: str,
+    conversation: str,
+    request: ModelRequest,
+    now: datetime,
+) -> RuntimeAcceptedEvent:
+    """Accept one exact interaction into the durable journal.
+
+    Args:
+        journal: Project journal receiving the acceptance.
+        key: Stable idempotency key for the logical interaction.
+        conversation: Caller conversation identity hashed by the journal.
+        request: Complete visible request.
+        now: Acceptance timestamp.
+
+    Returns:
+        Durable accepted event ready for a terminal result.
+    """
+    identity = _interaction_identity(journal.project_id, key, request, conversation)
+    decision = _decision(identity.lineage_id, request)
+    embedding = BillingSourceEconomics(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        economics=_operation(1, RoutedProviderComponent.ROUTER_EMBEDDING).economics,
+    )
+    reserved = journal.reserve_selection(
+        identity,
+        embedding,
+        now=now,
+        stale_after=timedelta(minutes=5),
+    )
+    assert reserved.reservation is not None
+    claim = journal.record_acceptance(
+        identity,
+        RuntimeAcceptance(
+            decision=decision,
+            selected_alias=decision.selected_alias,
+            selected_model=_model(),
+            router_embedding_billing_source=BillingSource.CUSTOMER_MANAGED,
+            policy_input=ArtifactInput(
+                artifact_id=decision.policy_id,
+                sha256=decision.policy_sha256,
+            ),
+        ),
+        reserved.reservation,
+        _operation(1, RoutedProviderComponent.ROUTER_EMBEDDING),
+        accepted_at=now,
+    )
+    assert claim.accepted is not None
+    return claim.accepted
+
+
+def _reserve_candidate(
+    journal: RuntimeInteractionJournal,
+    accepted: RuntimeAcceptedEvent,
+    *,
+    now: datetime,
+) -> None:
+    """Persist one deterministic candidate reservation before low-level dispatch."""
+    claim = journal.reserve_candidate(
+        accepted,
+        BillingSourceEconomics(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            economics=_operation(2, RoutedProviderComponent.SELECTED_CANDIDATE).economics,
+        ),
+        now=now,
+    )
+    assert claim.status == "dispatch"
+
+
+def _complete(
+    journal: RuntimeInteractionJournal,
+    *,
+    key: str,
+    conversation: str,
+    request: ModelRequest,
+    output: str | AssistantAction,
+    now: datetime,
+    finish_reason: ModelFinishReason = ModelFinishReason.COMPLETED,
+) -> RuntimeAcceptedEvent:
+    """Accept and complete one deterministic routed interaction.
+
+    Args:
+        journal: Project journal receiving both events.
+        key: Stable idempotency key.
+        conversation: Caller conversation identity.
+        request: Complete visible request.
+        output: Assistant response text or complete assistant action.
+        now: Acceptance timestamp.
+        finish_reason: Provider-reported terminal reason preserved in provenance.
+
+    Returns:
+        Accepted event named by the completion.
+    """
+    accepted = _accept(
+        journal,
+        key=key,
+        conversation=conversation,
+        request=request,
+        now=now,
+    )
+    action = output if isinstance(output, AssistantAction) else AssistantAction(content=output)
+    _reserve_candidate(journal, accepted, now=now)
+    journal.record_completed(
+        accepted,
+        ModelResponse(
+            output=action,
+            model=_model(),
+            economics=OperationEconomics(
+                usage=Usage(input_tokens=8, output_tokens=3, cached_input_tokens=0)
+            ),
+            finish_reason=finish_reason,
+        ),
+        candidate_operation=_operation(2, RoutedProviderComponent.SELECTED_CANDIDATE),
+        completed_at=now + timedelta(seconds=1),
+    )
+    return accepted
 
 
 def _store(tmp_path: Path) -> ProjectStore:
