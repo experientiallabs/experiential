@@ -762,7 +762,11 @@ def _exception_response(exception: BaseException) -> Response:
         error = OpenAIProtocolError(
             status_code=409,
             code="idempotency_replay_unavailable",
-            message="The completed keyed result is unavailable after restart.",
+            message=(
+                "The keyed operation cannot be replayed from retained response state. "
+                "Reconcile its outcome before starting a new operation with a new "
+                "Idempotency-Key."
+            ),
             error_type="api_error",
             param="Idempotency-Key",
         )

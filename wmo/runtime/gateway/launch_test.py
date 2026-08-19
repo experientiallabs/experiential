@@ -99,6 +99,62 @@ class _LoopbackProvider(BaseHTTPRequestHandler):
         del format, args
 
 
+class _EarlyDisconnectProvider(BaseHTTPRequestHandler):
+    """Hold a provider stream open after its first public semantic frame."""
+
+    calls = 0
+    first_frame_sent = threading.Event()
+    release = threading.Event()
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+        """Emit one delta, then wait while the gateway observes caller disconnect."""
+        length = int(self.headers.get("content-length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        assert payload["stream"] is True
+        type(self).calls += 1
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(
+            _provider_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "hello"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            )
+        )
+        self.wfile.flush()
+        type(self).first_frame_sent.set()
+        type(self).release.wait(timeout=5)
+        try:
+            self.wfile.write(
+                _provider_frame(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                )
+                + b"data: [DONE]\n\n"
+            )
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Suppress request logs so test output cannot retain payload context."""
+        del format, args
+
+
 def test_real_loopback_launch_serves_both_official_sdk_clients_and_revocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -171,6 +227,96 @@ def test_real_loopback_launch_serves_both_official_sdk_clients_and_revocation(
     )
     for forbidden in (prompt_canary, "hello world", raw_key, "provider-secret-canary"):
         assert forbidden.encode() not in durable
+
+
+def test_early_sdk_disconnect_reports_cause_neutral_replay_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-process disconnect never claims that replay failed after restart."""
+    _EarlyDisconnectProvider.calls = 0
+    _EarlyDisconnectProvider.first_frame_sent = threading.Event()
+    _EarlyDisconnectProvider.release = threading.Event()
+    provider_port = _unused_port()
+    gateway_port = _unused_port()
+    provider = ThreadingHTTPServer(("127.0.0.1", provider_port), _EarlyDisconnectProvider)
+    provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    provider_thread.start()
+    _manager, raw_key = _configure_gateway(
+        tmp_path,
+        base_url=f"http://127.0.0.1:{provider_port}/v1",
+    )
+    monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret-canary")
+    runtime = load_local_gateway(tmp_path, graceful_timeout_seconds=2)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            runtime.app,
+            host="127.0.0.1",
+            port=gateway_port,
+            log_level="error",
+        )
+    )
+    gateway_thread = threading.Thread(target=server.run, daemon=True)
+    gateway_thread.start()
+    _wait_ready(gateway_port, gateway_thread)
+    base_url = f"http://127.0.0.1:{gateway_port}/v1"
+    idempotency_key = "early-disconnect-operation"
+    payload = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "disconnect-canary"}],
+        "stream": True,
+    }
+    try:
+        with OpenAI(api_key=raw_key, base_url=base_url) as client:
+            stream = client.chat.completions.create(
+                model="coding",
+                messages=[{"role": "user", "content": "disconnect-canary"}],
+                stream=True,
+                extra_headers={"Idempotency-Key": idempotency_key},
+            )
+            for first in stream:
+                if first.choices and first.choices[0].delta.content is not None:
+                    break
+            else:
+                raise AssertionError("gateway stream produced no semantic content")
+            assert first.choices[0].delta.content == "hello"
+            assert _EarlyDisconnectProvider.first_frame_sent.wait(timeout=2)
+            stream.close()
+
+        terminal_state = _wait_for_request_terminal(
+            tmp_path / "gateway" / "gateway.db",
+            timeout_seconds=2,
+        )
+        assert terminal_state == "cancelled"
+        retry = httpx.post(
+            f"{base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {raw_key}",
+                "Idempotency-Key": idempotency_key,
+            },
+            json=payload,
+            timeout=2,
+        )
+
+        assert retry.status_code == 409
+        error = retry.json()["error"]
+        assert error["code"] == "idempotency_replay_unavailable"
+        assert error["message"] == (
+            "The keyed operation cannot be replayed from retained response state. "
+            "Reconcile its outcome before starting a new operation with a new "
+            "Idempotency-Key."
+        )
+        assert "restart" not in error["message"].lower()
+        assert _EarlyDisconnectProvider.calls == 1
+    finally:
+        _EarlyDisconnectProvider.release.set()
+        server.should_exit = True
+        gateway_thread.join(timeout=5)
+        provider.shutdown()
+        provider.server_close()
+        provider_thread.join(timeout=5)
+    assert not gateway_thread.is_alive()
+    assert not provider_thread.is_alive()
 
 
 def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
@@ -611,6 +757,20 @@ def _configure_gateway(root: Path, *, base_url: str) -> tuple[GatewayManagement,
     manager.add_grant(identity_id="default", alias_id="coding")
     issued = manager.issue_key(identity_id="default", key_id="key-one")
     return manager, issued.raw_key
+
+
+def _wait_for_request_terminal(database_path: Path, *, timeout_seconds: float) -> str | None:
+    """Return the first durable request terminal state within a finite wait."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        with sqlite3.connect(database_path) as connection:
+            row = connection.execute(
+                "SELECT terminal_state FROM gateway_requests ORDER BY accepted_at LIMIT 1"
+            ).fetchone()
+        if row is not None and row[0] is not None:
+            return str(row[0])
+        time.sleep(0.01)
+    return None
 
 
 def _provider_frame(payload: dict[str, object]) -> bytes:
