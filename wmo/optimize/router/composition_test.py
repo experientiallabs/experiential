@@ -56,10 +56,9 @@ from wmo.common.project import (
     ProjectStore,
     artifact_input,
 )
-from wmo.common.rollouts import SimulationArtifactSet, StopReason, unknown_spend_failure
+from wmo.common.rollouts import SimulationArtifactSet, StopReason
 from wmo.common.routing import KnnGuard
 from wmo.common.tasks import load_task_set
-from wmo.optimize.router import composition as composition_module
 from wmo.optimize.router.composition import (
     ApprovedRouterReview,
     RouterCompositionBudget,
@@ -74,7 +73,6 @@ from wmo.optimize.router.errors import (
     JudgeTranscriptAdmissionError,
 )
 from wmo.optimize.router.evaluation.spend import observed_rollout_spend
-from wmo.optimize.router.fit.workflow import RouterWorkflowError
 from wmo.optimize.router.fit.workflow_test import _persist_embeddings, _persist_pricing
 from wmo.optimize.router.judgment_budget import (
     JudgmentDispatchReceipt,
@@ -85,10 +83,7 @@ from wmo.runtime.models.providers.transport import ProviderTransportError
 from wmo.runtime.router.runtime_test import _Client, _request
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.engines.text import simulator as text_simulator_module
-from wmo.simulation.engines.text.resume import (
-    MAXIMUM_CELL_ATTEMPTS,
-    reexecutable_dispatch_failure,
-)
+from wmo.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
@@ -739,32 +734,42 @@ class _LoggingSimulator:
 
 
 class _TargetedTransportFailureClient(_ScriptedClient):
-    """Scripted second candidate whose dispatch for one exact task always fails in transport."""
+    """Scripted second candidate whose dispatch for one exact task fails in transport."""
 
-    def __init__(self, responses: list[ModelResponse], failing_instruction: str) -> None:
-        """Store scripted answers plus the instruction whose dispatch never succeeds.
+    def __init__(
+        self,
+        responses: list[ModelResponse],
+        failing_instruction: str,
+        *,
+        maximum_failures: int | None = None,
+    ) -> None:
+        """Store scripted answers plus the instruction whose dispatch fails in transport.
 
         Args:
             responses: Responses served in order for every other task.
-            failing_instruction: Exact task instruction whose dispatch always fails.
+            failing_instruction: Exact task instruction whose dispatch fails.
+            maximum_failures: Failures injected before the target recovers; None fails forever.
         """
         super().__init__(responses)
         self._failing_instruction = failing_instruction
+        self._maximum_failures = maximum_failures
         self.failures = 0
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Fail the targeted task at the transport level and answer every other task.
+        """Fail the targeted task at the transport level until its scripted recovery.
 
         Args:
             request: Candidate request emitted by the recording boundary.
 
         Returns:
-            The next scripted response for a non-targeted task.
+            The next scripted response for a non-targeted or recovered task.
 
         Raises:
-            ProviderTransportError: Every dispatch that carries the targeted instruction.
+            ProviderTransportError: A targeted dispatch before the scripted recovery.
         """
-        if request.messages[0].content == self._failing_instruction:
+        if request.messages[0].content == self._failing_instruction and (
+            self._maximum_failures is None or self.failures < self._maximum_failures
+        ):
             self.requests.append(request)
             self.failures += 1
             raise ProviderTransportError("connection reset by provider")
@@ -772,13 +777,14 @@ class _TargetedTransportFailureClient(_ScriptedClient):
 
 
 class _CapExhaustedSimulatorFactory(_SimulatorFactory):
-    """Simulator factory whose second candidate persistently fails one task's dispatch."""
+    """Simulator factory whose second candidate fails one task's dispatch in transport."""
 
-    def __init__(self, failing_instruction: str) -> None:
-        """Target one task with a persistent second-candidate transport failure.
+    def __init__(self, failing_instruction: str, *, maximum_failures: int | None = None) -> None:
+        """Target one task with a second-candidate transport failure.
 
         Args:
-            failing_instruction: Exact task instruction whose dispatch always fails.
+            failing_instruction: Exact task instruction whose dispatch fails.
+            maximum_failures: Failures injected before the target recovers; None fails forever.
         """
         super().__init__()
         self.candidate = _ScriptedClient(
@@ -787,6 +793,7 @@ class _CapExhaustedSimulatorFactory(_SimulatorFactory):
         self.failing = _TargetedTransportFailureClient(
             [_response("Resolved.", snapshot=_snapshot("candidate-b"), cost=0.01)] * 200,
             failing_instruction,
+            maximum_failures=maximum_failures,
         )
         self.world = _ScriptedClient(
             [
@@ -1172,238 +1179,6 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     assert first.plan.cells
 
 
-def test_failed_rollouts_are_never_judged_and_leftover_judgments_do_not_block_resume(
-    tmp_path: Path,
-) -> None:
-    """Skip judging failed rollouts, retry them fresh, and resume past leftover judgments.
-
-    Args:
-        tmp_path: Isolated project root for composed router artifacts.
-    """
-    project = ProjectStore(tmp_path, "project-a")
-    project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
-    )
-    _bind_completed_build(project, normalized, revision="test-revision")
-    simulator = _SimulatorFactory()
-    terminal = '{"message":"Done.","terminal":true}'
-    simulator.world = _ScriptedClient(
-        [_response("not-json", snapshot=_snapshot("world-model-a"), cost=0.01)]
-        + [_response(terminal, snapshot=_snapshot("world-model-a"), cost=0.01)] * 80
-    )
-    judge = _Judge()
-    services = RouterWorkflowServices(
-        review_supplier=_ReviewSupplier(),
-        setup_supplier=_SetupSupplier(),
-        simulator_factory=simulator,
-        judge=judge,
-        runtime_catalog=cast(
-            RuntimeModelCatalog,
-            _Catalog(
-                {
-                    "candidate-a": _snapshot("candidate-a"),
-                    "embedder": _snapshot("embedder"),
-                },
-                _Client(),
-            ),
-        ),
-    )
-    budget = RouterCompositionBudget(
-        maximum_simulation_cost_usd=10.0,
-        maximum_judgments=100,
-    )
-
-    with pytest.raises(RouterWorkflowError, match="cover the plan exactly"):
-        compose_router(
-            project,
-            normalized,
-            services=services,
-            budget=budget,
-            created_at=_TIME,
-            code_revision="test-revision",
-        )
-
-    first = compose_router(
-        project,
-        normalized,
-        services=services,
-        budget=budget,
-        created_at=_TIME,
-        code_revision="test-revision",
-    )
-
-    failed = tuple(
-        read_rollout(project.artifacts, artifact_id)[0]
-        for artifact_id in project.artifacts.list_ids()
-        if project.artifacts.read(artifact_id).manifest.artifact_type == "rollout"
-    )
-    failed_ids = {rollout.rollout_id for rollout in failed if rollout.failure is not None}
-    assert failed_ids
-    dispatches = tuple(
-        JudgmentDispatchReceipt.model_validate_json(
-            project.artifacts.read_bytes(artifact_id, "dispatch.json")
-        )
-        for artifact_id in project.artifacts.list_ids()
-        if project.artifacts.read(artifact_id).manifest.artifact_type == "judgment-dispatch"
-    )
-    assert all(item.rollout.artifact_id not in failed_ids for item in dispatches)
-    dispatched = judge.calls
-
-    leftover = _Judge().judge_persisted(
-        project,
-        rollout_artifact_id=sorted(failed_ids)[0],
-        rubric_artifact_id="rubric-a",
-        calibration_artifact_id="calibration-a",
-    )
-    project.artifacts.write_json(
-        artifact_id=leftover.judgment_id,
-        artifact_type="judgment",
-        envelope=leftover,
-        files={"judgment.json": leftover},
-    )
-
-    second = compose_router(
-        project,
-        normalized,
-        services=services,
-        budget=budget,
-        created_at=_TIME + timedelta(hours=1),
-        code_revision="test-revision",
-    )
-
-    assert second.optimization == first.optimization
-    assert judge.calls == dispatched
-
-
-def _zero_spend(
-    phase_project: ProjectStore,
-    artifact_set: SimulationArtifactSet,
-    completion_contract_input: ArtifactInput | None,
-) -> float:
-    """Return zero reconciled spend for a contract-less fixture without reservations."""
-    del phase_project, artifact_set, completion_contract_input
-    return 0.0
-
-
-class _RejectOnceClient:
-    """Reject one mid-flight dispatch with a non-retryable error, then serve responses."""
-
-    def __init__(self, responses: list[ModelResponse]) -> None:
-        """Store the answers served after the single non-retryable rejection.
-
-        Args:
-            responses: Responses returned in order once the rejection has occurred.
-        """
-        self._responses = list(responses)
-        self._failed = False
-
-    def complete(self, request: ModelRequest) -> ModelResponse:
-        """Fail the first dispatch with a non-transport provider error, answer afterwards.
-
-        Args:
-            request: Request emitted by the recording boundary.
-
-        Returns:
-            The next scripted response once the single rejection has occurred.
-
-        Raises:
-            ValueError: The first dispatch, mimicking a provider response rejection.
-        """
-        del request
-        if not self._failed:
-            self._failed = True
-            raise ValueError("provider rejected the dispatched request")
-        return self._responses.pop(0)
-
-
-def test_final_unknown_spend_failure_binds_as_failed_evidence_and_resumes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A non-retryable unknown-spend dispatch failure keeps its plan cell exactly covered.
-
-    The stranded cell binds as unjudged failed evidence instead of vanishing from the
-    exact-coverage index, the judge never dispatches against it, and a later-clock rerun
-    replays the same optimization without new dispatches. Spend reconciliation is stubbed
-    because this contract-less fixture persists no worst-case dispatch reservation; the
-    reservation charge itself is covered by the spend reconciliation tests.
-
-    Args:
-        tmp_path: Isolated project root for composed router artifacts.
-        monkeypatch: Patch fixture replacing spend reconciliation for the fixture.
-    """
-    monkeypatch.setattr(composition_module, "verified_simulation_spend", _zero_spend)
-    project = ProjectStore(tmp_path, "project-a")
-    project.initialize(ProjectConfig(project_id="project-a"))
-    normalized = TraceNormalizationResult(
-        traces=tuple(_trace(index) for index in range(100)), issues=()
-    )
-    _bind_completed_build(project, normalized, revision="test-revision")
-    simulator = _SimulatorFactory()
-    terminal = '{"message":"Done.","terminal":true}'
-    simulator.world = cast(
-        _ScriptedClient,
-        _RejectOnceClient(
-            [_response(terminal, snapshot=_snapshot("world-model-a"), cost=0.01)] * 80
-        ),
-    )
-    judge = _Judge()
-    services = RouterWorkflowServices(
-        review_supplier=_ReviewSupplier(),
-        setup_supplier=_SetupSupplier(),
-        simulator_factory=simulator,
-        judge=judge,
-        runtime_catalog=cast(
-            RuntimeModelCatalog,
-            _Catalog(
-                {
-                    "candidate-a": _snapshot("candidate-a"),
-                    "embedder": _snapshot("embedder"),
-                },
-                _Client(),
-            ),
-        ),
-    )
-    budget = RouterCompositionBudget(
-        maximum_simulation_cost_usd=10.0,
-        maximum_judgments=100,
-    )
-
-    first = compose_router(
-        project,
-        normalized,
-        services=services,
-        budget=budget,
-        created_at=_TIME,
-        code_revision="test-revision",
-    )
-
-    rollouts = tuple(
-        read_rollout(project.artifacts, artifact_id)[0]
-        for artifact_id in project.artifacts.list_ids()
-        if project.artifacts.read(artifact_id).manifest.artifact_type == "rollout"
-    )
-    stranded = tuple(item for item in rollouts if unknown_spend_failure(item.failure))
-    assert stranded
-    assert all(not reexecutable_dispatch_failure(item) for item in stranded)
-    stranded_cells = {item.cell_id for item in stranded}
-    assert stranded_cells.isdisjoint({cell_id for cell_id, _locked in judge.log})
-    dispatched = judge.calls
-
-    second = compose_router(
-        project,
-        normalized,
-        services=services,
-        budget=budget,
-        created_at=_TIME + timedelta(hours=1),
-        code_revision="test-revision",
-    )
-
-    assert second.optimization == first.optimization
-    assert judge.calls == dispatched
-
-
 def test_failed_rollouts_skip_judging_and_rerun_replays_after_partial_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1572,10 +1347,11 @@ def test_retry_cap_exhausted_cell_binds_failed_evidence_and_replays_without_disp
 ) -> None:
     """A cap-exhausted transport-failed cell covers its plan entry as excluded evidence.
 
-    Each resume below the retry cap re-executes the failing cell and still aborts at exact
-    plan coverage. Once the final permitted generation fails, evidence assembly binds the
-    terminal failed rollout, the fitter sees the cell only as a failed unjudged row, its
-    unknown spend stays conservatively charged, and replay adds no provider dispatches.
+    One composition call re-invokes the fit simulation phase until the failing cell
+    exhausts every permitted generation, so the loop terminates at the attempt cap.
+    Evidence assembly then binds the terminal failed rollout, the fitter sees the cell
+    only as a failed unjudged row, its unknown spend stays conservatively charged, and
+    replay adds no provider dispatches.
 
     Args:
         tmp_path: Isolated project root for composed router artifacts.
@@ -1612,25 +1388,19 @@ def test_retry_cap_exhausted_cell_binds_failed_evidence_and_replays_without_disp
         maximum_judgments=400,
     )
 
-    for hour in range(MAXIMUM_CELL_ATTEMPTS - 1):
-        with pytest.raises(ValueError, match="cover the plan exactly"):
-            compose_router(
-                project,
-                normalized,
-                services=services,
-                budget=budget,
-                created_at=_TIME + timedelta(hours=hour),
-                code_revision="test-revision",
-            )
     first = compose_router(
         project,
         normalized,
         services=services,
         budget=budget,
-        created_at=_TIME + timedelta(hours=MAXIMUM_CELL_ATTEMPTS),
+        created_at=_TIME,
         code_revision="test-revision",
     )
 
+    fit_phase_runs = sum(
+        1 for cell_ids, _locked in simulator.log if cell_ids == first.simulation_spec.cell_ids
+    )
+    assert fit_phase_runs == MAXIMUM_CELL_ATTEMPTS
     failing_cell_ids = {
         cell.cell_id
         for cell in first.plan.cells
@@ -1683,7 +1453,119 @@ def test_retry_cap_exhausted_cell_binds_failed_evidence_and_replays_without_disp
         normalized,
         services=services,
         budget=budget,
-        created_at=_TIME + timedelta(hours=MAXIMUM_CELL_ATTEMPTS + 1),
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="test-revision",
+    )
+    assert second.optimization == first.optimization
+    assert (
+        len(simulator.log),
+        len(simulator.candidate.requests),
+        len(simulator.failing.requests),
+        len(simulator.world.requests),
+        judge.calls,
+    ) == dispatched
+
+
+def test_retryable_attempt_zero_failure_converges_in_one_composition_invocation(
+    tmp_path: Path,
+) -> None:
+    """A retryable attempt-0 dispatch failure recovers inside one composition call.
+
+    The fit simulation phase re-invokes the simulator, so resume re-executes only the
+    superseded cell as attempt 1. Judgment and fitting then run against the recovered
+    final evidence, and replay adds no provider dispatches.
+
+    Args:
+        tmp_path: Isolated project root for composed router artifacts.
+    """
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    completed = _bind_completed_build(project, normalized, revision="test-revision")
+    tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
+    failing_task = tuple(task for task in tasks if task.partition == "fit")[10]
+    simulator = _CapExhaustedSimulatorFactory(failing_task.instruction, maximum_failures=1)
+    judge = _Judge()
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_ReservedSetupSupplier(),
+        simulator_factory=simulator,
+        judge=judge,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "candidate-b": _snapshot("candidate-b"),
+                    "embedder": _snapshot("embedder"),
+                },
+                _Client(),
+            ),
+        ),
+    )
+    budget = RouterCompositionBudget(
+        maximum_simulation_cost_usd=10.0,
+        maximum_judgments=400,
+    )
+
+    first = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+
+    assert simulator.failing.failures == 1
+    fit_phase_runs = sum(
+        1 for cell_ids, _locked in simulator.log if cell_ids == first.simulation_spec.cell_ids
+    )
+    assert fit_phase_runs == 2
+    retried = {
+        rollout.cell_id: rollout
+        for artifact_set in (
+            SimulationArtifactSet.model_validate_json(
+                project.artifacts.read_bytes(artifact_id, "artifact-set.json")
+            )
+            for artifact_id in project.artifacts.list_ids()
+            if project.artifacts.read(artifact_id).manifest.artifact_type
+            == "simulation-artifact-set"
+        )
+        for rollout in (
+            read_rollout(project.artifacts, rollout_id)[0]
+            for rollout_id in artifact_set.artifact_ids
+        )
+        if rollout.retry_attempt == 1
+    }
+    assert len(retried) == 1
+    (recovered,) = retried.values()
+    assert recovered.stop_reason == StopReason.COMPLETED
+    assert recovered.failure is None
+    recovered_cell = next(cell for cell in first.plan.cells if cell.cell_id == recovered.cell_id)
+    assert recovered_cell.task_id == failing_task.task_id
+    assert recovered_cell.candidate_alias == "candidate-b"
+    assert recovered_cell.purpose == "fit"
+    fit_dataset = load_evaluation_dataset(project.artifacts, first.optimization.fit_evaluation_id)
+    recovered_row = next(row for row in fit_dataset.rows if row.cell_id == recovered.cell_id)
+    assert recovered_row.status == "completed"
+    assert recovered_row.judgment_id is not None
+
+    dispatched = (
+        len(simulator.log),
+        len(simulator.candidate.requests),
+        len(simulator.failing.requests),
+        len(simulator.world.requests),
+        judge.calls,
+    )
+    second = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME + timedelta(hours=1),
         code_revision="test-revision",
     )
     assert second.optimization == first.optimization
