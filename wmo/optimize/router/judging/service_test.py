@@ -56,7 +56,6 @@ from wmo.optimize.router.judging.contracts import (
     JudgePromptTemplate,
     JudgeScoreProjection,
     ManualJudgeLabel,
-    ManualJudgeReviewState,
     ManualJudgeSetupArtifact,
     judge_feedback_schema,
 )
@@ -71,7 +70,6 @@ from wmo.optimize.router.judging.service import (
     prepare_manual_judge_calibration,
     prepare_manual_judge_setup,
 )
-from wmo.optimize.router.judging.template_bind import DEFAULT_JUDGE_TEMPLATE
 from wmo.runtime.models.registry import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
@@ -1147,44 +1145,6 @@ def test_setup_replay_rejects_changed_contract_with_same_model(tmp_path: Path) -
     review = store.read_review()
     assert isinstance(review, dict)
     assert review["manual_judge"]["setup"]["artifact_id"] == saved.setup_id
-
-
-def test_setup_commit_upgrades_template_version_and_restarts_calibration(
-    tmp_path: Path,
-) -> None:
-    """A saved version 2 setup is replaced by its version 3 twin with fresh review state."""
-    store = _built_store(tmp_path)
-    legacy_plan = prepare_manual_judge_setup(
-        store,
-        _catalog(),
-        prompt_template=DEFAULT_JUDGE_TEMPLATE.model_copy(update={"template_version": "2"}),
-        preview_count=2,
-        created_at=_TIME,
-        code_revision="test-revision",
-    )
-    legacy = commit_manual_judge_setup(store, legacy_plan, confirmed=True)
-    upgrade_plan = prepare_manual_judge_setup(
-        store,
-        _catalog(),
-        created_at=_TIME,
-        code_revision="test-revision",
-    )
-    upgraded = commit_manual_judge_setup(store, upgrade_plan, confirmed=True)
-
-    assert legacy.prompt_template.template_version == "2"
-    assert upgraded.prompt_template.template_version == "3"
-    assert upgraded.setup_id != legacy.setup_id
-    assert upgraded.rubric == legacy.rubric
-    assert upgraded.inputs == legacy.inputs
-    review = store.read_review()
-    assert isinstance(review, dict)
-    state = ManualJudgeReviewState.model_validate(review["manual_judge"])
-    assert state.setup.artifact_id == upgraded.setup_id
-    assert state.label_drafts == ()
-    assert state.trace_reviews == ()
-    assert state.audit is None
-    assert state.approved_calibration is None
-    assert store.artifacts.read(legacy.setup_id).manifest is not None
 
 
 @pytest.mark.parametrize("shape", ["boolean", "categorical"])

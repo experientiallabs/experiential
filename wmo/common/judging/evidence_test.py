@@ -8,8 +8,6 @@ from datetime import UTC, datetime
 from wmo.common.core.artifacts import SourceIdentity
 from wmo.common.judging.evidence import (
     DEFAULT_JUDGE_OUTPUT_TOKENS,
-    LEGACY_JUDGE_OUTPUT_TOKENS,
-    SUPPORTED_JUDGE_OUTPUT_TOKENS,
     visible_rollout_evidence,
 )
 from wmo.common.models import AssistantAction, ModelSnapshot, OperationEconomics, ToolCall
@@ -147,11 +145,9 @@ def _multi_turn_rollout() -> RolloutArtifact:
     )
 
 
-def test_default_budget_is_sixteen_k_and_legacy_stays_supported() -> None:
-    """The shared default is 16384 and 4096 remains a supported persisted budget."""
+def test_default_budget_is_sixteen_k() -> None:
+    """The shared judge output-token budget is 16384."""
     assert DEFAULT_JUDGE_OUTPUT_TOKENS == 16_384
-    assert LEGACY_JUDGE_OUTPUT_TOKENS == 4_096
-    assert SUPPORTED_JUDGE_OUTPUT_TOKENS == frozenset({4_096, 16_384})
 
 
 def test_visible_evidence_excludes_requests_and_reasoning() -> None:

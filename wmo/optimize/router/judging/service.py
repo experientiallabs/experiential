@@ -218,9 +218,7 @@ def commit_manual_judge_setup(
         confirmed: Explicit confirmation of judge, rubric, template, mapping, and schema.
 
     Returns:
-        Immutable setup artifact, including an idempotent exact replay. When the only
-        difference from the saved setup is an advanced template version, the setup is
-        replaced and calibration restarts under the current evidence rendering.
+        Immutable setup artifact, including an idempotent exact replay.
 
     Raises:
         ManualJudgeError: Confirmation is absent, the project/build changed before commit,
@@ -259,8 +257,6 @@ def commit_manual_judge_setup(
             and saved_rubric.dimensions == plan.dimensions
         )
         if not same_contract:
-            if _is_template_version_upgrade(saved, plan, saved_rubric, saved_rubric_input):
-                return _persist_setup(store, plan, inputs=saved.inputs, rubric=saved.rubric)
             raise ManualJudgeError("project already has a different finalized judge setup")
         return saved
     review = RubricReview.open(
@@ -327,43 +323,6 @@ def _persist_setup(
     setup_input = _write_setup(store, setup)
     write_review_state(store, ManualJudgeReviewState(setup=setup_input))
     return setup
-
-
-def _is_template_version_upgrade(
-    saved: ManualJudgeSetupArtifact,
-    plan: ManualJudgeSetupPlan,
-    saved_rubric: Rubric,
-    saved_rubric_input: ArtifactInput,
-) -> bool:
-    """Report whether the plan only advances a saved setup to the current template version.
-
-    Previews are intentionally not compared: they are operator-facing renderings whose
-    count is a display choice, not part of the judged contract. The saved setup, its
-    probes, and any approved audit stay immutable in the artifact store, and review
-    state restarts with no drafts, audit, or approval.
-
-    Args:
-        saved: Existing finalized setup persisted under an earlier template version.
-        plan: Confirmed replacement plan built from the same project evidence.
-        saved_rubric: Rubric loaded from the saved setup pointer.
-        saved_rubric_input: Verified manifest pointer of the saved rubric.
-
-    Returns:
-        True when every judged contract field matches and only the template version
-        moves from 2 to 3.
-    """
-    return (
-        saved.prompt_template.template_version == "2"
-        and plan.prompt_template
-        == saved.prompt_template.model_copy(update={"template_version": "3"})
-        and saved.project_id == plan.project_id
-        and saved.judge_alias == plan.judge_alias
-        and saved.judge_model == plan.judge_model
-        and saved.trace_dataset == plan.build.trace_dataset
-        and saved.task_set == plan.build.task_set
-        and saved_rubric_input == saved.rubric
-        and saved_rubric.dimensions == plan.dimensions
-    )
 
 
 def prepare_manual_judge_calibration(

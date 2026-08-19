@@ -17,20 +17,12 @@ from pydantic import JsonValue
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.rollouts import RolloutArtifact, RolloutSpan
 
-DEFAULT_JUDGE_OUTPUT_TOKENS: Final[int] = 16_384
-"""Per-call output-token budget reserved for newly configured LM judges.
+DEFAULT_JUDGE_OUTPUT_TOKENS: Final = 16_384
+"""Per-call output-token budget reserved for every LM judge dispatch.
 
 Reasoning-effort judge models can spend thousands of tokens on hidden reasoning before any
 visible text, so the reservation leaves room for both reasoning and the structured verdict.
 """
-
-LEGACY_JUDGE_OUTPUT_TOKENS: Final[int] = 4_096
-"""Per-call output-token budget recorded by previously approved judge economics."""
-
-SUPPORTED_JUDGE_OUTPUT_TOKENS: Final[frozenset[int]] = frozenset(
-    {LEGACY_JUDGE_OUTPUT_TOKENS, DEFAULT_JUDGE_OUTPUT_TOKENS}
-)
-"""Output-token budgets accepted when loading persisted judge economics contracts."""
 
 _HIDDEN_EVIDENCE_KEYS: Final[frozenset[str]] = frozenset(
     {

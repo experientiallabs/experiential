@@ -45,34 +45,16 @@ def test_new_budget_defaults_to_sixteen_k_output_tokens() -> None:
     assert budget.maximum_output_tokens_per_call == 16_384
 
 
-def test_persisted_legacy_budget_with_4096_output_tokens_still_loads() -> None:
-    """Previously approved audits priced at 4096 output tokens keep validating."""
-    budget = JudgeCalibrationBudget.model_validate(
-        {
-            "input_usd_per_million_tokens": 1.0,
-            "output_usd_per_million_tokens": 2.0,
-            "maximum_input_tokens_per_call": 4096,
-            "maximum_output_tokens_per_call": 4096,
-            "maximum_attempts_per_call": 3,
-            "call_count": 1,
-            "estimated_cost_usd": 0.01,
-            "maximum_cost_usd": 1.0,
-        }
-    )
-
-    assert budget.maximum_output_tokens_per_call == 4_096
-    assert budget.model_dump(mode="json")["maximum_output_tokens_per_call"] == 4_096
-
-
-def test_unsupported_output_budget_is_rejected() -> None:
-    """Output reservations outside the supported set fail closed."""
-    with pytest.raises(ValidationError, match="judge output tokens per call"):
+@pytest.mark.parametrize("output_tokens", [4_096, 8_192])
+def test_non_default_output_budget_is_rejected(output_tokens: int) -> None:
+    """Output reservations other than the single supported value fail closed."""
+    with pytest.raises(ValidationError, match="maximum_output_tokens_per_call"):
         JudgeCalibrationBudget.model_validate(
             {
                 "input_usd_per_million_tokens": 1.0,
                 "output_usd_per_million_tokens": 2.0,
                 "maximum_input_tokens_per_call": 4096,
-                "maximum_output_tokens_per_call": 8192,
+                "maximum_output_tokens_per_call": output_tokens,
                 "maximum_attempts_per_call": 3,
                 "call_count": 1,
                 "estimated_cost_usd": 0.01,
@@ -81,8 +63,8 @@ def test_unsupported_output_budget_is_rejected() -> None:
         )
 
 
-def test_review_pricing_defaults_new_and_loads_legacy_output_budget() -> None:
-    """New review pricing reserves 16384 while persisted 4096 pricing keeps loading."""
+def test_review_pricing_reserves_the_default_and_rejects_other_budgets() -> None:
+    """Review pricing reserves 16384 output tokens and rejects any other reservation."""
     fresh = ManualJudgeReviewPricing(
         input_usd_per_million_tokens=1.0,
         output_usd_per_million_tokens=2.0,
@@ -92,21 +74,22 @@ def test_review_pricing_defaults_new_and_loads_legacy_output_budget() -> None:
         maximum_reserved_cost_usd=0.196608,
         observed_economics=OperationEconomics(),
     )
-    legacy = ManualJudgeReviewPricing.model_validate(
-        {
-            "input_usd_per_million_tokens": 1.0,
-            "output_usd_per_million_tokens": 2.0,
-            "maximum_input_tokens_per_call": 4096,
-            "maximum_output_tokens_per_call": 4096,
-            "maximum_attempts_per_call": 3,
-            "authorized_call_count": 1,
-            "maximum_reserved_cost_usd": 0.036864,
-            "observed_economics": OperationEconomics().model_dump(mode="json"),
-        }
-    )
 
     assert fresh.maximum_output_tokens_per_call == 16_384
-    assert legacy.maximum_output_tokens_per_call == 4_096
+
+    with pytest.raises(ValidationError, match="maximum_output_tokens_per_call"):
+        ManualJudgeReviewPricing.model_validate(
+            {
+                "input_usd_per_million_tokens": 1.0,
+                "output_usd_per_million_tokens": 2.0,
+                "maximum_input_tokens_per_call": 4096,
+                "maximum_output_tokens_per_call": 4096,
+                "maximum_attempts_per_call": 3,
+                "authorized_call_count": 1,
+                "maximum_reserved_cost_usd": 0.036864,
+                "observed_economics": OperationEconomics().model_dump(mode="json"),
+            }
+        )
 
 
 def test_scalar_feedback_schema_matches_the_portable_rationale_contract() -> None:

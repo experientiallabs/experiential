@@ -20,37 +20,13 @@ from wmo.common.judging import (
     CalibrationReport,
     PromptDefinition,
 )
-from wmo.common.judging.evidence import (
-    DEFAULT_JUDGE_OUTPUT_TOKENS,
-    SUPPORTED_JUDGE_OUTPUT_TOKENS,
-)
+from wmo.common.judging.evidence import DEFAULT_JUDGE_OUTPUT_TOKENS
 from wmo.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
 from wmo.common.models import ModelSnapshot, OperationEconomics, PricingSource
 
 
 class ManualJudgeError(ValueError):
     """Raised when manual judge setup or calibration violates a local contract."""
-
-
-def _supported_output_budget(value: int) -> int:
-    """Require one supported per-call judge output-token budget.
-
-    New economics records reserve the current default, while previously approved records
-    keep loading with the legacy budget they were priced under.
-
-    Args:
-        value: Parsed per-call output-token budget.
-
-    Returns:
-        The supported budget unchanged.
-
-    Raises:
-        ValueError: The budget is not a supported judge output reservation.
-    """
-    if value not in SUPPORTED_JUDGE_OUTPUT_TOKENS:
-        supported = ", ".join(str(item) for item in sorted(SUPPORTED_JUDGE_OUTPUT_TOKENS))
-        raise ValueError(f"judge output tokens per call must be one of: {supported}")
-    return value
 
 
 class ManualJudgeLabel(ContractModel):
@@ -98,13 +74,10 @@ class JudgePromptTemplate(ContractModel):
 
     Template version 3 renders rollout variables through the shared judge-visible evidence
     projection, which excludes provider request payloads and candidate reasoning content.
-    Version 2 identifies setups persisted before that projection existed; they keep loading
-    unchanged and their completed probes replay without any provider call, but new provider
-    calls are refused so one approved setup never mixes two evidence renderings.
     """
 
     template_id: Literal["wmo-judge-evidence-json"] = "wmo-judge-evidence-json"
-    template_version: Literal["2", "3"] = "3"
+    template_version: Literal["3"] = "3"
     response_shape: Literal["scalar", "boolean", "categorical", "pairwise"] = "scalar"
     prompt: PromptDefinition
     variable_mapping: JsonObject
@@ -242,17 +215,11 @@ class JudgeCalibrationBudget(ContractModel):
     output_usd_per_million_tokens: float = Field(ge=0)
     pricing_source: PricingSource = PricingSource.UNKNOWN
     maximum_input_tokens_per_call: int = Field(gt=0)
-    maximum_output_tokens_per_call: int = DEFAULT_JUDGE_OUTPUT_TOKENS
+    maximum_output_tokens_per_call: Literal[16_384] = DEFAULT_JUDGE_OUTPUT_TOKENS
     maximum_attempts_per_call: int = Field(gt=0)
     call_count: int = Field(ge=0)
     estimated_cost_usd: float = Field(ge=0)
     maximum_cost_usd: float = Field(gt=0)
-
-    @field_validator("maximum_output_tokens_per_call")
-    @classmethod
-    def _require_supported_output_budget(cls, value: int) -> int:
-        """Restrict the per-call output reservation to supported judge budgets."""
-        return _supported_output_budget(value)
 
     @field_validator(
         "input_usd_per_million_tokens",
@@ -481,17 +448,11 @@ class ManualJudgeReviewPricing(ContractModel):
     output_usd_per_million_tokens: float = Field(ge=0)
     pricing_source: PricingSource = PricingSource.UNKNOWN
     maximum_input_tokens_per_call: int = Field(gt=0)
-    maximum_output_tokens_per_call: int = DEFAULT_JUDGE_OUTPUT_TOKENS
+    maximum_output_tokens_per_call: Literal[16_384] = DEFAULT_JUDGE_OUTPUT_TOKENS
     maximum_attempts_per_call: int = Field(gt=0)
     authorized_call_count: Literal[1, 2]
     maximum_reserved_cost_usd: float = Field(ge=0)
     observed_economics: OperationEconomics
-
-    @field_validator("maximum_output_tokens_per_call")
-    @classmethod
-    def _require_supported_output_budget(cls, value: int) -> int:
-        """Restrict the per-call output reservation to supported judge budgets."""
-        return _supported_output_budget(value)
 
     @field_validator(
         "input_usd_per_million_tokens",
