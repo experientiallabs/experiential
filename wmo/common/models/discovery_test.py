@@ -55,7 +55,7 @@ def test_maintained_sampling_pins_flow_into_resolved_capabilities() -> None:
     )
 
     assert not pinned.capabilities.supports_temperature
-    assert pinned.capabilities.reasoning_effort == "xhigh"
+    assert pinned.capabilities.reasoning_effort == "medium"
     assert unpinned.capabilities.supports_temperature
     assert unpinned.capabilities.reasoning_effort is None
 
@@ -131,6 +131,19 @@ def test_catalog_request_shaping_capability_reaches_openai_runtime_metadata() ->
     resolved = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.4-mini"))
 
     assert not resolved.capabilities.supports_temperature
+
+
+def test_reasoning_capable_models_resolve_with_the_default_medium_pin() -> None:
+    """Models proven to accept reasoning effort default to medium; others stay unpinned."""
+    reasoning = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.6-luna"))
+    plain = resolve_discovered_model(DiscoveredModel(provider="anthropic", model="claude-sonnet-5"))
+    embedding = resolve_discovered_model(
+        DiscoveredModel(provider="openai", model="text-embedding-3-small")
+    )
+
+    assert reasoning.capabilities.reasoning_effort == "medium"
+    assert plain.capabilities.reasoning_effort is None
+    assert embedding.capabilities.reasoning_effort is None
 
 
 def test_openai_pro_models_without_structured_output_are_not_offered_as_judges() -> None:

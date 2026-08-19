@@ -88,7 +88,7 @@ from wmo.optimize.router.judging.service import (
     prepare_manual_judge_setup,
 )
 from wmo.runtime.agents import ChatAgentRuntime
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.application import RouterApplicationError
 from wmo.simulation.build import build_project, select_completed_build
 from wmo.simulation.ingest.model_identity import (
@@ -394,7 +394,8 @@ class _RuntimeCatalog:
         """
         return self._static.snapshot(alias)
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        del role
         """Construct one deterministic runtime client after recording credential resolution.
 
         Args:
@@ -409,7 +410,14 @@ class _RuntimeCatalog:
         embedding = _EmbeddingClient(self._state) if capabilities.supports_embeddings else None
         return ResolvedModel(alias, snapshot, capabilities, completion, embedding)
 
-    def preflight(self, alias: str, _requirement: object | None = None) -> ResolvedModel:
+    def preflight(
+        self,
+        alias: str,
+        _requirement: object | None = None,
+        *,
+        role: CatalogRoleName | None = None,
+    ) -> ResolvedModel:
+        del role
         """Reuse deterministic resolution for locally verified fixture capabilities.
 
         Args:

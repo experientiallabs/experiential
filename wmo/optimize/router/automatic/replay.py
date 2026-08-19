@@ -32,7 +32,7 @@ from wmo.optimize.router.automatic.preflight import (
 )
 from wmo.optimize.router.composition import RouterPolicyLock
 from wmo.optimize.router.fit.report import HeldOutRouterReport
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.simulation.specs import SimulationSpec
 
 
@@ -100,15 +100,17 @@ class _ReadOnlyReplayCatalog:
         """
         return self._catalog.snapshot(alias)
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
         """Construct one no-dispatch runtime binding without reading credentials.
 
         Args:
             alias: Current local catalog alias.
+            role: Completion role, ignored because no request is ever dispatched.
 
         Returns:
             Exact model identity with a client that rejects every operation.
         """
+        del role
         snapshot, capabilities = self.snapshot(alias)
         return ResolvedModel(
             alias=alias,

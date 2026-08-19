@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from wmo.common.core.artifacts import JsonObject, sha256_json
 from wmo.common.models import (
@@ -14,6 +14,7 @@ from wmo.common.models import (
     ModelCatalog,
     ModelClient,
     ModelSnapshot,
+    ReasoningEffort,
 )
 from wmo.runtime.models.credentials import read_connection_api_key
 from wmo.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
@@ -34,6 +35,9 @@ from wmo.runtime.models.providers.tinker_sampling import (
     create_tinker_sampler,
 )
 from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
+
+CatalogRoleName = Literal["world_model", "judge", "candidate"]
+"""Completion role whose catalog-configured reasoning effort shapes resolved requests."""
 
 
 class ModelConnectionError(ValueError):
@@ -162,11 +166,14 @@ class RuntimeModelCatalog:
             capabilities,
         )
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
         """Build the one approved client shape named by an alias.
 
         Args:
             alias: Stable local catalog alias.
+            role: Optional completion role whose catalog-configured reasoning effort replaces
+                the alias's capability pin. Roles never add an effort to a model whose
+                verified capabilities carry no pin.
 
         Returns:
             Resolved identity, capabilities, completion client, and optional embedding client.
@@ -179,6 +186,9 @@ class RuntimeModelCatalog:
             raise ModelConnectionError(f"unknown model alias {alias!r}")
         connection = self._catalog.connections[record.connection]
         snapshot, capabilities = self.snapshot(alias)
+        role_effort = self._role_reasoning_effort(alias, role)
+        if role_effort is not None and capabilities.reasoning_effort is not None:
+            capabilities = capabilities.model_copy(update={"reasoning_effort": role_effort})
         provenance = record.sft_provenance
         if provenance is not None:
             current_connection: JsonObject = {
@@ -311,12 +321,15 @@ class RuntimeModelCatalog:
         self,
         alias: str,
         requirement: CapabilityRequirement | None = None,
+        *,
+        role: CatalogRoleName | None = None,
     ) -> ResolvedModel:
         """Construct and locally capability-check one alias before a paid provider call.
 
         Args:
             alias: Stable local catalog alias to validate and construct.
             requirement: Optional required protocol features and capacity limits.
+            role: Optional completion role whose configured reasoning effort shapes requests.
 
         Returns:
             The constructed focused client after its exact snapshot satisfies the requirement.
@@ -327,7 +340,30 @@ class RuntimeModelCatalog:
         """
         _, capabilities = self.snapshot(alias)
         preflight_capabilities(alias, capabilities, requirement or CapabilityRequirement())
-        return self.resolve(alias)
+        return self.resolve(alias, role=role)
+
+    def _role_reasoning_effort(
+        self,
+        alias: str,
+        role: CatalogRoleName | None,
+    ) -> ReasoningEffort | None:
+        """Return the catalog's role-specific reasoning effort bound to this alias, if any.
+
+        Args:
+            alias: Stable local catalog alias being resolved.
+            role: Completion role requested by the caller, or ``None`` for alias-level shaping.
+
+        Returns:
+            The configured effort when the alias currently holds the requested role.
+        """
+        roles = self._catalog.roles
+        if role == "world_model" and alias == roles.world_model:
+            return roles.world_model_reasoning_effort
+        if role == "judge" and alias == roles.judge:
+            return roles.judge_reasoning_effort
+        if role == "candidate":
+            return roles.candidate_reasoning_efforts.get(alias)
+        return None
 
     def with_catalog(self, catalog: ModelCatalog) -> RuntimeModelCatalog:
         """Return an equivalent resolver over updated local catalog metadata.

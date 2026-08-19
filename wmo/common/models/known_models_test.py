@@ -52,7 +52,7 @@ def test_documented_chat_model_carries_verified_capabilities_and_prices() -> Non
     assert known.cached_input_cost_per_million_tokens_usd == 0.2
     assert known.cache_write_cost_per_million_tokens_usd == 2.5
     assert known.supports_temperature is False
-    assert known.reasoning_effort == "xhigh"
+    assert known.supports_reasoning_effort
 
 
 def test_reasoning_models_pin_sampling_and_small_models_carry_token_limits() -> None:
@@ -62,12 +62,12 @@ def test_reasoning_models_pin_sampling_and_small_models_carry_token_limits() -> 
 
     assert mini is not None
     assert mini.supports_temperature is False
-    assert mini.reasoning_effort is None
+    assert mini.supports_reasoning_effort
     assert mini.context_window_tokens == 400_000
     assert mini.maximum_output_tokens == 128_000
     assert embedding is not None
     assert embedding.supports_temperature is None
-    assert embedding.reasoning_effort is None
+    assert not embedding.supports_reasoning_effort
 
 
 @pytest.mark.parametrize(

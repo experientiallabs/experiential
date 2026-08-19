@@ -43,7 +43,7 @@ from wmo.optimize.router.automatic.service_test import (
     _EmbeddingClient,
     _ProviderState,
 )
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.simulation.build import ProjectBuild
 
 _RUNNER = CliRunner()
@@ -119,11 +119,12 @@ class _WizardRuntimeCatalog:
         """
         return self._static.snapshot(alias)
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
         """Create a deterministic provider-shaped runtime while counting resolution.
 
         Args:
             alias: Current catalog alias.
+            role: Optional catalog role the alias serves.
 
         Returns:
             Exact resolved model with completion and optional embedding clients.
@@ -136,17 +137,24 @@ class _WizardRuntimeCatalog:
             embedding = _EmbeddingClient(self._state)
         return ResolvedModel(alias, snapshot, capabilities, completion, embedding)
 
-    def preflight(self, alias: str, _requirement: object | None = None) -> ResolvedModel:
+    def preflight(
+        self,
+        alias: str,
+        _requirement: object | None = None,
+        *,
+        role: CatalogRoleName | None = None,
+    ) -> ResolvedModel:
         """Resolve one verified alias for the existing build preflight seam.
 
         Args:
             alias: Current catalog alias.
             _requirement: Capability requirement already represented in the catalog.
+            role: Optional catalog role the alias serves.
 
         Returns:
             Exact resolved model.
         """
-        return self.resolve(alias)
+        return self.resolve(alias, role=role)
 
     def with_catalog(self, catalog: ModelCatalog) -> _WizardRuntimeCatalog:
         """Return an equivalent resolver over a candidate-inclusive catalog.
@@ -666,7 +674,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
     explicit = _RUNNER.invoke(
         app,
         ["build", "explicit", "-t", str(traces), "--root", str(root)],
-        input="1\n\n1,2,3\n\n1\n1\n1\n1,2\n\n1\ny\n",
+        input="1\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "WMO_RELEASE_REVISION": _REVISION},
     )
     assert explicit.exit_code == 0, explicit.output

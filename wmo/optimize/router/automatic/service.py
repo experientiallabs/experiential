@@ -46,7 +46,12 @@ from wmo.runtime.agents import (
     preflight_agent_factory,
     resolve_agent_factory,
 )
-from wmo.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import (
+    CapabilityRequirement,
+    CatalogRoleName,
+    ResolvedModel,
+    RuntimeModelCatalog,
+)
 from wmo.simulation.build import ProjectBuild
 from wmo.simulation.engines.text import (
     WORLD_MODEL_TEXT_PROMPT_ID,
@@ -286,12 +291,17 @@ def _resolve_all_models(
         AutomaticRouterError: A model identity or required client shape differs from preflight.
     """
 
-    def resolve(alias: str, requirement: CapabilityRequirement) -> ResolvedModel:
+    def resolve(
+        alias: str,
+        requirement: CapabilityRequirement,
+        role: CatalogRoleName | None = None,
+    ) -> ResolvedModel:
         """Resolve one role through a fresh provider client.
 
         Args:
             alias: Stable catalog alias.
             requirement: Exact local capability proof required for this role.
+            role: Completion role whose configured reasoning effort shapes requests.
 
         Returns:
             Independently constructed resolved model.
@@ -300,7 +310,7 @@ def _resolve_all_models(
             AutomaticRouterError: Credential or capability resolution fails.
         """
         try:
-            return catalog.preflight(alias, requirement)
+            return catalog.preflight(alias, requirement, role=role)
         except ValueError as exc:
             raise AutomaticRouterError(f"model alias {alias!r} cannot be resolved: {exc}") from exc
 
@@ -311,6 +321,7 @@ def _resolve_all_models(
                 minimum_context_window_tokens=options.simulation_maximum_output_tokens + 1,
                 minimum_output_tokens=options.simulation_maximum_output_tokens,
             ),
+            "candidate",
         )
         for candidate in preflight.candidates
     }
@@ -320,12 +331,14 @@ def _resolve_all_models(
             minimum_context_window_tokens=options.simulation_maximum_output_tokens + 1,
             minimum_output_tokens=options.simulation_maximum_output_tokens,
         ),
+        "world_model",
     )
     judge = resolve(
         preflight.judge_alias,
         CapabilityRequirement(
             minimum_output_tokens=preflight.judge_completion_reservation.maximum_output_tokens,
         ),
+        "judge",
     )
     embedder = resolve(
         preflight.embedder_alias,

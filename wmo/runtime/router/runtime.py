@@ -450,7 +450,7 @@ class RouterRuntime:
         """
         resolved = self._resolved.get(alias)
         if resolved is None:
-            resolved = self.catalog.resolve(alias)
+            resolved = self.catalog.resolve(alias, role="candidate")
             expected = self._expected_models.get(alias)
             if (
                 expected is None

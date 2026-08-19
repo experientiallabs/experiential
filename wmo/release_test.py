@@ -934,6 +934,7 @@ def _installed_release_driver() -> None:
         ("Output cost per million tokens in USD", "0"),
         ("Cached input cost per million tokens in USD", "0"),
         ("Cache write cost per million tokens in USD", "0"),
+        ("Reasoning effort", enter),
         ("core-model", (down * 2) + enter),
         ("World model", enter),
         ("Judge", enter),

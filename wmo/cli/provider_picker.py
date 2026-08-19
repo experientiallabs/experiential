@@ -30,6 +30,7 @@ from wmo.common.models import (
     PricingSource,
     ProviderConnection,
     ProviderSetup,
+    ReasoningEffort,
     SetupRole,
     derive_connection_name,
     derive_model_alias,
@@ -83,6 +84,9 @@ class SetupRoleInputs:
     embedder: str | None = None
     candidates: tuple[str, ...] = ()
     incumbent: str | None = None
+    world_model_reasoning_effort: ReasoningEffort | None = None
+    judge_reasoning_effort: ReasoningEffort | None = None
+    candidate_reasoning_efforts: dict[str, ReasoningEffort] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,7 @@ class ProviderSetupResult:
     setup: ProviderSetup
     candidates: tuple[str, ...] = ()
     incumbent: str | None = None
+    candidate_reasoning_efforts: dict[str, ReasoningEffort] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
