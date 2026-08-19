@@ -63,6 +63,35 @@ def test_model_catalog_round_trip_preserves_aliases_and_environment_name(tmp_pat
     assert "api_key =" not in path.read_text(encoding="utf-8")
 
 
+def test_model_catalog_round_trip_preserves_served_model_id(tmp_path: Path) -> None:
+    """An optional served-model pin survives the TOML write and load boundary."""
+    path = tmp_path / "models.toml"
+    base = _catalog()
+    record = base.models["candidate-economy"].model_copy(
+        update={"model": "deepseek-ai/DeepSeek-V4-Flash-0731", "served_model_id": "deepseek-v4-flash"}
+    )
+    catalog = base.model_copy(update={"models": {"candidate-economy": record}})
+
+    write_model_catalog(path, catalog)
+
+    loaded = load_model_catalog(path)
+    assert loaded == catalog
+    assert loaded.models["candidate-economy"].served_model_id == "deepseek-v4-flash"
+    assert 'served_model_id = "deepseek-v4-flash"' in path.read_text(encoding="utf-8")
+
+
+def test_model_record_rejects_empty_and_oversized_served_model_id() -> None:
+    """The served-model pin keeps the same bounded shape as the requested model ID."""
+    for invalid in ("", "x" * 2_049):
+        with pytest.raises(ValidationError, match="served_model_id"):
+            ModelRecord(
+                connection="openrouter",
+                model="deepseek/deepseek-v4-flash",
+                served_model_id=invalid,
+                billing_source=BillingSource.HOST_MANAGED,
+            )
+
+
 def test_current_model_records_require_explicit_billing_source() -> None:
     """New catalog construction cannot silently infer who owns a provider credential."""
     with pytest.raises(ValidationError, match="billing_source"):

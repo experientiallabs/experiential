@@ -118,6 +118,63 @@ def test_noninteractive_setup_collects_many_connections_models_and_roles(tmp_pat
     assert catalog.roles == ModelRoles(world_model="world", judge="judge", embedder="embed")
 
 
+def test_noninteractive_setup_persists_a_served_model_pin(tmp_path: Path) -> None:
+    """A ``served_model_id`` key in ``--model-json`` is written to the model catalog.
+
+    Args:
+        tmp_path: Temporary WMO root receiving the model catalog.
+    """
+    root = tmp_path / ".wmo"
+    hosted = json.dumps(
+        {
+            "name": "hosted",
+            "provider": "openai-compatible",
+            "api_key_env": "HOSTED_API_KEY",
+            "base_url": "https://models.example.test/v1",
+        }
+    )
+    pinned = json.dumps(
+        {
+            "alias": "candidate",
+            "connection": "hosted",
+            "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+            "served_model_id": "deepseek-v4-flash",
+            "capabilities": {
+                "supports_embeddings": True,
+                "input_cost_per_million_tokens_usd": 0,
+            },
+        }
+    )
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(root),
+            "--non-interactive",
+            "--connection-json",
+            hosted,
+            "--model-json",
+            pinned,
+            "--world-model",
+            "candidate",
+            "--judge",
+            "candidate",
+            "--embedder",
+            "candidate",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    catalog = load_model_catalog(root / "models.toml")
+    assert catalog.models["candidate"].model == "deepseek-ai/DeepSeek-V4-Flash-0731"
+    assert catalog.models["candidate"].served_model_id == "deepseek-v4-flash"
+    text = (root / "models.toml").read_text(encoding="utf-8")
+    assert 'served_model_id = "deepseek-v4-flash"' in text
+
+
 def test_noninteractive_setup_accepts_azure_and_bedrock_connections(tmp_path: Path) -> None:
     """Azure and Bedrock connections persist secret-free catalog fields only.
 

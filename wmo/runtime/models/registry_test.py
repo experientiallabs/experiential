@@ -57,6 +57,7 @@ def _catalog(
     region: str | None = None,
     capabilities: ModelCapabilities | None = _DEFAULT_CAPABILITIES,
     billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
+    served_model_id: str | None = None,
 ) -> ModelCatalog:
     """Build a minimum one-alias local catalog for deterministic resolution tests."""
     return ModelCatalog(
@@ -73,6 +74,7 @@ def _catalog(
             "fixture-model": ModelRecord(
                 connection="primary",
                 model="fixture-model",
+                served_model_id=served_model_id,
                 billing_source=billing_source,
                 capabilities=capabilities,
             )
@@ -239,6 +241,44 @@ def test_resolution_rejects_unsupported_connection_and_incomplete_compatible_url
         unsupported.snapshot("fixture-model")
     with pytest.raises(ModelConnectionError, match="needs connection.base_url"):
         compatible.resolve("fixture-model")
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("openai", None),
+        ("openai-compatible", "https://models.example.test/v1"),
+        ("azure", "https://resource.example.test"),
+    ],
+)
+def test_resolution_threads_catalog_served_model_pin_to_every_http_provider(
+    provider: str,
+    base_url: str | None,
+) -> None:
+    """A cataloged served-model pin reaches the resolved identity for each HTTP provider.
+
+    Args:
+        provider: Catalog connection provider under test.
+        base_url: Explicit endpoint for providers that require one.
+    """
+    pinned = RuntimeModelCatalog(
+        _catalog(
+            provider=provider,
+            base_url=base_url,
+            api_version="v1" if provider == "azure" else None,
+            served_model_id="fixture-model-served",
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    unpinned = RuntimeModelCatalog(
+        _catalog(provider=provider, base_url=base_url, api_version="v1" if provider == "azure" else None),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    assert pinned.resolve("fixture-model").served_model_id == "fixture-model-served"
+    assert unpinned.resolve("fixture-model").served_model_id is None
 
 
 def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent() -> None:

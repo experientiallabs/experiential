@@ -265,10 +265,16 @@ class ModelRecord(ContractModel):
     An omitted capability declaration means the catalog cannot prove any optional protocol
     feature or token limit. Callers may still resolve the alias for an unconstrained completion,
     but capability preflight fails closed instead of inferring support from a provider name.
+
+    ``served_model_id`` is the provider-reported response identity when it differs from the
+    requested model ID, for example when an endpoint normalizes every response to one configured
+    served-model name. Identity validation accepts a response naming either the requested model
+    or this pinned served identity.
     """
 
     connection: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=2_048)
+    served_model_id: str | None = Field(default=None, min_length=1, max_length=2_048)
     revision: str | None = Field(default=None, max_length=256)
     billing_source: BillingSource
     capabilities: ModelCapabilities | None = None
@@ -288,6 +294,7 @@ class ModelRecord(ContractModel):
                 {
                     "connection": self.connection,
                     "model": self.model,
+                    "served_model_id": self.served_model_id,
                     "revision": self.revision,
                     "billing_source": self.billing_source.value,
                     "capabilities": (

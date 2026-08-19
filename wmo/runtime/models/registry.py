@@ -232,6 +232,7 @@ class RuntimeModelCatalog:
                 capabilities,
                 client,
                 bedrock_client if capabilities.supports_embeddings else None,
+                served_model_id=record.served_model_id,
             )
         api_key = read_connection_api_key(connection, environment=self._environment)
         if provider == "openai":
@@ -249,6 +250,7 @@ class RuntimeModelCatalog:
                 capabilities,
                 openai_client,
                 openai_client if capabilities.supports_embeddings else None,
+                served_model_id=record.served_model_id,
             )
         if provider == "azure":
             if connection.base_url is None or connection.api_version is None:
@@ -276,6 +278,7 @@ class RuntimeModelCatalog:
                 capabilities,
                 client,
                 client if capabilities.supports_embeddings else None,
+                served_model_id=record.served_model_id,
             )
         if provider == "tinker":
             sampler_factory = self._tinker_sampler_factory or _runtime_tinker_sampler
@@ -289,7 +292,9 @@ class RuntimeModelCatalog:
                 model=snapshot,
                 sampler=sampler,
             )
-            return ResolvedModel(alias, snapshot, capabilities, client, None)
+            return ResolvedModel(
+                alias, snapshot, capabilities, client, None, served_model_id=record.served_model_id
+            )
         entry = _HTTP_PROVIDERS.get(provider)
         if entry is None:
             raise ModelConnectionError(f"unsupported provider {provider!r}")
@@ -310,7 +315,14 @@ class RuntimeModelCatalog:
             if capabilities.supports_embeddings and isinstance(http_client, EmbeddingClient)
             else None
         )
-        return ResolvedModel(alias, snapshot, capabilities, http_client, embedding_client)
+        return ResolvedModel(
+            alias,
+            snapshot,
+            capabilities,
+            http_client,
+            embedding_client,
+            served_model_id=record.served_model_id,
+        )
 
     def preflight(
         self,

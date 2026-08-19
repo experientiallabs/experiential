@@ -94,11 +94,16 @@ class ProviderConnection(ContractModel):
 
 
 class ProviderModelSelection(ContractModel):
-    """One stable alias and exact provider-side model selected during setup."""
+    """One stable alias and exact provider-side model selected during setup.
+
+    ``served_model_id`` optionally pins the provider-reported response identity when the
+    endpoint reports a served-model name that differs from the requested model ID.
+    """
 
     alias: str = Field(min_length=1, max_length=128)
     connection: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=2_048)
+    served_model_id: str | None = Field(default=None, min_length=1, max_length=2_048)
     billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED
     capabilities: ModelCapabilities = Field(default_factory=ModelCapabilities)
 
@@ -148,6 +153,7 @@ class ProviderModelSelection(ContractModel):
         return ModelRecord(
             connection=self.connection,
             model=self.model,
+            served_model_id=self.served_model_id,
             billing_source=self.billing_source,
             capabilities=self.capabilities,
         )
