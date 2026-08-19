@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 
 from wmo.common.core.artifacts import stable_id
@@ -48,6 +49,8 @@ _TERMINAL_EVENTS = {
     GatewayEventKind.INCOMPLETE,
     GatewayEventKind.FAILED,
 }
+_MAX_WITHHELD_REFUSAL_BYTES = 65_536
+_MAX_WITHHELD_REFUSAL_EVENTS = 256
 
 
 class GatewayExecutionError(RuntimeError):
@@ -80,6 +83,8 @@ class _PhysicalAttempt:
     iterator: AsyncIterator[GatewayEvent] | None = None
     latest_usage: GatewayUsage | None = None
     last_provider_sequence: int = -1
+    withheld_refusals: list[GatewayEvent] = field(default_factory=list)
+    withheld_refusal_bytes: int = 0
     settled: bool = False
 
 
@@ -134,6 +139,7 @@ class GatewayExecutionStream:
         self._settled = False
         self._parent_finalized = False
         self._next_sequence = 0
+        self._pending_outward: deque[GatewayEvent] = deque()
         self._settlement_lock = asyncio.Lock()
 
     @property
@@ -167,6 +173,8 @@ class GatewayExecutionStream:
 
     async def __anext__(self) -> GatewayEvent:
         """Yield one logical event, advancing routes only before semantic commitment."""
+        if self._pending_outward:
+            return self._outward(self._pending_outward.popleft())
         if self._settled:
             raise StopAsyncIteration
         while True:
@@ -208,6 +216,23 @@ class GatewayExecutionStream:
             current.last_provider_sequence = event.sequence_number
             if event.usage is not None:
                 current.latest_usage = event.usage
+            if (
+                event.kind == GatewayEventKind.REFUSAL_DELTA
+                and self._refusal_failover
+                and not self._committed
+            ):
+                current.withheld_refusals.append(event)
+                current.withheld_refusal_bytes += len((event.text_delta or "").encode("utf-8"))
+                if (
+                    current.withheld_refusal_bytes > _MAX_WITHHELD_REFUSAL_BYTES
+                    or len(current.withheld_refusals) > _MAX_WITHHELD_REFUSAL_EVENTS
+                ):
+                    self._commit_withheld_refusal(current)
+                    return self._outward(self._pending_outward.popleft())
+                continue
+            if current.withheld_refusals and event.kind in _SEMANTIC_EVENTS:
+                self._commit_withheld_refusal(current, event)
+                return self._outward(self._pending_outward.popleft())
             if event.kind in _SEMANTIC_EVENTS:
                 self._committed = True
                 return self._outward(event)
@@ -216,6 +241,41 @@ class GatewayExecutionStream:
                     return self._outward(event)
                 continue
             terminal = _with_latest_usage(event, current.latest_usage)
+            typed_refusal = (
+                terminal.kind == GatewayEventKind.FAILED
+                and terminal.failure is not None
+                and terminal.failure.failure_class == GatewayFailureClass.REFUSAL
+            )
+            if current.withheld_refusals and typed_refusal:
+                current.withheld_refusals.clear()
+                current.withheld_refusal_bytes = 0
+            elif current.withheld_refusals and terminal.kind != GatewayEventKind.FAILED:
+                current.withheld_refusals.clear()
+                current.withheld_refusal_bytes = 0
+                terminal = GatewayEvent(
+                    kind=GatewayEventKind.FAILED,
+                    sequence_number=terminal.sequence_number,
+                    failure=GatewayFailure(
+                        failure_class=GatewayFailureClass.REFUSAL,
+                        safe_message="provider refused the request",
+                        safe_details={"signal": "provider_refusal"},
+                    ),
+                    usage=terminal.usage,
+                )
+            elif current.withheld_refusals:
+                failure = terminal.failure or GatewayFailure(
+                    failure_class=GatewayFailureClass.INTERNAL,
+                    safe_message="provider execution failed",
+                )
+                self._health.failed(self._health_key(current.route_index), failure)
+                await self._finish_current(
+                    terminal=terminal,
+                    failure=failure,
+                    finalize_request=True,
+                )
+                self._settle()
+                self._commit_withheld_refusal(current, terminal)
+                return self._outward(self._pending_outward.popleft())
             if terminal.kind != GatewayEventKind.FAILED:
                 self._health.succeeded(self._health_key(current.route_index))
                 await self._finish_current(terminal=terminal, failure=None, finalize_request=True)
@@ -503,6 +563,23 @@ class GatewayExecutionStream:
         outward = event.model_copy(update={"sequence_number": self._next_sequence})
         self._next_sequence += 1
         return outward
+
+    def _commit_withheld_refusal(
+        self,
+        current: _PhysicalAttempt,
+        *following: GatewayEvent,
+    ) -> None:
+        """Flush bounded refusal output and permanently freeze the active route.
+
+        Args:
+            current: Physical attempt holding in-memory refusal deltas.
+            *following: Semantic or terminal events that arrived after the refusal.
+        """
+        self._committed = True
+        self._pending_outward.extend(current.withheld_refusals)
+        self._pending_outward.extend(following)
+        current.withheld_refusals.clear()
+        current.withheld_refusal_bytes = 0
 
     def _require_current(self) -> _PhysicalAttempt:
         """Return the active or terminal attempt after successful stream opening."""

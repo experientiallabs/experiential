@@ -17,7 +17,12 @@ on the exact release checkout.
 - The installed-wheel gateway lane uses real SQLite, a real subprocess listener, a real loopback
   upstream, and OpenAI `3.0.0`. It covers `OpenAI` and `AsyncOpenAI` across Chat Completions and
   Responses, with both stream and non-stream requests. HTML and JSON usage are checked for the same
-  per-identity accounting values.
+  per-identity accounting values. The same lane measures default SDK retries against physical
+  attempts, provider-authentication fallback, refusal policy, post-commit no-switch, restart and
+  replay behavior, revocation, cancellation, WAL mode, and cost attribution.
+- Deterministic source-level certification additionally covers selection-only project routing,
+  authentication-circuit open/skip/recovery, concurrent multi-identity key revocation and alias
+  revision activation, and atomic rollback of a failed legacy SQLite migration.
 - One content and secret canary scanner covers the gateway database, live WAL, migration backups
   when present, catalog snapshots, stdout, stderr, logs, usage responses, and HTTP error bodies.
 - Public Python exposes provider-free build, explicit router composition, frozen router load and

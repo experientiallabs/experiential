@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from wmo.runtime.gateway.sqlite import migrations
 from wmo.runtime.gateway.sqlite.migrations import (
     _MIGRATION_1,
     _MIGRATION_2,
@@ -384,6 +385,53 @@ def test_v6_migration_preserves_billing_and_adds_physical_ordinal(tmp_path: Path
         )
     finally:
         prior.close()
+
+
+def test_failed_legacy_migration_rolls_back_the_live_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed forward migration leaves the legacy database intact and recoverable."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for migration in (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3):
+            for statement in migration:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 3")
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+    monkeypatch.setitem(
+        migrations._MIGRATIONS,
+        4,
+        (
+            "ALTER TABLE gateway_attempts RENAME TO gateway_attempts_v3",
+            "INVALID MIGRATION STATEMENT",
+        ),
+    )
+
+    with pytest.raises(GatewaySchemaError, match="migration failed"):
+        initialize_database(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    finally:
+        connection.close()
+    assert "gateway_attempts" in tables
+    assert "gateway_attempts_v3" not in tables
+    backups = tuple(tmp_path.glob("gateway.db.backup-v3-*"))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as backup:
+        assert backup.execute("PRAGMA user_version").fetchone() == (3,)
 
 
 def test_concurrent_initializers_choose_migration_plan_under_exclusive_lock(

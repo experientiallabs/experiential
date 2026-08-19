@@ -58,7 +58,7 @@ jobs:
       - name: Smoke test the wheel
         run: |
           uv venv /tmp/wmo-wheel-smoke
-          uv pip install --python /tmp/wmo-wheel-smoke/bin/python dist/*.whl
+          uv pip install --python /tmp/wmo-wheel-smoke/bin/python dist/*.whl "openai==3.0.0"
           cd /tmp
           /tmp/wmo-wheel-smoke/bin/python - <<'PY'
           import wmo

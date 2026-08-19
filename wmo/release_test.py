@@ -685,6 +685,10 @@ def _installed_release_driver() -> None:
             """
             assert payload.get("stream") is True
             assert payload.get("stream_options") == {"include_usage": True}
+            prompt = json.dumps(payload, sort_keys=True)
+            if "sdk-retry-input-canary-P9" in prompt:
+                self._send_retryable_failure()
+                return
             if payload.get("tools"):
                 choices = (
                     {
@@ -753,9 +757,16 @@ def _installed_release_driver() -> None:
                 ordinal: Stable provider request ordinal.
             """
             prompt = json.dumps(payload, sort_keys=True)
-            if "prompt-content-canary-P9" in prompt or "tool-argument-canary" in prompt:
-                body = b'{"error":{"message":"temporary fixture failure"}}'
-                self.send_response(503)
+            if (
+                "prompt-content-canary-P9" in prompt
+                or "tool-argument-canary" in prompt
+                or "sdk-retry-input-canary-P9" in prompt
+            ):
+                self._send_retryable_failure()
+                return
+            if "provider-auth-input-canary-P9" in prompt:
+                body = b'{"error":{"message":"fixture credential rejected"}}'
+                self.send_response(401)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -864,6 +875,15 @@ def _installed_release_driver() -> None:
                     self.wfile.write(remainder)
                 except BrokenPipeError:
                     pass
+
+        def _send_retryable_failure(self) -> None:
+            """Return one content-free retryable provider failure."""
+            body = b'{"error":{"message":"temporary fixture failure"}}'
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
     server.daemon_threads = True
@@ -1197,6 +1217,8 @@ def _installed_release_driver() -> None:
     tool_argument_canary = "tool-argument-canary"
     invalid_key_canary = "invalid-virtual-key-canary-P9"
     refusal_input_canary = "refusal-input-canary-P9"
+    auth_input_canary = "provider-auth-input-canary-P9"
+    sdk_retry_input_canary = "sdk-retry-input-canary-P9"
     postcommit_input_canary = "postcommit-input-canary-P9"
     postcommit_response_canary = "postcommit-response-canary-P9"
     cancellation_input_canary = "cancellation-input-canary-P9"
@@ -1387,6 +1409,20 @@ def _installed_release_driver() -> None:
         assert default_refusal.json()["choices"][0]["message"]["refusal"] == "policy refusal"
         assert state.count_containing("gateway-secondary-model") == 0
 
+        auth_secondary = state.count_containing("gateway-secondary-model")
+        auth_fallback = httpx.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": auth_input_canary}],
+            },
+            timeout=10,
+        )
+        auth_fallback.raise_for_status()
+        assert auth_fallback.json()["choices"][0]["message"]["content"] == response_canary
+        assert state.count_containing("gateway-secondary-model") == auth_secondary + 1
+
         with OpenAI(api_key=raw_key, base_url=base_url, timeout=10) as client:
             assert [model.id for model in client.models.list().data] == ["coding"]
             chat = client.chat.completions.create(
@@ -1474,11 +1510,43 @@ def _installed_release_driver() -> None:
         primary_requests = state.count_containing("gateway-primary-model")
         secondary_requests = state.count_containing("gateway-secondary-model")
         assert primary_requests >= 2
-        assert secondary_requests == 9
+        assert secondary_requests == 10
 
         matrix_stdout, matrix_stderr = stop_gateway(gateway_process)
         gateway_stdout_parts.append(matrix_stdout)
         gateway_stderr_parts.append(matrix_stderr)
+        gateway_process, gateway_port, base_url = start_gateway(gateway_root)
+
+        usage_before_retry = httpx.get(
+            f"http://127.0.0.1:{gateway_port}/usage.json",
+            timeout=5,
+        ).json()["totals"]
+        provider_before_retry = state.count_containing(sdk_retry_input_canary)
+        try:
+            with OpenAI(api_key=raw_key, base_url=base_url, timeout=10) as client:
+                client.chat.completions.create(
+                    model="coding",
+                    messages=[{"role": "user", "content": sdk_retry_input_canary}],
+                )
+        except openai.APIStatusError as exc:
+            assert exc.status_code in {502, 503}
+            error_bodies.append(exc.response.text)
+        else:
+            raise AssertionError("default SDK retry scenario unexpectedly succeeded")
+        usage_after_retry = httpx.get(
+            f"http://127.0.0.1:{gateway_port}/usage.json",
+            timeout=5,
+        ).json()["totals"]
+        provider_retry_calls = (
+            state.count_containing(sdk_retry_input_canary) - provider_before_retry
+        )
+        assert usage_after_retry["requests"] - usage_before_retry["requests"] == 3
+        assert usage_after_retry["attempts"] - usage_before_retry["attempts"] == 4
+        assert provider_retry_calls == 4
+
+        retry_stdout, retry_stderr = stop_gateway(gateway_process)
+        gateway_stdout_parts.append(retry_stdout)
+        gateway_stderr_parts.append(retry_stderr)
         gateway_process, gateway_port, base_url = start_gateway(gateway_root)
 
         postcommit_secondary = state.count_containing("gateway-secondary-model")
@@ -1631,8 +1699,8 @@ def _installed_release_driver() -> None:
             timeout=10,
         )
         opted_refusal.raise_for_status()
-        assert opted_refusal.json()["choices"][0]["message"]["refusal"] == "policy refusal"
-        assert state.count_containing("gateway-secondary-model") == opted_secondary
+        assert opted_refusal.json()["choices"][0]["message"]["content"] == response_canary
+        assert state.count_containing("gateway-secondary-model") == opted_secondary + 1
 
         revoked = run_cli(
             "config",
@@ -1715,6 +1783,8 @@ def _installed_release_driver() -> None:
                 tool_argument_canary,
                 invalid_key_canary,
                 refusal_input_canary,
+                auth_input_canary,
+                sdk_retry_input_canary,
                 postcommit_input_canary,
                 postcommit_response_canary,
                 cancellation_input_canary,
@@ -1747,6 +1817,8 @@ def _installed_release_driver() -> None:
             tool_argument_canary,
             invalid_key_canary,
             refusal_input_canary,
+            auth_input_canary,
+            sdk_retry_input_canary,
             postcommit_input_canary,
             postcommit_response_canary,
             cancellation_input_canary,
@@ -2447,6 +2519,16 @@ def test_gateway_canary_scanner_covers_every_persistent_and_observable_channel(
                 channels=channels,
                 canaries=(canary,),
             )
+
+
+def test_package_workflow_installs_the_exact_certified_openai_sdk() -> None:
+    """The archive smoke lane constrains the SDK version claimed by certification."""
+    repository = Path(__file__).resolve().parent.parent
+    workflow = (repository / ".github" / "workflows" / "python-package.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'dist/*.whl "openai==3.0.0"' in workflow
 
 
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:

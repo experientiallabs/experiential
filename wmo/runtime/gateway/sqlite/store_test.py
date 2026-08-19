@@ -224,6 +224,74 @@ def test_authorization_serializes_with_concurrent_key_revocation(
         )
 
 
+def test_concurrent_multi_identity_revoke_and_revision_activation_are_serialized(
+    tmp_path: Path,
+) -> None:
+    """WAL preserves a concurrent revocation while another identity activates a revision."""
+    store, clock, revoked_raw_key = _configured_store(tmp_path)
+    store.create_identity(
+        organization_id="org-one",
+        identity_id="identity-two",
+        display_name="Identity Two",
+    )
+    store.grant_alias(
+        organization_id="org-one",
+        identity_id="identity-two",
+        alias_id="alias-coding",
+    )
+    surviving_raw_key = store.issue_virtual_key(
+        organization_id="org-one",
+        identity_id="identity-two",
+        key_id="key-two",
+    ).raw_key
+    second_store = SQLiteGatewayStore(
+        tmp_path / "gateway.db",
+        clock=clock,
+        busy_timeout_ms=10_000,
+    )
+    barrier = threading.Barrier(2)
+
+    def revoke() -> bool:
+        """Revoke the first identity's key at the shared concurrency boundary."""
+        barrier.wait(timeout=5)
+        return store.revoke_virtual_key(organization_id="org-one", key_id="key-one")
+
+    def activate() -> None:
+        """Activate a new immutable revision at the shared concurrency boundary."""
+        barrier.wait(timeout=5)
+        second_store.activate_alias_revision(
+            organization_id="org-one",
+            alias_id="alias-coding",
+            alias_name="coding",
+            revision_id="revision-two",
+            target=DirectTarget(pool_id="pool-coding"),
+            snapshot_ref="snapshot-one",
+            catalog_sha256=_DIGEST,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        revoked = executor.submit(revoke)
+        activated = executor.submit(activate)
+        assert revoked.result(timeout=15)
+        assert activated.result(timeout=15) is None
+
+    with pytest.raises(InvalidVirtualKeyError, match="invalid"):
+        store.authorize_request(
+            raw_key=revoked_raw_key,
+            alias="coding",
+            request=_request(),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+    snapshot = second_store.authorize_request(
+        raw_key=surviving_raw_key,
+        alias="coding",
+        request=_request(),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    assert snapshot.identity_id == "identity-two"
+    assert snapshot.alias_revision_id == "revision-two"
+
+
 def test_expiry_identity_disable_and_pepper_rotation_fail_closed(tmp_path: Path) -> None:
     """Expiry and identity state deny old keys while pepper rotation preserves fingerprints."""
     clock = FakeClock()

@@ -66,8 +66,10 @@ Provider execution is always internally streaming. Bounded same-deployment retri
 deployment fallback are allowed only for typed precommit failures. The first outward text, refusal,
 or tool-call semantic event commits the deployment, after which the gateway never switches
 providers. Typed refusal fallback is disabled unless the active alias revision explicitly enables
-it. Provider-internal retry layers are disabled so every possible billable dispatch is visible to
-the gateway ledger.
+it. Opted-in refusal deltas are withheld only in a bounded in-memory buffer: a refusal-only terminal
+result can advance to the next certified deployment, while mixed semantic output or buffer overflow
+commits and flushes the original route. Provider-internal retry layers are disabled so every
+possible billable dispatch is visible to the gateway ledger.
 
 Each physical attempt records its own provider, model, usage, latency, terminal state, and estimated
 cost attribution. The parent request terminalizes once after success, final failure, cancellation,
