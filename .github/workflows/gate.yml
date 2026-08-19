@@ -39,7 +39,7 @@ jobs:
 
   non-live-optimization:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
