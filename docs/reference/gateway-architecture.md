@@ -11,9 +11,9 @@ It serves:
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 
-The separate `wmo run PROJECT` form remains the frozen single-project compatibility server.
-Gateway startup and readiness perform no provider request. Only an authorized model request may
-cross the provider boundary.
+`wmo run PROJECT` is compatibility sugar that activates one project-backed alias and launches this
+same gateway application. It does not create a router HTTP server. Gateway startup and readiness
+perform no provider request. Only an authorized model request may cross the provider boundary.
 
 ## Authority and management
 
@@ -23,7 +23,9 @@ no runtime seeds. A usable installation requires an organization, active identit
 key, explicit identity-to-alias grant, active alias revision, immutable catalog snapshot, and a
 resolvable provider credential reference.
 
-Private authority state lives in `ROOT/gateway/gateway.db`. SQLite uses WAL mode, versioned forward
+Private serving authority lives in `ROOT/gateway/gateway.db`, including identities, keys, grants,
+provider connections and revisions, aliases and revisions, attempts, and usage. SQLite uses WAL
+mode, versioned forward
 migrations, private backups before migration, newer-schema refusal, and serialized initialization.
 Virtual keys are stored only as peppered fingerprints. Key material is delivered once in a JSON
 receipt or to a new mode-`0600` file, and commit ambiguity preserves recoverability. Provider
@@ -38,8 +40,10 @@ changes fail closed.
 
 ## Catalog, aliases, and exact-model pools
 
-`wmo/common/models/catalog.py` is the authored provider and deployment catalog. Gateway snapshots
-under `ROOT/gateway/catalog-snapshots/` are immutable, secret-free views of an exact catalog digest.
+The gateway database owns current provider connection state. Existing model metadata remains the
+authoring input for builds, policies, evaluations, and datasets; it is not consulted as mutable
+serving authority after an alias revision binds exact connection revisions. Gateway snapshots under
+`ROOT/gateway/catalog-snapshots/` are immutable, secret-free artifacts for an exact catalog digest.
 An advertised alias is executable only when readiness holds for the exact tuple of alias name,
 alias revision, and catalog digest used by authorization.
 
@@ -83,8 +87,11 @@ deployments.
 
 ## OpenAI-compatible protocol
 
-Chat Completions and Responses have separate allowlist decoders and field-specific OpenAI error
-responses. Both convert to one canonical gateway request without conflating their wire contracts.
+`wmo/runtime/openai_protocol` is the only OpenAI wire implementation. Chat Completions and
+Responses have separate allowlist decoders and field-specific OpenAI error responses, but both
+convert to one canonical gateway request without conflating their wire contracts. The package also
+owns headers, response assembly, SSE framing, tool-call reconstruction, and official SDK
+compatibility.
 Chat streaming emits valid completion chunks and one `[DONE]`. Responses streaming emits the
 created, in-progress, output, and exactly one terminal lifecycle. Provider tool-argument fragments
 are accumulated in original order and validated only at the complete-call boundary.

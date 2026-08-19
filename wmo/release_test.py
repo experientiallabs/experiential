@@ -458,11 +458,6 @@ def _installed_release_driver() -> None:
     from openai.types.responses import FunctionToolParam
 
     import wmo
-    from wmo.cli.gateway.catalog import (
-        upsert_certified_pool,
-        upsert_connection,
-        upsert_singleton_deployment,
-    )
     from wmo.cli.gateway.key_output import key_output_marker_path
     from wmo.common.models import (
         BillingSource,
@@ -497,6 +492,11 @@ def _installed_release_driver() -> None:
     from wmo.optimize.model.sft.selection import load_latest_sft_model_optimization
     from wmo.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
     from wmo.optimize.router.judging.service import prepare_manual_judge_calibration
+    from wmo.runtime.gateway.catalog_authority import (
+        upsert_certified_pool,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
     from wmo.runtime.gateway.lifecycle import load_local_gateway
     from wmo.runtime.gateway.management import GatewayManagement
     from wmo.runtime.models import (

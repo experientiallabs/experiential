@@ -8,7 +8,7 @@ The root surface is deliberately small:
 | `wmo optimize router PROJECT --root ROOT [--yes]` | Complete bounded fit simulation and judgment, lock a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `wmo optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `wmo run --root ROOT [--check]` | Validate or start the initialized authenticated multi-alias gateway on loopback. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
-| `wmo run PROJECT --root ROOT [--ghost]` | Load a frozen policy and expose it on development-only loopback. | Local OpenAI-compatible endpoint with durable journaling by default or no saved traffic in ghost mode. |
+| `wmo run PROJECT --root ROOT [--ghost]` | Activate a frozen policy as one project-backed alias and launch the normal gateway. | The same authenticated OpenAI endpoint and SQLite accounting as no-argument `wmo run`. |
 | `wmo config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, certified exact-model pools, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
 | `wmo config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. | Local `.wmo/models.toml`. |
 | `wmo config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command. | Local `.wmo/settings.toml`. |
@@ -24,11 +24,12 @@ the ceiling. Exact completed replays report a zero-dollar estimate and do not pr
 
 Successful build, router, simulation, and SFT operations preserve anonymous aggregate PostHog
 product telemetry, which may send unless disabled. `run` makes no provider call at startup.
-An HTTP completion or direct `RouterRuntime.complete` call is the explicit online model-call
-boundary. The router remains frozen for the process lifetime. `run --ghost` still permits provider
-calls but disables durable interaction, replay, RAG, and SFT state for that process.
+An authenticated gateway request is the explicit online model-call boundary. Project selectors
+remain frozen for the process lifetime and return only an exact model pool. `--ghost` remains a
+compatibility flag for project-journal behavior; gateway authentication, replay, attempts, and
+usage accounting stay enabled.
 
-No-argument `wmo run` is a separate gateway lifecycle. It binds only `127.0.0.1`, starts with no
+Both `wmo run` forms use one gateway lifecycle. It binds only `127.0.0.1`, starts with no
 provider call, and requires an explicit provider environment reference, exact model alias, identity,
 grant, and virtual key. `wmo run --non-interactive --json` returns `gateway_not_initialized` plus
 exact next commands on an empty root. `wmo run --check` validates local readiness without binding.
@@ -41,7 +42,9 @@ partitioned. Estimated cost is not provider invoice cost.
 
 One-time virtual-key material appears only in the successful key-issue receipt or a newly created
 mode-`0600` output file. Human key issuance on a non-terminal requires `--json` or `--output`.
-Provider configuration accepts an environment variable name, never a raw credential value.
+Provider configuration accepts an environment variable name, never a raw credential value. Its
+current revisions live in SQLite; immutable serving snapshots bind exact revisions while build and
+evaluation artifacts remain in the project artifact store.
 
 To add ordered failover, first author each deployment as a direct alias with the same
 `--exact-model`. Then certify their equivalence and order with:

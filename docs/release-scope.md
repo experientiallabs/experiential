@@ -26,8 +26,9 @@ on the exact release checkout.
   revision activation, and atomic rollback of a failed legacy SQLite migration.
 - One content and secret canary scanner covers the gateway database, live WAL, migration backups
   when present, catalog snapshots, stdout, stderr, logs, usage responses, and HTTP error bodies.
-- Public Python exposes provider-free build, explicit router composition, frozen router load and
-  HTTP application, structural text-versus-sandbox comparison, and managed SFT composition.
+- Public Python exposes provider-free build, explicit router composition, frozen selection-only
+  router load through the normal gateway application, structural text-versus-sandbox comparison,
+  and managed SFT composition. No separate router HTTP or SSE implementation is shipped.
 - W16 router evidence uses 100 normalized traces, 50 fit tasks, 20 held-out tasks, 140 planned
   cells, 130 deterministic text simulations, and 140 deterministic judgments under one finite
   simulation and judgment budget. Observed hosted-service spend is exactly $0.00.
