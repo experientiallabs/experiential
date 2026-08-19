@@ -522,7 +522,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
         episode_id="case-17",
     )
     assert first_selection.selected_alias == second_selection.selected_alias
-    assert runtime_catalog.clients["embedder"].embed_calls == 2
+    assert runtime_catalog.clients["embedder"].embed_calls == 1
     assert sum(client.complete_calls for client in runtime_catalog.clients.values()) == 0
     provenance = verify_release_evidence(
         project.artifacts,
