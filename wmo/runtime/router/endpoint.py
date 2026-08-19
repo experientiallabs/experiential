@@ -604,6 +604,7 @@ def model_messages(messages: tuple[HttpMessage, ...]) -> tuple[ModelMessage, ...
                         call_id=call.id,
                         name=call.function.name,
                         arguments=_arguments(call.function.arguments),
+                        raw_arguments=call.function.arguments,
                     )
                     for call in message.tool_calls
                 ),
@@ -732,7 +733,7 @@ def _assistant_message(action: AssistantAction) -> HttpMessage:
                 id=call.call_id,
                 function=HttpFunctionCall(
                     name=call.name,
-                    arguments=json.dumps(call.arguments, sort_keys=True, separators=(",", ":")),
+                    arguments=call.arguments_json(sort_keys=True, compact=True),
                 ),
             )
             for call in action.tool_calls
@@ -826,7 +827,7 @@ def _openai_response(
             "type": "function_call",
             "call_id": call.call_id,
             "name": call.name,
-            "arguments": json.dumps(call.arguments, sort_keys=True, separators=(",", ":")),
+            "arguments": call.arguments_json(sort_keys=True, compact=True),
             "status": "completed",
         }
         for call in action.tool_calls

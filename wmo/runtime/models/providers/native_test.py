@@ -113,7 +113,12 @@ def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity()
     assert isinstance(client, EmbeddingClient)
     assert response.model.model_id == "gpt-5.4-2026-08-11"
     assert response.output.tool_calls == (
-        ToolCall(call_id="call-new", name="create_ticket", arguments={"priority": "urgent"}),
+        ToolCall(
+            call_id="call-new",
+            name="create_ticket",
+            arguments={"priority": "urgent"},
+            raw_arguments='{"priority":"urgent"}',
+        ),
     )
     assert response.economics.usage == Usage(
         input_tokens=13,

@@ -237,7 +237,7 @@ def _openai_message(message: ModelMessage) -> JsonObject:
             {
                 "id": call.call_id,
                 "type": "function",
-                "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+                "function": {"name": call.name, "arguments": call.arguments_json()},
             }
             for call in action.tool_calls
         ]
@@ -275,7 +275,12 @@ def parse_openai_wire_tool_call(value: object, index: int) -> ToolCall:
         raise OpenAICompatibleResponseError(
             f"tool_calls[{index}].function.arguments must decode to an object"
         )
-    return ToolCall(call_id=call_id, name=name, arguments=arguments)
+    return ToolCall(
+        call_id=call_id,
+        name=name,
+        arguments=arguments,
+        raw_arguments=raw_arguments,
+    )
 
 
 def _array_or_empty(message: JsonObject) -> list[JsonValue]:

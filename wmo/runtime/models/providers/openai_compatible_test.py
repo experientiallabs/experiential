@@ -174,7 +174,12 @@ def test_openai_compatible_client_converts_tool_usage_and_resolved_identity() ->
     assert response.model.model_id == "served-model-20260811"
     assert response.output.content is None
     assert response.output.tool_calls == (
-        ToolCall(call_id="call-new", name="create_ticket", arguments={"priority": "urgent"}),
+        ToolCall(
+            call_id="call-new",
+            name="create_ticket",
+            arguments={"priority": "urgent"},
+            raw_arguments='{"priority":"urgent"}',
+        ),
     )
     assert response.economics.usage is not None
     assert response.economics.usage.input_tokens == 12

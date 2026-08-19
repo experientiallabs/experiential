@@ -260,7 +260,7 @@ def _responses_items_for_message(message: ModelMessage) -> list[JsonObject]:
                 "type": "function_call",
                 "call_id": call.call_id,
                 "name": call.name,
-                "arguments": json.dumps(call.arguments),
+                "arguments": call.arguments_json(),
             }
             for call in action.tool_calls
         )
@@ -282,7 +282,12 @@ def _tool_call(item: ResponseFunctionToolCall, index: int) -> ToolCall:
             f"OpenAI Responses output[{index}].arguments must decode to an object"
         )
     try:
-        return ToolCall(call_id=item.call_id, name=item.name, arguments=arguments)
+        return ToolCall(
+            call_id=item.call_id,
+            name=item.name,
+            arguments=arguments,
+            raw_arguments=item.arguments,
+        )
     except ValidationError as exc:
         raise ProviderResponseError(
             f"OpenAI Responses output[{index}] tool call is incomplete"

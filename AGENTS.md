@@ -172,6 +172,11 @@ uv run pytest -q
    Provider execution belongs under `wmo/runtime/models/providers/`. Common, runtime, and simulation
    must not import optimize. Keep the locked CLI small and do not return production modules to the
    flat `wmo/` namespace.
+   Provider-neutral gateway request, stream-event, target, and persistence interfaces live under
+   `wmo/runtime/gateway/`. They remain inert until a later application owner composes them. Exact
+   deployment metadata and singleton catalog normalization live under `wmo/common/models/`.
+   Gateway-only protocol and integer-pricing fields must not be added to `ModelCapabilities`:
+   its existing identity digest remains frozen for router artifact compatibility.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
    `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.
