@@ -20,6 +20,8 @@ from wmo.common.models import (
     ToolCall,
     Usage,
 )
+from wmo.runtime.gateway.contracts import GatewayRequest
+from wmo.runtime.models.providers.async_transport import RequestDeadline
 from wmo.runtime.models.providers.base import ProviderHttpClient
 from wmo.runtime.models.providers.errors import (
     ProviderRefusalError,
@@ -29,6 +31,10 @@ from wmo.runtime.models.providers.errors import (
     require_integer,
     require_object,
     require_string,
+)
+from wmo.runtime.models.providers.streaming import (
+    NormalizedProviderStream,
+    start_openai_compatible_stream,
 )
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -198,7 +204,41 @@ class OpenAIEmbeddingMixin(ProviderHttpClient):
 
 
 class OpenAICompatibleClient(OpenAIEmbeddingMixin):
-    """Calls one explicit OpenAI-compatible connection without streaming or failover."""
+    """Calls one explicit OpenAI-compatible connection without cross-provider failover."""
+
+    async def stream(
+        self,
+        request: GatewayRequest,
+        *,
+        deadline: RequestDeadline,
+        idempotency_key: str,
+    ) -> NormalizedProviderStream:
+        """Start one true Chat Completions stream under the gateway deadline.
+
+        Args:
+            request: Canonical streaming gateway request.
+            deadline: Immutable request-wide deadline.
+            idempotency_key: Stable identity for safe pre-commit opening retries.
+
+        Returns:
+            A cancellable provider-neutral event stream.
+
+        Raises:
+            ValueError: The canonical request did not ask for streaming.
+        """
+        if not request.stream:
+            raise ValueError("gateway provider stream requires request.stream")
+        return await start_openai_compatible_stream(
+            self._transport,
+            f"{self._base_url}/{self._request_path(self._completion_path())}",
+            headers=self._headers(),
+            request=request,
+            model_id=self._model.model_id,
+            deadline=deadline,
+            idempotency_key=idempotency_key,
+            retry_policy=self._retry_policy,
+            timeout_seconds=self._timeout_seconds,
+        )
 
     def _completion_path(self) -> str:
         """Return the shared Chat Completions route."""

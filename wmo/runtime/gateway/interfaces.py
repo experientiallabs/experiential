@@ -78,6 +78,11 @@ class AttemptLedger(Protocol):
 class ProviderStream(Protocol):
     """True provider stream yielding normalized events in provider order."""
 
+    @property
+    def committed(self) -> bool:
+        """Return whether an outward semantic event has committed this provider route."""
+        ...
+
     def __aiter__(self) -> AsyncIterator[GatewayEvent]:
         """Iterate normalized provider events until one terminal event."""
         ...
