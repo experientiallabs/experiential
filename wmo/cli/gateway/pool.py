@@ -106,16 +106,42 @@ def pool_certify(
                 raise GatewayCatalogAuthoringError(
                     "gateway catalog changed; refresh its digest before certifying the pool"
                 )
-            apply_certified_pool_update(root, update)
+            activation_started = False
             try:
+                apply_certified_pool_update(root, update)
+                activation_started = True
                 activation_changed = manager.activate_direct_alias(**activation_arguments)
-            except BaseException:
+            except BaseException as activation_error:
+                if not activation_started:
+                    rollback_certified_pool_update(root, update)
+                    raise
                 try:
                     activation_committed = not manager.preflight_direct_alias_activation(
                         **activation_arguments
                     )
                 except BaseException:  # noqa: BLE001 - preserve the primary activation failure
-                    activation_committed = False
+                    emit_receipt(
+                        GatewayReceipt(
+                            operation="pool.certify",
+                            resource_kind="alias_revision",
+                            resource_id=revision,
+                            changed=None,
+                            data={
+                                "status": "operation_outcome_unknown",
+                                "alias": alias,
+                                "pool_id": alias,
+                                "catalog_sha256": update.normalized.identity_sha256(),
+                                "revision": revision,
+                                "recovery": "inspect alias status before retrying",
+                            },
+                        ),
+                        json_output=json_output,
+                        human=(
+                            "operation_outcome_unknown: desired catalog preserved; inspect alias "
+                            f"{alias!r} revision {revision!r} before retrying"
+                        ),
+                    )
+                    raise typer.Exit(code=1) from activation_error
                 if not activation_committed:
                     rollback_certified_pool_update(root, update)
                     raise

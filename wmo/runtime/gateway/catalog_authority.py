@@ -337,6 +337,8 @@ def rollback_certified_pool_update(root: Path, update: CertifiedPoolUpdate) -> N
     if not update.changed:
         return
     current = load_model_catalog(root / "models.toml")
+    if current == update.original:
+        return
     if current != update.updated:
         raise GatewayCatalogAuthoringError(
             "gateway catalog changed during alias activation; refusing unsafe rollback"
