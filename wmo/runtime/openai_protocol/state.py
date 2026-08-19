@@ -13,7 +13,7 @@ from pydantic import Field
 
 from wmo.common.core.artifacts import ContractModel, Sha256
 from wmo.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage
-from wmo.runtime.gateway.openai.errors import OpenAIProtocolError
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
 class ProtocolNamespace(ContractModel):

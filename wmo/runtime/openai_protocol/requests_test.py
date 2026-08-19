@@ -1,4 +1,4 @@
-"""Tests for separate Chat Completions and Responses request decoding."""
+"""Tests for shared Chat Completions and Responses request decoding."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import pytest
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.runtime.gateway.contracts import GatewayApiSurface, GatewayNamedToolChoice
-from wmo.runtime.gateway.openai.errors import OpenAIProtocolError
-from wmo.runtime.gateway.openai.requests import (
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
+from wmo.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
     decode_chat,
     decode_responses,

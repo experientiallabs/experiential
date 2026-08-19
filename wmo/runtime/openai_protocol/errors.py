@@ -1,4 +1,4 @@
-"""Stable OpenAI-shaped public errors for the gateway protocol boundary."""
+"""Stable OpenAI-shaped public errors for the shared serving boundary."""
 
 from __future__ import annotations
 

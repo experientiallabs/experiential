@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from wmo.runtime.gateway.contracts import CompatibilityDisposition, CompatibilityManifest
-from wmo.runtime.gateway.openai.manifest import (
+from wmo.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     RESPONSES_MANIFEST,
     disposition_map,
