@@ -20,7 +20,7 @@ from typer.testing import CliRunner
 
 from wmo.cli.app import app
 from wmo.cli.build_cmd import _build_grounded_artifacts
-from wmo.cli.router_candidate_setup import collect_router_candidate_setup
+from wmo.cli.optimize.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes
 from wmo.common.models import (
     AssistantAction,
@@ -503,7 +503,7 @@ def test_replay_restores_discovered_candidate_records_before_reporting_success(
         tmp_path: Isolated local WMO root.
         monkeypatch: Test patching seam for the CLI's already-collected candidate plan.
     """
-    import wmo.cli.router_app as router_app
+    import wmo.cli.optimize.router as router_app
 
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)

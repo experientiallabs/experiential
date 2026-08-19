@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import typer
 
-from wmo.cli.model_optimize import optimize_model
-from wmo.cli.router_app import router
+from wmo.cli.optimize.model import optimize_model
+from wmo.cli.optimize.router import router
 
 optimize_app = typer.Typer(
     help="Offline optimization of frozen project artifacts.",

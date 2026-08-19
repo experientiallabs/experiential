@@ -103,8 +103,8 @@ def test_missing_package_revision_fails_before_spend_consent(
         consent_calls += 1
         return True
 
-    monkeypatch.setattr("wmo.cli.router_app.installed_release_revision", missing_revision)
-    monkeypatch.setattr("wmo.cli.router_app.require_spend_consent", unexpected_consent)
+    monkeypatch.setattr("wmo.cli.optimize.router.installed_release_revision", missing_revision)
+    monkeypatch.setattr("wmo.cli.optimize.router.require_spend_consent", unexpected_consent)
 
     result = _RUNNER.invoke(
         app,

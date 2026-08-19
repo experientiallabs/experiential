@@ -215,7 +215,7 @@ def test_cli_first_run_builds_runtime_w12_and_config_without_bootstrap(
         output=AssistantAction(content="First routed training response"),
         now=_TIME,
     )
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: backend)
     monkeypatch.setattr(command, "installed_release_revision", lambda: "automatic-cli-test")
@@ -356,7 +356,7 @@ def test_cli_first_run_noninteractive_reports_all_required_tinker_flags(
         output=AssistantAction(content="Completed response"),
         now=_TIME,
     )
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     backend_calls = []
     artifact_ids = fixture.store.artifacts.list_ids()
     catalog_bytes = fixture.store.model_catalog_path.read_bytes()
@@ -420,7 +420,7 @@ def test_first_run_setup_cancellation_writes_no_catalog_or_training_state(
             },
         ),
     )
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     catalog_bytes = fixture.store.model_catalog_path.read_bytes()
     artifact_ids = fixture.store.artifacts.list_ids()
     answers = iter(("tinker-local", "base", "TINKER_API_KEY", "test-base-model"))
@@ -475,7 +475,7 @@ def test_cli_runs_fake_w13_then_idempotently_resumes_without_consent(
 ) -> None:
     """The customer path trains once with --yes and later verifies a completed run without spend."""
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     first_backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: first_backend)
     monkeypatch.setattr(command, "installed_release_revision", lambda: "w14m-test")
@@ -563,7 +563,7 @@ def test_cli_crash_after_sft_receipt_replays_without_duplicate_event_or_dispatch
 ) -> None:
     """Durable catalog registration and telemetry receipt survive the final CLI crash window."""
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     first_backend = _FakeBackend(conservative_cost_per_batch=0.10)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: first_backend)
     monkeypatch.setattr(command, "installed_release_revision", lambda: "w14m-test")
@@ -628,7 +628,7 @@ def test_cli_yes_does_not_bypass_the_unsupported_budget_estimate_gate(
 ) -> None:
     """Passing --yes cannot turn an unpriceable maximum-cost Tinker plan into a dispatch."""
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     backend = _FakeBackend(conservative_cost_per_batch=None)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: backend)
     monkeypatch.setattr(command, "installed_release_revision", lambda: "w14m-test")
@@ -662,7 +662,7 @@ def test_cli_empty_journal_fails_before_backend_or_consent(
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
     configured.store.paths.runtime_journal.unlink()
     RuntimeInteractionJournal(configured.store.paths).spend_path.unlink()
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     backend_calls = []
     consent_calls = []
 
@@ -720,7 +720,7 @@ def test_declined_spend_consent_does_not_resolve_credentials_or_construct_sdk(
         monkeypatch: Scoped consent and backend-boundary replacements.
     """
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     backend_calls = []
 
     def forbidden_backend(*args: object) -> Never:
@@ -763,7 +763,7 @@ def test_completion_before_consent_refreshes_the_schedule_and_trains_once(
         monkeypatch: Scoped race injection, consent, backend, and revision replacements.
     """
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     original_preflight = command.preflight_sft_model_optimization
     preflight_calls = 0
     consented_row_counts: list[int] = []
@@ -843,7 +843,7 @@ def test_completion_during_consent_fails_before_run_acceptance_and_reconsents(
         monkeypatch: Scoped consent-race, backend, and revision replacements.
     """
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     backend_calls: list[bool] = []
     consent_calls: list[str] = []
 
@@ -939,7 +939,7 @@ def test_accepted_prefix_resumes_after_crash_and_defers_later_completion(
         monkeypatch: Scoped consent, crash, backend, and revision replacements.
     """
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     consent_calls: list[str] = []
     compose_calls: list[str] = []
     runner = CliRunner()
@@ -1086,7 +1086,7 @@ def test_connection_drift_after_consent_fails_before_credential_or_sdk(
     import tinker
 
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     credential_reads = []
     service_calls = []
 
@@ -1188,7 +1188,7 @@ def test_first_run_explicit_zero_training_price_is_preserved(
         output=AssistantAction(content="Train this response"),
         now=_TIME,
     )
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     backend = _FakeBackend(cost_per_batch=0.0, conservative_cost_per_batch=0.0)
     monkeypatch.setattr(command, "_compose_tinker_backend", lambda *_args: backend)
     monkeypatch.setattr(command, "installed_release_revision", lambda: "explicit-zero-price-test")
@@ -1253,7 +1253,7 @@ def test_schedule_ceiling_refuses_before_tinker_backend_construction(
         output=AssistantAction(content="Expensive response"),
         now=_TIME,
     )
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     backend_calls = []
 
     def forbidden_backend(*args: object) -> Never:
@@ -1310,7 +1310,7 @@ def test_command_budget_rejects_sft_before_credentials_even_with_yes(
     """
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
     set_maximum_command_cost_usd(0.01, configured.store.paths.root)
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     backend_calls: list[bool] = []
 
     def forbidden_backend(*args: object) -> Never:
@@ -1361,7 +1361,7 @@ def test_selected_price_replay_rejects_explicit_drift_before_backend(
         monkeypatch: Scoped backend replacement proving drift fails locally.
     """
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     backend_calls = []
 
     def forbidden_backend(*args: object) -> Never:
@@ -1407,7 +1407,7 @@ def test_tinker_backend_uses_the_selected_credential_environment(
     import tinker
 
     configured = _configured_project(tmp_path, _spec(maximum_cost_usd=1.0))
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     constructed = []
 
     def service_client(*, api_key: str, base_url: str | None = None) -> object:
@@ -1443,7 +1443,7 @@ def test_catalog_setup_preserves_unrelated_concurrent_additions(tmp_path: Path) 
         tmp_path: Pytest-owned project directory.
     """
     fixture = _persisted_dataset(tmp_path)
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     observed = _seed_catalog(fixture.store)
     concurrent = observed.model_copy(
         update={
@@ -1494,7 +1494,7 @@ def test_catalog_setup_rejects_concurrent_target_drift(tmp_path: Path, conflict:
         conflict: Confirmed catalog entry changed by the simulated concurrent writer.
     """
     fixture = _persisted_dataset(tmp_path)
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     observed = _seed_catalog(fixture.store)
     connections = dict(observed.connections)
     models = dict(observed.models)
@@ -1532,7 +1532,7 @@ def test_catalog_setup_is_idempotent_for_same_concurrent_selection(tmp_path: Pat
         tmp_path: Pytest-owned project directory.
     """
     fixture = _persisted_dataset(tmp_path)
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     observed = _seed_catalog(fixture.store)
     observed_sha256 = sha256_json(observed)
     arguments = {
@@ -1557,7 +1557,7 @@ def test_catalog_setup_preserves_compatible_base_model_metadata(tmp_path: Path) 
         tmp_path: Pytest-owned project directory.
     """
     fixture = _persisted_dataset(tmp_path)
-    command = importlib.import_module("wmo.cli.model_optimize")
+    command = importlib.import_module("wmo.cli.optimize.model")
     existing_record = ModelRecord(
         billing_source=BillingSource.CUSTOMER_MANAGED,
         connection="tinker-local",

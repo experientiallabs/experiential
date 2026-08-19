@@ -10,10 +10,10 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm
 
-from wmo.cli import router_candidate_setup
+from wmo.cli.optimize import router_candidate_setup
+from wmo.cli.optimize.router_candidate_setup import collect_router_candidate_setup
 from wmo.cli.picker import PickerAction, PickerOption, PickerResult
 from wmo.cli.provider_setup import RouterCandidatePickerResult
-from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.models import (
     BillingSource,
     ConnectionConfig,

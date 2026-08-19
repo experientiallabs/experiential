@@ -20,7 +20,7 @@ app.add_typer(config_app, name="config")
 add_deferred_typer(
     app,
     name="optimize",
-    module="wmo.cli.optimize_app",
+    module="wmo.cli.optimize.app",
     attr="optimize_app",
     help="Optimize supported frozen project artifacts.",
     known_names=("router", "model"),
