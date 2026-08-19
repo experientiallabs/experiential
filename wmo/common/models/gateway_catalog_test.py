@@ -10,7 +10,7 @@ from wmo.common.models.catalog import (
     ModelRecord,
     SFTModelProvenance,
 )
-from wmo.common.models.gateway_catalog import normalize_gateway_catalog
+from wmo.common.models.gateway_catalog import ExactModelDeployment, normalize_gateway_catalog
 from wmo.common.models.model import ModelCapabilities, ModelSnapshot
 
 _DIGEST = "a" * 64
@@ -124,6 +124,24 @@ def test_billing_source_changes_catalog_identity_without_changing_exact_model() 
     assert customer_normalized.deployments[0].billing_source == BillingSource.CUSTOMER_MANAGED
     assert host_normalized.deployments[0].billing_source == BillingSource.HOST_MANAGED
     assert customer_normalized.identity_sha256() != host_normalized.identity_sha256()
+
+
+def test_legacy_normalized_deployment_defaults_to_customer_managed_billing() -> None:
+    """A normalized payload written before billing attribution decodes conservatively."""
+    deployment = ExactModelDeployment.model_validate(
+        {
+            "deployment_id": "coding",
+            "source_alias": "coding",
+            "exact_model_id": "exact-coding",
+            "connection": "openai",
+            "provider": "openai",
+            "provider_model": "gpt-coding",
+            "connection_sha256": "a" * 64,
+            "capabilities_sha256": "b" * 64,
+        }
+    )
+
+    assert deployment.billing_source == BillingSource.CUSTOMER_MANAGED
 
 
 def test_tinker_and_sft_records_are_not_gateway_deployments() -> None:
