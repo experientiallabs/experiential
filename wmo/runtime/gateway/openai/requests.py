@@ -97,6 +97,12 @@ class _Message(_WireModel):
         return self
 
 
+class _ResponseMessage(_Message):
+    """Responses message item with its optional official discriminator."""
+
+    type: Literal["message"] = "message"
+
+
 class _FunctionDefinition(_WireModel):
     """One function schema offered through Chat Completions."""
 
@@ -224,7 +230,7 @@ class _ResponsesRequest(_WireModel):
     """Closed gateway Responses request profile."""
 
     model: str = Field(min_length=1, max_length=256)
-    input: str | tuple[_Message | _ResponseFunctionCall | _ResponseFunctionOutput, ...]
+    input: str | tuple[_ResponseMessage | _ResponseFunctionCall | _ResponseFunctionOutput, ...]
     instructions: str | None = None
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     tools: tuple[_ResponseTool, ...] = ()
@@ -524,14 +530,14 @@ def _responses_structured_text(value: _ResponseText | None) -> StructuredTextFor
 
 
 def _response_input_messages(
-    value: str | tuple[_Message | _ResponseFunctionCall | _ResponseFunctionOutput, ...],
+    value: str | tuple[_ResponseMessage | _ResponseFunctionCall | _ResponseFunctionOutput, ...],
 ) -> tuple[GatewayMessage, ...]:
     """Convert Responses input items into ordered canonical history."""
     if isinstance(value, str):
         return (GatewayMessage(role="user", content=value),)
     messages: list[GatewayMessage] = []
     for index, item in enumerate(value):
-        if isinstance(item, _Message):
+        if isinstance(item, _ResponseMessage):
             messages.extend(_messages((item,), f"input.{index}"))
         elif isinstance(item, _ResponseFunctionCall):
             wire_call = _AssistantToolCall(

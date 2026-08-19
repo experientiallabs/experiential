@@ -99,7 +99,7 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
             "model": "coding",
             "instructions": "Use tools.",
             "input": [
-                {"role": "user", "content": "Weather?"},
+                {"type": "message", "role": "user", "content": "Weather?"},
                 {
                     "type": "function_call",
                     "call_id": "call-one",
