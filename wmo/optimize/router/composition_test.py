@@ -854,6 +854,77 @@ class _CapExhaustedSimulatorFactory(_SimulatorFactory):
         return _LoggingSimulator(project, simulator, self.log)
 
 
+class _HeldOutCrashSimulatorFactory(_CapExhaustedSimulatorFactory):
+    """Cap-exhausted factory that crashes once before the held-out resume re-invocation."""
+
+    def __init__(self, failing_instruction: str) -> None:
+        """Target one held-out task and arm one crash before its resume re-execution.
+
+        Args:
+            failing_instruction: Exact held-out task instruction whose dispatch fails once.
+        """
+        super().__init__(failing_instruction, maximum_failures=1)
+        self.crash_armed = True
+        self.held_out_runs = 0
+
+    def __call__(self, project: ProjectStore, plan: EvaluationPlan) -> Simulator:
+        """Wrap the grounded simulator with a one-shot crash on the held-out resume run.
+
+        Args:
+            project: Project owning the completed immutable build graph.
+            plan: Frozen evaluation plan selected for simulation.
+
+        Returns:
+            Crash adapter around the reservation-bound grounded text simulator.
+        """
+        simulator = super().__call__(project, plan)
+        return _CrashBeforeHeldOutResumeSimulator(self, project, simulator)
+
+
+class _CrashBeforeHeldOutResumeSimulator:
+    """Crash once on the second held-out run, after superseded evidence persists."""
+
+    def __init__(
+        self,
+        factory: _HeldOutCrashSimulatorFactory,
+        project: ProjectStore,
+        simulator: Simulator,
+    ) -> None:
+        """Store the owning factory, project, and delegated simulator.
+
+        Args:
+            factory: Factory holding the shared crash arming and run counters.
+            project: Project whose policy-lock artifacts mark the held-out phase.
+            simulator: Delegated logging simulator for every surviving run.
+        """
+        self.factory = factory
+        self.project = project
+        self.simulator = simulator
+
+    def run(self, spec: SimulationSpec) -> SimulationArtifactSet:
+        """Crash before the armed held-out re-invocation, then delegate.
+
+        Args:
+            spec: Frozen simulation spec for one phase invocation.
+
+        Returns:
+            The delegated simulation artifact set.
+
+        Raises:
+            RuntimeError: The armed crash before the held-out resume re-invocation.
+        """
+        locked = any(
+            artifact_id.startswith("router-policy-lock-")
+            for artifact_id in self.project.artifacts.list_ids()
+        )
+        if locked:
+            self.factory.held_out_runs += 1
+            if self.factory.held_out_runs == 2 and self.factory.crash_armed:
+                self.factory.crash_armed = False
+                raise RuntimeError("simulated crash before held-out resume")
+        return self.simulator.run(spec)
+
+
 def test_composition_rejects_fit_rag_outside_completed_build_before_simulation(
     tmp_path: Path,
 ) -> None:
@@ -1566,6 +1637,156 @@ def test_retryable_attempt_zero_failure_converges_in_one_composition_invocation(
         services=services,
         budget=budget,
         created_at=_TIME + timedelta(hours=1),
+        code_revision="test-revision",
+    )
+    assert second.optimization == first.optimization
+    assert (
+        len(simulator.log),
+        len(simulator.candidate.requests),
+        len(simulator.failing.requests),
+        len(simulator.world.requests),
+        judge.calls,
+    ) == dispatched
+
+
+def test_crash_before_heldout_resume_completes_report_without_refit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash after policy lock with superseded held-out evidence resumes to a report.
+
+    The interrupted state persists the frozen policy, its lock, and a held-out artifact
+    set containing one reexecutable dispatch failure, but no report. One composition
+    call then re-executes only the superseded held-out cell, publishes the report, and
+    never refits or unlocks the frozen policy.
+
+    Args:
+        tmp_path: Isolated project root for composed router artifacts.
+        monkeypatch: Patch fixture proving the resume never refits.
+    """
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    completed = _bind_completed_build(project, normalized, revision="test-revision")
+    tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
+    failing_task = tuple(task for task in tasks if task.partition == "held_out")[0]
+    simulator = _HeldOutCrashSimulatorFactory(failing_task.instruction)
+    judge = _Judge()
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_ReservedSetupSupplier(),
+        simulator_factory=simulator,
+        judge=judge,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "candidate-b": _snapshot("candidate-b"),
+                    "embedder": _snapshot("embedder"),
+                },
+                _Client(),
+            ),
+        ),
+    )
+    budget = RouterCompositionBudget(
+        maximum_simulation_cost_usd=10.0,
+        maximum_judgments=400,
+    )
+
+    with pytest.raises(RuntimeError, match="before held-out resume"):
+        compose_router(
+            project,
+            normalized,
+            services=services,
+            budget=budget,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
+    def _artifact_ids(artifact_type: str) -> tuple[str, ...]:
+        """Return persisted artifact IDs of one exact manifest type.
+
+        Args:
+            artifact_type: Exact immutable manifest artifact type.
+
+        Returns:
+            Matching persisted artifact identifiers.
+        """
+        return tuple(
+            artifact_id
+            for artifact_id in project.artifacts.list_ids()
+            if project.artifacts.read(artifact_id).manifest.artifact_type == artifact_type
+        )
+
+    assert len(_artifact_ids("router-policy")) == 1
+    locks = _artifact_ids("router-policy-lock")
+    assert len(locks) == 1
+    assert not _artifact_ids("router-report")
+    assert simulator.failing.failures == 1
+
+    from wmo.optimize.router import composition as workflow_module
+
+    monkeypatch.setattr(
+        workflow_module,
+        "fit_router",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("fit repeated")),
+    )
+    crashed_candidate_requests = len(simulator.candidate.requests)
+    crashed_failing_requests = len(simulator.failing.requests)
+    first = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="test-revision",
+    )
+
+    assert _artifact_ids("router-policy-lock") == locks
+    assert len(_artifact_ids("router-report")) == 1
+    assert simulator.failing.failures == 1
+    assert len(simulator.candidate.requests) == crashed_candidate_requests
+    assert len(simulator.failing.requests) == crashed_failing_requests + 1
+    retried = {
+        rollout.cell_id: rollout
+        for artifact_set in (
+            SimulationArtifactSet.model_validate_json(
+                project.artifacts.read_bytes(artifact_id, "artifact-set.json")
+            )
+            for artifact_id in _artifact_ids("simulation-artifact-set")
+        )
+        for rollout in (
+            read_rollout(project.artifacts, rollout_id)[0]
+            for rollout_id in artifact_set.artifact_ids
+        )
+        if rollout.retry_attempt >= 1
+    }
+    assert len(retried) == 1
+    (recovered,) = retried.values()
+    assert recovered.retry_attempt == 1
+    assert recovered.stop_reason == StopReason.COMPLETED
+    assert recovered.failure is None
+    recovered_cell = next(cell for cell in first.plan.cells if cell.cell_id == recovered.cell_id)
+    assert recovered_cell.task_id == failing_task.task_id
+    assert recovered_cell.candidate_alias == "candidate-b"
+    assert recovered_cell.purpose == "held_out"
+
+    dispatched = (
+        len(simulator.log),
+        len(simulator.candidate.requests),
+        len(simulator.failing.requests),
+        len(simulator.world.requests),
+        judge.calls,
+    )
+    second = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME + timedelta(hours=2),
         code_revision="test-revision",
     )
     assert second.optimization == first.optimization

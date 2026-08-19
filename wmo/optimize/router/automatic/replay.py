@@ -130,6 +130,10 @@ def find_completed_automatic_router_replay(
 ) -> AutomaticRouterReplay | None:
     """Return a fully verified completed optimization without opening consent boundaries.
 
+    A frozen policy whose held-out report was never published is an interrupted
+    optimization rather than a completed one, so it never matches here and the
+    composition flow resumes it from persisted evidence instead.
+
     Args:
         project: Existing completed project.
         preflight: Current read-only automatic-router prerequisites and reservations.
@@ -168,8 +172,10 @@ def find_completed_automatic_router_replay(
             continue
         if not _simulation_specs_match(project, plan.plan_id, preflight, options, code_revision):
             continue
-        lock_id = _matching_policy_lock(project, policy)
         report_id = _matching_router_report(project, policy)
+        if report_id is None:
+            continue
+        lock_id = _matching_policy_lock(project, policy)
         replay_catalog = cast(
             RuntimeModelCatalog,
             _ReadOnlyReplayCatalog(preflight.catalog),
@@ -261,10 +267,13 @@ def find_persisted_automatic_router_replay(
             code_revision=code_revision,
         ):
             continue
+        report_id = _matching_router_report(project, policy)
+        if report_id is None:
+            continue
         matches.append(
             AutomaticRouterReplay(
                 policy_id=policy.policy_id,
-                report_id=_matching_router_report(project, policy),
+                report_id=report_id,
                 execution_contract_id=execution.execution_contract_id,
                 policy_lock_id=_matching_policy_lock(project, policy),
                 judgment_status=policy.judgment_status,
@@ -537,15 +546,21 @@ def _matching_policy_lock(project: ProjectStore, policy: KnnRouterPolicy) -> Art
     return _one(matches, "router policy lock")
 
 
-def _matching_router_report(project: ProjectStore, policy: KnnRouterPolicy) -> ArtifactId:
-    """Return the unique held-out report that names the frozen policy.
+def _matching_router_report(project: ProjectStore, policy: KnnRouterPolicy) -> ArtifactId | None:
+    """Return the unique held-out report that names the frozen policy, if published.
+
+    A frozen policy with no published report is an interrupted optimization, not a
+    completed one, so a missing report means resume rather than an error.
 
     Args:
         project: Project-local immutable artifact store.
         policy: Matching frozen policy.
 
     Returns:
-        Unique held-out router report identity.
+        Unique held-out router report identity, or ``None`` when no report exists.
+
+    Raises:
+        AutomaticRouterReplayError: More than one report names the policy.
     """
     matches = []
     for artifact_id in _artifact_ids(project, "router-report"):
@@ -559,7 +574,11 @@ def _matching_router_report(project: ProjectStore, policy: KnnRouterPolicy) -> A
             and envelope_matches_manifest(report, stored.manifest)
         ):
             matches.append(artifact_id)
-    return _one(matches, "router report")
+    if len(matches) > 1:
+        raise AutomaticRouterReplayError(
+            f"completed automatic router has {len(matches)} matching router report artifacts"
+        )
+    return matches[0] if matches else None
 
 
 def _load_policy(project: ProjectStore, artifact_id: ArtifactId) -> KnnRouterPolicy:
