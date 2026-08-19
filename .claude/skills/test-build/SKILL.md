@@ -70,16 +70,20 @@ Keep these exact. If a pin is unavailable, stop and report which one failed.
 - World model, first router candidate, and incumbent: hosted OpenAI-compatible
   `deepseek-v4-flash` as alias `dsflash`
 - Second hosted router candidate: `deepseek-ai/DeepSeek-V4-Flash-0731` as alias `dsflash0731`,
-  served by the same hosted endpoint, so both hosted model IDs exercise the same connection
+  served by the same hosted endpoint, so both hosted model IDs exercise the same connection.
+  The endpoint reports `deepseek-v4-flash` as the served identity for this dated ID, so the
+  alias pins `served_model_id` to `deepseek-v4-flash` and identity validation stays strict
 - Judge and third router candidate: OpenAI `gpt-5.6-luna` as alias `luna`. It rejects an
   explicit temperature, so its capabilities pin `supports_temperature` false and
   `reasoning_effort` `xhigh`. Its `maximum_output_tokens` is `32000` because the judge
   preflight requires an output budget of at least `16384` and fails closed below it.
 - Embedder: OpenAI `text-embedding-3-small` as alias `embed`
-- Shared command budget: `$50` via `wmo config budget`
+- Shared command budget: `$75` via `wmo config budget`
 - Build ceiling: `$5`
 - Judge calibration sample: `10` lineages, labeled non-interactively in two passes (see step 5)
-- Router ceilings: `$50` provider cost, `200` judgments, `10` model calls
+- Router ceilings: `$60` provider cost, `210` judgments, `10` model calls. Three candidates
+  over 50 fit plus 20 held-out tasks schedule 210 judgment cells, and preflight reserves the
+  complete schedule conservatively, so lower ceilings fail closed before any call
 - Loopback: `127.0.0.1:8000` with durable journaling (do not pass `--ghost`)
 
 The uniform label of `1` is a path-exercise input on the default 0-1 task-success axis. It is
@@ -164,7 +168,7 @@ bench config-providers uv run wmo config providers \
   --connection-json '{"name":"openai","provider":"openai","api_key_env":"OPENAI_API_KEY"}' \
   --connection-json "$EXPWM_JSON" \
   --model-json '{"alias":"dsflash","connection":"expwm","model":"deepseek-v4-flash","capabilities":{"supports_completions":true,"supports_tools":true,"supports_structured_output":true,"supports_temperature":true,"supports_embeddings":false,"maximum_output_tokens":16000,"context_window_tokens":1048576,"input_cost_per_million_tokens_usd":0,"output_cost_per_million_tokens_usd":0,"cached_input_cost_per_million_tokens_usd":0,"cache_write_cost_per_million_tokens_usd":0}}' \
-  --model-json '{"alias":"dsflash0731","connection":"expwm","model":"deepseek-ai/DeepSeek-V4-Flash-0731","capabilities":{"supports_completions":true,"supports_tools":true,"supports_structured_output":true,"supports_temperature":true,"supports_embeddings":false,"maximum_output_tokens":16000,"context_window_tokens":1048576,"input_cost_per_million_tokens_usd":0,"output_cost_per_million_tokens_usd":0,"cached_input_cost_per_million_tokens_usd":0,"cache_write_cost_per_million_tokens_usd":0}}' \
+  --model-json '{"alias":"dsflash0731","connection":"expwm","model":"deepseek-ai/DeepSeek-V4-Flash-0731","served_model_id":"deepseek-v4-flash","capabilities":{"supports_completions":true,"supports_tools":true,"supports_structured_output":true,"supports_temperature":true,"supports_embeddings":false,"maximum_output_tokens":16000,"context_window_tokens":1048576,"input_cost_per_million_tokens_usd":0,"output_cost_per_million_tokens_usd":0,"cached_input_cost_per_million_tokens_usd":0,"cache_write_cost_per_million_tokens_usd":0}}' \
   --model-json '{"alias":"luna","connection":"openai","model":"gpt-5.6-luna","capabilities":{"supports_completions":true,"supports_temperature":false,"reasoning_effort":"xhigh","supports_tools":true,"supports_structured_output":true,"supports_embeddings":false,"context_window_tokens":1050000,"maximum_output_tokens":32000,"input_cost_per_million_tokens_usd":0.2,"output_cost_per_million_tokens_usd":1.2,"cached_input_cost_per_million_tokens_usd":0.02,"cache_write_cost_per_million_tokens_usd":0.25}}' \
   --model-json '{"alias":"embed","connection":"openai","model":"text-embedding-3-small","capabilities":{"supports_completions":false,"supports_embeddings":true,"input_cost_per_million_tokens_usd":0.02,"context_window_tokens":8192}}' \
   --world-model dsflash \
@@ -177,11 +181,12 @@ Confirm with `grep`, not by editing the file: `models.toml` names the four alias
 world-model alias mean self-hosted spend, not a missing price.
 
 ```bash
-bench config-budget uv run wmo config budget 50 --root "$ROOT"
+bench config-budget uv run wmo config budget 75 --root "$ROOT"
 ```
 
-The default per-command budget is `$10`. The router step freezes a `$50` provider ceiling, so
-the shared ceiling must be raised before that command or it fails closed.
+The default per-command budget is `$10`. The router step freezes a `$60` provider ceiling and
+reserves the complete conservative schedule up front, so the shared ceiling must be raised
+before that command or it fails closed.
 
 ## 4. Build
 
@@ -255,8 +260,8 @@ bench optimize uv run wmo optimize router "$PROJECT" \
   --candidate dsflash0731 \
   --candidate luna \
   --incumbent dsflash \
-  --maximum-provider-cost-usd 50 \
-  --maximum-judgments 200 \
+  --maximum-provider-cost-usd 60 \
+  --maximum-judgments 210 \
   --maximum-model-calls 10 \
   --yes \
   --non-interactive
@@ -266,8 +271,8 @@ bench optimize-replay uv run wmo optimize router "$PROJECT" \
   --candidate dsflash0731 \
   --candidate luna \
   --incumbent dsflash \
-  --maximum-provider-cost-usd 50 \
-  --maximum-judgments 200 \
+  --maximum-provider-cost-usd 60 \
+  --maximum-judgments 210 \
   --maximum-model-calls 10 \
   --yes \
   --non-interactive
@@ -280,9 +285,10 @@ appear.
 
 A malformed world-model transition (`TextWorldModelProtocolError`, failure phase
 `world_model_protocol`) is a stochastic, retryable failure: resume supersedes it with a fresh
-attempt, and once attempts are exhausted the cell becomes durable excluded evidence. A named
-incumbent fits with partial coverage; the frozen policy lists any uncovered fit task IDs.
-Report retry counts and coverage gaps if they appear, they are not a failure.
+attempt, and one optimize invocation re-executes only the superseded cells until they converge
+or the per-cell attempt cap is exhausted, at which point the cell becomes durable excluded
+evidence. A named incumbent fits with partial coverage; the frozen policy lists any uncovered
+fit task IDs. Report retry counts and coverage gaps if they appear, they are not a failure.
 
 ## 7. Serve the router and send official traffic
 
