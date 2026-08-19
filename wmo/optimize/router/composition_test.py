@@ -193,7 +193,7 @@ def _bind_completed_build(
 def _capabilities(alias: str) -> ModelCapabilities:
     """Return the exact frozen capabilities used by each focused model."""
     if alias == "embedder":
-        return ModelCapabilities(supports_embeddings=True)
+        return ModelCapabilities(supports_embeddings=True, supports_tools=False)
     return ModelCapabilities(context_window_tokens=100_000, maximum_output_tokens=32_000)
 
 

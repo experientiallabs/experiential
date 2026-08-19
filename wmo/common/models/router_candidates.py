@@ -30,8 +30,9 @@ class RouterCandidateSetupError(ValueError):
 def router_candidate_capabilities_sha256(capabilities: ModelCapabilities) -> Sha256:
     """Hash the exact non-price candidate execution contract.
 
-    Unknown tool support hashes exactly like an explicit ``False`` so catalogs written before
-    tool support became declarable keep the digest frozen into existing plans and policies.
+    Unknown tool support hashes as its own tri-state value: runtime dispatch treats unknown
+    support permissively and an explicit ``False`` as a hard denial, so moving between them is
+    a semantic change that must invalidate frozen plans and policies.
 
     Args:
         capabilities: Explicit current candidate capability declaration.
@@ -43,7 +44,7 @@ def router_candidate_capabilities_sha256(capabilities: ModelCapabilities) -> Sha
         {
             "version": "router-candidate-capabilities-v1",
             "supports_completions": capabilities.supports_completions,
-            "supports_tools": bool(capabilities.supports_tools),
+            "supports_tools": capabilities.supports_tools,
             "supports_structured_output": capabilities.supports_structured_output,
             "context_window_tokens": capabilities.context_window_tokens,
             "maximum_output_tokens": capabilities.maximum_output_tokens,

@@ -149,7 +149,7 @@ def test_snapshot_identity_excludes_workflow_metadata_added_to_existing_catalogs
     assert original.identity_sha256() == sha256_json(
         {
             "supports_tools": True,
-            "supports_embeddings": False,
+            "supports_embeddings": None,
             "context_window_tokens": None,
             "maximum_output_tokens": 16_000,
         }

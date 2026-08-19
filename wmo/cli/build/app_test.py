@@ -285,12 +285,13 @@ class _RuntimeCatalog:
         return ResolvedModel(alias, snapshot, capabilities, self._completion, embedding)
 
 
-def _catalog(root: Path, *, embedder_input_usd_per_million: float = 0.0) -> None:
+def _catalog(root: Path, *, embedder_input_usd_per_million: float | None = 0.0) -> None:
     """Write complete secret-free build roles while leaving router candidates empty.
 
     Args:
         root: Temporary WMO root receiving ``models.toml``.
-        embedder_input_usd_per_million: Explicit fixture embedding input price.
+        embedder_input_usd_per_million: Explicit fixture embedding input price, or ``None``
+            for an unpriced embedder.
     """
     write_model_catalog(
         root / "models.toml",
@@ -859,20 +860,17 @@ def test_noninteractive_build_yes_confirms_an_in_budget_estimate(
 
 def test_unpriced_embedder_reports_an_undefined_cost_and_requires_manual_override(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An embedder without catalog pricing warns and builds only with an explicit --yes.
 
     Args:
         tmp_path: Temporary trace, catalog, and settings root.
-        monkeypatch: Cost boundary replacement returning an undefined estimate.
     """
     source = _otlp_export(tmp_path)
     root = tmp_path / ".wmo"
     root.mkdir()
-    _catalog(root)
+    _catalog(root, embedder_input_usd_per_million=None)
     set_maximum_command_cost_usd(1.0, root)
-    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: None)
 
     blocked = _RUNNER.invoke(
         app,

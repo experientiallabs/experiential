@@ -322,13 +322,17 @@ def test_routing_capability_binding_detects_completion_drift_separately() -> Non
     )
 
 
-def test_unknown_tool_support_keeps_the_frozen_candidate_capability_digest() -> None:
-    """Unknown tool support hashes exactly like an explicit denial for frozen plans."""
+def test_unknown_tool_support_changes_the_frozen_candidate_capability_digest() -> None:
+    """Unknown tool support hashes as its own tri-state value for frozen plans.
+
+    Runtime dispatch treats unknown support permissively and an explicit denial as a hard
+    block, so a drift between them must invalidate a frozen candidate digest.
+    """
     unknown = _capabilities(supports_tools=None)
     denied = _capabilities(supports_tools=False)
     granted = _capabilities(supports_tools=True)
 
-    assert router_candidate_capabilities_sha256(unknown) == (
+    assert router_candidate_capabilities_sha256(unknown) != (
         router_candidate_capabilities_sha256(denied)
     )
     assert router_candidate_capabilities_sha256(granted) != (

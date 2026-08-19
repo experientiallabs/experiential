@@ -125,7 +125,7 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
     capabilities = {
         "cheap": ModelCapabilities(supports_tools=False),
         "baseline": ModelCapabilities(supports_tools=True),
-        "embedder": ModelCapabilities(supports_embeddings=True),
+        "embedder": ModelCapabilities(supports_embeddings=True, supports_tools=False),
     }
     snapshots = {
         alias: snapshot.model_copy(

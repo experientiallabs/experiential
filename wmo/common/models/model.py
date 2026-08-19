@@ -385,9 +385,9 @@ class ModelCapabilities(ContractModel):
         declarations in a separate candidate capability digest and freezes prices in the pricing
         snapshot.
 
-        Unknown tool and embedding support hashes exactly like an explicit ``False`` so catalogs
-        written before support was declared keep the identity digest frozen into existing
-        artifacts.
+        Unknown tool and embedding support hashes as its own tri-state value: runtime dispatch
+        treats unknown support permissively and an explicit ``False`` as a hard denial, so
+        moving between them is a semantic change that must invalidate frozen identities.
 
         Returns:
             Stable digest of capability fields that identify the provider protocol boundary.
@@ -402,10 +402,7 @@ class ModelCapabilities(ContractModel):
             "cache_write_cost_per_million_tokens_usd",
         }
         excluded.add("supports_completions")
-        payload = self.model_dump(mode="json", exclude=excluded)
-        payload["supports_tools"] = bool(self.supports_tools)
-        payload["supports_embeddings"] = bool(self.supports_embeddings)
-        return sha256_json(payload)
+        return sha256_json(self.model_dump(mode="json", exclude=excluded))
 
 
 class ToolChoice(ContractModel):
