@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import click
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
@@ -148,4 +149,5 @@ def test_interactive_set_prompts_while_noninteractive_missing_values_fail(tmp_pa
         ],
     )
     assert missing.exit_code == 2
-    assert "--period is required" in missing.output
+    normalized = " ".join(click.unstyle(missing.output).replace("│", " ").split())
+    assert "--period is required" in normalized
