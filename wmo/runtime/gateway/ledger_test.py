@@ -26,6 +26,7 @@ from wmo.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from wmo.runtime.gateway.ledger import (
+    GatewayLedgerError,
     IdempotencyConflictError,
     IdempotencyReplayUnavailableError,
     SQLiteAttemptLedger,
@@ -342,6 +343,110 @@ def test_failed_attempt_terminalizes_its_parent_request(tmp_path: Path) -> None:
         connection.close()
     assert request_state == "failed"
     assert attempt_state == "failed"
+
+
+def test_predispatch_failure_terminalizes_real_sqlite_request(tmp_path: Path) -> None:
+    """Accepted routing failures cannot remain unterminated without an attempt row."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("routing-failure"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+
+    ledger.finish_request(
+        authorization=authorization,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.INTERNAL,
+            safe_message="route activation failed",
+        ),
+    )
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        request_state = connection.execute(
+            "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone()[0]
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM gateway_attempts WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert request_state == "failed"
+    assert attempt_count == 0
+
+
+def test_intermediate_attempt_can_settle_without_finalizing_parent(tmp_path: Path) -> None:
+    """The physical-attempt seam leaves parent finalization to a later route owner."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("future-waterfall"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization), deployment=_deployment(), route_depth=0
+    )
+
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="retry on sibling route",
+        ),
+        finalize_request=False,
+    )
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        states = connection.execute(
+            """
+            SELECT r.terminal_state, a.state
+            FROM gateway_requests AS r
+            JOIN gateway_attempts AS a ON a.request_id = r.request_id
+            WHERE r.request_id = ?
+            """,
+            (authorization.request_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert states == (None, "failed")
+
+
+def test_terminal_parent_rejects_late_attempt_dispatch(tmp_path: Path) -> None:
+    """No retry path can dispatch after durable request terminalization."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("late-dispatch"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    ledger.finish_request(
+        authorization=authorization,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.INTERNAL,
+            safe_message="route failed before dispatch",
+        ),
+    )
+
+    with pytest.raises(GatewayLedgerError, match="already terminal"):
+        ledger.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            route_depth=0,
+        )
 
 
 def test_idempotency_is_opt_in_and_restart_replay_fails_closed(tmp_path: Path) -> None:

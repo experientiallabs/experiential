@@ -623,6 +623,18 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             caller_operation_sha256=caller_operation,
         )
 
+    def authenticate_key(self, *, raw_key: str) -> None:
+        """Validate one virtual key without loading grants or request content.
+
+        Args:
+            raw_key: Presented virtual key.
+
+        Raises:
+            InvalidVirtualKeyError: The key is unknown, expired, or revoked.
+        """
+        with self._transaction() as connection:
+            self._authenticate_in_transaction(connection, raw_key)
+
     def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
         """List only active aliases granted to the key-derived identity.
 

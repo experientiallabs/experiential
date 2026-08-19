@@ -200,6 +200,8 @@ class SQLiteAttemptLedger:
                 raise GatewayLedgerError("attempt request was not durably accepted")
             if str(request["organization_id"]) != snapshot.authorization.organization_id:
                 raise GatewayLedgerError("attempt authority differs from accepted request")
+            if request["terminal_state"] is not None:
+                raise GatewayLedgerError("attempt request is already terminal")
             connection.execute(
                 """
                 INSERT INTO gateway_attempts (
@@ -270,6 +272,7 @@ class SQLiteAttemptLedger:
         attempt_id: AttemptId,
         terminal_event: GatewayEvent | None,
         failure: GatewayFailure | None,
+        finalize_request: bool = True,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -277,6 +280,7 @@ class SQLiteAttemptLedger:
             attempt_id: Stable attempt ID.
             terminal_event: Provider terminal event, possibly carrying usage.
             failure: Sanitized failure when no successful terminal event exists.
+            finalize_request: Whether this attempt is the final route for its parent request.
         """
         state, normalized_failure, usage = _terminal_values(terminal_event, failure)
         with self._transaction() as connection:
@@ -323,7 +327,7 @@ class SQLiteAttemptLedger:
                     attempt_id,
                 ),
             )
-            if state in {"completed", "failed", "cancelled", "incomplete"}:
+            if finalize_request and state in {"completed", "failed", "cancelled", "incomplete"}:
                 connection.execute(
                     """
                     UPDATE gateway_requests SET terminal_state = ?, terminal_at = ?
@@ -331,6 +335,45 @@ class SQLiteAttemptLedger:
                     """,
                     (state, utc_text(self._clock.now()), str(row["request_id"])),
                 )
+
+    def finish_request(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+    ) -> None:
+        """Idempotently terminalize accepted work that never reached dispatch.
+
+        Args:
+            authorization: Frozen authority identifying the accepted request.
+            failure: Sanitized pre-dispatch terminal failure.
+        """
+        state, normalized_failure, _ = _terminal_values(None, failure)
+        del normalized_failure
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT organization_id, terminal_state FROM gateway_requests
+                WHERE request_id = ?
+                """,
+                (authorization.request_id,),
+            ).fetchone()
+            if row is None:
+                raise GatewayLedgerError("request was not durably accepted")
+            if str(row["organization_id"]) != authorization.organization_id:
+                raise GatewayLedgerError("request authority differs from accepted request")
+            current = row["terminal_state"]
+            if current is not None:
+                if str(current) == state:
+                    return
+                raise GatewayLedgerError("request is already settled with another terminal state")
+            connection.execute(
+                """
+                UPDATE gateway_requests SET terminal_state = ?, terminal_at = ?
+                WHERE request_id = ? AND terminal_state IS NULL
+                """,
+                (state, utc_text(self._clock.now()), authorization.request_id),
+            )
 
     def reconcile_crashed_requests(self, *, cleanup_grace: timedelta) -> tuple[int, int]:
         """Settle expired pre-dispatch and dispatched work after a crash.
