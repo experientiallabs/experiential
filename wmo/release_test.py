@@ -54,6 +54,7 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "wmo/runtime/environments/local.py",
         "wmo/runtime/gateway/lifecycle.py",
         "wmo/runtime/gateway/openai/requests.py",
+        "wmo/runtime/gateway/provider_certification.py",
         "wmo/runtime/gateway/service.py",
         "wmo/runtime/models/registry.py",
         "wmo/runtime/router/application.py",
