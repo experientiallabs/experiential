@@ -160,12 +160,16 @@ def user_input(attributes: dict[str, JsonValue]) -> str | None:
         attributes: Canonical normalized span attributes.
 
     Returns:
-        Latest user content when captured, otherwise ``None``.
+        Latest user content from captured messages, or the current GenAI prompt attribute.
     """
-    return _last_role_message(
+    text = _last_role_message(
         _decoded_json_value(attributes.get("gen_ai.input.messages")),
         frozenset({"user", "human"}),
     )
+    if text is not None:
+        return text
+    prompt = attributes.get("gen_ai.prompt")
+    return prompt.strip() if isinstance(prompt, str) and prompt.strip() else None
 
 
 def _last_role_message(value: JsonValue, roles: frozenset[str]) -> str | None:
