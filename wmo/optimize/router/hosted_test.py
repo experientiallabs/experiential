@@ -87,7 +87,7 @@ from wmo.optimize.router.spend import (
     load_provider_spend_ledger,
     persist_provider_spend_ledger,
 )
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.simulation.build import build_project
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.mining.service import MiningSpec
@@ -422,7 +422,51 @@ def test_hosted_workflow_preserves_mixed_billing_sources_without_private_aliases
         )
 
 
-@pytest.mark.parametrize("failed_alias", ["judge", "world"])
+def test_hosted_simulation_failure_binds_excluded_evidence_and_completes(tmp_path: Path) -> None:
+    """Terminal world-model failures exclude their rollouts instead of aborting the run."""
+    prepared, catalog = _restored_prepared_project(
+        tmp_path,
+        model_catalog=_mixed_billing_catalog(),
+    )
+    state = _ProviderState()
+    runtime = _FailingRuntimeCatalog(catalog, state, failed_alias="world")
+    attempt_store = FileHostedAttemptAuthorityStore(tmp_path / "attempt-world-authority")
+    authority = attempt_store.create()
+    bundle_directory = tmp_path / "world-excluded-bundles"
+    bundle_directory.mkdir()
+
+    result = run_hosted_router_workflow(
+        prepared,
+        _setup(),
+        catalog,
+        cast(RuntimeModelCatalog, runtime),
+        attempt_store,
+        bundle_directory=bundle_directory,
+        attempt_id=authority.attempt_id,
+        created_at=_TIME + timedelta(hours=2),
+        code_revision=_REVISION,
+        options=_options(),
+    )
+
+    assert attempt_store.unresolved(authority) is None
+    assert [item.stage for item in result.bundles] == [
+        ProjectStage.BUILDING_WORLD_MODEL,
+        ProjectStage.OPTIMIZING_ROUTER,
+        ProjectStage.COMPLETING_REPORT,
+    ]
+    ledger = result.spend_ledger
+    assert ledger.outcome == "completed"
+    assert ledger.total_usd < ledger.ceiling_usd
+    world_entries = [
+        entry for entry in ledger.entries if entry.component == ProviderSpendComponent.WORLD_MODEL
+    ]
+    assert world_entries
+    # The failing fake raises before any provider dispatch, so world spend is an
+    # explicit zero-call record rather than a silently dropped component.
+    assert all(entry.status == ProviderSpendStatus.NOT_INCURRED for entry in world_entries)
+
+
+@pytest.mark.parametrize("failed_alias", ["judge"])
 def test_hosted_optimization_failure_reserves_remaining_ceiling_and_blocks_local_retry(
     tmp_path: Path,
     failed_alias: str,
@@ -1747,8 +1791,8 @@ class _FailingRuntimeCatalog(_RuntimeCatalog):
         super().__init__(catalog, state)
         self._failed_alias = failed_alias
 
-    def resolve(self, alias: str) -> ResolvedModel:
-        resolved = super().resolve(alias)
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        resolved = super().resolve(alias, role=role)
         if alias != self._failed_alias:
             return resolved
         failed = _FailingClient(resolved.client)

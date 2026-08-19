@@ -54,7 +54,7 @@ from wmo.optimize.router.composition_test import (
 )
 from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
 from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.application import create_project_router_app
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
@@ -370,8 +370,9 @@ class _RuntimeCatalog:
         """Return the exact snapshot and capabilities for one alias."""
         return _snapshot(alias), _capabilities(alias)
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
         """Resolve one alias without environment or provider access."""
+        del role
         snapshot, capabilities = self.snapshot(alias)
         client = self.clients[alias]
         return ResolvedModel(
@@ -621,6 +622,8 @@ class _EvidenceReviewSupplier:
                 score_maps=(
                     DimensionScoreMap(
                         dimension_id="dimension-a",
+                        min_score=0,
+                        max_score=5,
                         calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
                     ),
                 ),

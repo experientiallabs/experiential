@@ -169,6 +169,8 @@ def _workflow_fixture(root: Path) -> tuple[ProjectStore, RouterOptimizationConfi
                     dimension_id="dimension-a",
                     raw_score=4,
                     calibrated_score=4.0,
+                    min_score=0,
+                    max_score=5,
                     rationale="Deterministic completed evidence.",
                 ),
             ),

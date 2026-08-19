@@ -382,11 +382,7 @@ class _SetupSupplier:
             )
         if "pricing-a" not in project.artifacts.list_ids():
             _persist_pricing(project.artifacts)
-        embedding_set_id = _persist_embeddings(
-            project.artifacts,
-            tasks,
-            completed.task_set,
-        )
+            _persist_embeddings(project.artifacts, tasks)
         production = EvaluationProtocol(
             protocol_id="protocol-production",
             evidence_source="production",
@@ -412,7 +408,7 @@ class _SetupSupplier:
             observed_cells=tuple(observed),
             production_protocol=production,
             simulation_protocol=world,
-            embedding_set_id=embedding_set_id,
+            embedding_set_id="embeddings-a",
             fit_rag_input=completed.fit_rag,
             pricing_snapshot_id="pricing-a",
             incumbent_alias="candidate-a",
