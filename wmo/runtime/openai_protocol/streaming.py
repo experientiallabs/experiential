@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.runtime.gateway.contracts import (
@@ -638,40 +637,6 @@ class ResponsesSseEncoder:
             message=message,
             error_type="api_error",
         )
-
-
-def encode_chat_events(encoder: ChatSseEncoder, events: Iterable[GatewayEvent]) -> tuple[str, ...]:
-    """Encode one complete deterministic Chat event fixture.
-
-    Args:
-        encoder: Fresh Chat encoder.
-        events: Ordered provider events ending in one terminal.
-
-    Returns:
-        Complete SSE frame sequence.
-    """
-    frames = list(encoder.start())
-    for event in events:
-        frames.extend(encoder.feed(event))
-    return tuple(frames)
-
-
-def encode_responses_events(
-    encoder: ResponsesSseEncoder, events: Iterable[GatewayEvent]
-) -> tuple[str, ...]:
-    """Encode one complete deterministic Responses event fixture.
-
-    Args:
-        encoder: Fresh Responses encoder.
-        events: Ordered provider events ending in one terminal.
-
-    Returns:
-        Complete named SSE lifecycle.
-    """
-    frames = list(encoder.start())
-    for event in events:
-        frames.extend(encoder.feed(event))
-    return tuple(frames)
 
 
 def _required_index(event: GatewayEvent) -> int:

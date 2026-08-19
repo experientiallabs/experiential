@@ -21,57 +21,19 @@ from wmo.common.models import (
     ModelResponse,
     ModelSnapshot,
 )
+from wmo.runtime.models.conftest import ScriptedAsyncJsonTransport
 from wmo.runtime.models.providers.base import (
     DEFAULT_TIMEOUT_SECONDS,
     MAXIMUM_COMPLETION_TIMEOUT_SECONDS,
     ProviderHttpClient,
     completion_timeout_seconds,
 )
-from wmo.runtime.models.providers.transport import (
-    JsonHttpResponse,
-    JsonHttpTransport,
-    ScriptedJsonTransport,
-)
+from wmo.runtime.models.providers.transport import JsonHttpResponse
 
 
-class _TimeoutRecordingTransport(ScriptedJsonTransport):
-    """Scripted transport that also records the timeout given to every POST."""
-
-    def __init__(self, responses: list[JsonHttpResponse]) -> None:
-        """Store the scripted answers and start an empty timeout log.
-
-        Args:
-            responses: Responses to return, consumed in order.
-        """
-        super().__init__(responses)
-        self.timeouts: list[float] = []
-
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Record the per-attempt timeout, then delegate to the scripted answer.
-
-        Args:
-            url: Absolute provider endpoint URL.
-            headers: Request headers sent by the caller.
-            payload: JSON request object sent by the caller.
-            timeout_seconds: Bounded per-attempt timeout given by the client.
-
-        Returns:
-            The next scripted response.
-        """
-        self.timeouts.append(timeout_seconds)
-        return super().post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
-
-
-def _ok_transport() -> ScriptedJsonTransport:
+def _ok_transport() -> ScriptedAsyncJsonTransport:
     """Build a transport scripted with the single success body these tests expect."""
-    return ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={"answer": "ok"})])
+    return ScriptedAsyncJsonTransport([JsonHttpResponse(status_code=200, body={"answer": "ok"})])
 
 
 class _EchoClient(ProviderHttpClient):
@@ -111,7 +73,7 @@ def _snapshot() -> ModelSnapshot:
 
 
 def _client(
-    transport: JsonHttpTransport, *, base_url: str = "https://echo.test/v1/"
+    transport: ScriptedAsyncJsonTransport, *, base_url: str = "https://echo.test/v1/"
 ) -> _EchoClient:
     """Build the client under test against a deterministic transport."""
     return _EchoClient(
@@ -192,7 +154,7 @@ def test_completion_timeout_never_reduces_an_explicitly_configured_timeout() -> 
 
 def test_complete_passes_the_derived_timeout_to_the_transport() -> None:
     """The completion template posts each attempt under the token-scaled timeout."""
-    transport = _TimeoutRecordingTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(status_code=200, body={"answer": "ok"}),
             JsonHttpResponse(status_code=200, body={"answer": "ok"}),

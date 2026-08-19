@@ -22,10 +22,8 @@ from wmo.runtime.models.providers.openai_compatible import (
     OpenRouterClient,
 )
 from wmo.runtime.models.providers.protocol import (
-    AsyncCompletedModelClient,
     AsyncGatewayProvider,
     BoundedSyncModelClientAdapter,
-    SyncModelClientAdapter,
     preflight_gateway_request,
     require_gateway_provider,
 )
@@ -41,7 +39,6 @@ from wmo.runtime.models.providers.tinker_sampling import (
 
 __all__ = [
     "AnthropicClient",
-    "AsyncCompletedModelClient",
     "AsyncGatewayProvider",
     "AsyncJsonHttpTransport",
     "AzureClient",
@@ -59,7 +56,6 @@ __all__ = [
     "ProviderListingError",
     "ProviderModelLister",
     "RequestDeadline",
-    "SyncModelClientAdapter",
     "TinkerOptionalDependencyError",
     "TinkerSample",
     "TinkerSampler",

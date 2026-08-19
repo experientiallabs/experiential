@@ -16,6 +16,7 @@ from wmo.common.models import (
     ModelRecord,
     ModelRoles,
 )
+from wmo.runtime.models.conftest import ScriptedAsyncJsonTransport
 from wmo.runtime.models.credentials import ModelCredentialError
 from wmo.runtime.models.providers.azure import (
     AZURE_OPENAI_API_KEY_ENV,
@@ -25,7 +26,7 @@ from wmo.runtime.models.providers.azure import (
     same_azure_endpoint,
 )
 from wmo.runtime.models.providers.openai_compatible_test import _request, _snapshot
-from wmo.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from wmo.runtime.models.providers.transport import JsonHttpResponse
 from wmo.runtime.models.registry import RuntimeModelCatalog
 
 _SECRET = "azure-secret-key-value"
@@ -43,7 +44,7 @@ def _completion_response() -> JsonObject:
 
 def test_v1_route_sends_deployment_and_api_key_header() -> None:
     """Foundry and Azure OpenAI v1 keep the deployment in the body and authenticate with api-key."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [JsonHttpResponse(status_code=200, body=_completion_response())]
     )
     client = AzureClient(
@@ -67,7 +68,7 @@ def test_v1_route_sends_deployment_and_api_key_header() -> None:
 
 def test_classic_route_puts_the_exact_deployment_in_the_path() -> None:
     """Dated Azure OpenAI versions keep the deployment in the URL and the body."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [JsonHttpResponse(status_code=200, body=_completion_response())]
     )
     client = AzureClient(
@@ -90,7 +91,7 @@ def test_classic_route_puts_the_exact_deployment_in_the_path() -> None:
 
 def test_embeddings_use_the_configured_deployment_alias() -> None:
     """Embedding aliases send their own deployment ID rather than a guessed base model."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -175,7 +176,7 @@ def test_canonical_endpoint_comparison_is_host_insensitive_and_path_sensitive() 
 
 def test_a_v1_root_endpoint_is_not_double_appended() -> None:
     """Operators may store either the resource root or the v1 root."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [JsonHttpResponse(status_code=200, body=_completion_response())]
     )
     client = AzureClient(
@@ -222,7 +223,7 @@ def test_catalog_resolution_pairs_one_endpoint_with_its_key() -> None:
             AZURE_OPENAI_API_KEY_ENV: _SECRET,
             AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT,
         },
-        transport_factory=lambda: ScriptedJsonTransport(
+        transport_factory=lambda: ScriptedAsyncJsonTransport(
             [JsonHttpResponse(status_code=200, body=_completion_response())]
         ),
     )
@@ -259,7 +260,7 @@ def test_catalog_resolution_pairs_one_endpoint_with_its_key() -> None:
             AZURE_OPENAI_API_KEY_ENV: _SECRET,
             AZURE_OPENAI_ENDPOINT_ENV: _ENDPOINT,
         },
-        transport_factory=ScriptedJsonTransport,
+        transport_factory=ScriptedAsyncJsonTransport,
     )
     with pytest.raises(ModelCredentialError, match="different Azure resource"):
         mismatched.resolve("gpt")

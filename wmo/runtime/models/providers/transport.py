@@ -1,12 +1,10 @@
-"""JSON HTTP transport seam, bounded retries, request helpers, and a deterministic fake."""
+"""JSON HTTP transport seam, bounded retries, and request helpers."""
 
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import NamedTuple
-from uuid import uuid4
 
 import httpx
 
@@ -56,116 +54,6 @@ class JsonHttpTransport:
         """
         raise NotImplementedError
 
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Send JSON and decode a JSON object response.
-
-        Args:
-            url: Absolute provider endpoint URL.
-            headers: Request headers, including provider authentication.
-            payload: JSON request object.
-            timeout_seconds: Bounded per-attempt wall-clock timeout.
-
-        Returns:
-            The HTTP status and decoded object response.
-
-        Raises:
-            ProviderTransportError: The request failed or the endpoint returned non-object JSON.
-        """
-        raise NotImplementedError
-
-
-class RecordedRequest(NamedTuple):
-    """One request a scripted transport served, kept for wire assertions in tests.
-
-    The payload is the JSON body a POST sent; GET reads record an empty object.
-    """
-
-    url: str
-    headers: Mapping[str, str]
-    payload: JsonObject
-
-
-class ScriptedJsonTransport(JsonHttpTransport):
-    """Deterministic transport that replays scripted answers and records every request.
-
-    An empty script doubles as an unused-transport guard: any request raises AssertionError.
-    """
-
-    def __init__(self, responses: Sequence[JsonHttpResponse | Exception] = ()) -> None:
-        """Store the answers served in order, one per expected request.
-
-        Args:
-            responses: Responses to return or exceptions to raise, consumed in order.
-        """
-        self._responses = list(responses)
-        self.requests: list[RecordedRequest] = []
-
-    def get(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Record one GET and return the next scripted answer.
-
-        Args:
-            url: Absolute provider endpoint URL.
-            headers: Request headers sent by the caller.
-            timeout_seconds: Bounded per-attempt timeout, ignored by the fake.
-
-        Returns:
-            The next scripted response.
-
-        Raises:
-            Exception: The next scripted error, or AssertionError once the script is exhausted.
-        """
-        del timeout_seconds
-        self.requests.append(RecordedRequest(url, dict(headers), {}))
-        return self._answer()
-
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Record one POST and return the next scripted answer.
-
-        Args:
-            url: Absolute provider endpoint URL.
-            headers: Request headers sent by the caller.
-            payload: JSON request object sent by the caller.
-            timeout_seconds: Bounded per-attempt timeout, ignored by the fake.
-
-        Returns:
-            The next scripted response.
-
-        Raises:
-            Exception: The next scripted error, or AssertionError once the script is exhausted.
-        """
-        del timeout_seconds
-        self.requests.append(RecordedRequest(url, dict(headers), payload))
-        return self._answer()
-
-    def _answer(self) -> JsonHttpResponse:
-        """Consume and serve the next scripted answer, failing closed when exhausted."""
-        if not self._responses:
-            raise AssertionError("test made an unexpected provider request")
-        answer = self._responses.pop(0)
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
-
 
 class HttpxJsonTransport(JsonHttpTransport):
     """Production JSON transport backed by a caller-owned-or-default httpx client."""
@@ -195,41 +83,6 @@ class HttpxJsonTransport(JsonHttpTransport):
         """
         try:
             response = self._client.get(url, headers=dict(headers), timeout=timeout_seconds)
-        except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
-        except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
-        return _decoded_response(response)
-
-    def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Send one bounded JSON request without logging content or credentials.
-
-        Args:
-            url: Absolute provider endpoint URL.
-            headers: Provider request headers, including the resolved credential.
-            payload: Complete JSON request body.
-            timeout_seconds: Per-attempt request timeout.
-
-        Returns:
-            The HTTP status and decoded JSON response object.
-
-        Raises:
-            ProviderTransportError: The request fails or the response is not a JSON object.
-        """
-        try:
-            response = self._client.post(
-                url,
-                headers=dict(headers),
-                json=payload,
-                timeout=timeout_seconds,
-            )
         except httpx.TimeoutException as exc:
             raise ProviderTransportError("provider request timed out") from exc
         except httpx.TransportError as exc:
@@ -375,50 +228,6 @@ def get_json(
         """Run one GET attempt and return its successful body."""
         return _successful_body(
             transport.get(url, headers=headers, timeout_seconds=timeout_seconds)
-        )
-
-    return run_with_retry(send, policy=retry_policy)
-
-
-def post_json(
-    transport: JsonHttpTransport,
-    url: str,
-    *,
-    headers: Mapping[str, str],
-    payload: JsonObject,
-    timeout_seconds: float,
-    retry_policy: RetryPolicy,
-) -> JsonObject:
-    """Send one non-streaming JSON request with bounded same-endpoint retries.
-
-    Args:
-        transport: Explicit transport used for this request.
-        url: Absolute provider endpoint URL.
-        headers: Provider headers, including an already-resolved credential.
-        payload: Complete JSON request body.
-        timeout_seconds: Timeout for each attempt.
-        retry_policy: Retry policy that never changes provider or model.
-
-    Returns:
-        A successful response JSON object.
-
-    Raises:
-        ProviderTransportError: The endpoint failed or returned a non-success status.
-    """
-    request_headers = {
-        name: value for name, value in headers.items() if name.lower() != "idempotency-key"
-    }
-    request_headers["Idempotency-Key"] = f"wmo-{uuid4().hex}"
-
-    def send() -> JsonObject:
-        """Run one POST attempt, reusing the idempotency key, and return its successful body."""
-        return _successful_body(
-            transport.post(
-                url,
-                headers=request_headers,
-                payload=payload,
-                timeout_seconds=timeout_seconds,
-            )
         )
 
     return run_with_retry(send, policy=retry_policy)

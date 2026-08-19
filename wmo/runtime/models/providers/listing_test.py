@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from wmo.common.core.artifacts import JsonObject
+from wmo.runtime.models.conftest import ScriptedJsonTransport
 from wmo.runtime.models.providers.listing import (
     HttpProviderModelLister,
     ProviderEndpoint,
@@ -15,7 +16,6 @@ from wmo.runtime.models.providers.transport import (
     JsonHttpTransport,
     ProviderTransportError,
     RetryPolicy,
-    ScriptedJsonTransport,
 )
 
 

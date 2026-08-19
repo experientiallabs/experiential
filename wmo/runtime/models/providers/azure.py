@@ -10,7 +10,7 @@ from wmo.runtime.models.credentials import ModelCredentialError
 from wmo.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
 from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleClient
-from wmo.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
+from wmo.runtime.models.providers.transport import RetryPolicy
 
 AZURE_OPENAI_API_KEY_ENV = "AZURE_OPENAI_API_KEY"
 AZURE_OPENAI_ENDPOINT_ENV = "AZURE_OPENAI_ENDPOINT"
@@ -107,7 +107,7 @@ class AzureClient(OpenAICompatibleClient):
         endpoint: str,
         api_key: str,
         api_version: str,
-        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
+        transport: AsyncJsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:

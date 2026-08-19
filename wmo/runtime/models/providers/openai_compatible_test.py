@@ -21,6 +21,7 @@ from wmo.common.models import (
     ToolChoice,
 )
 from wmo.common.tasks import ToolSchema
+from wmo.runtime.models.conftest import ScriptedAsyncJsonTransport
 from wmo.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
@@ -31,11 +32,7 @@ from wmo.runtime.models.providers.openai_compatible import (
     openai_compatible_request,
     openai_compatible_response,
 )
-from wmo.runtime.models.providers.transport import (
-    JsonHttpResponse,
-    RetryPolicy,
-    ScriptedJsonTransport,
-)
+from wmo.runtime.models.providers.transport import JsonHttpResponse, RetryPolicy
 
 
 def _snapshot(provider: str = "openai-compatible", model_id: str = "fake-model") -> ModelSnapshot:
@@ -152,7 +149,7 @@ def test_openai_compatible_request_omits_absent_top_p() -> None:
 
 def test_openai_compatible_client_converts_tool_usage_and_resolved_identity() -> None:
     """One frozen tool response produces typed output, normalized usage, and actual model ID."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -212,7 +209,7 @@ def test_openai_compatible_client_converts_tool_usage_and_resolved_identity() ->
 
 def test_openai_compatible_client_retries_only_the_same_endpoint() -> None:
     """A retryable status retries the frozen request without a failover model path."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(status_code=503, body={"error": {"message": "busy"}}),
             JsonHttpResponse(
@@ -245,7 +242,9 @@ def test_openai_compatible_client_retries_only_the_same_endpoint() -> None:
 def test_response_without_choices_fails_closed_without_exposing_the_key() -> None:
     """A response with no choices raises a typed error that never includes the credential."""
     secret = "fake-secret-key-value"
-    transport = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={"choices": []})])
+    transport = ScriptedAsyncJsonTransport(
+        [JsonHttpResponse(status_code=200, body={"choices": []})]
+    )
     client = OpenAICompatibleClient(
         model=_snapshot(),
         base_url="https://example.test/v1",
@@ -261,7 +260,7 @@ def test_response_without_choices_fails_closed_without_exposing_the_key() -> Non
 
 def test_openai_compatible_embedding_response_is_ordered_and_normalized() -> None:
     """Embedding conversion restores provider indexes and returns unit-length vectors."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -293,7 +292,7 @@ def test_openai_compatible_embedding_response_is_ordered_and_normalized() -> Non
 
 def test_openai_compatible_conversion_rejects_malformed_tool_arguments() -> None:
     """A provider cannot turn malformed tool JSON into an invented empty argument object."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,

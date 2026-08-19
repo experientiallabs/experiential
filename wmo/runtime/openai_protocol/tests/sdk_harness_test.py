@@ -19,12 +19,26 @@ from wmo.runtime.gateway.contracts import (
 )
 from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
 from wmo.runtime.openai_protocol.requests import decode_chat, decode_responses
-from wmo.runtime.openai_protocol.streaming import (
-    ChatSseEncoder,
-    ResponsesSseEncoder,
-    encode_chat_events,
-    encode_responses_events,
-)
+from wmo.runtime.openai_protocol.streaming import ChatSseEncoder, ResponsesSseEncoder
+
+
+def _encode(
+    encoder: ChatSseEncoder | ResponsesSseEncoder,
+    events: tuple[GatewayEvent, ...],
+) -> tuple[str, ...]:
+    """Run one fresh encoder over ordered events and collect every SSE frame.
+
+    Args:
+        encoder: Fresh Chat or Responses encoder.
+        events: Ordered provider events ending in one terminal.
+
+    Returns:
+        Complete SSE frame sequence.
+    """
+    frames = list(encoder.start())
+    for event in events:
+        frames.extend(encoder.feed(event))
+    return tuple(frames)
 
 
 class _SdkHarness:
@@ -67,7 +81,7 @@ class _SdkHarness:
                     client_request_id=request.headers.get("x-client-request-id"),
                 )
                 self.responder_calls += 1
-                frames = encode_chat_events(
+                frames = _encode(
                     ChatSseEncoder(
                         request_id=f"request-{self.requests}",
                         model=decoded.alias,
@@ -83,7 +97,7 @@ class _SdkHarness:
                     client_request_id=request.headers.get("x-client-request-id"),
                 )
                 self.responder_calls += 1
-                frames = encode_responses_events(
+                frames = _encode(
                     ResponsesSseEncoder(
                         request_id=f"request-{self.requests}",
                         model=decoded.alias,

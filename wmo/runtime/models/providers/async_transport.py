@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
@@ -14,9 +14,7 @@ import httpx
 from wmo.common.core.artifacts import JsonObject
 from wmo.runtime.models.providers.transport import (
     JsonHttpResponse,
-    JsonHttpTransport,
     ProviderTransportError,
-    RecordedRequest,
     RetryClassification,
     RetryPolicy,
     classify_retry,
@@ -351,142 +349,6 @@ class _HttpxByteStream:
             await self._owned_client.aclose()
 
 
-class SyncJsonTransportAdapter:
-    """Bound the wait around a legacy sync transport used by existing injected callers.
-
-    Gateway request handlers use ``HttpxAsyncJsonTransport`` directly. This adapter exists for
-    deterministic tests and external sync transport injections while those callers migrate.
-    """
-
-    def __init__(self, transport: JsonHttpTransport) -> None:
-        """Bind one legacy transport without executing it on the event loop.
-
-        Args:
-            transport: Existing sync JSON transport to run in the default worker pool.
-        """
-        self._transport = transport
-
-    async def get(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Run one sync GET off-loop and bound the caller's wait.
-
-        Args:
-            url: Absolute provider endpoint URL.
-            headers: Provider request headers.
-            timeout_seconds: Maximum time the async caller waits.
-
-        Returns:
-            The legacy transport response.
-        """
-        operation = asyncio.to_thread(
-            self._transport.get,
-            url,
-            headers=headers,
-            timeout_seconds=timeout_seconds,
-        )
-        return await asyncio.wait_for(operation, timeout=timeout_seconds)
-
-    async def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Run one sync POST off-loop and bound the caller's wait.
-
-        Args:
-            url: Absolute provider endpoint URL.
-            headers: Provider request headers.
-            payload: Complete JSON request body.
-            timeout_seconds: Maximum time the async caller waits.
-
-        Returns:
-            The legacy transport response.
-        """
-        operation = asyncio.to_thread(
-            self._transport.post,
-            url,
-            headers=headers,
-            payload=payload,
-            timeout_seconds=timeout_seconds,
-        )
-        return await asyncio.wait_for(operation, timeout=timeout_seconds)
-
-
-class ScriptedAsyncJsonTransport:
-    """Deterministic async transport that records requests and replays scripted answers."""
-
-    def __init__(self, responses: Sequence[JsonHttpResponse | Exception] = ()) -> None:
-        """Store one answer for every expected async request.
-
-        Args:
-            responses: Ordered response objects or exceptions.
-        """
-        self._responses = list(responses)
-        self.requests: list[RecordedRequest] = []
-        self.timeouts: list[float] = []
-
-    async def get(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Record one GET and return the next scripted answer.
-
-        Args:
-            url: Absolute provider endpoint URL.
-            headers: Provider request headers.
-            timeout_seconds: Remaining attempt timeout.
-
-        Returns:
-            The next scripted response.
-        """
-        self.requests.append(RecordedRequest(url, dict(headers), {}))
-        self.timeouts.append(timeout_seconds)
-        return self._answer()
-
-    async def post(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> JsonHttpResponse:
-        """Record one POST and return the next scripted answer.
-
-        Args:
-            url: Absolute provider endpoint URL.
-            headers: Provider request headers.
-            payload: Complete JSON request body.
-            timeout_seconds: Remaining attempt timeout.
-
-        Returns:
-            The next scripted response.
-        """
-        self.requests.append(RecordedRequest(url, dict(headers), payload))
-        self.timeouts.append(timeout_seconds)
-        return self._answer()
-
-    def _answer(self) -> JsonHttpResponse:
-        """Consume the next answer, failing closed when the script is exhausted."""
-        if not self._responses:
-            raise AssertionError("test made an unexpected provider request")
-        answer = self._responses.pop(0)
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
-
-
 async def run_with_retry_async[ResultT](
     operation: Callable[[float], Awaitable[ResultT]],
     *,
@@ -540,46 +402,6 @@ async def run_with_retry_async[ResultT](
     raise RuntimeError("retry loop exhausted without running an attempt")
 
 
-async def get_json_async(
-    transport: AsyncJsonHttpTransport,
-    url: str,
-    *,
-    headers: Mapping[str, str],
-    deadline: RequestDeadline,
-    retry_policy: RetryPolicy,
-    attempt_timeout_seconds: float | None = None,
-) -> JsonObject:
-    """Read one JSON object through one deadline-aware async retry loop.
-
-    Args:
-        transport: Async transport used for every same-endpoint attempt.
-        url: Absolute provider endpoint URL.
-        headers: Provider request headers.
-        deadline: Absolute request-wide deadline.
-        retry_policy: Total same-endpoint attempt and delay bounds.
-        attempt_timeout_seconds: Optional smaller per-attempt bound.
-
-    Returns:
-        The first successful response body.
-    """
-
-    async def send(timeout_seconds: float) -> JsonObject:
-        """Send one GET attempt and validate its status."""
-        response = await transport.get(
-            url,
-            headers=headers,
-            timeout_seconds=timeout_seconds,
-        )
-        return _successful_body(response)
-
-    return await run_with_retry_async(
-        send,
-        policy=retry_policy,
-        deadline=deadline,
-        attempt_timeout_seconds=attempt_timeout_seconds,
-    )
-
-
 async def post_json_async(
     transport: AsyncJsonHttpTransport,
     url: str,
@@ -627,24 +449,6 @@ async def post_json_async(
         deadline=deadline,
         attempt_timeout_seconds=attempt_timeout_seconds,
     )
-
-
-def as_async_transport(
-    transport: AsyncJsonHttpTransport | JsonHttpTransport | None,
-) -> AsyncJsonHttpTransport:
-    """Normalize caller-injected or default transports onto the async protocol.
-
-    Args:
-        transport: Async transport, legacy sync transport, or ``None`` for production HTTPX.
-
-    Returns:
-        A transport implementing cancellable async request methods.
-    """
-    if transport is None:
-        return HttpxAsyncJsonTransport()
-    if isinstance(transport, JsonHttpTransport):
-        return SyncJsonTransportAdapter(transport)
-    return transport
 
 
 def _decoded_response(response: httpx.Response) -> JsonHttpResponse:

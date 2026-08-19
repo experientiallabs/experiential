@@ -2,27 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
-
-COMMIT_INDEPENDENT_HEADERS = frozenset(
-    {
-        "x-request-id",
-        "x-client-request-id",
-        "x-gateway-alias",
-        "x-gateway-alias-revision",
-    }
-)
-COMMIT_DEPENDENT_HEADERS = frozenset(
-    {
-        "x-gateway-canonical-model",
-        "x-gateway-provider",
-        "x-gateway-deployment",
-        "x-gateway-route-depth",
-        "x-gateway-route-reason",
-    }
-)
 
 
 def commit_independent_headers(
@@ -89,26 +69,6 @@ def commit_dependent_headers(
     if route_reason is not None:
         headers["x-gateway-route-reason"] = _header_value(route_reason)
     return headers
-
-
-def require_header_partition(headers: Mapping[str, str], *, committed: bool) -> None:
-    """Reject route-dependent headers emitted before commitment.
-
-    Args:
-        headers: Candidate response header map.
-        committed: Whether the provider route is already committed.
-
-    Raises:
-        OpenAIProtocolError: A route header would become false after failover.
-    """
-    normalized = {name.lower() for name in headers}
-    if not committed and normalized & COMMIT_DEPENDENT_HEADERS:
-        raise OpenAIProtocolError(
-            status_code=500,
-            code="invalid_gateway_headers",
-            message="Route-dependent headers cannot be emitted before provider commitment.",
-            error_type="api_error",
-        )
 
 
 def _header_value(value: str) -> str:

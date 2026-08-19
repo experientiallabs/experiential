@@ -45,8 +45,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["wmo"]
-# Test-only code is named for pytest discovery, and `wmo/conftest.py` is a pytest fixture module.
-exclude = ["**/*_test.py", "wmo/conftest.py"]
+# Test-only code is named for pytest discovery, and conftest.py modules are pytest fixtures.
+exclude = ["**/*_test.py", "**/conftest.py"]
 
 [tool.hatch.build.targets.sdist]
 # One flagship distribution: everything importable lives under /wmo.

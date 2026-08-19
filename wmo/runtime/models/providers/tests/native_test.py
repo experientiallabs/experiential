@@ -13,6 +13,7 @@ from wmo.common.models import (
     ToolChoice,
     Usage,
 )
+from wmo.runtime.models.conftest import ScriptedAsyncJsonTransport
 from wmo.runtime.models.providers.anthropic import (
     AnthropicClient,
     anthropic_messages_request,
@@ -39,11 +40,7 @@ from wmo.runtime.models.providers.tinker_sampling import (
     TinkerSdkSampler,
     create_tinker_sampler,
 )
-from wmo.runtime.models.providers.transport import (
-    JsonHttpResponse,
-    RetryPolicy,
-    ScriptedJsonTransport,
-)
+from wmo.runtime.models.providers.transport import JsonHttpResponse, RetryPolicy
 
 
 class _FakeTinkerSampler:
@@ -78,7 +75,7 @@ def test_default_tinker_factory_constructs_a_lazy_sdk_sampler_without_sampling()
 
 def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity() -> None:
     """Direct OpenAI uses Responses, not the compatible chat-completions shape."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -153,7 +150,7 @@ def test_openai_responses_client_preserves_native_tool_wire_usage_and_identity()
 
 def test_openai_reasoning_model_declarations_shape_the_wire_payload() -> None:
     """A no-temperature declaration drops the parameter and a pinned effort is sent verbatim."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -228,7 +225,7 @@ def test_openai_reasoning_model_rejects_top_p_before_dispatch() -> None:
 
 def test_openai_embeddings_use_the_shared_normalized_response_contract() -> None:
     """Direct OpenAI reuses only the common non-streaming embedding conversion."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -256,7 +253,7 @@ def test_openai_embeddings_use_the_shared_normalized_response_contract() -> None
 
 def test_openrouter_uses_one_compatible_endpoint_without_failover() -> None:
     """OpenRouter decorates the shared request without adding a provider chain."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -284,7 +281,7 @@ def test_openrouter_uses_one_compatible_endpoint_without_failover() -> None:
 
 def test_anthropic_uses_native_tool_blocks_and_normalizes_cache_usage() -> None:
     """Anthropic tool and cache fields stay native until the shared response boundary."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -369,7 +366,7 @@ def test_anthropic_messages_forwards_top_p() -> None:
 
 def test_gemini_uses_native_function_calls_usage_identity_and_embeddings() -> None:
     """Gemini retains its content parts, model version, and batch embedding shape."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             JsonHttpResponse(
                 status_code=200,
@@ -487,7 +484,7 @@ def _reasoning_only_response() -> JsonHttpResponse:
 
 def test_openai_reasoning_only_output_is_retried_and_a_later_answer_completes() -> None:
     """A response with only reasoning output re-dispatches within the bounded retry policy."""
-    transport = ScriptedJsonTransport(
+    transport = ScriptedAsyncJsonTransport(
         [
             _reasoning_only_response(),
             JsonHttpResponse(
@@ -534,7 +531,7 @@ def test_openai_reasoning_only_output_is_retried_and_a_later_answer_completes() 
 
 def test_openai_reasoning_only_output_surfaces_a_retryable_error_after_exhaustion() -> None:
     """Exhausted empty-output retries raise the typed retryable response error."""
-    transport = ScriptedJsonTransport([_reasoning_only_response(), _reasoning_only_response()])
+    transport = ScriptedAsyncJsonTransport([_reasoning_only_response(), _reasoning_only_response()])
     client = OpenAIClient(
         model=_snapshot("openai", "gpt-5.6-luna"),
         api_key="fixture-openai-key",

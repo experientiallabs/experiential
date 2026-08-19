@@ -20,14 +20,28 @@ from wmo.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
-from wmo.runtime.openai_protocol.streaming import (
-    ChatSseEncoder,
-    ResponsesSseEncoder,
-    encode_chat_events,
-    encode_responses_events,
-)
+from wmo.runtime.openai_protocol.streaming import ChatSseEncoder, ResponsesSseEncoder
 
 _RAW_ARGUMENTS = '{ "city" : "Zürich" }'
+
+
+def _encode(
+    encoder: ChatSseEncoder | ResponsesSseEncoder,
+    events: tuple[GatewayEvent, ...],
+) -> tuple[str, ...]:
+    """Run one fresh encoder over ordered events and collect every SSE frame.
+
+    Args:
+        encoder: Fresh Chat or Responses encoder.
+        events: Ordered provider events ending in one terminal.
+
+    Returns:
+        Complete SSE frame sequence.
+    """
+    frames = list(encoder.start())
+    for event in events:
+        frames.extend(encoder.feed(event))
+    return tuple(frames)
 
 
 def _tool_events() -> tuple[GatewayEvent, ...]:
@@ -95,7 +109,7 @@ def test_chat_sse_preserves_raw_arguments_stable_ids_usage_and_one_terminal() ->
         created_at=123,
         include_usage=True,
     )
-    frames = encode_chat_events(encoder, _tool_events())
+    frames = _encode(encoder, _tool_events())
     payloads = tuple(_chat_payload(frame) for frame in frames if frame != "data: [DONE]\n\n")
     argument_parts: list[str] = []
     finish_reasons: list[str] = []
@@ -136,7 +150,7 @@ def test_responses_sse_emits_full_lifecycle_monotonic_sequence_and_exact_argumen
         created_at=123.0,
         request=request,
     )
-    frames = encode_responses_events(encoder, _tool_events())
+    frames = _encode(encoder, _tool_events())
     payloads = tuple(_responses_payload(frame) for frame in frames)
     event_types = tuple(str(payload["type"]) for payload in payloads)
     deltas = tuple(
@@ -172,7 +186,7 @@ def test_responses_failure_closes_visible_content_then_emits_one_failed_terminal
         failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
         safe_message="Provider stream failed.",
     )
-    frames = encode_responses_events(
+    frames = _encode(
         ResponsesSseEncoder(
             request_id="request-two",
             model="coding",

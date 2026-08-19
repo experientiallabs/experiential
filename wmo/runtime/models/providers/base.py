@@ -13,14 +13,13 @@ from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import ModelRequest, ModelResponse, ModelSnapshot
 from wmo.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
+    HttpxAsyncJsonTransport,
     RequestDeadline,
-    as_async_transport,
     post_json_async,
     run_with_retry_async,
 )
 from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
 from wmo.runtime.models.providers.transport import (
-    JsonHttpTransport,
     ProviderTransportError,
     RetryClassification,
     RetryPolicy,
@@ -68,7 +67,7 @@ class ProviderHttpClient(abc.ABC):
         model: ModelSnapshot,
         api_key: str,
         base_url: str,
-        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
+        transport: AsyncJsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
@@ -90,7 +89,7 @@ class ProviderHttpClient(abc.ABC):
         self._model = model
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
-        self._transport = as_async_transport(transport)
+        self._transport = transport or HttpxAsyncJsonTransport()
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
 

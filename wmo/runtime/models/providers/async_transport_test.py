@@ -7,11 +7,11 @@ import asyncio
 import httpx
 import pytest
 
+from wmo.runtime.models.conftest import ScriptedAsyncJsonTransport
 from wmo.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
     ProviderDeadlineExceeded,
     RequestDeadline,
-    ScriptedAsyncJsonTransport,
     post_json_async,
     run_with_retry_async,
 )

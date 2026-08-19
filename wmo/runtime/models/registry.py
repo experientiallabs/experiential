@@ -42,9 +42,8 @@ from wmo.runtime.models.providers.tinker_sampling import (
     TinkerSamplingClient,
     create_tinker_sampler,
 )
-from wmo.runtime.models.providers.transport import JsonHttpTransport
 
-ProviderTransport = AsyncJsonHttpTransport | JsonHttpTransport
+ProviderTransport = AsyncJsonHttpTransport
 
 CatalogRoleName = Literal["world_model", "judge", "candidate"]
 """Completion role whose catalog-configured reasoning effort shapes resolved requests."""

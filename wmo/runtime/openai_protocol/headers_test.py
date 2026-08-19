@@ -6,11 +6,8 @@ import pytest
 
 from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
 from wmo.runtime.openai_protocol.headers import (
-    COMMIT_DEPENDENT_HEADERS,
-    COMMIT_INDEPENDENT_HEADERS,
     commit_dependent_headers,
     commit_independent_headers,
-    require_header_partition,
 )
 
 
@@ -22,8 +19,12 @@ def test_streaming_can_flush_only_truthful_commit_independent_headers() -> None:
         alias="coding",
         alias_revision="revision-one",
     )
-    require_header_partition(headers, committed=False)
-    assert set(headers) == COMMIT_INDEPENDENT_HEADERS
+    assert set(headers) == {
+        "x-request-id",
+        "x-client-request-id",
+        "x-gateway-alias",
+        "x-gateway-alias-revision",
+    }
 
 
 def test_route_headers_require_commit_and_reject_response_splitting() -> None:
@@ -35,10 +36,13 @@ def test_route_headers_require_commit_and_reject_response_splitting() -> None:
         route_depth=1,
         route_reason="fallback",
     )
-    assert set(headers) == COMMIT_DEPENDENT_HEADERS
-    with pytest.raises(OpenAIProtocolError, match="before provider commitment"):
-        require_header_partition(headers, committed=False)
-    require_header_partition(headers, committed=True)
+    assert set(headers) == {
+        "x-gateway-canonical-model",
+        "x-gateway-provider",
+        "x-gateway-deployment",
+        "x-gateway-route-depth",
+        "x-gateway-route-reason",
+    }
     with pytest.raises(OpenAIProtocolError, match="not safe"):
         commit_independent_headers(
             request_id="request-one\nforged: yes",

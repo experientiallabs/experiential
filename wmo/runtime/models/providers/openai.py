@@ -40,7 +40,7 @@ from wmo.runtime.models.providers.streaming import (
     NormalizedProviderStream,
     start_openai_responses_stream,
 )
-from wmo.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
+from wmo.runtime.models.providers.transport import RetryPolicy
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
@@ -200,7 +200,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
         model: ModelSnapshot,
         api_key: str,
         base_url: str = OPENAI_BASE_URL,
-        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
+        transport: AsyncJsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         supports_temperature: bool = True,

@@ -1,20 +1,9 @@
-"""Tests for provider protocols, sync bridges, preflight, and gateway exclusions."""
+"""Tests for provider capability preflight and gateway exclusions."""
 
 from __future__ import annotations
 
-import asyncio
-import threading
-
 import pytest
 
-from wmo.common.models import (
-    AssistantAction,
-    BillingSource,
-    ModelMessage,
-    ModelRequest,
-    ModelResponse,
-    ModelSnapshot,
-)
 from wmo.common.models.catalog import GatewayDeploymentCapabilities
 from wmo.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -22,114 +11,11 @@ from wmo.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
-from wmo.runtime.models.providers.async_transport import RequestDeadline
 from wmo.runtime.models.providers.errors import ProviderCapabilityError
 from wmo.runtime.models.providers.protocol import (
-    BoundedSyncModelClientAdapter,
-    SyncModelClientAdapter,
     preflight_gateway_request,
     require_gateway_provider,
 )
-
-
-def _request() -> ModelRequest:
-    """Build one existing sync-model request fixture."""
-    return ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
-
-
-def _response() -> ModelResponse:
-    """Build one completed model response fixture."""
-    return ModelResponse.completed(
-        output=AssistantAction(content="ok"),
-        configured_model=ModelSnapshot(
-            provider="fixture",
-            model_id="fixture-model",
-            billing_source=BillingSource.CUSTOMER_MANAGED,
-            revision="fixture-revision",
-            capabilities_sha256="a" * 64,
-            connection_sha256="b" * 64,
-        ),
-        served_model_id=None,
-        usage=None,
-        latency_seconds=0.01,
-    )
-
-
-class _AsyncClient:
-    """Minimal async completed client for sync compatibility tests."""
-
-    async def complete_async(
-        self,
-        request: ModelRequest,
-        *,
-        deadline: RequestDeadline | None = None,
-        idempotency_key: str | None = None,
-    ) -> ModelResponse:
-        """Return one fixture response after validating adapter inputs."""
-        assert request == _request()
-        assert deadline is not None
-        assert idempotency_key is None
-        return _response()
-
-
-class _BlockingClient:
-    """Sync client that blocks until a test-controlled release event."""
-
-    def __init__(self) -> None:
-        """Create blocked-call coordination state."""
-        self.started = threading.Event()
-        self.release = threading.Event()
-        self.calls = 0
-
-    def complete(self, request: ModelRequest) -> ModelResponse:
-        """Block one worker completion until the test releases it."""
-        assert request == _request()
-        self.calls += 1
-        self.started.set()
-        self.release.wait(timeout=2)
-        return _response()
-
-
-def test_sync_adapter_preserves_existing_model_client_callers() -> None:
-    """Optimizer callers can retain ``complete`` while providers execute asynchronously."""
-    adapter = SyncModelClientAdapter(_AsyncClient(), timeout_seconds=1)
-
-    assert adapter.complete(_request()).output.content == "ok"
-
-
-def test_sync_adapter_refuses_to_block_an_event_loop() -> None:
-    """Gateway handlers must await providers instead of using the sync bridge."""
-
-    async def scenario() -> None:
-        """Call the sync method from an event loop and require a focused failure."""
-        adapter = SyncModelClientAdapter(_AsyncClient(), timeout_seconds=1)
-        with pytest.raises(RuntimeError, match="await complete_async"):
-            adapter.complete(_request())
-
-    asyncio.run(scenario())
-
-
-def test_bounded_worker_holds_admission_after_client_cancellation() -> None:
-    """A detached blocking call retains its permit until the SDK work actually stops."""
-    client = _BlockingClient()
-
-    async def scenario() -> None:
-        """Cancel one call, then prove a second call cannot enter the full worker bound."""
-        adapter = BoundedSyncModelClientAdapter(client, maximum_outstanding_calls=1)
-        first = asyncio.create_task(
-            adapter.complete_async(_request(), deadline=RequestDeadline.after(1))
-        )
-        await asyncio.to_thread(client.started.wait, 1)
-        first.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await first
-        with pytest.raises(TimeoutError):
-            await adapter.complete_async(_request(), deadline=RequestDeadline.after(0.02))
-        assert client.calls == 1
-        client.release.set()
-        await asyncio.sleep(0.02)
-
-    asyncio.run(scenario())
 
 
 def test_preflight_rejects_unsupported_semantics_before_dispatch() -> None:

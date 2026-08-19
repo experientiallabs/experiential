@@ -94,22 +94,19 @@ def invalid_field(param: str, message: str | None = None) -> OpenAIProtocolError
     )
 
 
-def unsupported_field(param: str, *, capability: bool = False) -> OpenAIProtocolError:
-    """Build one explicit unsupported field or capability error.
+def unsupported_field(param: str) -> OpenAIProtocolError:
+    """Build one explicit unsupported field error.
 
     Args:
         param: Public request field path.
-        capability: Whether the field is conditionally supported by deployments.
 
     Returns:
         Stable pre-dispatch rejection.
     """
-    code = "unsupported_capability" if capability else "unsupported_parameter"
-    noun = "capability" if capability else "parameter"
     return OpenAIProtocolError(
         status_code=400,
-        code=code,
-        message=f"The {noun} '{param}' is not supported by this gateway profile.",
+        code="unsupported_parameter",
+        message=f"The parameter '{param}' is not supported by this gateway profile.",
         param=param,
     )
 

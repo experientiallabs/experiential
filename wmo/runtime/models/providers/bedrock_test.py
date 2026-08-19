@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -27,7 +26,7 @@ from wmo.common.models import (
     ToolChoice,
 )
 from wmo.common.tasks import ToolSchema
-from wmo.runtime.models.providers.async_transport import RequestDeadline
+from wmo.runtime.models.conftest import ScriptedAsyncJsonTransport
 from wmo.runtime.models.providers.bedrock import (
     AWS_DEFAULT_REGION_ENV,
     AWS_REGION_ENV,
@@ -48,7 +47,7 @@ from wmo.runtime.models.providers.errors import (
     ProviderRefusalSignal,
     ProviderResponseError,
 )
-from wmo.runtime.models.providers.transport import ProviderTransportError, ScriptedJsonTransport
+from wmo.runtime.models.providers.transport import ProviderTransportError
 from wmo.runtime.models.registry import RuntimeModelCatalog
 
 
@@ -374,7 +373,7 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
             roles=ModelRoles(world_model="claude", judge="claude", embedder="embed"),
         ),
         environment={},
-        transport_factory=ScriptedJsonTransport,
+        transport_factory=ScriptedAsyncJsonTransport,
         bedrock_runtime_factory=lambda *, region_name: runtime,
     )
 
@@ -384,15 +383,6 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
     response = resolved.client.complete(_request())
     vectors = embedder.embedding_client.embed(["hello"]) if embedder.embedding_client else ()
 
-    async def complete_through_bounded_lane() -> str | None:
-        """Exercise the catalog-exposed bounded async completion contract."""
-        assert isinstance(resolved.client, BoundedBedrockClient)
-        async_response = await resolved.client.complete_async(
-            _request(),
-            deadline=RequestDeadline.after(1),
-        )
-        return async_response.output.content
-
     assert snapshot.provider == "bedrock"
     assert snapshot.model_id == "us.anthropic.claude-sonnet-4-5"
     assert isinstance(resolved.client, BoundedBedrockClient)
@@ -400,7 +390,6 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
     assert embedder.embedding_client is not embedder.client
     assert isinstance(embedder.embedding_client, BedrockClient)
     assert response.output.content == "ok"
-    assert asyncio.run(complete_through_bounded_lane()) == "ok"
     assert vectors[0].values == (0.6, 0.8)
 
 
@@ -424,7 +413,7 @@ def test_snapshot_does_not_construct_a_bedrock_runtime() -> None:
             },
         ),
         environment={},
-        transport_factory=ScriptedJsonTransport,
+        transport_factory=ScriptedAsyncJsonTransport,
         bedrock_runtime_factory=forbidden,
     )
 

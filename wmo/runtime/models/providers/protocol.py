@@ -14,20 +14,6 @@ from wmo.runtime.models.providers.errors import ProviderCapabilityError
 from wmo.runtime.models.providers.transport import RetryPolicy
 
 
-class AsyncCompletedModelClient(Protocol):
-    """Async non-streaming completion seam used by existing provider translations."""
-
-    async def complete_async(
-        self,
-        request: ModelRequest,
-        *,
-        deadline: RequestDeadline | None = None,
-        idempotency_key: str | None = None,
-    ) -> ModelResponse:
-        """Complete one request under an absolute deadline and stable attempt identity."""
-        ...
-
-
 class AsyncGatewayProvider(Protocol):
     """Gateway-native provider that yields normalized events in provider order."""
 
@@ -43,57 +29,12 @@ class AsyncGatewayProvider(Protocol):
         ...
 
 
-class SyncModelClientAdapter:
-    """Expose an async completed client through the existing sync ``ModelClient`` contract."""
-
-    def __init__(self, client: AsyncCompletedModelClient, *, timeout_seconds: float) -> None:
-        """Bind one async client and positive compatibility timeout.
-
-        Args:
-            client: Async provider client used for every completion.
-            timeout_seconds: Total request-wide compatibility budget.
-
-        Raises:
-            ValueError: The timeout is not positive.
-        """
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
-        self._client = client
-        self._timeout_seconds = timeout_seconds
-
-    def complete(self, request: ModelRequest) -> ModelResponse:
-        """Run one async completion for a caller that is not on an event loop.
-
-        Args:
-            request: Existing provider-independent model request.
-
-        Returns:
-            The completed response from the async provider.
-
-        Raises:
-            RuntimeError: Called from an event-loop thread, where callers must await directly.
-        """
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(self._complete(request))
-        raise RuntimeError(
-            "sync model compatibility cannot run on an event loop; await complete_async instead"
-        )
-
-    async def _complete(self, request: ModelRequest) -> ModelResponse:
-        """Apply the configured total deadline to one async provider completion."""
-        deadline = RequestDeadline.after(self._timeout_seconds)
-        async with asyncio.timeout(self._timeout_seconds):
-            return await self._client.complete_async(request, deadline=deadline)
-
-
 class BoundedSyncModelClientAdapter:
-    """Run blocking provider calls off-loop with a hard outstanding-work bound.
+    """Bound blocking provider calls behind a hard outstanding-work admission limit.
 
-    Cancellation and deadline expiry stop waiting immediately but cannot interrupt an SDK call
-    already executing in a worker thread. Its permit remains reserved until that call returns, so
-    repeated disconnects cannot create an unbounded set of blocking Bedrock operations.
+    Subclasses acquire one permit before dispatching a blocking SDK call to a worker thread and
+    release it only after that call actually stops, so repeated disconnects cannot create an
+    unbounded set of blocking Bedrock operations.
     """
 
     def __init__(self, client: ModelClient, *, maximum_outstanding_calls: int = 4) -> None:
@@ -122,48 +63,11 @@ class BoundedSyncModelClientAdapter:
         """
         return self._client.complete(request)
 
-    async def complete_async(
-        self,
-        request: ModelRequest,
-        *,
-        deadline: RequestDeadline | None = None,
-        idempotency_key: str | None = None,
-    ) -> ModelResponse:
-        """Run one blocking completion while preserving queue and cancellation bounds.
-
-        Args:
-            request: Existing provider-independent model request.
-            deadline: Absolute request-wide deadline, required for gateway execution.
-            idempotency_key: Stable request identity, unsupported by blocking Bedrock today.
-
-        Returns:
-            The completed provider response.
-
-        Raises:
-            ValueError: No absolute deadline was supplied or idempotency forwarding was requested.
-            TimeoutError: Queueing or the caller's wait exhausts the deadline.
-        """
-        if deadline is None:
-            raise ValueError("bounded sync provider calls require an absolute deadline")
-        if idempotency_key is not None:
-            raise ValueError("blocking provider adapter cannot forward idempotency identity")
-        await self._acquire(deadline)
-        task = asyncio.create_task(asyncio.to_thread(self._client.complete, request))
-        task.add_done_callback(self._release_permit)
-        timeout_seconds = deadline.attempt_timeout()
-        async with asyncio.timeout(timeout_seconds):
-            return await asyncio.shield(task)
-
     async def _acquire(self, deadline: RequestDeadline) -> None:
         """Wait for one worker permit without exceeding the request deadline."""
         timeout_seconds = deadline.attempt_timeout()
         async with asyncio.timeout(timeout_seconds):
             await self._permits.acquire()
-
-    def _release_permit(self, task: asyncio.Task[ModelResponse]) -> None:
-        """Release admission only after the underlying blocking call actually stops."""
-        del task
-        self._permits.release()
 
 
 def preflight_gateway_request(
