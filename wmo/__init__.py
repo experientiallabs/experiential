@@ -11,6 +11,10 @@ if TYPE_CHECKING:
         build_fidelity_evaluation_plan as build_fidelity_evaluation_plan,
     )
     from wmo.common.evaluations import build_fidelity_report as build_fidelity_report
+    from wmo.common.project import ProjectProviderFreeStage as ProjectProviderFreeStage
+    from wmo.common.project import (
+        ProjectTracePreparationSettings as ProjectTracePreparationSettings,
+    )
     from wmo.optimize.router.activation import load_project_router as load_project_router
     from wmo.optimize.router.activation import load_router as load_router
     from wmo.optimize.router.composition import (
@@ -49,6 +53,10 @@ if TYPE_CHECKING:
     from wmo.simulation.build import TaskSetBuild as TaskSetBuild
     from wmo.simulation.build import build_project as build_project
     from wmo.simulation.build import build_task_set as build_task_set
+    from wmo.simulation.build import (
+        load_project_provider_free_stage as load_project_provider_free_stage,
+    )
+    from wmo.simulation.build import prepare_project_traces as prepare_project_traces
     from wmo.simulation.world_model.application import WorldModel as WorldModel
     from wmo.simulation.world_model.application import (
         WorldModelLoadError as WorldModelLoadError,
@@ -68,11 +76,15 @@ if TYPE_CHECKING:
     from wmo.simulation.world_model.application import load_world_model as load_world_model
 
 _EXPORT_MODULES = {
+    "ProjectProviderFreeStage": "wmo.common.project",
+    "ProjectTracePreparationSettings": "wmo.common.project",
     "BuildReviewReadiness": "wmo.simulation.build",
     "ProjectBuild": "wmo.simulation.build",
     "TaskSetBuild": "wmo.simulation.build",
     "build_project": "wmo.simulation.build",
     "build_task_set": "wmo.simulation.build",
+    "load_project_provider_free_stage": "wmo.simulation.build",
+    "prepare_project_traces": "wmo.simulation.build",
     "WorldModel": "wmo.simulation.world_model.application",
     "WorldModelLoadError": "wmo.simulation.world_model.application",
     "WorldModelObservation": "wmo.simulation.world_model.application",

@@ -34,7 +34,9 @@ from wmo.common.project.paths import ProjectPaths, validate_local_id
 from wmo.common.project.project import (
     ProjectBuildArtifacts,
     ProjectConfig,
+    ProjectProviderFreeStage,
     load_project_config,
+    require_durable_source_id,
     write_project_config,
 )
 
@@ -501,7 +503,7 @@ class ArtifactStore:
 
 
 class ProjectStore:
-    """Owns project configuration, a write-once SFT config binding, review draft, and artifacts."""
+    """Own project configuration, immutable pointer bindings, review draft, and artifacts."""
 
     def __init__(self, root: Path, project_id: str) -> None:
         """Create a project-local store without writing state until an explicit method is called."""
@@ -554,6 +556,57 @@ class ProjectStore:
             return load_project_config(self.paths.project_toml)
         except ValueError as exc:
             raise ProjectStoreError(str(exc)) from exc
+
+    def bind_provider_free_stage(self, stage: ProjectProviderFreeStage) -> ProjectConfig:
+        """Atomically select one verified provider-free graph or accept its exact replay.
+
+        Args:
+            stage: Exact trace and task manifest pointers to select.
+
+        Returns:
+            Existing or newly updated Project configuration naming the stage.
+
+        Raises:
+            ProjectStoreError: The graph is invalid, settings are absent, or another stage won.
+        """
+        with file_write_lock(self.paths.project_toml, what="provider-free project stage"):
+            try:
+                self._verify_provider_free_stage(stage)
+                existing = load_project_config(self.paths.project_toml)
+                if existing.trace_preparation is None:
+                    raise ValueError("Project has no provider-free trace preparation settings")
+                if existing.provider_free_stage == stage:
+                    return existing
+                if existing.provider_free_stage is not None:
+                    raise ValueError("project already selects a different provider-free stage")
+                updated = existing.model_copy(update={"provider_free_stage": stage})
+                write_project_config(self.paths.project_toml, updated)
+            except (ArtifactStoreError, ValueError) as exc:
+                raise ProjectStoreError(f"cannot bind provider-free stage: {exc}") from exc
+            return updated
+
+    def _verify_provider_free_stage(self, stage: ProjectProviderFreeStage) -> None:
+        """Verify exact manifests, derived provenance, and lineage behind one stage pointer."""
+        trace = self.artifacts.read(stage.trace_dataset.artifact_id).manifest
+        task = self.artifacts.read(stage.task_set.artifact_id).manifest
+        if trace.artifact_type != "trace-dataset":
+            raise ValueError("provider-free trace pointer does not name a trace-dataset artifact")
+        if task.artifact_type != "task-set":
+            raise ValueError("provider-free task pointer does not name a task-set artifact")
+        if artifact_input(trace) != stage.trace_dataset:
+            raise ValueError("provider-free trace manifest digest changed")
+        if artifact_input(task) != stage.task_set:
+            raise ValueError("provider-free task manifest digest changed")
+        if trace.inputs:
+            raise ValueError("provider-free trace dataset must not have artifact inputs")
+        if task.inputs != (stage.trace_dataset,):
+            raise ValueError("provider-free task set does not bind the selected trace dataset")
+        source = trace.source
+        if source is None or source.sha256 is None:
+            raise ValueError("provider-free trace manifest source requires a byte digest")
+        require_durable_source_id(source.source_id)
+        if task.code_revision != trace.code_revision:
+            raise ValueError("provider-free trace and task manifest revisions differ")
 
     def bind_completed_build(self, build: ProjectBuildArtifacts) -> ProjectConfig:
         """Atomically select a fully verified immutable build for future project workflows.

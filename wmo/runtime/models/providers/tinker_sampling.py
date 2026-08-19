@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast, runtime_checkable
 
 from wmo.common.core.artifacts import ContractModel
 from wmo.common.models import (
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     import tinker
     from tinker_cookbook.renderers import Message as CookbookMessage
     from tinker_cookbook.renderers import Renderer as CookbookRenderer
+    from tinker_cookbook.renderers import ToolCall as CookbookToolCall
     from tinker_cookbook.renderers import ToolSpec as CookbookToolSpec
 
 
@@ -29,6 +30,15 @@ _OPTIONAL_DEPENDENCY_GUIDANCE = (
     "install the Tinker sampling dependencies with `uv sync --extra sft` or "
     "`pip install 'world-model-optimizer[sft]'`"
 )
+
+
+class TinkerPromptMessage(TypedDict):
+    """One cookbook-shaped chat message assembled for Tinker prompt rendering."""
+
+    role: str
+    content: str
+    tool_calls: NotRequired[list[CookbookToolCall]]
+    tool_call_id: NotRequired[str]
 
 
 class TinkerOptionalDependencyError(ImportError):
@@ -248,9 +258,9 @@ def _tinker_prompt(request: ModelRequest, renderer: CookbookRenderer) -> tinker.
     """Convert the WMO request to one cookbook-rendered Tinker model input."""
     from tinker_cookbook.renderers import ToolCall as CookbookToolCall
 
-    messages: list[CookbookMessage] = []
+    messages: list[TinkerPromptMessage] = []
     for message in request.messages:
-        payload: CookbookMessage = {
+        payload: TinkerPromptMessage = {
             "role": message.role,
             "content": _message_content(message.content, message.assistant_action),
         }
@@ -269,7 +279,7 @@ def _tinker_prompt(request: ModelRequest, renderer: CookbookRenderer) -> tinker.
             ]
         messages.append(payload)
     if not request.tools:
-        return renderer.build_generation_prompt(messages)
+        return renderer.build_generation_prompt(cast("list[CookbookMessage]", messages))
     from tinker_cookbook.renderers import ToolSpec
 
     tool_specs: list[CookbookToolSpec] = [
@@ -282,11 +292,10 @@ def _tinker_prompt(request: ModelRequest, renderer: CookbookRenderer) -> tinker.
     ]
     system_prompt = ""
     if messages and messages[0]["role"] == "system":
-        system_content = messages.pop(0)["content"]
-        if isinstance(system_content, str):
-            system_prompt = system_content
+        system_prompt = messages.pop(0)["content"]
     return renderer.build_generation_prompt(
-        renderer.create_conversation_prefix_with_tools(tool_specs, system_prompt) + messages
+        renderer.create_conversation_prefix_with_tools(tool_specs, system_prompt)
+        + cast("list[CookbookMessage]", messages)
     )
 
 

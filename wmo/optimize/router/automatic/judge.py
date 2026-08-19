@@ -16,13 +16,19 @@ from wmo.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    completion_request_cost_usd,
     reconcile_completion_economics,
     verify_completion_reservation,
 )
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact
+from wmo.optimize.router.errors import (
+    JudgeDispatchExhaustedError,
+    JudgeTranscriptAdmissionError,
+)
 from wmo.optimize.router.judging.contracts import ManualJudgeError, ManualJudgeSetupArtifact
 from wmo.optimize.router.judging.protocol import TemplateJudgeClient
+from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
 from wmo.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
 
 
@@ -81,6 +87,10 @@ class ReservedJudgeClient:
             Provider response with known bounded economics.
 
         Raises:
+            JudgeTranscriptAdmissionError: The counted request input exceeds the frozen
+                reserved input-token ceiling, so the rendered transcript cannot be admitted.
+            JudgeDispatchExhaustedError: The admitted dispatch exhausted its bounded retries
+                without usable output; the error carries the conservative billed-spend ceiling.
             ValueError: The request exceeds a bound or provider usage and spend cannot be bounded.
         """
         if self._calls >= self._maximum_provider_calls:
@@ -90,11 +100,23 @@ class ReservedJudgeClient:
         if output_tokens is None:
             raise ValueError("judge request must declare a maximum output-token ceiling")
         if input_tokens > self._reservation.maximum_input_tokens:
-            raise ValueError("judge request exceeds its reserved input-token ceiling")
+            raise JudgeTranscriptAdmissionError(
+                "judge request exceeds its reserved input-token ceiling"
+            )
         if output_tokens > self._reservation.maximum_output_tokens:
             raise ValueError("judge request exceeds its reserved output-token ceiling")
         self._calls += 1
-        response = self._client.complete(request)
+        try:
+            response = self._client.complete(request)
+        except ProviderRetryableResponseError as exc:
+            raise JudgeDispatchExhaustedError(
+                str(exc),
+                conservative_cost_usd=completion_request_cost_usd(
+                    self._reservation,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                ),
+            ) from exc
         if response.model != self._reservation.model:
             raise ValueError("judge response model differs from its frozen reservation")
         economics = reconcile_completion_economics(
