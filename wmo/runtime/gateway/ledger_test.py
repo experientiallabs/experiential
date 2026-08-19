@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from wmo.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
+from wmo.common.models.catalog import BillingSource, GatewayDeploymentMetadata, GatewayTokenPrices
 from wmo.common.models.gateway_catalog import ExactModelDeployment
 from wmo.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -61,7 +61,11 @@ class FakeLedgerClock:
         self.monotonic_value += seconds
 
 
-def _deployment(*, priced: bool = True) -> ExactModelDeployment:
+def _deployment(
+    *,
+    priced: bool = True,
+    billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
+) -> ExactModelDeployment:
     """Create one exact singleton deployment with optional known rates."""
     prices = (
         GatewayTokenPrices(
@@ -80,6 +84,7 @@ def _deployment(*, priced: bool = True) -> ExactModelDeployment:
         connection="connection-one",
         provider="openai",
         provider_model="provider-model-canary",
+        billing_source=billing_source,
         connection_sha256="b" * 64,
         capabilities_sha256="c" * 64,
         gateway=GatewayDeploymentMetadata(
@@ -196,6 +201,47 @@ def test_attempt_usage_and_integer_cost_are_content_free(tmp_path: Path) -> None
     assert b"prompt-content-canary" not in durable
     assert raw_key.encode() not in durable
     assert b"provider-model-canary" not in durable
+
+
+def test_attempt_retains_dispatch_billing_source_after_catalog_change(tmp_path: Path) -> None:
+    """Attempt attribution remains frozen when later catalog ownership changes."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("billing-freeze"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    dispatched = _deployment(billing_source=BillingSource.HOST_MANAGED)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization), deployment=dispatched, route_depth=0
+    )
+
+    authored_after_dispatch = dispatched.model_copy(
+        update={"billing_source": BillingSource.CUSTOMER_MANAGED}
+    )
+    assert authored_after_dispatch.billing_source == BillingSource.CUSTOMER_MANAGED
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=1, output_tokens=1),
+        ),
+        failure=None,
+    )
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        row = connection.execute(
+            "SELECT billing_source, state FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row == (BillingSource.HOST_MANAGED.value, "completed")
 
 
 def test_unknown_prices_remain_unknown_instead_of_zero(tmp_path: Path) -> None:
