@@ -165,7 +165,15 @@ def _capabilities(alias: str) -> ModelCapabilities:
     """Return the exact frozen capabilities used by each focused model."""
     if alias == "embedder":
         return ModelCapabilities(supports_embeddings=True)
-    return ModelCapabilities(context_window_tokens=100_000, maximum_output_tokens=16_000)
+    return ModelCapabilities(
+        supports_completions=True,
+        context_window_tokens=100_000,
+        maximum_output_tokens=16_000,
+        input_cost_per_million_tokens_usd=1,
+        output_cost_per_million_tokens_usd=2,
+        cached_input_cost_per_million_tokens_usd=0.5,
+        cache_write_cost_per_million_tokens_usd=1.5,
+    )
 
 
 def _snapshot(alias: str) -> ModelSnapshot:
@@ -331,7 +339,12 @@ class _SetupSupplier:
             )
         if "pricing-a" not in project.artifacts.list_ids():
             _persist_pricing(project.artifacts)
-            _persist_embeddings(project.artifacts, tasks)
+        embedding_set_id = _persist_embeddings(
+            project.artifacts,
+            tasks,
+            task_set_input=build.review.task_set,
+            embedder=_snapshot("embedder"),
+        )
         production = EvaluationProtocol(
             protocol_id="protocol-production",
             evidence_source="production",
@@ -357,7 +370,7 @@ class _SetupSupplier:
             observed_cells=tuple(observed),
             production_protocol=production,
             simulation_protocol=world,
-            embedding_set_id="embeddings-a",
+            embedding_set_id=embedding_set_id,
             fit_rag_input=completed.fit_rag,
             pricing_snapshot_id="pricing-a",
             incumbent_alias="candidate-a",
@@ -380,7 +393,10 @@ class _SetupSupplier:
                     maximum_input_tokens=10_000,
                 ),
             ),
-            simulation_completion_input=_persist_completion_contract(project.artifacts),
+            simulation_completion_input=_persist_completion_contract(
+                project.artifacts,
+                snapshot=_snapshot,
+            ),
             agent_id="agent-a",
             seed=7,
             maximum_steps=2,
@@ -544,7 +560,10 @@ class _SimulatorFactory:
                 )
             },
             agent_factory=_OneTurnAgent,
-            completion_contract_input=_persist_completion_contract(project.artifacts),
+            completion_contract_input=_persist_completion_contract(
+                project.artifacts,
+                snapshot=_snapshot,
+            ),
             clock=lambda: _TIME,
             monotonic=lambda: 1.0,
         )

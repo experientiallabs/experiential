@@ -460,6 +460,7 @@ def _query_embedding(
 def _completion_reservation(
     alias: str,
     *,
+    model: ModelSnapshot | None = None,
     maximum_input_tokens: int = 80_000,
     maximum_output_tokens: int = 16_000,
 ) -> CompletionCostReservation:
@@ -467,6 +468,7 @@ def _completion_reservation(
 
     Args:
         alias: Exact candidate or world-model alias.
+        model: Exact model identity, or the shared simulator-test snapshot.
         maximum_input_tokens: Hard per-request input admission ceiling.
         maximum_output_tokens: Provider output ceiling.
 
@@ -474,7 +476,7 @@ def _completion_reservation(
         Conservative completion request reservation.
     """
     return completion_cost_reservation(
-        model=_snapshot(alias),
+        model=model or _snapshot(alias),
         input_usd_per_million_tokens=1,
         output_usd_per_million_tokens=2,
         cached_input_usd_per_million_tokens=0.5,
@@ -489,6 +491,7 @@ def _persist_completion_contract(
     store: ArtifactStore,
     *,
     candidate_aliases: tuple[str, ...] = ("candidate-a", "candidate-b"),
+    snapshot: Callable[[str], ModelSnapshot] | None = None,
     candidate_maximum_input_tokens: int = 80_000,
     candidate_maximum_output_tokens: int = 16_000,
 ) -> ArtifactInput:
@@ -497,12 +500,14 @@ def _persist_completion_contract(
     Args:
         store: Project-local artifact store.
         candidate_aliases: Candidate aliases that need request reservations.
+        snapshot: Exact model-identity factory, or the shared simulator-test snapshot.
         candidate_maximum_input_tokens: Hard candidate input admission ceiling.
         candidate_maximum_output_tokens: Candidate provider output ceiling.
 
     Returns:
         Exact completion-contract manifest input.
     """
+    model_for = snapshot or _snapshot
     _contract, contract_input = persist_simulation_completion_contract(
         store,
         inputs=(),
@@ -511,6 +516,7 @@ def _persist_completion_contract(
                 candidate_alias=alias,
                 request=_completion_reservation(
                     alias,
+                    model=model_for(alias),
                     maximum_input_tokens=candidate_maximum_input_tokens,
                     maximum_output_tokens=candidate_maximum_output_tokens,
                 ),
@@ -518,7 +524,10 @@ def _persist_completion_contract(
             for alias in candidate_aliases
         ),
         world_model_alias="world-model-a",
-        world_model_request=_completion_reservation("world-model-a"),
+        world_model_request=_completion_reservation(
+            "world-model-a",
+            model=model_for("world-model-a"),
+        ),
         maximum_attempts=1,
         created_at=_TIME,
         code_revision="test-revision",

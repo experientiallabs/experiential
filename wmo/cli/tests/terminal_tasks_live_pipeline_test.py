@@ -237,7 +237,7 @@ def _calibrate_judge(runner: CliRunner, root: Path) -> None:
     labels = [
         argument
         for trace in plan.traces
-        for argument in ("--label", f"{trace.trace_id}:task-success=4")
+        for argument in ("--label", f"{trace.trace_id}:task-success=1")
     ]
     result = runner.invoke(
         app,
