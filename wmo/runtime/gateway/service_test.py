@@ -9,18 +9,18 @@ from typing import cast
 
 import pytest
 from fastapi.responses import StreamingResponse
-from wmo.runtime.gateway.data_plane_test import (
-    _BlockingStream,
-    _EventStream,
-    _Provider,
-    _service,
-)
 
 from wmo.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+)
+from wmo.runtime.gateway.tests.data_plane_test import (
+    _BlockingStream,
+    _EventStream,
+    _Provider,
+    _service,
 )
 from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
 from wmo.runtime.openai_protocol.requests import decode_chat, decode_responses
