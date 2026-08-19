@@ -288,7 +288,8 @@ def test_project_alias_rejects_deployment_billing_source(tmp_path: Path) -> None
     )
 
     assert result.exit_code == 2
-    assert "--billing-source applies only to direct --deployment aliases" in result.output
+    output_text = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert "--billing-source applies only to direct --deployment aliases" in output_text
 
 
 def test_pool_certification_preflights_revision_conflict_before_catalog_write(
