@@ -6,6 +6,7 @@ from pydantic import Field, model_validator
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256, sha256_json
 from wmo.common.models.catalog import (
+    BillingSource,
     GatewayDeploymentMetadata,
     ModelCatalog,
 )
@@ -26,6 +27,7 @@ class ExactModelDeployment(ContractModel):
     provider: str = Field(min_length=1, max_length=128)
     provider_model: str = Field(min_length=1, max_length=2_048)
     revision: str | None = Field(default=None, max_length=256)
+    billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED
     connection_sha256: Sha256
     capabilities_sha256: Sha256
     capabilities: ModelCapabilities | None = None
@@ -137,6 +139,7 @@ def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog
             provider=connection.provider,
             provider_model=record.model,
             revision=record.revision,
+            billing_source=record.billing_source,
             connection_sha256=connection.identity_sha256(),
             capabilities_sha256=capabilities_sha256,
             capabilities=record.capabilities,

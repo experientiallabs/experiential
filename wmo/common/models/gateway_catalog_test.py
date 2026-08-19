@@ -92,6 +92,40 @@ def test_identical_alias_records_remain_separate_singleton_pools() -> None:
     assert all(len(pool.deployment_ids) == 1 for pool in normalized.pools)
 
 
+def test_billing_source_changes_catalog_identity_without_changing_exact_model() -> None:
+    """Billing ownership is frozen in deployment identity but not model equivalence."""
+    connection = ConnectionConfig(provider="openai")
+    customer = ModelCatalog(
+        connections={"openai": connection},
+        models={
+            "coding": ModelRecord(
+                connection="openai",
+                model="gpt-coding",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+            )
+        },
+    )
+    host = customer.model_copy(
+        update={
+            "models": {
+                "coding": customer.models["coding"].model_copy(
+                    update={"billing_source": BillingSource.HOST_MANAGED}
+                )
+            }
+        }
+    )
+
+    customer_normalized = normalize_gateway_catalog(customer)
+    host_normalized = normalize_gateway_catalog(host)
+
+    assert customer_normalized.deployments[0].exact_model_id == (
+        host_normalized.deployments[0].exact_model_id
+    )
+    assert customer_normalized.deployments[0].billing_source == BillingSource.CUSTOMER_MANAGED
+    assert host_normalized.deployments[0].billing_source == BillingSource.HOST_MANAGED
+    assert customer_normalized.identity_sha256() != host_normalized.identity_sha256()
+
+
 def test_tinker_and_sft_records_are_not_gateway_deployments() -> None:
     """Training handles retain provenance without being treated as operational model routes."""
     sampling_handle = "tinker://sampling/run-1"
