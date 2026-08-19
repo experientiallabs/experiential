@@ -492,7 +492,11 @@ class RuntimeInteractionJournal:
             spend_events = list(self._read_spend_unlocked())
             _validate_combined_spend(events, spend_events)
             state = validate_events(events).get(accepted.interaction_id)
-            if state is None or state.accepted != accepted or state.terminal is not None:
+            if (
+                state is None
+                or not _same_accepted_event(state.accepted, accepted)
+                or state.terminal is not None
+            ):
                 return SpendReservationClaim("superseded")
             expected_source = accepted.acceptance.selected_model.billing_source
             if reservation.billing_source != expected_source:

@@ -376,7 +376,7 @@ def require_identity(
     """Reject reuse of one key with a different request, project, or lineage."""
     from wmo.runtime.router.journal import RuntimeIdempotencyConflictError
 
-    if accepted.identity != identity:
+    if accepted.identity.model_dump(mode="json") != identity.model_dump(mode="json"):
         raise RuntimeIdempotencyConflictError(
             "idempotency key was already used for different request or conversation content"
         )

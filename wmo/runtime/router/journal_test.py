@@ -147,10 +147,10 @@ def _operation(
     )
 
 
-def test_completion_matches_accepted_attempt_after_raw_arguments_are_not_persisted(
+def test_reloaded_claim_matches_request_after_raw_arguments_are_not_persisted(
     tmp_path: Path,
 ) -> None:
-    """Execution-only provider bytes cannot break a durable attempt's completion handshake.
+    """A reloaded retry compares durable semantics and retains fresh provider bytes.
 
     Args:
         tmp_path: Pytest-owned project root.
@@ -177,30 +177,77 @@ def test_completion_matches_accepted_attempt_after_raw_arguments_are_not_persist
         )
     )
     identity = _interaction_identity("support-agent", "raw-arguments-key", request, None)
-    decision = _decision(identity.lineage_id, request)
-    claim = journal.claim(
-        identity,
-        RuntimeAcceptance(
-            decision=decision,
-            selected_alias=decision.selected_alias,
-            selected_model=_snapshot(),
-            policy_input=ArtifactInput(
-                artifact_id=decision.policy_id,
-                sha256=decision.policy_sha256,
-            ),
+    claim = _accept(journal, identity, now=_TIME)
+
+    assert claim.status == "dispatch"
+    assert claim.accepted is not None
+    _reserve_candidate(journal, claim.accepted, now=_TIME)
+    journal.record_failure(
+        claim.accepted,
+        StructuredFailure(
+            code=FailureCode.TIMEOUT,
+            message="provider timed out",
+            retryable=True,
+            attribution=FailureAttribution.MODEL,
         ),
-        now=_TIME,
+        failed_at=_TIME + timedelta(seconds=1),
+    )
+    reloaded = RuntimeInteractionJournal(
+        ProjectPaths(root=tmp_path / ".wmo", project_id="support-agent")
+    )
+    retried = reloaded.claim(
+        _interaction_identity("support-agent", "raw-arguments-key", request, None),
+        now=_TIME + timedelta(seconds=2),
         stale_after=timedelta(seconds=30),
     )
 
-    assert claim.accepted is not None
-    completed = journal.record_completed(
-        claim.accepted,
-        _response(),
-        completed_at=_TIME + timedelta(seconds=1),
+    assert retried.status == "dispatch"
+    assert retried.accepted is not None
+    retried_call = retried.accepted.identity.request.messages[1].assistant_action
+    assert retried_call is not None
+    assert retried_call.tool_calls[0].raw_arguments == '{ "ticket_id": "42", "priority": 1 }'
+    persisted = reloaded.read_events()
+    persisted_action = (
+        cast(RuntimeAcceptedEvent, persisted[-1]).identity.request.messages[1].assistant_action
     )
-
+    assert persisted_action is not None
+    assert persisted_action.tool_calls[0].raw_arguments is None
+    _reserve_candidate(reloaded, retried.accepted, now=_TIME + timedelta(seconds=2))
+    completed = reloaded.record_completed(
+        retried.accepted,
+        _response(),
+        candidate_operation=_operation(
+            ordinal=retried.accepted.spend.operation_count + 1,
+            component=RoutedProviderComponent.SELECTED_CANDIDATE,
+            source=BillingSource.CUSTOMER_MANAGED,
+            disposition=RoutedSpendDisposition.OBSERVED,
+            input_tokens=11,
+        ),
+        completed_at=_TIME + timedelta(seconds=3),
+    )
     assert completed.event == "completed"
+    with pytest.raises(RuntimeIdempotencyConflictError):
+        reloaded.claim(
+            _interaction_identity(
+                "support-agent",
+                "raw-arguments-key",
+                request.model_copy(update={"maximum_output_tokens": 2}),
+                None,
+            ),
+            now=_TIME + timedelta(seconds=4),
+            stale_after=timedelta(seconds=30),
+        )
+    with pytest.raises(RuntimeIdempotencyConflictError):
+        reloaded.claim(
+            _interaction_identity(
+                "support-agent",
+                "raw-arguments-key",
+                request,
+                "different-caller-lineage",
+            ),
+            now=_TIME + timedelta(seconds=4),
+            stale_after=timedelta(seconds=30),
+        )
 
 
 def _decision(lineage_id: str, request: ModelRequest | None = None) -> RoutingDecision:
