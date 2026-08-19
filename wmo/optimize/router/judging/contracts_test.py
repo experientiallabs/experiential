@@ -89,7 +89,7 @@ def test_review_pricing_defaults_new_and_loads_legacy_output_budget() -> None:
         maximum_input_tokens_per_call=32_768,
         maximum_attempts_per_call=3,
         authorized_call_count=1,
-        maximum_reserved_cost_usd=1.0,
+        maximum_reserved_cost_usd=0.196608,
         observed_economics=OperationEconomics(),
     )
     legacy = ManualJudgeReviewPricing.model_validate(
@@ -100,7 +100,7 @@ def test_review_pricing_defaults_new_and_loads_legacy_output_budget() -> None:
             "maximum_output_tokens_per_call": 4096,
             "maximum_attempts_per_call": 3,
             "authorized_call_count": 1,
-            "maximum_reserved_cost_usd": 1.0,
+            "maximum_reserved_cost_usd": 0.036864,
             "observed_economics": OperationEconomics().model_dump(mode="json"),
         }
     )
