@@ -24,6 +24,7 @@ from wmo.common.models.discovery import (
 )
 from wmo.common.models.known_models import KnownModel, known_model_metadata
 from wmo.common.models.model import (
+    DEFAULT_REASONING_EFFORT,
     AssistantAction,
     Embedding,
     ModelAlias,
@@ -35,6 +36,7 @@ from wmo.common.models.model import (
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
+    ReasoningEffort,
     RoutedCandidateSnapshot,
     ToolCall,
     ToolChoice,
@@ -57,6 +59,7 @@ from wmo.common.models.router_candidates import (
     RouterCandidateSelection,
     RouterCandidateSetupError,
     completion_candidate_aliases,
+    configure_provider_catalog_with_router_candidates,
     configure_router_candidates,
     router_candidate_capabilities_sha256,
     router_candidate_prices,
@@ -81,6 +84,7 @@ __all__ = [
     "DiscoveredModel",
     "Embedding",
     "EmbeddingClient",
+    "DEFAULT_REASONING_EFFORT",
     "EmbeddingCostReservation",
     "IdempotentModelClient",
     "KnownModel",
@@ -97,6 +101,7 @@ __all__ = [
     "ModelRoles",
     "ModelSnapshot",
     "NumericMeasurement",
+    "ReasoningEffort",
     "OperationEconomics",
     "PricingSnapshot",
     "PricingSource",
@@ -116,6 +121,7 @@ __all__ = [
     "catalog_state_sha256",
     "combine_economics",
     "completion_candidate_aliases",
+    "configure_provider_catalog_with_router_candidates",
     "completion_cost_reservation",
     "completion_request_cost_usd",
     "configure_provider_catalog",

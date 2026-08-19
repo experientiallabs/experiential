@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -37,7 +36,7 @@ from wmo.common.models import (
     Usage,
 )
 from wmo.common.project import ProjectConfig, ProjectStore, artifact_input
-from wmo.common.routing import FrozenEmbedding, FrozenEmbeddingSet, KnnGuard, RouterFeatureExtractor
+from wmo.common.routing import KnnGuard
 from wmo.common.tasks import load_task_set
 from wmo.optimize.router.composition import (
     ApprovedRouterReview,
@@ -48,14 +47,14 @@ from wmo.optimize.router.composition import (
 from wmo.optimize.router.composition_test import (
     _bind_completed_build,
     _capabilities,
-    _FidelityApproval,
     _Judge,
     _resolved,
     _snapshot,
 )
+from wmo.optimize.router.fit.workflow_test import _persist_embeddings
 from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
 from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.application import create_project_router_app
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
@@ -154,7 +153,12 @@ class _EvidenceSetupSupplier:
                 envelope=pricing,
                 files={"pricing.json": pricing},
             )
-            _persist_release_embeddings(project, tasks, self.revision)
+        embedding_set_id = _persist_embeddings(
+            project.artifacts,
+            tasks,
+            completed.task_set,
+            code_revision=self.revision,
+        )
         production = EvaluationProtocol(
             protocol_id="w16-production-protocol",
             evidence_source="production",
@@ -180,7 +184,7 @@ class _EvidenceSetupSupplier:
             observed_cells=tuple(observed),
             production_protocol=production,
             simulation_protocol=world,
-            embedding_set_id="embeddings-a",
+            embedding_set_id=embedding_set_id,
             fit_rag_input=completed.fit_rag,
             pricing_snapshot_id="w16-pricing",
             incumbent_alias="candidate-baseline",
@@ -371,8 +375,9 @@ class _RuntimeCatalog:
         """Return the exact snapshot and capabilities for one alias."""
         return _snapshot(alias), _capabilities(alias)
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
         """Resolve one alias without environment or provider access."""
+        del role
         snapshot, capabilities = self.snapshot(alias)
         client = self.clients[alias]
         return ResolvedModel(
@@ -417,14 +422,12 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     completed_build = _bind_completed_build(project, normalized, revision=revision)
     simulator = _EvidenceSimulatorFactory()
     judge = _EvidenceJudge(revision)
-    approval = _FidelityApproval()
     runtime_catalog = _RuntimeCatalog()
     services = RouterWorkflowServices(
         review_supplier=_EvidenceReviewSupplier(revision),
         setup_supplier=_EvidenceSetupSupplier(revision),
         simulator_factory=simulator,
         judge=judge,
-        fidelity_approval=approval,
         runtime_catalog=cast(RuntimeModelCatalog, runtime_catalog),
     )
     budget = RouterCompositionBudget(
@@ -452,7 +455,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
         created_at=_TIME,
         code_revision=revision,
     )
-    dispatches_after_completion = _dispatch_counts(simulator, judge, approval)
+    dispatches_after_completion = _dispatch_counts(simulator, judge)
     replay = wmo.compose_router(
         project,
         normalized,
@@ -469,7 +472,6 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert result.build.review.status == "proposals_pending"
     assert result.review.rubric_id == "rubric-a"
     assert result.review.calibration_id == "calibration-a"
-    assert result.fidelity_approval_id
     assert result.policy_lock_id
     report = result.optimization.optimization.report
     assert len(report.held_out_task_ids) == 20
@@ -478,7 +480,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert report.coverage.not_run_row_count == 0
     assert report.source_strata
     assert result.build.review.paid_calls_made == 0
-    assert result.phase_a_simulation_spend_usd == 0.0
+    assert result.fit_simulation_spend_usd == 0.0
     assert result.held_out_simulation_spend_usd == 0.0
     assert result.total_simulation_spend_usd == 0.0
     assert result.held_out_simulation_spec.maximum_cost_usd == (budget.maximum_simulation_cost_usd)
@@ -491,14 +493,14 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert report.run_spend.world_model.missing_row_count == 0
     assert report.run_spend.judge.missing_row_count == 0
     assert replay.optimization == result.optimization
-    assert _dispatch_counts(simulator, judge, approval) == dispatches_after_completion
+    assert _dispatch_counts(simulator, judge) == dispatches_after_completion
     planned_phase_cells = len(result.simulation_spec.cell_ids) + len(
         result.held_out_simulation_spec.cell_ids
     )
-    assert planned_phase_cells == 140
+    assert planned_phase_cells == 130
     assert dispatches_after_completion[:2] == (
-        140,
-        140,
+        130,
+        130,
     )
     reservations = tuple(
         JudgmentDispatchReceipt.model_validate_json(
@@ -507,7 +509,7 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
         for artifact_id in project.artifacts.list_ids()
         if project.artifacts.read(artifact_id).manifest.artifact_type == "judgment-dispatch"
     )
-    assert len(reservations) == judge.calls == len(result.plan.cells) == 150
+    assert len(reservations) == judge.calls == len(result.plan.cells) == 140
     assert judge.calls <= budget.maximum_judgments
     assert len(telemetry_delivered) == 1
     assert len(telemetry_attempts) == 2
@@ -543,9 +545,9 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
             "normalized_trace_count": 100,
             "fit_task_count": 50,
             "held_out_task_count": 20,
-            "planned_cell_count": 150,
-            "simulated_cell_count": 140,
-            "judgment_count": 150,
+            "planned_cell_count": 140,
+            "simulated_cell_count": 130,
+            "judgment_count": 140,
             "maximum_judgments": 200,
             "maximum_simulation_cost_usd": 2.0,
             "observed_spend_usd": 0.0,
@@ -625,6 +627,8 @@ class _EvidenceReviewSupplier:
                 score_maps=(
                     DimensionScoreMap(
                         dimension_id="dimension-a",
+                        min_score=0,
+                        max_score=5,
                         calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
                     ),
                 ),
@@ -639,37 +643,10 @@ class _EvidenceReviewSupplier:
         return ApprovedRouterReview(rubric_id="rubric-a", calibration_id="calibration-a")
 
 
-def _persist_release_embeddings(project: ProjectStore, tasks, revision: str) -> None:  # noqa: ANN001
-    """Persist exact local vectors with release-checkout provenance."""
-    extractor = RouterFeatureExtractor()
-    embeddings = FrozenEmbeddingSet(
-        schema_version=1,
-        created_at=_TIME,
-        code_revision=revision,
-        embedding_set_id="embeddings-a",
-        embedder_alias="embedder",
-        embedder=_snapshot("embedder"),
-        embeddings=tuple(
-            FrozenEmbedding(
-                text_sha256=hashlib.sha256(extractor.from_task(task).encode()).hexdigest(),
-                values=(1.0, 0.0),
-            )
-            for task in tasks
-        ),
-    )
-    project.artifacts.write_json(
-        artifact_id=embeddings.embedding_set_id,
-        artifact_type="router-embeddings",
-        envelope=embeddings,
-        files={"embeddings.json": embeddings},
-    )
-
-
 def _dispatch_counts(
     simulator: _EvidenceSimulatorFactory,
     judge: _Judge,
-    approval: _FidelityApproval,
-) -> tuple[int, int, int, int]:
-    """Return model, world-model, judge, and approval dispatch totals."""
+) -> tuple[int, int, int]:
+    """Return candidate, world-model, and judge dispatch totals."""
     candidate_calls = sum(len(client.requests) for client in simulator.candidates.values())
-    return candidate_calls, len(simulator.world.requests), judge.calls, approval.calls
+    return candidate_calls, len(simulator.world.requests), judge.calls

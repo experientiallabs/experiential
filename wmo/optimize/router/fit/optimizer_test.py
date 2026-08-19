@@ -641,6 +641,8 @@ def _persist_canonical_evaluation(
                         dimension_id="dimension-a",
                         raw_score=5 if score > 0.9 else (4 if score > 0.8 else 3),
                         calibrated_score=score * 5,
+                        min_score=0,
+                        max_score=5,
                         rationale="The response met the expected behavior.",
                     ),
                 ),
@@ -841,9 +843,6 @@ def _persist_plan(
         ),
         pricing_snapshot_id=pricing_input.artifact_id,
         pricing_snapshot_sha256=pricing_input.sha256,
-        fidelity_thresholds_id="fidelity-thresholds-a",
-        fidelity_thresholds_sha256=_DIGEST,
-        fidelity_protocol_sha256=_DIGEST,
         cells=cells,
     )
     manifest = store.write_json(
@@ -909,6 +908,8 @@ def _persist_calibration(
         score_maps=(
             DimensionScoreMap(
                 dimension_id="dimension-a",
+                min_score=0,
+                max_score=5,
                 calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
             ),
         ),

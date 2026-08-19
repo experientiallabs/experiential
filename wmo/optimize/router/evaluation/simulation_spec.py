@@ -24,7 +24,8 @@ def build_router_simulation_spec(
     code_revision: str,
     cells: tuple[EvaluationCell, ...],
     *,
-    phase: Literal["fidelity-fit", "heldout"],
+    phase: Literal["fit", "heldout"],
+    stop_on_overspend: bool,
 ) -> SimulationSpec:
     """Create one phase-scoped simulation spec over the exact fit-only RAG.
 
@@ -37,7 +38,9 @@ def build_router_simulation_spec(
         created_at: Immutable specification timestamp.
         code_revision: Exact source revision bound to generated artifacts.
         cells: Phase-specific plan cells eligible for simulation.
-        phase: Fidelity-fit or held-out phase label used in stable identity.
+        phase: Fit or held-out phase label used in stable identity.
+        stop_on_overspend: When true, reconciled spend reaching the ceiling blocks the next
+            dispatch; by default the authorized run warns and continues.
 
     Returns:
         Sparse immutable specification that binds the same fit RAG in either phase.
@@ -56,6 +59,7 @@ def build_router_simulation_spec(
         "maximum_steps": setup.maximum_steps,
         "maximum_concurrency": setup.maximum_concurrency,
         "maximum_cost_usd": maximum_cost_usd,
+        "stop_on_overspend": stop_on_overspend,
         "code_revision": code_revision,
     }
     if setup.simulation_completion_input is not None:
@@ -83,4 +87,5 @@ def build_router_simulation_spec(
         maximum_steps=setup.maximum_steps,
         maximum_concurrency=setup.maximum_concurrency,
         maximum_cost_usd=maximum_cost_usd,
+        stop_on_overspend=stop_on_overspend,
     )

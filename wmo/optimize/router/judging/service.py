@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes, stable_id
+from wmo.common.core.artifacts import ArtifactInput, stable_id
 from wmo.common.judging import (
     HumanLabelSet,
     HumanScoreReview,
@@ -19,9 +19,10 @@ from wmo.common.judging import (
     RubricReview,
     write_router_lineage_split,
 )
+from wmo.common.judging.evidence import DEFAULT_JUDGE_OUTPUT_TOKENS
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.models import ModelCatalog, ModelSnapshot, PricingSource
-from wmo.common.project import ArtifactCorruptionError, ProjectStore, artifact_input
+from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, load_trace_dataset
 from wmo.optimize.router.judging.artifacts import (
@@ -71,6 +72,12 @@ from wmo.optimize.router.judging.selection import (
     representative_pairs,
     representative_pairwise_pairs,
     trace_preview,
+)
+from wmo.optimize.router.judging.setup_store import (
+    read_setup_artifact as _read_setup,
+)
+from wmo.optimize.router.judging.setup_store import (
+    write_setup_artifact as _write_setup,
 )
 from wmo.optimize.router.judging.template_bind import (
     DEFAULT_JUDGE_TEMPLATE,
@@ -214,7 +221,8 @@ def commit_manual_judge_setup(
         Immutable setup artifact, including an idempotent exact replay.
 
     Raises:
-        ManualJudgeError: Confirmation is absent or the project/build changed before commit.
+        ManualJudgeError: Confirmation is absent, the project/build changed before commit,
+            or the plan names a different finalized contract.
     """
     if not confirmed:
         raise ManualJudgeError("judge setup requires explicit confirmation before writing")
@@ -266,6 +274,27 @@ def commit_manual_judge_setup(
             key=lambda item: item.artifact_id,
         )
     )
+    return _persist_setup(store, plan, inputs=inputs, rubric=rubric_input)
+
+
+def _persist_setup(
+    store: ProjectStore,
+    plan: ManualJudgeSetupPlan,
+    *,
+    inputs: tuple[ArtifactInput, ...],
+    rubric: ArtifactInput,
+) -> ManualJudgeSetupArtifact:
+    """Write one finalized setup and point fresh review state at it.
+
+    Args:
+        store: Project-local artifact and mutable review store.
+        plan: Confirmed setup plan to persist.
+        inputs: Ordered exact manifest inputs binding the setup.
+        rubric: Verified manifest pointer of the finalized rubric.
+
+    Returns:
+        The newly persisted immutable setup artifact.
+    """
     setup_id = stable_id(
         "manual-judge-setup",
         {
@@ -288,7 +317,7 @@ def commit_manual_judge_setup(
         prompt_template=plan.prompt_template,
         trace_dataset=plan.build.trace_dataset,
         task_set=plan.build.task_set,
-        rubric=rubric_input,
+        rubric=rubric,
         previews=plan.previews,
     )
     setup_input = _write_setup(store, setup)
@@ -425,12 +454,15 @@ def estimate_manual_judge_budget(
         raise ValueError("completed judge review count is outside the frozen trace sample")
     calls_per_trace = 2 if plan.setup.prompt_template.response_shape == "pairwise" else 1
     call_count = (len(plan.traces) - completed_review_count) * calls_per_trace
-    per_attempt = (maximum_input_tokens_per_call * input_price + 4_096 * output_price) / 1_000_000
+    per_attempt = (
+        maximum_input_tokens_per_call * input_price + DEFAULT_JUDGE_OUTPUT_TOKENS * output_price
+    ) / 1_000_000
     return JudgeCalibrationBudget(
         input_usd_per_million_tokens=input_price,
         output_usd_per_million_tokens=output_price,
         pricing_source=source,
         maximum_input_tokens_per_call=maximum_input_tokens_per_call,
+        maximum_output_tokens_per_call=DEFAULT_JUDGE_OUTPUT_TOKENS,
         maximum_attempts_per_call=resolved_retry.maximum_attempts,
         call_count=call_count,
         estimated_cost_usd=per_attempt * resolved_retry.maximum_attempts * call_count,
@@ -495,7 +527,7 @@ def calibrate_manual_judge(
         save_label_draft(store, setup, sample_sha256, supplied_labels, created_at)
         reviewer = reviewer_from_labels(setup, supplied_labels)
     elif supplied_labels:
-        raise ManualJudgeError("supply either a review callback or legacy labels, not both")
+        raise ManualJudgeError("supply either a review callback or explicit labels, not both")
     calls_per_trace = 2 if setup.prompt_template.response_shape == "pairwise" else 1
     expected_calls = (len(plan.traces) - len(completed_reviews)) * (calls_per_trace)
     total_calls = len(plan.traces) * calls_per_trace
@@ -561,7 +593,7 @@ def calibrate_manual_judge(
     if rubric_input != setup.rubric:
         raise ManualJudgeError("manual judge rubric manifest differs from setup")
     if len(completed_reviews) < len(plan.traces):
-        resolved = runtime_catalog.preflight(setup.judge_alias)
+        resolved = runtime_catalog.preflight(setup.judge_alias, role="judge")
         if resolved.snapshot != setup.judge_model:
             raise ManualJudgeError("configured judge identity changed after setup")
         collection = collect_trace_reviews(
@@ -679,81 +711,6 @@ def calibrate_manual_judge(
         approved_at=created_at,
         provider_calls_made=collection.provider_calls_made,
     )
-
-
-def _write_setup(store: ProjectStore, setup: ManualJudgeSetupArtifact) -> ArtifactInput:
-    """Persist or verify one finalized manual judge setup.
-
-    Args:
-        store: Project-local immutable artifact store.
-        setup: Confirmed setup contract.
-
-    Returns:
-        Exact manifest pointer for the stored setup.
-
-    Raises:
-        ManualJudgeError: An existing artifact conflicts or cannot be verified.
-    """
-    try:
-        _stored, manifest = store.artifacts.write_or_replay(
-            artifact_id=setup.setup_id,
-            artifact_type="manual-judge-setup",
-            envelope=setup,
-            envelope_path="setup.json",
-            envelope_type=ManualJudgeSetupArtifact,
-            files={"setup.json": canonical_json_bytes(setup)},
-        )
-    except ArtifactCorruptionError as exc:
-        raise ManualJudgeError("existing manual judge setup cannot be resumed safely") from exc
-    except ValueError as exc:
-        raise ManualJudgeError("existing manual judge setup conflicts with confirmation") from exc
-    return artifact_input(manifest)
-
-
-def _read_setup(store: ProjectStore, expected: ArtifactInput) -> ManualJudgeSetupArtifact:
-    """Read one setup and require its exact manifest pointer.
-
-    Args:
-        store: Project-local immutable artifact store.
-        expected: Review-state setup pointer.
-
-    Returns:
-        Verified setup contract.
-
-    Raises:
-        ManualJudgeError: The artifact is absent, malformed, or changed.
-    """
-    saved, saved_input = _read_setup_with_input(store, expected.artifact_id)
-    if saved_input != expected:
-        raise ManualJudgeError("manual judge setup manifest differs from review state")
-    return saved
-
-
-def _read_setup_with_input(
-    store: ProjectStore, artifact_id: str
-) -> tuple[ManualJudgeSetupArtifact, ArtifactInput]:
-    """Read a setup artifact through the shared provenance verifier.
-
-    Args:
-        store: Project-local immutable artifact store.
-        artifact_id: Setup artifact identifier.
-
-    Returns:
-        Verified setup and canonical manifest input.
-
-    Raises:
-        ManualJudgeError: The setup cannot be verified.
-    """
-    try:
-        return read_artifact_json(
-            store,
-            artifact_id=artifact_id,
-            expected_artifact_type="manual-judge-setup",
-            relative_path="setup.json",
-            model_type=ManualJudgeSetupArtifact,
-        )
-    except JudgingProvenanceError as exc:
-        raise ManualJudgeError("completed manual judge setup is unavailable") from exc
 
 
 def _validate_labels(

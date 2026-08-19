@@ -13,9 +13,14 @@ from wmo.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
-from wmo.common.models.model import ModelCapabilities
+from wmo.common.models.model import ModelCapabilities, ReasoningEffort
 from wmo.common.models.pricing import CandidateTokenPrice
-from wmo.common.models.setup import ProviderModelSelection, catalog_state_sha256
+from wmo.common.models.setup import (
+    ProviderModelSelection,
+    ProviderSetup,
+    _merge_provider_setup,
+    catalog_state_sha256,
+)
 
 
 class RouterCandidateSetupError(ValueError):
@@ -44,10 +49,15 @@ def router_candidate_capabilities_sha256(capabilities: ModelCapabilities) -> Sha
 
 
 class RouterCandidateSelection(ContractModel):
-    """Explicit ordered router candidates and the quality incumbent among them."""
+    """Explicit ordered router candidates and the quality incumbent among them.
+
+    Each candidate alias may carry its own reasoning-effort choice for candidate-role calls.
+    An absent entry means that candidate keeps its catalog capability pin unchanged.
+    """
 
     candidates: tuple[str, ...] = Field(min_length=2)
     incumbent: str = Field(min_length=1, max_length=128)
+    candidate_reasoning_efforts: dict[str, ReasoningEffort] = Field(default_factory=dict)
 
     @field_validator("candidates")
     @classmethod
@@ -79,6 +89,11 @@ class RouterCandidateSelection(ContractModel):
         """
         if self.incumbent not in self.candidates:
             raise ValueError("router incumbent must also be a selected candidate")
+        unknown = sorted(set(self.candidate_reasoning_efforts).difference(self.candidates))
+        if unknown:
+            raise ValueError(
+                "candidate_reasoning_efforts name unselected candidates: " + ", ".join(unknown)
+            )
         return self
 
 
@@ -191,17 +206,85 @@ def configure_router_candidates(
                 )
             models[candidate.alias] = candidate_record
         catalog = catalog.model_copy(update={"models": models})
-        problems = validate_router_candidate_selection(catalog, selection)
-        if problems:
-            raise RouterCandidateSetupError(
-                "router candidate setup is incomplete:\n- " + "\n- ".join(problems)
-            )
-        roles = catalog.roles.model_copy(
-            update={"candidates": selection.candidates, "incumbent": selection.incumbent}
-        )
-        configured = catalog.model_copy(update={"roles": roles})
+        configured = _apply_router_candidate_selection(catalog, selection)
         write_model_catalog(path, configured)
         return configured
+
+
+def configure_provider_catalog_with_router_candidates(
+    path: Path,
+    setup: ProviderSetup,
+    selection: RouterCandidateSelection,
+    *,
+    expected_state_sha256: str | None = None,
+) -> ModelCatalog:
+    """Atomically persist provider records and the selected router roles together.
+
+    Args:
+        path: Local ``.wmo/models.toml`` path.
+        setup: Newly discovered provider records plus the existing build-role aliases.
+        selection: Confirmed ordered router candidates and incumbent.
+        expected_state_sha256: Exact catalog state observed during collection.
+
+    Returns:
+        Complete catalog after provider records and router roles are committed.
+
+    Raises:
+        RouterCandidateSetupError: The catalog changed, provider setup conflicts, or the
+            selected aliases are incomplete.
+        ModelCatalogError: Existing catalog content is absent or malformed.
+    """
+    with file_write_lock(path, what="provider model and router candidate configuration"):
+        current_state = catalog_state_sha256(path)
+        if expected_state_sha256 is not None and current_state != expected_state_sha256:
+            raise RouterCandidateSetupError(
+                "models.toml changed while candidates were being confirmed; review and retry"
+            )
+        existing = load_model_catalog(path) if path.exists() else None
+        try:
+            catalog = _merge_provider_setup(existing, setup, replace=False)
+        except ValueError as exc:
+            raise RouterCandidateSetupError(str(exc)) from exc
+        configured = _apply_router_candidate_selection(catalog, selection)
+        write_model_catalog(path, configured)
+        return configured
+
+
+def _apply_router_candidate_selection(
+    catalog: ModelCatalog,
+    selection: RouterCandidateSelection,
+) -> ModelCatalog:
+    """Validate and apply router candidate roles to an in-memory catalog.
+
+    Args:
+        catalog: Catalog containing all selected provider and model records.
+        selection: Confirmed ordered router candidates and incumbent.
+
+    Returns:
+        Catalog with the selected router roles assigned.
+
+    Raises:
+        RouterCandidateSetupError: The selection is incomplete for the catalog.
+    """
+    problems = validate_router_candidate_selection(catalog, selection)
+    if problems:
+        raise RouterCandidateSetupError(
+            "router candidate setup is incomplete:\n- " + "\n- ".join(problems)
+        )
+    retained = {
+        alias: effort
+        for alias, effort in catalog.roles.candidate_reasoning_efforts.items()
+        if alias in selection.candidates
+    }
+    retained.update(selection.candidate_reasoning_efforts)
+    roles = catalog.roles.model_copy(
+        update={
+            "candidates": selection.candidates,
+            "incumbent": selection.incumbent,
+            "candidate_reasoning_efforts": retained,
+        }
+    )
+    return catalog.model_copy(update={"roles": roles})
 
 
 def verify_router_candidate_catalog_state(path: Path, expected_state_sha256: str) -> None:

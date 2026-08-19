@@ -12,11 +12,12 @@ from wmo.common.core.artifacts import (
     ArtifactInput,
     FailureAttribution,
     FailureCode,
+    JsonValue,
     StructuredFailure,
-    sorted_unique_inputs,
 )
 from wmo.common.evaluations import EvaluationCell, EvaluationPlan
 from wmo.common.models import OperationEconomics
+from wmo.common.progress import ProgressHook
 from wmo.common.project import (
     ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
@@ -24,6 +25,7 @@ from wmo.common.project import (
     artifact_input,
 )
 from wmo.common.rollouts import (
+    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
     RolloutArtifact,
     SimulationArtifactSet,
     SimulationCellBinding,
@@ -42,6 +44,7 @@ from wmo.simulation.engines.text.bindings import (
     make_resolution,
     rollout_id_for_binding,
 )
+from wmo.simulation.engines.text.cell_progress import cell_progress_reporter
 from wmo.simulation.engines.text.episode_loop import execute_text_episode_loop
 from wmo.simulation.engines.text.errors import (
     SimulationConfigurationError,
@@ -58,6 +61,7 @@ from wmo.simulation.engines.text.grounding import (
     verify_fit_retriever,
 )
 from wmo.simulation.engines.text.leases import (
+    TextCellLease,
     TextCellLeaseError,
     TextCellLeaseState,
     TextCellLeaseStore,
@@ -70,6 +74,16 @@ from wmo.simulation.engines.text.recording import (
     text_prompt_digest,
 )
 from wmo.simulation.engines.text.redaction import redact_rollout_secrets, redacted_field_set
+from wmo.simulation.engines.text.resume import (
+    ROLLOUT_FILE,
+    ResumePins,
+    load_optional_rollout,
+    load_rollout,
+    persisted_cell_attempts,
+    resolve_cell_attempt,
+    validate_resume_rollout,
+    verify_persisted_evaluation_plan,
+)
 from wmo.simulation.engines.text.rollout_support import (
     combine_spans,
     elapsed_seconds,
@@ -79,6 +93,7 @@ from wmo.simulation.engines.text.rollout_support import (
     normalize_text_tool_failure,
     orchestration_economics,
 )
+from wmo.simulation.engines.text.spec_persistence import persist_canonical_specification
 from wmo.simulation.orchestration import require_implemented_mode
 from wmo.simulation.retrieval import TraceRAGRetriever
 from wmo.simulation.specs import SimulationSpec
@@ -86,18 +101,14 @@ from wmo.simulation.specs import SimulationSpec
 if TYPE_CHECKING:
     from wmo.simulation.world_model import GroundedWorldModel
 
-_SPEC_FILE = "simulation-spec.json"
-_ROLLOUT_FILE = "rollout.json"
-
 
 class WorldModelSimulator:
     """Execute a text-only customer agent against a remote world-model provider.
 
-    The simulator deliberately owns only one concrete mode. It invokes an independently resolved
-    candidate client and world-model client, gives the agent an execute-only no-tools environment,
-    and persists one immutable rollout per selected evaluation cell. It never exposes a mutable
-    world-model session, sends no tools to the world model, and records candidate economics apart
-    from simulator operating cost.
+    The simulator deliberately owns only one concrete mode. It invokes independently resolved
+    candidate and world-model clients, gives the agent an execute-only no-tools environment,
+    persists one immutable rollout per selected cell, never exposes a mutable world-model session,
+    sends no tools to the world model, and records candidate economics apart from simulator cost.
 
     Args:
         store: Immutable local artifact store receiving specifications and rollout artifacts.
@@ -115,6 +126,7 @@ class WorldModelSimulator:
         clock: Time source for artifact and span timestamps.
         monotonic: Monotonic time source for orchestration latency measurements.
         token_counter: Optional full-request preflight counter. The default never truncates input.
+        progress: Optional observer of exact per-cell completion counts.
     """
 
     def __init__(
@@ -135,6 +147,7 @@ class WorldModelSimulator:
         clock: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         token_counter: TokenCounter | None = None,
+        progress: ProgressHook | None = None,
     ) -> None:
         """Bind one immutable plan and all explicit runtime dependencies.
 
@@ -154,6 +167,7 @@ class WorldModelSimulator:
             clock: Time source, injectable for deterministic tests.
             monotonic: Duration source, injectable for deterministic tests.
             token_counter: Full-request counter used before each provider call.
+            progress: Optional observer of exact per-cell completion counts.
 
         Raises:
             SimulationConfigurationError: The supplied plan input does not name this plan.
@@ -182,6 +196,7 @@ class WorldModelSimulator:
         self._clock = clock or utc_now
         self._monotonic = monotonic
         self._token_counter = token_counter or Utf8UpperBoundTokenCounter()
+        self._progress = progress
         self._rollout_builder = GroundedRolloutBuilder(
             plan_input=self._plan_input,
             task_set_input=self._task_set_input,
@@ -190,34 +205,18 @@ class WorldModelSimulator:
             clock=self._clock,
         )
         self._leases = TextCellLeaseStore(store.project_directory, clock=self._clock)
-        self._verify_persisted_evaluation_plan()
+        verify_persisted_evaluation_plan(
+            self._store, self._plan, self._plan_input, self._task_set.task_set_id
+        )
 
-    def _verify_persisted_evaluation_plan(self) -> None:
-        """Reject a caller-provided plan object that differs from its immutable manifest input."""
-        try:
-            stored = self._store.read(self._plan_input.artifact_id)
-            persisted = EvaluationPlan.model_validate_json(
-                self._store.read_bytes(self._plan_input.artifact_id, "evaluation-plan.json")
-            )
-        except (ArtifactCorruptionError, ValueError) as exc:
-            raise SimulationConfigurationError(
-                f"simulation evaluation plan {self._plan_input.artifact_id!r} cannot be read safely"
-            ) from exc
-        if (
-            stored.manifest.artifact_type != "evaluation-plan"
-            or artifact_input(stored.manifest) != self._plan_input
-        ):
-            raise SimulationConfigurationError(
-                "evaluation_plan_input must name the exact persisted evaluation-plan manifest"
-            )
-        if persisted != self._plan:
-            raise SimulationConfigurationError(
-                "supplied evaluation plan differs from its immutable persisted manifest"
-            )
-        if self._plan.task_set_id != self._task_set.task_set_id:
-            raise SimulationConfigurationError(
-                "evaluation plan task_set_id does not match the supplied immutable task set"
-            )
+    def _pins(self, resolution_input: ArtifactInput) -> ResumePins:
+        """Return the exact immutable pointers persisted rollouts must match."""
+        return ResumePins(
+            plan_input=self._plan_input,
+            task_set_input=self._task_set_input,
+            fit_rag_input=self._fit_rag_input,
+            resolution_input=resolution_input,
+        )
 
     def run(self, spec: SimulationSpec) -> SimulationArtifactSet:
         """Run or resume exactly the sparse simulated cells selected by ``spec``.
@@ -239,7 +238,7 @@ class WorldModelSimulator:
         """
         require_implemented_mode(spec, SimulationMode.WORLD_MODEL)
         cells, world_model, grounded_world_model = self._validate_spec_and_bindings(spec)
-        spec_input = self._persist_specification(spec)
+        spec, spec_input = persist_canonical_specification(self._store, spec)
         resolution, resolution_input, bindings = self._persist_resolution(
             spec,
             spec_input,
@@ -250,22 +249,20 @@ class WorldModelSimulator:
         completed = self._load_completed_rollouts(cells, bindings, resolution_input)
         pending = tuple(cell for cell in cells if cell.cell_id not in completed)
 
-        if pending:
-            completed.update(
-                {
-                    cell.cell_id: self._execute_and_persist_cell(
-                        spec,
-                        cell,
-                        world_model,
-                        grounded_world_model,
-                        spec_input,
-                        resolution,
-                        resolution_input,
-                        bindings,
-                    )
-                    for cell in pending
-                }
+        observe_cells = cell_progress_reporter(self._progress, cells, completed)
+        observe_cells()
+        for cell in pending:
+            completed[cell.cell_id] = self._execute_and_persist_cell(
+                spec,
+                cell,
+                world_model,
+                grounded_world_model,
+                spec_input,
+                resolution,
+                resolution_input,
+                bindings,
             )
+            observe_cells()
         ordered_rollouts = tuple(completed[cell.cell_id] for cell in cells)
         return persist_artifact_set(
             store=self._store,
@@ -390,36 +387,6 @@ class WorldModelSimulator:
             cells.append(cell)
         return tuple(cells), world_model, grounded_world_model
 
-    def _persist_specification(self, spec: SimulationSpec) -> ArtifactInput:
-        """Atomically write or verify the immutable specification before rollout execution."""
-        try:
-            manifest = self._store.write_json(
-                artifact_id=spec.simulation_id,
-                artifact_type="simulation-spec",
-                envelope=spec,
-                files={_SPEC_FILE: spec},
-            )
-            return artifact_input(manifest)
-        except ArtifactAlreadyExistsError as exc:
-            stored = self._store.read(spec.simulation_id)
-            if stored.manifest.artifact_type != "simulation-spec":
-                raise SimulationResumeError(
-                    f"artifact {spec.simulation_id!r} exists but is not a simulation specification"
-                ) from exc
-            try:
-                persisted = SimulationSpec.model_validate_json(
-                    self._store.read_bytes(spec.simulation_id, _SPEC_FILE)
-                )
-            except (ArtifactCorruptionError, ValueError) as exc:
-                raise SimulationResumeError(
-                    f"simulation specification {spec.simulation_id!r} cannot be read safely"
-                ) from exc
-            if persisted != spec:
-                raise SimulationResumeError(
-                    f"simulation ID {spec.simulation_id!r} already names a different immutable spec"
-                ) from exc
-            return artifact_input(stored.manifest)
-
     def _persist_resolution(
         self,
         spec: SimulationSpec,
@@ -503,13 +470,13 @@ class WorldModelSimulator:
         bindings: Mapping[ArtifactId, SimulationCellBinding],
         resolution_input: ArtifactInput,
     ) -> dict[ArtifactId, RolloutArtifact]:
-        """Load only completed rollout artifacts whose full immutable bindings still match."""
+        """Load only final rollout artifacts whose full immutable bindings still match."""
         completed: dict[ArtifactId, RolloutArtifact] = {}
+        pins = self._pins(resolution_input)
         for cell in cells:
             binding = bindings[cell.cell_id]
-            rollout = self._load_optional_rollout(rollout_id_for_binding(binding))
+            _attempt, rollout = resolve_cell_attempt(self._store, cell, binding, pins)
             if rollout is not None:
-                self._validate_resume_rollout(rollout, cell, binding, resolution_input)
                 completed[cell.cell_id] = rollout
         return completed
 
@@ -544,21 +511,22 @@ class WorldModelSimulator:
             SimulationResumeError: Lease or persisted evidence is inconsistent.
         """
         binding = bindings[cell.cell_id]
-        rollout_id = rollout_id_for_binding(binding)
-        existing = self._load_optional_rollout(rollout_id)
+        pins = self._pins(resolution_input)
+        attempt, existing = resolve_cell_attempt(self._store, cell, binding, pins)
         if existing is not None:
-            self._validate_resume_rollout(existing, cell, binding, resolution_input)
             return existing
+        rollout_id = rollout_id_for_binding(binding, attempt=attempt)
         try:
             claim = self._leases.acquire(
-                lease_id=lease_id_for_binding(resolution, binding),
+                lease_id=lease_id_for_binding(resolution, binding, attempt=attempt),
                 resolution_id=resolution.resolution_id,
                 simulation_id=spec.simulation_id,
                 rollout_id=rollout_id,
                 binding_sha256=binding_digest(binding),
                 maximum_cost_usd=spec.maximum_cost_usd,
-                rollout_completed=lambda item: self._load_optional_rollout(item) is not None,
+                rollout_completed=lambda item: load_optional_rollout(self._store, item) is not None,
                 observed_spend_usd=lambda: self._known_resolution_spend(bindings, resolution_input),
+                stop_on_overspend=spec.stop_on_overspend,
             )
         except TextCellLeaseError as exc:
             raise SimulationResumeError(
@@ -567,24 +535,30 @@ class WorldModelSimulator:
         if claim.retryable:
             raise SimulationContentionError("text simulation cell is contended; retry the run")
         if claim.state == TextCellLeaseState.COMPLETED:
-            completed = self._load_optional_rollout(rollout_id)
+            completed = load_optional_rollout(self._store, rollout_id)
             if completed is None:  # pragma: no cover - artifact check and read share one store
                 raise SimulationResumeError("completed text-cell claim has no readable rollout")
-            self._validate_resume_rollout(completed, cell, binding, resolution_input)
+            validate_resume_rollout(completed, cell, binding, pins, attempt=attempt)
             return completed
         if claim.state == TextCellLeaseState.STALE:
             stale = claim.lease
             if stale is None:  # pragma: no cover - stale state always retains its durable record
                 raise SimulationResumeError("stale text-cell claim omitted its recovery evidence")
             rollout = self._lease_failure_rollout(
-                spec, cell, world_model, binding, resolution_input, stale.lease_id
+                spec, cell, world_model, binding, resolution_input, stale, attempt=attempt
             )
-            return self._persist_rollout(rollout, cell, binding, resolution_input)
+            return self._persist_rollout(rollout, cell, binding, resolution_input, attempt=attempt)
         if claim.state == TextCellLeaseState.BUDGET_BLOCKED:
             rollout = self._budget_failure_rollout(
-                spec, cell, world_model, binding, resolution_input, claim.observed_spend_usd
+                spec,
+                cell,
+                world_model,
+                binding,
+                resolution_input,
+                claim.observed_spend_usd,
+                attempt=attempt,
             )
-            return self._persist_rollout(rollout, cell, binding, resolution_input)
+            return self._persist_rollout(rollout, cell, binding, resolution_input, attempt=attempt)
         if claim.lease is None:  # pragma: no cover - owned state always creates an exact lease
             raise SimulationResumeError("owned text-cell admission omitted its durable lease")
         try:
@@ -598,8 +572,11 @@ class WorldModelSimulator:
                 binding,
                 resolution_input,
                 maximum_cell_cost_usd=maximum_cell_cost_usd,
+                attempt=attempt,
             )
-            persisted = self._persist_rollout(rollout, cell, binding, resolution_input)
+            persisted = self._persist_rollout(
+                rollout, cell, binding, resolution_input, attempt=attempt
+            )
         except BaseException:
             raise
         self._leases.release(claim.lease)
@@ -610,15 +587,17 @@ class WorldModelSimulator:
         bindings: Mapping[ArtifactId, SimulationCellBinding],
         resolution_input: ArtifactInput,
     ) -> float | None:
-        """Return completed provider spend or unknown when one bound cell is unpriced."""
-        rollouts = []
+        """Return conservative provider spend or unknown when one bound cell is unpriced.
+
+        Every persisted attempt of every bound cell counts, so a superseded unknown-spend
+        failure keeps charging its worst-case reservation while its re-execution is admitted
+        under whatever ceiling remains.
+        """
+        rollouts: list[RolloutArtifact] = []
+        pins = self._pins(resolution_input)
         for cell_id, binding in bindings.items():
-            rollout = self._load_optional_rollout(rollout_id_for_binding(binding))
-            if rollout is None:
-                continue
             cell = next(item for item in self._plan.cells if item.cell_id == cell_id)
-            self._validate_resume_rollout(rollout, cell, binding, resolution_input)
-            rollouts.append(rollout)
+            rollouts.extend(persisted_cell_attempts(self._store, cell, binding, pins))
         return known_total_spend(rollouts)
 
     def _execute_cell(
@@ -631,6 +610,7 @@ class WorldModelSimulator:
         resolution_input: ArtifactInput,
         *,
         maximum_cell_cost_usd: float,
+        attempt: int = 0,
     ) -> RolloutArtifact:
         """Execute one grounded no-tools episode or retain its structured failure.
 
@@ -642,6 +622,7 @@ class WorldModelSimulator:
             binding: Complete immutable binding for this cell.
             resolution_input: Exact resolution pointer retained by the rollout.
             maximum_cell_cost_usd: Reconciled provider-spend remainder for the cell.
+            attempt: Zero-based deliberate re-execution generation for this binding.
 
         Returns:
             Completed or failed rollout with separated candidate, retrieval, and simulator costs.
@@ -670,6 +651,7 @@ class WorldModelSimulator:
                     details={"phase": "task_tools", "tool_count": len(task.tools)},
                 ),
                 duration_seconds=elapsed_seconds(started_monotonic, self._monotonic()),
+                attempt=attempt,
             )
         settings = spec.world_model
         if settings is None:  # pragma: no cover - validated before this execution path
@@ -679,9 +661,8 @@ class WorldModelSimulator:
         reservation_failure = episode_reservation_failure(
             settings,
             completion_contract=self._completion_contract,
-            candidate_alias=cell.candidate_alias,
-            maximum_steps=spec.maximum_steps,
             remaining_cost_usd=maximum_cell_cost_usd,
+            stop_on_overspend=spec.stop_on_overspend,
         )
         if reservation_failure is not None:
             return self._failure_rollout(
@@ -695,6 +676,7 @@ class WorldModelSimulator:
                 StopReason.MAXIMUM_COST,
                 reservation_failure,
                 duration_seconds=elapsed_seconds(started_monotonic, self._monotonic()),
+                attempt=attempt,
             )
         candidate_request, world_request = completion_reservations(
             self._completion_contract,
@@ -716,6 +698,7 @@ class WorldModelSimulator:
                 else 1
             ),
             maximum_cost_usd=maximum_cell_cost_usd,
+            stop_on_overspend=spec.stop_on_overspend,
             maximum_steps=spec.maximum_steps,
             maximum_output_tokens=settings.maximum_output_tokens,
             redacted_field_names=self._redacted_field_names,
@@ -741,6 +724,7 @@ class WorldModelSimulator:
                 internal_failure("agent construction or lifecycle", exc),
                 duration_seconds=elapsed_seconds(started_monotonic, self._monotonic()),
                 recorder=recorder,
+                attempt=attempt,
             )
         failure = outcome.failure
         if outcome.episodes and failure == outcome.episodes[-1].failure:
@@ -767,6 +751,7 @@ class WorldModelSimulator:
             orchestration_economics=orchestration_economics(
                 elapsed_seconds(started_monotonic, self._monotonic())
             ),
+            attempt=attempt,
         )
 
     def _failure_rollout(
@@ -783,6 +768,7 @@ class WorldModelSimulator:
         *,
         duration_seconds: float,
         recorder: RecordingCandidateClient | None = None,
+        attempt: int = 0,
     ) -> RolloutArtifact:
         """Build an artifact-safe failed cell while retaining completed calls.
 
@@ -798,6 +784,7 @@ class WorldModelSimulator:
             failure: Structured failure safe for persistence.
             duration_seconds: Observed orchestration duration.
             recorder: Optional completed-call recorder available at failure time.
+            attempt: Zero-based deliberate re-execution generation for this binding.
 
         Returns:
             Canonical failed rollout with any known operation economics.
@@ -833,6 +820,7 @@ class WorldModelSimulator:
                 recorded.retrieval_economics if recorded is not None else OperationEconomics()
             ),
             orchestration_economics=orchestration_economics(duration_seconds),
+            attempt=attempt,
         )
 
     def _budget_failure_rollout(
@@ -843,8 +831,10 @@ class WorldModelSimulator:
         binding: SimulationCellBinding,
         resolution_input: ArtifactInput,
         spent: float | None,
+        *,
+        attempt: int = 0,
     ) -> RolloutArtifact:
-        """Represent a cell rejected by the durable finite-spend admission reservation."""
+        """Represent a cell rejected by stop-on-overspend finite-spend admission."""
         failure = StructuredFailure(
             code=FailureCode.BUDGET,
             message="simulation spend is unknown or its durable reservation exhausted the ceiling",
@@ -862,6 +852,7 @@ class WorldModelSimulator:
             StopReason.MAXIMUM_COST,
             failure,
             duration_seconds=0.0,
+            attempt=attempt,
         )
 
     def _lease_failure_rollout(
@@ -871,16 +862,29 @@ class WorldModelSimulator:
         world_model: ResolvedModel,
         binding: SimulationCellBinding,
         resolution_input: ArtifactInput,
-        lease_id: ArtifactId,
+        stale: TextCellLease,
+        *,
+        attempt: int = 0,
     ) -> RolloutArtifact:
-        """Record a non-replayed crash recovery outcome for an ambiguous expired paid-cell claim."""
+        """Record a non-replayed crash recovery outcome for an ambiguous expired paid-cell claim.
+
+        The stale claim's whole-ceiling budget barrier persists into the failure evidence so
+        later spend reconciliation charges the exact durable reservation instead of aborting
+        on permanently ambiguous spend.
+        """
+        details: dict[str, JsonValue] = {
+            "phase": "paid_cell_stale_lease",
+            "lease_id": stale.lease_id,
+        }
+        if stale.reserved_cost_usd is not None:
+            details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] = stale.reserved_cost_usd
         failure = StructuredFailure(
             code=FailureCode.BUDGET,
             message=(
                 "a prior paid-cell claim expired after its owner exited; WMO will not replay it"
             ),
             attribution=FailureAttribution.MODEL,
-            details={"phase": "paid_cell_stale_lease", "lease_id": lease_id},
+            details=details,
         )
         return self._failure_rollout(
             spec,
@@ -893,6 +897,7 @@ class WorldModelSimulator:
             StopReason.MAXIMUM_COST,
             failure,
             duration_seconds=0.0,
+            attempt=attempt,
         )
 
     def _persist_rollout(
@@ -901,6 +906,8 @@ class WorldModelSimulator:
         cell: EvaluationCell,
         binding: SimulationCellBinding,
         resolution_input: ArtifactInput,
+        *,
+        attempt: int = 0,
     ) -> RolloutArtifact:
         """Atomically store a rollout, accepting only an exactly bound completed counterpart.
 
@@ -914,13 +921,15 @@ class WorldModelSimulator:
                 artifact_id=rollout.artifact_id,
                 artifact_type="rollout",
                 envelope=rollout,
-                files={_ROLLOUT_FILE: rollout},
+                files={ROLLOUT_FILE: rollout},
             )
             return rollout
         except ArtifactAlreadyExistsError:
             existing = self._load_rollout(rollout.artifact_id)
             try:
-                self._validate_resume_rollout(existing, cell, binding, resolution_input)
+                validate_resume_rollout(
+                    existing, cell, binding, self._pins(resolution_input), attempt=attempt
+                )
             except SimulationResumeError as error:
                 raise SimulationResumeError(
                     f"rollout ID {rollout.artifact_id!r} is already bound to incompatible evidence"
@@ -929,60 +938,4 @@ class WorldModelSimulator:
 
     def _load_rollout(self, rollout_id: ArtifactId) -> RolloutArtifact:
         """Load a verified rollout or surface malformed immutable data to the caller."""
-        stored = self._store.read(rollout_id)
-        if stored.manifest.artifact_type != "rollout":
-            raise ArtifactCorruptionError(f"artifact {rollout_id!r} is not a rollout")
-        try:
-            return RolloutArtifact.model_validate_json(
-                self._store.read_bytes(rollout_id, _ROLLOUT_FILE)
-            )
-        except (ArtifactCorruptionError, ValueError) as exc:
-            raise ArtifactCorruptionError(
-                f"rollout {rollout_id!r} is not valid canonical evidence"
-            ) from exc
-
-    def _load_optional_rollout(self, rollout_id: ArtifactId) -> RolloutArtifact | None:
-        """Load an existing rollout while distinguishing absence from immutable corruption."""
-        destination = self._store.project_directory / "artifacts" / rollout_id
-        if not destination.exists():
-            return None
-        return self._load_rollout(rollout_id)
-
-    def _validate_resume_rollout(
-        self,
-        rollout: RolloutArtifact,
-        cell: EvaluationCell,
-        binding: SimulationCellBinding,
-        resolution_input: ArtifactInput,
-    ) -> None:
-        """Validate an existing rollout against every requested immutable pin.
-
-        Args:
-            rollout: Previously persisted rollout proposed for exact replay.
-            cell: Requested evaluation cell.
-            binding: Newly derived complete cell binding.
-            resolution_input: Exact resolution pointer required by the replay.
-
-        Raises:
-            SimulationResumeError: Any stable ID, task, mode, RAG, input, or binding differs.
-        """
-        expected_inputs = sorted_unique_inputs(
-            self._plan_input,
-            self._task_set_input,
-            self._fit_rag_input,
-            binding.grounded_world_model_input,
-            binding.simulation_spec_input,
-            resolution_input,
-        )
-        if (
-            rollout.cell_id != cell.cell_id
-            or rollout.task_id != cell.task_id
-            or rollout.mode != SimulationMode.WORLD_MODEL
-            or rollout.rollout_id != rollout_id_for_binding(binding)
-            or rollout.simulation_binding != binding
-            or rollout.inputs != expected_inputs
-        ):
-            raise SimulationResumeError(
-                f"stored rollout {rollout.artifact_id!r} does not match the requested "
-                "simulation cell"
-            )
+        return load_rollout(self._store, rollout_id)

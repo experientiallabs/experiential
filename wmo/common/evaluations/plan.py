@@ -1,4 +1,4 @@
-"""Canonical sparse evaluation-plan and fidelity-gate contracts."""
+"""Canonical sparse evaluation-plan contracts."""
 
 from __future__ import annotations
 
@@ -36,59 +36,6 @@ class EvaluationCell(ContractModel):
         return self
 
 
-class FidelityThresholds(ArtifactEnvelope):
-    """Reusable numerical thresholds with no authority over any evaluation plan."""
-
-    fidelity_thresholds_id: ArtifactId
-    planned_overlaps: int = Field(default=10, gt=0)
-    minimum_usable_overlaps: int = Field(default=8, gt=0)
-    maximum_score_mae: float = Field(default=0.10, ge=0)
-
-    @model_validator(mode="after")
-    def _require_usable_denominator(self) -> FidelityThresholds:
-        """Keep the usable requirement within the exact planned denominator.
-
-        Returns:
-            Validated reusable thresholds.
-
-        Raises:
-            ValueError: The usable minimum exceeds the planned overlaps.
-        """
-        if self.minimum_usable_overlaps > self.planned_overlaps:
-            raise ValueError("minimum usable fidelity overlaps cannot exceed planned overlaps")
-        return self
-
-
-class FidelityGate(ArtifactEnvelope):
-    """Plan-bound approval gate that cannot be replayed across evaluation scopes."""
-
-    fidelity_gate_id: ArtifactId
-    fidelity_thresholds_id: ArtifactId
-    fidelity_thresholds_sha256: Sha256
-    evaluation_plan_id: ArtifactId
-    evaluation_plan_sha256: Sha256
-    protocol_sha256: Sha256
-    task_model_scope_sha256: Sha256
-    overlap_cell_ids: tuple[ArtifactId, ...]
-    planned_overlaps: int = Field(default=10, gt=0)
-    minimum_usable_overlaps: int = Field(default=8, gt=0)
-    maximum_score_mae: float = Field(default=0.10, ge=0)
-
-    @model_validator(mode="after")
-    def _require_usable_denominator(self) -> FidelityGate:
-        """Keep the bound usable requirement within its exact overlap scope.
-
-        Returns:
-            Validated plan-bound gate.
-
-        Raises:
-            ValueError: The usable minimum exceeds the planned overlaps.
-        """
-        if self.minimum_usable_overlaps > self.planned_overlaps:
-            raise ValueError("minimum usable fidelity overlaps cannot exceed planned overlaps")
-        return self
-
-
 class EvaluationPlan(ArtifactEnvelope):
     """A frozen sparse plan that names every observed and simulated evaluation cell."""
 
@@ -97,9 +44,7 @@ class EvaluationPlan(ArtifactEnvelope):
     candidate_snapshots: tuple[RoutedCandidateSnapshot, ...]
     pricing_snapshot_id: ArtifactId
     pricing_snapshot_sha256: Sha256
-    fidelity_thresholds_id: ArtifactId
-    fidelity_thresholds_sha256: Sha256
-    fidelity_protocol_sha256: Sha256
+    fidelity_protocol_sha256: Sha256 | None = None
     cells: tuple[EvaluationCell, ...]
 
     @field_validator("candidate_snapshots")
@@ -126,6 +71,9 @@ class EvaluationPlan(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_consistent_cell_references(self) -> EvaluationPlan:
+        fidelity_cells = tuple(cell for cell in self.cells if cell.purpose == "fidelity")
+        if bool(fidelity_cells) != (self.fidelity_protocol_sha256 is not None):
+            raise ValueError("fidelity cells and protocol identity must be present together")
         candidate_aliases = {candidate.alias for candidate in self.candidate_snapshots}
         cells_by_id = {cell.cell_id: cell for cell in self.cells}
         planned_cell_keys: set[tuple[ArtifactId, ModelAlias, int, str]] = set()

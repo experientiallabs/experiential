@@ -42,6 +42,7 @@ from wmo.optimize.router.automatic.reservations import (
     retrieval_embedding_reservation,
     router_feature_reservation,
     simulation_completion_reservations,
+    simulation_input_token_estimate,
 )
 from wmo.optimize.router.judging.artifacts import read_audit
 from wmo.optimize.router.judging.contracts import (
@@ -57,6 +58,7 @@ from wmo.simulation.ingest.dataset import (
 )
 from wmo.simulation.ingest.model_identity import TraceModelIdentityEvidenceSet
 from wmo.simulation.specs import CandidateCompletionReservation
+from wmo.simulation.world_model import load_grounded_world_model_artifact
 
 
 class AutomaticRouterPreflightError(ValueError):
@@ -79,8 +81,7 @@ class AutomaticRouterOptions:
 
     maximum_provider_cost_usd: float = 25.0
     maximum_judgments: int = 100
-    preferred_fidelity_overlaps: int = 10
-    maximum_model_calls: int = 8
+    maximum_model_calls: int = 50
     maximum_router_feature_tokens: int = 8_192
     maximum_retrieval_query_tokens: int = 32_768
     router_embedding_maximum_attempts: int = 3
@@ -88,6 +89,7 @@ class AutomaticRouterOptions:
     simulation_maximum_output_tokens: int = 16_000
     maximum_concurrency: int = 1
     seed: int = 0
+    stop_on_overspend: bool = False
 
 
 @dataclass(frozen=True)
@@ -117,8 +119,6 @@ class AutomaticRouterPreflight:
     traces: tuple[Trace, ...]
     trace_identity_evidence: TraceModelIdentityEvidenceSet | None
     observed_traces: tuple[ObservedRouterTrace, ...]
-    fidelity_overlap_count: int
-    preferred_fidelity_overlaps: int
     router_embedding_reservation: RouterEmbeddingReservation
     retrieval_embedding_reservation: EmbeddingCostReservation
     candidate_completion_reservations: tuple[CandidateCompletionReservation, ...]
@@ -129,11 +129,6 @@ class AutomaticRouterPreflight:
     remaining_simulation_cost_usd: float
     agent_factory_sha256: Sha256
     simulation_configuration_sha256: Sha256
-
-    @property
-    def low_fidelity_evidence(self) -> bool:
-        """Return whether explicit approval must acknowledge a sub-preferred denominator."""
-        return self.fidelity_overlap_count < self.preferred_fidelity_overlaps
 
 
 def preflight_automatic_router(
@@ -208,14 +203,7 @@ def preflight_automatic_router(
         traces,
         identity_evidence,
         candidates,
-        options.preferred_fidelity_overlaps,
     )
-    fidelity_overlap_count = len(observed)
-    if not observed:
-        problems.append(
-            "fidelity evidence: no real fit trace matches an exact selected candidate model; "
-            "include the production incumbent or collect a matching trace"
-        )
     try:
         agent_identity = agent_factory_sha256(
             config.agent,
@@ -241,15 +229,36 @@ def preflight_automatic_router(
         options.maximum_retrieval_query_tokens,
         options.router_embedding_maximum_attempts,
     )
-    candidate_requests, world_request = simulation_completion_reservations(
-        problems,
-        catalog=catalog,
-        candidates=candidates,
-        world_alias=world_alias,
-        world=world,
-        maximum_attempts=options.completion_maximum_attempts,
-        maximum_output_tokens=options.simulation_maximum_output_tokens,
+    world_model_top_k = _world_model_retrieval_count(problems, project, completed)
+    estimated_input_tokens = (
+        None
+        if world_model_top_k is None
+        else simulation_input_token_estimate(
+            traces,
+            retrieved_transition_count=world_model_top_k,
+            maximum_retrieval_query_tokens=options.maximum_retrieval_query_tokens,
+            maximum_output_tokens=options.simulation_maximum_output_tokens,
+        )
     )
+    if world_model_top_k is not None and estimated_input_tokens is None:
+        problems.append(
+            "simulation completion reservations: the completed build has no persisted traces "
+            "to size the per-call input reservation"
+        )
+    if estimated_input_tokens is None:
+        candidate_requests: tuple[CandidateCompletionReservation, ...] = ()
+        world_request = None
+    else:
+        candidate_requests, world_request = simulation_completion_reservations(
+            problems,
+            catalog=catalog,
+            candidates=candidates,
+            world_alias=world_alias,
+            world=world,
+            maximum_attempts=options.completion_maximum_attempts,
+            estimated_input_tokens=estimated_input_tokens,
+            maximum_output_tokens=options.simulation_maximum_output_tokens,
+        )
     judge_request = judge_completion_reservation(
         problems,
         catalog=catalog,
@@ -269,7 +278,6 @@ def preflight_automatic_router(
         problems,
         maximum_provider_cost_usd=options.maximum_provider_cost_usd,
         router_reservation=reservation,
-        judge_reservation_cost_usd=judge_reservation_cost_usd,
     )
     if problems:
         raise _preflight_error(problems)
@@ -318,8 +326,6 @@ def preflight_automatic_router(
         traces=traces,
         trace_identity_evidence=identity_evidence,
         observed_traces=observed,
-        fidelity_overlap_count=fidelity_overlap_count,
-        preferred_fidelity_overlaps=options.preferred_fidelity_overlaps,
         router_embedding_reservation=reservation,
         retrieval_embedding_reservation=query_reservation,
         candidate_completion_reservations=candidate_requests,
@@ -341,7 +347,6 @@ def preflight_automatic_router(
 
 _BOUNDED_OPTION_FIELDS = (
     "maximum_model_calls",
-    "preferred_fidelity_overlaps",
     "maximum_router_feature_tokens",
     "maximum_retrieval_query_tokens",
     "router_embedding_maximum_attempts",
@@ -417,6 +422,31 @@ def _completed_build_problems(
         except (OSError, ValueError) as exc:
             problems.append(f"completed build {name}: {exc}")
     return tuple(problems)
+
+
+def _world_model_retrieval_count(
+    problems: list[str],
+    project: ProjectStore,
+    completed: ProjectBuildArtifacts | None,
+) -> int | None:
+    """Read the frozen per-prediction retrieval count from the completed grounded world model.
+
+    Args:
+        problems: Mutable aggregate problem list.
+        project: Project-local artifact store.
+        completed: Exact completed-build pointers, if present.
+
+    Returns:
+        Persisted world-model top-k, or ``None`` after recording a problem.
+    """
+    if completed is None:
+        return None
+    try:
+        artifact = load_grounded_world_model_artifact(project.artifacts, completed.world_model)
+    except (OSError, ValueError) as exc:
+        problems.append(f"grounded world model: {exc}")
+        return None
+    return artifact.top_k
 
 
 def _candidate_snapshots(
@@ -647,6 +677,11 @@ def _verify_manual_judge_chain(
 ) -> None:
     """Cross-bind the selected audit to its exact setup and approved calibration lineage.
 
+    The audit budget reserves only the provider calls consented for its own invocation. A
+    calibration resumed from persisted trace reviews reserves fewer calls than the recorded
+    judgment probes, so the budget must never reserve more calls than the recorded probes and
+    its estimate must match its own reserved call count exactly.
+
     Args:
         project: Project-local immutable artifact store.
         state: Mutable review pointers selected for automatic optimization.
@@ -708,7 +743,7 @@ def _verify_manual_judge_chain(
         or report.judge_prompt_sha256 != calibration.judge_prompt_sha256
         or provisional.judge_prompt_id != calibration.judge_prompt_id
         or provisional.judge_prompt_sha256 != calibration.judge_prompt_sha256
-        or audit.budget.call_count != sum(len(item.probes) for item in audit.judgments)
+        or audit.budget.call_count > sum(len(item.probes) for item in audit.judgments)
         or not math.isclose(
             audit.budget.estimated_cost_usd,
             expected_estimate,
@@ -767,7 +802,6 @@ def _observed_traces(
     traces: tuple[Trace, ...],
     identity_evidence: TraceModelIdentityEvidenceSet | None,
     candidates: tuple[RoutedCandidateSnapshot, ...],
-    preferred_overlap_limit: int,
 ) -> tuple[ObservedRouterTrace, ...]:
     """Resolve real fit lineages through verified declared or unique inferred identity.
 
@@ -775,14 +809,12 @@ def _observed_traces(
         problems: Mutable aggregate preflight failures.
         tasks: Verified representative tasks.
         traces: Verified normalized production traces.
-        identity_evidence: Verified model-span digest provenance, if the dataset carries it.
+        identity_evidence: Verified model-span digest provenance, when a completed build exists.
         candidates: Exact selected candidate identities.
-        preferred_overlap_limit: Maximum fidelity overlaps admitted to evaluation.
-
     Returns:
-        One deterministic attributed trace per admitted fit lineage.
+        One deterministic exact-match trace per attributable fit lineage.
     """
-    if not tasks or not traces or not candidates:
+    if not tasks or not traces or not candidates or identity_evidence is None:
         return ()
     try:
         attributions = resolve_router_observed_attributions(
@@ -790,10 +822,9 @@ def _observed_traces(
             traces,
             identity_evidence,
             candidates,
-            preferred_overlap_limit=preferred_overlap_limit,
         )
     except RouterAttributionError as exc:
-        problems.append(f"fidelity identity attribution: {exc}")
+        problems.append(f"observed fit attribution: {exc}")
         return ()
     tasks_by_id = {task.task_id: task for task in tasks}
     traces_by_id = {trace.trace_id: trace for trace in traces}

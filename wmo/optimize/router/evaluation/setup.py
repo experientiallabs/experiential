@@ -48,5 +48,3 @@ def verify_router_evaluation_setup(
         raise RouterCompositionError("production_protocol must name production evidence")
     if simulation_protocol.evidence_source != "world_model":
         raise RouterCompositionError("simulation_protocol must name world-model evidence")
-    if simulation_protocol.fidelity_report_id is not None:
-        raise RouterCompositionError("simulation protocol cannot preclaim a fidelity report")

@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import math
-
+from wmo.common.core.artifacts import canonical_json_bytes
 from wmo.common.models import (
     CompletionCostReservation,
     EmbeddingCostReservation,
@@ -19,8 +18,77 @@ from wmo.common.routing import (
     router_feature_token_upper_bound,
 )
 from wmo.common.tasks import TaskCase
+from wmo.common.traces import Trace
 from wmo.optimize.router.judging.contracts import ManualJudgeCalibrationAudit
 from wmo.simulation.specs import CandidateCompletionReservation
+
+_PROMPT_FRAMING_TOKEN_BUDGET = 4_096
+"""Fixed conservative allowance for the frozen system prompt and message framing."""
+
+
+def median_trace_token_estimate(traces: tuple[Trace, ...]) -> int | None:
+    """Return the lower-median conservative token estimate over frozen build traces.
+
+    One trace is measured as the UTF-8 byte length of its canonical serialization. This matches
+    the provider-neutral byte-per-token upper bound used by simulation request admission, so a
+    reservation sized from this estimate compares directly against counted request tokens.
+
+    Args:
+        traces: Verified traces persisted by the completed build.
+
+    Returns:
+        Deterministic lower-median byte-length token estimate, or ``None`` without traces.
+    """
+    if not traces:
+        return None
+    sizes = sorted(len(canonical_json_bytes(trace)) for trace in traces)
+    return sizes[(len(sizes) - 1) // 2]
+
+
+def simulation_input_token_estimate(
+    traces: tuple[Trace, ...],
+    *,
+    retrieved_transition_count: int,
+    maximum_retrieval_query_tokens: int,
+    maximum_output_tokens: int,
+) -> int | None:
+    """Size one realistic per-call input planning estimate from the frozen build traces.
+
+    The estimate sums explicit deterministic components instead of a model's full context
+    window: one median-length trace for the visible episode transcript, one median-length trace
+    for each of the world model's retrieved fit-RAG transitions rendered into the prompt (one
+    whole trace bounds one transition), the explicit retrieval query token budget, one full
+    output turn echoed back into the next request, and a fixed prompt-framing allowance.
+
+    The estimate prices provider reservations only. It never bounds an individual request:
+    the hard per-request admission ceiling is the model's real context capacity.
+
+    Args:
+        traces: Verified traces persisted by the completed build.
+        retrieved_transition_count: Frozen world-model retrieval count rendered per prediction.
+        maximum_retrieval_query_tokens: Explicit rendered RAG query token budget.
+        maximum_output_tokens: Per-turn completion output ceiling echoed into later prompts.
+
+    Returns:
+        Deterministic per-call input token reservation, or ``None`` without traces.
+
+    Raises:
+        ValueError: The retrieval count is not positive.
+    """
+    if retrieved_transition_count <= 0:
+        raise ValueError("retrieved transition count must be positive")
+    median = median_trace_token_estimate(traces)
+    if median is None:
+        return None
+    transcript_tokens = median
+    retrieved_transition_tokens = median * retrieved_transition_count
+    return (
+        transcript_tokens
+        + retrieved_transition_tokens
+        + maximum_retrieval_query_tokens
+        + maximum_output_tokens
+        + _PROMPT_FRAMING_TOKEN_BUDGET
+    )
 
 
 def router_feature_reservation(
@@ -83,9 +151,10 @@ def simulation_completion_reservations(
     world_alias: str | None,
     world: ModelSnapshot | None,
     maximum_attempts: int,
+    estimated_input_tokens: int,
     maximum_output_tokens: int,
 ) -> tuple[tuple[CandidateCompletionReservation, ...], CompletionCostReservation | None]:
-    """Freeze candidate and world call ceilings from exact catalog declarations.
+    """Freeze candidate and world call reservations from exact catalog declarations.
 
     Args:
         problems: Mutable aggregate problem list.
@@ -94,6 +163,7 @@ def simulation_completion_reservations(
         world_alias: Build-frozen world-model alias.
         world: Exact world-model snapshot.
         maximum_attempts: Active completion retry ceiling.
+        estimated_input_tokens: Trace-derived realistic per-call input planning size.
         maximum_output_tokens: Per-turn candidate and world output ceiling.
 
     Returns:
@@ -108,6 +178,7 @@ def simulation_completion_reservations(
             model=candidate.model,
             label="candidate",
             maximum_attempts=maximum_attempts,
+            estimated_input_tokens=estimated_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
         )
         if request is not None:
@@ -125,6 +196,7 @@ def simulation_completion_reservations(
             model=world,
             label="world model",
             maximum_attempts=maximum_attempts,
+            estimated_input_tokens=estimated_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
         )
         if world_alias is not None and world is not None
@@ -180,9 +252,13 @@ def completion_reservation_from_catalog(
     model: ModelSnapshot,
     label: str,
     maximum_attempts: int,
+    estimated_input_tokens: int,
     maximum_output_tokens: int,
 ) -> CompletionCostReservation | None:
     """Create one completion reservation from exact capacity and pricing metadata.
+
+    The hard per-request admission ceiling is the model's full context capacity after its
+    per-turn output budget. The trace-derived estimate prices the reservation only.
 
     Args:
         problems: Mutable aggregate problem list.
@@ -191,6 +267,7 @@ def completion_reservation_from_catalog(
         model: Frozen provider model identity.
         label: Candidate, world-model, or judge diagnostic role.
         maximum_attempts: Active provider request-attempt ceiling.
+        estimated_input_tokens: Trace-derived realistic per-request input planning size.
         maximum_output_tokens: Per-request output ceiling.
 
     Returns:
@@ -209,6 +286,13 @@ def completion_reservation_from_catalog(
         problems.append(
             f"{label} alias {alias!r} cannot reserve {maximum_output_tokens} output tokens "
             "inside its explicit capacity"
+        )
+        return None
+    maximum_input_tokens = context - maximum_output_tokens
+    if estimated_input_tokens <= 0 or estimated_input_tokens > maximum_input_tokens:
+        problems.append(
+            f"{label} alias {alias!r} cannot fit the estimated {estimated_input_tokens} input "
+            f"plus {maximum_output_tokens} output tokens inside its {context}-token context window"
         )
         return None
     prices = (
@@ -230,8 +314,9 @@ def completion_reservation_from_catalog(
             cached_input_usd_per_million_tokens=cached_input_price,
             cache_write_usd_per_million_tokens=cache_write_price,
             maximum_attempts=maximum_attempts,
-            maximum_input_tokens=context - maximum_output_tokens,
+            maximum_input_tokens=maximum_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
+            estimated_input_tokens=estimated_input_tokens,
         )
     except ValueError as exc:
         problems.append(f"{label} alias {alias!r} reservation: {exc}")
@@ -246,7 +331,12 @@ def judge_completion_reservation(
     judge: ModelSnapshot | None,
     audit: ManualJudgeCalibrationAudit | None,
 ) -> CompletionCostReservation | None:
-    """Freeze production judge calls to the exact approved calibration budget.
+    """Freeze production judge calls priced by the approved calibration budget.
+
+    The approved calibration input budget is the realistic planning size that prices the
+    reservation. The hard per-request admission ceiling is the judge's real context capacity
+    after its approved output budget, so an oversized rollout transcript is still admitted
+    when it fits the model and the remaining spend.
 
     Args:
         problems: Mutable aggregate problem list.
@@ -274,27 +364,27 @@ def judge_completion_reservation(
     cache_write_price = capabilities.cache_write_cost_per_million_tokens_usd
     if cached_input_price is None or cache_write_price is None:
         return None
+    context = capabilities.context_window_tokens
+    if context is None or (
+        budget.maximum_input_tokens_per_call + budget.maximum_output_tokens_per_call > context
+    ):
+        problems.append("approved judge request reservation exceeds active context capacity")
+        return None
     try:
-        reservation = completion_cost_reservation(
+        return completion_cost_reservation(
             model=judge,
             input_usd_per_million_tokens=budget.input_usd_per_million_tokens,
             output_usd_per_million_tokens=budget.output_usd_per_million_tokens,
             cached_input_usd_per_million_tokens=cached_input_price,
             cache_write_usd_per_million_tokens=cache_write_price,
             maximum_attempts=budget.maximum_attempts_per_call,
-            maximum_input_tokens=budget.maximum_input_tokens_per_call,
+            maximum_input_tokens=context - budget.maximum_output_tokens_per_call,
             maximum_output_tokens=budget.maximum_output_tokens_per_call,
+            estimated_input_tokens=budget.maximum_input_tokens_per_call,
         )
     except ValueError as exc:
         problems.append(f"judge reservation: {exc}")
         return None
-    context = capabilities.context_window_tokens
-    if context is None or (
-        reservation.maximum_input_tokens + reservation.maximum_output_tokens > context
-    ):
-        problems.append("approved judge request reservation exceeds active context capacity")
-        return None
-    return reservation
 
 
 def remaining_simulation_budget(
@@ -302,27 +392,26 @@ def remaining_simulation_budget(
     *,
     maximum_provider_cost_usd: float,
     router_reservation: RouterEmbeddingReservation | None,
-    judge_reservation_cost_usd: float,
 ) -> float:
-    """Subtract non-simulation reservations from one provider-spend ceiling.
+    """Subtract the router-embedding reservation from one provider-spend ceiling.
+
+    Judge calls take no upfront carve-out: judgments draw from this same shared remainder as
+    reconciled actual spend, so a large judge planning estimate never starves simulation.
 
     Args:
         problems: Mutable aggregate problem list.
         maximum_provider_cost_usd: User-approved total provider ceiling.
         router_reservation: Conservative router-feature embedding reservation.
-        judge_reservation_cost_usd: Full maximum judgment-set reservation.
 
     Returns:
-        Positive ceiling remaining for candidate, retrieval, and world-model calls.
+        Positive shared ceiling remaining for simulation and judging provider calls.
     """
     if router_reservation is None or maximum_provider_cost_usd <= 0:
         return 0.0
-    remaining = maximum_provider_cost_usd - math.fsum(
-        (router_reservation.estimated_cost_usd, judge_reservation_cost_usd)
-    )
+    remaining = maximum_provider_cost_usd - router_reservation.estimated_cost_usd
     if remaining <= 0:
         problems.append(
-            "router embedding and judge reservations consume the entire provider spend ceiling; "
+            "the router embedding reservation consumes the entire provider spend ceiling; "
             "increase --maximum-simulation-cost-usd or lower a request/retry ceiling"
         )
         return 0.0

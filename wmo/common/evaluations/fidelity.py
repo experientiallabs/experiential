@@ -1,11 +1,10 @@
-"""Frozen world-model fidelity qualification over explicit fit-lineage overlaps."""
+"""Frozen world-model fidelity measurement over explicit fit-lineage overlaps."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -26,15 +25,12 @@ from wmo.common.evaluations.evidence import (
     EvaluationEvidenceError,
     evaluation_protocol_digest,
     read_evaluation_plan,
-    read_fidelity_gate,
     read_fidelity_report,
     read_judgment,
     read_rollout,
     sorted_evaluation_inputs,
-    verify_fidelity_report_gate,
 )
 from wmo.common.evaluations.plan import EvaluationCell
-from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
 from wmo.common.project import ArtifactStore
 from wmo.common.rollouts import (
     RolloutArtifact,
@@ -59,13 +55,12 @@ def build_fidelity_report(
     cell_evidence: Sequence[EvaluationCellEvidence],
     created_at: datetime,
     code_revision: str,
-    approved_at: datetime | None = None,
 ) -> FidelityReport:
     """Measure and persist world-model agreement on every precommitted overlap.
 
     The report uses only fidelity cells already frozen in the plan. Missing judgments, failed
-    rollouts, and pre-rollout failures remain explicit denominator failures. Passing numerical
-    evidence requires an explicit approval time before the report can become eligible.
+    rollouts, and pre-rollout failures remain explicit denominator failures. The report records
+    measurements only and carries no approval or authorization decision.
 
     Args:
         store: Project-local immutable artifact store.
@@ -74,13 +69,12 @@ def build_fidelity_report(
         cell_evidence: Explicit evidence for fidelity cells and their observed comparisons.
         created_at: Time the report is completed.
         code_revision: Exact WMO revision creating the report.
-        approved_at: Explicit approval time when the frozen gate passes.
 
     Returns:
-        Persisted approved, rejected, or insufficient fidelity evidence.
+        Persisted fidelity counts, failures, pairs, and score error.
 
     Raises:
-        EvaluationEvidenceError: Plan, protocol, evidence, or approval state is inconsistent.
+        EvaluationEvidenceError: Plan, protocol, or evidence is inconsistent.
     """
     if protocol.evidence_source != "world_model":
         raise EvaluationEvidenceError("fidelity reports require a world-model protocol")
@@ -88,27 +82,15 @@ def build_fidelity_report(
     protocol_sha256 = evaluation_protocol_digest(protocol)
     if protocol_sha256 != plan.fidelity_protocol_sha256:
         raise EvaluationEvidenceError("fidelity protocol differs from the plan-bound protocol")
-    gate_id = plan_bound_fidelity_gate_id(plan_input.sha256, protocol_sha256)
-    gate, gate_input = read_fidelity_gate(store, gate_id)
-    if (
-        gate.evaluation_plan_id != plan.plan_id
-        or gate.evaluation_plan_sha256 != plan_input.sha256
-        or gate.protocol_sha256 != protocol_sha256
-    ):
-        raise EvaluationEvidenceError("fidelity gate cannot be replayed across plan or protocol")
     overlaps = tuple(cell for cell in plan.cells if cell.purpose == "fidelity")
-    if gate.overlap_cell_ids != tuple(cell.cell_id for cell in overlaps):
-        raise EvaluationEvidenceError("fidelity gate overlap scope differs from the plan")
-    if len(overlaps) != gate.planned_overlaps:
-        raise EvaluationEvidenceError(
-            "evaluation plan does not contain the precommitted fidelity denominator"
-        )
+    if not overlaps:
+        raise EvaluationEvidenceError("evaluation plan contains no fidelity measurement cells")
     evidence_by_cell = _index_evidence(cell_evidence)
     cells_by_id = {cell.cell_id: cell for cell in plan.cells}
     failures = []
     pairs = []
     absolute_errors = []
-    verified_inputs: list[ArtifactInput] = [plan_input, gate_input]
+    verified_inputs: list[ArtifactInput] = [plan_input]
     pair_material = []
     for overlap in overlaps:
         comparison = cells_by_id.get(overlap.comparison_observed_cell_id)
@@ -201,28 +183,19 @@ def build_fidelity_report(
         )
     usable = len(absolute_errors)
     score_mae = sum(absolute_errors) / usable if usable else None
-    status = _fidelity_status(
-        usable_count=usable,
-        minimum_usable=gate.minimum_usable_overlaps,
-        score_mae=score_mae,
-        maximum_score_mae=gate.maximum_score_mae,
-        approved_at=approved_at,
-    )
     report_inputs = sorted_evaluation_inputs(verified_inputs)
     report_id = stable_id(
         "fidelity-report",
         {
-            "version": "world-model-fidelity-report-v1",
+            "version": "world-model-fidelity-report-v2",
             "plan": plan_input.model_dump(mode="json"),
-            "gate": gate_input.model_dump(mode="json"),
             "protocol_sha256": protocol_sha256,
             "inputs": [item.model_dump(mode="json") for item in report_inputs],
             "pairs": pair_material,
-            "status": status,
         },
     )
     report = FidelityReport(
-        schema_version=1,
+        schema_version=2,
         created_at=created_at,
         inputs=report_inputs,
         code_revision=code_revision,
@@ -237,12 +210,7 @@ def build_fidelity_report(
         score_mae=score_mae,
         failures=tuple(failures),
         pairs=tuple(pairs),
-        gate_id=gate.fidelity_gate_id,
-        gate_sha256=gate_input.sha256,
-        status=status,
-        approved_at=approved_at if status == "approved" else None,
     )
-    verify_fidelity_report_gate(report, gate)
     destination = store.project_directory / "artifacts" / report.fidelity_report_id
     if destination.exists():
         existing, _input = read_fidelity_report(store, report.fidelity_report_id)
@@ -342,30 +310,6 @@ def _require_cell_rollout(
         or simulator.prompt_id != protocol.simulator_prompt_id
     ):
         raise EvaluationEvidenceError("fidelity rollout simulator or prompt has drifted")
-
-
-def _fidelity_status(
-    *,
-    usable_count: int,
-    minimum_usable: int,
-    score_mae: float | None,
-    maximum_score_mae: float,
-    approved_at: datetime | None,
-) -> Literal["approved", "rejected", "insufficient"]:
-    """Apply the frozen numerical gate and explicit approval boundary."""
-    if usable_count < minimum_usable:
-        if approved_at is not None:
-            raise EvaluationEvidenceError("insufficient fidelity evidence cannot be approved")
-        return "insufficient"
-    if score_mae is None or score_mae > maximum_score_mae:
-        if approved_at is not None:
-            raise EvaluationEvidenceError("rejected fidelity evidence cannot be approved")
-        return "rejected"
-    if approved_at is None:
-        raise EvaluationEvidenceError(
-            "passing fidelity evidence requires an explicit approval timestamp"
-        )
-    return "approved"
 
 
 def _missing_failure(cell_id: str, message: str) -> StructuredFailure:

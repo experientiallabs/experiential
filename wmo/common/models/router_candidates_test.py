@@ -12,7 +12,11 @@ from wmo.common.models import (
     ModelCatalog,
     ModelRecord,
     ModelRoles,
+    ProviderConnection,
+    ProviderSetup,
     catalog_state_sha256,
+    configure_provider_catalog_with_router_candidates,
+    load_model_catalog,
     write_model_catalog,
 )
 from wmo.common.models.router_candidates import (
@@ -157,6 +161,68 @@ def test_candidate_confirmation_rejects_concurrent_catalog_change(tmp_path: Path
         )
 
     assert path.read_bytes() == before
+
+
+def test_provider_and_router_candidate_setup_is_atomic_on_validation_failure(
+    tmp_path: Path,
+) -> None:
+    """Invalid candidate roles cannot leave newly discovered provider records persisted.
+
+    Args:
+        tmp_path: Temporary root containing the shared catalog.
+    """
+    catalog = _catalog().model_copy(
+        update={
+            "models": {
+                **_catalog().models,
+                "judge": ModelRecord(connection="provider", model="judge"),
+                "embedder": ModelRecord(
+                    connection="provider",
+                    model="embedder",
+                    capabilities=ModelCapabilities(
+                        supports_embeddings=True,
+                        input_cost_per_million_tokens_usd=0.1,
+                    ),
+                ),
+            },
+            "roles": ModelRoles(world_model="world", judge="judge", embedder="embedder"),
+        }
+    )
+    path = tmp_path / "models.toml"
+    write_model_catalog(path, catalog)
+    connection = ProviderConnection(
+        name="discovered",
+        provider="openai",
+        api_key_env="DISCOVERED_API_KEY",
+    )
+    setup = ProviderSetup(
+        connections=(connection,),
+        models=(
+            ProviderModelSelection(
+                alias="candidate-new",
+                connection=connection.name,
+                model="candidate-new",
+            ),
+        ),
+        known_existing_connections=("provider",),
+        known_existing_aliases=tuple(catalog.models),
+        world_model="world",
+        judge="judge",
+        embedder="embedder",
+    )
+    before = path.read_bytes()
+
+    with pytest.raises(RouterCandidateSetupError, match="supports_completions=true"):
+        configure_provider_catalog_with_router_candidates(
+            path,
+            setup,
+            RouterCandidateSelection(
+                candidates=("candidate-a", "candidate-new"), incumbent="candidate-a"
+            ),
+        )
+
+    assert path.read_bytes() == before
+    assert "discovered" not in load_model_catalog(path).connections
 
 
 def test_candidate_definition_cannot_retarget_an_existing_alias(tmp_path: Path) -> None:

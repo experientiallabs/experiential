@@ -38,7 +38,6 @@ def test_unique_inferred_identity_maps_without_relabeling_fallback_digests() -> 
         (trace,),
         _evidence(trace, capabilities="inferred", connection="inferred"),
         _candidates(selected, _model("anthropic", "other", None, "c", "d")),
-        preferred_overlap_limit=10,
     )
 
     assert records[0].candidate_alias == "candidate-a"
@@ -55,7 +54,6 @@ def test_accidental_inferred_digest_equality_remains_inferred() -> None:
         (trace,),
         _evidence(trace, capabilities="inferred", connection="inferred"),
         _candidates(recorded, _model("anthropic", "other", None, "c", "d")),
-        preferred_overlap_limit=1,
     )[0]
 
     assert record.candidate_model == recorded
@@ -75,23 +73,23 @@ def test_mixed_declared_component_is_a_hard_constraint() -> None:
         update={"capabilities_sha256": "b" * 64, "connection_sha256": "c" * 64}
     )
 
-    with pytest.raises(RouterAttributionError, match="conflicts with declared identity"):
-        resolve_router_observed_attributions(
-            (_task(trace),),
-            (trace,),
-            _evidence(trace, capabilities="declared", connection="inferred"),
-            _candidates(wrong, _model("anthropic", "other", None, "d", "e")),
-            preferred_overlap_limit=1,
-        )
+    records = resolve_router_observed_attributions(
+        (_task(trace),),
+        (trace,),
+        _evidence(trace, capabilities="declared", connection="inferred"),
+        _candidates(wrong, _model("anthropic", "other", None, "d", "e")),
+    )
+
+    assert records == ()
 
 
-def test_unique_inferred_mapping_rejects_ambiguous_aliases_and_revision_drift() -> None:
-    """Two selected base matches or an exact revision mismatch remain actionable failures."""
+def test_unique_inferred_mapping_omits_ambiguous_aliases_and_revision_drift() -> None:
+    """Ambiguous or revision-drifted traces remain optional fit evidence."""
     recorded = _fallback_model("openai", "gpt-test", "2026-08")
     trace = _trace((recorded,))
     evidence = _evidence(trace, capabilities="inferred", connection="inferred")
 
-    with pytest.raises(RouterAttributionError, match="ambiguous"):
+    assert (
         resolve_router_observed_attributions(
             (_task(trace),),
             (trace,),
@@ -100,9 +98,10 @@ def test_unique_inferred_mapping_rejects_ambiguous_aliases_and_revision_drift() 
                 _model("openai", "gpt-test", "2026-08", "a", "b"),
                 _model("openai", "gpt-test", "2026-08", "c", "d"),
             ),
-            preferred_overlap_limit=1,
         )
-    with pytest.raises(RouterAttributionError, match="matches no selected candidate"):
+        == ()
+    )
+    assert (
         resolve_router_observed_attributions(
             (_task(trace),),
             (trace,),
@@ -111,12 +110,13 @@ def test_unique_inferred_mapping_rejects_ambiguous_aliases_and_revision_drift() 
                 _model("openai", "gpt-test", None, "a", "b"),
                 _model("anthropic", "other", None, "c", "d"),
             ),
-            preferred_overlap_limit=1,
         )
+        == ()
+    )
 
 
-def test_unspecified_and_legacy_identity_require_full_snapshot_equality() -> None:
-    """Direct and legacy records never receive provider/model-only inference."""
+def test_unspecified_identity_requires_full_snapshot_equality() -> None:
+    """Direct records never receive provider/model-only inference."""
     recorded = _model("openai", "gpt-test", None, "a", "b")
     trace = _trace((recorded,))
     candidates = _candidates(recorded, _model("anthropic", "other", None, "c", "d"))
@@ -126,28 +126,20 @@ def test_unspecified_and_legacy_identity_require_full_snapshot_equality() -> Non
         (trace,),
         _evidence(trace, capabilities="unspecified", connection="unspecified"),
         candidates,
-        preferred_overlap_limit=1,
-    )[0]
-    legacy = resolve_router_observed_attributions(
-        (_task(trace),),
-        (trace,),
-        None,
-        candidates,
-        preferred_overlap_limit=1,
     )[0]
 
     assert unspecified.match_kind == "strict_snapshot"
-    assert legacy.match_kind == "strict_snapshot"
 
     changed = recorded.model_copy(update={"connection_sha256": "e" * 64})
-    with pytest.raises(RouterAttributionError, match="matches no selected candidate"):
+    assert (
         resolve_router_observed_attributions(
             (_task(trace),),
             (trace,),
-            None,
+            _evidence(trace, capabilities="unspecified", connection="unspecified"),
             _candidates(changed, _model("anthropic", "other", None, "c", "d")),
-            preferred_overlap_limit=1,
         )
+        == ()
+    )
 
 
 def test_multi_span_trace_requires_one_candidate_alias() -> None:
@@ -162,18 +154,18 @@ def test_multi_span_trace_requires_one_candidate_alias() -> None:
         (same,),
         _evidence(same, capabilities="inferred", connection="inferred"),
         _candidates(first, second),
-        preferred_overlap_limit=1,
     )[0]
     assert len(same_record.spans) == 2
 
-    with pytest.raises(RouterAttributionError, match="resolve across selected aliases"):
+    assert (
         resolve_router_observed_attributions(
             (_task(cross),),
             (cross,),
             _evidence(cross, capabilities="inferred", connection="inferred"),
             _candidates(first, second),
-            preferred_overlap_limit=1,
         )
+        == ()
+    )
 
 
 def test_trace_summary_reports_inference_when_any_span_requires_it() -> None:
@@ -204,27 +196,27 @@ def test_trace_summary_reports_inference_when_any_span_requires_it() -> None:
         (trace,),
         evidence,
         _candidates(recorded, _fallback_model("anthropic", "other", None)),
-        preferred_overlap_limit=1,
     )[0]
 
     assert record.match_kind == "inferred_unique"
 
 
-def test_trace_without_model_and_missing_evidence_are_typed_failures() -> None:
-    """Absent model calls or incomplete evidence never surface raw lookup errors."""
+def test_trace_without_model_is_omitted_but_inconsistent_evidence_is_typed() -> None:
+    """Unattributable traces are optional while corrupt evidence remains an error."""
     trace = _trace((None,))
     candidates = _candidates(
         _model("openai", "gpt-a", None, "a", "b"),
         _model("openai", "gpt-b", None, "c", "d"),
     )
-    with pytest.raises(RouterAttributionError, match="has no model span"):
+    assert (
         resolve_router_observed_attributions(
             (_task(trace),),
             (trace,),
             TraceModelIdentityEvidenceSet(records=()),
             candidates,
-            preferred_overlap_limit=1,
         )
+        == ()
+    )
 
     modeled = _trace((candidates[0].model,))
     with pytest.raises(RouterAttributionError, match="evidence is inconsistent"):
@@ -233,7 +225,6 @@ def test_trace_without_model_and_missing_evidence_are_typed_failures() -> None:
             (modeled,),
             TraceModelIdentityEvidenceSet(records=()),
             candidates,
-            preferred_overlap_limit=1,
         )
 
 

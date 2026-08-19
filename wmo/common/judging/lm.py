@@ -20,6 +20,10 @@ from wmo.common.judging.calibration import CalibrationError
 from wmo.common.judging.calibration_provenance import (
     _load_authoritative_persisted_calibration,
 )
+from wmo.common.judging.evidence import (
+    DEFAULT_JUDGE_OUTPUT_TOKENS,
+    visible_rollout_evidence,
+)
 from wmo.common.judging.judgment import DimensionJudgment, Judgment
 from wmo.common.judging.prompts import PromptDefinition
 from wmo.common.judging.provenance import (
@@ -122,16 +126,20 @@ class LMJudge:
         *,
         code_revision: str,
         clock: Callable[[], datetime] | None = None,
+        maximum_output_tokens: int = DEFAULT_JUDGE_OUTPUT_TOKENS,
     ) -> None:
         """Bind an injected model client, prompt, judging revision, and optional clock."""
         if not code_revision.strip() or len(code_revision) > 256:
             raise JudgmentError(
                 "judging code revision must be a nonempty value of at most 256 characters"
             )
+        if maximum_output_tokens <= 0:
+            raise JudgmentError("judge maximum output tokens must be positive")
         self._model = model
         self._prompt = prompt
         self._code_revision = code_revision
         self._clock = _utc_now if clock is None else clock
+        self._maximum_output_tokens = maximum_output_tokens
 
     def judge_persisted(
         self,
@@ -239,7 +247,7 @@ class LMJudge:
                     ),
                 ),
                 temperature=0.0,
-                maximum_output_tokens=4_096,
+                maximum_output_tokens=self._maximum_output_tokens,
             )
         )
         if response.model != calibration.judge_model:
@@ -493,7 +501,10 @@ def _build_dimensions(
 
 
 def _render_judgment_request(rollout: RolloutArtifact, rubric: Rubric) -> str:
-    """Render scoring anchors and rollout spans for scalar judgment.
+    """Render scoring anchors and judge-visible rollout evidence for scalar judgment.
+
+    The rollout section is the shared visible-evidence projection, so the judge never
+    receives provider request payloads or candidate reasoning content.
 
     Args:
         rollout: Verified immutable rollout evidence to score.
@@ -502,25 +513,7 @@ def _render_judgment_request(rollout: RolloutArtifact, rubric: Rubric) -> str:
         Deterministic JSON-grounded user request for the structured judge.
     """
     rubric_payload = [dimension.prompt_payload() for dimension in rubric.dimensions]
-    rollout_payload = {
-        "rollout_id": rollout.rollout_id,
-        "task_id": rollout.task_id,
-        "stop_reason": rollout.stop_reason.value,
-        "final_output": rollout.final_output.model_dump(mode="json")
-        if rollout.final_output is not None
-        else None,
-        "spans": [
-            {
-                "span_id": span.span_id,
-                "kind": span.kind.value,
-                "payload": span.payload,
-                "failure": (
-                    span.failure.model_dump(mode="json") if span.failure is not None else None
-                ),
-            }
-            for span in rollout.spans
-        ],
-    }
+    rollout_payload = visible_rollout_evidence(rollout)
     return (
         "Score the rollout against every rubric axis. Return only JSON with a dimensions "
         "array. Each item must contain dimension_id and raw_score inside that axis inclusive "

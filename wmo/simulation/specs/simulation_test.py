@@ -73,7 +73,7 @@ def test_v1_world_model_spec_preserves_exact_identity_payload() -> None:
         "allow_tools",
     }
     assert simulation_spec_digest(parsed) == (
-        "c6ed1992b5e18efe9f245ab93007a846b5f95fdd60ef1d0a813bf7626f67950e"
+        "d254c9c2087e0b6364696bd361bbc4ab5691a1860c50fd9752651f213e4702f1"
     )
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Literal
 
 import numpy as np
@@ -19,16 +19,12 @@ from wmo.common.core.artifacts import (
 from wmo.common.evaluations import (
     EvaluationDataset,
     EvaluationPlan,
-    EvaluationProtocol,
-    FidelityReport,
     load_evaluation_dataset,
-    world_model_protocol_is_eligible,
 )
 from wmo.common.evaluations.evidence import (
     EvaluationEvidenceError,
     read_calibration,
     read_evaluation_plan,
-    read_fidelity_report,
     sorted_evaluation_inputs,
 )
 from wmo.common.models import (
@@ -147,11 +143,9 @@ class RouterOptimizer:
             pricing_input=pricing_input,
             pricing_aliases=tuple(item.candidate_alias for item in pricing.candidate_prices),
         )
-        reports, report_inputs = _load_reports(self._store, dataset)
         _require_protocol_compatibility(
             self._store,
             dataset,
-            reports,
             pricing_snapshot_id=spec.pricing_snapshot_id,
             judgment_status=spec.judgment_status,
             tasks=loaded_tasks.tasks,
@@ -160,7 +154,6 @@ class RouterOptimizer:
         bank = build_knn_bank(
             dataset,
             loaded_tasks.tasks,
-            reports,
             embedder=self._embedder,
             feature_extractor=self._feature_extractor,
         )
@@ -173,7 +166,6 @@ class RouterOptimizer:
             plan_input,
             task_input,
             pricing_input,
-            report_inputs,
             bank,
         )
         policy, _policy_input = _persist_policy(
@@ -314,14 +306,12 @@ class RouterOptimizer:
             expected_purpose="held_out",
         )
         _require_dataset_tasks(dataset, loaded_tasks.tasks)
-        reports, _report_inputs = _load_reports(self._store, dataset)
         policy_input = artifact_input(self._store.read(policy.policy_id).manifest)
         report = build_held_out_report(
             self._store,
             dataset=dataset,
             evaluation_input=evaluation_input,
             tasks=loaded_tasks.tasks,
-            reports=reports,
             policy=policy,
             policy_input=policy_input,
             bank_manifest=bank_manifest,
@@ -355,13 +345,8 @@ class RouterOptimizer:
 
 
 def _protocol_scope_sha256(dataset: EvaluationDataset) -> Sha256:
-    """Digest the exact ordered protocol and fidelity-report scope."""
-    return sha256_json(
-        {
-            "protocols": [item.model_dump(mode="json") for item in dataset.manifest.protocols],
-            "fidelity_report_ids": list(dataset.manifest.fidelity_report_ids),
-        }
-    )
+    """Digest the exact ordered evaluation protocol scope."""
+    return sha256_json([item.model_dump(mode="json") for item in dataset.manifest.protocols])
 
 
 def _require_plan_scope(
@@ -409,9 +394,7 @@ def _require_plan_task_seal(
         if task is None:
             raise RouterOptimizationError("evaluation plan names a task outside its task set")
         if cell.purpose == "fidelity":
-            if task.partition != "fit":
-                raise RouterOptimizationError("evaluation fidelity cell names a non-fit task")
-            continue
+            raise RouterOptimizationError("router evaluation plans must not contain fidelity cells")
         if task.partition != cell.purpose:
             raise RouterOptimizationError(
                 "evaluation plan cell purpose differs from its task partition"
@@ -554,8 +537,6 @@ def _require_fit_lock(
         (manifest.task_set_id, bank.task_set_id, "bank task set"),
         (_protocol_scope_sha256(dataset), policy.evaluation_protocols_sha256, "protocol scope"),
         (_protocol_scope_sha256(dataset), bank.evaluation_protocols_sha256, "bank protocol scope"),
-        (manifest.fidelity_report_ids, policy.fidelity_report_ids, "fidelity scope"),
-        (manifest.fidelity_report_ids, bank.fidelity_report_ids, "bank fidelity scope"),
         (
             tuple(item.alias for item in manifest.candidate_snapshots),
             bank.candidate_aliases,
@@ -588,7 +569,6 @@ def _require_held_out_lock(dataset: EvaluationDataset, policy: KnnRouterPolicy) 
             policy.evaluation_protocols_sha256,
             "held-out protocol scope",
         ),
-        (manifest.fidelity_report_ids, policy.fidelity_report_ids, "held-out fidelity scope"),
     )
     for actual, expected, label in checks:
         if actual != expected:
@@ -679,30 +659,9 @@ def _require_held_out_only_dataset(dataset: EvaluationDataset) -> None:
         )
 
 
-def _load_reports(
-    store: ArtifactStore,
-    dataset: EvaluationDataset,
-) -> tuple[dict[str, FidelityReport], tuple[ArtifactInput, ...]]:
-    """Load every fidelity report named by the immutable evaluation manifest."""
-    reports = {}
-    inputs = []
-    for report_id in dataset.manifest.fidelity_report_ids:
-        report, report_input = read_fidelity_report(store, report_id)
-        if report.fidelity_report_id != report_id:
-            raise RouterOptimizationError("fidelity report identity does not match its artifact")
-        if report_input not in dataset.manifest.inputs:
-            raise RouterOptimizationError(
-                "evaluation manifest does not retain a named fidelity-report input"
-            )
-        reports[report_id] = report
-        inputs.append(report_input)
-    return reports, tuple(inputs)
-
-
 def _require_protocol_compatibility(
     store: ArtifactStore,
     dataset: EvaluationDataset,
-    reports: Mapping[str, FidelityReport],
     *,
     pricing_snapshot_id: ArtifactId,
     judgment_status: str,
@@ -714,9 +673,7 @@ def _require_protocol_compatibility(
     used_protocol_ids = {
         row.protocol_id
         for row in dataset.rows
-        if row.purpose == "fit"
-        and row.status in {"observed", "completed"}
-        and _protocol_is_eligible(protocols[row.protocol_id], reports, dataset)
+        if row.purpose == "fit" and row.status in {"observed", "completed"}
     }
     if not used_protocol_ids:
         raise RouterOptimizationError("evaluation has no eligible completed fit evidence")
@@ -758,22 +715,6 @@ def _require_protocol_compatibility(
             )
 
 
-def _protocol_is_eligible(
-    protocol: EvaluationProtocol,
-    reports: Mapping[str, FidelityReport],
-    dataset: EvaluationDataset,
-) -> bool:
-    """Admit direct execution and only fidelity-approved world-model evidence."""
-    return protocol.evidence_source in {"production", "sandbox"} or (
-        world_model_protocol_is_eligible(
-            protocol,
-            dict(reports),
-            evaluation_plan_id=dataset.manifest.evaluation_plan_id,
-            evaluation_plan_sha256=dataset.manifest.evaluation_plan_sha256,
-        )
-    )
-
-
 def _persist_bank(
     store: ArtifactStore,
     spec: RouterOptimizationSpec,
@@ -782,15 +723,12 @@ def _persist_bank(
     plan_input: ArtifactInput,
     task_input: ArtifactInput,
     pricing_input: ArtifactInput,
-    report_inputs: Sequence[ArtifactInput],
     bank: KnnEvidenceBank,
 ) -> tuple[KnnBankManifest, ArtifactInput]:
     """Persist byte-stable numeric evidence with exact fit and identity pins."""
     payload = bank_bytes(bank)
     digest = hashlib.sha256(payload).hexdigest()
-    inputs = sorted_evaluation_inputs(
-        (evaluation_input, plan_input, task_input, pricing_input, *report_inputs)
-    )
+    inputs = sorted_evaluation_inputs((evaluation_input, plan_input, task_input, pricing_input))
     protocol_scope = _protocol_scope_sha256(dataset)
     bank_id = stable_id(
         "knn-bank",
@@ -805,7 +743,6 @@ def _persist_bank(
             "task_ids": list(bank.task_ids),
             "candidate_aliases": list(bank.candidate_aliases),
             "evaluation_protocols_sha256": protocol_scope,
-            "fidelity_report_ids": list(dataset.manifest.fidelity_report_ids),
             "embedder": spec.embedder.model_dump(mode="json"),
             "embedder_alias": spec.embedder_alias,
             "feature_extractor_id": spec.feature_extractor_id,
@@ -829,7 +766,6 @@ def _persist_bank(
         task_ids=bank.task_ids,
         candidate_aliases=bank.candidate_aliases,
         evaluation_protocols_sha256=protocol_scope,
-        fidelity_report_ids=dataset.manifest.fidelity_report_ids,
         embedder_alias=spec.embedder_alias,
         embedder=spec.embedder,
         feature_extractor_id=spec.feature_extractor_id,
@@ -883,7 +819,6 @@ def _persist_policy(
         "task_set_id": dataset.manifest.task_set_id,
         "task_set_sha256": bank.task_set_sha256,
         "evaluation_protocols_sha256": bank.evaluation_protocols_sha256,
-        "fidelity_report_ids": list(bank.fidelity_report_ids),
         "judgment_status": spec.judgment_status,
     }
     policy = KnnRouterPolicy(
@@ -909,7 +844,6 @@ def _persist_policy(
         task_set_id=dataset.manifest.task_set_id,
         task_set_sha256=bank.task_set_sha256,
         evaluation_protocols_sha256=bank.evaluation_protocols_sha256,
-        fidelity_report_ids=bank.fidelity_report_ids,
         judgment_status=spec.judgment_status,
     )
     policy_record = store.write_or_verify_exact(

@@ -1294,9 +1294,9 @@ def test_command_budget_rejects_sft_before_credentials_even_with_yes(
     )
 
     assert result.exit_code == 2
-    output = unstyle(result.output)
+    output = " ".join(unstyle(result.output).split())
     assert "Cost preflight" in output
-    assert "configured budget: $0.01 per command" in output
+    assert "of the $0.01 per-command budget" in output
     flattened = _flat_cli_output(result.output)
     assert "exceedstheconfiguredper-commandbudget" in flattened
     assert "--yescannotoverride" in flattened

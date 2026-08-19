@@ -198,7 +198,6 @@ def _require_policy_bank_match(
             manifest.evaluation_protocols_sha256,
             "evaluation protocol scope",
         ),
-        (policy.fidelity_report_ids, manifest.fidelity_report_ids, "fidelity scope"),
         (policy.embedder_alias, manifest.embedder_alias, "embedder alias"),
         (policy.embedder, manifest.embedder, "embedder snapshot"),
         (policy.feature_extractor_id, manifest.feature_extractor_id, "feature extractor"),

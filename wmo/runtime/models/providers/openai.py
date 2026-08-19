@@ -26,7 +26,10 @@ from wmo.common.models import (
     Usage,
 )
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
-from wmo.runtime.models.providers.errors import ProviderResponseError
+from wmo.runtime.models.providers.errors import (
+    ProviderResponseError,
+    ProviderRetryableResponseError,
+)
 from wmo.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
 from wmo.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
@@ -115,6 +118,8 @@ def openai_responses_response(
         The typed assistant action, served model identity, and observed economics.
 
     Raises:
+        ProviderRetryableResponseError: The completed output carries no text or tool call,
+            typically because reasoning consumed the entire output budget.
         ProviderResponseError: The response status, output, tools, or usage is malformed.
     """
     try:
@@ -155,7 +160,9 @@ def openai_responses_response(
     try:
         action = AssistantAction(content=content, tool_calls=tuple(tool_calls))
     except ValueError as exc:
-        raise ProviderResponseError("OpenAI Responses output has no text or tool call") from exc
+        raise ProviderRetryableResponseError(
+            "OpenAI Responses output has no text or tool call"
+        ) from exc
     return ModelResponse.completed(
         output=action,
         configured_model=configured_model,
@@ -189,7 +196,8 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             base_url: Provider endpoint root.
             transport: Optional injected JSON transport for deterministic tests.
             retry_policy: Bounded retry behavior for transient transport failures.
-            timeout_seconds: Positive per-request timeout.
+            timeout_seconds: Positive per-attempt timeout floor; completion attempts scale
+                above it with the requested maximum output tokens.
             supports_temperature: Catalog declaration that the model accepts an explicit
                 sampling temperature; ``False`` omits requested temperatures from payloads.
             reasoning_effort: Optional catalog-pinned reasoning-effort level.

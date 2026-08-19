@@ -6,12 +6,20 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from wmo.common.evaluations import FidelityReport as FidelityReport
+    from wmo.common.evaluations import (
+        build_fidelity_evaluation_plan as build_fidelity_evaluation_plan,
+    )
+    from wmo.common.evaluations import build_fidelity_report as build_fidelity_report
+    from wmo.common.project import ProjectProviderFreeStage as ProjectProviderFreeStage
+    from wmo.common.project import (
+        ProjectTracePreparationSettings as ProjectTracePreparationSettings,
+    )
     from wmo.optimize.router.activation import load_project_router as load_project_router
     from wmo.optimize.router.activation import load_router as load_router
     from wmo.optimize.router.composition import (
         ApprovedRouterReview as ApprovedRouterReview,
     )
-    from wmo.optimize.router.composition import FidelityApprovalDecision as FidelityApprovalDecision
     from wmo.optimize.router.composition import (
         RouterCompositionBudget as RouterCompositionBudget,
     )
@@ -45,6 +53,10 @@ if TYPE_CHECKING:
     from wmo.simulation.build import TaskSetBuild as TaskSetBuild
     from wmo.simulation.build import build_project as build_project
     from wmo.simulation.build import build_task_set as build_task_set
+    from wmo.simulation.build import (
+        load_project_provider_free_stage as load_project_provider_free_stage,
+    )
+    from wmo.simulation.build import prepare_project_traces as prepare_project_traces
     from wmo.simulation.world_model.application import WorldModel as WorldModel
     from wmo.simulation.world_model.application import (
         WorldModelLoadError as WorldModelLoadError,
@@ -64,11 +76,15 @@ if TYPE_CHECKING:
     from wmo.simulation.world_model.application import load_world_model as load_world_model
 
 _EXPORT_MODULES = {
+    "ProjectProviderFreeStage": "wmo.common.project",
+    "ProjectTracePreparationSettings": "wmo.common.project",
     "BuildReviewReadiness": "wmo.simulation.build",
     "ProjectBuild": "wmo.simulation.build",
     "TaskSetBuild": "wmo.simulation.build",
     "build_project": "wmo.simulation.build",
     "build_task_set": "wmo.simulation.build",
+    "load_project_provider_free_stage": "wmo.simulation.build",
+    "prepare_project_traces": "wmo.simulation.build",
     "WorldModel": "wmo.simulation.world_model.application",
     "WorldModelLoadError": "wmo.simulation.world_model.application",
     "WorldModelObservation": "wmo.simulation.world_model.application",
@@ -76,6 +92,9 @@ _EXPORT_MODULES = {
     "WorldModelSessionError": "wmo.simulation.world_model.application",
     "WorldModelSessionLimits": "wmo.simulation.world_model.application",
     "load_world_model": "wmo.simulation.world_model.application",
+    "FidelityReport": "wmo.common.evaluations",
+    "build_fidelity_evaluation_plan": "wmo.common.evaluations",
+    "build_fidelity_report": "wmo.common.evaluations",
     "EvaluationInputs": "wmo.optimize.router.fit.workflow",
     "RouterFitConfig": "wmo.optimize.router.fit.workflow",
     "RouterFitWorkflowResult": "wmo.optimize.router.fit.workflow",
@@ -90,7 +109,6 @@ _EXPORT_MODULES = {
     "load_project_router": "wmo.optimize.router.activation",
     "load_router": "wmo.optimize.router.activation",
     "ApprovedRouterReview": "wmo.optimize.router.composition",
-    "FidelityApprovalDecision": "wmo.optimize.router.composition",
     "RouterCompositionBudget": "wmo.optimize.router.composition",
     "RouterCompositionResult": "wmo.optimize.router.composition",
     "RouterEvaluationSetup": "wmo.optimize.router.composition",

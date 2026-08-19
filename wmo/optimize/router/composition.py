@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import time
 from collections.abc import Callable
@@ -23,39 +24,32 @@ from wmo.common.core.artifacts import (
     stable_id,
 )
 from wmo.common.evaluations import (
-    EvaluationCell,
-    EvaluationCellEvidence,
     EvaluationPlan,
     EvaluationProtocol,
-    FidelityReport,
     ObservedProductionCell,
     build_evaluation_plan,
-    build_fidelity_report,
-    default_fidelity_thresholds,
-    persist_fidelity_thresholds,
 )
 from wmo.common.evaluations.evidence import (
-    read_evaluation_plan,
-    read_fidelity_gate,
-    read_fidelity_report,
-    read_judgment,
     read_rollout,
 )
-from wmo.common.evaluations.planning import plan_bound_fidelity_gate_id
-from wmo.common.judging import Judge, Judgment
+from wmo.common.judging import Judge
 from wmo.common.models import (
     ModelCatalog,
+    ProviderConnection,
     ProviderModelSelection,
     RoutedCandidateSnapshot,
     RouterCandidateSelection,
 )
 from wmo.common.observability.telemetry import capture_completion_once
+from wmo.common.progress import ProgressHook, report
 from wmo.common.project import (
-    ArtifactAlreadyExistsError,
     ProjectStore,
     artifact_input,
 )
-from wmo.common.rollouts import SimulationArtifactSet
+from wmo.common.rollouts import (
+    RolloutArtifact,
+    SimulationArtifactSet,
+)
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
 from wmo.common.routing.bank import KnnBankManifest
 from wmo.optimize.router.activation import load_project_router
@@ -77,26 +71,34 @@ from wmo.optimize.router.fit.workflow import (
     fit_router,
     report_router,
 )
-from wmo.optimize.router.judgment_budget import (
-    JudgmentBudgetError,
-    find_verified_judgment,
-    find_verified_judgments,
-    persist_dispatch_reservation,
-    read_dispatch_reservation,
-)
+from wmo.optimize.router.judgment_budget import complete_cell_evidence
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
 from wmo.simulation.build import ProjectBuild
+from wmo.simulation.engines.text.bindings import rollout_id_for_binding
+from wmo.simulation.engines.text.errors import SimulationConfigurationError
+from wmo.simulation.engines.text.grounding import load_completion_contract
+from wmo.simulation.engines.text.resume import reexecutable_dispatch_failure
+from wmo.simulation.engines.text.rollout_support import rollout_spend
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
 
+logger = logging.getLogger(__name__)
+
 
 class RouterCompositionBudget(ContractModel):
-    """Finite dispatch ceilings required by the composed customer workflow."""
+    """Finite dispatch ceilings required by the composed customer workflow.
+
+    ``maximum_simulation_cost_usd`` is one shared provider-spend pool: simulation and judging
+    both draw from it as reconciled actual cost, with no estimate-based carve-outs. By default it
+    authorizes the whole run, so spend crossing it logs a warning and the run completes;
+    ``stop_on_overspend`` instead blocks the next dispatch once reconciled spend reaches it.
+    """
 
     maximum_simulation_cost_usd: float = Field(gt=0)
     maximum_judgments: int = Field(gt=0)
+    stop_on_overspend: bool = False
 
     @field_validator("maximum_simulation_cost_usd")
     @classmethod
@@ -107,6 +109,13 @@ class RouterCompositionBudget(ContractModel):
         return value
 
 
+def _spend_ceiling_crossed(stop_on_overspend: bool, error: str, detail: str) -> None:
+    """Fail closed in stop mode or log that the authorized run continues past its ceiling."""
+    if stop_on_overspend:
+        raise RouterCompositionError(error)
+    logger.warning("%s; continuing because the run is already authorized", detail)
+
+
 @dataclass(frozen=True)
 class RouterCandidateSetupPlan:
     """Confirmed candidate roles paired with the catalog state shown to the operator."""
@@ -115,6 +124,7 @@ class RouterCandidateSetupPlan:
     candidate_models: tuple[ProviderModelSelection, ...]
     prospective_catalog: ModelCatalog
     expected_catalog_sha256: str
+    candidate_connections: tuple[ProviderConnection, ...] = ()
 
 
 class ApprovedRouterReview(ContractModel):
@@ -139,8 +149,6 @@ class RouterEvaluationSetup(ContractModel):
     judgment_status: Literal["provisional", "human_calibrated"]
     world_model_settings: WorldModelSettings
     simulation_completion_input: ArtifactInput | None = None
-    fidelity_planned_overlaps: int = Field(default=10, gt=0)
-    fidelity_minimum_usable_overlaps: int = Field(default=8, gt=0)
     agent_id: str = Field(min_length=1, max_length=256)
     seed: int
     maximum_steps: int = Field(gt=0)
@@ -179,40 +187,6 @@ class SimulatorFactory(Protocol):
         """Return a simulator bound to the exact persisted plan."""
 
 
-class FidelityApproval(Protocol):
-    """Owns the explicit human or application approval boundary for passing fidelity."""
-
-    def __call__(
-        self,
-        project: ProjectStore,
-        plan: EvaluationPlan,
-        evidence: tuple[EvaluationCellEvidence, ...],
-        budget: RouterCompositionBudget,
-    ) -> FidelityApprovalDecision:
-        """Return explicit approval actor, evidence, and time for reviewed fidelity evidence."""
-
-
-class FidelityApprovalDecision(ContractModel):
-    """Non-secret actor evidence returned by one explicit fidelity approval callback."""
-
-    actor_id: str = Field(min_length=1, max_length=256)
-    evidence: str = Field(min_length=1, max_length=2_000)
-    approved_at: datetime
-
-
-class FidelityApprovalReceipt(ArtifactEnvelope):
-    """Immutable exact plan, gate, report, actor, and approval-evidence binding."""
-
-    approval_id: ArtifactId
-    plan: ArtifactInput
-    gate: ArtifactInput
-    report: ArtifactInput
-    protocol_sha256: Sha256
-    actor_id: str = Field(min_length=1, max_length=256)
-    evidence: str = Field(min_length=1, max_length=2_000)
-    approved_at: datetime
-
-
 class RouterPolicyLock(ArtifactEnvelope):
     """Immutable proof that fit-only evaluation froze a verified bank and policy."""
 
@@ -232,7 +206,6 @@ class RouterWorkflowServices:
     setup_supplier: EvaluationSetupSupplier
     simulator_factory: SimulatorFactory
     judge: Judge
-    fidelity_approval: FidelityApproval
     runtime_catalog: RuntimeModelCatalog
     evaluation_plan_inputs: tuple[ArtifactInput, ...] = ()
 
@@ -246,10 +219,8 @@ class RouterCompositionResult:
     plan: EvaluationPlan
     simulation_spec: SimulationSpec
     held_out_simulation_spec: SimulationSpec
-    fidelity_approval_id: ArtifactId
     policy_lock_id: ArtifactId
-    fidelity_report_id: ArtifactId
-    phase_a_simulation_spend_usd: float
+    fit_simulation_spend_usd: float
     held_out_simulation_spend_usd: float
     total_simulation_spend_usd: float
     optimization: RouterWorkflowResult
@@ -265,6 +236,7 @@ def compose_router(
     created_at: datetime,
     code_revision: str,
     phase_hook: Callable[[str], None] | None = None,
+    progress: ProgressHook | None = None,
 ) -> RouterCompositionResult:
     """Build evidence, evaluate, freeze, report, and load one router with explicit services.
 
@@ -273,9 +245,12 @@ def compose_router(
         trace_source: Canonical normalized traces used to build task evidence.
         services: Review, simulation, judging, and runtime dependencies. None are auto-resolved.
         budget: Finite simulation spend and judgment-call ceilings.
-        created_at: Timezone-aware artifact completion time.
+        created_at: Timezone-aware artifact completion time. Once the evaluation plan is
+            persisted, every later phase artifact adopts the plan's completion time so a rerun
+            replays completed simulation, fit, and report work deterministically.
         code_revision: Exact code revision for every new artifact.
         phase_hook: Optional local observer used to audit phase ordering.
+        progress: Optional observer of truthful stage names and exact unit counts.
 
     Returns:
         The complete immutable artifact chain and W11 frozen runtime.
@@ -284,6 +259,7 @@ def compose_router(
         RouterCompositionError: A dependency, budget, artifact, or resume binding is invalid.
     """
     started = time.monotonic()
+    report(progress, "preflight")
     _preflight(project, services, budget, code_revision)
     completed_build = completed_project_build(project)
     built = reconstruct_completed_project_build(
@@ -305,101 +281,96 @@ def compose_router(
         calibration_id=review.calibration_id,
     )
 
-    thresholds = default_fidelity_thresholds(
-        created_at=created_at,
-        code_revision=code_revision,
-        planned_overlaps=setup.fidelity_planned_overlaps,
-        minimum_usable_overlaps=setup.fidelity_minimum_usable_overlaps,
-    )
-    persist_fidelity_thresholds(project.artifacts, thresholds)
     plan = build_evaluation_plan(
         project.artifacts,
         task_set_id=built.artifacts.task_set.task_set_id,
         candidate_snapshots=setup.candidates,
         pricing_snapshot_id=setup.pricing_snapshot_id,
         observed_cells=setup.observed_cells,
-        fidelity_thresholds_id=thresholds.fidelity_thresholds_id,
-        fidelity_protocol_sha256=_protocol_digest(setup.simulation_protocol),
         additional_inputs=services.evaluation_plan_inputs,
         created_at=created_at,
         code_revision=code_revision,
     )
     plan_input = artifact_input(project.artifacts.read(plan.plan_id).manifest)
     task_input = built.review.task_set
-    cells_by_id = {cell.cell_id: cell for cell in plan.cells}
-
-    _phase(phase_hook, "fidelity_fit_started")
-    phase_a_cells = tuple(cell for cell in plan.cells if cell.purpose in {"fit", "fidelity"})
+    _phase(phase_hook, "fit_started")
+    fit_cells = tuple(cell for cell in plan.cells if cell.purpose == "fit")
     spec = build_router_simulation_spec(
         plan,
         plan_input,
         task_input,
         setup,
         budget.maximum_simulation_cost_usd,
-        created_at,
+        plan.created_at,
         code_revision,
-        phase_a_cells,
-        phase="fidelity-fit",
+        fit_cells,
+        phase="fit",
+        stop_on_overspend=budget.stop_on_overspend,
     )
-    phase_a_set = _run_or_load_simulation(project, plan, spec, services.simulator_factory)
-    phase_a_spend = _verified_simulation_spend(project, phase_a_set)
-    if phase_a_spend > budget.maximum_simulation_cost_usd:
-        raise RouterCompositionError("verified Phase A simulation spend exceeds the total budget")
-    remaining_cost_usd = max(0.0, budget.maximum_simulation_cost_usd - phase_a_spend)
-    if remaining_cost_usd <= 0 and any(
-        cell.purpose == "held_out" and cell.execution == "simulate" for cell in plan.cells
-    ):
-        raise RouterCompositionError(
-            "Phase A consumed the total simulation budget; held-out dispatch is blocked"
+    fit_set = _run_or_load_simulation(
+        project,
+        plan,
+        spec,
+        services.simulator_factory,
+        progress=progress,
+        progress_detail="fit",
+    )
+    fit_spend = _verified_simulation_spend(project, fit_set, setup)
+    if fit_spend > budget.maximum_simulation_cost_usd:
+        _spend_ceiling_crossed(
+            budget.stop_on_overspend,
+            "verified fit simulation spend exceeds the total budget",
+            f"verified fit simulation spend ${fit_spend:.4f} exceeds the authorized "
+            f"${budget.maximum_simulation_cost_usd:.4f}",
         )
-    phase_a_evidence, phase_a_consumed = _complete_cell_evidence(
+    fit_evidence, fit_consumed, fit_judge_spend = complete_cell_evidence(
         project,
         plan_input,
-        phase_a_cells,
-        phase_a_set.artifact_ids,
+        fit_cells,
+        fit_set.artifact_ids,
         setup,
         review,
         services.judge,
         budget.maximum_judgments,
+        remaining_cost_usd=budget.maximum_simulation_cost_usd - fit_spend,
+        stop_on_overspend=budget.stop_on_overspend,
+        spend_ceiling_crossed=_spend_ceiling_crossed,
+        progress=progress,
+        progress_detail="fit",
     )
-    fidelity_evidence = tuple(
-        item for item in phase_a_evidence if cells_by_id[item.cell_id].purpose == "fidelity"
+    remaining_cost_usd = max(
+        0.0, budget.maximum_simulation_cost_usd - math.fsum((fit_spend, fit_judge_spend))
     )
-    fidelity, approval = _approve_fidelity_once(
-        project,
-        plan,
-        setup.simulation_protocol,
-        phase_a_evidence,
-        fidelity_evidence,
-        services.fidelity_approval,
-        budget,
-        created_at,
-        code_revision,
-    )
-    approved_protocol = setup.simulation_protocol.model_copy(
-        update={"fidelity_report_id": fidelity.fidelity_report_id}
-    )
+    if remaining_cost_usd <= 0 and any(
+        cell.purpose == "held_out" and cell.execution == "simulate" for cell in plan.cells
+    ):
+        _spend_ceiling_crossed(
+            budget.stop_on_overspend,
+            "fit simulation and judging consumed the total budget; held-out dispatch is blocked",
+            f"fit simulation and judging consumed the authorized "
+            f"${budget.maximum_simulation_cost_usd:.4f} before held-out dispatch",
+        )
     fit_config = RouterFitConfig(
         fit=EvaluationInputs(
             evaluation_plan_id=plan.plan_id,
-            rollout_set_ids=(phase_a_set.artifact_set_id,),
-            protocols=(setup.production_protocol, approved_protocol),
-            cell_evidence=phase_a_evidence,
-            fidelity_report_ids=(fidelity.fidelity_report_id,),
+            rollout_set_ids=(fit_set.artifact_set_id,),
+            protocols=(setup.production_protocol, setup.simulation_protocol),
+            cell_evidence=fit_evidence,
         ),
         embedding_set_id=setup.embedding_set_id,
         incumbent_alias=setup.incumbent_alias,
         pricing_snapshot_id=setup.pricing_snapshot_id,
         guard=setup.guard,
         judgment_status=setup.judgment_status,
-        created_at=created_at,
+        created_at=plan.created_at,
         code_revision=code_revision,
     )
+    report(progress, "fitting")
     fit, policy_lock = _fit_and_lock_once(
         project,
         plan_input,
         fit_config,
-        created_at,
+        plan.created_at,
         code_revision,
     )
     _phase(phase_hook, "policy_locked")
@@ -411,17 +382,30 @@ def compose_router(
         plan_input,
         task_input,
         setup,
-        remaining_cost_usd,
-        created_at,
+        remaining_cost_usd if budget.stop_on_overspend else budget.maximum_simulation_cost_usd,
+        plan.created_at,
         code_revision,
         held_cells,
         phase="heldout",
+        stop_on_overspend=budget.stop_on_overspend,
     )
-    held_set = _run_or_load_simulation(project, plan, held_spec, services.simulator_factory)
-    held_out_spend = _verified_simulation_spend(project, held_set)
-    if math.fsum((phase_a_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
-        raise RouterCompositionError("verified composed simulation spend exceeds the total budget")
-    held_evidence, _held_dispatched = _complete_cell_evidence(
+    held_set = _run_or_load_simulation(
+        project,
+        plan,
+        held_spec,
+        services.simulator_factory,
+        progress=progress,
+        progress_detail="held-out",
+    )
+    held_out_spend = _verified_simulation_spend(project, held_set, setup)
+    if math.fsum((fit_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
+        _spend_ceiling_crossed(
+            budget.stop_on_overspend,
+            "verified composed simulation spend exceeds the total budget",
+            f"verified composed simulation spend ${math.fsum((fit_spend, held_out_spend)):.4f} "
+            f"exceeds the authorized ${budget.maximum_simulation_cost_usd:.4f}",
+        )
+    held_evidence, _held_dispatched, _held_judge_spend = complete_cell_evidence(
         project,
         plan_input,
         held_cells,
@@ -429,8 +413,15 @@ def compose_router(
         setup,
         review,
         services.judge,
-        budget.maximum_judgments - phase_a_consumed,
+        budget.maximum_judgments - fit_consumed,
+        remaining_cost_usd=budget.maximum_simulation_cost_usd
+        - math.fsum((fit_spend, fit_judge_spend, held_out_spend)),
+        stop_on_overspend=budget.stop_on_overspend,
+        spend_ceiling_crossed=_spend_ceiling_crossed,
+        progress=progress,
+        progress_detail="held-out",
     )
+    report(progress, "artifact publication")
     optimized = report_router(
         project.artifacts,
         fit,
@@ -438,23 +429,22 @@ def compose_router(
             held_out=EvaluationInputs(
                 evaluation_plan_id=plan.plan_id,
                 rollout_set_ids=(held_set.artifact_set_id,),
-                protocols=(setup.production_protocol, approved_protocol),
+                protocols=(setup.production_protocol, setup.simulation_protocol),
                 cell_evidence=held_evidence,
-                fidelity_report_ids=(fidelity.fidelity_report_id,),
             ),
             embedding_set_id=setup.embedding_set_id,
-            created_at=created_at,
+            created_at=plan.created_at,
             code_revision=code_revision,
         ),
     )
-    total_spend = math.fsum((phase_a_spend, held_out_spend))
+    total_spend = math.fsum((fit_spend, held_out_spend))
     completion_id = optimized.optimization.report.report_id
     capture_completion_once(
         "wmo simulation completed",
         completion_id,
         {
             "success": True,
-            "rollout_count": len(phase_a_set.artifact_ids) + len(held_set.artifact_ids),
+            "rollout_count": len(fit_set.artifact_ids) + len(held_set.artifact_ids),
             "duration_seconds": max(time.monotonic() - started, 0.0),
             "cost_usd": total_spend,
         },
@@ -473,10 +463,8 @@ def compose_router(
         plan=plan,
         simulation_spec=spec,
         held_out_simulation_spec=held_spec,
-        fidelity_approval_id=approval.approval_id,
         policy_lock_id=policy_lock.lock_id,
-        fidelity_report_id=fidelity.fidelity_report_id,
-        phase_a_simulation_spend_usd=phase_a_spend,
+        fit_simulation_spend_usd=fit_spend,
         held_out_simulation_spend_usd=held_out_spend,
         total_simulation_spend_usd=total_spend,
         optimization=optimized,
@@ -489,8 +477,26 @@ def _run_or_load_simulation(
     plan: EvaluationPlan,
     spec: SimulationSpec,
     simulator_factory: SimulatorFactory,
+    *,
+    progress: ProgressHook | None = None,
+    progress_detail: str | None = None,
 ) -> SimulationArtifactSet:
-    """Load an exactly completed simulation set without invoking its simulator again."""
+    """Load an exactly completed simulation set without invoking its simulator again.
+
+    Args:
+        project: Project store holding completed simulation artifacts.
+        plan: Frozen evaluation plan bound to the injected simulator.
+        spec: Phase-scoped simulation specification to load or run.
+        simulator_factory: Injected constructor invoked only when no completed set exists.
+        progress: Optional observer of exact replayed evaluation-cell counts.
+        progress_detail: Phase qualifier attached to replayed evaluation-cell counts.
+
+    Returns:
+        Immutable index of one rollout artifact for every selected cell.
+
+    Raises:
+        RouterCompositionError: A stored artifact set is ambiguous, drifted, or mismatched.
+    """
     matches = []
     for artifact_id in project.artifacts.list_ids():
         stored = project.artifacts.read(artifact_id)
@@ -525,10 +531,20 @@ def _run_or_load_simulation(
             raise RouterCompositionError(
                 "completed simulation artifact set differs from phase spec"
             )
+        if any(reexecutable_dispatch_failure(rollout) for rollout in rollouts):
+            continue
         matches.append(artifact_set)
     if len(matches) > 1:
         raise RouterCompositionError("multiple completed artifact sets name one simulation phase")
     if matches:
+        cell_count = len(matches[0].artifact_ids)
+        report(
+            progress,
+            "evaluation cells",
+            completed=cell_count,
+            total=cell_count,
+            detail=progress_detail,
+        )
         return matches[0]
     return simulator_factory(project, plan).run(spec)
 
@@ -536,6 +552,7 @@ def _run_or_load_simulation(
 def _verified_simulation_spend(
     project: ProjectStore,
     expected: SimulationArtifactSet,
+    setup: RouterEvaluationSetup,
 ) -> float:
     """Recompute one phase's spend from verified immutable rollouts.
 
@@ -562,99 +579,54 @@ def _verified_simulation_spend(
     )
     if hashlib.sha256(index_payload).hexdigest() != artifact_set.artifacts_sha256:
         raise RouterCompositionError("simulation spend index digest has drifted")
-    values = tuple(
-        observed_rollout_spend(read_rollout(project.artifacts, rollout_id)[0])
-        for rollout_id in artifact_set.artifact_ids
-    )
+    values: list[float] = []
+    for rollout_id in artifact_set.artifact_ids:
+        rollout = read_rollout(project.artifacts, rollout_id)[0]
+        values.append(observed_rollout_spend(rollout))
+        values.extend(_superseded_attempt_spend(project, rollout, setup))
     return math.fsum(values)
 
 
-def _approve_fidelity_once(
+def _superseded_attempt_spend(
     project: ProjectStore,
-    plan: EvaluationPlan,
-    protocol: EvaluationProtocol,
-    phase_a_evidence: tuple[EvaluationCellEvidence, ...],
-    fidelity_evidence: tuple[EvaluationCellEvidence, ...],
-    approval_service: FidelityApproval,
-    budget: RouterCompositionBudget,
-    created_at: datetime,
-    code_revision: str,
-) -> tuple[FidelityReport, FidelityApprovalReceipt]:
-    """Call approval exactly once, persist its exact receipt, and verify every replay."""
-    plan_value, plan_input = read_evaluation_plan(project.artifacts, plan.plan_id)
-    protocol_sha256 = _protocol_digest(protocol)
-    gate_id = plan_bound_fidelity_gate_id(plan_input.sha256, protocol_sha256)
-    _gate, gate_input = read_fidelity_gate(project.artifacts, gate_id)
-    approval_id = stable_id(
-        "fidelity-approval",
-        {
-            "plan": plan_input.model_dump(mode="json"),
-            "gate": gate_input.model_dump(mode="json"),
-            "protocol_sha256": protocol_sha256,
-        },
-    )
-    destination = project.artifacts.project_directory / "artifacts" / approval_id
-    if destination.exists():
-        if project.artifacts.read(approval_id).manifest.artifact_type != "fidelity-approval":
-            raise RouterCompositionError("fidelity approval identity has the wrong artifact type")
-        receipt = FidelityApprovalReceipt.model_validate_json(
-            project.artifacts.read_bytes(approval_id, "approval.json")
+    rollout: RolloutArtifact,
+    setup: RouterEvaluationSetup,
+) -> tuple[float, ...]:
+    """Return conservative charges for every superseded retry attempt behind one rollout.
+
+    Args:
+        project: Project store containing the immutable prior-attempt artifacts.
+        rollout: Final rollout selected for its cell, possibly after retries.
+        setup: Reviewed evaluation setup naming the completion reservation contract.
+
+    Returns:
+        One worst-case charge per superseded attempt, so retried dispatches with unknown
+        spend still count against the phase ceiling.
+
+    Raises:
+        RouterCompositionError: A superseded attempt cannot be reconciled conservatively.
+    """
+    if rollout.retry_attempt == 0:
+        return ()
+    binding = rollout.simulation_binding
+    if binding is None:
+        raise RouterCompositionError("retried simulation rollout lacks its cell binding")
+    try:
+        load_completion_contract(project.artifacts, setup.simulation_completion_input)
+    except SimulationConfigurationError as exc:
+        raise RouterCompositionError(str(exc)) from exc
+    charges = []
+    for attempt in range(rollout.retry_attempt):
+        prior, _input = read_rollout(
+            project.artifacts, rollout_id_for_binding(binding, attempt=attempt)
         )
-        report, report_input = read_fidelity_report(project.artifacts, receipt.report.artifact_id)
-        if (
-            plan_value != plan
-            or receipt.plan != plan_input
-            or receipt.gate != gate_input
-            or receipt.report != report_input
-            or receipt.protocol_sha256 != protocol_sha256
-            or sorted_unique_inputs(*receipt.inputs)
-            != sorted_unique_inputs(plan_input, gate_input, report_input)
-        ):
-            raise RouterCompositionError("fidelity approval receipt binding has drifted")
-        replay = build_fidelity_report(
-            project.artifacts,
-            evaluation_plan_id=plan.plan_id,
-            protocol=protocol,
-            cell_evidence=phase_a_evidence,
-            created_at=created_at,
-            code_revision=code_revision,
-            approved_at=receipt.approved_at,
-        )
-        if replay != report:
-            raise RouterCompositionError("approved fidelity report differs from exact replay")
-        return report, receipt
-    decision = approval_service(project, plan, fidelity_evidence, budget)
-    report = build_fidelity_report(
-        project.artifacts,
-        evaluation_plan_id=plan.plan_id,
-        protocol=protocol,
-        cell_evidence=phase_a_evidence,
-        created_at=created_at,
-        code_revision=code_revision,
-        approved_at=decision.approved_at,
-    )
-    report_input = artifact_input(project.artifacts.read(report.fidelity_report_id).manifest)
-    receipt = FidelityApprovalReceipt(
-        schema_version=1,
-        created_at=created_at,
-        inputs=sorted_unique_inputs(plan_input, gate_input, report_input),
-        code_revision=code_revision,
-        approval_id=approval_id,
-        plan=plan_input,
-        gate=gate_input,
-        report=report_input,
-        protocol_sha256=protocol_sha256,
-        actor_id=decision.actor_id,
-        evidence=decision.evidence,
-        approved_at=decision.approved_at,
-    )
-    project.artifacts.write_json(
-        artifact_id=approval_id,
-        artifact_type="fidelity-approval",
-        envelope=receipt,
-        files={"approval.json": receipt},
-    )
-    return report, receipt
+        spend = rollout_spend(prior)
+        if spend is None:
+            raise RouterCompositionError(
+                "superseded simulation attempt spend cannot be reconciled conservatively"
+            )
+        charges.append(spend)
+    return tuple(charges)
 
 
 def _fit_and_lock_once(
@@ -749,7 +721,6 @@ def _preflight(
             services.setup_supplier,
             services.simulator_factory,
             services.judge,
-            services.fidelity_approval,
             services.runtime_catalog,
         )
     ):
@@ -762,156 +733,6 @@ def _verify_review(project: ProjectStore, review: ApprovedRouterReview) -> None:
     for artifact_id, artifact_type in expected:
         if project.artifacts.read(artifact_id).manifest.artifact_type != artifact_type:
             raise RouterCompositionError(f"{artifact_id} is not a completed {artifact_type}")
-
-
-def _complete_cell_evidence(
-    project: ProjectStore,
-    plan_input: ArtifactInput,
-    cells: tuple[EvaluationCell, ...],
-    simulated_rollout_ids: tuple[str, ...],
-    setup: RouterEvaluationSetup,
-    review: ApprovedRouterReview,
-    judge: Judge,
-    maximum_judgments: int,
-) -> tuple[tuple[EvaluationCellEvidence, ...], int]:
-    """Verify evidence and reserve each bounded judgment dispatch durably before calling it."""
-    rollouts_by_cell = {}
-    for rollout_id in simulated_rollout_ids:
-        rollout, _input = read_rollout(project.artifacts, rollout_id)
-        if rollout.cell_id is None or rollout.cell_id in rollouts_by_cell:
-            raise RouterCompositionError("simulator output lacks unique evaluation cell bindings")
-        rollouts_by_cell[rollout.cell_id] = rollout
-    observed = {
-        (item.task_id, item.candidate_alias, item.repeat): item.rollout_artifact_id
-        for item in setup.observed_cells
-    }
-    bound_cells = []
-    protocols_by_rollout: dict[str, EvaluationProtocol] = {}
-    for cell in cells:
-        rollout_id = (
-            cell.observed_rollout_id
-            if cell.execution == "observed"
-            else getattr(rollouts_by_cell.get(cell.cell_id), "rollout_id", None)
-        )
-        if rollout_id is None:
-            raise RouterCompositionError(
-                f"no completed rollout exists for planned cell {cell.cell_id}"
-            )
-        if (
-            cell.execution == "observed"
-            and observed.get((cell.task_id, cell.candidate_alias, cell.repeat)) != rollout_id
-        ):
-            raise RouterCompositionError("observed rollout binding changed after planning")
-        protocol = (
-            setup.production_protocol if cell.execution == "observed" else setup.simulation_protocol
-        )
-        existing_protocol = protocols_by_rollout.setdefault(rollout_id, protocol)
-        if existing_protocol != protocol:
-            raise RouterCompositionError("one rollout is bound to conflicting evaluation protocols")
-        bound_cells.append((cell, rollout_id, protocol))
-    try:
-        judgments_by_rollout = find_verified_judgments(
-            project,
-            protocols_by_rollout=protocols_by_rollout,
-            rubric_id=review.rubric_id,
-            calibration_id=review.calibration_id,
-        )
-    except JudgmentBudgetError as exc:
-        raise RouterCompositionError(str(exc)) from exc
-
-    evidence = []
-    consumed = 0
-    for cell, rollout_id, protocol in bound_cells:
-        try:
-            judgment = judgments_by_rollout.get(rollout_id)
-            receipt = read_dispatch_reservation(
-                project,
-                plan_input,
-                cell,
-                rollout_id,
-                review.rubric_id,
-                review.calibration_id,
-                protocol,
-            )
-            if judgment is None and receipt is not None:
-                judgment = find_verified_judgment(
-                    project,
-                    rollout_id,
-                    review.rubric_id,
-                    review.calibration_id,
-                    protocol,
-                )
-                if judgment is not None:
-                    judgments_by_rollout[rollout_id] = judgment
-        except JudgmentBudgetError as exc:
-            raise RouterCompositionError(str(exc)) from exc
-        if judgment is not None or receipt is not None:
-            consumed += 1
-        if consumed > maximum_judgments:
-            raise RouterCompositionError("judgment dispatch budget exhausted")
-        if judgment is None:
-            if receipt is not None:
-                raise RouterCompositionError(
-                    "reserved judgment dispatch has no completed judgment; retry is blocked"
-                )
-            if consumed >= maximum_judgments:
-                raise RouterCompositionError("judgment dispatch budget exhausted")
-            try:
-                persist_dispatch_reservation(
-                    project,
-                    plan_input,
-                    cell,
-                    rollout_id,
-                    review.rubric_id,
-                    review.calibration_id,
-                    protocol,
-                )
-            except JudgmentBudgetError as exc:
-                raise RouterCompositionError(str(exc)) from exc
-            consumed += 1
-            judgment = judge.judge_persisted(
-                project,
-                rollout_artifact_id=rollout_id,
-                rubric_artifact_id=review.rubric_id,
-                calibration_artifact_id=review.calibration_id,
-            )
-            _persist_judgment(project, judgment)
-            judgments_by_rollout[rollout_id] = judgment
-        rollout, _input = read_rollout(project.artifacts, rollout_id)
-        evidence.append(
-            EvaluationCellEvidence(
-                cell_id=cell.cell_id,
-                protocol_id=protocol.protocol_id,
-                rollout_artifact_id=rollout_id,
-                judgment_artifact_id=judgment.judgment_id,
-                source_run_id=rollout.source_run_id,
-            )
-        )
-    return tuple(evidence), consumed
-
-
-def _persist_judgment(project: ProjectStore, judgment: Judgment) -> None:
-    """Persist or exactly verify one deterministic injected-judge result."""
-    try:
-        project.artifacts.write_json(
-            artifact_id=judgment.judgment_id,
-            artifact_type="judgment",
-            envelope=judgment,
-            files={"judgment.json": judgment},
-        )
-    except ArtifactAlreadyExistsError:
-        existing, _input = read_judgment(project.artifacts, judgment.judgment_id)
-        if existing != judgment:
-            raise RouterCompositionError(
-                "existing judgment differs from injected judge result"
-            ) from None
-
-
-def _protocol_digest(protocol: EvaluationProtocol) -> str:
-    """Return the canonical fidelity digest without a circular report identity."""
-    from wmo.common.evaluations.evidence import evaluation_protocol_digest
-
-    return evaluation_protocol_digest(protocol)
 
 
 def _phase(hook: Callable[[str], None] | None, phase: str) -> None:

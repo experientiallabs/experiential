@@ -22,20 +22,17 @@ from wmo.common.evaluations.dataset import (
     EvaluationDatasetManifest,
     EvaluationProtocol,
     EvaluationRow,
-    FidelityReport,
 )
 from wmo.common.evaluations.evidence import (
     EvaluationCellEvidence,
     EvaluationEvidenceError,
-    evaluation_protocol_digest,
     read_calibration,
     read_evaluation_plan,
-    read_fidelity_report,
     read_judgment,
     read_rollout,
     sorted_evaluation_inputs,
 )
-from wmo.common.evaluations.plan import EvaluationCell, EvaluationPlan
+from wmo.common.evaluations.plan import EvaluationCell
 from wmo.common.judging import JudgeCalibration, Judgment
 from wmo.common.models import RoutedCandidateSnapshot, load_pricing_snapshot
 from wmo.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
@@ -55,7 +52,6 @@ def build_evaluation_dataset(
     pricing_snapshot_id: ArtifactId,
     protocols: Sequence[EvaluationProtocol],
     cell_evidence: Sequence[EvaluationCellEvidence],
-    fidelity_report_ids: Sequence[ArtifactId] = (),
     purposes: Sequence[Literal["fit", "held_out", "fidelity"]] = (
         "fit",
         "held_out",
@@ -72,7 +68,6 @@ def build_evaluation_dataset(
         pricing_snapshot_id: Exact pricing artifact already pinned by the plan.
         protocols: Frozen production, world-model, or sandbox evidence protocols.
         cell_evidence: One explicit execution assignment for every plan cell.
-        fidelity_report_ids: Fidelity reports available to qualify world-model evidence.
         created_at: Time the dataset is completed.
         code_revision: Exact WMO revision creating the dataset.
 
@@ -114,7 +109,6 @@ def build_evaluation_dataset(
         raise EvaluationEvidenceError("evaluation materialization needs at least one purpose")
     selected_cells = tuple(cell for cell in plan.cells if cell.purpose in selected_purposes)
     evidence_by_cell = _index_cell_evidence(selected_cells, cell_evidence)
-    reports, report_inputs = _load_reports(store, fidelity_report_ids)
     calibrations, calibration_inputs = _load_calibrations(
         store, tuple(protocol_by_id.values()), loaded_tasks.tasks
     )
@@ -124,22 +118,18 @@ def build_evaluation_dataset(
         plan_input,
         task_input,
         pricing_input,
-        *report_inputs,
         *calibration_inputs,
     ]
     rows = tuple(
         _materialize_row(
             store,
-            plan,
             cell,
             evidence_by_cell[cell.cell_id],
             protocol_by_id,
             candidates_by_alias,
             tasks_by_id,
             calibrations,
-            reports,
             verified_inputs,
-            plan_input,
         )
         for cell in selected_cells
     )
@@ -156,7 +146,6 @@ def build_evaluation_dataset(
         if task.partition == "held_out" and task.task_id in used_task_ids
     )
     inputs = sorted_evaluation_inputs(verified_inputs)
-    report_ids = tuple(sorted(reports))
     ordered_protocols = tuple(sorted(protocol_by_id.values(), key=lambda item: item.protocol_id))
     evaluation_id = stable_id(
         "evaluation",
@@ -166,9 +155,6 @@ def build_evaluation_dataset(
             "plan": plan_input.model_dump(mode="json"),
             "rows_sha256": sha256_bytes(rows_payload),
             "protocols": [item.model_dump(mode="json") for item in ordered_protocols],
-            "fidelity_reports": [
-                reports[report_id].model_dump(mode="json") for report_id in report_ids
-            ],
         },
     )
     manifest = EvaluationDatasetManifest(
@@ -184,7 +170,6 @@ def build_evaluation_dataset(
         held_out_task_ids=held_out_task_ids,
         candidate_snapshots=plan.candidate_snapshots,
         protocols=ordered_protocols,
-        fidelity_report_ids=report_ids,
         rows_path="rows.jsonl",
         rows_sha256=sha256_bytes(rows_payload),
     )
@@ -252,39 +237,6 @@ def load_evaluation_dataset(store: ArtifactStore, evaluation_id: ArtifactId) -> 
     return EvaluationDataset(manifest=manifest, rows=rows)
 
 
-def world_model_protocol_is_eligible(
-    protocol: EvaluationProtocol,
-    reports: dict[str, FidelityReport],
-    *,
-    evaluation_plan_id: ArtifactId | None = None,
-    evaluation_plan_sha256: str | None = None,
-) -> bool:
-    """Return whether one world-model protocol has approved matching fidelity evidence.
-
-    Args:
-        protocol: Protocol whose simulated rows may enter router fitting.
-        reports: Fidelity reports loaded with the evaluation dataset.
-
-    Returns:
-        ``True`` only for an approved report bound to the exact protocol digest.
-    """
-    if protocol.evidence_source != "world_model" or protocol.fidelity_report_id is None:
-        return False
-    report = reports.get(protocol.fidelity_report_id)
-    return bool(
-        report is not None
-        and report.status == "approved"
-        and report.protocol_sha256 == evaluation_protocol_digest(protocol)
-        and (
-            evaluation_plan_id is None
-            or (
-                report.evaluation_plan_id == evaluation_plan_id
-                and report.evaluation_plan_sha256 == evaluation_plan_sha256
-            )
-        )
-    )
-
-
 def _index_protocols(
     protocols: Sequence[EvaluationProtocol],
 ) -> dict[str, EvaluationProtocol]:
@@ -320,23 +272,6 @@ def _index_cell_evidence(
     return result
 
 
-def _load_reports(
-    store: ArtifactStore, report_ids: Sequence[ArtifactId]
-) -> tuple[dict[str, FidelityReport], tuple[ArtifactInput, ...]]:
-    """Load unique fidelity reports without filtering their status."""
-    reports: dict[str, FidelityReport] = {}
-    inputs = []
-    for report_id in sorted(report_ids):
-        if report_id in reports:
-            raise EvaluationEvidenceError(f"fidelity report repeats {report_id}")
-        report, report_input = read_fidelity_report(store, report_id)
-        if report.fidelity_report_id != report_id:
-            raise EvaluationEvidenceError("fidelity report record has the wrong identity")
-        reports[report_id] = report
-        inputs.append(report_input)
-    return reports, tuple(inputs)
-
-
 def _load_calibrations(
     store: ArtifactStore,
     protocols: Sequence[EvaluationProtocol],
@@ -368,16 +303,13 @@ def _load_calibrations(
 
 def _materialize_row(
     store: ArtifactStore,
-    plan: EvaluationPlan,
     cell: EvaluationCell,
     evidence: EvaluationCellEvidence,
     protocols: dict[str, EvaluationProtocol],
     candidates: dict[str, RoutedCandidateSnapshot],
     tasks: dict[str, TaskCase],
     calibrations: dict[str, JudgeCalibration],
-    reports: dict[str, FidelityReport],
     verified_inputs: list[ArtifactInput],
-    plan_input: ArtifactInput,
 ) -> EvaluationRow:
     """Join one planned cell to exactly one execution and optional judgment."""
     protocol = protocols.get(evidence.protocol_id)
@@ -387,17 +319,6 @@ def _materialize_row(
         )
     if cell.execution == "simulate" and protocol.evidence_source == "production":
         raise EvaluationEvidenceError("missing cells cannot use a production evidence protocol")
-    if protocol.evidence_source == "world_model" and protocol.fidelity_report_id is not None:
-        report = reports.get(protocol.fidelity_report_id)
-        if report is None or report.protocol_sha256 != evaluation_protocol_digest(protocol):
-            raise EvaluationEvidenceError("world-model protocol fidelity reference is unavailable")
-        if (
-            report.evaluation_plan_id != plan.plan_id
-            or report.evaluation_plan_sha256 != plan_input.sha256
-        ):
-            raise EvaluationEvidenceError(
-                "world-model fidelity report uses a different evaluation plan"
-            )
     if cell.execution == "observed":
         if evidence.failure is not None or evidence.rollout_artifact_id is None:
             raise EvaluationEvidenceError("observed cells require their frozen production rollout")

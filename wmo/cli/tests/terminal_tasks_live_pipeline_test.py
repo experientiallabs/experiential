@@ -26,6 +26,8 @@ import pytest
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
+from wmo.common.judging import Rubric
+from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models.catalog import load_model_catalog
 from wmo.common.project import ProjectStore
 from wmo.optimize.router.judging.service import prepare_manual_judge_calibration
@@ -40,8 +42,9 @@ TRACES_SHA256 = "21c62cba7e3372cbf03df051dc2408699fbf8ea3561ba661b599e4949f0e5d4
 _PROJECT = "terminal-tasks"
 _INCUMBENT_ALIAS = "mini"
 _CALIBRATION_SAMPLE_SIZE = 10
-_CALIBRATION_CEILING_USD = "5"
-_ROUTER_CEILING_USD = "40"
+_CALIBRATION_CEILING_USD = "8"
+_ROUTER_CEILING_USD = "60"
+_COMMAND_BUDGET_USD = "75"
 _ROUTER_JUDGMENTS = "60"
 _SERVER_PORT = 8399
 _MODELS: tuple[dict[str, object], ...] = (
@@ -72,7 +75,7 @@ _MODELS: tuple[dict[str, object], ...] = (
             "supports_temperature": False,
             "reasoning_effort": "xhigh",
             "supports_structured_output": True,
-            "maximum_output_tokens": 8000,
+            "maximum_output_tokens": 32000,
             "context_window_tokens": 400000,
             "input_cost_per_million_tokens_usd": 1.25,
             "output_cost_per_million_tokens_usd": 10.0,
@@ -234,10 +237,23 @@ def _calibrate_judge(runner: CliRunner, root: Path) -> None:
     """Label representative traces programmatically and calibrate with a bounded ceiling."""
     store = ProjectStore(root, _PROJECT)
     plan = prepare_manual_judge_calibration(store, sample_size=_CALIBRATION_SAMPLE_SIZE)
+    rubric, _ = read_artifact_json(
+        store,
+        artifact_id=plan.setup.rubric.artifact_id,
+        expected_artifact_type="rubric",
+        relative_path="rubric.json",
+        model_type=Rubric,
+    )
+    top_score = rubric.axis("task-success").max_score
     labels = [
         argument
         for trace in plan.traces
-        for argument in ("--label", f"{trace.trace_id}:task-success=4")
+        for argument in (
+            "--label",
+            f"{trace.trace_id}:task-success={top_score}",
+            "--judgment",
+            f"{trace.trace_id}:task-success=Live calibration label pinned to the top score.",
+        )
     ]
     result = runner.invoke(
         app,
@@ -380,6 +396,8 @@ def test_live_openai_pipeline_covers_every_locked_cli_path(
         app, ["config", "providers", "--root", str(root), "--non-interactive"]
     )
     assert providers.exit_code == 0, providers.output
+    budget = runner.invoke(app, ["config", "budget", _COMMAND_BUDGET_USD, "--root", str(root)])
+    assert budget.exit_code == 0, budget.output
     _walk_telemetry(runner, root)
 
     attributed = tmp_path / "traces.attributed.jsonl"
@@ -414,12 +432,9 @@ def test_live_openai_pipeline_covers_every_locked_cli_path(
             _ROUTER_CEILING_USD,
             "--maximum-judgments",
             _ROUTER_JUDGMENTS,
-            "--preferred-fidelity-overlaps",
-            "3",
             "--maximum-model-calls",
             "8",
             "--yes",
-            "--approve-fidelity",
             "--non-interactive",
         ],
     )

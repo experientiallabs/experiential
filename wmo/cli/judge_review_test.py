@@ -170,6 +170,7 @@ def test_one_trace_view_separates_conversation_and_truthfully_truncates() -> Non
         proposal,
         character_limit=40,
         page=False,
+        non_interactive=False,
         console=console,
     )
 
@@ -202,6 +203,56 @@ def test_one_trace_view_separates_conversation_and_truthfully_truncates() -> Non
     assert "Evidence content:" in output
     assert "truncated 40 characters" in output
     assert "use --page for the full transcript" in flattened
+
+
+@pytest.mark.parametrize(
+    ("page", "non_interactive", "expect_viewer"),
+    [
+        (False, False, True),
+        (True, False, False),
+        (False, True, False),
+    ],
+)
+def test_full_screen_viewer_runs_only_for_interactive_unpaged_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+    page: bool,
+    non_interactive: bool,
+    expect_viewer: bool,
+) -> None:
+    """The viewer never intercepts paged or fully flag-driven reviews on a TTY.
+
+    Args:
+        monkeypatch: Scoped TTY detection and viewer replacement.
+        page: Whether the explicit pager mode is selected.
+        non_interactive: Whether every decision comes from explicit flags.
+        expect_viewer: Whether the full-screen viewer must own the display.
+    """
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=100, color_system=None, force_terminal=True)
+    monkeypatch.setattr(
+        review_module,
+        "_interactive_viewer_available",
+        lambda _console: True,
+    )
+    viewed: list[str] = []
+    monkeypatch.setattr(
+        review_module,
+        "view_trace_proposal",
+        lambda proposal, *, console: viewed.append(proposal.trace.trace_id),
+    )
+    proposal = _proposal(_trace("trace-a", completion="Done.", failed=False))
+
+    review_module.render_trace_proposal(
+        proposal,
+        character_limit=1_200,
+        page=page,
+        non_interactive=non_interactive,
+        console=console,
+    )
+
+    assert viewed == (["trace-a"] if expect_viewer else [])
+    if not expect_viewer and not page:
+        assert "Original user request:" in buffer.getvalue()
 
 
 def test_acceptance_prompts_only_after_every_axis_proposal_is_visible(
@@ -380,6 +431,55 @@ def test_noninteractive_multi_axis_inputs_accept_and_correct_independently() -> 
     )
 
 
+def test_noninteractive_missing_labels_list_ready_to_paste_expressions() -> None:
+    """The non-interactive error lists one paste-ready --label expression per missing key."""
+    proposal = _proposal(_trace("trace-a", completion="Done.", failed=False), multi_axis=True)
+
+    with pytest.raises(ValueError) as excinfo:
+        review_module.build_manual_judge_reviewer(
+            _setup(),
+            proposal.rubric,
+            _previews(proposal),
+            drafted_labels=(),
+            supplied_labels=(),
+            supplied_judgments=(),
+            non_interactive=True,
+            character_limit=1_200,
+            page=False,
+            console=Console(file=io.StringIO(), width=100, color_system=None),
+        )
+
+    message = str(excinfo.value)
+    assert message.startswith("missing labels: supply ")
+    assert "--label trace-a:task-success=SCORE" in message
+    assert "--label trace-a:policy-compliance=SCORE" in message
+
+
+def test_noninteractive_missing_pairwise_labels_list_typed_winner_values() -> None:
+    """The pairwise non-interactive error shows the typed winner values to paste."""
+    trace = _trace("trace-a", completion="Candidate A finished.", failed=False)
+    reference = _trace("trace-b", completion="Candidate B finished.", failed=False)
+    proposal = _proposal(trace, reference=reference)
+
+    with pytest.raises(ValueError) as excinfo:
+        review_module.build_manual_judge_reviewer(
+            _setup(response_shape="pairwise"),
+            proposal.rubric,
+            _previews(proposal),
+            drafted_labels=(),
+            supplied_labels=(),
+            supplied_judgments=(),
+            non_interactive=True,
+            character_limit=1_200,
+            page=False,
+            console=Console(file=io.StringIO(), width=100, color_system=None),
+        )
+
+    message = str(excinfo.value)
+    assert "--label trace-a:trace-b:task-success=WINNER" in message
+    assert "(WINNER is winner_a, winner_b, or tie)" in message
+
+
 def test_noninteractive_scalar_score_respects_the_saved_axis_range() -> None:
     """Explicit scalar corrections cannot leave the finalized inclusive range."""
     proposal = _proposal(_trace("trace-a", completion="Done.", failed=False))
@@ -437,6 +537,7 @@ def test_page_expands_only_the_current_full_transcript() -> None:
         proposal,
         character_limit=40,
         page=True,
+        non_interactive=False,
         console=console,
     )
 

@@ -1,4 +1,4 @@
-"""Plan-bound execution of the approved manual judge contract."""
+"""Execution of the approved manual judge contract against plan-bound rollouts."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from datetime import datetime
 
 from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.evaluations import EvaluationPlan
-from wmo.common.evaluations.evidence import read_rollout
+from wmo.common.evaluations.evidence import read_evaluation_plan, read_rollout
 from wmo.common.judging import Judgment, LMJudge, Rubric
 from wmo.common.judging.provenance import read_artifact_json
 from wmo.common.models import (
@@ -16,13 +16,19 @@ from wmo.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    completion_request_cost_usd,
     reconcile_completion_economics,
     verify_completion_reservation,
 )
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.rollouts import RolloutArtifact
+from wmo.optimize.router.errors import (
+    JudgeDispatchExhaustedError,
+    JudgeTranscriptAdmissionError,
+)
 from wmo.optimize.router.judging.contracts import ManualJudgeError, ManualJudgeSetupArtifact
 from wmo.optimize.router.judging.protocol import TemplateJudgeClient
+from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
 from wmo.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
 
 
@@ -81,6 +87,10 @@ class ReservedJudgeClient:
             Provider response with known bounded economics.
 
         Raises:
+            JudgeTranscriptAdmissionError: The counted request input exceeds the frozen
+                reserved input-token ceiling, so the rendered transcript cannot be admitted.
+            JudgeDispatchExhaustedError: The admitted dispatch exhausted its bounded retries
+                without usable output; the error carries the conservative billed-spend ceiling.
             ValueError: The request exceeds a bound or provider usage and spend cannot be bounded.
         """
         if self._calls >= self._maximum_provider_calls:
@@ -90,11 +100,23 @@ class ReservedJudgeClient:
         if output_tokens is None:
             raise ValueError("judge request must declare a maximum output-token ceiling")
         if input_tokens > self._reservation.maximum_input_tokens:
-            raise ValueError("judge request exceeds its reserved input-token ceiling")
+            raise JudgeTranscriptAdmissionError(
+                "judge request exceeds its reserved input-token ceiling"
+            )
         if output_tokens > self._reservation.maximum_output_tokens:
             raise ValueError("judge request exceeds its reserved output-token ceiling")
         self._calls += 1
-        response = self._client.complete(request)
+        try:
+            response = self._client.complete(request)
+        except ProviderRetryableResponseError as exc:
+            raise JudgeDispatchExhaustedError(
+                str(exc),
+                conservative_cost_usd=completion_request_cost_usd(
+                    self._reservation,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                ),
+            ) from exc
         if response.model != self._reservation.model:
             raise ValueError("judge response model differs from its frozen reservation")
         economics = reconcile_completion_economics(
@@ -114,6 +136,7 @@ class AutomaticRouterJudge:
         *,
         created_at: datetime,
         code_revision: str,
+        maximum_output_tokens: int,
     ) -> None:
         """Bind the finalized manual setup and provider boundary.
 
@@ -122,25 +145,13 @@ class AutomaticRouterJudge:
             setup: Finalized manual judge prompt, mapping, schema, and rubric pointer.
             created_at: Materialization time for provider probes and judgments.
             code_revision: Exact producer revision.
+            maximum_output_tokens: Approved per-call output-token reservation for dispatches.
         """
         self._client = client
         self._setup = setup
         self._created_at = created_at
         self._code_revision = code_revision
-        self._plan: EvaluationPlan | None = None
-
-    def bind_plan(self, plan: EvaluationPlan) -> None:
-        """Bind the one frozen evaluation plan whose rollouts may be judged.
-
-        Args:
-            plan: Persisted current composition plan.
-
-        Raises:
-            ValueError: A different plan was already bound.
-        """
-        if self._plan is not None and self._plan != plan:
-            raise ValueError("automatic judge is already bound to a different evaluation plan")
-        self._plan = plan
+        self._maximum_output_tokens = maximum_output_tokens
 
     def judge_persisted(
         self,
@@ -164,8 +175,6 @@ class AutomaticRouterJudge:
         Raises:
             ManualJudgeError: Plan, setup, rollout, or same-task pairwise evidence is invalid.
         """
-        if self._plan is None:
-            raise ManualJudgeError("automatic judge has not been bound to an evaluation plan")
         if rubric_artifact_id != self._setup.rubric.artifact_id:
             raise ManualJudgeError("router rubric differs from the finalized judge setup")
         rollout, rollout_input = read_rollout(store.artifacts, rollout_artifact_id)
@@ -189,12 +198,14 @@ class AutomaticRouterJudge:
             reference_input=reference_input,
             created_at=self._created_at,
             code_revision=self._code_revision,
+            maximum_output_tokens=self._maximum_output_tokens,
         )
         return LMJudge(
             adapter,
             self._setup.prompt_template.prompt,
             code_revision=self._code_revision,
             clock=lambda: self._created_at,
+            maximum_output_tokens=self._maximum_output_tokens,
         ).judge_persisted(
             store,
             rollout_artifact_id=rollout_artifact_id,
@@ -221,10 +232,8 @@ class AutomaticRouterJudge:
         """
         if self._setup.prompt_template.response_shape != "pairwise":
             return None, None
-        assert self._plan is not None
-        allowed_cells = {
-            cell.cell_id for cell in self._plan.cells if cell.task_id == target.task_id
-        }
+        plan = self._target_plan(store, target)
+        allowed_cells = {cell.cell_id for cell in plan.cells if cell.task_id == target.task_id}
         candidates = []
         for artifact_id in store.artifacts.list_ids():
             try:
@@ -246,6 +255,33 @@ class AutomaticRouterJudge:
             )
         _rollout_id, reference, reference_input = min(candidates, key=lambda item: item[0])
         return reference, reference_input
+
+    def _target_plan(self, store: ProjectStore, target: RolloutArtifact) -> EvaluationPlan:
+        """Load the exact frozen evaluation plan the target rollout was simulated under.
+
+        Args:
+            store: Project-local artifact store.
+            target: Verified target rollout.
+
+        Returns:
+            Verified evaluation plan named by the rollout's immutable simulation binding.
+
+        Raises:
+            ManualJudgeError: The rollout carries no binding or the persisted plan drifted.
+        """
+        binding = target.simulation_binding
+        if binding is None:
+            raise ManualJudgeError(
+                "pairwise router judging needs a rollout with a simulation cell binding"
+            )
+        plan, plan_input = read_evaluation_plan(
+            store.artifacts, binding.evaluation_plan_input.artifact_id
+        )
+        if plan_input != binding.evaluation_plan_input:
+            raise ManualJudgeError(
+                "persisted evaluation plan differs from the rollout's immutable binding"
+            )
+        return plan
 
 
 def _setup_input(store: ProjectStore, setup: ManualJudgeSetupArtifact) -> ArtifactInput:

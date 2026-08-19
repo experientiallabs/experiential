@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,9 +10,13 @@ from datetime import datetime
 from wmo.common.core.artifacts import stable_id
 from wmo.common.evaluations import EvaluationPlan, EvaluationProtocol
 from wmo.common.models import (
+    ModelCatalog,
+    ProviderSetup,
+    configure_provider_catalog_with_router_candidates,
     configure_router_candidates,
     verify_router_candidate_catalog_state,
 )
+from wmo.common.progress import ProgressHook, report
 from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.routing import KnnGuard
 from wmo.optimize.router.automatic.artifacts import (
@@ -27,7 +32,6 @@ from wmo.optimize.router.automatic.preflight import (
 )
 from wmo.optimize.router.composition import (
     ApprovedRouterReview,
-    FidelityApproval,
     RouterCandidateSetupPlan,
     RouterCompositionBudget,
     RouterCompositionResult,
@@ -40,7 +44,12 @@ from wmo.runtime.agents import (
     preflight_agent_factory,
     resolve_agent_factory,
 )
-from wmo.runtime.models import CapabilityRequirement, ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import (
+    CapabilityRequirement,
+    CatalogRoleName,
+    ResolvedModel,
+    RuntimeModelCatalog,
+)
 from wmo.simulation.build import ProjectBuild
 from wmo.simulation.engines.text import (
     WORLD_MODEL_TEXT_PROMPT_ID,
@@ -51,6 +60,10 @@ from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.retrieval import RAGEmbedderBinding, load_fit_rag_retriever
 from wmo.simulation.specs import WorldModelSettings
 from wmo.simulation.world_model import bind_fit_grounded_world_model
+
+logger = logging.getLogger(__name__)
+
+_REASONING_JUDGE_OUTPUT_FLOOR_TOKENS = 8_192
 
 
 class AutomaticRouterError(ValueError):
@@ -83,10 +96,10 @@ def optimize_project_router(
     *,
     options: AutomaticRouterOptions,
     provider_spend_consented: bool,
-    fidelity_approval: FidelityApproval,
     created_at: datetime,
     code_revision: str,
     phase_hook: Callable[[str], None] | None = None,
+    progress: ProgressHook | None = None,
 ) -> AutomaticRouterResult:
     """Optimize a router from one completed project with no workflow config file.
 
@@ -96,10 +109,10 @@ def optimize_project_router(
         runtime_catalog: Resolver retaining the caller's credential and transport seams.
         options: Bounded provider, evidence, retry, and concurrency controls.
         provider_spend_consented: Explicit approval of the displayed shared provider ceiling.
-        fidelity_approval: Separate explicit approval boundary for measured simulation fidelity.
         created_at: Materialization time for new immutable artifacts.
         code_revision: Exact producer revision.
         phase_hook: Optional local phase-order observer.
+        progress: Optional observer of truthful stage names and exact unit counts.
 
     Returns:
         Complete preflight, execution contract, optimized policy, report, and runtime.
@@ -108,6 +121,7 @@ def optimize_project_router(
         AutomaticRouterError: Consent, credentials, catalog state, or runtime binding differs.
         AutomaticRouterPreflightError: Aggregate prerequisites are incomplete.
     """
+    report(progress, "preflight")
     preflight = preflight_automatic_router(
         project,
         candidate_plan.selection,
@@ -122,28 +136,22 @@ def optimize_project_router(
         project.model_catalog_path,
         candidate_plan.expected_catalog_sha256,
     )
+    resolved_catalog = runtime_catalog.with_catalog(candidate_plan.prospective_catalog)
+    agent_factory = _resolve_agent_factory(preflight, options)
+    resolved = _resolve_all_models(preflight, resolved_catalog, options)
+    configured = persist_router_candidate_setup(project, candidate_plan)
+    if configured != candidate_plan.prospective_catalog:
+        raise AutomaticRouterError("persisted router candidate catalog differs from confirmation")
     _attribution, attribution_input = persist_router_observed_attribution_set(
         project.artifacts,
         trace_dataset=preflight.completed_build.trace_dataset,
         task_set=preflight.completed_build.task_set,
         catalog_sha256=preflight.catalog_sha256,
         candidates=preflight.candidates,
-        preferred_overlap_limit=preflight.preferred_fidelity_overlaps,
         records=tuple(item.attribution for item in preflight.observed_traces),
         created_at=created_at,
         code_revision=code_revision,
     )
-    resolved_catalog = runtime_catalog.with_catalog(candidate_plan.prospective_catalog)
-    agent_factory = _resolve_agent_factory(preflight, options)
-    resolved = _resolve_all_models(preflight, resolved_catalog, options)
-    configured = configure_router_candidates(
-        project.model_catalog_path,
-        candidate_plan.selection,
-        candidate_models=candidate_plan.candidate_models,
-        expected_state_sha256=candidate_plan.expected_catalog_sha256,
-    )
-    if configured != candidate_plan.prospective_catalog:
-        raise AutomaticRouterError("persisted router candidate catalog differs from confirmation")
     artifacts = materialize_automatic_router_artifacts(
         project,
         preflight,
@@ -164,8 +172,8 @@ def optimize_project_router(
         resolved_catalog,
         judge,
         agent_factory,
-        fidelity_approval,
         options,
+        progress=progress,
     )
     composition = compose_router(
         project,
@@ -177,22 +185,86 @@ def optimize_project_router(
                 if preflight.trace_identity_evidence is None
                 else preflight.trace_identity_evidence.records
             ),
-            include_identity_evidence=preflight.trace_identity_evidence is not None,
         ),
         services=services,
         budget=RouterCompositionBudget(
             maximum_simulation_cost_usd=preflight.remaining_simulation_cost_usd,
             maximum_judgments=options.maximum_judgments,
+            stop_on_overspend=options.stop_on_overspend,
         ),
         created_at=created_at,
         code_revision=code_revision,
         phase_hook=phase_hook,
+        progress=progress,
     )
     return AutomaticRouterResult(
         preflight=preflight,
         artifacts=artifacts,
         composition=composition,
     )
+
+
+def persist_router_candidate_setup(
+    project: ProjectStore,
+    candidate_plan: RouterCandidateSetupPlan,
+) -> ModelCatalog:
+    """Persist candidate provider records and router roles in one catalog transaction.
+
+    Args:
+        project: Project whose shared model catalog was confirmed during collection.
+        candidate_plan: Confirmed candidate selection and prospective catalog.
+
+    Returns:
+        Complete catalog after the selected provider records and roles are committed.
+
+    Raises:
+        AutomaticRouterError: The confirmed catalog cannot be persisted atomically.
+    """
+    try:
+        if not candidate_plan.candidate_connections and not candidate_plan.candidate_models:
+            return configure_router_candidates(
+                project.model_catalog_path,
+                candidate_plan.selection,
+                expected_state_sha256=candidate_plan.expected_catalog_sha256,
+            )
+
+        roles = candidate_plan.prospective_catalog.roles
+        world_model, judge, embedder = roles.world_model, roles.judge, roles.embedder
+        if world_model is None or judge is None or embedder is None:
+            raise AutomaticRouterError(
+                "discovered router candidates require an existing world model, judge, and embedder"
+            )
+        new_connection_names = {
+            connection.name for connection in candidate_plan.candidate_connections
+        }
+        new_aliases = {model.alias for model in candidate_plan.candidate_models}
+        setup = ProviderSetup(
+            connections=candidate_plan.candidate_connections,
+            models=candidate_plan.candidate_models,
+            known_existing_connections=tuple(
+                sorted(
+                    set(candidate_plan.prospective_catalog.connections).difference(
+                        new_connection_names
+                    )
+                )
+            ),
+            known_existing_aliases=tuple(
+                sorted(set(candidate_plan.prospective_catalog.models).difference(new_aliases))
+            ),
+            world_model=world_model,
+            judge=judge,
+            embedder=embedder,
+        )
+        return configure_provider_catalog_with_router_candidates(
+            project.model_catalog_path,
+            setup,
+            candidate_plan.selection,
+            expected_state_sha256=candidate_plan.expected_catalog_sha256,
+        )
+    except AutomaticRouterError:
+        raise
+    except ValueError as exc:
+        raise AutomaticRouterError(f"router candidate setup could not be saved: {exc}") from exc
 
 
 def _resolve_all_models(
@@ -214,12 +286,17 @@ def _resolve_all_models(
         AutomaticRouterError: A model identity or required client shape differs from preflight.
     """
 
-    def resolve(alias: str, requirement: CapabilityRequirement) -> ResolvedModel:
+    def resolve(
+        alias: str,
+        requirement: CapabilityRequirement,
+        role: CatalogRoleName | None = None,
+    ) -> ResolvedModel:
         """Resolve one role through a fresh provider client.
 
         Args:
             alias: Stable catalog alias.
             requirement: Exact local capability proof required for this role.
+            role: Completion role whose configured reasoning effort shapes requests.
 
         Returns:
             Independently constructed resolved model.
@@ -228,7 +305,7 @@ def _resolve_all_models(
             AutomaticRouterError: Credential or capability resolution fails.
         """
         try:
-            return catalog.preflight(alias, requirement)
+            return catalog.preflight(alias, requirement, role=role)
         except ValueError as exc:
             raise AutomaticRouterError(f"model alias {alias!r} cannot be resolved: {exc}") from exc
 
@@ -239,6 +316,7 @@ def _resolve_all_models(
                 minimum_context_window_tokens=options.simulation_maximum_output_tokens + 1,
                 minimum_output_tokens=options.simulation_maximum_output_tokens,
             ),
+            "candidate",
         )
         for candidate in preflight.candidates
     }
@@ -248,12 +326,14 @@ def _resolve_all_models(
             minimum_context_window_tokens=options.simulation_maximum_output_tokens + 1,
             minimum_output_tokens=options.simulation_maximum_output_tokens,
         ),
+        "world_model",
     )
     judge = resolve(
         preflight.judge_alias,
         CapabilityRequirement(
             minimum_output_tokens=preflight.judge_completion_reservation.maximum_output_tokens,
         ),
+        "judge",
     )
     embedder = resolve(
         preflight.embedder_alias,
@@ -328,12 +408,25 @@ def _automatic_judge(
         Judge awaiting the exact evaluation plan from the simulator factory.
     """
     judge = resolved.judge
+    reservation = preflight.judge_completion_reservation
+    if (
+        judge.capabilities.reasoning_effort is not None
+        and reservation.maximum_output_tokens < _REASONING_JUDGE_OUTPUT_FLOOR_TOKENS
+    ):
+        logger.warning(
+            "judge model %s pins reasoning effort %s but its approved calibration output "
+            "budget is only %d tokens; reasoning can consume the whole budget and leave no "
+            "visible text, so affected cells retry and may be excluded from evidence",
+            judge.snapshot.model_id,
+            judge.capabilities.reasoning_effort,
+            reservation.maximum_output_tokens,
+        )
     bounded = ReservedJudgeClient(
         judge.client,
-        reservation=preflight.judge_completion_reservation,
+        reservation=reservation,
         model=judge.snapshot,
         capabilities=judge.capabilities,
-        maximum_attempts=preflight.judge_completion_reservation.maximum_attempts,
+        maximum_attempts=reservation.maximum_attempts,
         maximum_provider_calls=preflight.judge_provider_call_count,
     )
     return AutomaticRouterJudge(
@@ -341,6 +434,7 @@ def _automatic_judge(
         preflight.setup,
         created_at=created_at,
         code_revision=code_revision,
+        maximum_output_tokens=reservation.maximum_output_tokens,
     )
 
 
@@ -352,8 +446,8 @@ def _workflow_services(
     runtime_catalog: RuntimeModelCatalog,
     judge: AutomaticRouterJudge,
     agent_factory: AgentFactory,
-    fidelity_approval: FidelityApproval,
     options: AutomaticRouterOptions,
+    progress: ProgressHook | None = None,
 ) -> RouterWorkflowServices:
     """Bind the generic composition interfaces to verified automatic project inputs.
 
@@ -365,8 +459,8 @@ def _workflow_services(
         runtime_catalog: Resolver used by the final online router runtime.
         judge: Approved saved-contract judge awaiting its exact plan.
         agent_factory: Post-consent validated fresh-runtime constructor.
-        fidelity_approval: Explicit measured-fidelity approval boundary.
         options: Active simulation controls.
+        progress: Optional observer forwarded to each constructed simulator.
 
     Returns:
         Complete service bundle for the existing router composition.
@@ -437,8 +531,6 @@ def _workflow_services(
                 maximum_output_tokens=options.simulation_maximum_output_tokens,
             ),
             simulation_completion_input=artifacts.simulation_completion_input,
-            fidelity_planned_overlaps=preflight.fidelity_overlap_count,
-            fidelity_minimum_usable_overlaps=min(8, preflight.fidelity_overlap_count),
             agent_id=preflight.project_config.project_id,
             seed=options.seed,
             maximum_steps=options.maximum_model_calls,
@@ -456,12 +548,11 @@ def _workflow_services(
             plan: Exact evaluation plan being executed by composition.
 
         Returns:
-            Grounded simulator with candidate, world-model, judge, and retrieval boundaries.
+            Grounded simulator with candidate, world-model, and retrieval boundaries.
 
         Raises:
             AutomaticRouterError: The verified embedder no longer exposes an embedding client.
         """
-        judge.bind_plan(plan)
         embedder = resolved.embedder
         if embedder.embedding_client is None:
             raise AutomaticRouterError("resolved embedder client disappeared after preflight")
@@ -499,6 +590,7 @@ def _workflow_services(
             agent_factory=agent_factory,
             completion_contract_input=artifacts.simulation_completion_input,
             redacted_field_names=preflight.project_config.redacted_field_names,
+            progress=progress,
         )
 
     return RouterWorkflowServices(
@@ -506,7 +598,6 @@ def _workflow_services(
         setup_supplier=setup_supplier,
         simulator_factory=simulator_factory,
         judge=judge,
-        fidelity_approval=fidelity_approval,
         runtime_catalog=runtime_catalog,
         evaluation_plan_inputs=(
             artifacts.attribution_input,

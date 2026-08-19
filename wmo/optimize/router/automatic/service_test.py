@@ -22,7 +22,6 @@ from wmo.cli.app import app
 from wmo.cli.build_cmd import _build_grounded_artifacts
 from wmo.cli.router_candidate_setup import collect_router_candidate_setup
 from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes
-from wmo.common.evaluations import EvaluationCellEvidence, EvaluationPlan
 from wmo.common.models import (
     AssistantAction,
     ConnectionConfig,
@@ -37,7 +36,12 @@ from wmo.common.models import (
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
+    ProviderConnection,
+    ProviderModelSelection,
+    RouterCandidateSelection,
     Usage,
+    catalog_state_sha256,
+    load_model_catalog,
     write_model_catalog,
 )
 from wmo.common.project import (
@@ -65,19 +69,31 @@ from wmo.optimize.router.automatic.replay import find_completed_automatic_router
 from wmo.optimize.router.automatic.service import (
     AutomaticRouterError,
     optimize_project_router,
+    persist_router_candidate_setup,
 )
-from wmo.optimize.router.composition import FidelityApprovalDecision, RouterCompositionBudget
+from wmo.optimize.router.composition import RouterCandidateSetupPlan
 from wmo.optimize.router.judging.artifacts import read_audit, write_audit, write_review_state
-from wmo.optimize.router.judging.contracts import ManualJudgeLabel, ManualJudgeReviewState
+from wmo.optimize.router.judging.contracts import (
+    ManualJudgeAxisDecision,
+    ManualJudgeError,
+    ManualJudgeLabel,
+    ManualJudgeReviewState,
+)
+from wmo.optimize.router.judging.labels import calibration_sample_digest
+from wmo.optimize.router.judging.review import (
+    ManualJudgeTraceProposal,
+    completed_trace_review_count,
+)
 from wmo.optimize.router.judging.service import (
     calibrate_manual_judge,
+    calibration_sample,
     commit_manual_judge_setup,
     estimate_manual_judge_budget,
     prepare_manual_judge_calibration,
     prepare_manual_judge_setup,
 )
 from wmo.runtime.agents import ChatAgentRuntime
-from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.application import RouterApplicationError
 from wmo.simulation.build import build_project, select_completed_build
 from wmo.simulation.ingest.model_identity import (
@@ -211,7 +227,8 @@ class _RuntimeCatalog:
         """
         return self._static.snapshot(alias)
 
-    def resolve(self, alias: str) -> ResolvedModel:
+    def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
+        del role
         """Construct one deterministic runtime client after recording credential resolution.
 
         Args:
@@ -226,7 +243,14 @@ class _RuntimeCatalog:
         embedding = _EmbeddingClient(self._state) if capabilities.supports_embeddings else None
         return ResolvedModel(alias, snapshot, capabilities, completion, embedding)
 
-    def preflight(self, alias: str, _requirement: object | None = None) -> ResolvedModel:
+    def preflight(
+        self,
+        alias: str,
+        _requirement: object | None = None,
+        *,
+        role: CatalogRoleName | None = None,
+    ) -> ResolvedModel:
+        del role
         """Reuse deterministic resolution for locally verified fixture capabilities.
 
         Args:
@@ -248,40 +272,6 @@ class _RuntimeCatalog:
             New resolver sharing the same provider counters.
         """
         return _RuntimeCatalog(catalog, self._state)
-
-
-@dataclass
-class _FidelityApproval:
-    """Count and approve the one explicit measured fidelity boundary."""
-
-    calls: int = 0
-
-    def __call__(
-        self,
-        project: ProjectStore,
-        plan: EvaluationPlan,
-        evidence: tuple[EvaluationCellEvidence, ...],
-        budget: RouterCompositionBudget,
-    ) -> FidelityApprovalDecision:
-        """Approve nonempty measured evidence and record one callback.
-
-        Args:
-            project: Project-local store.
-            plan: Frozen current evaluation plan.
-            evidence: Completed fidelity evidence.
-            budget: Finite composition budget.
-
-        Returns:
-            Explicit immutable approval actor evidence.
-        """
-        del project, plan, budget
-        assert evidence
-        self.calls += 1
-        return FidelityApprovalDecision(
-            actor_id="test-operator",
-            evidence=f"approved {len(evidence)} exact overlaps",
-            approved_at=_TIME,
-        )
 
 
 @pytest.mark.parametrize(
@@ -311,11 +301,9 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         non_interactive=True,
         console=Console(file=StringIO(), force_terminal=False),
     )
-    approval = _FidelityApproval()
     options = AutomaticRouterOptions(
         maximum_provider_cost_usd=25.0,
         maximum_judgments=20,
-        preferred_fidelity_overlaps=1,
         maximum_model_calls=1,
         maximum_router_feature_tokens=8_192,
         maximum_retrieval_query_tokens=32_768,
@@ -330,7 +318,6 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
         options=options,
         provider_spend_consented=True,
-        fidelity_approval=approval,
         created_at=_TIME + timedelta(hours=1),
         code_revision=_REVISION,
     )
@@ -359,7 +346,6 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
     assert result.artifacts.attribution_input in result.composition.plan.inputs
     assert result.preflight.observed_traces[0].attribution.match_kind == "strict_snapshot"
     assert result.composition.plan.inputs
-    assert approval.calls == 1
     assert len(state.completion_calls) > before_completion
     assert len(state.embedding_calls) > before_embedding
     completed_completion = tuple(state.completion_calls)
@@ -387,26 +373,6 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         )
         is None
     )
-    expanded_fidelity = preflight_automatic_router(
-        store,
-        plan.selection,
-        catalog_override=plan.prospective_catalog,
-        options=replace(options, preferred_fidelity_overlaps=2),
-    )
-    assert expanded_fidelity.fidelity_overlap_count == 2
-    assert (
-        find_completed_automatic_router_replay(
-            store,
-            expanded_fidelity,
-            options=replace(options, preferred_fidelity_overlaps=2),
-            code_revision=_REVISION,
-        )
-        is None
-    )
-    assert tuple(state.completion_calls) == completed_completion
-    assert tuple(state.embedding_calls) == completed_embedding
-    assert state.credential_resolutions == completed_credentials
-
     catalog_drift = replace(result.preflight, catalog_sha256="0" * 64)
     assert (
         find_completed_automatic_router_replay(
@@ -431,8 +397,6 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
             str(store.paths.root),
             "--maximum-judgments",
             "20",
-            "--preferred-fidelity-overlaps",
-            "1",
             "--maximum-model-calls",
             "1",
             "--simulation-maximum-output-tokens",
@@ -528,6 +492,131 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
     )
 
 
+def test_replay_restores_discovered_candidate_records_before_reporting_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified replay restores missing discovered provider records before returning.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+        monkeypatch: Test patching seam for the CLI's already-collected candidate plan.
+    """
+    import wmo.cli.router_app as router_app
+
+    store, catalog, state = _completed_project(tmp_path)
+    _approve_manual_judge(store, catalog, state)
+    connection = ProviderConnection(
+        name="discovered",
+        provider="openai",
+        api_key_env="DISCOVERED_API_KEY",
+    )
+    capabilities = catalog.models["candidate-a"].capabilities
+    assert capabilities is not None
+    model = ProviderModelSelection(
+        alias="candidate-new",
+        connection=connection.name,
+        model="candidate-new",
+        capabilities=capabilities,
+    )
+    prospective = catalog.model_copy(
+        update={
+            "connections": {
+                **catalog.connections,
+                connection.name: connection.catalog_config(),
+            },
+            "models": {**catalog.models, model.alias: model.catalog_record()},
+            "roles": catalog.roles.model_copy(
+                update={
+                    "candidates": ("candidate-a", model.alias),
+                    "incumbent": "candidate-a",
+                }
+            ),
+        }
+    )
+    plan = RouterCandidateSetupPlan(
+        selection=RouterCandidateSelection(
+            candidates=("candidate-a", model.alias), incumbent="candidate-a"
+        ),
+        candidate_models=(model,),
+        prospective_catalog=prospective,
+        expected_catalog_sha256=catalog_state_sha256(store.model_catalog_path),
+        candidate_connections=(connection,),
+    )
+    options = AutomaticRouterOptions(
+        maximum_judgments=20,
+        maximum_model_calls=1,
+        simulation_maximum_output_tokens=8_000,
+    )
+    optimize_project_router(
+        store,
+        plan,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        options=options,
+        provider_spend_consented=True,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision=_REVISION,
+    )
+
+    persisted = load_model_catalog(store.model_catalog_path)
+    damaged = persisted.model_copy(
+        update={
+            "connections": {
+                name: value
+                for name, value in persisted.connections.items()
+                if name != connection.name
+            },
+            "models": {
+                alias: value for alias, value in persisted.models.items() if alias != model.alias
+            },
+            "roles": persisted.roles.model_copy(update={"candidates": (), "incumbent": None}),
+        }
+    )
+    write_model_catalog(store.model_catalog_path, damaged)
+    replay_plan = replace(
+        plan,
+        expected_catalog_sha256=catalog_state_sha256(store.model_catalog_path),
+    )
+    monkeypatch.setattr(
+        router_app,
+        "collect_router_candidate_setup",
+        lambda *_args, **_kwargs: replay_plan,
+    )
+    before_credentials = state.credential_resolutions
+    before_completion = tuple(state.completion_calls)
+    before_embedding = tuple(state.embedding_calls)
+
+    cli = _RUNNER.invoke(
+        app,
+        [
+            "optimize",
+            "router",
+            "support",
+            "--root",
+            str(store.paths.root),
+            "--maximum-judgments",
+            "20",
+            "--maximum-model-calls",
+            "1",
+            "--simulation-maximum-output-tokens",
+            "8000",
+            "--non-interactive",
+        ],
+        env={"WMO_RELEASE_REVISION": _REVISION},
+    )
+
+    assert cli.exit_code == 0, cli.output
+    assert "replay: verified completed optimization" in unstyle(cli.output)
+    restored = load_model_catalog(store.model_catalog_path)
+    assert restored.connections[connection.name] == connection.catalog_config()
+    assert restored.models[model.alias] == model.catalog_record()
+    assert restored.roles.candidates == replay_plan.selection.candidates
+    assert restored.roles.incumbent == replay_plan.selection.incumbent
+    assert state.credential_resolutions == before_credentials
+    assert tuple(state.completion_calls) == before_completion
+    assert tuple(state.embedding_calls) == before_embedding
+
+
 def test_automatic_router_refuses_spend_before_credentials_calls_or_writes(
     tmp_path: Path,
 ) -> None:
@@ -559,12 +648,10 @@ def test_automatic_router_refuses_spend_before_credentials_calls_or_writes(
             plan,
             cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
             options=AutomaticRouterOptions(
-                preferred_fidelity_overlaps=1,
                 maximum_model_calls=1,
                 simulation_maximum_output_tokens=8_000,
             ),
             provider_spend_consented=False,
-            fidelity_approval=_FidelityApproval(),
             created_at=_TIME + timedelta(hours=1),
             code_revision=_REVISION,
         )
@@ -575,6 +662,64 @@ def test_automatic_router_refuses_spend_before_credentials_calls_or_writes(
     assert store.artifacts.list_ids() == before_artifacts
     assert store.model_catalog_path.read_bytes() == before_catalog
     assert store.read_review() == before_review
+
+
+def test_discovered_candidate_provider_records_and_roles_persist_atomically(
+    tmp_path: Path,
+) -> None:
+    """Persist newly discovered candidate metadata and router roles in one catalog write.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+    """
+    catalog = _catalog()
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    path = root / "models.toml"
+    write_model_catalog(path, catalog)
+    project = ProjectStore(root, "support")
+    connection = ProviderConnection(
+        name="discovered",
+        provider="openai",
+        api_key_env="DISCOVERED_API_KEY",
+    )
+    capabilities = catalog.models["candidate-a"].capabilities
+    assert capabilities is not None
+    model = ProviderModelSelection(
+        alias="candidate-new",
+        connection=connection.name,
+        model="candidate-new",
+        capabilities=capabilities,
+    )
+    prospective = catalog.model_copy(
+        update={
+            "connections": {
+                **catalog.connections,
+                connection.name: connection.catalog_config(),
+            },
+            "models": {**catalog.models, model.alias: model.catalog_record()},
+            "roles": catalog.roles.model_copy(
+                update={"candidates": ("candidate-a", model.alias), "incumbent": "candidate-a"}
+            ),
+        }
+    )
+    plan = RouterCandidateSetupPlan(
+        selection=RouterCandidateSelection(
+            candidates=("candidate-a", model.alias), incumbent="candidate-a"
+        ),
+        candidate_models=(model,),
+        prospective_catalog=prospective,
+        expected_catalog_sha256=catalog_state_sha256(path),
+        candidate_connections=(connection,),
+    )
+
+    configured = persist_router_candidate_setup(project, plan)
+    saved = load_model_catalog(path)
+    assert saved.connections[connection.name].provider == "openai"
+    assert saved.models[model.alias] == model.catalog_record()
+    assert saved.roles.candidates == plan.selection.candidates
+    assert configured.roles.candidates == plan.selection.candidates
+    assert configured.roles.candidates == ("candidate-a", model.alias)
 
 
 def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution(
@@ -602,12 +747,10 @@ def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
         options=AutomaticRouterOptions(
             maximum_judgments=20,
-            preferred_fidelity_overlaps=1,
             maximum_model_calls=1,
             simulation_maximum_output_tokens=8_000,
         ),
         provider_spend_consented=True,
-        fidelity_approval=_FidelityApproval(),
         created_at=_TIME + timedelta(hours=1),
         code_revision=_REVISION,
     )
@@ -618,8 +761,8 @@ def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution
     assert result.artifacts.attribution_input in result.composition.plan.inputs
 
 
-def test_ambiguous_inferred_telemetry_fails_before_stateful_boundaries(tmp_path: Path) -> None:
-    """Candidate ambiguity is aggregated before writes, credentials, factories, or providers.
+def test_duplicate_candidate_identities_fail_before_stateful_boundaries(tmp_path: Path) -> None:
+    """Duplicate selected identities fail before writes, credentials, or providers.
 
     Args:
         tmp_path: Isolated local WMO root.
@@ -650,19 +793,17 @@ def test_ambiguous_inferred_telemetry_fails_before_stateful_boundaries(tmp_path:
     before_embedding = tuple(state.embedding_calls)
     before_credentials = state.credential_resolutions
 
-    with pytest.raises(AutomaticRouterPreflightError, match="ambiguous"):
+    with pytest.raises(AutomaticRouterPreflightError, match="distinct exact model identities"):
         optimize_project_router(
             store,
             plan,
             cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
             options=AutomaticRouterOptions(
                 maximum_judgments=20,
-                preferred_fidelity_overlaps=1,
                 maximum_model_calls=1,
                 simulation_maximum_output_tokens=8_000,
             ),
             provider_spend_consented=True,
-            fidelity_approval=_FidelityApproval(),
             created_at=_TIME + timedelta(hours=1),
             code_revision=_REVISION,
         )
@@ -697,7 +838,6 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
     )
     options = AutomaticRouterOptions(
         maximum_judgments=20,
-        preferred_fidelity_overlaps=1,
         maximum_model_calls=1,
         simulation_maximum_output_tokens=8_000,
     )
@@ -707,7 +847,6 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
         options=options,
         provider_spend_consented=True,
-        fidelity_approval=_FidelityApproval(),
         created_at=_TIME + timedelta(hours=1),
         code_revision=_REVISION,
     )
@@ -723,7 +862,6 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
                 task_set=result.preflight.completed_build.task_set,
                 catalog_sha256=result.preflight.catalog_sha256,
                 candidates=result.preflight.candidates,
-                preferred_overlap_limit=1,
                 records=(record,),
                 created_at=_TIME + timedelta(hours=2),
                 code_revision=_REVISION,
@@ -815,7 +953,6 @@ def test_completed_custom_agent_replay_does_not_import_or_construct_factory(
     options = AutomaticRouterOptions(
         maximum_provider_cost_usd=25.0,
         maximum_judgments=20,
-        preferred_fidelity_overlaps=1,
         maximum_model_calls=1,
         simulation_maximum_output_tokens=8_000,
     )
@@ -825,7 +962,6 @@ def test_completed_custom_agent_replay_does_not_import_or_construct_factory(
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
         options=options,
         provider_spend_consented=True,
-        fidelity_approval=_FidelityApproval(),
         created_at=_TIME + timedelta(hours=1),
         code_revision=_REVISION,
     )
@@ -842,8 +978,6 @@ def test_completed_custom_agent_replay_does_not_import_or_construct_factory(
             str(store.paths.root),
             "--maximum-judgments",
             "20",
-            "--preferred-fidelity-overlaps",
-            "1",
             "--maximum-model-calls",
             "1",
             "--simulation-maximum-output-tokens",
@@ -900,12 +1034,10 @@ def test_automatic_router_rejects_confirmed_catalog_drift_before_credentials(
             plan,
             cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
             options=AutomaticRouterOptions(
-                preferred_fidelity_overlaps=1,
                 maximum_model_calls=1,
                 simulation_maximum_output_tokens=8_000,
             ),
             provider_spend_consented=True,
-            fidelity_approval=_FidelityApproval(),
             created_at=_TIME + timedelta(hours=1),
             code_revision=_REVISION,
         )
@@ -995,7 +1127,6 @@ def test_automatic_router_rejects_substituted_manual_judge_audit_before_calls(
             options=AutomaticRouterOptions(
                 maximum_provider_cost_usd=25.0,
                 maximum_judgments=20,
-                preferred_fidelity_overlaps=1,
                 maximum_model_calls=1,
                 router_embedding_maximum_attempts=1,
                 completion_maximum_attempts=1,
@@ -1007,6 +1138,139 @@ def test_automatic_router_rejects_substituted_manual_judge_audit_before_calls(
     assert tuple(state.completion_calls) == before_completion
     assert tuple(state.embedding_calls) == before_embedding
     assert store.artifacts.list_ids() == before_artifacts
+
+
+def test_preflight_accepts_calibration_resumed_after_a_failed_first_pass(
+    tmp_path: Path,
+) -> None:
+    """Approve a calibration resumed from a failed first pass, then pass router preflight.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+    """
+    store, catalog, state = _completed_project(tmp_path)
+    setup_plan = prepare_manual_judge_setup(
+        store,
+        catalog,
+        preview_count=1,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    commit_manual_judge_setup(store, setup_plan, confirmed=True)
+    plan = prepare_manual_judge_calibration(store, sample_size=2)
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    budget = estimate_manual_judge_budget(
+        plan,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=2.0,
+        maximum_input_tokens_per_call=32_768,
+        maximum_cost_usd=1.0,
+    )
+    reviewed_positions: list[int] = []
+
+    def _accept(proposal: ManualJudgeTraceProposal) -> tuple[ManualJudgeAxisDecision, ...]:
+        """Accept every proposed axis unchanged.
+
+        Args:
+            proposal: Persisted configured-judge proposal for the current trace.
+
+        Returns:
+            One explicit acceptance per proposed rubric axis.
+        """
+        return tuple(
+            ManualJudgeAxisDecision(dimension_id=item.dimension_id, accepted=True)
+            for item in proposal.judgment.dimensions
+        )
+
+    def _fail_on_second(
+        proposal: ManualJudgeTraceProposal,
+    ) -> tuple[ManualJudgeAxisDecision, ...]:
+        """Accept the first trace, then fail like a correction missing its judgment.
+
+        Args:
+            proposal: Persisted configured-judge proposal for the current trace.
+
+        Returns:
+            One explicit acceptance per proposed rubric axis for the first trace only.
+
+        Raises:
+            ManualJudgeError: The reviewer reaches any trace after the first.
+        """
+        reviewed_positions.append(proposal.position)
+        if len(reviewed_positions) > 1:
+            raise ManualJudgeError(
+                "a corrected score requires --judgment TRACE:dim=CORRECTED_JUDGMENT"
+            )
+        return _accept(proposal)
+
+    with pytest.raises(ManualJudgeError, match="corrected score requires"):
+        calibrate_manual_judge(
+            store,
+            runtime,
+            plan,
+            (),
+            budget,
+            spend_consented=True,
+            approve=True,
+            accept_insufficient_labels=True,
+            created_at=_TIME,
+            code_revision=_REVISION,
+            reviewer=_fail_on_second,
+        )
+
+    plan = prepare_manual_judge_calibration(store, sample_size=2)
+    reviewed = completed_trace_review_count(
+        store,
+        plan.setup,
+        calibration_sample_digest(plan.setup, calibration_sample(plan)),
+    )
+    assert reviewed == 1
+    resumed_budget = estimate_manual_judge_budget(
+        plan,
+        input_usd_per_million_tokens=1.0,
+        output_usd_per_million_tokens=2.0,
+        maximum_input_tokens_per_call=32_768,
+        maximum_cost_usd=1.0,
+        completed_review_count=reviewed,
+    )
+    result = calibrate_manual_judge(
+        store,
+        runtime,
+        plan,
+        (),
+        resumed_budget,
+        spend_consented=True,
+        approve=True,
+        accept_insufficient_labels=True,
+        created_at=_TIME + timedelta(minutes=1),
+        code_revision=_REVISION,
+        reviewer=_accept,
+    )
+    assert result.approved_calibration is not None
+    candidate_plan = collect_router_candidate_setup(
+        store.model_catalog_path,
+        catalog,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+
+    preflight = preflight_automatic_router(
+        store,
+        candidate_plan.selection,
+        catalog_override=candidate_plan.prospective_catalog,
+        options=AutomaticRouterOptions(
+            maximum_provider_cost_usd=25.0,
+            maximum_judgments=20,
+            maximum_model_calls=1,
+            simulation_maximum_output_tokens=8_000,
+        ),
+    )
+
+    assert preflight.approved_calibration_input == result.approved_calibration
+    assert preflight.judge_audit.budget.call_count == 1
+    assert sum(len(item.probes) for item in preflight.judge_audit.judgments) == 2
 
 
 @pytest.mark.parametrize("tamper", ["execution", "policy"])
@@ -1036,12 +1300,10 @@ def test_runtime_activation_rejects_automatic_contract_tamper_before_credentials
         cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
         options=AutomaticRouterOptions(
             maximum_judgments=20,
-            preferred_fidelity_overlaps=1,
             maximum_model_calls=1,
             simulation_maximum_output_tokens=8_000,
         ),
         provider_spend_consented=True,
-        fidelity_approval=_FidelityApproval(),
         created_at=_TIME + timedelta(hours=1),
         code_revision=_REVISION,
     )
@@ -1248,7 +1510,7 @@ def _catalog() -> ModelCatalog:
         supports_tools=False,
         supports_structured_output=True,
         context_window_tokens=128_000,
-        maximum_output_tokens=16_000,
+        maximum_output_tokens=32_000,
         input_cost_per_million_tokens_usd=1.0,
         output_cost_per_million_tokens_usd=2.0,
         cached_input_cost_per_million_tokens_usd=0.5,

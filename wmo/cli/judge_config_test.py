@@ -255,7 +255,7 @@ def test_calibrate_prints_catalog_pricing_breakdown_before_labels(tmp_path: Path
     _setup(store)
     _write_catalog(store.paths.root, _priced_catalog())
     (store.paths.root / "settings.toml").write_text(
-        "[commands]\nmaximum_cost_usd = 0.5\n",
+        "[commands]\nmaximum_cost_usd = 1.0\n",
         encoding="utf-8",
     )
 
@@ -276,14 +276,13 @@ def test_calibrate_prints_catalog_pricing_breakdown_before_labels(tmp_path: Path
 
     output = " ".join(unstyle(result.output).replace("│", " ").split())
     assert result.exit_code == 2
-    assert "Cost preflight" in output
-    assert "command: wmo config judge calibrate support" in output
-    assert "estimated cost: $0.368641 (conservative maximum)" in output
-    assert "configured budget: $0.50 per command" in output
+    assert "Cost preflight wmo config judge calibrate support" in output
+    assert "estimated cost $0.589824 (conservative maximum)" in output
+    assert "of the $1.00 per-command budget" in output
     assert "judge judge-main: openai/judge-model" in output
     assert "pricing source: configured" in output
     assert "at most 3 remaining judge calls with up to 3 attempts each" in output
-    assert "32768 input and 4096 output tokens per attempt" in output
+    assert "32768 input and 16384 output tokens per attempt" in output
     assert "$1.000000 input and $2.000000 output per million tokens" in output
     assert "re-run with --yes" in output
     assert "missing labels" not in output
@@ -343,7 +342,7 @@ def test_calibrate_uses_shared_command_budget_when_flag_is_omitted(tmp_path: Pat
     output = " ".join(unstyle(result.output).replace("│", " ").split())
     assert result.exit_code == 2
     assert "exceeds the configured per-command" in output
-    assert "wmo config budget 0.368641" in output
+    assert "wmo config budget 0.589824" in output
     assert "--yes cannot override" in output
     assert "missing labels" not in output
 

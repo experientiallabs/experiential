@@ -21,7 +21,6 @@ from wmo.common.core.artifacts import (
 from wmo.common.models import CompletionCostReservation, ModelSnapshot
 from wmo.common.project import ArtifactStore, artifact_input
 from wmo.common.routing import (
-    ReservedFrozenEmbeddingSet,
     RouterEmbeddingReservation,
     load_frozen_embedding_set,
 )
@@ -53,9 +52,14 @@ class CandidateExecutionBinding(ContractModel):
 
 
 class RouterExecutionContract(ArtifactEnvelope):
-    """Immutable automatic-router calls and one shared provider-spend allocation."""
+    """Immutable automatic-router calls and one shared provider-spend ceiling.
 
-    schema_version: Literal[2] = 2
+    ``reserved_judgment_cost_usd`` records the judge planning estimate for consent and
+    reporting only: judgments spend from the same shared simulation remainder as reconciled
+    actual cost, so the estimate never carves spend away from simulation upfront.
+    """
+
+    schema_version: Literal[4] = 4
     execution_contract_id: ArtifactId
     router_embedding_input: ArtifactInput
     simulation_completion_input: ArtifactInput
@@ -65,9 +69,6 @@ class RouterExecutionContract(ArtifactEnvelope):
     incumbent_alias: ArtifactId
     agent_factory_sha256: Sha256
     simulation_configuration_sha256: Sha256
-    preferred_fidelity_overlaps: int = Field(gt=0)
-    fidelity_planned_overlaps: int = Field(gt=0)
-    fidelity_minimum_usable_overlaps: int = Field(gt=0)
     world_model_alias: ArtifactId
     world_model: ModelSnapshot
     world_model_request: CompletionCostReservation
@@ -118,10 +119,6 @@ class RouterExecutionContract(ArtifactEnvelope):
             raise ValueError("router execution contract needs at least two unique candidates")
         if self.incumbent_alias not in aliases:
             raise ValueError("router execution incumbent must be one of the selected candidates")
-        if self.fidelity_planned_overlaps > self.preferred_fidelity_overlaps:
-            raise ValueError("planned fidelity overlaps exceed the preferred bound")
-        if self.fidelity_minimum_usable_overlaps > self.fidelity_planned_overlaps:
-            raise ValueError("minimum usable fidelity overlaps exceed the planned denominator")
         if self.world_model_request.model != self.world_model:
             raise ValueError("world-model request reservation differs from its model")
         if self.judge_request.model != self.judge_model:
@@ -147,8 +144,8 @@ class RouterExecutionContract(ArtifactEnvelope):
             abs_tol=1e-12,
         ):
             raise ValueError("judgment allocation differs from its full call reservation")
-        expected_remaining = self.maximum_provider_cost_usd - math.fsum(
-            (self.reserved_router_embedding_cost_usd, self.reserved_judgment_cost_usd)
+        expected_remaining = (
+            self.maximum_provider_cost_usd - self.reserved_router_embedding_cost_usd
         )
         if not math.isclose(
             self.remaining_simulation_cost_usd,
@@ -172,9 +169,6 @@ def persist_router_execution_contract(
     incumbent_alias: ArtifactId,
     agent_factory_sha256: Sha256,
     simulation_configuration_sha256: Sha256,
-    preferred_fidelity_overlaps: int,
-    fidelity_planned_overlaps: int,
-    fidelity_minimum_usable_overlaps: int,
     world_model_alias: ArtifactId,
     world_model: ModelSnapshot,
     world_model_request: CompletionCostReservation,
@@ -199,9 +193,6 @@ def persist_router_execution_contract(
         incumbent_alias: Exact quality baseline selected for fitting and fallback.
         agent_factory_sha256: Exact effective built-in or custom agent configuration digest.
         simulation_configuration_sha256: Exact agent and data-redaction simulation digest.
-        preferred_fidelity_overlaps: Operator-selected upper bound on real overlap cells.
-        fidelity_planned_overlaps: Exact real overlap denominator admitted to the plan.
-        fidelity_minimum_usable_overlaps: Exact passing denominator bound for the fidelity gate.
         world_model_alias: Build-frozen world-model alias.
         world_model: Exact world-model identity.
         world_model_request: World-model call reservation.
@@ -223,11 +214,9 @@ def persist_router_execution_contract(
     if canonical_inputs != inputs or len({item.artifact_id for item in inputs}) != len(inputs):
         raise ValueError("router execution inputs must be sorted and unique")
     reserved_judgment = judge_request.estimated_maximum_call_cost_usd * maximum_judge_provider_calls
-    remaining = maximum_provider_cost_usd - math.fsum(
-        (router_embedding_reservation.estimated_cost_usd, reserved_judgment)
-    )
+    remaining = maximum_provider_cost_usd - router_embedding_reservation.estimated_cost_usd
     semantic = {
-        "version": "automatic-router-execution-v2",
+        "version": "automatic-router-execution-v4",
         "inputs": [item.model_dump(mode="json") for item in inputs],
         "router_embedding_input": router_embedding_input.model_dump(mode="json"),
         "simulation_completion_input": simulation_completion_input.model_dump(mode="json"),
@@ -237,9 +226,6 @@ def persist_router_execution_contract(
         "incumbent_alias": incumbent_alias,
         "agent_factory_sha256": agent_factory_sha256,
         "simulation_configuration_sha256": simulation_configuration_sha256,
-        "preferred_fidelity_overlaps": preferred_fidelity_overlaps,
-        "fidelity_planned_overlaps": fidelity_planned_overlaps,
-        "fidelity_minimum_usable_overlaps": fidelity_minimum_usable_overlaps,
         "world_model_alias": world_model_alias,
         "world_model": world_model.model_dump(mode="json"),
         "world_model_request": world_model_request.model_dump(mode="json"),
@@ -251,7 +237,7 @@ def persist_router_execution_contract(
     }
     contract_id = stable_id("router-execution", semantic)
     contract = RouterExecutionContract(
-        schema_version=2,
+        schema_version=4,
         created_at=created_at,
         inputs=inputs,
         code_revision=code_revision,
@@ -264,9 +250,6 @@ def persist_router_execution_contract(
         incumbent_alias=incumbent_alias,
         agent_factory_sha256=agent_factory_sha256,
         simulation_configuration_sha256=simulation_configuration_sha256,
-        preferred_fidelity_overlaps=preferred_fidelity_overlaps,
-        fidelity_planned_overlaps=fidelity_planned_overlaps,
-        fidelity_minimum_usable_overlaps=fidelity_minimum_usable_overlaps,
         world_model_alias=world_model_alias,
         world_model=world_model,
         world_model_request=world_model_request,
@@ -320,8 +303,7 @@ def load_router_execution_contract(
         raise ValueError("router execution contract differs from its manifest")
     embedding_set = load_frozen_embedding_set(store, value.router_embedding_input.artifact_id)
     if (
-        not isinstance(embedding_set, ReservedFrozenEmbeddingSet)
-        or artifact_input(store.read(value.router_embedding_input.artifact_id).manifest)
+        artifact_input(store.read(value.router_embedding_input.artifact_id).manifest)
         != value.router_embedding_input
         or embedding_set.reservation != value.router_embedding_reservation
     ):
@@ -370,7 +352,7 @@ def load_router_execution_contract(
     expected_id = stable_id(
         "router-execution",
         {
-            "version": "automatic-router-execution-v2",
+            "version": "automatic-router-execution-v4",
             "inputs": [item.model_dump(mode="json") for item in value.inputs],
             "router_embedding_input": value.router_embedding_input.model_dump(mode="json"),
             "simulation_completion_input": value.simulation_completion_input.model_dump(
@@ -384,9 +366,6 @@ def load_router_execution_contract(
             "incumbent_alias": value.incumbent_alias,
             "agent_factory_sha256": value.agent_factory_sha256,
             "simulation_configuration_sha256": value.simulation_configuration_sha256,
-            "preferred_fidelity_overlaps": value.preferred_fidelity_overlaps,
-            "fidelity_planned_overlaps": value.fidelity_planned_overlaps,
-            "fidelity_minimum_usable_overlaps": value.fidelity_minimum_usable_overlaps,
             "world_model_alias": value.world_model_alias,
             "world_model": value.world_model.model_dump(mode="json"),
             "world_model_request": value.world_model_request.model_dump(mode="json"),

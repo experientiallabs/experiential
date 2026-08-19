@@ -49,11 +49,15 @@ uv run pytest -q
   judgment, fitting, held-out verification, reporting, and runtime loading. Callers inject the
   approved review and setup suppliers, simulator factory, judge, runtime catalog, and finite
   simulation-dollar and judgment-call ceilings. Preserve its phase boundary: held-out evidence
-  opens only after fit evidence, approval, policy locking, and remaining-budget checks pass.
+  opens only after fit evidence, policy locking, and remaining-budget checks pass. Router fitting
+  never runs or consumes world-model fidelity evaluation.
 - `wmo optimize router PROJECT --root ROOT` discovers the completed build, fit-only RAG, grounded
   world model, approved manual judge calibration, and confirmed router candidates from the
   project. It freezes one shared provider ceiling before calls, simulates and judges missing
-  evidence, locks the fit policy before held-out execution, and exactly replays completed work.
+  fit evidence, locks the fit policy before held-out execution, and exactly replays completed work.
+  World-model fidelity testing is a separately invoked common-evaluation mode with no authority
+  over router fitting or runtime activation. Its reports contain measurements only and never carry
+  an approval, denial, gate, threshold, or decision.
 - `wmo run PROJECT --root ROOT --port PORT [--ghost]` loads one frozen policy and exposes OpenAI Chat
   Completions, Responses, and Models routes on loopback. Public request and response types come
   from the official OpenAI SDK. Chat retries use the standard `Idempotency-Key`; Responses
@@ -265,7 +269,16 @@ uv run pytest -q
     turn and address them immediately: fix valid findings, reply on the thread, and resolve
     it. Do not wait for `/ready-for-merge` to start that loop.
 
-14. **All visuals follow the brand system.** Research figures, README/docs images, frontends, and
+14. **No silent legacy, shims, or backwards compatibility.** Any legacy path, shim,
+    compatibility constant, migration branch, deprecated alias, versioned fallback, or other
+    backwards-compatibility mechanism must be reported explicitly and approved before it lands.
+    These are costly decisions: they grow the codebase and its complexity permanently. The
+    project does not guarantee those contracts right now; with few users we stay flexible and
+    remove as much of that weight as we can, because once there are real users the flexibility
+    disappears. The default is a hard cutover: stale persisted contracts fail closed and require
+    a fresh setup, with no migration path, unless a human explicitly approves one.
+
+15. **All visuals follow the brand system.** Research figures, README/docs images, frontends, and
     any UI must look clean and minimal — Vercel/Notion/Apple-like: white background, generous
     whitespace, no chartjunk, left-aligned titles, hairline grids. All accents come from the brand
     palette; do not introduce ad-hoc colors:

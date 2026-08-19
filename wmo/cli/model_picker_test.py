@@ -116,7 +116,7 @@ def test_model_screen_cancellation_ends_setup() -> None:
 
 def test_roles_are_filtered_to_the_selected_models_that_can_serve_them() -> None:
     """Each role screen offers only selected models whose metadata proves the role."""
-    console = ScriptedConsole("1\n1\n1\n\n")
+    console = ScriptedConsole("1\n\n1\n\n1\n")
 
     roles = assign_roles(
         (_CHAT, _EMBEDDER),
@@ -132,7 +132,7 @@ def test_roles_are_filtered_to_the_selected_models_that_can_serve_them() -> None
 
 def test_prior_role_answers_are_kept_with_an_empty_line() -> None:
     """Rerunning setup accepts the roles already persisted without retyping them."""
-    console = ScriptedConsole("\n\n\n\n")
+    console = ScriptedConsole("\n\n\n\n\n")
 
     roles = assign_roles(
         (_CHAT, _EMBEDDER),
@@ -146,7 +146,7 @@ def test_prior_role_answers_are_kept_with_an_empty_line() -> None:
 
 def test_a_role_with_no_compatible_model_sends_the_user_back_to_selection() -> None:
     """Selecting no embedder is explained on the role screen, not saved as unknown."""
-    console = ScriptedConsole("1\n1\n")
+    console = ScriptedConsole("1\n\n1\n\n")
 
     roles = assign_roles((_CHAT,), role_inputs=SetupRoleInputs(), console=console)
 
@@ -156,7 +156,7 @@ def test_a_role_with_no_compatible_model_sends_the_user_back_to_selection() -> N
 
 def test_router_candidates_and_their_incumbent_are_assigned_from_selected_models() -> None:
     """Two priced candidates with explicit limits are offered with an incumbent screen."""
-    console = ScriptedConsole("1\n1\n1\n1,2\n\n2\n")
+    console = ScriptedConsole("1\n\n1\n\n1\n1,2\n\n\n\n2\n")
 
     roles = assign_roles(
         (_CHAT, _OTHER_CHAT, _EMBEDDER),
@@ -171,7 +171,7 @@ def test_router_candidates_and_their_incumbent_are_assigned_from_selected_models
 
 def test_a_single_selected_candidate_skips_the_router_role() -> None:
     """Router candidates require at least two models, so one selection is skipped."""
-    console = ScriptedConsole("1\n1\n1\n1\n\n")
+    console = ScriptedConsole("1\n\n1\n\n1\n1\n\n")
 
     roles = assign_roles(
         (_CHAT, _OTHER_CHAT, _EMBEDDER),
@@ -187,7 +187,7 @@ def test_a_single_selected_candidate_skips_the_router_role() -> None:
 
 def test_the_setup_written_from_confirmed_answers_carries_verified_metadata() -> None:
     """The saved setup states exactly the discovered metadata and assigned roles."""
-    console = ScriptedConsole("1\n1\n1\n\n")
+    console = ScriptedConsole("1\n\n1\n\n1\n")
     chosen = (_CHAT, _EMBEDDER)
     roles = assign_roles(chosen, role_inputs=SetupRoleInputs(), console=console)
 
@@ -208,8 +208,8 @@ def test_the_setup_written_from_confirmed_answers_carries_verified_metadata() ->
     assert chat.capabilities.supports_tools
     assert chat.capabilities.supports_structured_output
     assert chat.capabilities.context_window_tokens == 1_050_000
-    assert chat.capabilities.input_cost_per_million_tokens_usd == 1.0
-    assert chat.capabilities.cache_write_cost_per_million_tokens_usd == 1.25
+    assert chat.capabilities.input_cost_per_million_tokens_usd == 0.2
+    assert chat.capabilities.cache_write_cost_per_million_tokens_usd == 0.25
     assert (setup.world_model, setup.judge, setup.embedder) == ("luna", "luna", "embedder")
 
 
@@ -229,7 +229,7 @@ def test_already_configured_models_are_not_written_again() -> None:
         roles=assign_roles(
             (configured, _EMBEDDER),
             role_inputs=SetupRoleInputs(),
-            console=ScriptedConsole("1\n1\n1\n\n"),
+            console=ScriptedConsole("1\n\n1\n\n1\n"),
         )
         or pytest.fail("roles were not assigned"),
         endpoints=(_endpoint(),),
@@ -280,7 +280,7 @@ def test_unverified_configured_alias_retains_only_its_exact_prior_role() -> None
     assert rows[0].capabilities is None
     assert rows[0].retainable_roles == frozenset({SetupRole.WORLD_MODEL})
     assert "retain only: world_model" in rows[0].detail()
-    console = ScriptedConsole("\nlegacy\n1\n\n")
+    console = ScriptedConsole("\nlegacy\n1\n\n\n")
     roles = assign_roles(
         (*rows, _CHAT, _EMBEDDER),
         role_inputs=SetupRoleInputs(
@@ -319,18 +319,62 @@ def test_unverified_router_candidates_and_incumbent_can_be_retained() -> None:
             candidates=("legacy-a", "legacy-b"),
             incumbent="legacy-a",
         ),
-        console=ScriptedConsole("\n\n\n\n\n"),
+        console=ScriptedConsole("\n\n\n\n\n\n\n"),
     )
 
     assert roles is not None
     assert roles.candidates == ("legacy-a", "legacy-b")
     assert roles.incumbent == "legacy-a"
+    assert roles.candidate_reasoning_efforts == {}
+
+
+def test_each_completion_role_asks_its_effort_directly_after_its_model_screen() -> None:
+    """Every completion role gets its own effort screen, so one alias can differ per role."""
+    console = ScriptedConsole("1\n5\n1\n2\n1\n1,2\n\n3\n\n2\n")
+
+    roles = assign_roles(
+        (_CHAT, _OTHER_CHAT, _EMBEDDER),
+        role_inputs=SetupRoleInputs(),
+        console=console,
+    )
+
+    assert roles is not None
+    assert roles.world_model == "luna"
+    assert roles.world_model_reasoning_effort == "xhigh"
+    assert roles.judge == "luna"
+    assert roles.judge_reasoning_effort == "low"
+    assert roles.candidates == ("luna", "terra")
+    assert roles.incumbent == "terra"
+    assert roles.candidate_reasoning_efforts == {"luna": "medium", "terra": "medium"}
+    assert "Reasoning effort for the world model (luna)" in console.output
+    assert "Reasoning effort for the judge (luna)" in console.output
+    assert "Reasoning effort for the router candidate (luna)" in console.output
+    assert "Reasoning effort for the router candidate (terra)" in console.output
+
+
+def test_unassigned_and_unsupported_models_are_never_asked_for_effort() -> None:
+    """Only role-assigned reasoning-capable models show an effort screen."""
+    console = ScriptedConsole("1\n\n1\n\n1\n\n")
+
+    roles = assign_roles(
+        (_CHAT, _OTHER_CHAT, _EMBEDDER),
+        role_inputs=SetupRoleInputs(),
+        console=console,
+    )
+
+    assert roles is not None
+    assert roles.world_model_reasoning_effort == "medium"
+    assert roles.judge_reasoning_effort == "medium"
+    assert roles.candidate_reasoning_efforts == {}
+    assert "Reasoning effort for the world model (luna)" in console.output
+    assert "(terra)" not in console.output.split("Router candidates")[-1]
+    assert "Reasoning effort for the embedder" not in console.output
 
 
 def test_manual_declaration_stays_behind_the_advanced_row() -> None:
     """A hand-declared model is only reachable from the explicit advanced row."""
     session = _session(_CHAT, advanced_models=True)
-    console = ScriptedConsole("2\n\n1\nprivate-model\ny\nn\ny\ny\nn\nn\n2\n6\n0.5\n0.75\n\n")
+    console = ScriptedConsole("2\n\n1\nprivate-model\ny\nn\ny\ny\nn\nn\n2\n6\n0.5\n0.75\n\n\n")
 
     selected = select_models(session, console=console)
 
@@ -342,6 +386,7 @@ def test_manual_declaration_stays_behind_the_advanced_row() -> None:
     assert declared.capabilities is not None
     assert declared.capabilities.supports_tools
     assert declared.capabilities.input_cost_per_million_tokens_usd == 2.0
+    assert declared.capabilities.reasoning_effort is None
 
 
 def test_manual_declaration_requires_a_prepared_connection() -> None:
@@ -357,7 +402,7 @@ def test_summary_states_providers_models_roles_prices_and_credential_behavior() 
     console = ScriptedConsole("")
     chosen = (_CHAT, _EMBEDDER)
     roles = assign_roles(
-        chosen, role_inputs=SetupRoleInputs(), console=ScriptedConsole("1\n1\n1\n\n")
+        chosen, role_inputs=SetupRoleInputs(), console=ScriptedConsole("1\n\n1\n\n1\n")
     )
 
     assert roles is not None
@@ -375,7 +420,10 @@ def test_summary_states_providers_models_roles_prices_and_credential_behavior() 
     assert "provider openai: connection openai, credential OPENAI_API_KEY" in printed
     assert "model luna: openai/gpt-5.6-luna" in printed
     assert "pricing=wmo-catalog" in printed
-    assert "roles: world_model=luna, judge=luna, embedder=embedder" in printed
+    assert (
+        "roles: world_model=luna (effort medium), judge=luna (effort medium), embedder=embedder"
+        in printed
+    )
     assert "WMO stores only the credential environment-variable name" in printed
     assert "secret-key" not in printed
 
@@ -386,7 +434,7 @@ def test_summary_names_the_aws_credential_chain_for_bedrock() -> None:
     bedrock = ProviderConnection(name="bedrock", provider="bedrock", region="us-east-1")
     chosen = (_CHAT, _EMBEDDER)
     roles = assign_roles(
-        chosen, role_inputs=SetupRoleInputs(), console=ScriptedConsole("1\n1\n1\n\n")
+        chosen, role_inputs=SetupRoleInputs(), console=ScriptedConsole("1\n\n1\n\n1\n")
     )
 
     assert roles is not None
@@ -414,7 +462,7 @@ def test_summary_names_confirmed_router_candidates() -> None:
     roles = assign_roles(
         chosen,
         role_inputs=SetupRoleInputs(),
-        console=ScriptedConsole("1\n1\n1\n1,2\n\n1\n"),
+        console=ScriptedConsole("1\n\n1\n\n1\n1,2\n\n\n\n1\n"),
     )
 
     assert roles is not None
@@ -427,7 +475,10 @@ def test_summary_names_confirmed_router_candidates() -> None:
     )
     render_summary(result, chosen=chosen, endpoints=(_endpoint(),), console=console)
 
-    assert "router candidates: luna, terra; incumbent luna" in console.output
+    assert (
+        "router candidates: luna (effort medium), terra (effort medium); incumbent luna"
+        in console.output
+    )
 
 
 def test_a_connection_only_used_by_unselected_models_is_not_written() -> None:
@@ -435,7 +486,7 @@ def test_a_connection_only_used_by_unselected_models_is_not_written() -> None:
     other = ProviderConnection(
         name="anthropic", provider="anthropic", api_key_env="ANTHROPIC_API_KEY"
     )
-    console = ScriptedConsole("1\n1\n1\n\n")
+    console = ScriptedConsole("1\n\n1\n\n1\n")
     chosen = (_CHAT, _EMBEDDER)
     roles = assign_roles(chosen, role_inputs=SetupRoleInputs(), console=console)
 

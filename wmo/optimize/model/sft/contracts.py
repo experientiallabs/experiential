@@ -119,12 +119,11 @@ class ProductionAcceptanceRule(ArtifactEnvelope):
 
 
 class TeacherAcceptanceRule(ArtifactEnvelope):
-    """Immutable score, calibration, and fidelity policy for teacher rollout acceptance."""
+    """Immutable score and calibration policy for teacher rollout acceptance."""
 
     acceptance_rule_id: ArtifactId
     minimum_overall_score: float = Field(ge=0, le=1)
     required_calibration: ArtifactInput
-    require_approved_fidelity: Literal[True] = True
 
     @field_validator("minimum_overall_score")
     @classmethod
@@ -207,7 +206,6 @@ class TeacherAcceptanceEvidence(ArtifactEnvelope):
     task_sha256: Sha256
     judgment: ArtifactInput
     calibration: ArtifactInput
-    fidelity_report: ArtifactInput
     acceptance_rule: ArtifactInput
     transcript_path: str = Field(min_length=1)
     transcript_sha256: Sha256
@@ -238,7 +236,6 @@ class TeacherAcceptanceEvidence(ArtifactEnvelope):
                     self.task_set,
                     self.judgment,
                     self.calibration,
-                    self.fidelity_report,
                     self.acceptance_rule,
                 ),
                 key=lambda item: item.artifact_id,
@@ -483,7 +480,7 @@ class SFTInspectionReport(ContractModel):
 class SFTDatasetMetadata(ContractModel):
     """All non-row frozen manifest data persisted beside canonical SFT JSONL examples."""
 
-    build_spec: SFTBuildSpec | None = None
+    build_spec: SFTBuildSpec
     dataset: SFTDataset
     sources: tuple[SFTSourceReference, ...]
     partitions: tuple[SFTPartition, ...]
@@ -494,7 +491,7 @@ class SFTDatasetMetadata(ContractModel):
 class SFTDatasetArtifact(ContractModel):
     """Materialized dataset rows plus the immutable metadata required to reload and inspect them."""
 
-    build_spec: SFTBuildSpec | None = None
+    build_spec: SFTBuildSpec
     dataset: SFTDataset
     sources: tuple[SFTSourceReference, ...]
     partitions: tuple[SFTPartition, ...]

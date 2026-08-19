@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Literal
 
-from pydantic import AwareDatetime, Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactEnvelope,
@@ -30,20 +30,14 @@ class EvaluationProtocol(ContractModel):
     rubric_id: ArtifactId
     judge_calibration_id: ArtifactId
     pricing_snapshot_id: ArtifactId
-    fidelity_report_id: ArtifactId | None = None
 
     @model_validator(mode="after")
     def _require_source_specific_identity(self) -> EvaluationProtocol:
         if self.evidence_source == "world_model":
             if self.world_model is None or self.simulator_prompt_id is None:
                 raise ValueError("world-model protocols require world-model and prompt identities")
-        elif any(
-            value is not None
-            for value in (self.world_model, self.simulator_prompt_id, self.fidelity_report_id)
-        ):
-            raise ValueError(
-                "sandbox and production protocols must not name world-model or fidelity evidence"
-            )
+        elif self.world_model is not None or self.simulator_prompt_id is not None:
+            raise ValueError("sandbox and production protocols must not name world-model identity")
         return self
 
 
@@ -153,7 +147,7 @@ class FidelityPair(ContractModel):
 
 
 class FidelityReport(ArtifactEnvelope):
-    """Measured world-model agreement against precommitted observed overlap cells."""
+    """Measured world-model agreement against frozen observed overlap cells."""
 
     fidelity_report_id: ArtifactId
     evaluation_plan_id: ArtifactId
@@ -166,10 +160,6 @@ class FidelityReport(ArtifactEnvelope):
     score_mae: float | None = Field(default=None, ge=0)
     failures: tuple[FidelityFailure, ...] = ()
     pairs: tuple[FidelityPair, ...]
-    gate_id: ArtifactId
-    gate_sha256: Sha256
-    status: Literal["approved", "rejected", "insufficient"]
-    approved_at: AwareDatetime | None = None
 
     @field_validator("overlap_cell_ids")
     @classmethod
@@ -195,6 +185,22 @@ class FidelityReport(ArtifactEnvelope):
         usable_pairs = sum(pair.status == "usable" for pair in self.pairs)
         if usable_pairs != self.usable_overlap_count:
             raise ValueError("usable fidelity pair records must match the usable count")
+        usable_errors = tuple(pair.absolute_error for pair in self.pairs if pair.status == "usable")
+        measured_mae = (
+            sum(error for error in usable_errors if error is not None) / len(usable_errors)
+            if usable_errors
+            else None
+        )
+        if measured_mae is None:
+            if self.score_mae is not None:
+                raise ValueError("fidelity score MAE requires at least one usable pair")
+        elif self.score_mae is None or not math.isclose(
+            self.score_mae,
+            measured_mae,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("fidelity score MAE must equal the mean usable pair error")
         if self.usable_overlap_count + self.failed_overlap_count != self.planned_overlap_count:
             raise ValueError(
                 "usable and failed overlap counts must match the planned overlap count"
@@ -206,10 +212,6 @@ class FidelityReport(ArtifactEnvelope):
             raise ValueError("fidelity failures must name planned overlap cells")
         if len(self.failures) != self.failed_overlap_count:
             raise ValueError("fidelity failure records must match the failed overlap count")
-        if self.status == "approved" and self.approved_at is None:
-            raise ValueError("approved fidelity reports require approved_at")
-        if self.status != "approved" and self.approved_at is not None:
-            raise ValueError("only approved fidelity reports may set approved_at")
         return self
 
 
@@ -224,7 +226,6 @@ class EvaluationDatasetManifest(ArtifactEnvelope):
     held_out_task_ids: tuple[ArtifactId, ...]
     candidate_snapshots: tuple[RoutedCandidateSnapshot, ...]
     protocols: tuple[EvaluationProtocol, ...]
-    fidelity_report_ids: tuple[ArtifactId, ...] = ()
     rows_path: str = Field(min_length=1)
     rows_sha256: Sha256
 
@@ -249,8 +250,6 @@ class EvaluationDatasetManifest(ArtifactEnvelope):
         protocol_ids = tuple(protocol.protocol_id for protocol in self.protocols)
         if not protocol_ids or len(set(protocol_ids)) != len(protocol_ids):
             raise ValueError("evaluation manifest protocol IDs must be non-empty and unique")
-        if len(set(self.fidelity_report_ids)) != len(self.fidelity_report_ids):
-            raise ValueError("evaluation manifest fidelity report IDs must not repeat")
         return self
 
 

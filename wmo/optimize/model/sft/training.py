@@ -19,7 +19,7 @@ from wmo.common.core.artifacts import (
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import NumericMeasurement
 from wmo.common.project import ProjectStore
-from wmo.optimize.model.sft.contracts import SFTBuildSpec, SFTDatasetArtifact
+from wmo.optimize.model.sft.contracts import SFTDatasetArtifact
 from wmo.optimize.model.sft.provider_resources import validate_provider_resource_id
 from wmo.optimize.model.sft.run_manifest import (
     _read_model,
@@ -84,7 +84,6 @@ class TinkerSFTOptimizer:
         output_dir: Path,
         created_at: datetime,
         code_revision: str,
-        legacy_build_spec: SFTBuildSpec | None = None,
     ) -> TinkerSFTResult:
         """Train from one persisted dataset without changing catalog, router, or serving state."""
         return train_tinker_sft(
@@ -95,7 +94,6 @@ class TinkerSFTOptimizer:
             backend=self._backend,
             created_at=created_at,
             code_revision=code_revision,
-            legacy_build_spec=legacy_build_spec,
         )
 
 
@@ -108,7 +106,6 @@ def train_tinker_sft(
     backend: TrainerBackend,
     created_at: datetime,
     code_revision: str,
-    legacy_build_spec: SFTBuildSpec | None = None,
 ) -> TinkerSFTResult:
     """Train a managed LoRA from frozen W12 examples with append-only local provenance.
 
@@ -120,8 +117,6 @@ def train_tinker_sft(
         backend: Concrete Tinker SDK adapter or a deterministic injected fake.
         created_at: Time recorded when this output directory is first initialized.
         code_revision: Exact revision recorded when this output directory is first initialized.
-        legacy_build_spec: Original W12 build settings for a dataset that predates persisted
-            build specifications. The runner rebuilds and verifies the legacy evidence chain.
 
     Returns:
         Completed model-handle and result artifacts containing only training and checkpoint facts.
@@ -129,11 +124,7 @@ def train_tinker_sft(
     Raises:
         TinkerSFTError: Dataset, budget, or append-only resume state is unsafe to continue.
     """
-    dataset, dataset_input = verified_training_inputs(
-        store,
-        dataset_id,
-        legacy_build_spec=legacy_build_spec,
-    )
+    dataset, dataset_input = verified_training_inputs(store, dataset_id)
     validate_run_inputs(dataset, created_at=created_at, code_revision=code_revision)
     manifest_path = output_dir / _MANIFEST_FILE
     with file_write_lock(manifest_path, what="the Tinker SFT run"):

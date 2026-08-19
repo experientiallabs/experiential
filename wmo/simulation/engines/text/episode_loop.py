@@ -38,6 +38,11 @@ def execute_text_episode_loop(
     normal customer runtime seam while making the simulator, rather than a one-turn adapter,
     authoritative for scenario termination.
 
+    Exhausting the pinned candidate turn ceiling is a judgeable episode outcome, not an
+    infrastructure failure: the recorded transcript is complete evidence that the candidate did
+    not finish the task within the pinned budget, so the cell stops with ``MAXIMUM_STEPS`` and
+    no structured failure.
+
     Args:
         agent_factory: Creates one isolated customer runtime for the simulation cell.
         task: Canonical text-only representative task.
@@ -66,20 +71,21 @@ def execute_text_episode_loop(
             )
         text_error = recorder.terminal_error
         if text_error is not None:
+            judgeable = text_error.stop_reason in (
+                StopReason.COMPLETED,
+                StopReason.MAXIMUM_STEPS,
+            )
             return TextEpisodeOutcome(
                 episodes=tuple(episodes),
                 stop_reason=text_error.stop_reason,
-                failure=(
-                    None if text_error.stop_reason == StopReason.COMPLETED else text_error.failure
-                ),
+                failure=None if judgeable else text_error.failure,
                 final_output=episode.final_action or recorder.last_candidate_action,
             )
-        limit_error = recorder.terminal_limit_error()
-        if limit_error is not None:
+        if recorder.turn_limit_reached:
             return TextEpisodeOutcome(
                 episodes=tuple(episodes),
-                stop_reason=limit_error.stop_reason,
-                failure=limit_error.failure,
+                stop_reason=StopReason.MAXIMUM_STEPS,
+                failure=None,
                 final_output=episode.final_action or recorder.last_candidate_action,
             )
         if episode.stop_reason == StopReason.COMPLETED:

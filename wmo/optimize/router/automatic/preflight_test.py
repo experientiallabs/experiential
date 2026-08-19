@@ -30,7 +30,7 @@ from wmo.runtime.models import RuntimeModelCatalog
 def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One read-only failure lists build, review, evidence, and role prerequisites.
+    """One read-only failure lists build, review, and role prerequisites.
 
     Args:
         tmp_path: Temporary initialized project root.
@@ -69,7 +69,7 @@ def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(
     assert "completed build" in message
     assert "frozen model roles" in message
     assert "manual judge" in message
-    assert "fidelity evidence" in message
+    assert "fidelity" not in message
     assert project.paths.project_toml.read_bytes() == before_project
     assert project.model_catalog_path.read_bytes() == before_catalog
     assert project.artifacts.list_ids() == before_artifacts
@@ -91,14 +91,34 @@ def test_router_embedding_reservation_is_admitted_before_other_provider_work() -
         problems,
         maximum_provider_cost_usd=1,
         router_reservation=reservation,
-        judge_reservation_cost_usd=0,
     )
 
     assert remaining == 0
     assert problems == [
-        "router embedding and judge reservations consume the entire provider spend ceiling; "
+        "the router embedding reservation consumes the entire provider spend ceiling; "
         "increase --maximum-simulation-cost-usd or lower a request/retry ceiling"
     ]
+
+
+def test_shared_remainder_excludes_only_the_router_embedding_reservation() -> None:
+    """Judge planning estimates take no upfront carve-out from the shared spend pool."""
+    reservation = router_embedding_reservation(
+        model=_catalog_model_snapshot(),
+        input_usd_per_million_tokens=1,
+        maximum_attempts_per_feature=1,
+        maximum_input_tokens_per_feature=1_000,
+        feature_count=1,
+    )
+    problems: list[str] = []
+
+    remaining = remaining_simulation_budget(
+        problems,
+        maximum_provider_cost_usd=50,
+        router_reservation=reservation,
+    )
+
+    assert problems == []
+    assert remaining == 50 - reservation.estimated_cost_usd
 
 
 def _catalog() -> ModelCatalog:

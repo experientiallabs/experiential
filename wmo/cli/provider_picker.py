@@ -4,12 +4,13 @@ Setup opens with one provider screen, resolves each selected provider's credenti
 canonical environment variable or a masked paste, then asks that provider which models the
 authenticated account may call. Discovered metadata is merged with WMO's maintained capability and
 price table, so a model whose metadata cannot satisfy any build role is hidden rather than turned
-into a questionnaire. Manual declaration stays available as an explicit advanced choice.
+into a questionnaire. Providers without a safe listing API keep manual declaration on the model
+screen.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, MutableMapping, Sequence
+from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from getpass import getpass
 
@@ -18,19 +19,18 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 
 from wmo.cli.picker import (
     PickerAction,
-    PickerKey,
+    PickerKeyReader,
     PickerOption,
     PickerResult,
-    select_many,
-    select_many_list,
-    select_one,
-    uses_keyboard_list,
+    choose_many,
+    choose_one,
 )
 from wmo.common.models import (
     ModelCapabilities,
     PricingSource,
     ProviderConnection,
     ProviderSetup,
+    ReasoningEffort,
     SetupRole,
     derive_connection_name,
     derive_model_alias,
@@ -62,8 +62,6 @@ CANONICAL_CREDENTIAL_ENV = {
 }
 _MANUAL_MODEL_PROVIDERS = frozenset({"azure", "bedrock"})
 _CONFIGURED_ONLY = "configured-models-only"
-_ADVANCED_CREDENTIALS = "advanced-credentials"
-_ADVANCED_MANUAL_MODEL = "advanced-manual-model"
 _RECOVERY_RETRY = "retry"
 _RECOVERY_SKIP = "skip"
 _RECOVERY_BACK = "back"
@@ -86,6 +84,9 @@ class SetupRoleInputs:
     embedder: str | None = None
     candidates: tuple[str, ...] = ()
     incumbent: str | None = None
+    world_model_reasoning_effort: ReasoningEffort | None = None
+    judge_reasoning_effort: ReasoningEffort | None = None
+    candidate_reasoning_efforts: dict[str, ReasoningEffort] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class ProviderSetupResult:
     setup: ProviderSetup
     candidates: tuple[str, ...] = ()
     incumbent: str | None = None
+    candidate_reasoning_efforts: dict[str, ReasoningEffort] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -143,7 +145,6 @@ class SetupSession:
     """Answers already given, kept across back navigation and provider retries."""
 
     providers: tuple[str, ...] = ()
-    advanced_credentials: bool = False
     advanced_models: bool = False
     endpoints: tuple[PreparedEndpoint, ...] = ()
     available: tuple[AvailableModel, ...] = ()
@@ -198,20 +199,19 @@ def resolve_setup_providers(values: Sequence[str]) -> tuple[str, ...]:
 
 def explicit_provider_selection(
     providers: Sequence[str],
-) -> tuple[tuple[str, ...], bool, bool]:
+) -> tuple[tuple[str, ...], bool]:
     """Turn validated provider names into the same selection the picker returns.
 
     Args:
         providers: Already validated provider names in catalog order.
 
     Returns:
-        Providers plus advanced-credential and advanced-model flags. Azure and Bedrock
-        still require manual model declaration.
+        Providers plus the manual-model flag. Azure and Bedrock still require manual model
+        declaration.
     """
     selected = tuple(providers)
     return (
         selected,
-        False,
         any(provider in _MANUAL_MODEL_PROVIDERS for provider in selected),
     )
 
@@ -222,8 +222,8 @@ def select_providers(
     console: Console,
     environment: MutableMapping[str, str],
     configured: bool = False,
-    read_key: Callable[[], PickerKey] | None = None,
-) -> tuple[tuple[str, ...], bool, bool] | None:
+    read_key: PickerKeyReader | None = None,
+) -> tuple[tuple[str, ...], bool] | None:
     """Show the one provider screen that opens setup.
 
     Args:
@@ -235,7 +235,8 @@ def select_providers(
         read_key: Optional keyboard source used by tests instead of the controlling terminal.
 
     Returns:
-        Selected providers with both advanced flags, or ``None`` when the user cancelled.
+        Selected providers plus whether manual model declaration is needed, or ``None`` when the
+        user cancelled.
     """
     options = [
         PickerOption(
@@ -245,18 +246,6 @@ def select_providers(
         )
         for provider, label in SETUP_PROVIDER_LABELS.items()
     ]
-    options.append(
-        PickerOption(
-            value=_ADVANCED_CREDENTIALS,
-            label="Advanced: choose credential environment-variable names",
-        )
-    )
-    options.append(
-        PickerOption(
-            value=_ADVANCED_MANUAL_MODEL,
-            label="Advanced: declare a model and its capabilities by hand",
-        )
-    )
     if configured:
         options.insert(
             0,
@@ -267,10 +256,6 @@ def select_providers(
             ),
         )
     preselected = list(session.providers)
-    if session.advanced_credentials:
-        preselected.append(_ADVANCED_CREDENTIALS)
-    if session.advanced_models:
-        preselected.append(_ADVANCED_MANUAL_MODEL)
     while True:
         result = _select_provider_rows(
             console,
@@ -288,12 +273,7 @@ def select_providers(
             console.print("[yellow]Select at least one provider.[/yellow]")
             preselected = list(result.values)
             continue
-        return (
-            providers,
-            _ADVANCED_CREDENTIALS in result.values,
-            _ADVANCED_MANUAL_MODEL in result.values
-            or any(provider in _MANUAL_MODEL_PROVIDERS for provider in providers),
-        )
+        return providers, any(provider in _MANUAL_MODEL_PROVIDERS for provider in providers)
 
 
 def _select_provider_rows(
@@ -301,33 +281,25 @@ def _select_provider_rows(
     *,
     options: Sequence[PickerOption],
     preselected: Sequence[str],
-    read_key: Callable[[], PickerKey] | None,
+    read_key: PickerKeyReader | None,
 ) -> PickerResult:
-    """Show the provider list as a keyboard screen on a TTY, otherwise as typed rows.
+    """Show the provider multi-select screen for this console.
 
     Args:
         console: Terminal used for the screen.
-        options: Provider and advanced rows in presentation order.
+        options: Provider rows in presentation order.
         preselected: Values already chosen, kept when the screen is shown again.
         read_key: Optional keyboard source used by tests instead of the controlling terminal.
 
     Returns:
         The chosen rows, or the requested back or cancel navigation.
     """
-    title = "Select the providers you want to use"
-    if read_key is not None or uses_keyboard_list(console):
-        return select_many_list(
-            console,
-            title=title,
-            options=options,
-            preselected=preselected,
-            read_key=read_key,
-        )
-    return select_many(
+    return choose_many(
         console,
-        title=title,
+        title="Select the providers you want to use",
         options=options,
         preselected=preselected,
+        read_key=read_key,
     )
 
 
@@ -377,7 +349,6 @@ def prepare_providers(
             provider,
             existing_connections=existing_connections,
             taken_names=frozenset(taken_names),
-            advanced_credentials=session.advanced_credentials,
             console=console,
             environment=environment,
         )
@@ -423,7 +394,6 @@ def _resolve_endpoint(
     *,
     existing_connections: tuple[ProviderConnection, ...],
     taken_names: frozenset[str],
-    advanced_credentials: bool,
     console: Console,
     environment: MutableMapping[str, str],
 ) -> PreparedEndpoint | None:
@@ -433,7 +403,6 @@ def _resolve_endpoint(
         provider: Selected provider kind.
         existing_connections: Connections already configured in the catalog.
         taken_names: Connection names already used by the catalog or this session.
-        advanced_credentials: Whether the user asked to name credential variables.
         console: Terminal used for prompts.
         environment: Process environment consulted and updated for pasted credentials.
 
@@ -464,12 +433,6 @@ def _resolve_endpoint(
             or None
         )
     api_key_env = CANONICAL_CREDENTIAL_ENV.get(provider)
-    if advanced_credentials and api_key_env is not None:
-        api_key_env = ask_text(
-            f"{label} credential environment variable",
-            console=console,
-            default=api_key_env,
-        )
     connection = _reused_connection(
         existing_connections,
         provider=provider,
@@ -645,7 +608,7 @@ def _recover(title: str, *, console: Console) -> str:
     Raises:
         SetupCancelled: The user cancelled setup.
     """
-    result = select_one(
+    result = choose_one(
         console,
         title=title,
         options=[

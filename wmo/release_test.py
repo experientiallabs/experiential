@@ -251,9 +251,9 @@ def _run_checked(
 def _tty_answer_bytes(answer: str) -> bytes:
     """Encode one scripted terminal answer.
 
-    Keyboard sequences that start with an escape, or a lone carriage return, are written
-    exactly so a raw-mode picker can read them. Line-oriented prompts still receive a
-    trailing newline.
+    A keyboard sequence, recognized by any escape or carriage return it contains, is written
+    exactly so a raw-mode picker reads only the intended keys. Line-oriented prompts still
+    receive a trailing newline.
 
     Args:
         answer: Scripted key sequence or line-oriented prompt answer.
@@ -261,7 +261,7 @@ def _tty_answer_bytes(answer: str) -> bytes:
     Returns:
         Bytes written to the child pseudo-terminal.
     """
-    if answer.startswith("\x1b") or answer == "\r":
+    if "\x1b" in answer or "\r" in answer:
         return answer.encode()
     return (answer + "\n").encode()
 
@@ -408,7 +408,12 @@ def _installed_release_driver() -> None:
     from openai.types.responses import FunctionToolParam
 
     import wmo
-    from wmo.common.models import EmbeddingCostReservation, load_model_catalog
+    from wmo.common.models import (
+        ConnectionConfig,
+        EmbeddingCostReservation,
+        ModelCapabilities,
+        load_model_catalog,
+    )
     from wmo.common.project import ProjectStore, artifact_input
     from wmo.optimize.model.sft import (
         RuntimeInteractionExampleSource,
@@ -510,7 +515,7 @@ def _installed_release_driver() -> None:
                 self.send_error(400)
                 return
             ordinal = state.append(self.path, payload)
-            if self.path == "/v1/embeddings":
+            if self.path.endswith("/embeddings"):
                 values = payload.get("input", [])
                 texts = [values] if isinstance(values, str) else list(values)
                 data = []
@@ -617,6 +622,37 @@ def _installed_release_driver() -> None:
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     provider_url = f"http://127.0.0.1:{server.server_port}/v1"
+    azure_endpoint = provider_url.removesuffix("/v1")
+    provider_embeddings_path = "/openai/v1/embeddings"
+    provider_chat_path = "/openai/v1/chat/completions"
+    azure_connection_sha256 = ConnectionConfig(
+        provider="azure",
+        base_url=azure_endpoint,
+        api_key_env="AZURE_OPENAI_API_KEY",
+        api_version="v1",
+    ).identity_sha256()
+    core_capabilities_sha256 = ModelCapabilities(
+        supports_completions=True,
+        supports_embeddings=True,
+        supports_tools=True,
+        supports_structured_output=True,
+        context_window_tokens=128000,
+        maximum_output_tokens=32000,
+        input_cost_per_million_tokens_usd=0,
+        output_cost_per_million_tokens_usd=0,
+        cached_input_cost_per_million_tokens_usd=0,
+        cache_write_cost_per_million_tokens_usd=0,
+    ).identity_sha256()
+    candidate_capabilities_sha256 = ModelCapabilities(
+        supports_completions=True,
+        supports_tools=True,
+        context_window_tokens=128000,
+        maximum_output_tokens=32000,
+        input_cost_per_million_tokens_usd=0,
+        output_cost_per_million_tokens_usd=0,
+        cached_input_cost_per_million_tokens_usd=0,
+        cache_write_cost_per_million_tokens_usd=0,
+    ).identity_sha256()
 
     root = execution_root / ".wmo"
     traces = execution_root / "support.otel.jsonl"
@@ -627,7 +663,7 @@ def _installed_release_driver() -> None:
         {
             "WMO_RELEASE_REVISION": _RELEASE_REVISION,
             "WMO_INSTALLED_RELEASE_EVIDENCE": "0",
-            "P17_PROVIDER_KEY": "deterministic-loopback-placeholder",
+            "AZURE_OPENAI_API_KEY": "deterministic-loopback-placeholder",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
             "HTTP_PROXY": "http://127.0.0.1:9",
@@ -673,11 +709,16 @@ def _installed_release_driver() -> None:
             trace_id = f"{index + 1:032x}"
             trace_ids.append(trace_id)
             model = "core-model" if index % 2 == 0 else "candidate-b-model"
+            capabilities_sha256 = (
+                core_capabilities_sha256 if model == "core-model" else candidate_capabilities_sha256
+            )
             base = 1_760_000_000_000_000_000 + index * 10_000_000_000
             common = [
                 attribute("gen_ai.operation.name", "chat"),
-                attribute("gen_ai.provider.name", "openai-compatible"),
+                attribute("gen_ai.provider.name", "azure"),
                 attribute("gen_ai.request.model", model),
+                attribute("wmo.model.capabilities_sha256", capabilities_sha256),
+                attribute("wmo.model.connection_sha256", azure_connection_sha256),
                 attribute("wmo.customer.id", f"customer-{index}"),
                 attribute("wmo.conversation.id", f"conversation-{index}"),
             ]
@@ -868,17 +909,16 @@ def _installed_release_driver() -> None:
 
     down = "\x1b[B"
     enter = "\r"
+    space = " "
     setup_answers = [
         (
             "Select the providers you want to use",
-            (down * 4) + enter + (down * 3) + enter + down + enter + down + enter,
+            (down * 5) + enter + (down * 2) + enter,
         ),
-        ("base URL", provider_url),
-        ("credential environment variable", "P17_PROVIDER_KEY"),
-        ("Continue without this provider", "2"),
-        ("Select the models to configure", "1"),
-        ("cancels.", ""),
-        ("Connection for the declared model", "1"),
+        ("Azure OpenAI base URL", azure_endpoint),
+        ("Azure OpenAI API version", ""),
+        ("Select the models to configure", space + down + enter),
+        ("Connection for the declared model", enter),
         ("Provider model ID", "core-model"),
         ("Supports chat completions?", "y"),
         ("Supports embeddings?", "y"),
@@ -887,15 +927,16 @@ def _installed_release_driver() -> None:
         ("Record context window tokens?", "y"),
         ("Context window tokens", "128000"),
         ("Record maximum output tokens?", "y"),
-        ("Maximum output tokens", "16000"),
+        ("Maximum output tokens", "32000"),
         ("Input cost per million tokens in USD", "0"),
         ("Output cost per million tokens in USD", "0"),
         ("Cached input cost per million tokens in USD", "0"),
         ("Cache write cost per million tokens in USD", "0"),
-        ("cancels.", ""),
-        ("World model", "1"),
-        ("Judge model", "1"),
-        ("Embedder model", "1"),
+        ("Reasoning effort", enter),
+        ("/core-model)", (down * 2) + enter),
+        ("World model", enter),
+        ("Judge model", enter),
+        ("Embedder model", enter),
         ("Save this configuration?", "y"),
     ]
     try:
@@ -906,6 +947,9 @@ def _installed_release_driver() -> None:
         )
         assert "Model setup is required" in build_output
         assert "Candidate aliases" not in build_output
+        assert "\x1b[2K" in build_output
+        assert "\x1b[1A" in build_output
+        assert "Complete" in build_output
         support_store = ProjectStore(root, "support-agent")
         support_project = support_store.load_project()
         assert support_project.build is not None
@@ -913,14 +957,14 @@ def _installed_release_driver() -> None:
         assert support_project.models.candidates == ()
         catalog_text = (root / "models.toml").read_text(encoding="utf-8")
         assert "deterministic-loopback-placeholder" not in catalog_text
-        assert "P17_PROVIDER_KEY" in catalog_text
+        assert "AZURE_OPENAI_API_KEY" in catalog_text
         build_counts = state.counts()
-        assert build_counts["/v1/embeddings"] > 0
-        assert build_counts["/v1/chat/completions"] == 0
+        assert build_counts[provider_embeddings_path] > 0
+        assert build_counts[provider_chat_path] == 0
         world_model = wmo.load_world_model(
             "support-agent",
             root=root,
-            environment={"P17_PROVIDER_KEY": "deterministic-loopback-placeholder"},
+            environment={"AZURE_OPENAI_API_KEY": "deterministic-loopback-placeholder"},
         )
         session = world_model.new_session(task="Help a customer reset their password")
         observation = world_model.step(
@@ -934,8 +978,8 @@ def _installed_release_driver() -> None:
         assert observation.terminal is True
         world_requests = state.snapshot()[sum(build_counts.values()) :]
         assert [item["path"] for item in world_requests] == [
-            "/v1/embeddings",
-            "/v1/chat/completions",
+            provider_embeddings_path,
+            provider_chat_path,
         ]
         world_prompt = json.dumps(world_requests[-1]["payload"], sort_keys=True)
         assert "What account email?" in world_prompt
@@ -1016,36 +1060,44 @@ def _installed_release_driver() -> None:
             "0.000001",
             "--maximum-judgments",
             "100",
-            "--preferred-fidelity-overlaps",
-            "2",
             "--maximum-model-calls",
             "1",
             "--simulation-maximum-output-tokens",
             "8000",
             "--maximum-concurrency",
             "1",
+            "--candidate",
+            "candidate-b",
+            "--candidate",
+            "core-model",
+            "--incumbent",
+            "core-model",
+            "--candidate-model",
+            json.dumps(
+                {
+                    "alias": "candidate-b",
+                    "connection": "azure",
+                    "model": "candidate-b-model",
+                    "capabilities": {
+                        "supports_completions": True,
+                        "supports_tools": True,
+                        "context_window_tokens": 128_000,
+                        "maximum_output_tokens": 32_000,
+                        "input_cost_per_million_tokens_usd": 0,
+                        "output_cost_per_million_tokens_usd": 0,
+                        "cached_input_cost_per_million_tokens_usd": 0,
+                        "cache_write_cost_per_million_tokens_usd": 0,
+                    },
+                }
+            ),
             "--yes",
-            "--approve-fidelity",
         ]
         optimization_output = run_tty(
             optimize_arguments,
-            [
-                ("Candidate alias", "candidate-b"),
-                ("Provider connection", "openai-compatible"),
-                ("Provider model ID", "candidate-b-model"),
-                ("Supports tools?", "y"),
-                ("Context window tokens", "128000"),
-                ("Maximum output tokens", "16000"),
-                ("Input USD per million tokens", "0"),
-                ("Output USD per million tokens", "0"),
-                ("Cached input USD per million tokens", "0"),
-                ("Cache write USD per million tokens", "0"),
-                ("Candidate aliases (comma separated)", "core-model,candidate-b"),
-                ("Incumbent alias", "core-model"),
-                ("Save these router candidates?", "y"),
-            ],
+            [("Save these router candidates?", "y")],
         )
-        assert optimization_output.count("Candidate aliases (comma separated)") == 1
+        assert "candidates: candidate-b, core-model" in optimization_output
+        assert "incumbent: core-model" in optimization_output
         assert "policy:" in optimization_output
         assert "report:" in optimization_output
         optimized_artifacts = directory_digest(support_store.paths.artifacts_directory)
@@ -1054,7 +1106,7 @@ def _installed_release_driver() -> None:
         optimized_review = support_store.paths.review_json.read_bytes()
         optimized_provider_requests = state.snapshot()
         replay_result = run_cli(
-            *optimize_arguments[:-2],
+            *optimize_arguments[:-1],
             "--non-interactive",
         )
         assert "replay: verified completed optimization" in replay_result.stdout
@@ -1145,11 +1197,12 @@ def _installed_release_driver() -> None:
             )
             assert second_response.previous_response_id == first_response.id
             second_response_counts = state.counts()
-            assert first_response_counts["/v1/embeddings"] == (
-                response_calls_before["/v1/embeddings"] + 1
+            assert first_response_counts[provider_embeddings_path] == (
+                response_calls_before[provider_embeddings_path] + 1
             )
             assert (
-                second_response_counts["/v1/embeddings"] == first_response_counts["/v1/embeddings"]
+                second_response_counts[provider_embeddings_path]
+                == first_response_counts[provider_embeddings_path]
             )
             keyed_chat = client.chat.completions.create(
                 model="support-agent",
@@ -1170,7 +1223,7 @@ def _installed_release_driver() -> None:
         with wmo.load_router(
             "support-agent",
             root=root,
-            environment={"P17_PROVIDER_KEY": "deterministic-loopback-placeholder"},
+            environment={"AZURE_OPENAI_API_KEY": "deterministic-loopback-placeholder"},
         ) as loaded_router:
             replayed_chat = loaded_router.chat.completions.create(
                 model="support-agent",
@@ -1230,7 +1283,7 @@ def _installed_release_driver() -> None:
         catalog = load_model_catalog(root / "models.toml")
         resolved_embedder = RuntimeModelCatalog(
             catalog,
-            environment={"P17_PROVIDER_KEY": "deterministic-loopback-placeholder"},
+            environment={"AZURE_OPENAI_API_KEY": "deterministic-loopback-placeholder"},
         ).preflight(
             current_project.models.embedder,
             CapabilityRequirement(requires_embeddings=True),
@@ -1266,7 +1319,7 @@ def _installed_release_driver() -> None:
         provider_after_refresh = state.snapshot()
         assert len(provider_after_refresh) > len(provider_before_refresh)
         assert all(
-            request["path"] == "/v1/embeddings"
+            request["path"] == provider_embeddings_path
             for request in provider_after_refresh[len(provider_before_refresh) :]
         )
         assert refresh.snapshot_export.snapshot.completed_target_count == len(completed)

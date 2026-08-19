@@ -20,8 +20,8 @@ class DimensionJudgment(ContractModel):
     dimension_id: ArtifactId
     raw_score: int = Field(ge=0)
     calibrated_score: float = Field(ge=0)
-    min_score: int = Field(default=0, ge=0)
-    max_score: int = Field(default=5, ge=0)
+    min_score: int = Field(ge=0)
+    max_score: int = Field(ge=0)
     rationale: str | None = None
 
     @field_validator("calibrated_score")

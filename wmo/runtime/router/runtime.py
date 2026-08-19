@@ -132,10 +132,7 @@ class RouterRuntime:
 
         try:
             from wmo.common.evaluations import load_evaluation_dataset
-            from wmo.common.evaluations.evidence import (
-                read_evaluation_plan,
-                read_fidelity_report,
-            )
+            from wmo.common.evaluations.evidence import read_evaluation_plan
             from wmo.common.tasks import load_task_set
 
             pricing, pricing_sha256 = load_pricing_snapshot(store, pricing_snapshot_id)
@@ -157,26 +154,17 @@ class RouterRuntime:
             plan, plan_input = read_evaluation_plan(store, policy.evaluation_plan_id)
             load_task_set(store, policy.task_set_id)
             task_input = artifact_input(store.read(policy.task_set_id).manifest)
-            report_inputs = tuple(
-                read_fidelity_report(store, report_id)[1]
-                for report_id in policy.fidelity_report_ids
-            )
             expected_policy_inputs = tuple(
                 sorted((evaluation_input, bank_input), key=lambda item: item.artifact_id)
             )
             expected_bank_inputs = tuple(
                 sorted(
-                    (evaluation_input, plan_input, task_input, pricing_input, *report_inputs),
+                    (evaluation_input, plan_input, task_input, pricing_input),
                     key=lambda item: item.artifact_id,
                 )
             )
             protocol_scope_sha256 = sha256_json(
-                {
-                    "protocols": [
-                        item.model_dump(mode="json") for item in evaluation.manifest.protocols
-                    ],
-                    "fidelity_report_ids": list(evaluation.manifest.fidelity_report_ids),
-                }
+                [item.model_dump(mode="json") for item in evaluation.manifest.protocols]
             )
             if policy.inputs != expected_policy_inputs:
                 raise ValueError("router policy inputs differ from the canonical fit lock")
@@ -187,7 +175,6 @@ class RouterRuntime:
                 (evaluation.manifest.evaluation_plan_sha256, policy.evaluation_plan_sha256),
                 (evaluation.manifest.task_set_id, policy.task_set_id),
                 (evaluation.manifest.candidate_snapshots, policy.candidates),
-                (evaluation.manifest.fidelity_report_ids, policy.fidelity_report_ids),
                 (protocol_scope_sha256, policy.evaluation_protocols_sha256),
                 (plan_input.sha256, policy.evaluation_plan_sha256),
                 (task_input.sha256, policy.task_set_sha256),
@@ -204,7 +191,6 @@ class RouterRuntime:
                 plan_input,
                 task_input,
                 pricing_input,
-                *report_inputs,
             }
             if not required_evaluation_inputs.issubset(evaluation.manifest.inputs):
                 raise ValueError("router evaluation omits a frozen scope input")
@@ -414,11 +400,6 @@ class RouterRuntime:
                 self.manifest.evaluation_protocols_sha256,
                 "evaluation protocol scope",
             ),
-            (
-                self.policy.fidelity_report_ids,
-                self.manifest.fidelity_report_ids,
-                "fidelity scope",
-            ),
             (self.policy.embedder_alias, self.manifest.embedder_alias, "embedder alias"),
             (self.policy.embedder, self.manifest.embedder, "embedder snapshot"),
             (
@@ -469,7 +450,7 @@ class RouterRuntime:
         """
         resolved = self._resolved.get(alias)
         if resolved is None:
-            resolved = self.catalog.resolve(alias)
+            resolved = self.catalog.resolve(alias, role="candidate")
             expected = self._expected_models.get(alias)
             if (
                 expected is None

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.parse import urlsplit
 
 import tomli_w
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ArtifactId,
@@ -19,7 +20,7 @@ from wmo.common.core.files import write_text_atomic
 
 
 def _exclude_absent(value: object) -> bool:
-    """Return whether an optional compatibility field should be omitted from serialization.
+    """Return whether an optional absent field should be omitted from serialization.
 
     Args:
         value: Field value being serialized.
@@ -32,6 +33,38 @@ def _exclude_absent(value: object) -> bool:
 
 class ProjectConfigError(ValueError):
     """A project configuration file was absent, malformed, or violated its local contract."""
+
+
+def require_durable_source_id(source_id: str) -> str:
+    """Require a stable acquisition label rather than a worker-local path.
+
+    Args:
+        source_id: Caller-owned source label to persist in immutable provenance.
+
+    Returns:
+        The unchanged durable source label.
+
+    Raises:
+        ValueError: The label is blank, padded, or path-shaped without a URI scheme.
+    """
+    if not source_id or source_id != source_id.strip():
+        raise ValueError(
+            "source_id must be a nonblank durable acquisition label without surrounding spaces"
+        )
+    windows_path = PureWindowsPath(source_id)
+    uri_scheme = urlsplit(source_id).scheme
+    if (
+        PurePosixPath(source_id).is_absolute()
+        or windows_path.is_absolute()
+        or bool(windows_path.drive)
+        or source_id.casefold().startswith("file:")
+        or "\\" in source_id
+        or ("/" in source_id and not uri_scheme)
+    ):
+        raise ValueError(
+            "source_id must be a durable acquisition label, not a worker-local filesystem path"
+        )
+    return source_id
 
 
 class AgentConfiguration(ContractModel):
@@ -65,6 +98,39 @@ class ProjectBudgetConfiguration(ContractModel):
     """Finite spend limits applied to future project workflow calls."""
 
     maximum_build_cost_usd: float = Field(default=5.0, gt=0)
+
+
+class ProjectTracePreparationSettings(ContractModel):
+    """Provider-free settings fixed before canonical trace preparation starts."""
+
+    source_kind: str = Field(min_length=1, max_length=64)
+    fit_task_budget: int = Field(default=50, ge=0)
+    held_out_task_budget: int = Field(default=20, ge=0)
+    descriptor_dimensions: int = Field(default=64, ge=8)
+
+    @field_validator("source_kind")
+    @classmethod
+    def _normalize_source_kind(cls, value: str) -> str:
+        """Return one canonical declared source name."""
+        normalized = value.strip().casefold()
+        if not normalized:
+            raise ValueError("trace source kind must not be blank")
+        return normalized
+
+
+class ProjectProviderFreeStage(ContractModel):
+    """Exact immutable trace and task pointers selected before provider-backed work."""
+
+    schema_version: int = 1
+    trace_dataset: ArtifactInput
+    task_set: ArtifactInput
+
+    @model_validator(mode="after")
+    def _require_distinct_artifacts(self) -> ProjectProviderFreeStage:
+        """Reject a stage that reuses one artifact for both semantic outputs."""
+        if self.trace_dataset.artifact_id == self.task_set.artifact_id:
+            raise ValueError("provider-free stage trace and task artifacts must be distinct")
+        return self
 
 
 class ProjectBuildArtifacts(ContractModel):
@@ -107,13 +173,35 @@ class ProjectConfig(ContractModel):
     schema_version: int = Field(default=2, ge=1)
     project_id: ArtifactId
     trace_source: str | None = Field(default=None, max_length=64)
+    trace_preparation: ProjectTracePreparationSettings | None = None
+    provider_free_stage: ProjectProviderFreeStage | None = None
     models: ProjectModelConfiguration | None = None
-    retrieval: ProjectRetrievalConfiguration = Field(default_factory=ProjectRetrievalConfiguration)
-    budgets: ProjectBudgetConfiguration = Field(default_factory=ProjectBudgetConfiguration)
+    retrieval: ProjectRetrievalConfiguration | None = Field(
+        default_factory=ProjectRetrievalConfiguration
+    )
+    budgets: ProjectBudgetConfiguration | None = Field(default_factory=ProjectBudgetConfiguration)
     build: ProjectBuildArtifacts | None = None
     agent: AgentConfiguration | None = None
     model_optimization_config: ArtifactInput | None = None
     redacted_field_names: tuple[str, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _keep_provider_free_bootstrap_minimal(cls, value: object) -> object:
+        """Omit late retrieval and spend setup only for trace-first Project configuration."""
+        if not isinstance(value, dict) or value.get("trace_preparation") is None:
+            return value
+        updated = dict(value)
+        updated.setdefault("retrieval", None)
+        updated.setdefault("budgets", None)
+        return updated
+
+    @model_validator(mode="after")
+    def _require_trace_preparation_for_provider_free_stage(self) -> ProjectConfig:
+        """Require Project-owned preparation settings before selecting provider-free evidence."""
+        if self.provider_free_stage is not None and self.trace_preparation is None:
+            raise ValueError("provider-free stage requires Project trace preparation settings")
+        return self
 
 
 def load_project_config(path: Path) -> ProjectConfig:

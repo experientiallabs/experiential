@@ -16,6 +16,7 @@ from wmo.common.core.artifacts import (
     stable_id,
 )
 from wmo.common.judging import RawJudgment, Rubric
+from wmo.common.judging.evidence import visible_rollout_evidence
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.models import (
     AssistantAction,
@@ -99,6 +100,7 @@ class TemplateJudgeClient:
         reference_input: ArtifactInput | None,
         created_at: datetime,
         code_revision: str,
+        maximum_output_tokens: int,
     ) -> None:
         """Bind one target, optional same-task reference, and exact finalized contract.
 
@@ -114,9 +116,11 @@ class TemplateJudgeClient:
             reference_input: Exact comparison rollout pointer when pairwise.
             created_at: Materialization time for newly completed probes.
             code_revision: Exact producer revision for probe artifacts.
+            maximum_output_tokens: Reserved per-call output-token ceiling for dispatches.
 
         Raises:
-            ManualJudgeError: Pairwise feedback lacks a distinct same-task reference.
+            ManualJudgeError: Pairwise feedback lacks a distinct same-task reference, or the
+                output-token ceiling is not positive.
         """
         if template.response_shape == "pairwise":
             if reference is None or reference.task_id != rollout.task_id:
@@ -136,8 +140,11 @@ class TemplateJudgeClient:
         self._setup_input = setup_input
         self._rollout_input = rollout_input
         self._reference_input = reference_input
+        if maximum_output_tokens <= 0:
+            raise ManualJudgeError("judge maximum output tokens must be positive")
         self._created_at = created_at
         self._code_revision = code_revision
+        self._maximum_output_tokens = maximum_output_tokens
         self._probes: list[ArtifactInput] = []
         self._provider_calls_made = 0
         self._pairwise_citation_evidence: PairwiseCitationEvidence = ()
@@ -194,7 +201,7 @@ class TemplateJudgeClient:
             order: Audit-visible presentation order.
 
         Returns:
-            Provider response after model dispatch.
+            Provider response after model dispatch or exact probe replay.
         """
         probe_id = stable_id(
             "manual-judge-probe",
@@ -239,7 +246,7 @@ class TemplateJudgeClient:
                     ),
                 ),
                 temperature=0.0,
-                maximum_output_tokens=4_096,
+                maximum_output_tokens=self._maximum_output_tokens,
             )
         )
         self._provider_calls_made += 1
@@ -574,6 +581,9 @@ def _render_request(
 ) -> str:
     """Render all finalized mapped variables and the exact saved response schema.
 
+    Rollout variables use the shared judge-visible evidence projection, so rendered
+    requests exclude provider request payloads and candidate reasoning content.
+
     Args:
         template: Finalized executable prompt contract.
         rubric: Finalized scoring rubric.
@@ -587,10 +597,10 @@ def _render_request(
         "rubric": [item.prompt_payload() for item in rubric.dimensions],
     }
     if candidate_b is None:
-        values["rollout"] = _rollout_payload(candidate_a)
+        values["rollout"] = visible_rollout_evidence(candidate_a)
     else:
-        values["candidate_a"] = _rollout_payload(candidate_a)
-        values["candidate_b"] = _rollout_payload(candidate_b)
+        values["candidate_a"] = visible_rollout_evidence(candidate_a)
+        values["candidate_b"] = visible_rollout_evidence(candidate_b)
     sections = [
         f"{cast(str, template.variable_mapping[key])}:\n"
         + json.dumps(values[key], ensure_ascii=False, sort_keys=True)
@@ -601,35 +611,6 @@ def _render_request(
         + json.dumps(template.response_schema, ensure_ascii=False, sort_keys=True)
     )
     return "\n\n".join(sections)
-
-
-def _rollout_payload(rollout: RolloutArtifact) -> JsonObject:
-    """Return request-visible evidence from one verified rollout.
-
-    Args:
-        rollout: Verified immutable production rollout.
-
-    Returns:
-        Deterministic task, output, and span payload.
-    """
-    return {
-        "rollout_id": rollout.rollout_id,
-        "task_id": rollout.task_id,
-        "final_output": (
-            rollout.final_output.model_dump(mode="json")
-            if rollout.final_output is not None
-            else None
-        ),
-        "spans": [
-            {
-                "span_id": span.span_id,
-                "kind": span.kind.value,
-                "payload": span.payload,
-                "failure": span.failure.model_dump(mode="json") if span.failure else None,
-            }
-            for span in rollout.spans
-        ],
-    }
 
 
 def _validate_normalized_dimensions(dimensions: list[JsonObject], rubric: Rubric) -> None:
