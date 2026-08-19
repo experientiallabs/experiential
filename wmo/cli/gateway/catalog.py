@@ -9,6 +9,7 @@ from wmo.common.core.artifacts import canonical_json_bytes, validate_artifact_id
 from wmo.common.core.files import write_bytes_atomic
 from wmo.common.core.locks import file_write_lock
 from wmo.common.models import (
+    BillingSource,
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
@@ -148,6 +149,7 @@ def upsert_singleton_deployment(
             connection=connection_name,
             model=provider_model,
             revision=revision,
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             capabilities=capabilities,
             gateway=GatewayDeploymentMetadata(
                 exact_model_id=exact_model_id,
