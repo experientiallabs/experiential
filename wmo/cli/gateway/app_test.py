@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Iterator
+import subprocess
+import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,9 +15,11 @@ import pytest
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
-from wmo.cli.gateway import app as gateway_cli_app
+from wmo.cli.gateway import key_output as gateway_key_output
+from wmo.common.core.artifacts import sha256_json
 from wmo.runtime.gateway.auth import IssuedVirtualKey, issue_key_material
 from wmo.runtime.gateway.management import GatewayManagement
+from wmo.runtime.gateway.sqlite import key_delivery
 from wmo.runtime.gateway.sqlite.store import OperationOutcomeUnknownError, SQLiteGatewayStore
 
 
@@ -236,7 +240,7 @@ def test_key_output_failure_rolls_back_key_receipt_and_partial_file(
         raise OSError(f"injected {failure} failure")
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(gateway_cli_app.os, failure, fail_operation)
+        scoped.setattr(gateway_key_output.os, failure, fail_operation)
         failed = runner.invoke(app, arguments)
 
     assert failed.exit_code == 2
@@ -252,6 +256,184 @@ def test_key_output_failure_rolls_back_key_receipt_and_partial_file(
     assert retried.exit_code == 0, retried.output
     assert output.read_text(encoding="utf-8").strip().startswith("wmo_vk_")
     assert len(manager.keys()) == 1
+
+
+@pytest.mark.parametrize("crash_phase", ("precommit", "postcommit"))
+def test_key_output_process_crash_recovers_exact_delivery(
+    tmp_path: Path,
+    crash_phase: str,
+) -> None:
+    """Restart reconciles exact output across pre- and post-COMMIT process death."""
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+    manager.create_identity(identity_id="default", display_name="Default")
+    output = tmp_path / "issued-key"
+    script = """
+import os
+import sys
+from functools import partial
+from pathlib import Path
+
+from wmo.cli.gateway.key_output import deliver_key_output
+from wmo.runtime.gateway.management import GatewayManagement
+
+root = Path(sys.argv[1])
+output = Path(sys.argv[2])
+phase = sys.argv[3]
+manager = GatewayManagement(root)
+store = manager.require_initialized()
+if phase == "precommit":
+    def crash_before_commit(*_args, **_kwargs):
+        os._exit(71)
+    store._record_operation = crash_before_commit
+store.issue_virtual_key(
+    organization_id=manager.organization_id,
+    identity_id="default",
+    key_id="key-one",
+    operation_id="operation-one",
+    secret_delivery=partial(deliver_key_output, output),
+)
+os._exit(72)
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), str(output), crash_phase],
+        cwd=Path(__file__).parents[3],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert crashed.returncode == (71 if crash_phase == "precommit" else 72)
+    marker = gateway_key_output.key_output_marker_path(output)
+    assert output.is_file()
+    assert marker.is_file()
+    before = output.read_bytes()
+    runner = CliRunner()
+    retried = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "key",
+            "issue",
+            "default",
+            "--key-id",
+            "key-one",
+            "--operation-id",
+            "operation-one",
+            "--root",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--json",
+        ],
+    )
+
+    assert retried.exit_code == 0, retried.output
+    receipt = json.loads(retried.stdout)
+    if crash_phase == "postcommit":
+        assert receipt["data"]["status"] == "recovered_committed"
+        assert receipt["changed"] is False
+        assert output.read_bytes() == before
+    else:
+        assert "status" not in receipt["data"]
+        assert receipt["changed"] is True
+    assert not marker.exists()
+    assert len(manager.keys()) == 1
+
+
+def test_key_output_crash_recovery_preserves_mismatched_output(tmp_path: Path) -> None:
+    """A modified orphan is never deleted even when SQLite proves rollback."""
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+    manager.create_identity(identity_id="default", display_name="Default")
+    output = tmp_path / "issued-key"
+    prefix, raw_key = issue_key_material()
+    evidence = key_delivery.KeyDeliveryEvidence(
+        organization_id=manager.organization_id,
+        identity_id="default",
+        key_id="key-one",
+        operation_id="operation-one",
+        request_sha256=sha256_json(
+            {
+                "organization_id": manager.organization_id,
+                "identity_id": "default",
+                "key_id": "key-one",
+                "expires_at": None,
+            }
+        ),
+        prefix=prefix,
+        fingerprint_version=1,
+        fingerprint_sha256="a" * 64,
+        expires_at=None,
+        created_at="2026-08-19T00:00:00Z",
+    )
+    gateway_key_output.deliver_key_output(output, raw_key, evidence)
+    marker = gateway_key_output.key_output_marker_path(output)
+    output.write_text("tampered\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "key",
+            "issue",
+            "default",
+            "--key-id",
+            "key-one",
+            "--operation-id",
+            "operation-one",
+            "--root",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert output.read_text(encoding="utf-8") == "tampered\n"
+    assert marker.exists()
+    assert manager.keys() == ()
+
+
+def test_key_output_delivery_failure_preserves_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exception cleanup cannot unlink a path swapped after O_EXCL creation."""
+    output = tmp_path / "issued-key"
+    prefix, raw_key = issue_key_material()
+    evidence = key_delivery.KeyDeliveryEvidence(
+        organization_id="local",
+        identity_id="default",
+        key_id="key-one",
+        operation_id="operation-one",
+        request_sha256="a" * 64,
+        prefix=prefix,
+        fingerprint_version=1,
+        fingerprint_sha256="b" * 64,
+        expires_at=None,
+        created_at="2026-08-19T00:00:00Z",
+    )
+    original_write = gateway_key_output.os.write
+
+    def replace_output(descriptor: int, payload: bytes) -> int:
+        """Swap the output after writing through the still-owned descriptor."""
+        written = original_write(descriptor, payload)
+        if output.exists():
+            output.unlink()
+            output.write_text("unrelated", encoding="utf-8")
+            raise OSError("injected post-swap failure")
+        return written
+
+    monkeypatch.setattr(gateway_key_output.os, "write", replace_output)
+    with pytest.raises(gateway_key_output.KeyOutputRecoveryError, match="changed before cleanup"):
+        gateway_key_output.deliver_key_output(output, raw_key, evidence)
+
+    assert output.read_text(encoding="utf-8") == "unrelated"
+    assert gateway_key_output.key_output_marker_path(output).exists()
 
 
 def test_unknown_key_commit_emits_content_free_recovery_and_retains_output(
@@ -278,12 +460,33 @@ def test_unknown_key_commit_emits_content_free_recovery_and_retains_output(
     def unknown_issue(
         _manager: GatewayManagement,
         *,
-        secret_delivery: Callable[[str], Callable[[], None]] | None = None,
+        secret_delivery: key_delivery.KeyDeliverySink | None = None,
         **_kwargs: object,
     ) -> IssuedVirtualKey:
         """Publish the secret and inject an inconclusive commit acknowledgement."""
         assert secret_delivery is not None
-        secret_delivery(raw_key)
+        secret_delivery(
+            raw_key,
+            key_delivery.KeyDeliveryEvidence(
+                organization_id="local",
+                identity_id="default",
+                key_id="key-one",
+                operation_id="operation-one",
+                request_sha256=sha256_json(
+                    {
+                        "organization_id": "local",
+                        "identity_id": "default",
+                        "key_id": "key-one",
+                        "expires_at": None,
+                    }
+                ),
+                prefix=prefix,
+                fingerprint_version=1,
+                fingerprint_sha256="a" * 64,
+                expires_at=None,
+                created_at=issued.created_at.isoformat().replace("+00:00", "Z"),
+            ),
+        )
         raise OperationOutcomeUnknownError(issued=issued)
 
     monkeypatch.setattr(GatewayManagement, "issue_key", unknown_issue)
@@ -315,11 +518,17 @@ def test_unknown_key_commit_emits_content_free_recovery_and_retains_output(
     assert raw_key not in result.stdout
     assert output.read_text(encoding="utf-8").strip() == raw_key
     assert output.stat().st_mode & 0o777 == 0o600
+    assert gateway_key_output.key_output_marker_path(output).exists()
 
 
+@pytest.mark.parametrize(
+    "commit_error",
+    (sqlite3.OperationalError, KeyboardInterrupt, SystemExit),
+)
 def test_definite_key_commit_failure_is_content_free_and_removes_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    commit_error: type[BaseException],
 ) -> None:
     """A proven rollback returns a stable CLI error without secret or SQLite detail.
 
@@ -348,7 +557,7 @@ def test_definite_key_commit_failure_is_content_free_and_removes_output(
         ) -> sqlite3.Cursor:
             """Raise a secret-bearing SQLite error before the commit is applied."""
             if statement == "COMMIT":
-                raise sqlite3.OperationalError("injected database detail")
+                raise commit_error("injected database detail")
             return self.connection.execute(statement, parameters)
 
     @contextmanager
@@ -357,26 +566,25 @@ def test_definite_key_commit_failure_is_content_free_and_removes_output(
         with original_connect(store) as connection:
             yield FailedCommitConnection(connection)
 
-    monkeypatch.setattr(SQLiteGatewayStore, "_connect", failed_commit)
-    result = runner.invoke(
-        app,
-        [
-            "config",
-            "gateway",
-            "key",
-            "issue",
-            "default",
-            "--key-id",
-            "key-one",
-            "--operation-id",
-            "operation-one",
-            "--root",
-            str(tmp_path),
-            "--output",
-            str(output),
-            "--json",
-        ],
-    )
+    arguments = [
+        "config",
+        "gateway",
+        "key",
+        "issue",
+        "default",
+        "--key-id",
+        "key-one",
+        "--operation-id",
+        "operation-one",
+        "--root",
+        str(tmp_path),
+        "--output",
+        str(output),
+        "--json",
+    ]
+    with monkeypatch.context() as scoped:
+        scoped.setattr(SQLiteGatewayStore, "_connect", failed_commit)
+        result = runner.invoke(app, arguments)
 
     assert result.exit_code == 2
     error_output = result.output + result.stderr
@@ -389,3 +597,7 @@ def test_definite_key_commit_failure_is_content_free_and_removes_output(
     assert manager.keys() == ()
     with sqlite3.connect(manager.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
+
+    retried = runner.invoke(app, arguments)
+    assert retried.exit_code == 0, retried.output
+    assert output.read_text(encoding="utf-8").strip().startswith("wmo_vk_")

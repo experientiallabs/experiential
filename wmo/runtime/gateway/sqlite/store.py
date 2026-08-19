@@ -7,7 +7,7 @@ import hmac
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -120,6 +120,11 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         """Return the user-only virtual-key pepper path."""
         return self._pepper.path
 
+    @property
+    def busy_timeout_ms(self) -> int:
+        """Return the configured SQLite lock-wait bound."""
+        return self._busy_timeout_ms
+
     def create_organization(
         self,
         *,
@@ -213,7 +218,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         key_id: str,
         expires_at: datetime | None = None,
         operation_id: str | None = None,
-        secret_delivery: Callable[[str], Callable[[], None]] | None = None,
+        secret_delivery: key_delivery.KeyDeliverySink | None = None,
     ) -> IssuedVirtualKey:
         """Issue a 256-bit virtual key and persist only its HMAC fingerprint.
 
@@ -258,8 +263,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             expires_at=expires_at,
             created_at=created_at,
         )
-        delivery_cleanup: Callable[[], None] | None = None
-        commit_error: Exception | None = None
+        delivery_hooks: key_delivery.KeyDeliveryHooks | None = None
+        commit_error: BaseException | None = None
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -293,7 +298,21 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                     ),
                 )
                 if secret_delivery is not None:
-                    delivery_cleanup = secret_delivery(raw_key)
+                    delivery_hooks = secret_delivery(
+                        raw_key,
+                        key_delivery.KeyDeliveryEvidence(
+                            organization_id=organization_id,
+                            identity_id=identity_id,
+                            key_id=key_id,
+                            operation_id=operation_id,
+                            request_sha256=request_sha256,
+                            prefix=prefix,
+                            fingerprint_version=pepper.version,
+                            fingerprint_sha256=fingerprint,
+                            expires_at=expires_text,
+                            created_at=created_text,
+                        ),
+                    )
                 self._record_operation(
                     connection,
                     organization_id=organization_id,
@@ -304,20 +323,20 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                     resource_id=key_id,
                     created_at=created_text,
                 )
+                try:
+                    connection.execute("COMMIT")
+                except BaseException as error:  # noqa: BLE001 - COMMIT outcome is ambiguous
+                    commit_error = error
             except BaseException as body_error:
                 try:
                     connection.execute("ROLLBACK")
                 except BaseException as rollback_error:
-                    if delivery_cleanup is not None:
+                    if delivery_hooks is not None:
                         raise OperationOutcomeUnknownError(issued=issued) from rollback_error
                     raise body_error from rollback_error
-                if delivery_cleanup is not None:
-                    delivery_cleanup()
+                if delivery_hooks is not None:
+                    delivery_hooks.rollback()
                 raise
-            try:
-                connection.execute("COMMIT")
-            except Exception as error:  # noqa: BLE001 - commit outcome requires reconciliation
-                commit_error = error
 
         if commit_error is None:
             return issued
@@ -338,8 +357,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         if outcome is True:
             return issued
         if outcome is False:
-            if delivery_cleanup is not None:
-                delivery_cleanup()
+            if delivery_hooks is not None:
+                delivery_hooks.rollback()
             raise KeyIssuanceCommitError("virtual key issuance did not commit") from commit_error
         raise OperationOutcomeUnknownError(issued=issued) from commit_error
 

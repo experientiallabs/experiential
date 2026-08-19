@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import os
 import sys
-import uuid
-from collections.abc import Callable
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -14,6 +11,13 @@ import typer
 from rich.console import Console
 
 from wmo.cli.gateway.alias import alias_app
+from wmo.cli.gateway.key_output import (
+    KeyOutputOutcomeUnknownError,
+    KeyOutputRecoveryError,
+    deliver_key_output,
+    recover_key_output,
+    settle_key_output,
+)
 from wmo.cli.gateway.provider import provider_app
 from wmo.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
 from wmo.cli.options import ROOT_OPTION, usage_error
@@ -249,11 +253,63 @@ def key_issue(
         raise typer.BadParameter(
             "key issue on a non-TTY requires --json or an explicit --output path"
         )
-    if output is not None and output.exists():
-        raise typer.BadParameter(f"refusing to overwrite existing secret output {output}")
-    delivery = None if output is None else partial(_deliver_secret_once, output)
+    manager = _management(root)
+    if output is not None:
+        try:
+            recovered = recover_key_output(
+                output,
+                store=manager.require_initialized(),
+                organization_id=manager.organization_id,
+                identity_id=identity_id,
+                key_id=key_id,
+                operation_id=operation_id,
+                expires_at=expires_at,
+            )
+        except KeyOutputOutcomeUnknownError as exc:
+            emit_receipt(
+                GatewayReceipt(
+                    operation="key.issue",
+                    resource_kind="virtual_key",
+                    resource_id=exc.key_id,
+                    changed=None,
+                    data={
+                        "status": "operation_outcome_unknown",
+                        "prefix": exc.prefix,
+                        "output_path": str(output),
+                    },
+                ),
+                json_output=json_output,
+                human=(
+                    "operation_outcome_unknown: preserve the key output and recovery marker; "
+                    "inspect key status before retrying"
+                ),
+            )
+            raise typer.Exit(code=1) from None
+        except (ValueError, OSError) as exc:
+            raise typer.BadParameter(str(exc)) from None
+        if recovered is not None:
+            emit_receipt(
+                GatewayReceipt(
+                    operation="key.issue",
+                    resource_kind="virtual_key",
+                    resource_id=recovered.key_id,
+                    changed=False,
+                    data={
+                        "status": "recovered_committed",
+                        "prefix": recovered.prefix,
+                        "output_path": str(output),
+                    },
+                ),
+                json_output=json_output,
+                human=f"recovered committed key {recovered.key_id} at {output}",
+            )
+            _settle_emitted_key_output(output)
+            return
+        if output.exists():
+            raise typer.BadParameter(f"refusing to overwrite existing secret output {output}")
+    delivery = None if output is None else partial(deliver_key_output, output)
     try:
-        issued = _management(root).issue_key(
+        issued = manager.issue_key(
             identity_id=identity_id,
             key_id=key_id,
             expires_at=expires_at,
@@ -307,6 +363,8 @@ def key_issue(
             else f"issued key {issued.key_id}: {issued.raw_key}"
         ),
     )
+    if output is not None:
+        _settle_emitted_key_output(output)
 
 
 @key_app.command("revoke")
@@ -417,63 +475,20 @@ def gateway_usage(
     emit_items("identity usage", report.identities, json_output=False)
 
 
-def _deliver_secret_once(path: Path, raw_key: str) -> Callable[[], None]:
-    """Durably publish one private secret without overwriting an existing path."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    published = False
-    try:
-        payload = f"{raw_key}\n".encode()
-        written = 0
-        while written < len(payload):
-            count = os.write(descriptor, payload[written:])
-            if count == 0:
-                raise OSError("secret output write made no progress")
-            written += count
-        os.fchmod(descriptor, 0o600)
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        os.link(temporary, path)
-        published = True
-        temporary.unlink()
-        _fsync_directory(path.parent)
-    except BaseException:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
-        if published:
-            path.unlink(missing_ok=True)
-            _fsync_directory_quietly(path.parent)
-        raise
-
-    def cleanup() -> None:
-        """Remove a published secret when its database transaction cannot commit."""
-        path.unlink(missing_ok=True)
-        _fsync_directory_quietly(path.parent)
-
-    return cleanup
-
-
-def _fsync_directory(path: Path) -> None:
-    """Fsync one directory after an atomic secret publication."""
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _fsync_directory_quietly(path: Path) -> None:
-    """Best-effort fsync one directory during rollback cleanup."""
-    try:
-        _fsync_directory(path)
-    except OSError:
-        return
-
-
 def _require_existing(changed: bool, resource_kind: str, resource_id: str) -> None:
     """Reject an update that did not identify an existing resource."""
     if not changed:
         raise typer.BadParameter(f"unknown {resource_kind} {resource_id!r}")
+
+
+def _settle_emitted_key_output(output: Path) -> None:
+    """Flush visible success before best-effort committed-marker cleanup.
+
+    Args:
+        output: Exact one-time secret output that must remain untouched.
+    """
+    sys.stdout.flush()
+    try:
+        settle_key_output(output)
+    except (KeyOutputRecoveryError, OSError):
+        return

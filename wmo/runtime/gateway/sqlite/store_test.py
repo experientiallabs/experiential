@@ -28,6 +28,7 @@ from wmo.runtime.gateway.sqlite.provider_authority import (
 from wmo.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
     InvalidVirtualKeyError,
+    KeyIssuanceCommitError,
     OperationConflictError,
     OperationOutcomeUnknownError,
     OperationReplayUnavailableError,
@@ -35,6 +36,11 @@ from wmo.runtime.gateway.sqlite.store import (
 )
 
 _DIGEST = "a" * 64
+
+
+def _delivery_hooks(rollback: Callable[[], None]) -> key_delivery.KeyDeliveryHooks:
+    """Create observable rollback and no-op commit hooks for store tests."""
+    return key_delivery.KeyDeliveryHooks(rollback=rollback, committed=lambda: None)
 
 
 class FakeClock:
@@ -278,7 +284,10 @@ def test_failed_transactional_key_delivery_rolls_back_key_and_receipt(
         display_name="Identity",
     )
 
-    def fail_delivery(_raw_key: str) -> Callable[[], None]:
+    def fail_delivery(
+        _raw_key: str,
+        _evidence: key_delivery.KeyDeliveryEvidence,
+    ) -> key_delivery.KeyDeliveryHooks:
         """Fail before acknowledging one-time secret delivery."""
         raise OSError("injected secret delivery failure")
 
@@ -300,7 +309,10 @@ def test_failed_transactional_key_delivery_rolls_back_key_and_receipt(
 
     delivered: list[str] = []
 
-    def deliver(raw_key: str) -> Callable[[], None]:
+    def deliver(
+        raw_key: str,
+        _evidence: key_delivery.KeyDeliveryEvidence,
+    ) -> key_delivery.KeyDeliveryHooks:
         """Capture the retried secret and expose reversible delivery cleanup."""
         delivered.append(raw_key)
 
@@ -308,7 +320,7 @@ def test_failed_transactional_key_delivery_rolls_back_key_and_receipt(
             """Remove the captured secret if commit fails."""
             delivered.clear()
 
-        return cleanup
+        return _delivery_hooks(cleanup)
 
     issued = store.issue_virtual_key(
         organization_id="org-one",
@@ -343,7 +355,10 @@ def test_failed_key_receipt_commit_invokes_delivery_cleanup(
     )
     delivered: list[str] = []
 
-    def deliver(raw_key: str) -> Callable[[], None]:
+    def deliver(
+        raw_key: str,
+        _evidence: key_delivery.KeyDeliveryEvidence,
+    ) -> key_delivery.KeyDeliveryHooks:
         """Capture delivery and return cleanup observable by the test."""
         delivered.append(raw_key)
 
@@ -351,7 +366,7 @@ def test_failed_key_receipt_commit_invokes_delivery_cleanup(
             """Remove the captured secret after transaction failure."""
             delivered.clear()
 
-        return cleanup
+        return _delivery_hooks(cleanup)
 
     def fail_receipt(*_args: object, **_kwargs: object) -> None:
         """Fail after one-time delivery but before transaction commit."""
@@ -377,9 +392,93 @@ def test_failed_key_receipt_commit_invokes_delivery_cleanup(
         connection.close()
 
 
+@pytest.mark.parametrize("interruption", (KeyboardInterrupt, SystemExit))
+def test_precommit_hard_interruption_cleans_delivery_and_permits_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+) -> None:
+    """A hard interruption before COMMIT cannot orphan one-time secret delivery."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.create_identity(
+        organization_id="org-one",
+        identity_id="identity-one",
+        display_name="Identity",
+    )
+    original_connect = store._connect
+    delivered: list[str] = []
+
+    class PrecommitInterruptedConnection:
+        """Interrupt immediately before the transaction can apply COMMIT."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            """Wrap one configured SQLite connection."""
+            self.connection = connection
+
+        def execute(
+            self,
+            statement: str,
+            parameters: tuple[object, ...] = (),
+        ) -> sqlite3.Cursor:
+            """Delegate transaction work except the interrupted COMMIT."""
+            if statement == "COMMIT":
+                raise interruption("injected precommit interruption")
+            return self.connection.execute(statement, parameters)
+
+    @contextmanager
+    def precommit_interrupted() -> Iterator[PrecommitInterruptedConnection]:
+        """Yield one connection interrupted before COMMIT takes effect."""
+        with original_connect() as connection:
+            yield PrecommitInterruptedConnection(connection)
+
+    def deliver(
+        raw_key: str,
+        _evidence: key_delivery.KeyDeliveryEvidence,
+    ) -> key_delivery.KeyDeliveryHooks:
+        """Capture delivery and return exact rollback cleanup."""
+        delivered.append(raw_key)
+
+        def cleanup() -> None:
+            """Remove the delivered secret after proven rollback."""
+            delivered.clear()
+
+        return _delivery_hooks(cleanup)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(store, "_connect", precommit_interrupted)
+        with pytest.raises(KeyIssuanceCommitError, match="did not commit"):
+            store.issue_virtual_key(
+                organization_id="org-one",
+                identity_id="identity-one",
+                key_id="key-one",
+                operation_id="operation-key",
+                secret_delivery=deliver,
+            )
+
+    assert delivered == []
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM virtual_keys").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
+
+    issued = store.issue_virtual_key(
+        organization_id="org-one",
+        identity_id="identity-one",
+        key_id="key-one",
+        operation_id="operation-key",
+        secret_delivery=deliver,
+    )
+    assert delivered == [issued.raw_key]
+
+
+@pytest.mark.parametrize(
+    "commit_error",
+    (sqlite3.OperationalError, KeyboardInterrupt, SystemExit),
+)
 def test_commit_error_after_effect_reconciles_success_and_retains_delivery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    commit_error: type[BaseException],
 ) -> None:
     """A COMMIT that took effect remains a successful recoverable issuance."""
     store = SQLiteGatewayStore(tmp_path / "gateway.db")
@@ -403,7 +502,7 @@ def test_commit_error_after_effect_reconciles_success_and_retains_delivery(
             """Delegate SQL and inject an error after COMMIT takes effect."""
             result = self.connection.execute(statement, parameters)
             if statement == "COMMIT":
-                raise sqlite3.OperationalError("injected commit acknowledgement failure")
+                raise commit_error("injected commit acknowledgement failure")
             return result
 
     @contextmanager
@@ -412,7 +511,10 @@ def test_commit_error_after_effect_reconciles_success_and_retains_delivery(
         with original_connect() as connection:
             yield CommitAfterEffectConnection(connection)
 
-    def deliver(raw_key: str) -> Callable[[], None]:
+    def deliver(
+        raw_key: str,
+        _evidence: key_delivery.KeyDeliveryEvidence,
+    ) -> key_delivery.KeyDeliveryHooks:
         """Capture one delivered key and provide observable cleanup."""
         delivered.append(raw_key)
 
@@ -420,7 +522,7 @@ def test_commit_error_after_effect_reconciles_success_and_retains_delivery(
             """Remove the delivered key if the transaction is absent."""
             delivered.clear()
 
-        return cleanup
+        return _delivery_hooks(cleanup)
 
     monkeypatch.setattr(store, "_connect", commit_after_effect)
     issued = store.issue_virtual_key(
@@ -477,7 +579,10 @@ def test_unknown_commit_outcome_retains_delivery_for_manual_recovery(
         with original_connect() as connection:
             yield CommitAfterEffectConnection(connection)
 
-    def deliver(raw_key: str) -> Callable[[], None]:
+    def deliver(
+        raw_key: str,
+        _evidence: key_delivery.KeyDeliveryEvidence,
+    ) -> key_delivery.KeyDeliveryHooks:
         """Capture the secret that manual recovery must retain."""
         delivered.append(raw_key)
 
@@ -485,7 +590,7 @@ def test_unknown_commit_outcome_retains_delivery_for_manual_recovery(
             """Remove the delivered secret only after a proven rollback."""
             delivered.clear()
 
-        return cleanup
+        return _delivery_hooks(cleanup)
 
     def unknown_outcome(_database_path: Path, **_kwargs: object) -> None:
         """Make the injected post-COMMIT fresh read inconclusive."""

@@ -4,10 +4,39 @@ from __future__ import annotations
 
 import hmac
 import sqlite3
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from wmo.common.core.artifacts import Sha256
 from wmo.runtime.gateway.sqlite.migrations import connect_database
+
+
+@dataclass(frozen=True, slots=True)
+class KeyDeliveryEvidence:
+    """Content-free identity needed to reconcile one delivered virtual key."""
+
+    organization_id: str
+    identity_id: str
+    key_id: str
+    operation_id: str | None
+    request_sha256: Sha256
+    prefix: str
+    fingerprint_version: int
+    fingerprint_sha256: Sha256
+    expires_at: str | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class KeyDeliveryHooks:
+    """Filesystem settlement hooks for one transactionally delivered secret."""
+
+    rollback: Callable[[], None]
+    committed: Callable[[], None]
+
+
+KeyDeliverySink = Callable[[str, KeyDeliveryEvidence], KeyDeliveryHooks]
 
 
 def reconcile_key_issue(
@@ -94,3 +123,36 @@ def reconcile_key_issue(
         and str(receipt["resource_id"]) == key_id
     )
     return True if receipt_matches else None
+
+
+def reconcile_delivery_evidence(
+    database_path: Path,
+    *,
+    busy_timeout_ms: int,
+    evidence: KeyDeliveryEvidence,
+) -> bool | None:
+    """Reconcile one structured delivery claim against exact authority rows.
+
+    Args:
+        database_path: Gateway authority database.
+        busy_timeout_ms: SQLite lock wait bound.
+        evidence: Content-free key and operation identity from durable delivery state.
+
+    Returns:
+        ``True`` for an exact commit, ``False`` for proven absence, or ``None``
+        when the outcome cannot be proven.
+    """
+    return reconcile_key_issue(
+        database_path,
+        busy_timeout_ms=busy_timeout_ms,
+        organization_id=evidence.organization_id,
+        identity_id=evidence.identity_id,
+        key_id=evidence.key_id,
+        prefix=evidence.prefix,
+        fingerprint_version=evidence.fingerprint_version,
+        fingerprint=evidence.fingerprint_sha256,
+        expires_at=evidence.expires_at,
+        created_at=evidence.created_at,
+        operation_id=evidence.operation_id,
+        request_sha256=evidence.request_sha256,
+    )

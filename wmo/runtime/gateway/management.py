@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -12,6 +11,7 @@ from pydantic import Field
 from wmo.common.core.artifacts import ContractModel
 from wmo.runtime.gateway.auth import IssuedVirtualKey
 from wmo.runtime.gateway.contracts import DirectTarget, ProjectTarget
+from wmo.runtime.gateway.sqlite import key_delivery
 from wmo.runtime.gateway.sqlite.migrations import connect_database
 from wmo.runtime.gateway.sqlite.store import GatewayStoreError, SQLiteGatewayStore
 
@@ -229,7 +229,7 @@ class GatewayManagement:
         key_id: str,
         expires_at: datetime | None = None,
         operation_id: str | None = None,
-        secret_delivery: Callable[[str], Callable[[], None]] | None = None,
+        secret_delivery: key_delivery.KeyDeliverySink | None = None,
     ) -> IssuedVirtualKey:
         """Issue one virtual key and optionally deliver it before durable commit."""
         return self.require_initialized().issue_virtual_key(
