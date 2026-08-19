@@ -9,7 +9,6 @@ import json
 import os
 import secrets
 import stat
-import tempfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -92,19 +91,6 @@ class FingerprintPepperFile:
                 raise GatewayAuthError("virtual-key fingerprint version is unavailable") from exc
             return PepperKey(version=version, value=value)
 
-    def rotate(self) -> int:
-        """Append and select a fresh key while retaining older versions.
-
-        Returns:
-            The new current version.
-        """
-        with self._lock:
-            current_version, keys = self._read()
-            next_version = current_version + 1
-            keys[next_version] = secrets.token_bytes(32)
-            self._replace(next_version, keys)
-            return next_version
-
     def _create_initial(self) -> None:
         """Create version one without following links or replacing existing state."""
         self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -150,24 +136,6 @@ class FingerprintPepperFile:
         if current_version not in keys or any(len(value) != 32 for value in keys.values()):
             raise GatewayAuthError("virtual-key fingerprint pepper is invalid")
         return current_version, keys
-
-    def _replace(self, current_version: int, keys: dict[int, bytes]) -> None:
-        """Atomically replace the pepper file with a validated version set."""
-        self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{self._path.name}.", dir=self._path.parent
-        )
-        temporary = Path(temporary_name)
-        try:
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(self._encode(current_version, keys))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self._path)
-            os.chmod(self._path, 0o600)
-        finally:
-            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _encode(current_version: int, keys: dict[int, bytes]) -> bytes:

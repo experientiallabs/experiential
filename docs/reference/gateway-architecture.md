@@ -178,10 +178,8 @@ subprocess-bound loopback gateway, a real loopback upstream, and the official SD
 scanner checks database, WAL, backups when present, catalog snapshots, stdout, stderr, logs, usage
 responses, and error bodies for raw content and secret canaries.
 
-`wmo/runtime/gateway/provider_certification.py` is the dated provider capability matrix. Each cell
-names the official client SDK, public gateway surfaces, provider wire surface, fixture result, and
-credential-gated live status. OpenAI and Anthropic have native fixtures; generic OpenAI-compatible,
-Azure, and OpenRouter share compatible-stream coverage; Gemini and Bedrock have native deterministic
-fixtures. Live provider cells remain explicitly `not_run_requires_credentials` until a separately
-authorized run supplies dated evidence. Deterministic fixtures do not imply hosted-provider
+Provider coverage is deterministic and fixture-based. OpenAI and Anthropic have native fixtures;
+generic OpenAI-compatible, Azure, and OpenRouter share compatible-stream coverage; Gemini and
+Bedrock have native deterministic fixtures. Live hosted-provider evidence requires a separately
+authorized run with account credentials. Deterministic fixtures do not imply hosted-provider
 availability, billing, or account-specific behavior.

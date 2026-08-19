@@ -218,12 +218,7 @@ def deliver_key_output(
         _unlink_exact_inode(marker_path, marker_identity)
         _fsync_directory(marker_path.parent)
 
-    def committed() -> None:
-        """Preserve exact output and remove its settled ownership marker."""
-        _require_exact_output(path, marker)
-        settle_key_output(path)
-
-    return key_delivery.KeyDeliveryHooks(rollback=rollback, committed=committed)
+    return key_delivery.KeyDeliveryHooks(rollback=rollback)
 
 
 def recover_key_output(

@@ -188,7 +188,7 @@ def test_attempt_usage_and_integer_cost_are_content_free(tmp_path: Path) -> None
         failure=None,
     )
 
-    usage = ledger.usage(organization_id="org-one")
+    usage = ledger.usage_snapshot(organization_id="org-one").identities
     assert len(usage) == 1
     assert usage[0].requests == 1
     assert usage[0].attempts == 1
@@ -304,7 +304,7 @@ def test_usage_billing_source_buckets_conserve_physical_attempt_totals(tmp_path:
         ),
     )
 
-    buckets = ledger.usage_by_billing_source(organization_id="org-one")
+    buckets = ledger.usage_snapshot(organization_id="org-one").by_billing_source
 
     assert [bucket.billing_source for bucket in buckets] == [
         BillingSource.CUSTOMER_MANAGED,
@@ -434,7 +434,7 @@ def test_unknown_prices_remain_unknown_instead_of_zero(tmp_path: Path) -> None:
         failure=None,
     )
 
-    usage = ledger.usage(organization_id="org-one")[0]
+    usage = ledger.usage_snapshot(organization_id="org-one").identities[0]
     assert usage.known_estimated_cost_micro_usd == 0
     assert usage.unknown_cost_attempts == 1
 
@@ -471,7 +471,7 @@ def test_cancelled_post_commit_attempt_keeps_observed_billable_usage(tmp_path: P
         failure=cancelled,
     )
 
-    usage = ledger.usage(organization_id="org-one")[0]
+    usage = ledger.usage_snapshot(organization_id="org-one").identities[0]
     assert usage.known_estimated_cost_micro_usd == 280
     assert usage.terminal_counts[0].attempts == 1
     assert usage.terminal_counts[0].state == "cancelled"
@@ -842,7 +842,7 @@ def test_concurrent_multi_identity_wal_preserves_receipts_grants_and_attempts(
     with ThreadPoolExecutor(max_workers=8) as executor:
         tuple(executor.map(run_identity, range(8)))
 
-    usage = ledger.usage(organization_id="org-one")
+    usage = ledger.usage_snapshot(organization_id="org-one").identities
     assert len(usage) == 8
     assert sum(item.requests for item in usage) == 8
     assert sum(item.attempts for item in usage) == 8

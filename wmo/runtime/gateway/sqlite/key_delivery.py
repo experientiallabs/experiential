@@ -33,7 +33,6 @@ class KeyDeliveryHooks:
     """Filesystem settlement hooks for one transactionally delivered secret."""
 
     rollback: Callable[[], None]
-    committed: Callable[[], None]
 
 
 KeyDeliverySink = Callable[[str, KeyDeliveryEvidence], KeyDeliveryHooks]

@@ -26,13 +26,14 @@ from wmo.common.models import (
     ModelRecord,
     PricingSnapshot,
     RoutedCandidateSnapshot,
+    ModelCatalog,
     load_model_catalog,
     write_model_catalog,
 )
 from wmo.common.routing import RoutingDecision
 from wmo.runtime.gateway.catalog_authority import (
-    upsert_certified_pool,
-    upsert_connection,
+    apply_certified_pool_update,
+    plan_certified_pool_update,
     upsert_singleton_deployment,
 )
 from wmo.runtime.gateway.lifecycle import (
@@ -269,16 +270,17 @@ def test_readiness_requires_an_explicit_grant(tmp_path: Path) -> None:
 def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) -> None:
     """One absent provider secret does not block another complete granted alias."""
     manager, raw_key = _configured_gateway(tmp_path)
-    upsert_connection(
-        tmp_path,
-        name="missing-provider",
-        connection=ConnectionConfig(
+    manager.upsert_provider_connection(
+        connection_id="missing-provider",
+        config=ConnectionConfig(
             provider="openai-compatible",
             base_url="http://127.0.0.1:9/v1",
             api_key_env="MISSING_PROVIDER_KEY",
         ),
-        replace=False,
     )
+    serving_connections = {
+        item.connection_id: item.config for item in manager.provider_connections()
+    }
     normalized, snapshot, _changed = upsert_singleton_deployment(
         tmp_path,
         deployment_alias="broken",
@@ -291,6 +293,7 @@ def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) 
         prices=GatewayTokenPrices(),
         pricing_source=None,
         replace=False,
+        serving_connections=serving_connections,
     )
     manager.activate_direct_alias(
         alias_id="broken",
@@ -664,16 +667,17 @@ def _configured_gateway(root: Path) -> tuple[GatewayManagement, str]:
     """Create one explicit direct alias, identity, grant, and key in real SQLite."""
     manager = GatewayManagement(root)
     manager.initialize()
-    upsert_connection(
-        root,
-        name="provider-main",
-        connection=ConnectionConfig(
+    manager.upsert_provider_connection(
+        connection_id="provider-main",
+        config=ConnectionConfig(
             provider="openai-compatible",
             base_url="http://127.0.0.1:9/v1",
             api_key_env="TEST_PROVIDER_KEY",
         ),
-        replace=False,
     )
+    serving_connections = {
+        item.connection_id: item.config for item in manager.provider_connections()
+    }
     normalized, snapshot, _changed = upsert_singleton_deployment(
         root,
         deployment_alias="coding",
@@ -686,6 +690,7 @@ def _configured_gateway(root: Path) -> tuple[GatewayManagement, str]:
         prices=GatewayTokenPrices(),
         pricing_source=None,
         replace=False,
+        serving_connections=serving_connections,
     )
     manager.activate_direct_alias(
         alias_id="coding",
@@ -713,26 +718,36 @@ def _configured_project_pool(
     for deployment_alias in deployment_aliases:
         name = f"{deployment_alias}-provider"
         credential_env = f"{deployment_alias.upper()}_PROVIDER_KEY"
-        upsert_connection(
-            root,
-            name=name,
-            connection=ConnectionConfig(
+        manager.upsert_provider_connection(
+            connection_id=name,
+            config=ConnectionConfig(
                 provider="openai-compatible",
                 base_url=base_url,
                 api_key_env=credential_env,
             ),
-            replace=False,
         )
-    authored = load_model_catalog(root / "models.toml")
     primary_connection = f"{deployment_aliases[0]}-provider"
-    models = dict(authored.models)
-    models["embedder"] = ModelRecord(
-        connection=primary_connection,
-        model="embedder-model",
-        billing_source=BillingSource.CUSTOMER_MANAGED,
-        capabilities=ModelCapabilities(supports_embeddings=True),
+    write_model_catalog(
+        root / "models.toml",
+        ModelCatalog(
+            connections={
+                f"{alias}-provider": ConnectionConfig(
+                    provider="openai-compatible",
+                    base_url=base_url,
+                    api_key_env=f"{alias.upper()}_PROVIDER_KEY",
+                )
+                for alias in deployment_aliases
+            },
+            models={
+                "embedder": ModelRecord(
+                    connection=primary_connection,
+                    model="embedder-model",
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    capabilities=ModelCapabilities(supports_embeddings=True),
+                )
+            },
+        ),
     )
-    write_model_catalog(root / "models.toml", authored.model_copy(update={"models": models}))
     normalized = None
     for deployment_alias in deployment_aliases:
         normalized, _snapshot, _changed = upsert_singleton_deployment(
@@ -749,7 +764,7 @@ def _configured_project_pool(
             replace=False,
         )
     assert normalized is not None
-    normalized, snapshot, _changed = upsert_certified_pool(
+    pool_update = plan_certified_pool_update(
         root,
         pool_id="certified-pool",
         exact_model_id="model-revision-exact",
@@ -763,6 +778,9 @@ def _configured_project_pool(
         expected_catalog_sha256=normalized.identity_sha256(),
         replace=False,
     )
+    apply_certified_pool_update(root, pool_update)
+    normalized = pool_update.normalized
+    snapshot = pool_update.snapshot
     manager.activate_project_alias(
         alias_id="coding",
         alias_name="coding",

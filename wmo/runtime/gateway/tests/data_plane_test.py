@@ -200,13 +200,7 @@ class _EventStream:
 
     def __init__(self, events: tuple[GatewayEvent, ...]) -> None:
         self._events = iter(events)
-        self._committed = False
         self.cancelled = False
-
-    @property
-    def committed(self) -> bool:
-        """Return whether a semantic event has been yielded."""
-        return self._committed
 
     def __aiter__(self) -> AsyncIterator[GatewayEvent]:
         """Return this asynchronous iterator."""
@@ -215,11 +209,9 @@ class _EventStream:
     async def __anext__(self) -> GatewayEvent:
         """Yield the next normalized event."""
         try:
-            event = next(self._events)
+            return next(self._events)
         except StopIteration as exc:
             raise StopAsyncIteration from exc
-        self._committed = True
-        return event
 
     async def cancel(self) -> None:
         """Record bounded upstream cancellation."""
@@ -258,11 +250,6 @@ class _BlockingStream:
         self.entered = asyncio.Event()
         self.released = asyncio.Event()
         self.cancelled = False
-
-    @property
-    def committed(self) -> bool:
-        """Return false because no semantic event is emitted."""
-        return False
 
     def __aiter__(self) -> AsyncIterator[GatewayEvent]:
         """Return this asynchronous iterator."""
@@ -366,7 +353,6 @@ class _ProjectResolver:
         return ProjectSelection(
             exact_model_id="exact-one",
             selected_alias="source-one",
-            activation_ref=target.activation_ref,
             fallback_reason="embedding_error",
         )
 

@@ -51,12 +51,6 @@ from wmo.runtime.models.providers.transport import ProviderTransportError, Retry
 
 _MAXIMUM_SSE_EVENT_BYTES = 4_000_000
 _CANCELLATION_BOUND_SECONDS = 1.0
-_SEMANTIC_KINDS = {
-    GatewayEventKind.TEXT_DELTA,
-    GatewayEventKind.REFUSAL_DELTA,
-    GatewayEventKind.TOOL_CALL_STARTED,
-    GatewayEventKind.TOOL_ARGUMENTS_DELTA,
-}
 _TERMINAL_KINDS = {
     GatewayEventKind.COMPLETED,
     GatewayEventKind.INCOMPLETE,
@@ -248,14 +242,8 @@ class NormalizedProviderStream:
         self._phase_timeout_seconds = phase_timeout_seconds
         self._attempt_controller = attempt_controller
         self._decoder = decoder
-        self._committed = False
         self._done = False
         self._last_sequence = -1
-
-    @property
-    def committed(self) -> bool:
-        """Return whether an outward semantic event has made the route immutable."""
-        return self._committed
 
     def __aiter__(self) -> AsyncIterator[GatewayEvent]:
         """Return this one-pass normalized iterator."""
@@ -311,8 +299,6 @@ class NormalizedProviderStream:
                 failure=normalized_provider_failure(exc),
             )
         self._last_sequence = event.sequence_number
-        if event.kind in _SEMANTIC_KINDS:
-            self._committed = True
         if event.kind in _TERMINAL_KINDS:
             self._done = True
             await self._close()

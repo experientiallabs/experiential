@@ -512,43 +512,6 @@ class SQLiteAttemptLedger:
                 unknown_attempts += 1
         return expired_requests, unknown_attempts
 
-    def usage(
-        self, *, organization_id: str, identity_id: str | None = None
-    ) -> tuple[IdentityUsage, ...]:
-        """Aggregate request, usage, cost, and terminal states by identity.
-
-        Args:
-            organization_id: Tenant boundary.
-            identity_id: Optional identity filter.
-
-        Returns:
-            Stable identity usage rows without prompts or outputs.
-        """
-        return self.usage_snapshot(
-            organization_id=organization_id,
-            identity_id=identity_id,
-        ).identities
-
-    def usage_by_billing_source(
-        self,
-        *,
-        organization_id: str,
-        identity_id: str | None = None,
-    ) -> tuple[BillingSourceUsage, ...]:
-        """Aggregate physical attempts by their frozen credential ownership source.
-
-        Args:
-            organization_id: Tenant boundary.
-            identity_id: Optional identity filter applied through the parent request.
-
-        Returns:
-            Deterministic source buckets without partitioning logical request counts.
-        """
-        return self.usage_snapshot(
-            organization_id=organization_id,
-            identity_id=identity_id,
-        ).by_billing_source
-
     def usage_snapshot(
         self,
         *,

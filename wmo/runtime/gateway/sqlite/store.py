@@ -796,10 +796,6 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             for row in rows
         )
 
-    def rotate_fingerprint_pepper(self) -> int:
-        """Rotate future key fingerprints while retaining old key authentication."""
-        return self._pepper.rotate()
-
     def _authenticate_in_transaction(
         self, connection: sqlite3.Connection, raw_key: str
     ) -> tuple[str, str, str]:

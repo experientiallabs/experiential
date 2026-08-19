@@ -215,7 +215,6 @@ def test_bedrock_guardrail_stop_is_typed_and_precommit() -> None:
         ]
         assert events[-1].failure is not None
         assert events[-1].failure.failure_class is GatewayFailureClass.REFUSAL
-        assert not stream.committed
 
     asyncio.run(scenario())
 

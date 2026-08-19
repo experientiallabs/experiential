@@ -48,81 +48,6 @@ class CertifiedPoolUpdate:
     changed: bool
 
 
-def list_connections(root: Path) -> tuple[tuple[str, ConnectionConfig], ...]:
-    """Return role-free connections without resolving their environment secrets."""
-    path = root / "models.toml"
-    if not path.exists():
-        return ()
-    return tuple(sorted(load_model_catalog(path).connections.items()))
-
-
-def upsert_connection(
-    root: Path,
-    *,
-    name: str,
-    connection: ConnectionConfig,
-    replace: bool,
-) -> bool:
-    """Create or explicitly replace one secret-free provider connection.
-
-    Args:
-        root: WMO root containing ``models.toml``.
-        name: Stable connection identifier.
-        connection: Environment-reference-only connection metadata.
-        replace: Whether an existing connection may change.
-
-    Returns:
-        Whether catalog bytes changed.
-    """
-    validate_artifact_id(name)
-    path = root / "models.toml"
-    with file_write_lock(path, what="the gateway provider catalog"):
-        if path.exists():
-            current = load_model_catalog(path)
-            existing = current.connections.get(name)
-            if existing is not None and existing != connection and not replace:
-                raise GatewayCatalogAuthoringError(
-                    f"provider connection {name!r} exists; pass --replace to update it"
-                )
-            if existing == connection:
-                return False
-            connections = {**current.connections, name: connection}
-            updated = current.model_copy(update={"connections": connections})
-        else:
-            updated = ModelCatalog(
-                connections={name: connection},
-                models={},
-                roles=ModelRoles(),
-            )
-        write_model_catalog(path, updated)
-    return True
-
-
-def remove_connection(root: Path, *, name: str) -> bool:
-    """Remove an unreferenced provider connection without touching secret values."""
-    path = root / "models.toml"
-    if not path.exists():
-        return False
-    with file_write_lock(path, what="the gateway provider catalog"):
-        current = load_model_catalog(path)
-        if name not in current.connections:
-            return False
-        references = sorted(
-            alias for alias, record in current.models.items() if record.connection == name
-        )
-        if references:
-            raise GatewayCatalogAuthoringError(
-                f"provider connection {name!r} is used by deployments: {', '.join(references)}"
-            )
-        connections = dict(current.connections)
-        del connections[name]
-        if not connections:
-            path.unlink()
-            return True
-        write_model_catalog(path, current.model_copy(update={"connections": connections}))
-    return True
-
-
 def upsert_singleton_deployment(
     root: Path,
     *,
@@ -207,48 +132,6 @@ def upsert_singleton_deployment(
     normalized = normalize_gateway_catalog(current)
     snapshot = _write_catalog_snapshot(root, current, normalized)
     return normalized, snapshot, changed
-
-
-def upsert_certified_pool(
-    root: Path,
-    *,
-    pool_id: str,
-    exact_model_id: str,
-    deployment_aliases: tuple[str, ...],
-    certification: GatewayEquivalenceCertification,
-    expected_catalog_sha256: str,
-    replace: bool,
-) -> tuple[NormalizedGatewayCatalog, Path, bool]:
-    """Author one certified ordered pool against an optimistic catalog digest.
-
-    Args:
-        root: WMO root containing ``models.toml`` and gateway snapshots.
-        pool_id: Stable direct-pool and public-alias identifier.
-        exact_model_id: Exact logical model identity shared by every deployment.
-        deployment_aliases: Ordered existing deployment aliases.
-        certification: Operator evidence binding the declared equivalence.
-        expected_catalog_sha256: Normalized digest observed before this mutation.
-        replace: Whether an existing pool declaration may change.
-
-    Returns:
-        Updated normalized catalog, immutable snapshot path, and change status.
-
-    Raises:
-        GatewayCatalogAuthoringError: The catalog moved or the pool already differs.
-    """
-    path = root / "models.toml"
-    with file_write_lock(path, what="the gateway exact-model pool catalog"):
-        update = plan_certified_pool_update(
-            root,
-            pool_id=pool_id,
-            exact_model_id=exact_model_id,
-            deployment_aliases=deployment_aliases,
-            certification=certification,
-            expected_catalog_sha256=expected_catalog_sha256,
-            replace=replace,
-        )
-        apply_certified_pool_update(root, update)
-    return update.normalized, update.snapshot, update.changed
 
 
 def plan_certified_pool_update(

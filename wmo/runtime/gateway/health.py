@@ -31,7 +31,6 @@ class _DeploymentHealth:
     open_until: float = 0.0
     throttle_until: float = 0.0
     half_open_probe: bool = False
-    refusal_count: int = 0
 
 
 class DeploymentHealthRegistry:
@@ -120,7 +119,6 @@ class DeploymentHealthRegistry:
                 )
                 return
             if failure.failure_class == GatewayFailureClass.REFUSAL:
-                state.refusal_count += 1
                 return
             if failure.failure_class in _HARD_FAILURES:
                 state.consecutive_failures = self._failure_threshold

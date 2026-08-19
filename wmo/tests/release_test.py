@@ -60,7 +60,6 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "wmo/runtime/gateway/budgets.py",
         "wmo/runtime/gateway/ledger.py",
         "wmo/runtime/openai_protocol/requests.py",
-        "wmo/runtime/gateway/provider_certification.py",
         "wmo/runtime/gateway/service.py",
         "wmo/runtime/gateway/usage.py",
         "wmo/runtime/models/registry.py",
@@ -473,6 +472,7 @@ def _installed_release_driver() -> None:
         GatewayEquivalenceCertification,
         GatewayTokenPrices,
         ModelCapabilities,
+        ModelCatalog,
         ModelRecord,
         ModelRequest,
         ModelResponse,
@@ -494,8 +494,8 @@ def _installed_release_driver() -> None:
     from wmo.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
     from wmo.optimize.router.judging.service import prepare_manual_judge_calibration
     from wmo.runtime.gateway.catalog_authority import (
-        upsert_certified_pool,
-        upsert_connection,
+        apply_certified_pool_update,
+        plan_certified_pool_update,
         upsert_singleton_deployment,
     )
     from wmo.runtime.gateway.lifecycle import load_local_gateway
@@ -2187,27 +2187,34 @@ def _installed_release_driver() -> None:
     project_manager = GatewayManagement(project_root)
     project_manager.initialize()
     for alias in ("cheap", "baseline"):
-        upsert_connection(
-            project_root,
-            name=f"project-{alias}",
-            connection=ConnectionConfig(
+        project_manager.upsert_provider_connection(
+            connection_id=f"project-{alias}",
+            config=ConnectionConfig(
                 provider="openai-compatible",
                 base_url=provider_url,
                 api_key_env="P9_LOOPBACK_PROVIDER_KEY",
             ),
-            replace=False,
         )
-    authored_project_catalog = load_model_catalog(project_root / "models.toml")
-    authored_models = dict(authored_project_catalog.models)
-    authored_models["embedder"] = ModelRecord(
-        connection="project-cheap",
-        model="project-embedder-model",
-        billing_source=BillingSource.CUSTOMER_MANAGED,
-        capabilities=ModelCapabilities(supports_embeddings=True),
-    )
     write_model_catalog(
         project_root / "models.toml",
-        authored_project_catalog.model_copy(update={"models": authored_models}),
+        ModelCatalog(
+            connections={
+                f"project-{alias}": ConnectionConfig(
+                    provider="openai-compatible",
+                    base_url=provider_url,
+                    api_key_env="P9_LOOPBACK_PROVIDER_KEY",
+                )
+                for alias in ("cheap", "baseline")
+            },
+            models={
+                "embedder": ModelRecord(
+                    connection="project-cheap",
+                    model="project-embedder-model",
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    capabilities=ModelCapabilities(supports_embeddings=True),
+                )
+            },
+        ),
     )
     project_catalog = None
     for alias, provider_model, billing_source in (
@@ -2232,7 +2239,7 @@ def _installed_release_driver() -> None:
             replace=False,
         )
     assert project_catalog is not None
-    project_catalog, project_snapshot, _changed = upsert_certified_pool(
+    project_pool_update = plan_certified_pool_update(
         project_root,
         pool_id="project-pool",
         exact_model_id="project-exact-model",
@@ -2246,6 +2253,9 @@ def _installed_release_driver() -> None:
         expected_catalog_sha256=project_catalog.identity_sha256(),
         replace=False,
     )
+    apply_certified_pool_update(project_root, project_pool_update)
+    project_catalog = project_pool_update.normalized
+    project_snapshot = project_pool_update.snapshot
     project_manager.activate_project_alias(
         alias_id="project-coding",
         alias_name="project-coding",
@@ -3157,7 +3167,6 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     scope = (docs / "release-scope.md").read_text(encoding="utf-8")
     assert "local gateway" in scope
     assert "Gateway provider evidence matrix" in scope
-    assert "not_run_requires_credentials" in scope
     for exclusion in (
         "No paid E2B or Harbor cloud smoke ran",
         "No real Tinker training ran",
@@ -3170,7 +3179,6 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     assert "GET /v1/models" in architecture
     assert "POST /v1/chat/completions" in architecture
     assert "POST /v1/responses" in architecture
-    assert "provider_certification.py" in architecture
     assert "schema-v2" in architecture
     assert "by_billing_source" in architecture
     assert "inert contracts" not in architecture

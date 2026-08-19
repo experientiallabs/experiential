@@ -177,14 +177,19 @@ class GatewayManagement:
             connection_id=connection_id,
         )
 
-    def import_legacy_provider_connections(self, catalog: ModelCatalog) -> int:
-        """Import legacy models.toml connection metadata into SQLite exactly once.
+    def migrate_legacy_provider_connections(self) -> int:
+        """Import a legacy models.toml only when SQLite has no serving connections.
 
         Existing equal records are stable replays. Existing different records fail closed so a
         catalog file can never silently override current serving authority.
         """
+        if self.provider_connections():
+            return 0
+        path = self.root / "models.toml"
+        if not path.is_file():
+            return 0
         imported = 0
-        for connection_id, config in sorted(catalog.connections.items()):
+        for connection_id, config in sorted(load_model_catalog(path).connections.items()):
             changed, _authority = self.upsert_provider_connection(
                 connection_id=connection_id,
                 config=config,
@@ -192,15 +197,6 @@ class GatewayManagement:
             )
             imported += int(changed)
         return imported
-
-    def migrate_legacy_provider_connections(self) -> int:
-        """Import a legacy models.toml only when SQLite has no serving connections."""
-        if self.provider_connections():
-            return 0
-        path = self.root / "models.toml"
-        if not path.is_file():
-            return 0
-        return self.import_legacy_provider_connections(load_model_catalog(path))
 
     def provider_bindings(self, catalog: ModelCatalog) -> tuple[ProviderConnectionBinding, ...]:
         """Resolve an authored snapshot to exact active SQLite connection revisions."""

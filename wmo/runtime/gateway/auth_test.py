@@ -16,8 +16,8 @@ from wmo.runtime.gateway.auth import (
 )
 
 
-def test_pepper_is_mode_0600_and_rotation_retains_old_fingerprint_keys(tmp_path: Path) -> None:
-    """Pepper rotation changes future HMACs without invalidating retained versions."""
+def test_pepper_is_mode_0600_and_fingerprints_are_stable_by_version(tmp_path: Path) -> None:
+    """Pepper state stays owner-private and versioned HMAC keys reproduce fingerprints."""
     path = tmp_path / "state" / "gateway-key-pepper.json"
     pepper_file = FingerprintPepperFile(path)
     first = pepper_file.current()
@@ -25,10 +25,8 @@ def test_pepper_is_mode_0600_and_rotation_retains_old_fingerprint_keys(tmp_path:
     first_fingerprint = fingerprint_virtual_key(raw_key, first)
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert pepper_file.rotate() == 2
-    assert pepper_file.current().version == 2
+    assert pepper_file.current().version == 1
     assert fingerprint_virtual_key(raw_key, pepper_file.key(1)) == first_fingerprint
-    assert fingerprint_virtual_key(raw_key, pepper_file.current()) != first_fingerprint
 
 
 def test_pepper_rejects_group_readable_and_symlink_state(tmp_path: Path) -> None:

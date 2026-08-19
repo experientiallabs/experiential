@@ -43,14 +43,6 @@ class GatewayControlStore(Protocol):
         ...
 
 
-class SecretResolver(Protocol):
-    """Late-bound resolver for opaque provider credential references."""
-
-    def resolve(self, reference: str) -> str:
-        """Resolve one configured reference without logging or persisting its value."""
-        ...
-
-
 class AttemptLedger(Protocol):
     """Content-free persistence seam for request and provider-attempt accounting."""
 
@@ -103,11 +95,6 @@ class AttemptLedger(Protocol):
 
 class ProviderStream(Protocol):
     """True provider stream yielding normalized events in provider order."""
-
-    @property
-    def committed(self) -> bool:
-        """Return whether an outward semantic event has committed this provider route."""
-        ...
 
     def __aiter__(self) -> AsyncIterator[GatewayEvent]:
         """Iterate normalized provider events until one terminal event."""

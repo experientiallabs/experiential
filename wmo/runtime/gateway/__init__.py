@@ -32,7 +32,6 @@ from wmo.runtime.gateway.interfaces import (
     GatewayControlStore,
     ProjectTargetResolver,
     ProviderStream,
-    SecretResolver,
 )
 from wmo.runtime.gateway.platform import (
     ActivateAliasRevisionCommand,
@@ -178,7 +177,6 @@ __all__ = [
     "RoutingRevisionAuthority",
     "SetMonthlyBudgetCommand",
     "UpsertProviderConnectionCommand",
-    "SecretResolver",
     "StructuredTextFormat",
     "UsageAttribution",
     "UsageAttributionAuthority",

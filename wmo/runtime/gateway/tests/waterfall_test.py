@@ -847,13 +847,7 @@ class _WaterfallStream:
     def __init__(self, events: tuple[GatewayEvent, ...]) -> None:
         """Store the provider-local events in delivery order."""
         self._events = iter(events)
-        self._committed = False
         self.cancelled = False
-
-    @property
-    def committed(self) -> bool:
-        """Return whether this physical stream emitted semantic output."""
-        return self._committed
 
     def __aiter__(self) -> AsyncIterator[GatewayEvent]:
         """Return this one-pass asynchronous iterator."""
@@ -862,18 +856,9 @@ class _WaterfallStream:
     async def __anext__(self) -> GatewayEvent:
         """Yield the next scripted provider event."""
         try:
-            event = next(self._events)
+            return next(self._events)
         except StopIteration as exc:
             raise StopAsyncIteration from exc
-        if event.kind in {
-            GatewayEventKind.TEXT_DELTA,
-            GatewayEventKind.REFUSAL_DELTA,
-            GatewayEventKind.TOOL_CALL_STARTED,
-            GatewayEventKind.TOOL_ARGUMENTS_DELTA,
-            GatewayEventKind.TOOL_CALL_COMPLETED,
-        }:
-            self._committed = True
-        return event
 
     async def cancel(self) -> None:
         """Record bounded cancellation of this provider stream."""
@@ -904,7 +889,6 @@ class _ProjectResolver:
         return ProjectSelection(
             exact_model_id="exact-one",
             selected_alias=self._selected_alias,
-            activation_ref=target.activation_ref,
         )
 
 

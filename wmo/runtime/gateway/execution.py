@@ -149,11 +149,6 @@ class GatewayExecutionStream:
         self._settlement_lock = asyncio.Lock()
 
     @property
-    def committed(self) -> bool:
-        """Return whether outward semantic output has frozen the current deployment."""
-        return self._committed
-
-    @property
     def deployment(self) -> ExactModelDeployment:
         """Return the active or terminal physical deployment."""
         current = self._require_current()

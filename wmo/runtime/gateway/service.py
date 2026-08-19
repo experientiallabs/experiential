@@ -137,21 +137,6 @@ class GatewayService:
         self._cleanup_tasks: set[asyncio.Task[object]] = set()
         self._lifecycle = asyncio.Condition()
 
-    async def __aenter__(self) -> GatewayService:
-        """Preflight the service before an owning lifecycle exposes readiness."""
-        await self.preflight()
-        return self
-
-    async def __aexit__(
-        self,
-        exception_type: type[BaseException] | None,
-        exception: BaseException | None,
-        traceback: object | None,
-    ) -> None:
-        """Stop admission and drain all owned work on lifecycle exit."""
-        del exception_type, exception, traceback
-        await self.drain(timeout_seconds=5.0)
-
     async def preflight(self) -> ExecutionSnapshot:
         """Return proof that a granted alias routes without credentials or provider work."""
         async with self._lifecycle:

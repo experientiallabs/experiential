@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from wmo.runtime.gateway.contracts import GatewayEvent
 
+_MAXIMUM_EVENTS = 100_000
+_MAXIMUM_BYTES = 64 * 1024 * 1024
+
 
 class GatewayAggregationOverflowError(ValueError):
     """Provider output exceeded the launch data-plane retention ceiling."""
@@ -12,32 +15,15 @@ class GatewayAggregationOverflowError(ValueError):
 class BoundedGatewayEvents:
     """Retain normalized events under fixed count and serialized-byte ceilings."""
 
-    def __init__(
-        self,
-        *,
-        maximum_events: int = 100_000,
-        maximum_bytes: int = 64 * 1024 * 1024,
-    ) -> None:
-        """Create empty bounded event state.
-
-        Args:
-            maximum_events: Maximum normalized events retained for one response.
-            maximum_bytes: Maximum UTF-8 serialized event bytes retained.
-        """
-        if maximum_events < 1 or maximum_bytes < 1:
-            raise ValueError("gateway event bounds must be positive")
-        self._maximum_events = maximum_events
-        self._maximum_bytes = maximum_bytes
+    def __init__(self) -> None:
+        """Create empty bounded event state."""
         self._events: list[GatewayEvent] = []
         self._bytes = 0
 
     def append(self, event: GatewayEvent) -> None:
         """Retain one event or fail before process-local state becomes unbounded."""
         event_bytes = len(event.model_dump_json().encode("utf-8"))
-        if (
-            len(self._events) >= self._maximum_events
-            or self._bytes + event_bytes > self._maximum_bytes
-        ):
+        if len(self._events) >= _MAXIMUM_EVENTS or self._bytes + event_bytes > _MAXIMUM_BYTES:
             raise GatewayAggregationOverflowError(
                 "provider output exceeded the bounded gateway aggregation limit"
             )

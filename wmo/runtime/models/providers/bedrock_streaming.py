@@ -35,13 +35,6 @@ _TERMINAL_KINDS = {
     GatewayEventKind.INCOMPLETE,
     GatewayEventKind.FAILED,
 }
-_SEMANTIC_KINDS = {
-    GatewayEventKind.TEXT_DELTA,
-    GatewayEventKind.REFUSAL_DELTA,
-    GatewayEventKind.TOOL_CALL_STARTED,
-    GatewayEventKind.TOOL_ARGUMENTS_DELTA,
-    GatewayEventKind.TOOL_CALL_COMPLETED,
-}
 
 
 class BedrockEventStream(Protocol):
@@ -112,15 +105,9 @@ class BedrockProviderStream:
         self._tools: dict[int, _ToolAccumulator] = {}
         self._next_sequence = 0
         self._stop_reason: str | None = None
-        self._committed = False
         self._done = False
         self._close_started = False
         self._released = False
-
-    @property
-    def committed(self) -> bool:
-        """Return whether semantic Bedrock output has committed this route."""
-        return self._committed
 
     def __aiter__(self) -> AsyncIterator[GatewayEvent]:
         """Return this one-pass normalized iterator."""
@@ -176,8 +163,6 @@ class BedrockProviderStream:
             if any(event.kind in _TERMINAL_KINDS for event in normalized):
                 await self._finish()
         event = self._events.popleft()
-        if event.kind in _SEMANTIC_KINDS:
-            self._committed = True
         return event
 
     async def cancel(self) -> None:

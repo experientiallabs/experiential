@@ -44,8 +44,8 @@ _DIGEST = "a" * 64
 
 
 def _delivery_hooks(rollback: Callable[[], None]) -> key_delivery.KeyDeliveryHooks:
-    """Create observable rollback and no-op commit hooks for store tests."""
-    return key_delivery.KeyDeliveryHooks(rollback=rollback, committed=lambda: None)
+    """Create observable rollback hooks for store tests."""
+    return key_delivery.KeyDeliveryHooks(rollback=rollback)
 
 
 class FakeClock:
@@ -292,8 +292,8 @@ def test_concurrent_multi_identity_revoke_and_revision_activation_are_serialized
     assert snapshot.alias_revision_id == "revision-two"
 
 
-def test_expiry_identity_disable_and_pepper_rotation_fail_closed(tmp_path: Path) -> None:
-    """Expiry and identity state deny old keys while pepper rotation preserves fingerprints."""
+def test_expiry_and_identity_disable_fail_closed(tmp_path: Path) -> None:
+    """Key expiry and identity disablement deny previously issued keys."""
     clock = FakeClock()
     store = SQLiteGatewayStore(tmp_path / "gateway.db", clock=clock)
     store.create_organization(organization_id="org-one", slug="one", display_name="One")
@@ -304,8 +304,6 @@ def test_expiry_identity_disable_and_pepper_rotation_fail_closed(tmp_path: Path)
         key_id="key-expiring",
         expires_at=clock.now() + timedelta(seconds=5),
     )
-    assert store.rotate_fingerprint_pepper() == 2
-    assert store.granted_aliases(raw_key=expiring.raw_key) == ()
     clock.advance(5)
     with pytest.raises(InvalidVirtualKeyError):
         store.granted_aliases(raw_key=expiring.raw_key)

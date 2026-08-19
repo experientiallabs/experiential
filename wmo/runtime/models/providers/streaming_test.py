@@ -259,7 +259,7 @@ def test_openai_responses_stream_preserves_raw_tools_usage_and_commitment() -> N
         return httpx.Response(200, stream=upstream)
 
     async def scenario() -> list[GatewayEvent]:
-        """Open the Responses stream and inspect commitment around its first event."""
+        """Open the Responses stream and read events beginning with its first."""
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             client = OpenAIClient(
                 model=_snapshot("openai"),
@@ -271,10 +271,8 @@ def test_openai_responses_stream_preserves_raw_tools_usage_and_commitment() -> N
                 deadline=RequestDeadline.after(2),
                 idempotency_key="attempt-1",
             )
-            assert stream.committed is False
             first = await anext(stream)
             assert first.kind is GatewayEventKind.TOOL_CALL_STARTED
-            assert stream.committed is True
             return [first, *await _collect(stream)]
 
     events = asyncio.run(scenario())
@@ -331,7 +329,7 @@ def test_openai_incomplete_reasons_do_not_conflate_filtering_with_length(
         del request
         return httpx.Response(200, stream=_ChunkStream((frames,)))
 
-    async def scenario() -> tuple[list[GatewayEvent], bool]:
+    async def scenario() -> list[GatewayEvent]:
         """Consume usage and the classified terminal event."""
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             client = _provider_client("openai", http_client)
@@ -340,12 +338,11 @@ def test_openai_incomplete_reasons_do_not_conflate_filtering_with_length(
                 deadline=RequestDeadline.after(1),
                 idempotency_key=f"incomplete-{reason}",
             )
-            return await _collect(stream), stream.committed
+            return await _collect(stream)
 
-    events, committed = asyncio.run(scenario())
+    events = asyncio.run(scenario())
 
     assert [event.kind for event in events] == [GatewayEventKind.USAGE, terminal_kind]
-    assert committed is False
     if failure_class is None:
         assert events[-1].failure is None
     else:
@@ -504,8 +501,8 @@ def test_anthropic_text_stream_emits_text_usage_and_completion() -> None:
         assert json.loads(request.content)["stream"] is True
         return httpx.Response(200, stream=_ChunkStream((frames,)))
 
-    async def scenario() -> tuple[list[GatewayEvent], bool]:
-        """Consume one native Messages text stream and its commitment state."""
+    async def scenario() -> list[GatewayEvent]:
+        """Consume one native Messages text stream."""
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             client = AnthropicClient(
                 model=_snapshot("anthropic"),
@@ -518,9 +515,9 @@ def test_anthropic_text_stream_emits_text_usage_and_completion() -> None:
                 deadline=RequestDeadline.after(2),
                 idempotency_key="anthropic-text-attempt",
             )
-            return await _collect(stream), stream.committed
+            return await _collect(stream)
 
-    events, committed = asyncio.run(scenario())
+    events = asyncio.run(scenario())
 
     assert [event.kind for event in events] == [
         GatewayEventKind.TEXT_DELTA,
@@ -531,7 +528,6 @@ def test_anthropic_text_stream_emits_text_usage_and_completion() -> None:
     assert events[1].usage is not None
     assert events[1].usage.input_tokens == 3
     assert events[1].usage.output_tokens == 2
-    assert committed is True
 
 
 def test_openai_compatible_stream_emits_refusal_reasoning_usage_and_terminal() -> None:
@@ -734,7 +730,6 @@ def test_stream_open_retry_reuses_stable_idempotency_before_commit() -> None:
                 deadline=RequestDeadline.after(1),
                 idempotency_key="stable-attempt",
             )
-            assert stream.committed is False
             return await _collect(stream)
 
     events = asyncio.run(scenario())
@@ -931,7 +926,7 @@ def test_launch_adapters_emit_refusal_as_semantic_commit(provider: str) -> None:
         del request
         return httpx.Response(200, stream=_ChunkStream((frames,)))
 
-    async def scenario() -> tuple[list[GatewayEvent], bool]:
+    async def scenario() -> list[GatewayEvent]:
         """Read the refusal event before consuming its terminal continuation."""
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             client = _provider_client(provider, http_client)
@@ -941,16 +936,14 @@ def test_launch_adapters_emit_refusal_as_semantic_commit(provider: str) -> None:
                 idempotency_key=f"refusal-{provider}",
             )
             first = await anext(stream)
-            committed = stream.committed
-            return [first, *await _collect(stream)], committed
+            return [first, *await _collect(stream)]
 
-    events, committed = asyncio.run(scenario())
+    events = asyncio.run(scenario())
 
     assert events[0].kind is GatewayEventKind.REFUSAL_DELTA
     assert events[-1].kind is GatewayEventKind.FAILED
     assert events[-1].failure is not None
     assert events[-1].failure.failure_class is GatewayFailureClass.REFUSAL
-    assert committed is True
 
 
 @pytest.mark.parametrize("provider", ["openai", "anthropic", "openai-compatible"])
@@ -979,7 +972,7 @@ def test_launch_adapters_sanitize_native_stream_errors(provider: str) -> None:
         del request
         return httpx.Response(200, stream=_ChunkStream((frames,)))
 
-    async def scenario() -> tuple[GatewayEvent, bool]:
+    async def scenario() -> GatewayEvent:
         """Consume one sanitized provider failure."""
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             client = _provider_client(provider, http_client)
@@ -988,15 +981,14 @@ def test_launch_adapters_sanitize_native_stream_errors(provider: str) -> None:
                 deadline=RequestDeadline.after(1),
                 idempotency_key=f"error-{provider}",
             )
-            return await anext(stream), stream.committed
+            return await anext(stream)
 
-    event, committed = asyncio.run(scenario())
+    event = asyncio.run(scenario())
 
     assert event.kind is GatewayEventKind.FAILED
     assert event.failure is not None
     assert event.failure.failure_class is GatewayFailureClass.PROVIDER_INTERNAL
     assert canary not in event.failure.safe_message
-    assert committed is False
 
 
 @pytest.mark.parametrize("provider", ["openai", "anthropic", "openai-compatible"])
@@ -1080,7 +1072,7 @@ def test_launch_adapters_reject_duplicate_or_conflicting_tool_starts(provider: s
         calls += 1
         return httpx.Response(200, stream=_ChunkStream((frames,)))
 
-    async def scenario() -> tuple[list[GatewayEvent], bool]:
+    async def scenario() -> list[GatewayEvent]:
         """Consume the tool start and its terminal malformed-response failure."""
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             client = _provider_client(provider, http_client)
@@ -1089,10 +1081,9 @@ def test_launch_adapters_reject_duplicate_or_conflicting_tool_starts(provider: s
                 deadline=RequestDeadline.after(1),
                 idempotency_key=f"duplicate-{provider}",
             )
-            events = await _collect(stream)
-            return events, stream.committed
+            return await _collect(stream)
 
-    events, committed = asyncio.run(scenario())
+    events = asyncio.run(scenario())
 
     assert calls == 1
     assert [event.kind for event in events] == [
@@ -1101,7 +1092,6 @@ def test_launch_adapters_reject_duplicate_or_conflicting_tool_starts(provider: s
     ]
     assert events[-1].failure is not None
     assert events[-1].failure.failure_class is GatewayFailureClass.MALFORMED_RESPONSE
-    assert committed is True
 
 
 def test_first_byte_deadline_returns_sanitized_timeout_and_closes_upstream() -> None:
@@ -1113,7 +1103,7 @@ def test_first_byte_deadline_returns_sanitized_timeout_and_closes_upstream() -> 
         del request
         return httpx.Response(200, stream=upstream)
 
-    async def scenario() -> tuple[GatewayEvent, bool]:
+    async def scenario() -> GatewayEvent:
         """Wait through one bounded first-byte phase."""
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
             client = OpenAICompatibleClient(
@@ -1128,15 +1118,13 @@ def test_first_byte_deadline_returns_sanitized_timeout_and_closes_upstream() -> 
                 deadline=RequestDeadline.after(0.02),
                 idempotency_key="attempt-timeout",
             )
-            event = await anext(stream)
-            return event, stream.committed
+            return await anext(stream)
 
-    event, committed = asyncio.run(scenario())
+    event = asyncio.run(scenario())
 
     assert event.kind is GatewayEventKind.FAILED
     assert event.failure is not None
     assert event.failure.failure_class is GatewayFailureClass.TIMEOUT
-    assert committed is False
     assert upstream.closed.is_set()
 
 
@@ -1201,7 +1189,6 @@ def test_explicit_cancellation_closes_each_launch_stream_within_bound(provider: 
                 idempotency_key=f"cancel-{provider}",
             )
             await stream.cancel()
-            assert stream.committed is False
 
     asyncio.run(scenario())
 

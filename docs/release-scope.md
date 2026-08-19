@@ -58,10 +58,8 @@ credentials. `Not run` means exactly that; it is not inferred from fixture cover
 | Gemini | Native fixtures for text, structured complete function arguments, usage, cancellation, and refusal | Not run; requires Gemini credential |
 | Amazon Bedrock | Native EventStream fixtures for text, incremental tool arguments, usage, bounded cancellation, refusal, and single dispatch | Not run; requires an authorized AWS account and region |
 
-The machine-readable dated matrix is
-`wmo/runtime/gateway/provider_certification.py`. Its live cells are
-`not_run_requires_credentials`. Gemini complete structured function arguments are explicitly not
-labeled as provider-byte incremental tool-argument streaming.
+Gemini complete structured function arguments are explicitly not labeled as provider-byte
+incremental tool-argument streaming.
 
 ## Explicitly excluded
 

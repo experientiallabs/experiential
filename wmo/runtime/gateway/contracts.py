@@ -270,7 +270,6 @@ class ProjectSelection(ContractModel):
 
     exact_model_id: ExactModelId
     selected_alias: ArtifactId
-    activation_ref: ActivationRef
     fallback_reason: str | None = Field(default=None, max_length=512)
 
 

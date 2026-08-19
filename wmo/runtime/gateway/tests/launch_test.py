@@ -27,10 +27,7 @@ from wmo.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
-from wmo.runtime.gateway.catalog_authority import (
-    upsert_connection,
-    upsert_singleton_deployment,
-)
+from wmo.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from wmo.runtime.gateway.lifecycle import load_local_gateway
 from wmo.runtime.gateway.management import GatewayManagement
 
@@ -573,16 +570,17 @@ def _configure_gateway(root: Path, *, base_url: str) -> tuple[GatewayManagement,
     """Create explicit launch state against one real loopback provider."""
     manager = GatewayManagement(root)
     manager.initialize()
-    upsert_connection(
-        root,
-        name="provider-main",
-        connection=ConnectionConfig(
+    manager.upsert_provider_connection(
+        connection_id="provider-main",
+        config=ConnectionConfig(
             provider="openai-compatible",
             base_url=base_url,
             api_key_env="LOOPBACK_PROVIDER_KEY",
         ),
-        replace=False,
     )
+    serving_connections = {
+        item.connection_id: item.config for item in manager.provider_connections()
+    }
     normalized, snapshot, _changed = upsert_singleton_deployment(
         root,
         deployment_alias="coding",
@@ -598,6 +596,7 @@ def _configure_gateway(root: Path, *, base_url: str) -> tuple[GatewayManagement,
         ),
         pricing_source="loopback-test",
         replace=False,
+        serving_connections=serving_connections,
     )
     manager.activate_direct_alias(
         alias_id="coding",

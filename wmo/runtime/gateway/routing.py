@@ -301,7 +301,6 @@ class RouterProjectTargetResolver:
         return ProjectSelection(
             exact_model_id=exact_model_id,
             selected_alias=decision.selected_alias,
-            activation_ref=target.activation_ref,
             fallback_reason=decision.fallback_reason,
         )
 
