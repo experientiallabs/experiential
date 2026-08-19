@@ -7,24 +7,22 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from wmo.common.core.artifacts import ArtifactId, ContractModel, stable_id
-from wmo.common.models import AssistantAction, ModelMessage, ModelRequest, ToolChoice
 from wmo.common.models.gateway_catalog import (
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
-from wmo.common.tasks import ToolSchema
 from wmo.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
     ExecutionSnapshot,
-    GatewayNamedToolChoice,
     GatewayRequest,
     ProjectSelection,
     ProjectTarget,
 )
 from wmo.runtime.gateway.interfaces import ProjectTargetResolver
 from wmo.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
+from wmo.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 from wmo.runtime.router.runtime import RouterRuntime
 
 
@@ -305,53 +303,6 @@ class RouterProjectTargetResolver:
         """Release bounded capacity only after the synchronous selection stops."""
         del task
         self._permits.release()
-
-
-def gateway_model_request(request: GatewayRequest) -> ModelRequest:
-    """Project canonical gateway content into the existing learned-selector contract.
-
-    Args:
-        request: Canonical gateway request.
-
-    Returns:
-        Existing request shape consumed by ``RouterRuntime.select`` only.
-    """
-    messages: list[ModelMessage] = []
-    for message in request.messages:
-        role = "system" if message.role == "developer" else message.role
-        action = (
-            AssistantAction(content=message.content, tool_calls=message.tool_calls)
-            if message.role == "assistant"
-            else None
-        )
-        messages.append(
-            ModelMessage(
-                role=role,
-                content=message.content,
-                tool_call_id=message.tool_call_id,
-                assistant_action=action,
-            )
-        )
-    tools = tuple(
-        ToolSchema(
-            name=tool.name,
-            description=tool.description or tool.name,
-            input_schema=tool.parameters,
-        )
-        for tool in request.tools
-    )
-    choice = (
-        ToolChoice(name=request.tool_choice.name)
-        if isinstance(request.tool_choice, GatewayNamedToolChoice)
-        else request.tool_choice
-    )
-    return ModelRequest(
-        messages=tuple(messages),
-        tools=tools,
-        tool_choice=choice,
-        temperature=request.temperature,
-        maximum_output_tokens=request.maximum_output_tokens,
-    )
 
 
 def project_episode_identity(
