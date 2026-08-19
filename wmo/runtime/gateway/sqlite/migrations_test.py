@@ -214,6 +214,60 @@ def test_attempt_billing_migration_is_explicit_and_preserves_v2_backup(tmp_path:
         backup_connection.close()
 
 
+def test_provider_authority_migration_preserves_v3_backup(tmp_path: Path) -> None:
+    """Schema v4 adds serving connection revisions without rewriting prior authority."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = connect_database(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for statement in (*_MIGRATION_1, *_MIGRATION_2):
+            connection.execute(statement)
+        connection.execute(
+            """
+            ALTER TABLE gateway_attempts
+            ADD COLUMN billing_source TEXT NOT NULL DEFAULT 'customer_managed'
+            CHECK (billing_source IN ('customer_managed', 'host_managed'))
+            """
+        )
+        connection.execute("PRAGMA user_version = 3")
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    backup = initialize_database(path)
+
+    assert backup is not None
+    backup_connection = sqlite3.connect(backup)
+    current = connect_database(path)
+    try:
+        assert backup_connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert (
+            backup_connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'provider_connections'"
+            ).fetchone()
+            is None
+        )
+        tables = {
+            str(row[0])
+            for row in current.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name LIKE '%provider_connection%'
+                """
+            )
+        }
+        assert tables == {
+            "alias_revision_provider_connections",
+            "provider_connection_revisions",
+            "provider_connections",
+        }
+    finally:
+        current.close()
+        backup_connection.close()
+
+
 def test_concurrent_initializers_choose_migration_plan_under_exclusive_lock(
     tmp_path: Path,
 ) -> None:

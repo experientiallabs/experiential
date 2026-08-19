@@ -10,12 +10,17 @@ from pathlib import Path
 
 import pytest
 
+from wmo.common.models import ConnectionConfig
 from wmo.runtime.gateway.contracts import (
     DirectTarget,
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
     ProjectTarget,
+)
+from wmo.runtime.gateway.sqlite.provider_authority import (
+    ProviderAuthorityError,
+    ProviderConnectionBinding,
 )
 from wmo.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
@@ -335,3 +340,105 @@ def test_cross_tenant_grant_is_rejected_by_composite_foreign_keys(tmp_path: Path
         store.grant_alias(
             organization_id="org-one", identity_id="identity-one", alias_id="alias-two"
         )
+
+
+def test_provider_revisions_are_sqlite_authority_and_alias_bindings_remain_frozen(
+    tmp_path: Path,
+) -> None:
+    """Alias revisions retain exact provider metadata after the active connection changes."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    original = ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")
+    changed, first = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id="provider-revision-one",
+        config=original,
+    )
+    assert changed
+    store.register_catalog_snapshot(
+        organization_id="org-one", snapshot_ref="snapshot-one", catalog_sha256=_DIGEST
+    )
+    store.activate_alias_revision(
+        organization_id="org-one",
+        alias_id="alias-one",
+        alias_name="coding",
+        revision_id="alias-revision-one",
+        target=DirectTarget(pool_id="pool-one"),
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+        provider_connections=(
+            ProviderConnectionBinding(
+                connection_id="primary",
+                connection_revision_id=first.revision_id,
+                connection_sha256=first.connection_sha256,
+            ),
+        ),
+    )
+
+    replacement = ConnectionConfig(provider="openai", api_key_env="SECONDARY_OPENAI_KEY")
+    changed, second = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id="provider-revision-two",
+        config=replacement,
+        replace=True,
+    )
+
+    assert changed
+    assert second.revision_number == 2
+    assert store.provider_connections(organization_id="org-one") == (second,)
+    assert store.alias_provider_connections(
+        organization_id="org-one",
+        alias_id="alias-one",
+        alias_revision_id="alias-revision-one",
+    ) == (first,)
+    with pytest.raises(ProviderAuthorityError, match="active alias"):
+        store.disable_provider_connection(
+            organization_id="org-one",
+            connection_id="primary",
+        )
+
+
+def test_alias_activation_rejects_stale_provider_binding_atomically(tmp_path: Path) -> None:
+    """A stale connection revision cannot create either an alias or a partial binding."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    _, authority = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id="provider-revision-one",
+        config=ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY"),
+    )
+    store.register_catalog_snapshot(
+        organization_id="org-one", snapshot_ref="snapshot-one", catalog_sha256=_DIGEST
+    )
+
+    with pytest.raises(ProviderAuthorityError, match="differs"):
+        store.activate_alias_revision(
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="alias-revision-one",
+            target=DirectTarget(pool_id="pool-one"),
+            snapshot_ref="snapshot-one",
+            catalog_sha256=_DIGEST,
+            provider_connections=(
+                ProviderConnectionBinding(
+                    connection_id="primary",
+                    connection_revision_id="stale-revision",
+                    connection_sha256=authority.connection_sha256,
+                ),
+            ),
+        )
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM gateway_aliases").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM alias_revision_provider_connections"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
