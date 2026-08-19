@@ -457,14 +457,21 @@ def _query_embedding(
     )
 
 
-def _completion_reservation(alias: str) -> CompletionCostReservation:
+def _completion_reservation(
+    alias: str,
+    *,
+    maximum_input_tokens: int = 80_000,
+    maximum_output_tokens: int = 16_000,
+) -> CompletionCostReservation:
     """Build a complete one-attempt request reservation for one fixture model.
 
     Args:
         alias: Exact candidate or world-model alias.
+        maximum_input_tokens: Hard per-request input admission ceiling.
+        maximum_output_tokens: Provider output ceiling.
 
     Returns:
-        Conservative full-context completion request reservation.
+        Conservative completion request reservation.
     """
     return completion_cost_reservation(
         model=_snapshot(alias),
@@ -473,8 +480,8 @@ def _completion_reservation(alias: str) -> CompletionCostReservation:
         cached_input_usd_per_million_tokens=0.5,
         cache_write_usd_per_million_tokens=1.5,
         maximum_attempts=1,
-        maximum_input_tokens=80_000,
-        maximum_output_tokens=16_000,
+        maximum_input_tokens=maximum_input_tokens,
+        maximum_output_tokens=maximum_output_tokens,
     )
 
 
@@ -482,12 +489,16 @@ def _persist_completion_contract(
     store: ArtifactStore,
     *,
     candidate_aliases: tuple[str, ...] = ("candidate-a", "candidate-b"),
+    candidate_maximum_input_tokens: int = 80_000,
+    candidate_maximum_output_tokens: int = 16_000,
 ) -> ArtifactInput:
     """Persist the complete candidate and world reservation fixture.
 
     Args:
         store: Project-local artifact store.
         candidate_aliases: Candidate aliases that need request reservations.
+        candidate_maximum_input_tokens: Hard candidate input admission ceiling.
+        candidate_maximum_output_tokens: Candidate provider output ceiling.
 
     Returns:
         Exact completion-contract manifest input.
@@ -498,7 +509,11 @@ def _persist_completion_contract(
         candidate_requests=tuple(
             CandidateCompletionReservation(
                 candidate_alias=alias,
-                request=_completion_reservation(alias),
+                request=_completion_reservation(
+                    alias,
+                    maximum_input_tokens=candidate_maximum_input_tokens,
+                    maximum_output_tokens=candidate_maximum_output_tokens,
+                ),
             )
             for alias in candidate_aliases
         ),
@@ -679,14 +694,14 @@ def test_text_simulation_persists_separate_economics_and_resumes_without_duplica
     tasks = {"task-a": _task("task-a")}
     task_set_input = _persist_task_set(store, tasks)
     candidate_client = _ScriptedClient(
-        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.2)]
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.05)]
     )
     world_client = _ScriptedClient(
         [
             _response(
                 '{"message":"Thanks.","terminal":true}',
                 snapshot=_snapshot("world-model-a"),
-                cost=0.8,
+                cost=0.10,
             )
         ]
     )
@@ -708,12 +723,12 @@ def test_text_simulation_persists_separate_economics_and_resumes_without_duplica
     resumed = simulator.run(spec.model_copy(update={"created_at": _TIME + timedelta(hours=1)}))
 
     assert rollout.candidate_economics.cost_usd == NumericMeasurement(
-        value=0.2,
+        value=0.05,
         provenance="observed",
     )
     assert rollout.world_model_economics is not None
     assert rollout.world_model_economics.cost_usd == NumericMeasurement(
-        value=0.8,
+        value=0.10,
         provenance="observed",
     )
     assert rollout.retrieval_economics is not None
@@ -782,14 +797,14 @@ def test_persisted_rollout_redacts_generated_secrets_and_records_audit_count(
     plan_input = _persist_plan(store, plan)
     task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
     candidate_client = _ScriptedClient(
-        [_response(f"export KEY={secret}", snapshot=_snapshot("candidate-a"), cost=0.2)]
+        [_response(f"export KEY={secret}", snapshot=_snapshot("candidate-a"), cost=0.05)]
     )
     world_client = _ScriptedClient(
         [
             _response(
                 '{"message":"Done.","terminal":true}',
                 snapshot=_snapshot("world-model-a"),
-                cost=0.8,
+                cost=0.10,
             )
         ]
     )
@@ -857,14 +872,14 @@ def test_persisted_fit_rag_grounds_active_simulation_and_replay_has_zero_dispatc
     fit_rag_input = artifact_input(persisted.manifest)
     retriever = load_fit_rag_retriever(store, fit_rag_input, embedder=embedding)
     candidate_client = _ScriptedClient(
-        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.2)]
+        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=0.05)]
     )
     world_client = _ScriptedClient(
         [
             _response(
                 '{"message":"Thanks.","terminal":true}',
                 snapshot=_snapshot("world-model-a"),
-                cost=0.8,
+                cost=0.10,
             )
         ]
     )
@@ -1129,6 +1144,11 @@ def test_text_simulation_records_tool_tasks_and_context_overflow_as_failed_cells
     task_set_input = _persist_task_set(store, tasks)
     candidate_client = _ScriptedClient([])
     world_client = _ScriptedClient([])
+    completion_input = _persist_completion_contract(
+        store,
+        candidate_maximum_input_tokens=1_000,
+        candidate_maximum_output_tokens=1_000,
+    )
     simulator = _simulator(
         store,
         plan,
@@ -1137,8 +1157,15 @@ def test_text_simulation_records_tool_tasks_and_context_overflow_as_failed_cells
         candidate_client,
         world_client,
         candidate_context_window=16_000,
+        completion_contract_input=completion_input,
     )
-    spec = _spec(plan_input, task_set_input, ("cell-a", "cell-b"), store)
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a", "cell-b"),
+        store,
+        completion_contract_input=completion_input,
+    )
 
     artifact_set = simulator.run(spec)
     tool_rollout = simulator._load_rollout(artifact_set.artifact_ids[0])
@@ -1195,7 +1222,7 @@ def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path
             _response(
                 "unfinished",
                 snapshot=_snapshot("candidate-a"),
-                cost=0.6,
+                cost=0.10,
                 finish_reason=ModelFinishReason.LENGTH,
             )
         ]
@@ -1214,7 +1241,7 @@ def test_text_simulation_observes_length_stop_and_stops_spend_admission(tmp_path
         task_set_input,
         ("cell-a", "cell-b"),
         store,
-        maximum_cost_usd=0.5,
+        maximum_cost_usd=0.08,
         stop_on_overspend=True,
     )
 
@@ -1245,7 +1272,11 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
     tasks = {"task-a": _task("task-a"), "task-b": _task("task-b")}
     task_set_input = _persist_task_set(store, tasks)
     candidate_client = _ScriptedClient(
-        [_response("I can help.", snapshot=_snapshot("candidate-a"), cost=None)]
+        [
+            _response("I can help.", snapshot=_snapshot("candidate-a"), cost=None).model_copy(
+                update={"economics": OperationEconomics()}
+            )
+        ]
     )
     world_client = _ScriptedClient(
         [
@@ -1269,7 +1300,7 @@ def test_text_simulation_does_not_treat_unpriced_provider_calls_as_zero_spend(
         task_set_input,
         ("cell-a", "cell-b"),
         store,
-        maximum_cost_usd=1.0,
+        maximum_cost_usd=0.01,
         stop_on_overspend=True,
     )
 
@@ -1618,6 +1649,7 @@ def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: P
         candidate_client,
         world_client,
     )
+    call_reservation = _completion_reservation("candidate-a").estimated_maximum_call_cost_usd
 
     artifact_set = simulator.run(
         _spec(
@@ -1640,7 +1672,7 @@ def test_finite_budget_provider_timeout_poisons_later_paid_admission(tmp_path: P
     assert first.candidate_economics.cost_usd is None
     assert second.stop_reason == StopReason.MAXIMUM_COST
     assert second.failure is not None
-    assert second.failure.details["observed_spend_usd"] is None
+    assert second.failure.details["observed_spend_usd"] == pytest.approx(call_reservation)
 
 
 def test_stale_transition_blocks_paid_admission_until_unknown_spend_rollout_persists(
