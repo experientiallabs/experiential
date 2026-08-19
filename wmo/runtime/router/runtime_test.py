@@ -54,7 +54,11 @@ from wmo.runtime.gateway.contracts import (
     GatewayRequest,
     ProjectTarget,
 )
-from wmo.runtime.gateway.routing import RouterProjectTargetResolver, gateway_model_request
+from wmo.runtime.gateway.routing import (
+    RouterProjectTargetResolver,
+    gateway_model_request,
+    project_episode_identity,
+)
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from wmo.runtime.router import RouterRuntime, RouterRuntimeIntegrityError
@@ -705,7 +709,7 @@ def test_project_resolver_retains_failed_embedding_evidence_without_reembedding(
     decision = next(iter(runtime._request_decisions.values()))  # noqa: SLF001
     operation = runtime.selection_operation(
         gateway_model_request(request),
-        episode_id="\x1f".join(namespace),
+        episode_id=project_episode_identity(namespace),
         decision=decision,
     )
     assert operation.disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
