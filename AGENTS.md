@@ -195,10 +195,10 @@ uv run pytest -q
 
    **Agents must never create a new top-level directory.** Not for scratch work, not for a
    one-off script, not for output, not "temporarily". If work does not fit an existing surface,
-   put it under the closest one and say so — do not invent a sibling. The only way a new
+   put it under the closest one and say so - do not invent a sibling. The only way a new
    top-level directory is ever added is that a human names the exact directory and grants
    permission for that name; then, in the same change, it is added to `ALLOWED_TOP_DIRS` in
-   `wmo/repo_layout_test.py` and documented here. Blanket approval to "restructure" or "add whatever
+   `wmo/tests/repo_layout_test.py` and documented here. Blanket approval to "restructure" or "add whatever
    you need" is not permission for a directory name. Absent that, an agent that wants a new surface
    asks and waits. The same rule binds top-level FILES, against `ALLOWED_TOP_FILES` in the same
    test. Both lists are enforced by the gate, so an unapproved path fails CI rather than landing
@@ -209,7 +209,7 @@ uv run pytest -q
      pipeline on one benchmark, each step one real CLI command plus the artifact it creates),
      plus two root pages: `docs/usage.md` (the terse map of the CLI surface: one line of purpose
      and one artifact per command) and `docs/release-scope.md` (the supported and explicitly
-     excluded claims of the current release, checked by `wmo/release_test.py`). Nothing else: raw
+     excluded claims of the current release, checked by `wmo/tests/release_test.py`). Nothing else: raw
      result JSONs, vector sources, design notes, and drafts stay out of the repo. `docs/README.md`
      indexes every doc and records its purpose. Update or remove superseded material only after
      checking references and retaining durable evidence.

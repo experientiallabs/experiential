@@ -103,7 +103,7 @@ from wmo.simulation.retrieval import (
     load_rag_index,
     persist_trace_rag,
 )
-from wmo.simulation.retrieval.retrieval_test import _message_trace as _trace
+from wmo.simulation.retrieval.tests.retrieval_test import _message_trace as _trace
 from wmo.simulation.specs import (
     CandidateCompletionReservation,
     SimulationCompletionContract,

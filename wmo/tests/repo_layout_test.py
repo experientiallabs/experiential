@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 MAX_HAND_AUTHORED_LINES = 999
 HAND_AUTHORED_SUFFIXES = {
     ".css",
@@ -105,6 +105,24 @@ def test_top_level_paths_are_allowlisted() -> None:
     actual_files = {path for path in tracked if "/" not in path}
     assert actual_dirs == ALLOWED_TOP_DIRS
     assert actual_files == ALLOWED_TOP_FILES
+
+
+def test_package_wide_tests_live_in_tests_directories() -> None:
+    """Keep tests without a same-stem production module in package test directories."""
+    offenders: list[str] = []
+    for relative_path in _tracked_files():
+        relative = Path(relative_path)
+        if not relative.name.endswith("_test.py"):
+            continue
+        module_name = relative.name.removesuffix("_test.py") + ".py"
+        module_path = relative.with_name(module_name)
+        if relative.parent.name == "tests" or (REPO_ROOT / module_path).is_file():
+            continue
+        offenders.append(relative_path)
+    assert not offenders, (
+        "package-wide tests without a same-stem module must live in a tests directory: "
+        f"{sorted(offenders)}"
+    )
 
 
 def test_review_surfaces_are_python_only() -> None:

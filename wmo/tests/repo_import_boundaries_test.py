@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 WMO_DIR = REPO_ROOT / "wmo"
 FORBIDDEN_IMPORTS = {
     "common": frozenset({"runtime", "simulation", "optimize", "cli"}),

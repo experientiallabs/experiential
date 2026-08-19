@@ -36,7 +36,6 @@ from wmo.common.rollouts import (
     WorldModelSimulatorSnapshot,
 )
 from wmo.common.tasks import TaskCase
-from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
 from wmo.runtime.agents import AgentEpisode
 from wmo.runtime.environments import (
     EnvironmentSession,
@@ -66,6 +65,7 @@ from wmo.simulation.engines.text.simulator_test import (
     _snapshot,
 )
 from wmo.simulation.retrieval import TraceRAGRetriever
+from wmo.tests.release_revision_test import exact_checkout_revision, verify_release_evidence
 
 _LOCK_AT = datetime(2026, 8, 12, 11, tzinfo=UTC)
 _EVIDENCE_AT = datetime(2026, 8, 12, 12, tzinfo=UTC)

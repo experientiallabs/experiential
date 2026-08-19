@@ -95,7 +95,7 @@ jobs:
           WMO_SOURCE_CHECKOUT: ${{ github.workspace }}
           WMO_TELEMETRY: "0"
         run: |
-          cp wmo/release_test.py /tmp/wmo-wheel-smoke/installed_release_evidence.py
+          cp wmo/tests/release_test.py /tmp/wmo-wheel-smoke/installed_release_evidence.py
           cd /tmp/wmo-wheel-smoke
           ./bin/python installed_release_evidence.py
       - uses: actions/upload-artifact@v4
