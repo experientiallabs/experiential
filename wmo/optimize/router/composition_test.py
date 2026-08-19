@@ -38,6 +38,8 @@ from wmo.common.models import (
     EmbeddingCostReservation,
     ModelCapabilities,
     ModelClient,
+    ModelRequest,
+    ModelResponse,
     ModelSnapshot,
     OperationEconomics,
     RoutedCandidateSnapshot,
@@ -48,9 +50,10 @@ from wmo.common.project import (
     ProjectStore,
     artifact_input,
 )
-from wmo.common.rollouts import SimulationArtifactSet
+from wmo.common.rollouts import SimulationArtifactSet, unknown_spend_failure
 from wmo.common.routing import KnnGuard
 from wmo.common.tasks import load_task_set
+from wmo.optimize.router import composition as composition_module
 from wmo.optimize.router.composition import (
     ApprovedRouterReview,
     RouterCompositionBudget,
@@ -74,6 +77,7 @@ from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatal
 from wmo.runtime.router.runtime_test import _Client, _request
 from wmo.simulation.build import ProjectBuild, build_project, select_completed_build
 from wmo.simulation.engines.text import simulator as text_simulator_module
+from wmo.simulation.engines.text.resume import reexecutable_dispatch_failure
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
@@ -974,6 +978,134 @@ def test_failed_rollouts_are_never_judged_and_leftover_judgments_do_not_block_re
         envelope=leftover,
         files={"judgment.json": leftover},
     )
+
+    second = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="test-revision",
+    )
+
+    assert second.optimization == first.optimization
+    assert judge.calls == dispatched
+
+
+def _zero_spend(
+    phase_project: ProjectStore,
+    artifact_set: SimulationArtifactSet,
+    completion_contract_input: ArtifactInput | None,
+) -> float:
+    """Return zero reconciled spend for a contract-less fixture without reservations."""
+    del phase_project, artifact_set, completion_contract_input
+    return 0.0
+
+
+class _RejectOnceClient:
+    """Reject one mid-flight dispatch with a non-retryable error, then serve responses."""
+
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        """Store the answers served after the single non-retryable rejection.
+
+        Args:
+            responses: Responses returned in order once the rejection has occurred.
+        """
+        self._responses = list(responses)
+        self._failed = False
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Fail the first dispatch with a non-transport provider error, answer afterwards.
+
+        Args:
+            request: Request emitted by the recording boundary.
+
+        Returns:
+            The next scripted response once the single rejection has occurred.
+
+        Raises:
+            ValueError: The first dispatch, mimicking a provider response rejection.
+        """
+        del request
+        if not self._failed:
+            self._failed = True
+            raise ValueError("provider rejected the dispatched request")
+        return self._responses.pop(0)
+
+
+def test_final_unknown_spend_failure_binds_as_failed_evidence_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-retryable unknown-spend dispatch failure keeps its plan cell exactly covered.
+
+    The stranded cell binds as unjudged failed evidence instead of vanishing from the
+    exact-coverage index, the judge never dispatches against it, and a later-clock rerun
+    replays the same optimization without new dispatches. Spend reconciliation is stubbed
+    because this contract-less fixture persists no worst-case dispatch reservation; the
+    reservation charge itself is covered by the spend reconciliation tests.
+
+    Args:
+        tmp_path: Isolated project root for composed router artifacts.
+        monkeypatch: Patch fixture replacing spend reconciliation for the fixture.
+    """
+    monkeypatch.setattr(composition_module, "verified_simulation_spend", _zero_spend)
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = TraceNormalizationResult(
+        traces=tuple(_trace(index) for index in range(100)), issues=()
+    )
+    _bind_completed_build(project, normalized, revision="test-revision")
+    simulator = _SimulatorFactory()
+    terminal = '{"message":"Done.","terminal":true}'
+    simulator.world = cast(
+        _ScriptedClient,
+        _RejectOnceClient(
+            [_response(terminal, snapshot=_snapshot("world-model-a"), cost=0.01)] * 80
+        ),
+    )
+    judge = _Judge()
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_SetupSupplier(),
+        simulator_factory=simulator,
+        judge=judge,
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "embedder": _snapshot("embedder"),
+                },
+                _Client(),
+            ),
+        ),
+    )
+    budget = RouterCompositionBudget(
+        maximum_simulation_cost_usd=10.0,
+        maximum_judgments=100,
+    )
+
+    first = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+
+    rollouts = tuple(
+        read_rollout(project.artifacts, artifact_id)[0]
+        for artifact_id in project.artifacts.list_ids()
+        if project.artifacts.read(artifact_id).manifest.artifact_type == "rollout"
+    )
+    stranded = tuple(item for item in rollouts if unknown_spend_failure(item.failure))
+    assert stranded
+    assert all(not reexecutable_dispatch_failure(item) for item in stranded)
+    stranded_cells = {item.cell_id for item in stranded}
+    assert stranded_cells.isdisjoint({cell_id for cell_id, _locked in judge.log})
+    dispatched = judge.calls
 
     second = compose_router(
         project,
