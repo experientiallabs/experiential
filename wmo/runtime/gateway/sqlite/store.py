@@ -7,7 +7,7 @@ import hmac
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -196,6 +196,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         key_id: str,
         expires_at: datetime | None = None,
         operation_id: str | None = None,
+        secret_delivery: Callable[[str], Callable[[], None]] | None = None,
     ) -> IssuedVirtualKey:
         """Issue a 256-bit virtual key and persist only its HMAC fingerprint.
 
@@ -205,6 +206,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             key_id: Stable non-secret credential ID.
             expires_at: Optional timezone-aware expiry.
             operation_id: Optional retry-safe operation ID.
+            secret_delivery: Optional transactional one-time secret sink. The sink
+                returns cleanup that removes its published output if commit fails.
 
         Returns:
             One-time receipt containing the raw key.
@@ -228,46 +231,54 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         fingerprint = fingerprint_virtual_key(raw_key, pepper)
         created_at = self._clock.now()
         created_text = utc_text(created_at)
-        with self._transaction() as connection:
-            replay = self._operation_replay(
-                connection,
-                organization_id=organization_id,
-                operation_id=operation_id,
-                operation_kind="issue_virtual_key",
-                request_sha256=request_sha256,
-            )
-            if replay is not None:
-                raise OperationReplayUnavailableError(
-                    f"virtual key {replay!r} was already issued and cannot be revealed again"
+        delivery_cleanup: Callable[[], None] | None = None
+        try:
+            with self._transaction() as connection:
+                replay = self._operation_replay(
+                    connection,
+                    organization_id=organization_id,
+                    operation_id=operation_id,
+                    operation_kind="issue_virtual_key",
+                    request_sha256=request_sha256,
                 )
-            connection.execute(
-                """
-                INSERT INTO virtual_keys (
-                    key_id, organization_id, identity_id, prefix, fingerprint_version,
-                    fingerprint_sha256, expires_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    key_id,
-                    organization_id,
-                    identity_id,
-                    prefix,
-                    pepper.version,
-                    fingerprint,
-                    expires_text,
-                    created_text,
-                ),
-            )
-            self._record_operation(
-                connection,
-                organization_id=organization_id,
-                operation_id=operation_id,
-                operation_kind="issue_virtual_key",
-                request_sha256=request_sha256,
-                resource_kind="virtual_key",
-                resource_id=key_id,
-                created_at=created_text,
-            )
+                if replay is not None:
+                    raise OperationReplayUnavailableError(
+                        f"virtual key {replay!r} was already issued and cannot be revealed again"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO virtual_keys (
+                        key_id, organization_id, identity_id, prefix, fingerprint_version,
+                        fingerprint_sha256, expires_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key_id,
+                        organization_id,
+                        identity_id,
+                        prefix,
+                        pepper.version,
+                        fingerprint,
+                        expires_text,
+                        created_text,
+                    ),
+                )
+                if secret_delivery is not None:
+                    delivery_cleanup = secret_delivery(raw_key)
+                self._record_operation(
+                    connection,
+                    organization_id=organization_id,
+                    operation_id=operation_id,
+                    operation_kind="issue_virtual_key",
+                    request_sha256=request_sha256,
+                    resource_kind="virtual_key",
+                    resource_id=key_id,
+                    created_at=created_text,
+                )
+        except BaseException:
+            if delivery_cleanup is not None:
+                delivery_cleanup()
+            raise
         return IssuedVirtualKey(
             key_id=key_id,
             organization_id=organization_id,

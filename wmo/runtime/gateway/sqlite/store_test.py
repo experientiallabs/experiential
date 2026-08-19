@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -260,6 +261,117 @@ def test_operation_receipts_are_atomic_and_one_time_key_replay_stays_secret(
     if wal.exists():
         durable += wal.read_bytes()
     assert issued.raw_key.encode() not in durable
+
+
+def test_failed_transactional_key_delivery_rolls_back_key_and_receipt(
+    tmp_path: Path,
+) -> None:
+    """A delivery failure can retry the same key operation without orphaned state."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.create_identity(
+        organization_id="org-one",
+        identity_id="identity-one",
+        display_name="Identity",
+    )
+
+    def fail_delivery(_raw_key: str) -> Callable[[], None]:
+        """Fail before acknowledging one-time secret delivery."""
+        raise OSError("injected secret delivery failure")
+
+    with pytest.raises(OSError, match="injected secret delivery failure"):
+        store.issue_virtual_key(
+            organization_id="org-one",
+            identity_id="identity-one",
+            key_id="key-one",
+            operation_id="operation-key",
+            secret_delivery=fail_delivery,
+        )
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM virtual_keys").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+    delivered: list[str] = []
+
+    def deliver(raw_key: str) -> Callable[[], None]:
+        """Capture the retried secret and expose reversible delivery cleanup."""
+        delivered.append(raw_key)
+
+        def cleanup() -> None:
+            """Remove the captured secret if commit fails."""
+            delivered.clear()
+
+        return cleanup
+
+    issued = store.issue_virtual_key(
+        organization_id="org-one",
+        identity_id="identity-one",
+        key_id="key-one",
+        operation_id="operation-key",
+        secret_delivery=deliver,
+    )
+    assert delivered == [issued.raw_key]
+    with pytest.raises(OperationReplayUnavailableError, match="cannot be revealed"):
+        store.issue_virtual_key(
+            organization_id="org-one",
+            identity_id="identity-one",
+            key_id="key-one",
+            operation_id="operation-key",
+            secret_delivery=deliver,
+        )
+    assert delivered == [issued.raw_key]
+
+
+def test_failed_key_receipt_commit_invokes_delivery_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-delivery transaction failure removes output and authority state."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.create_identity(
+        organization_id="org-one",
+        identity_id="identity-one",
+        display_name="Identity",
+    )
+    delivered: list[str] = []
+
+    def deliver(raw_key: str) -> Callable[[], None]:
+        """Capture delivery and return cleanup observable by the test."""
+        delivered.append(raw_key)
+
+        def cleanup() -> None:
+            """Remove the captured secret after transaction failure."""
+            delivered.clear()
+
+        return cleanup
+
+    def fail_receipt(*_args: object, **_kwargs: object) -> None:
+        """Fail after one-time delivery but before transaction commit."""
+        raise sqlite3.OperationalError("injected receipt failure")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(store, "_record_operation", fail_receipt)
+        with pytest.raises(sqlite3.OperationalError, match="injected receipt failure"):
+            store.issue_virtual_key(
+                organization_id="org-one",
+                identity_id="identity-one",
+                key_id="key-one",
+                operation_id="operation-key",
+                secret_delivery=deliver,
+            )
+
+    assert delivered == []
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM virtual_keys").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
+    finally:
+        connection.close()
 
 
 def test_project_activation_binding_is_unique_per_tenant_and_revisions_are_immutable(

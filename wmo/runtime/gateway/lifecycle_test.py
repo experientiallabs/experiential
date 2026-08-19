@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -76,7 +77,7 @@ def test_readiness_requires_an_explicit_grant(tmp_path: Path) -> None:
 
 def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) -> None:
     """One absent provider secret does not block another complete granted alias."""
-    manager, _raw_key = _configured_gateway(tmp_path)
+    manager, raw_key = _configured_gateway(tmp_path)
     upsert_connection(
         tmp_path,
         name="missing-provider",
@@ -116,6 +117,29 @@ def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) 
         environment={"TEST_PROVIDER_KEY": "available"},
     )
 
+    with TestClient(runtime.app) as client:
+        models = client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+        unavailable = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "broken",
+                "messages": [{"role": "user", "content": "unavailable-content-canary"}],
+            },
+        )
+
+    assert [item["id"] for item in models.json()["data"]] == ["coding"]
+    assert unavailable.status_code == 503
+    assert unavailable.json()["error"]["code"] == "unavailable_route"
+    connection = sqlite3.connect(manager.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone()[0] == 0
+    finally:
+        connection.close()
     assert runtime.reconciled_expired_requests == 0
 
 

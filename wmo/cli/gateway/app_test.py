@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
+from wmo.cli.gateway import app as gateway_cli_app
 from wmo.runtime.gateway.management import GatewayManagement
 
 
@@ -193,3 +195,55 @@ def test_key_output_path_receives_the_only_raw_secret_copy(tmp_path: Path) -> No
     assert raw_key.startswith("wmo_vk_")
     assert raw_key not in result.stdout
     assert output.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("failure", ["fsync", "link"])
+def test_key_output_failure_rolls_back_key_receipt_and_partial_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """Fallible secret publication leaves no key and permits an identical retry."""
+    runner = CliRunner()
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+    manager.create_identity(identity_id="default", display_name="Default")
+    output = tmp_path / "issued-key"
+    arguments = [
+        "config",
+        "gateway",
+        "key",
+        "issue",
+        "default",
+        "--key-id",
+        "key-one",
+        "--operation-id",
+        "operation-one",
+        "--root",
+        str(tmp_path),
+        "--output",
+        str(output),
+        "--json",
+    ]
+
+    def fail_operation(*_args: object, **_kwargs: object) -> None:
+        """Inject one filesystem durability failure without secret-bearing detail."""
+        raise OSError(f"injected {failure} failure")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(gateway_cli_app.os, failure, fail_operation)
+        failed = runner.invoke(app, arguments)
+
+    assert failed.exit_code == 2
+    assert "wmo_vk_" not in failed.stdout
+    assert not output.exists()
+    assert tuple(tmp_path.glob(".issued-key.*.tmp")) == ()
+    assert manager.keys() == ()
+    connection = manager.require_initialized().database_path
+    with sqlite3.connect(connection) as database:
+        assert database.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
+
+    retried = runner.invoke(app, arguments)
+    assert retried.exit_code == 0, retried.output
+    assert output.read_text(encoding="utf-8").strip().startswith("wmo_vk_")
+    assert len(manager.keys()) == 1

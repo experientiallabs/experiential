@@ -25,15 +25,20 @@ from wmo.runtime.gateway.contracts import (
     DirectTarget,
     ExecutionSnapshot,
     GatewayApiSurface,
+    GatewayRequest,
     ProjectTarget,
 )
 from wmo.runtime.gateway.execution import GatewayExecutor
 from wmo.runtime.gateway.interfaces import ProjectTargetResolver
 from wmo.runtime.gateway.ledger import SQLiteAttemptLedger
 from wmo.runtime.gateway.management import GatewayAliasView, GatewayManagement
-from wmo.runtime.gateway.routing import CatalogRouteResolver, RouterProjectTargetResolver
+from wmo.runtime.gateway.routing import (
+    CatalogRouteResolver,
+    GatewayRoutingError,
+    RouterProjectTargetResolver,
+)
 from wmo.runtime.gateway.service import GatewayService, create_gateway_app
-from wmo.runtime.gateway.sqlite.store import SystemGatewayClock
+from wmo.runtime.gateway.sqlite.store import SQLiteGatewayStore, SystemGatewayClock
 from wmo.runtime.gateway.usage import read_usage_report, usage_html
 from wmo.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from wmo.runtime.models.credentials import ModelCredentialError
@@ -76,6 +81,49 @@ class LocalGatewayRuntime:
     state: GatewayLifecycleState
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
+
+
+@dataclass(frozen=True)
+class _ReadyControlStore:
+    """Filter public authority through one frozen startup readiness snapshot."""
+
+    store: SQLiteGatewayStore
+    authorities: frozenset[tuple[str, str, str]]
+
+    def authenticate_key(self, *, raw_key: str) -> None:
+        """Delegate authentication without consulting alias readiness."""
+        self.store.authenticate_key(raw_key=raw_key)
+
+    def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
+        """Return granted aliases that were ready in this process snapshot."""
+        available = {alias for alias, _revision, _digest in self.authorities}
+        return tuple(
+            alias for alias in self.store.granted_aliases(raw_key=raw_key) if alias in available
+        )
+
+    def authorize_request(
+        self,
+        *,
+        raw_key: str,
+        alias: str,
+        request: GatewayRequest,
+        deadline_monotonic: float,
+    ) -> AuthorizationSnapshot:
+        """Authorize only the exact alias revision proven ready at startup."""
+        authorization = self.store.authorize_request(
+            raw_key=raw_key,
+            alias=alias,
+            request=request,
+            deadline_monotonic=deadline_monotonic,
+        )
+        authority = (
+            authorization.alias,
+            authorization.alias_revision_id,
+            authorization.catalog_sha256,
+        )
+        if authority not in self.authorities:
+            raise GatewayRoutingError("authorized alias revision is unavailable in this process")
+        return authorization
 
 
 @contextmanager
@@ -212,8 +260,16 @@ def load_local_gateway(
         """Return precomputed credential and route proof without provider work."""
         return proof
 
+    ready_authorities = frozenset(
+        (
+            item.authorization.alias,
+            item.authorization.alias_revision_id,
+            item.authorization.catalog_sha256,
+        )
+        for item in readiness
+    )
     service = GatewayService(
-        control_store=store,
+        control_store=_ReadyControlStore(store=store, authorities=ready_authorities),
         ledger=ledger,
         routes=routes,
         executor=executor,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -228,14 +229,16 @@ class GatewayManagement:
         key_id: str,
         expires_at: datetime | None = None,
         operation_id: str | None = None,
+        secret_delivery: Callable[[str], Callable[[], None]] | None = None,
     ) -> IssuedVirtualKey:
-        """Issue one virtual key whose raw material appears only in this return value."""
+        """Issue one virtual key and optionally deliver it before durable commit."""
         return self.require_initialized().issue_virtual_key(
             organization_id=self.organization_id,
             identity_id=identity_id,
             key_id=key_id,
             expires_at=expires_at,
             operation_id=operation_id,
+            secret_delivery=secret_delivery,
         )
 
     def revoke_key(self, *, key_id: str) -> bool:

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
+from collections.abc import Callable
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import typer
@@ -247,22 +250,15 @@ def key_issue(
         )
     if output is not None and output.exists():
         raise typer.BadParameter(f"refusing to overwrite existing secret output {output}")
-    output_descriptor = None if output is None else _reserve_secret_output(output)
-    try:
-        with usage_error(ValueError):
-            issued = _management(root).issue_key(
-                identity_id=identity_id,
-                key_id=key_id,
-                expires_at=expires_at,
-                operation_id=operation_id,
-            )
-    except BaseException:
-        if output_descriptor is not None and output is not None:
-            os.close(output_descriptor)
-            output.unlink(missing_ok=True)
-        raise
-    if output_descriptor is not None and output is not None:
-        _write_reserved_secret(output_descriptor, output, issued.raw_key)
+    delivery = None if output is None else partial(_deliver_secret_once, output)
+    with usage_error(ValueError, OSError):
+        issued = _management(root).issue_key(
+            identity_id=identity_id,
+            key_id=key_id,
+            expires_at=expires_at,
+            operation_id=operation_id,
+            secret_delivery=delivery,
+        )
     data: JsonObject = issued.model_dump(mode="json") if json_output else {"prefix": issued.prefix}
     if output is not None:
         data = {"prefix": issued.prefix, "output_path": str(output)}
@@ -391,20 +387,60 @@ def gateway_usage(
     emit_items("identity usage", report.identities, json_output=False)
 
 
-def _reserve_secret_output(path: Path) -> int:
-    """Create and return one private output descriptor before key issuance."""
+def _deliver_secret_once(path: Path, raw_key: str) -> Callable[[], None]:
+    """Durably publish one private secret without overwriting an existing path."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-
-
-def _write_reserved_secret(descriptor: int, path: Path, raw_key: str) -> None:
-    """Write one raw key to its already reserved private output file."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    published = False
     try:
-        os.write(descriptor, f"{raw_key}\n".encode())
+        payload = f"{raw_key}\n".encode()
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count == 0:
+                raise OSError("secret output write made no progress")
+            written += count
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.link(temporary, path)
+        published = True
+        temporary.unlink()
+        _fsync_directory(path.parent)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        if published:
+            path.unlink(missing_ok=True)
+            _fsync_directory_quietly(path.parent)
+        raise
+
+    def cleanup() -> None:
+        """Remove a published secret when its database transaction cannot commit."""
+        path.unlink(missing_ok=True)
+        _fsync_directory_quietly(path.parent)
+
+    return cleanup
+
+
+def _fsync_directory(path: Path) -> None:
+    """Fsync one directory after an atomic secret publication."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    os.chmod(path, 0o600)
+
+
+def _fsync_directory_quietly(path: Path) -> None:
+    """Best-effort fsync one directory during rollback cleanup."""
+    try:
+        _fsync_directory(path)
+    except OSError:
+        return
 
 
 def _require_existing(changed: bool, resource_kind: str, resource_id: str) -> None:
