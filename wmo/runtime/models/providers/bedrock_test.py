@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,7 @@ from wmo.common.models import (
     ToolChoice,
 )
 from wmo.common.tasks import ToolSchema
+from wmo.runtime.models.providers.async_transport import RequestDeadline
 from wmo.runtime.models.providers.bedrock import (
     AWS_DEFAULT_REGION_ENV,
     AWS_REGION_ENV,
@@ -35,6 +37,7 @@ from wmo.runtime.models.providers.bedrock import (
     BedrockClient,
     BedrockRegionError,
     BedrockRuntime,
+    BoundedBedrockClient,
     converse_request,
     converse_response,
     create_bedrock_runtime_client,
@@ -376,11 +379,23 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
     response = resolved.client.complete(_request())
     vectors = embedder.embedding_client.embed(["hello"]) if embedder.embedding_client else ()
 
+    async def complete_through_bounded_lane() -> str | None:
+        """Exercise the catalog-exposed bounded async completion contract."""
+        assert isinstance(resolved.client, BoundedBedrockClient)
+        async_response = await resolved.client.complete_async(
+            _request(),
+            deadline=RequestDeadline.after(1),
+        )
+        return async_response.output.content
+
     assert snapshot.provider == "bedrock"
     assert snapshot.model_id == "us.anthropic.claude-sonnet-4-5"
-    assert isinstance(resolved.client, BedrockClient)
-    assert embedder.embedding_client is embedder.client
+    assert isinstance(resolved.client, BoundedBedrockClient)
+    assert isinstance(embedder.client, BoundedBedrockClient)
+    assert embedder.embedding_client is not embedder.client
+    assert isinstance(embedder.embedding_client, BedrockClient)
     assert response.output.content == "ok"
+    assert asyncio.run(complete_through_bounded_lane()) == "ok"
     assert vectors[0].values == (0.6, 0.8)
 
 

@@ -24,7 +24,11 @@ from wmo.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
 )
 from wmo.runtime.models.providers.azure import AzureClient, bind_azure_api_key
-from wmo.runtime.models.providers.bedrock import BedrockClient, BedrockRuntimeFactory
+from wmo.runtime.models.providers.bedrock import (
+    BedrockClient,
+    BedrockRuntimeFactory,
+    BoundedBedrockClient,
+)
 from wmo.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
 from wmo.runtime.models.providers.openai import OPENAI_BASE_URL, OpenAIClient
 from wmo.runtime.models.providers.openai_compatible import (
@@ -215,18 +219,19 @@ class RuntimeModelCatalog:
                 )
         provider = connection.provider
         if provider == "bedrock":
-            client = BedrockClient(
+            bedrock_client = BedrockClient(
                 model=snapshot,
                 region=connection.region,
                 environment=self._environment,
                 runtime_factory=self._bedrock_runtime_factory,
             )
+            client = BoundedBedrockClient(bedrock_client)
             return ResolvedModel(
                 alias,
                 snapshot,
                 capabilities,
                 client,
-                client if capabilities.supports_embeddings else None,
+                bedrock_client if capabilities.supports_embeddings else None,
             )
         api_key = read_connection_api_key(connection, environment=self._environment)
         if provider == "openai":

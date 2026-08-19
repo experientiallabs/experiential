@@ -109,6 +109,17 @@ class BoundedSyncModelClientAdapter:
         self._client = client
         self._permits = asyncio.Semaphore(maximum_outstanding_calls)
 
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Preserve the existing synchronous completion contract for optimizer callers.
+
+        Args:
+            request: Existing provider-independent model request.
+
+        Returns:
+            The completed response from the wrapped blocking provider.
+        """
+        return self._client.complete(request)
+
     async def complete_async(
         self,
         request: ModelRequest,
