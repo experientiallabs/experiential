@@ -30,6 +30,14 @@ add_deferred_typer(
     help="Set up and manually calibrate a project judge.",
     known_names=("setup", "calibrate"),
 )
+add_deferred_typer(
+    config_app,
+    name="gateway",
+    module="wmo.cli.gateway.app",
+    attr="gateway_app",
+    help="Manage the local authenticated model gateway.",
+    known_names=("init", "status", "provider", "identity", "key", "alias", "grant", "usage"),
+)
 _console = Console(theme=WMO_THEME)
 _CONNECTION_JSON_OPTION = typer.Option(
     None,

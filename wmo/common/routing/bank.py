@@ -62,29 +62,10 @@ class KnnBankManifest(ArtifactEnvelope):
     @field_validator("bank_path")
     @classmethod
     def _require_safe_bank_path(cls, value: str) -> str:
-        """Normalize a safe artifact-relative bank path.
-
-        Args:
-            value: Candidate artifact-relative path.
-
-        Returns:
-            The normalized POSIX path.
-
-        Raises:
-            ValueError: The path can escape the artifact directory.
-        """
         return validate_artifact_file_path(value).as_posix()
 
     @model_validator(mode="after")
     def _require_aligned_bank_scope(self) -> KnnBankManifest:
-        """Validate the bank task, candidate, and evidence-count axes.
-
-        Returns:
-            The validated bank manifest.
-
-        Raises:
-            ValueError: An axis is empty, duplicated, or misaligned.
-        """
         if not self.task_ids or len(set(self.task_ids)) != len(self.task_ids):
             raise ValueError("kNN bank task IDs must be non-empty and unique")
         if not self.candidate_aliases or len(set(self.candidate_aliases)) != len(
@@ -192,11 +173,6 @@ def build_knn_bank(
 ) -> KnnEvidenceBank:
     """Build a normalized bank using eligible fit rows and request-visible task features.
 
-    Completed and observed rows contribute their judged scores. Failed rows are real
-    routing evidence too: a candidate that could not finish the task scores the floor
-    quality of zero, so the fitted policy routes away from unreliable candidates instead
-    of failing closed on missing coverage.
-
     Args:
         dataset: Immutable sparse evaluation with explicit missing and failed rows.
         tasks: Canonical task cases named by the evaluation manifest.
@@ -232,13 +208,11 @@ def build_knn_bank(
         if key in seen_cells:
             raise ValueError("evaluation repeats a fit task, candidate, and repeat cell")
         seen_cells.add(key)
-        if row.status not in {"observed", "completed", "failed"}:
+        if row.status not in {"observed", "completed"}:
             continue
         target_row = row_of[row.task_id]
         target_column = column_of[row.candidate_alias]
-        if row.status == "failed":
-            score_values[target_row][target_column].append(0.0)
-        elif row.score is not None:
+        if row.score is not None:
             score_values[target_row][target_column].append(row.score)
         if row.candidate_cost_usd is not None:
             if row.candidate_cost_usd.value < 0:

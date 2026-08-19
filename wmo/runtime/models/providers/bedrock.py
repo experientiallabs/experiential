@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
@@ -23,7 +24,13 @@ from wmo.common.models import (
     ToolChoice,
     Usage,
 )
+from wmo.runtime.gateway.contracts import GatewayRequest
+from wmo.runtime.models.providers.async_transport import RequestDeadline
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY
+from wmo.runtime.models.providers.bedrock_streaming import (
+    BedrockEventStream,
+    BedrockProviderStream,
+)
 from wmo.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
@@ -40,6 +47,7 @@ from wmo.runtime.models.providers.transport import (
     RetryPolicy,
     run_with_retry,
 )
+from wmo.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 AWS_REGION_ENV = "AWS_REGION"
 AWS_DEFAULT_REGION_ENV = "AWS_DEFAULT_REGION"
@@ -76,6 +84,9 @@ class BedrockRuntime(Protocol):
 
     def converse(self, **request: object) -> Mapping[str, object]:
         """Send one Converse request and return the decoded response object."""
+
+    def converse_stream(self, **request: object) -> Mapping[str, object]:
+        """Open one Converse EventStream and return its response envelope."""
 
     def invoke_model(self, **request: object) -> Mapping[str, object]:
         """Send one InvokeModel request and return the decoded response object."""
@@ -204,6 +215,31 @@ class BedrockClient:
             latency_seconds=time.monotonic() - started_at,
         )
 
+    def open_stream(
+        self,
+        request: ModelRequest,
+        *,
+        retry_policy: RetryPolicy | None = None,
+    ) -> BedrockEventStream:
+        """Open one blocking native Converse EventStream without consuming it.
+
+        Args:
+            request: Provider-neutral request translated to Converse.
+            retry_policy: Optional caller-owned response-opening attempt limit.
+
+        Returns:
+            The synchronous provider EventStream from the response envelope.
+        """
+        payload = converse_request(self._model.model_id, request)
+        response = self._call_with_retry(
+            lambda: self._runtime().converse_stream(**payload),
+            retry_policy=retry_policy,
+        )
+        stream = response.get("stream")
+        if stream is None or not hasattr(stream, "__iter__") or not hasattr(stream, "close"):
+            raise ProviderResponseError("Bedrock Converse stream is missing its EventStream")
+        return cast("BedrockEventStream", stream)
+
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
         """Embed ordered text through the configured Bedrock embedding model.
 
@@ -267,6 +303,8 @@ class BedrockClient:
     def _call_with_retry(
         self,
         operation: Callable[[], Mapping[str, object]],
+        *,
+        retry_policy: RetryPolicy | None = None,
     ) -> Mapping[str, object]:
         """Retry one Bedrock call on the same region and model without botocore multiplication."""
 
@@ -283,7 +321,7 @@ class BedrockClient:
             except Exception as exc:
                 raise _as_transport_error(exc) from exc
 
-        return run_with_retry(send, policy=self._retry_policy)
+        return run_with_retry(send, policy=retry_policy or self._retry_policy)
 
 
 class BoundedBedrockClient(BoundedSyncModelClientAdapter):
@@ -310,6 +348,69 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
             client,
             maximum_outstanding_calls=maximum_outstanding_calls,
         )
+        self._bedrock_client = client
+
+    async def stream(
+        self,
+        request: GatewayRequest,
+        *,
+        deadline: RequestDeadline,
+        idempotency_key: str,
+        retry_policy: RetryPolicy | None = None,
+    ) -> BedrockProviderStream:
+        """Open native Bedrock streaming behind the shared bounded worker admission.
+
+        Args:
+            request: Canonical streaming gateway request.
+            deadline: Immutable request-wide deadline.
+            idempotency_key: Deployment-scoped identity unavailable on Bedrock's wire.
+            retry_policy: Optional caller-owned physical response-opening limit.
+
+        Returns:
+            A cancellable provider-neutral stream holding one worker permit until cleanup.
+
+        Raises:
+            ValueError: The canonical request did not ask for streaming.
+        """
+        del idempotency_key
+        if not request.stream:
+            raise ValueError("gateway provider stream requires request.stream")
+        await self._acquire(deadline)
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._bedrock_client.open_stream,
+                gateway_model_request(request),
+                retry_policy=retry_policy,
+            )
+        )
+        try:
+            async with asyncio.timeout(deadline.attempt_timeout()):
+                upstream = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.add_done_callback(self._release_stream_open_permit)
+            raise
+        except Exception:
+            task.add_done_callback(self._release_stream_open_permit)
+            raise
+        return BedrockProviderStream(
+            upstream,
+            deadline=deadline,
+            release=self._permits.release,
+        )
+
+    def _release_stream_open_permit(self, task: asyncio.Task[BedrockEventStream]) -> None:
+        """Close an abandoned response before releasing its blocking-worker admission."""
+        if task.cancelled() or task.exception() is not None:
+            self._permits.release()
+            return
+        upstream = task.result()
+        cleanup = asyncio.create_task(asyncio.to_thread(upstream.close))
+        cleanup.add_done_callback(self._release_abandoned_stream_permit)
+
+    def _release_abandoned_stream_permit(self, task: asyncio.Task[None]) -> None:
+        """Release admission after abandoned EventStream closure stops."""
+        del task
+        self._permits.release()
 
 
 def _boto_session_region() -> str | None:

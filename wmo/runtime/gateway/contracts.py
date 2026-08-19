@@ -241,6 +241,7 @@ class GatewayFailureClass(StrEnum):
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
     AUTHENTICATION = "authentication"
     AUTHORIZATION = "authorization"
+    QUOTA_EXCEEDED = "quota_exceeded"
     THROTTLED = "throttled"
     TRANSPORT = "transport"
     TIMEOUT = "timeout"
@@ -286,6 +287,7 @@ class AuthorizationSnapshot(ContractModel):
     catalog_sha256: Sha256
     canonical_request_sha256: Sha256
     caller_operation_sha256: Sha256 | None = None
+    refusal_failover: bool = False
     deadline_monotonic: float = Field(gt=0)
 
 

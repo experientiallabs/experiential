@@ -453,6 +453,87 @@ def test_anthropic_stream_normalizes_cache_usage_and_tool_fragments() -> None:
     assert events[4].usage.cached_input_tokens == 3
 
 
+def test_anthropic_text_stream_emits_text_usage_and_completion() -> None:
+    """Native Messages text streaming commits and emits one complete lifecycle."""
+    frames = b"".join(
+        (
+            _sse(
+                {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 3,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                        }
+                    },
+                },
+                event="message_start",
+            ),
+            _sse(
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                event="content_block_start",
+            ),
+            _sse(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "hello"},
+                },
+                event="content_block_delta",
+            ),
+            _sse({"type": "content_block_stop", "index": 0}, event="content_block_stop"),
+            _sse(
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 2},
+                },
+                event="message_delta",
+            ),
+            _sse({"type": "message_stop"}, event="message_stop"),
+        )
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """Require native streaming and return the Anthropic text fixture."""
+        assert json.loads(request.content)["stream"] is True
+        return httpx.Response(200, stream=_ChunkStream((frames,)))
+
+    async def scenario() -> tuple[list[GatewayEvent], bool]:
+        """Consume one native Messages text stream and its commitment state."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = AnthropicClient(
+                model=_snapshot("anthropic"),
+                api_key="fixture-key",
+                base_url="https://anthropic.test/v1",
+                transport=HttpxAsyncJsonTransport(http_client),
+            )
+            stream = await client.stream(
+                _request(GatewayApiSurface.CHAT_COMPLETIONS),
+                deadline=RequestDeadline.after(2),
+                idempotency_key="anthropic-text-attempt",
+            )
+            return await _collect(stream), stream.committed
+
+    events, committed = asyncio.run(scenario())
+
+    assert [event.kind for event in events] == [
+        GatewayEventKind.TEXT_DELTA,
+        GatewayEventKind.USAGE,
+        GatewayEventKind.COMPLETED,
+    ]
+    assert events[0].text_delta == "hello"
+    assert events[1].usage is not None
+    assert events[1].usage.input_tokens == 3
+    assert events[1].usage.output_tokens == 2
+    assert committed is True
+
+
 def test_openai_compatible_stream_emits_refusal_reasoning_usage_and_terminal() -> None:
     """Generic Chat streaming retains refusal semantics and reported reasoning units."""
     frames = b"".join(

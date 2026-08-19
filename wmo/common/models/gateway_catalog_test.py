@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
+import pytest
+from pydantic import ValidationError
+
 from wmo.common.core.artifacts import ArtifactInput, sha256_json
 from wmo.common.models.catalog import (
     BillingSource,
     ConnectionConfig,
+    GatewayDeploymentMetadata,
+    GatewayEquivalenceCertification,
+    GatewayPoolRecord,
     ModelCatalog,
     ModelRecord,
     SFTModelProvenance,
 )
-from wmo.common.models.gateway_catalog import ExactModelDeployment, normalize_gateway_catalog
+from wmo.common.models.gateway_catalog import (
+    ExactModelDeployment,
+    ExactModelPool,
+    normalize_gateway_catalog,
+)
 from wmo.common.models.model import ModelCapabilities, ModelSnapshot
 
 _DIGEST = "a" * 64
@@ -195,3 +207,120 @@ def test_tinker_and_sft_records_are_not_gateway_deployments() -> None:
 
     assert tuple(item.source_alias for item in normalized.deployments) == ("regular",)
     assert normalized.identity_sha256() == normalize_gateway_catalog(catalog).identity_sha256()
+
+
+def test_operator_certified_pool_preserves_explicit_deployment_order_and_provenance() -> None:
+    """Only one authored certification groups deployments and fixes waterfall priority."""
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-one",
+        provenance="operator comparison run 2026-08-18",
+        evidence_sha256=_DIGEST,
+        certified_at=datetime(2026, 8, 18, tzinfo=UTC),
+    )
+    catalog = ModelCatalog(
+        connections={
+            "anthropic": ConnectionConfig(provider="anthropic"),
+            "openai": ConnectionConfig(provider="openai"),
+        },
+        models={
+            "route-a": ModelRecord(
+                connection="openai",
+                model="provider-a",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id="exact-certified"),
+            ),
+            "route-b": ModelRecord(
+                connection="anthropic",
+                model="provider-b",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id="exact-certified"),
+            ),
+        },
+        gateway_pools={
+            "certified-pool": GatewayPoolRecord(
+                exact_model_id="exact-certified",
+                deployment_aliases=("route-b", "route-a"),
+                equivalence=certification,
+            )
+        },
+    )
+
+    normalized = normalize_gateway_catalog(catalog)
+
+    assert normalized.pools == (
+        ExactModelPool(
+            pool_id="certified-pool",
+            exact_model_id="exact-certified",
+            deployment_ids=("route-b", "route-a"),
+            equivalence=certification,
+        ),
+    )
+    assert normalized.identity_sha256() == normalize_gateway_catalog(catalog).identity_sha256()
+
+
+def test_equivalence_catalog_rejects_implicit_false_or_ambiguous_grouping() -> None:
+    """Missing exact declarations, training handles, and repeated membership fail closed."""
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-one",
+        provenance="operator comparison run",
+        evidence_sha256=_DIGEST,
+        certified_at=datetime(2026, 8, 18, tzinfo=UTC),
+    )
+    with pytest.raises(ValidationError, match="declare exact model identity"):
+        ModelCatalog(
+            connections={"openai": ConnectionConfig(provider="openai")},
+            models={
+                "route-a": ModelRecord(
+                    connection="openai",
+                    model="provider-a",
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                ),
+                "route-b": ModelRecord(
+                    connection="openai",
+                    model="provider-b",
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                ),
+            },
+            gateway_pools={
+                "pool": GatewayPoolRecord(
+                    exact_model_id="exact-certified",
+                    deployment_aliases=("route-a", "route-b"),
+                    equivalence=certification,
+                )
+            },
+        )
+    with pytest.raises(ValidationError, match="more than one pool"):
+        ModelCatalog(
+            connections={"openai": ConnectionConfig(provider="openai")},
+            models={
+                alias: ModelRecord(
+                    connection="openai",
+                    model=alias,
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    gateway=GatewayDeploymentMetadata(exact_model_id="exact-certified"),
+                )
+                for alias in ("route-a", "route-b", "route-c")
+            },
+            gateway_pools={
+                "pool-a": GatewayPoolRecord(
+                    exact_model_id="exact-certified",
+                    deployment_aliases=("route-a", "route-b"),
+                    equivalence=certification,
+                ),
+                "pool-b": GatewayPoolRecord(
+                    exact_model_id="exact-certified",
+                    deployment_aliases=("route-b", "route-c"),
+                    equivalence=certification,
+                ),
+            },
+        )
+
+
+def test_normalized_multi_deployment_pool_requires_operator_certification() -> None:
+    """The runtime snapshot cannot construct implicit multi-route equivalence."""
+    with pytest.raises(ValidationError, match="operator equivalence certification"):
+        ExactModelPool(
+            pool_id="unsafe",
+            exact_model_id="exact-one",
+            deployment_ids=("route-a", "route-b"),
+        )

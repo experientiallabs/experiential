@@ -8,7 +8,7 @@ import stat
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 
 
 class GatewaySchemaError(RuntimeError):
@@ -319,11 +319,206 @@ _MIGRATION_4 = (
     """,
 )
 
+_MIGRATION_5 = (
+    """
+    ALTER TABLE alias_revisions
+    ADD COLUMN refusal_failover INTEGER NOT NULL DEFAULT 0 CHECK (refusal_failover IN (0, 1))
+    """,
+)
+
+_MIGRATION_6 = (
+    "ALTER TABLE gateway_attempts RENAME TO gateway_attempts_v5",
+    """
+    CREATE TABLE gateway_attempts (
+        attempt_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        organization_id TEXT NOT NULL,
+        attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 0),
+        route_depth INTEGER NOT NULL CHECK (route_depth >= 0),
+        deployment_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        exact_model_id TEXT NOT NULL,
+        pool_id TEXT NOT NULL,
+        catalog_sha256 TEXT NOT NULL CHECK (length(catalog_sha256) = 64),
+        billing_source TEXT NOT NULL DEFAULT 'customer_managed'
+            CHECK (billing_source IN ('customer_managed', 'host_managed')),
+        pricing_source TEXT,
+        pricing_effective_at TEXT,
+        route_reason TEXT,
+        fallback_reason TEXT,
+        input_rate INTEGER CHECK (input_rate IS NULL OR input_rate >= 0),
+        cached_input_rate INTEGER CHECK (cached_input_rate IS NULL OR cached_input_rate >= 0),
+        output_rate INTEGER CHECK (output_rate IS NULL OR output_rate >= 0),
+        reasoning_rate INTEGER CHECK (reasoning_rate IS NULL OR reasoning_rate >= 0),
+        state TEXT NOT NULL CHECK (state IN (
+            'dispatched', 'completed', 'failed', 'cancelled',
+            'incomplete', 'unknown_after_crash'
+        )),
+        started_at TEXT NOT NULL,
+        terminal_at TEXT,
+        failure_class TEXT,
+        input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
+        cached_input_tokens INTEGER CHECK (
+            cached_input_tokens IS NULL OR cached_input_tokens >= 0
+        ),
+        output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
+        reasoning_tokens INTEGER CHECK (reasoning_tokens IS NULL OR reasoning_tokens >= 0),
+        usage_source TEXT CHECK (
+            usage_source IS NULL OR usage_source IN ('observed', 'estimated', 'unknown')
+        ),
+        estimated_cost_micro_usd INTEGER CHECK (
+            estimated_cost_micro_usd IS NULL OR estimated_cost_micro_usd >= 0
+        ),
+        content_retained INTEGER NOT NULL DEFAULT 0 CHECK (content_retained = 0),
+        UNIQUE (organization_id, attempt_id),
+        UNIQUE (request_id, attempt_ordinal),
+        FOREIGN KEY (organization_id, request_id)
+            REFERENCES gateway_requests (organization_id, request_id)
+    ) STRICT
+    """,
+    """
+    INSERT INTO gateway_attempts (
+        attempt_id, request_id, organization_id, attempt_ordinal, route_depth,
+        deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
+        billing_source, pricing_source, pricing_effective_at, route_reason, fallback_reason,
+        input_rate, cached_input_rate, output_rate, reasoning_rate, state, started_at,
+        terminal_at, failure_class, input_tokens, cached_input_tokens, output_tokens,
+        reasoning_tokens, usage_source, estimated_cost_micro_usd, content_retained
+    )
+    SELECT
+        attempt_id, request_id, organization_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY request_id ORDER BY started_at, attempt_id
+        ) - 1,
+        route_depth, deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
+        billing_source, pricing_source, pricing_effective_at, route_reason, fallback_reason,
+        input_rate, cached_input_rate, output_rate, reasoning_rate, state, started_at,
+        terminal_at, failure_class, input_tokens, cached_input_tokens, output_tokens,
+        reasoning_tokens, usage_source, estimated_cost_micro_usd, content_retained
+    FROM gateway_attempts_v5
+    """,
+    "DROP TABLE gateway_attempts_v5",
+    """
+    CREATE INDEX gateway_attempts_usage
+    ON gateway_attempts (organization_id, terminal_at, state)
+    """,
+)
+
+_MIGRATION_7 = (
+    """
+    ALTER TABLE gateway_attempts
+    ADD COLUMN budget_period_start TEXT CHECK (
+        budget_period_start IS NULL OR (
+            length(budget_period_start) = 25
+            AND substr(budget_period_start, 8) = '-01T00:00:00+00:00'
+        )
+    )
+    """,
+    """
+    ALTER TABLE gateway_attempts
+    ADD COLUMN budget_reserved_micro_usd INTEGER CHECK (
+        budget_reserved_micro_usd IS NULL OR budget_reserved_micro_usd >= 0
+    )
+    """,
+    """
+    ALTER TABLE gateway_attempts
+    ADD COLUMN budget_settled_micro_usd INTEGER CHECK (
+        budget_settled_micro_usd IS NULL OR budget_settled_micro_usd >= 0
+    )
+    """,
+    """
+    UPDATE gateway_attempts
+    SET budget_period_start = substr(started_at, 1, 7) || '-01T00:00:00+00:00',
+        budget_settled_micro_usd = estimated_cost_micro_usd
+    """,
+    """
+    CREATE TRIGGER gateway_attempts_require_budget_period
+    BEFORE INSERT ON gateway_attempts
+    WHEN NEW.budget_period_start IS NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'gateway attempt requires a UTC budget period');
+    END
+    """,
+    """
+    CREATE TABLE gateway_monthly_budgets (
+        budget_id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        period_start TEXT NOT NULL CHECK (
+            length(period_start) = 25
+            AND substr(period_start, 8) = '-01T00:00:00+00:00'
+        ),
+        scope_kind TEXT NOT NULL CHECK (
+            scope_kind IN ('team', 'identity', 'pool', 'deployment')
+        ),
+        scope_key TEXT NOT NULL,
+        identity_id TEXT,
+        alias_id TEXT,
+        pool_id TEXT,
+        deployment_id TEXT,
+        limit_micro_usd INTEGER NOT NULL CHECK (limit_micro_usd >= 0),
+        reserved_micro_usd INTEGER NOT NULL DEFAULT 0 CHECK (reserved_micro_usd >= 0),
+        settled_micro_usd INTEGER NOT NULL DEFAULT 0 CHECK (settled_micro_usd >= 0),
+        unknown_cost_attempts INTEGER NOT NULL DEFAULT 0 CHECK (unknown_cost_attempts >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (organization_id, period_start, scope_key),
+        CHECK (
+            (scope_kind = 'team' AND identity_id IS NULL AND alias_id IS NULL
+                AND pool_id IS NULL AND deployment_id IS NULL)
+            OR
+            (scope_kind = 'identity' AND identity_id IS NOT NULL AND alias_id IS NULL
+                AND pool_id IS NULL AND deployment_id IS NULL)
+            OR
+            (scope_kind = 'pool' AND identity_id IS NULL AND alias_id IS NOT NULL
+                AND pool_id IS NOT NULL AND deployment_id IS NULL)
+            OR
+            (scope_kind = 'deployment' AND identity_id IS NULL AND alias_id IS NOT NULL
+                AND pool_id IS NOT NULL AND deployment_id IS NOT NULL)
+        ),
+        FOREIGN KEY (organization_id) REFERENCES organizations (organization_id),
+        FOREIGN KEY (organization_id, identity_id)
+            REFERENCES identities (organization_id, identity_id),
+        FOREIGN KEY (organization_id, alias_id)
+            REFERENCES gateway_aliases (organization_id, alias_id)
+    ) STRICT
+    """,
+    """
+    CREATE TABLE gateway_attempt_budget_charges (
+        budget_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        reserved_micro_usd INTEGER CHECK (
+            reserved_micro_usd IS NULL OR reserved_micro_usd >= 0
+        ),
+        settled_micro_usd INTEGER CHECK (
+            settled_micro_usd IS NULL OR settled_micro_usd >= 0
+        ),
+        PRIMARY KEY (budget_id, attempt_id),
+        FOREIGN KEY (budget_id) REFERENCES gateway_monthly_budgets (budget_id),
+        FOREIGN KEY (attempt_id) REFERENCES gateway_attempts (attempt_id)
+    ) STRICT
+    """,
+    """
+    CREATE INDEX gateway_monthly_budgets_period
+    ON gateway_monthly_budgets (organization_id, period_start, scope_kind)
+    """,
+    """
+    CREATE INDEX gateway_attempts_budget_period
+    ON gateway_attempts (organization_id, budget_period_start, pool_id, deployment_id)
+    """,
+    """
+    CREATE INDEX gateway_attempt_budget_charges_attempt
+    ON gateway_attempt_budget_charges (attempt_id)
+    """,
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
     3: _MIGRATION_3,
     4: _MIGRATION_4,
+    5: _MIGRATION_5,
+    6: _MIGRATION_6,
+    7: _MIGRATION_7,
 }
 
 
@@ -479,7 +674,9 @@ def _require_schema_objects(connection: sqlite3.Connection) -> None:
         "alias_revisions",
         "catalog_snapshot_refs",
         "gateway_aliases",
+        "gateway_attempt_budget_charges",
         "gateway_attempts",
+        "gateway_monthly_budgets",
         "gateway_requests",
         "identities",
         "identity_alias_grants",

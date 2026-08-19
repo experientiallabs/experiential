@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -51,9 +53,24 @@ from wmo.optimize.router.fit.spec import (
     RouterOptimizationSpec,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class RouterOptimizationError(ValueError):
     """Immutable evaluation evidence cannot support a conservative offline policy."""
+
+
+@dataclass(frozen=True)
+class BaselineSelection:
+    """Chosen conservative baseline plus the fit tasks it lacks score evidence on.
+
+    Args:
+        alias: Baseline candidate frozen into the fitted policy.
+        uncovered_task_ids: Fit tasks with no baseline score evidence, in bank order.
+    """
+
+    alias: ModelAlias
+    uncovered_task_ids: tuple[str, ...]
 
 
 class RouterOptimizer:
@@ -158,6 +175,15 @@ class RouterOptimizer:
             feature_extractor=self._feature_extractor,
         )
         baseline = choose_baseline(bank, incumbent_alias=spec.incumbent_alias)
+        if baseline.uncovered_task_ids:
+            logger.warning(
+                "named incumbent %s lacks score evidence on %d of %d fit tasks; fitting on "
+                "the covered tasks only (uncovered: %s)",
+                baseline.alias,
+                len(baseline.uncovered_task_ids),
+                len(bank.task_ids),
+                ", ".join(baseline.uncovered_task_ids),
+            )
         bank_manifest, bank_input = _persist_bank(
             self._store,
             spec,
@@ -579,18 +605,25 @@ def choose_baseline(
     bank: KnnEvidenceBank,
     *,
     incumbent_alias: ModelAlias | None,
-) -> ModelAlias:
-    """Choose a fully scored incumbent or the fully scored weighted best fixed model.
+) -> BaselineSelection:
+    """Choose a scored incumbent or the fully scored weighted best fixed model.
+
+    A named incumbent may lack score evidence on a strict subset of fit tasks: the fit
+    proceeds on the covered tasks and the uncovered task IDs are surfaced explicitly in
+    the selection and the frozen policy. An incumbent with zero covered fit tasks fails
+    closed. The automatic fallback still requires complete score coverage because it
+    compares candidates against each other over the whole fit workload.
 
     Args:
         bank: Fit-only evidence bank with explicit missing score and cost cells.
         incumbent_alias: Optional customer-named quality baseline.
 
     Returns:
-        A candidate with score evidence on every fit task.
+        The baseline alias plus any fit tasks without baseline score evidence.
 
     Raises:
-        RouterOptimizationError: The named or automatic baseline lacks complete score coverage.
+        RouterOptimizationError: The named incumbent has zero covered fit tasks, or no
+            automatic fallback candidate has complete score coverage.
     """
     aliases = bank.candidate_aliases
     if incumbent_alias is not None:
@@ -599,11 +632,17 @@ def choose_baseline(
                 f"named incumbent {incumbent_alias} is not an evaluated candidate"
             )
         column = aliases.index(incumbent_alias)
-        if bool(np.any(np.isnan(bank.scores[:, column]))):
+        uncovered = np.isnan(bank.scores[:, column])
+        if bool(np.all(uncovered)):
             raise RouterOptimizationError(
-                f"named incumbent {incumbent_alias} lacks score evidence on every fit task"
+                f"named incumbent {incumbent_alias} has score evidence on zero fit tasks"
             )
-        return incumbent_alias
+        uncovered_task_ids = tuple(
+            task_id
+            for task_id, missing in zip(bank.task_ids, uncovered.tolist(), strict=True)
+            if missing
+        )
+        return BaselineSelection(alias=incumbent_alias, uncovered_task_ids=uncovered_task_ids)
     eligible = []
     for column, alias in enumerate(aliases):
         scores = bank.scores[:, column]
@@ -616,7 +655,8 @@ def choose_baseline(
         raise RouterOptimizationError(
             "no candidate has score evidence on every fit task for a conservative fallback"
         )
-    return min(eligible, key=lambda item: (-item[1], item[2], item[0]))[0]
+    chosen = min(eligible, key=lambda item: (-item[1], item[2], item[0]))[0]
+    return BaselineSelection(alias=chosen, uncovered_task_ids=())
 
 
 def _require_dataset_tasks(
@@ -805,14 +845,14 @@ def _persist_policy(
     evaluation_input: ArtifactInput,
     bank: KnnBankManifest,
     bank_input: ArtifactInput,
-    baseline: ModelAlias,
+    baseline: BaselineSelection,
 ) -> tuple[KnnRouterPolicy, ArtifactInput]:
     """Lock the complete fit-time policy before any held-out report is built."""
     inputs = sorted_evaluation_inputs((evaluation_input, bank_input))
     material = {
         "version": "guarded-knn-policy-v1",
         "inputs": [item.model_dump(mode="json") for item in inputs],
-        "baseline_alias": baseline,
+        "baseline_alias": baseline.alias,
         "candidates": [
             item.model_dump(mode="json") for item in dataset.manifest.candidate_snapshots
         ],
@@ -833,13 +873,16 @@ def _persist_policy(
         "evaluation_protocols_sha256": bank.evaluation_protocols_sha256,
         "judgment_status": spec.judgment_status,
     }
+    if baseline.uncovered_task_ids:
+        material["baseline_uncovered_fit_task_ids"] = list(baseline.uncovered_task_ids)
     policy = KnnRouterPolicy(
         schema_version=1,
         created_at=spec.created_at,
         inputs=inputs,
         code_revision=spec.code_revision,
         policy_id=stable_id("router-policy", material),
-        baseline_alias=baseline,
+        baseline_alias=baseline.alias,
+        baseline_uncovered_fit_task_ids=baseline.uncovered_task_ids,
         candidates=dataset.manifest.candidate_snapshots,
         embedder_alias=spec.embedder_alias,
         embedder=spec.embedder,

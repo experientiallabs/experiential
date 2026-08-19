@@ -30,6 +30,8 @@ from wmo.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from wmo.runtime.gateway.interfaces import GatewayClock
+from wmo.runtime.gateway.sqlite import key_delivery
+from wmo.runtime.gateway.sqlite.alias_activation import alias_activation_transaction
 from wmo.runtime.gateway.sqlite.migrations import connect_database, initialize_database
 from wmo.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
@@ -58,6 +60,26 @@ class OperationReplayUnavailableError(GatewayStoreError):
     """A completed one-time key operation cannot reveal its raw key again."""
 
 
+class OperationOutcomeUnknownError(GatewayStoreError):
+    """A one-time key operation could not prove its durable commit outcome."""
+
+    def __init__(self, *, issued: IssuedVirtualKey) -> None:
+        """Create a content-free recovery error for one non-secret key identifier."""
+        self.issued = issued
+        super().__init__(
+            "operation_outcome_unknown: preserve the delivered secret and inspect key status "
+            f"for {issued.key_id!r} before retrying"
+        )
+
+
+class KeyIssuanceCommitError(GatewayStoreError):
+    """A virtual-key transaction was proven not to have committed."""
+
+
+class KeyIssuanceConflictError(GatewayStoreError):
+    """Virtual-key issuance conflicts with existing gateway authority."""
+
+
 class SystemGatewayClock:
     """Production wall and monotonic clock implementation."""
 
@@ -72,6 +94,8 @@ class SystemGatewayClock:
 
 class SQLiteGatewayStore(ProviderConnectionStoreMixin):
     """SQLite implementation of gateway authority and management operations."""
+
+    _store_error = GatewayStoreError
 
     def __init__(
         self,
@@ -102,6 +126,11 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
     def pepper_path(self) -> Path:
         """Return the user-only virtual-key pepper path."""
         return self._pepper.path
+
+    @property
+    def busy_timeout_ms(self) -> int:
+        """Return the configured SQLite lock-wait bound."""
+        return self._busy_timeout_ms
 
     def create_organization(
         self,
@@ -196,6 +225,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         key_id: str,
         expires_at: datetime | None = None,
         operation_id: str | None = None,
+        secret_delivery: key_delivery.KeyDeliverySink | None = None,
     ) -> IssuedVirtualKey:
         """Issue a 256-bit virtual key and persist only its HMAC fingerprint.
 
@@ -205,11 +235,15 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             key_id: Stable non-secret credential ID.
             expires_at: Optional timezone-aware expiry.
             operation_id: Optional retry-safe operation ID.
+            secret_delivery: Optional transactional one-time secret sink. The sink
+                returns cleanup that removes its published output if commit fails.
 
         Returns:
             One-time receipt containing the raw key.
 
         Raises:
+            KeyIssuanceConflictError: The requested key conflicts with existing authority.
+            OperationOutcomeUnknownError: Commit outcome cannot be proven after delivery.
             OperationReplayUnavailableError: A retry names an already issued key operation.
         """
         expires_text = None if expires_at is None else utc_text(expires_at)
@@ -228,47 +262,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         fingerprint = fingerprint_virtual_key(raw_key, pepper)
         created_at = self._clock.now()
         created_text = utc_text(created_at)
-        with self._transaction() as connection:
-            replay = self._operation_replay(
-                connection,
-                organization_id=organization_id,
-                operation_id=operation_id,
-                operation_kind="issue_virtual_key",
-                request_sha256=request_sha256,
-            )
-            if replay is not None:
-                raise OperationReplayUnavailableError(
-                    f"virtual key {replay!r} was already issued and cannot be revealed again"
-                )
-            connection.execute(
-                """
-                INSERT INTO virtual_keys (
-                    key_id, organization_id, identity_id, prefix, fingerprint_version,
-                    fingerprint_sha256, expires_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    key_id,
-                    organization_id,
-                    identity_id,
-                    prefix,
-                    pepper.version,
-                    fingerprint,
-                    expires_text,
-                    created_text,
-                ),
-            )
-            self._record_operation(
-                connection,
-                organization_id=organization_id,
-                operation_id=operation_id,
-                operation_kind="issue_virtual_key",
-                request_sha256=request_sha256,
-                resource_kind="virtual_key",
-                resource_id=key_id,
-                created_at=created_text,
-            )
-        return IssuedVirtualKey(
+        issued = IssuedVirtualKey(
             key_id=key_id,
             organization_id=organization_id,
             identity_id=identity_id,
@@ -277,6 +271,108 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             expires_at=expires_at,
             created_at=created_at,
         )
+        delivery_hooks: key_delivery.KeyDeliveryHooks | None = None
+        commit_error: BaseException | None = None
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                replay = self._operation_replay(
+                    connection,
+                    organization_id=organization_id,
+                    operation_id=operation_id,
+                    operation_kind="issue_virtual_key",
+                    request_sha256=request_sha256,
+                )
+                if replay is not None:
+                    raise OperationReplayUnavailableError(
+                        f"virtual key {replay!r} was already issued and cannot be revealed again"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO virtual_keys (
+                        key_id, organization_id, identity_id, prefix, fingerprint_version,
+                        fingerprint_sha256, expires_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key_id,
+                        organization_id,
+                        identity_id,
+                        prefix,
+                        pepper.version,
+                        fingerprint,
+                        expires_text,
+                        created_text,
+                    ),
+                )
+                if secret_delivery is not None:
+                    delivery_hooks = secret_delivery(
+                        raw_key,
+                        key_delivery.KeyDeliveryEvidence(
+                            organization_id=organization_id,
+                            identity_id=identity_id,
+                            key_id=key_id,
+                            operation_id=operation_id,
+                            request_sha256=request_sha256,
+                            prefix=prefix,
+                            fingerprint_version=pepper.version,
+                            fingerprint_sha256=fingerprint,
+                            expires_at=expires_text,
+                            created_at=created_text,
+                        ),
+                    )
+                self._record_operation(
+                    connection,
+                    organization_id=organization_id,
+                    operation_id=operation_id,
+                    operation_kind="issue_virtual_key",
+                    request_sha256=request_sha256,
+                    resource_kind="virtual_key",
+                    resource_id=key_id,
+                    created_at=created_text,
+                )
+                try:
+                    connection.execute("COMMIT")
+                except BaseException as error:  # noqa: BLE001 - COMMIT outcome is ambiguous
+                    commit_error = error
+            except BaseException as body_error:
+                try:
+                    connection.execute("ROLLBACK")
+                except BaseException as rollback_error:
+                    if delivery_hooks is not None:
+                        raise OperationOutcomeUnknownError(issued=issued) from rollback_error
+                    raise body_error from rollback_error
+                if delivery_hooks is not None:
+                    delivery_hooks.rollback()
+                if isinstance(body_error, sqlite3.IntegrityError):
+                    raise KeyIssuanceConflictError(
+                        "virtual key issuance conflicts with existing gateway authority"
+                    ) from None
+                raise
+
+        if commit_error is None:
+            return issued
+        outcome = key_delivery.reconcile_key_issue(
+            self.database_path,
+            busy_timeout_ms=self._busy_timeout_ms,
+            organization_id=organization_id,
+            identity_id=identity_id,
+            key_id=key_id,
+            prefix=prefix,
+            fingerprint_version=pepper.version,
+            fingerprint=fingerprint,
+            expires_at=expires_text,
+            created_at=created_text,
+            operation_id=operation_id,
+            request_sha256=request_sha256,
+        )
+        if outcome is True:
+            return issued
+        if outcome is False:
+            if delivery_hooks is not None:
+                delivery_hooks.rollback()
+            raise KeyIssuanceCommitError("virtual key issuance did not commit") from commit_error
+        raise OperationOutcomeUnknownError(issued=issued) from commit_error
 
     def revoke_virtual_key(self, *, organization_id: str, key_id: str) -> bool:
         """Revoke a key idempotently.
@@ -353,6 +449,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         snapshot_ref: str,
         catalog_sha256: Sha256,
         provider_connections: tuple[ProviderConnectionBinding, ...] = (),
+        refusal_failover: bool = False,
     ) -> None:
         """Create and atomically activate one immutable alias revision.
 
@@ -365,11 +462,22 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             snapshot_ref: Registered catalog snapshot reference.
             catalog_sha256: Exact normalized catalog digest.
             provider_connections: Exact active connection revisions used by the snapshot.
+            refusal_failover: Whether typed precommit refusals may advance within the pool.
         """
         if isinstance(target, ProjectTarget) and target.catalog_sha256 != catalog_sha256:
             raise GatewayStoreError("project target catalog digest differs from alias activation")
         now = utc_text(self._clock.now())
-        with self._transaction() as connection:
+        with alias_activation_transaction(
+            connect=self._connect,
+            organization_id=organization_id,
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            target=target,
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            refusal_failover=refusal_failover,
+        ) as connection:
             snapshot = connection.execute(
                 """
                 SELECT 1 FROM catalog_snapshot_refs
@@ -420,8 +528,9 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 """
                 INSERT INTO alias_revisions (
                     revision_id, organization_id, alias_id, revision_number, target_kind,
-                    pool_id, project_ref, activation_ref, catalog_sha256, snapshot_ref, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pool_id, project_ref, activation_ref, catalog_sha256, snapshot_ref,
+                    refusal_failover, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     revision_id,
@@ -434,6 +543,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                     activation_ref,
                     catalog_sha256,
                     snapshot_ref,
+                    int(refusal_failover),
                     now,
                 ),
             )
@@ -581,7 +691,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             row = connection.execute(
                 """
                 SELECT a.alias_id, a.alias_name, a.active_revision_id,
-                       r.target_kind, r.pool_id, r.project_ref, r.activation_ref, r.catalog_sha256
+                       r.target_kind, r.pool_id, r.project_ref, r.activation_ref,
+                       r.catalog_sha256, r.refusal_failover
                 FROM identity_alias_grants AS g
                 JOIN identities AS i
                   ON i.organization_id = g.organization_id AND i.identity_id = g.identity_id
@@ -621,7 +732,20 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             deadline_monotonic=deadline_monotonic,
             surface=request.surface,
             caller_operation_sha256=caller_operation,
+            refusal_failover=bool(row["refusal_failover"]),
         )
+
+    def authenticate_key(self, *, raw_key: str) -> None:
+        """Validate one virtual key without loading grants or request content.
+
+        Args:
+            raw_key: Presented virtual key.
+
+        Raises:
+            InvalidVirtualKeyError: The key is unknown, expired, or revoked.
+        """
+        with self._transaction() as connection:
+            self._authenticate_in_transaction(connection, raw_key)
 
     def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
         """List only active aliases granted to the key-derived identity.
@@ -632,21 +756,45 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         Returns:
             Granted public alias names in stable order.
         """
+        return tuple(
+            alias for alias, _revision, _digest in self.granted_alias_authorities(raw_key=raw_key)
+        )
+
+    def granted_alias_authorities(self, *, raw_key: str) -> tuple[tuple[str, str, str], ...]:
+        """Return exact active authorities granted to the key-derived identity.
+
+        Args:
+            raw_key: Caller virtual key.
+
+        Returns:
+            Alias name, active revision, and catalog digest tuples in stable order.
+        """
         with self._transaction() as connection:
             organization_id, identity_id, _ = self._authenticate_in_transaction(connection, raw_key)
             rows = connection.execute(
                 """
-                SELECT a.alias_name
+                SELECT a.alias_name, a.active_revision_id, r.catalog_sha256
                 FROM identity_alias_grants AS g
                 JOIN gateway_aliases AS a
                   ON a.organization_id = g.organization_id AND a.alias_id = g.alias_id
+                JOIN alias_revisions AS r
+                  ON r.organization_id = a.organization_id
+                 AND r.alias_id = a.alias_id
+                 AND r.revision_id = a.active_revision_id
                 WHERE g.organization_id = ? AND g.identity_id = ?
                   AND a.active = 1 AND a.active_revision_id IS NOT NULL
                 ORDER BY a.alias_name
                 """,
                 (organization_id, identity_id),
             ).fetchall()
-        return tuple(str(row["alias_name"]) for row in rows)
+        return tuple(
+            (
+                str(row["alias_name"]),
+                str(row["active_revision_id"]),
+                str(row["catalog_sha256"]),
+            )
+            for row in rows
+        )
 
     def rotate_fingerprint_pepper(self) -> int:
         """Rotate future key fingerprints while retaining old key authentication."""

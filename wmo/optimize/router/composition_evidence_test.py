@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from fastapi.testclient import TestClient
 
 import wmo
 from wmo.common.evaluations import EvaluationPlan, EvaluationProtocol, ObservedProductionCell
@@ -27,6 +26,7 @@ from wmo.common.models import (
     EmbeddingCostReservation,
     ModelClient,
     ModelFinishReason,
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     NumericMeasurement,
@@ -56,7 +56,6 @@ from wmo.optimize.router.composition_test import (
 from wmo.optimize.router.judgment_budget import JudgmentDispatchReceipt
 from wmo.release_revision_test import exact_checkout_revision, verify_release_evidence
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
-from wmo.runtime.router.application import create_project_router_app
 from wmo.simulation.engines.text.simulator import WorldModelSimulator
 from wmo.simulation.engines.text.simulator_test import (
     _OneTurnAgent,
@@ -510,29 +509,22 @@ def test_w16_public_router_evidence_is_complete_replay_safe_and_openai_native(
     assert len(telemetry_delivered) == 1
     assert len(telemetry_attempts) == 2
 
-    app = create_project_router_app("w16-router", result.runtime)
-    http = TestClient(app)
-    payload = {
-        "model": "w16-router",
-        "messages": [{"role": "user", "content": "Resolve customer case 17"}],
-    }
-    first_http = http.post("/v1/chat/completions", json=payload)
-    second_http = http.post(
-        "/v1/chat/completions",
-        json={
-            **payload,
-            "messages": [
-                *payload["messages"],
-                {"role": "user", "content": "Continue with the same customer case"},
-            ],
-        },
+    first_selection = result.runtime.select(
+        ModelRequest(messages=(ModelMessage(role="user", content="Resolve customer case 17"),)),
+        episode_id="case-17",
     )
-    assert first_http.status_code == second_http.status_code == 200
-    assert first_http.headers["X-WMO-Routed-Model"] == second_http.headers["X-WMO-Routed-Model"]
-    assert first_http.json()["object"] == second_http.json()["object"] == "chat.completion"
-    assert runtime_catalog.clients["embedder"].embed_calls == 2
-    assert sum(client.complete_calls for client in runtime_catalog.clients.values()) == 2
-    assert "routing_decision" not in first_http.text
+    second_selection = result.runtime.select(
+        ModelRequest(
+            messages=(
+                ModelMessage(role="user", content="Resolve customer case 17"),
+                ModelMessage(role="user", content="Continue with the same customer case"),
+            )
+        ),
+        episode_id="case-17",
+    )
+    assert first_selection.selected_alias == second_selection.selected_alias
+    assert runtime_catalog.clients["embedder"].embed_calls == 1
+    assert sum(client.complete_calls for client in runtime_catalog.clients.values()) == 0
     provenance = verify_release_evidence(
         project.artifacts,
         expected_revision=revision,

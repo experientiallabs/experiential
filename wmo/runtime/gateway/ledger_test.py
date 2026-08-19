@@ -26,6 +26,7 @@ from wmo.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from wmo.runtime.gateway.ledger import (
+    GatewayLedgerError,
     IdempotencyConflictError,
     IdempotencyReplayUnavailableError,
     SQLiteAttemptLedger,
@@ -160,7 +161,10 @@ def test_attempt_usage_and_integer_cost_are_content_free(tmp_path: Path) -> None
     )
     ledger.accept_request(authorization=authorization)
     attempt_id = ledger.start_attempt(
-        snapshot=_execution(authorization), deployment=_deployment(), route_depth=0
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
     )
     ledger.record_route_context(
         attempt_id=attempt_id,
@@ -216,7 +220,10 @@ def test_attempt_retains_dispatch_billing_source_after_catalog_change(tmp_path: 
     ledger.accept_request(authorization=authorization)
     dispatched = _deployment(billing_source=BillingSource.HOST_MANAGED)
     attempt_id = ledger.start_attempt(
-        snapshot=_execution(authorization), deployment=dispatched, route_depth=0
+        snapshot=_execution(authorization),
+        deployment=dispatched,
+        attempt_ordinal=0,
+        route_depth=0,
     )
 
     authored_after_dispatch = dispatched.model_copy(
@@ -244,6 +251,162 @@ def test_attempt_retains_dispatch_billing_source_after_catalog_change(tmp_path: 
     assert row == (BillingSource.HOST_MANAGED.value, "completed")
 
 
+def test_usage_billing_source_buckets_conserve_physical_attempt_totals(tmp_path: Path) -> None:
+    """Source buckets conserve attempts, usage, cost, unknowns, and terminal states."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+
+    host_authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("host-attempt"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=host_authorization)
+    host_attempt = ledger.start_attempt(
+        snapshot=_execution(host_authorization),
+        deployment=_deployment(billing_source=BillingSource.HOST_MANAGED),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=host_attempt,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=3, output_tokens=2),
+        ),
+        failure=None,
+    )
+
+    customer_authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("customer-attempt"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=customer_authorization)
+    customer_attempt = ledger.start_attempt(
+        snapshot=_execution(customer_authorization),
+        deployment=_deployment(
+            priced=False,
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+        ),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=customer_attempt,
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider unavailable",
+        ),
+    )
+
+    buckets = ledger.usage_by_billing_source(organization_id="org-one")
+
+    assert [bucket.billing_source for bucket in buckets] == [
+        BillingSource.CUSTOMER_MANAGED,
+        BillingSource.HOST_MANAGED,
+    ]
+    customer, host = buckets
+    assert customer.attempts == 1
+    assert customer.unknown_cost_attempts == 1
+    assert [(item.state, item.attempts) for item in customer.terminal_counts] == [("failed", 1)]
+    assert host.attempts == 1
+    assert host.input_tokens == 3
+    assert host.output_tokens == 2
+    assert host.known_estimated_cost_micro_usd == 14
+    assert host.unknown_cost_attempts == 0
+    assert [(item.state, item.attempts) for item in host.terminal_counts] == [("completed", 1)]
+
+
+def test_usage_snapshot_conserves_source_totals_during_concurrent_wal_settlement(
+    tmp_path: Path,
+) -> None:
+    """Concurrent settlement cannot split identity and source report snapshots."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    attempts: list[str] = []
+    for index in range(24):
+        authorization = store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(f"concurrent-usage-{index}"),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+        ledger.accept_request(authorization=authorization)
+        attempts.append(
+            ledger.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(
+                    billing_source=(
+                        BillingSource.HOST_MANAGED
+                        if index % 2 == 0
+                        else BillingSource.CUSTOMER_MANAGED
+                    )
+                ),
+                attempt_ordinal=0,
+                route_depth=0,
+            )
+        )
+
+    def settle_attempts() -> None:
+        """Settle every dispatched attempt while readers hold independent WAL snapshots."""
+        for attempt_id in attempts:
+            ledger.finish_attempt(
+                attempt_id=attempt_id,
+                terminal_event=GatewayEvent(
+                    kind=GatewayEventKind.COMPLETED,
+                    sequence_number=1,
+                    usage=GatewayUsage(input_tokens=3, output_tokens=2),
+                ),
+                failure=None,
+            )
+            time.sleep(0.001)
+
+    def assert_conservation() -> None:
+        """Require every metric and terminal state to reconcile inside one read."""
+        snapshot = ledger.usage_snapshot(organization_id="org-one")
+        identity = snapshot.identities[0]
+        sources = snapshot.by_billing_source
+        assert identity.attempts == sum(item.attempts for item in sources)
+        for field_name in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "known_estimated_cost_micro_usd",
+            "unknown_cost_attempts",
+        ):
+            assert getattr(identity, field_name) == sum(
+                getattr(item, field_name) for item in sources
+            )
+        identity_terminals = {item.state: item.attempts for item in identity.terminal_counts}
+        source_terminals: dict[str, int] = {}
+        for source in sources:
+            for item in source.terminal_counts:
+                source_terminals[item.state] = source_terminals.get(item.state, 0) + item.attempts
+        assert identity_terminals == source_terminals
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        settlement = executor.submit(settle_attempts)
+        for _index in range(100):
+            assert_conservation()
+            if settlement.done():
+                break
+        settlement.result(timeout=5)
+
+    final = ledger.usage_snapshot(organization_id="org-one")
+    assert sum(item.attempts for item in final.identities[0].terminal_counts) == len(attempts)
+    assert sum(
+        terminal.attempts
+        for source in final.by_billing_source
+        for terminal in source.terminal_counts
+    ) == len(attempts)
+
+
 def test_unknown_prices_remain_unknown_instead_of_zero(tmp_path: Path) -> None:
     """Observed token usage with absent rates increments unknown-cost accounting."""
     clock = FakeLedgerClock()
@@ -256,7 +419,10 @@ def test_unknown_prices_remain_unknown_instead_of_zero(tmp_path: Path) -> None:
     )
     ledger.accept_request(authorization=authorization)
     attempt_id = ledger.start_attempt(
-        snapshot=_execution(authorization), deployment=_deployment(priced=False), route_depth=0
+        snapshot=_execution(authorization),
+        deployment=_deployment(priced=False),
+        attempt_ordinal=0,
+        route_depth=0,
     )
     ledger.finish_attempt(
         attempt_id=attempt_id,
@@ -285,7 +451,10 @@ def test_cancelled_post_commit_attempt_keeps_observed_billable_usage(tmp_path: P
     )
     ledger.accept_request(authorization=authorization)
     attempt_id = ledger.start_attempt(
-        snapshot=_execution(authorization), deployment=_deployment(), route_depth=0
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
     )
     cancelled = GatewayFailure(
         failure_class=GatewayFailureClass.CANCELLED,
@@ -320,7 +489,10 @@ def test_failed_attempt_terminalizes_its_parent_request(tmp_path: Path) -> None:
     )
     ledger.accept_request(authorization=authorization)
     attempt_id = ledger.start_attempt(
-        snapshot=_execution(authorization), deployment=_deployment(), route_depth=0
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
     )
     failure = GatewayFailure(
         failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
@@ -342,6 +514,177 @@ def test_failed_attempt_terminalizes_its_parent_request(tmp_path: Path) -> None:
         connection.close()
     assert request_state == "failed"
     assert attempt_state == "failed"
+
+
+def test_predispatch_failure_terminalizes_real_sqlite_request(tmp_path: Path) -> None:
+    """Accepted routing failures cannot remain unterminated without an attempt row."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("routing-failure"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+
+    ledger.finish_request(
+        authorization=authorization,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.INTERNAL,
+            safe_message="route activation failed",
+        ),
+    )
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        request_state = connection.execute(
+            "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone()[0]
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM gateway_attempts WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert request_state == "failed"
+    assert attempt_count == 0
+
+
+def test_intermediate_attempt_can_settle_without_finalizing_parent(tmp_path: Path) -> None:
+    """The physical-attempt seam leaves parent finalization to a later route owner."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("future-waterfall"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="retry on sibling route",
+        ),
+        finalize_request=False,
+    )
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        states = connection.execute(
+            """
+            SELECT r.terminal_state, a.state
+            FROM gateway_requests AS r
+            JOIN gateway_attempts AS a ON a.request_id = r.request_id
+            WHERE r.request_id = ?
+            """,
+            (authorization.request_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert states == (None, "failed")
+
+
+def test_concurrent_attempt_ordinal_conflict_rolls_back_without_blocking_retry(
+    tmp_path: Path,
+) -> None:
+    """One physical ordinal wins concurrently and the next ordinal remains writable."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("concurrent-ordinal"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+
+    def start_first_ordinal() -> str | None:
+        """Compete for one physical ordinal and normalize the expected loser."""
+        try:
+            return ledger.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(),
+                attempt_ordinal=0,
+                route_depth=0,
+            )
+        except sqlite3.IntegrityError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = tuple(executor.submit(start_first_ordinal) for _index in range(2))
+        results = tuple(future.result(timeout=5) for future in futures)
+    winners = tuple(result for result in results if result is not None)
+    assert len(winners) == 1
+    ledger.finish_attempt(
+        attempt_id=winners[0],
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="safe physical retry",
+        ),
+        finalize_request=False,
+    )
+
+    retry_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=1,
+        route_depth=0,
+    )
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        rows = connection.execute(
+            "SELECT attempt_ordinal, route_depth FROM gateway_attempts ORDER BY attempt_ordinal"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert rows == [(0, 0), (1, 0)]
+    ledger.finish_attempt(
+        attempt_id=retry_id,
+        terminal_event=GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0),
+        failure=None,
+    )
+
+
+def test_terminal_parent_rejects_late_attempt_dispatch(tmp_path: Path) -> None:
+    """No retry path can dispatch after durable request terminalization."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("late-dispatch"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    ledger.finish_request(
+        authorization=authorization,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.INTERNAL,
+            safe_message="route failed before dispatch",
+        ),
+    )
+
+    with pytest.raises(GatewayLedgerError, match="already terminal"):
+        ledger.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+        )
 
 
 def test_idempotency_is_opt_in_and_restart_replay_fails_closed(tmp_path: Path) -> None:
@@ -394,7 +737,12 @@ def test_crash_reconciliation_waits_for_deadline_and_cleanup_bound(tmp_path: Pat
         deadline_monotonic=clock.monotonic() + 10,
     )
     ledger.accept_request(authorization=dispatched)
-    ledger.start_attempt(snapshot=_execution(dispatched), deployment=_deployment(), route_depth=0)
+    ledger.start_attempt(
+        snapshot=_execution(dispatched),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
 
     clock.advance(12)
     assert ledger.reconcile_crashed_requests(cleanup_grace=timedelta(seconds=5)) == (1, 0)
@@ -408,7 +756,12 @@ def test_crash_reconciliation_waits_for_deadline_and_cleanup_bound(tmp_path: Pat
         deadline_monotonic=clock.monotonic() + 10,
     )
     ledger.accept_request(authorization=superseding)
-    ledger.start_attempt(snapshot=_execution(superseding), deployment=_deployment(), route_depth=0)
+    ledger.start_attempt(
+        snapshot=_execution(superseding),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
 
     connection = sqlite3.connect(tmp_path / "gateway.db")
     try:
@@ -471,7 +824,10 @@ def test_concurrent_multi_identity_wal_preserves_receipts_grants_and_attempts(
         )
         ledger.accept_request(authorization=authorization)
         attempt_id = ledger.start_attempt(
-            snapshot=_execution(authorization), deployment=_deployment(), route_depth=0
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
         )
         ledger.finish_attempt(
             attempt_id=attempt_id,

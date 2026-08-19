@@ -23,6 +23,10 @@ from wmo.runtime.gateway.contracts import (
 class GatewayControlStore(Protocol):
     """Persistence seam for identities, grants, aliases, and immutable revisions."""
 
+    def authenticate_key(self, *, raw_key: str) -> None:
+        """Validate a virtual key before parsing a full content-bearing request."""
+        ...
+
     def authorize_request(
         self,
         *,
@@ -59,9 +63,11 @@ class AttemptLedger(Protocol):
         *,
         snapshot: ExecutionSnapshot,
         deployment: ExactModelDeployment,
+        attempt_ordinal: int,
         route_depth: int,
+        maximum_cost_micro_usd: int | None = None,
     ) -> AttemptId:
-        """Persist one accepted attempt before provider dispatch."""
+        """Atomically reserve cost and persist one attempt before provider dispatch."""
         ...
 
     def finish_attempt(
@@ -70,8 +76,28 @@ class AttemptLedger(Protocol):
         attempt_id: AttemptId,
         terminal_event: GatewayEvent | None,
         failure: GatewayFailure | None,
+        finalize_request: bool = True,
     ) -> None:
-        """Idempotently settle one attempt with content-free terminal accounting."""
+        """Settle one physical attempt and optionally finalize its parent request."""
+        ...
+
+    def finish_request(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+    ) -> None:
+        """Terminalize accepted work that failed before a provider dispatch existed."""
+        ...
+
+    def record_route_context(
+        self,
+        *,
+        attempt_id: AttemptId,
+        route_reason: str | None,
+        fallback_reason: str | None,
+    ) -> None:
+        """Attach display-safe selection context to one dispatched attempt."""
         ...
 
 
@@ -100,7 +126,7 @@ class ProjectTargetResolver(Protocol):
         *,
         target: GatewayTarget,
         request: GatewayRequest,
-        episode_namespace: tuple[ArtifactId, ArtifactId],
+        episode_namespace: tuple[ArtifactId, ArtifactId, ArtifactId, str],
         deadline_monotonic: float,
     ) -> ProjectSelection:
         """Resolve one direct or project target to a frozen exact logical model."""

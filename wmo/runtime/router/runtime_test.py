@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import threading
 from collections.abc import Sequence
@@ -47,12 +48,26 @@ from wmo.common.routing.bank import (
 )
 from wmo.common.routing.features import ROUTER_FEATURE_SCHEMA_SHA256
 from wmo.common.tasks import TaskCase, TaskSet
+from wmo.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+    ProjectTarget,
+)
+from wmo.runtime.gateway.routing import (
+    RouterProjectTargetResolver,
+    gateway_model_request,
+    project_episode_identity,
+)
 from wmo.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
+from wmo.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from wmo.runtime.router import RouterRuntime, RouterRuntimeIntegrityError
 from wmo.runtime.router.economics import (
     RoutedProviderComponent,
     RoutedSpendDisposition,
 )
+from wmo.runtime.router.runtime import _PreparedSelection  # noqa: PLC2701
+from wmo.runtime.router.runtime_support import sticky_decision
 
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
@@ -215,8 +230,9 @@ def test_artifact_mutation_and_pricing_or_alias_drift_block_activation() -> None
     )
     bank.scores.setflags(write=True)
     bank.scores[0, 0] = 0.0
-    with pytest.raises(RouterRuntimeIntegrityError, match="bank content has mutated"):
-        runtime.select(_request(), episode_id="episode-a")
+    assert runtime.select(_request(), episode_id="episode-a").selected_alias == "cheap"
+    with pytest.raises(ValueError, match="cannot set WRITEABLE flag"):
+        runtime.bank.scores.setflags(write=True)
 
 
 @pytest.mark.parametrize(
@@ -548,8 +564,233 @@ def test_concurrent_first_selection_embeds_and_records_exactly_once() -> None:
     assert recorded == [decisions[0]]
 
 
-def test_cached_selection_and_completion_recheck_integrity_without_consumption() -> None:
-    """Mutation and forged decisions reject while exact retries reuse the frozen decision."""
+def test_distinct_first_selections_embed_outside_the_shared_cache_lock() -> None:
+    """Independent episodes can embed concurrently without serializing on cache state."""
+    runtime, client = _runtime()
+    entered = threading.Barrier(3)
+    decisions: list[object] = []
+
+    def concurrent_embed(texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Wait until both embedding calls are concurrently in flight."""
+        del texts
+        client.embed_calls += 1
+        entered.wait(timeout=1)
+        return (Embedding(values=(1.0, 0.0)),)
+
+    client.__dict__["embed"] = concurrent_embed
+
+    def select(episode_id: str) -> None:
+        """Select one independent episode on a worker thread."""
+        decisions.append(runtime.select(_request(), episode_id=episode_id))
+
+    threads = (
+        threading.Thread(target=select, args=("episode-a",)),
+        threading.Thread(target=select, args=("episode-b",)),
+    )
+    for thread in threads:
+        thread.start()
+    entered.wait(timeout=1)
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(decisions) == 2
+    assert client.embed_calls == 2
+
+
+def test_decision_cache_ttl_and_capacity_bound_all_process_local_state() -> None:
+    """Least-recent decisions evict at capacity and expired episodes reselect."""
+    policy, manifest, bank, snapshots, client = _fixture()
+    now = [10.0]
+    runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _Catalog(snapshots, client)),
+        pricing_snapshot_id=policy.pricing_snapshot_id,
+        pricing_snapshot_sha256=policy.pricing_snapshot_sha256,
+        pricing_candidate_aliases=manifest.candidate_aliases,
+        decision_capacity=1,
+        decision_ttl_seconds=5,
+        clock=lambda: now[0],
+    )
+
+    runtime.select(_request(), episode_id="episode-a")
+    runtime.select(_request(), episode_id="episode-b")
+    assert len(runtime._episode_decisions) == 1  # noqa: SLF001 - bounded-state regression
+    assert len(runtime._request_decisions) == 1  # noqa: SLF001 - bounded-state regression
+    assert len(runtime._request_embedding_economics) == 1  # noqa: SLF001
+    assert len(runtime._request_embedding_dispositions) == 1  # noqa: SLF001
+    now[0] = 16.0
+    runtime.select(_request(), episode_id="episode-b")
+
+    assert client.embed_calls == 3
+    assert len(runtime._episode_decisions) == 1  # noqa: SLF001 - bounded-state regression
+    assert len(runtime._request_decisions) == 1  # noqa: SLF001 - bounded-state regression
+    assert set(runtime._request_embedding_economics) == set(  # noqa: SLF001
+        runtime._request_decisions  # noqa: SLF001
+    )
+    assert set(runtime._request_embedding_dispositions) == set(  # noqa: SLF001
+        runtime._request_decisions  # noqa: SLF001
+    )
+
+
+def test_prepared_selections_keep_physical_evidence_local_until_atomic_retain() -> None:
+    """Concurrent-equivalent bundles cannot collide or publish before explicit retain."""
+    runtime, client = _runtime()
+    request = _request()
+    first = runtime._select_unretained(request, episode_id="episode-a")  # noqa: SLF001
+    client.embedding_values = RuntimeError("embed failed")
+    second = runtime._select_unretained(request, episode_id="episode-a")  # noqa: SLF001
+
+    assert first is not second
+    assert first.disposition == RoutedSpendDisposition.LOCALLY_PRICED
+    assert second.disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
+    assert runtime._episode_decisions == {}  # noqa: SLF001 - publication boundary
+    assert runtime._request_decisions == {}  # noqa: SLF001 - publication boundary
+
+    retained = runtime._retain_prepared_selection(  # noqa: SLF001
+        request,
+        episode_id="episode-a",
+        prepared=first,
+    )
+    first_operation = runtime.selection_operation(
+        request,
+        episode_id="episode-a",
+        decision=retained,
+    )
+    reconciled = runtime._retain_prepared_selection(  # noqa: SLF001
+        request,
+        episode_id="episode-a",
+        prepared=second,
+    )
+    second_operation = runtime.selection_operation(
+        request,
+        episode_id="episode-a",
+        decision=reconciled,
+    )
+
+    assert reconciled == retained
+    assert first_operation.disposition == RoutedSpendDisposition.LOCALLY_PRICED
+    assert second_operation.disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
+    assert client.embed_calls == 2
+
+
+def test_project_resolver_retains_failed_embedding_evidence_without_reembedding() -> None:
+    """A failed physical embed binds ambiguous accounting through gateway selection."""
+    runtime, client = _runtime()
+    client.embedding_values = RuntimeError("embed failed")
+    target = ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256=_DIGEST,
+    )
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one"): runtime},
+        {("project-one", "activation-one", _DIGEST, "baseline"): "exact-baseline"},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+    namespace = ("org", "identity", "revision", "episode")
+
+    selection = asyncio.run(
+        resolver.select(
+            target=target,
+            request=request,
+            episode_namespace=namespace,
+            deadline_monotonic=__import__("time").monotonic() + 1,
+        )
+    )
+    continued = asyncio.run(
+        resolver.select(
+            target=target,
+            request=request.model_copy(
+                update={
+                    "messages": (
+                        *request.messages,
+                        GatewayMessage(role="user", content="next"),
+                    )
+                }
+            ),
+            episode_namespace=namespace,
+            deadline_monotonic=__import__("time").monotonic() + 1,
+        )
+    )
+
+    assert selection.selected_alias == "baseline"
+    assert continued.selected_alias == selection.selected_alias
+    assert client.embed_calls == 1
+    assert len(runtime._request_decisions) == 1  # noqa: SLF001 - accounting regression
+    decision = next(iter(runtime._request_decisions.values()))  # noqa: SLF001
+    operation = runtime.selection_operation(
+        gateway_model_request(request),
+        episode_id=project_episode_identity(namespace),
+        decision=decision,
+    )
+    assert operation.disposition == RoutedSpendDisposition.RESERVED_AMBIGUOUS
+    assert operation.operation_count == 1
+
+
+def test_timed_out_project_selection_cannot_publish_late_sticky_state() -> None:
+    """A detached blocking embed remains unretained after its request deadline expires."""
+    runtime, client = _runtime()
+    recorded: list[object] = []
+    runtime._decision_sink = recorded.append  # noqa: SLF001 - deadline publication regression
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def blocking_embed(texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Hold selection beyond the gateway deadline, then report completion."""
+        del texts
+        entered.set()
+        release.wait(timeout=1)
+        completed.set()
+        return (Embedding(values=(1.0, 0.0)),)
+
+    client.__dict__["embed"] = blocking_embed
+    target = ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256=_DIGEST,
+    )
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one"): runtime},
+        {("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap"},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+
+    async def scenario() -> None:
+        """Expire the wrapper while the unretained worker remains blocked."""
+        selection = asyncio.create_task(
+            resolver.select(
+                target=target,
+                request=request,
+                episode_namespace=("org", "identity", "revision", "episode"),
+                deadline_monotonic=__import__("time").monotonic() + 0.01,
+            )
+        )
+        await asyncio.to_thread(entered.wait, 1)
+        with pytest.raises(ProviderDeadlineExceeded):
+            await selection
+        release.set()
+        await asyncio.to_thread(completed.wait, 1)
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert runtime._episode_decisions == {}  # noqa: SLF001 - deadline isolation regression
+    assert runtime._request_decisions == {}  # noqa: SLF001 - deadline isolation regression
+    assert recorded == []
+
+
+def test_cached_selection_and_completion_reuse_sealed_activation_without_rehashing() -> None:
+    """Forged decisions reject while exact retries reuse immutable activation state."""
     runtime, client = _runtime()
     request = _request()
     decision = runtime.select(request, episode_id="episode-a")
@@ -562,10 +803,51 @@ def test_cached_selection_and_completion_recheck_integrity_without_consumption()
     runtime.complete(request, episode_id="episode-a", decision=decision)
     assert len(client.requests) == 2
 
-    runtime.bank.scores.setflags(write=True)
-    runtime.bank.scores[0, 0] = 0.0
-    with pytest.raises(RouterRuntimeIntegrityError, match="bank content has mutated"):
-        runtime.select(request, episode_id="episode-a")
+    with pytest.raises(ValueError, match="cannot set WRITEABLE flag"):
+        runtime.bank.scores.setflags(write=True)
+    assert runtime.select(request, episode_id="episode-a") == decision
+
+
+def test_complete_survives_concurrent_repopulation_after_internal_selection_eviction() -> None:
+    """A valid in-flight selection survives conflicting same-episode repopulation."""
+    policy, manifest, bank, snapshots, client = _fixture()
+    runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _Catalog(snapshots, client)),
+        pricing_snapshot_id=policy.pricing_snapshot_id,
+        pricing_snapshot_sha256=policy.pricing_snapshot_sha256,
+        pricing_candidate_aliases=manifest.candidate_aliases,
+        decision_capacity=1,
+    )
+    original_select = runtime._select_retained  # noqa: SLF001 - concurrency boundary regression.
+
+    def select_then_repopulate(
+        request: ModelRequest,
+        *,
+        episode_id: str,
+    ) -> _PreparedSelection:
+        """Evict and replace the returned episode before completion validation."""
+        prepared = original_select(request, episode_id=episode_id)
+        original_select(_request(tool_name="evict"), episode_id="other-episode")
+        client.embedding_values = ()
+        replacement = original_select(
+            _request(tool_name="repopulate"),
+            episode_id=episode_id,
+        )
+        client.embedding_values = (Embedding(values=(1.0, 0.0)),)
+        assert prepared.decision.selected_alias == "cheap"
+        assert replacement.decision.selected_alias == "baseline"
+        return prepared
+
+    runtime.__dict__["_select_retained"] = select_then_repopulate
+
+    result = runtime.complete(_request(), episode_id="episode-a")
+
+    assert result.decision.episode_id_sha256 == hashlib.sha256(b"episode-a").hexdigest()
+    assert result.decision.selected_alias == "cheap"
+    assert client.complete_calls == 1
 
 
 def test_sticky_decision_identity_hashes_all_retained_evidence() -> None:
@@ -581,10 +863,8 @@ def test_sticky_decision_identity_hashes_all_retained_evidence() -> None:
     )
     request_sha256 = "f" * 64
 
-    sticky = runtime._sticky_decision(first, request_sha256)  # noqa: SLF001 - identity probe
-    changed_sticky = runtime._sticky_decision(  # noqa: SLF001 - identity probe
-        changed, request_sha256
-    )
+    sticky = sticky_decision(first, request_sha256)
+    changed_sticky = sticky_decision(changed, request_sha256)
 
     assert sticky != changed_sticky
     assert sticky.decision_id != changed_sticky.decision_id

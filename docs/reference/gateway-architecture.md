@@ -1,98 +1,152 @@
-# Gateway foundation architecture contract
+# Local gateway architecture
 
-## Current scope
+## Supported surface
 
-This reference describes the inert contracts available on main after the gateway foundation
-change. It does not claim that a gateway server, identity store, provider stream, public alias,
-or no-argument `wmo run` mode exists yet.
+No-argument `wmo run` starts an authenticated multi-alias gateway on `127.0.0.1`.
+It serves:
 
-The foundation establishes one vocabulary for later independently reviewed implementations:
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `GET /health/live` and `GET /health/ready`
+- `GET /usage` and `GET /usage.json`
 
-- a public gateway alias targets either one exact-model pool or one immutable project activation
-- a project resolver selects one exact logical model, and later operational execution may choose
-  only among deployments certified for that model
-- authentication, grants, persistence, provider execution, and wire encoding depend on injected
-  interfaces instead of importing optimizer owners into runtime
-- tool calls keep their existing parsed argument object and may also retain exact provider JSON
-- provider stream events carry raw tool-argument fragments without requiring each fragment to be
-  valid JSON
+`wmo run PROJECT` is compatibility sugar that activates one project-backed alias and launches this
+same gateway application. It does not create a router HTTP server. Gateway startup and readiness
+perform no provider request. Only an authorized model request may cross the provider boundary.
 
-No root CLI set, endpoint set, release claim, or provider behavior changes in this foundation.
+## Authority and management
 
-## Ownership
+`wmo config gateway` owns explicit local setup. Its provider, identity, key, grant, alias, pool, and
+monthly budget commands produce versioned receipts suitable for interactive or non-interactive
+callers. There are no runtime seeds. A usable installation requires an organization, active
+identity, active virtual key, explicit identity-to-alias grant, active alias revision, immutable
+catalog snapshot, and a resolvable provider credential reference.
 
-`wmo/common/models/catalog.py` remains the sole authored provider and model catalog. A model record
-may carry optional gateway-only protocol capabilities, exact-model certification, and integer
-attribution prices. These fields are deployment metadata. They do not enter
-`ModelCapabilities`, whose existing identity digest remains frozen for compatibility with built
-router artifacts.
+Private serving authority lives in `ROOT/gateway/gateway.db`, including identities, keys, grants,
+provider connections and revisions, aliases and revisions, attempts, and usage. SQLite uses WAL
+mode, versioned forward
+migrations, private backups before migration, newer-schema refusal, and serialized initialization.
+Virtual keys are stored only as peppered fingerprints. Key material is delivered once in a JSON
+receipt or to a new mode-`0600` file, and commit ambiguity preserves recoverability. Provider
+configuration stores an environment variable name, never its value. The local pepper is mode
+`0600` and is not exported.
 
-`wmo/common/models/gateway_catalog.py` derives an immutable secret-free deployment view. Existing
-model aliases become separate singleton pools. Runtime gateway contracts and injected interfaces
-live under `wmo/runtime/gateway/`. Runtime continues to be forbidden from importing simulation,
-optimization, or CLI modules by `wmo/repo_import_boundaries_test.py`.
+Every data-plane request is authenticated and authorized before request decoding, routing,
+continuation lookup, or provider work. Authorization freezes organization, identity, API surface,
+alias revision, target, catalog digest, request digest, optional hashed operation identity, and one
+monotonic deadline. Identity disable, key revocation or expiry, grant removal, and alias revision
+changes fail closed.
 
-## Conservative singleton migration
+## Catalog, aliases, and exact-model pools
 
-The derived identity for an existing model includes:
+The gateway database owns current provider connection state. Existing model metadata remains the
+authoring input for builds, policies, evaluations, and datasets; it is not consulted as mutable
+serving authority after an alias revision binds exact connection revisions. Gateway snapshots under
+`ROOT/gateway/catalog-snapshots/` are immutable, secret-free artifacts for an exact catalog digest.
+An advertised alias is executable only when readiness holds for the exact tuple of alias name,
+alias revision, and catalog digest used by authorization.
 
-1. the normalized secret-free connection identity digest
-2. the exact provider model spelling and optional revision
-3. a digest of the complete authored capability declaration
+An alias targets either:
 
-Capability variants and connections to different compatible endpoints therefore do not collapse
-into one exact model. Separate aliases remain separate singleton pools even when all three inputs
-are identical. Grouping them later requires a deliberate equivalence contract.
+1. a direct exact-model pool, or
+2. one immutable project activation.
 
-Provider `tinker` records and any model carrying SFT provenance are excluded. Sampling handles are
-run-bound training provenance, not general gateway deployments.
+A singleton alias creates a one-deployment pool. `wmo config gateway pool certify` can replace that
+with an ordered pool only when every member has the same exact logical model identity and an
+operator-supplied equivalence certification. The certification records an ID, provenance, evidence
+digest, time, and exact deployment order. Project policy selection still chooses one exact logical
+model; operational fallback can only move among certified deployments for that model.
 
-## Catalog authoring boundary
+## Request, route, and provider attempts
 
-A valid catalog may contain provider connections and zero model records. The role-free connection
-authoring service can create this state for a runtime consumer without inventing optimizer roles.
-The existing `ProviderSetup` service is unchanged and continues to require world-model, judge, and
-embedding roles plus an embedding-capable embedder for build and optimize workflows.
+The content-free ledger accepts the logical request before learned project selection. Selection or
+direct resolution then produces an execution snapshot containing the exact model, pool, and ordered
+deployment IDs. Each physical provider dispatch gets its own durable attempt row immediately before
+network work. Attempt ordinal counts all physical dispatches; route depth identifies the selected
+deployment position.
 
-The catalog stores environment variable names, never credential values. Gateway prices use integer
-micro-USD rates and keep unknown values as `None`. The existing optimizer float pricing and pricing
-snapshot contracts remain unchanged.
+Provider execution is always internally streaming. Bounded same-deployment retries and ordered
+deployment fallback are allowed only for typed precommit failures. The first outward text, refusal,
+or tool-call semantic event commits the deployment, after which the gateway never switches
+providers. Typed refusal fallback is disabled unless the active alias revision explicitly enables
+it. Opted-in refusal deltas are withheld only in a bounded in-memory buffer: a refusal-only terminal
+result can advance to the next certified deployment, while mixed semantic output or buffer overflow
+commits and flushes the original route. Provider-internal retry layers are disabled so every
+possible billable dispatch is visible to the gateway ledger.
 
-## Raw tool arguments
+Before each physical dispatch, the same immediate SQLite transaction reserves the request's
+conservative maximum integer micro-USD cost and inserts its attempt row. Applicable hard limits can
+cover the local team, one identity, one alias pool, and each provider deployment within that pool.
+An exhausted deployment allocation removes only that route from the current certified waterfall.
+If no route can fit the shared team, identity, or total pool allocation, the neutral protocol
+returns HTTP 429 with OpenAI `insufficient_quota` semantics before provider work. Any required
+unknown price makes that route ineligible while a hard limit applies.
 
-`ToolCall.arguments` remains the parsed JSON object consumed by environments, judging, simulation,
-and training. `ToolCall.raw_arguments` is optional. When present, it must decode to the same object
-and is used for exact provider-order wire replay. When absent, it is omitted from serialization,
-which keeps legacy payload bytes stable.
+Settlement replaces the reservation with observed integer micro-USD usage. A dispatched failure,
+cancellation, or crash without trustworthy usage retains its conservative reservation because it
+may be billable. Retries and fallbacks therefore consume one allocation entry per physical attempt,
+while keyed replay creates no new reservation. A period is the immutable UTC bucket beginning at
+`YYYY-MM-01T00:00:00+00:00`; rollover selects a new bucket and never clears or rewrites an earlier
+month. Management and remaining-allocation reports are CLI surfaces only. There is no budgets
+dashboard.
 
-Partial provider output uses `GatewayEvent.raw_arguments_delta`. A delta can split at any byte or
-token boundary and is not parsed in isolation. The complete call is validated only at its terminal
-contract boundary.
+Each physical attempt records its own provider, model, usage, latency, terminal state, estimated
+cost attribution, and frozen credential-ownership billing source. Later catalog activation and
+process restart never rewrite that source. Schema-v1/v2 attempt rows migrate explicitly as
+`customer_managed`; current dispatches persist either `host_managed` or `customer_managed` before
+network work. The public usage report conserves physical attempt, token, cost, unknown-cost, and
+terminal totals across those source buckets without partitioning logical request counts. The parent
+request terminalizes once after success, final failure, cancellation, disconnect, or crash
+reconciliation. Unknown prices remain unknown instead of being treated as zero or copied across
+deployments.
 
-## Request and attempt boundaries
+## OpenAI-compatible protocol
 
-Authorization freezes key-derived organization and identity, alias revision, target, API surface,
-request hash, optional hashed caller-operation identity, catalog snapshot, and one monotonic deadline
-before learned selection. Raw idempotency and client request values are not persisted in the
-snapshot. A project target does not yet know its exact model, pool, or deployments at that point.
-Selection and direct-target resolution produce a separate route-bound execution snapshot.
+`wmo/runtime/openai_protocol` is the only OpenAI wire implementation. Chat Completions and
+Responses have separate allowlist decoders and field-specific OpenAI error responses, but both
+convert to one canonical gateway request without conflating their wire contracts. The package also
+owns headers, response assembly, SSE framing, tool-call reconstruction, and official SDK
+compatibility.
+Chat streaming emits valid completion chunks and one `[DONE]`. Responses streaming emits the
+created, in-progress, output, and exactly one terminal lifecycle. Provider tool-argument fragments
+are accumulated in original order and validated only at the complete-call boundary.
 
-The attempt ledger records acceptance before selection. It records a provider attempt only
-immediately before that provider dispatch. This separates requests that fail or crash before any
-upstream work from attempts that may have incurred provider usage.
+Commit-independent headers are available before streaming begins. Route-dependent headers are
+emitted only after an execution snapshot exists. Stable public IDs do not expose raw key,
+idempotency, request, or provider values.
 
-## Locked repository contracts
+OpenAI `3.0.0` `OpenAI` and `AsyncOpenAI` clients are release-certified for Chat Completions and
+Responses in synchronous and asynchronous, streaming and non-streaming forms. Responses
+continuation and duplicate replay retain content only in bounded, process-local, tenant and
+alias-revision-scoped stores. Replay is opt-in through an idempotency or client request key. Restart
+or eviction returns an explicit unavailable error and never reconstructs content from SQLite.
 
-This foundation updates the following tracked locks:
+## Content-free observability and lifecycle
 
-- `AGENTS.md` names gateway package ownership and freezes `ModelCapabilities` digest placement.
-- `docs/README.md` indexes this verified reference page.
-- `wmo/common/models/model_test.py` proves legacy tool-call serialization is unchanged.
-- `wmo/common/models/catalog_test.py` proves connections-only catalogs and deployment-local gateway
-  metadata round trip.
-- `wmo/repo_import_boundaries_test.py` already applies to the new runtime package and requires no
-  allowlist widening.
+SQLite stores hashes, frozen authority, route identity, state transitions, token counts, latency,
+and estimated cost. It never stores prompts, responses, raw tool arguments, raw virtual keys, or
+provider secrets. `GET /usage` and `GET /usage.json` are two renderings of the same schema-v2 report
+and expose only aggregate, per-identity, and physical-attempt `by_billing_source` accounting.
+Source buckets conserve attempt, token, known-cost, unknown-cost, and terminal-state totals but do
+not partition logical request counts. Estimated cost is attribution, not a provider invoice.
 
-The exact root CLI commands, config subcommands, release scope, dependency list, installed-wheel
-driver, and `wmo run PROJECT` behavior are unchanged. Their executable locks therefore require no
-edit in this foundation.
+The process owns readiness from preflight through bounded drain. New work is rejected after drain
+starts. Admitted tasks, upstream streams, disconnect cleanup, replay ownership, continuation state,
+and final ledger settlement are process-owned and bounded. A stuck cancellation cannot prevent the
+terminal flusher from attempting content-free settlement.
+
+## Certification boundary
+
+Deterministic release evidence uses a built and freshly installed wheel, real SQLite, a real
+subprocess-bound loopback gateway, a real loopback upstream, and the official SDK clients. One
+scanner checks database, WAL, backups when present, catalog snapshots, stdout, stderr, logs, usage
+responses, and error bodies for raw content and secret canaries.
+
+`wmo/runtime/gateway/provider_certification.py` is the dated provider capability matrix. Each cell
+names the official client SDK, public gateway surfaces, provider wire surface, fixture result, and
+credential-gated live status. OpenAI and Anthropic have native fixtures; generic OpenAI-compatible,
+Azure, and OpenRouter share compatible-stream coverage; Gemini and Bedrock have native deterministic
+fixtures. Live provider cells remain explicitly `not_run_requires_credentials` until a separately
+authorized run supplies dated evidence. Deterministic fixtures do not imply hosted-provider
+availability, billing, or account-specific behavior.

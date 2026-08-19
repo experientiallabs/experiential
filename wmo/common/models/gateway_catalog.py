@@ -8,6 +8,7 @@ from wmo.common.core.artifacts import ArtifactId, ContractModel, Sha256, sha256_
 from wmo.common.models.catalog import (
     BillingSource,
     GatewayDeploymentMetadata,
+    GatewayEquivalenceCertification,
     ModelCatalog,
 )
 from wmo.common.models.model import ModelAlias, ModelCapabilities
@@ -40,6 +41,7 @@ class ExactModelPool(ContractModel):
     pool_id: ExactModelPoolId
     exact_model_id: ExactModelId
     deployment_ids: tuple[DeploymentId, ...] = Field(min_length=1)
+    equivalence: GatewayEquivalenceCertification | None = None
 
     @model_validator(mode="after")
     def _require_unique_deployments(self) -> ExactModelPool:
@@ -53,6 +55,10 @@ class ExactModelPool(ContractModel):
         """
         if len(set(self.deployment_ids)) != len(self.deployment_ids):
             raise ValueError("exact-model pool deployments must not repeat")
+        if len(self.deployment_ids) > 1 and self.equivalence is None:
+            raise ValueError("multi-deployment pools require operator equivalence certification")
+        if len(self.deployment_ids) == 1 and self.equivalence is not None:
+            raise ValueError("singleton pools must not assert equivalence certification")
         return self
 
 
@@ -100,13 +106,11 @@ class NormalizedGatewayCatalog(ContractModel):
 
 
 def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog:
-    """Derive safe singleton deployments from legacy authored model records.
+    """Derive safe deployments and explicitly certified exact-model pools.
 
-    Every eligible model alias becomes its own deployment and singleton pool. Derived exact-model
-    identity includes normalized connection identity, provider model and revision, and the full
-    capability declaration digest. Separate aliases remain separate pools even when those inputs
-    are identical. Tinker and SFT sampling handles are intentionally excluded because they are
-    training-run provenance, not generally callable gateway deployments.
+    Unclaimed eligible aliases remain singleton pools. Multi-deployment pools exist only when the
+    authored catalog names their exact ordered aliases and carries operator equivalence evidence.
+    Tinker and SFT sampling handles remain excluded from gateway deployment normalization.
 
     Args:
         catalog: Validated authored provider and model catalog.
@@ -115,7 +119,6 @@ def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog
         Deterministically ordered deployment and singleton-pool records.
     """
     deployments: list[ExactModelDeployment] = []
-    pools: list[ExactModelPool] = []
     for alias, record in sorted(catalog.models.items()):
         connection = catalog.connections[record.connection]
         if connection.provider == "tinker" or record.sft_provenance is not None:
@@ -146,10 +149,29 @@ def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog
             gateway=record.gateway or GatewayDeploymentMetadata(),
         )
         deployments.append(deployment)
+    by_alias = {deployment.source_alias: deployment for deployment in deployments}
+    pools: list[ExactModelPool] = []
+    claimed_aliases: set[str] = set()
+    for pool_id, authored in sorted(catalog.gateway_pools.items()):
+        deployment_ids = tuple(
+            by_alias[alias].deployment_id for alias in authored.deployment_aliases
+        )
         pools.append(
             ExactModelPool(
-                pool_id=alias,
-                exact_model_id=exact_model_id,
+                pool_id=pool_id,
+                exact_model_id=authored.exact_model_id,
+                deployment_ids=deployment_ids,
+                equivalence=authored.equivalence,
+            )
+        )
+        claimed_aliases.update(authored.deployment_aliases)
+    for deployment in deployments:
+        if deployment.source_alias in claimed_aliases:
+            continue
+        pools.append(
+            ExactModelPool(
+                pool_id=deployment.source_alias,
+                exact_model_id=deployment.exact_model_id,
                 deployment_ids=(deployment.deployment_id,),
             )
         )

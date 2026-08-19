@@ -62,9 +62,6 @@ from wmo.optimize.router.hosted import (
 )
 from wmo.optimize.router.spend import ProviderSpendEntry, ProviderSpendLedger
 from wmo.runtime.models import RuntimeModelCatalog
-from wmo.runtime.router.application import (
-    create_project_router_app,
-)
 from wmo.runtime.router.economics import (
     BillingSourceEconomics,
     RoutedCompletionEconomics,
@@ -181,7 +178,7 @@ def test_public_api_matches_quickstart() -> None:
     assert wmo.load_project_router is load_project_router
     assert wmo.load_router is load_router
     assert "ghost" in signature(wmo.load_router).parameters
-    assert wmo.create_project_router_app is create_project_router_app
+    assert "create_project_router_app" not in wmo.__all__
     assert wmo.load_world_model is load_world_model
     assert wmo.WorldModel is WorldModel
     assert wmo.WorldModelLoadError is WorldModelLoadError

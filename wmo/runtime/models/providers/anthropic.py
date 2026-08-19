@@ -34,6 +34,7 @@ from wmo.runtime.models.providers.streaming import (
     NormalizedProviderStream,
     start_anthropic_messages_stream,
 )
+from wmo.runtime.models.providers.transport import RetryPolicy
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -154,6 +155,7 @@ class AnthropicClient(ProviderHttpClient):
         *,
         deadline: RequestDeadline,
         idempotency_key: str,
+        retry_policy: RetryPolicy | None = None,
     ) -> NormalizedProviderStream:
         """Start one true native Messages stream under the gateway deadline.
 
@@ -161,6 +163,7 @@ class AnthropicClient(ProviderHttpClient):
             request: Canonical streaming gateway request.
             deadline: Immutable request-wide deadline.
             idempotency_key: Stable identity for safe pre-commit opening retries.
+            retry_policy: Optional caller-owned physical dispatch limit.
 
         Returns:
             A cancellable provider-neutral event stream.
@@ -178,7 +181,7 @@ class AnthropicClient(ProviderHttpClient):
             model_id=self._model.model_id,
             deadline=deadline,
             idempotency_key=idempotency_key,
-            retry_policy=self._retry_policy,
+            retry_policy=retry_policy or self._retry_policy,
             timeout_seconds=self._timeout_seconds,
         )
 

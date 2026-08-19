@@ -17,6 +17,7 @@ import pytest
 from wmo.common.core.artifacts import (
     SECRET_REDACTION_PLACEHOLDER,
     ArtifactInput,
+    FailureCode,
     assert_secret_free,
     canonical_json_bytes,
 )
@@ -1413,6 +1414,77 @@ def test_resume_reexecutes_retryable_transport_failure_as_new_immutable_attempt(
     assert simulator._load_rollout(first.artifact_id) == first
     assert replay == resumed_set
     assert len(candidate_client.requests) == 2
+
+
+def test_resume_reexecutes_world_model_protocol_failure_as_new_immutable_attempt(
+    tmp_path: Path,
+) -> None:
+    """A malformed world-model transition is retried and can succeed on a later generation.
+
+    Args:
+        tmp_path: Isolated project root for durable protocol-failure and retry evidence.
+    """
+    cells = (_cell("cell-a", "task-a"),)
+    plan = _plan(cells)
+    store = _store(tmp_path)
+    plan_input = _persist_plan(store, plan)
+    task_set_input = _persist_task_set(store, {"task-a": _task("task-a")})
+    candidate_client = _ScriptedClient(
+        [
+            _response("I can help.", snapshot=_snapshot("candidate-a"), cost=None),
+            _response("I can help.", snapshot=_snapshot("candidate-a"), cost=None),
+        ]
+    )
+    world_client = _ScriptedClient(
+        [
+            _response(
+                'Sure! Here is the transition: {"message":"done","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=None,
+            ),
+            _response(
+                '{"message":"done","terminal":true}',
+                snapshot=_snapshot("world-model-a"),
+                cost=None,
+            ),
+        ]
+    )
+    completion_input = _persist_completion_contract(store)
+    simulator = _simulator(
+        store,
+        plan,
+        plan_input,
+        task_set_input,
+        candidate_client,
+        world_client,
+        completion_contract_input=completion_input,
+    )
+    spec = _spec(
+        plan_input,
+        task_set_input,
+        ("cell-a",),
+        completion_contract_input=completion_input,
+    )
+
+    first_set = simulator.run(spec)
+    first = simulator._load_rollout(first_set.artifact_ids[0])
+    resumed_set = simulator.run(spec)
+    second = simulator._load_rollout(resumed_set.artifact_ids[0])
+    replay = simulator.run(spec)
+
+    assert first.stop_reason == StopReason.FAILURE
+    assert first.failure is not None
+    assert first.failure.retryable is True
+    assert first.failure.code == FailureCode.PROVIDER
+    assert first.failure.exception_type == "TextWorldModelProtocolError"
+    assert first.failure.details["phase"] == "world_model_protocol"
+    assert first.retry_attempt == 0
+    assert second.retry_attempt == 1
+    assert second.rollout_id != first.rollout_id
+    assert second.stop_reason == StopReason.COMPLETED
+    assert simulator._load_rollout(first.artifact_id) == first
+    assert replay == resumed_set
+    assert len(world_client.requests) == 2
 
 
 def test_persistent_transport_failure_stops_at_the_attempt_cap_and_replays(

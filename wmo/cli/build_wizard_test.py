@@ -424,7 +424,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
             ["run", "support", "--root", str(root), "--port", "8123"],
         )
     assert run_result.exit_code == 0, run_result.output
-    assert "provisional judgment" in run_result.output
+    assert f"policy {policy.policy_id}" in run_result.output
     assert "http://127.0.0.1:8123/v1" in run_result.output
     assert served == [("127.0.0.1", 8123)]
 

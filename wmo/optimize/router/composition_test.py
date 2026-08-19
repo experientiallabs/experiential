@@ -74,6 +74,7 @@ from wmo.optimize.router.errors import (
     JudgeTranscriptAdmissionError,
 )
 from wmo.optimize.router.evaluation.spend import observed_rollout_spend
+from wmo.optimize.router.fit.workflow import RouterWorkflowError
 from wmo.optimize.router.fit.workflow_test import _persist_embeddings, _persist_pricing
 from wmo.optimize.router.judgment_budget import (
     JudgmentDispatchReceipt,
@@ -1174,7 +1175,7 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
 def test_failed_rollouts_are_never_judged_and_leftover_judgments_do_not_block_resume(
     tmp_path: Path,
 ) -> None:
-    """Skip judgment dispatch for failed rollouts and resume past persisted leftovers.
+    """Skip judging failed rollouts, retry them fresh, and resume past leftover judgments.
 
     Args:
         tmp_path: Isolated project root for composed router artifacts.
@@ -1213,6 +1214,16 @@ def test_failed_rollouts_are_never_judged_and_leftover_judgments_do_not_block_re
         maximum_judgments=100,
     )
 
+    with pytest.raises(RouterWorkflowError, match="cover the plan exactly"):
+        compose_router(
+            project,
+            normalized,
+            services=services,
+            budget=budget,
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
     first = compose_router(
         project,
         normalized,
@@ -1229,8 +1240,6 @@ def test_failed_rollouts_are_never_judged_and_leftover_judgments_do_not_block_re
     )
     failed_ids = {rollout.rollout_id for rollout in failed if rollout.failure is not None}
     assert failed_ids
-    failed_cells = {rollout.cell_id for rollout in failed if rollout.failure is not None}
-    assert failed_cells.isdisjoint({cell_id for cell_id, _locked in judge.log})
     dispatches = tuple(
         JudgmentDispatchReceipt.model_validate_json(
             project.artifacts.read_bytes(artifact_id, "dispatch.json")

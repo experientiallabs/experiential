@@ -63,7 +63,7 @@ class _DeterministicEmbedder:
 
 
 def test_bank_admits_world_model_fit_rows_without_fidelity_and_uses_candidate_cost() -> None:
-    """Completed fit rows need no fidelity report while failed rows score zero."""
+    """Completed fit rows need no fidelity report while failed rows stay out."""
     tasks = (_task("task-fit-0", partition="fit"), _task("task-fit-1", partition="fit"))
     production = _protocol("protocol-production", "production")
     sandbox = _protocol("protocol-sandbox", "sandbox")
@@ -119,9 +119,11 @@ def test_bank_admits_world_model_fit_rows_without_fidelity_and_uses_candidate_co
     )
     assert bank.candidate_costs[0, 1] == pytest.approx(0.1)
     assert bank.candidate_costs[1, 1] == pytest.approx(0.01)
-    assert bank.scores[1, 1] == pytest.approx(0.5)
-    assert choose_baseline(bank, incumbent_alias=None) == "candidate-a"
-    assert choose_baseline(bank, incumbent_alias="candidate-b") == "candidate-b"
+    assert bank.scores[1, 1] == pytest.approx(1.0)
+    assert choose_baseline(bank, incumbent_alias=None).alias == "candidate-b"
+    named = choose_baseline(bank, incumbent_alias="candidate-b")
+    assert named.alias == "candidate-b"
+    assert named.uncovered_task_ids == ()
 
 
 def test_fifty_fit_tasks_are_bank_only_and_twenty_held_out_rows_cannot_change_it() -> None:
