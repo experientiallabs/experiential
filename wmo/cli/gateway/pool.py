@@ -18,6 +18,7 @@ from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.core.locks import FileLockTimeout, file_write_lock
 from wmo.common.models import GatewayEquivalenceCertification
 from wmo.runtime.gateway.management import GatewayManagement
+from wmo.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 pool_app = typer.Typer(help="Certify ordered exact-model deployment pools.", no_args_is_help=True)
 _JSON_OPTION = typer.Option(False, "--json")
@@ -106,46 +107,35 @@ def pool_certify(
                 raise GatewayCatalogAuthoringError(
                     "gateway catalog changed; refresh its digest before certifying the pool"
                 )
-            activation_started = False
             try:
                 apply_certified_pool_update(root, update)
-                activation_started = True
                 activation_changed = manager.activate_direct_alias(**activation_arguments)
-            except BaseException as activation_error:
-                if not activation_started:
-                    rollback_certified_pool_update(root, update)
-                    raise
-                try:
-                    activation_committed = not manager.preflight_direct_alias_activation(
-                        **activation_arguments
-                    )
-                except BaseException:  # noqa: BLE001 - preserve the primary activation failure
-                    emit_receipt(
-                        GatewayReceipt(
-                            operation="pool.certify",
-                            resource_kind="alias_revision",
-                            resource_id=revision,
-                            changed=None,
-                            data={
-                                "status": "operation_outcome_unknown",
-                                "alias": alias,
-                                "pool_id": alias,
-                                "catalog_sha256": update.normalized.identity_sha256(),
-                                "revision": revision,
-                                "recovery": "inspect alias status before retrying",
-                            },
-                        ),
-                        json_output=json_output,
-                        human=(
-                            "operation_outcome_unknown: desired catalog preserved; inspect alias "
-                            f"{alias!r} revision {revision!r} before retrying"
-                        ),
-                    )
-                    raise typer.Exit(code=1) from activation_error
-                if not activation_committed:
-                    rollback_certified_pool_update(root, update)
-                    raise
-                activation_changed = True
+            except AliasActivationOutcomeUnknownError as activation_error:
+                emit_receipt(
+                    GatewayReceipt(
+                        operation="pool.certify",
+                        resource_kind="alias_revision",
+                        resource_id=revision,
+                        changed=None,
+                        data={
+                            "status": "operation_outcome_unknown",
+                            "alias": alias,
+                            "pool_id": alias,
+                            "catalog_sha256": update.normalized.identity_sha256(),
+                            "revision": revision,
+                            "recovery": "inspect alias status before retrying",
+                        },
+                    ),
+                    json_output=json_output,
+                    human=(
+                        "operation_outcome_unknown: desired catalog preserved; inspect alias "
+                        f"{alias!r} revision {revision!r} before retrying"
+                    ),
+                )
+                raise typer.Exit(code=1) from activation_error
+            except BaseException:
+                rollback_certified_pool_update(root, update)
+                raise
         normalized = update.normalized
         catalog_changed = update.changed
     emit_receipt(

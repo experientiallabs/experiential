@@ -21,12 +21,14 @@ from wmo.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from wmo.runtime.gateway.sqlite import key_delivery
+from wmo.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 from wmo.runtime.gateway.sqlite.provider_authority import (
     ProviderAuthorityError,
     ProviderConnectionBinding,
 )
 from wmo.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
+    GatewayStoreError,
     InvalidVirtualKeyError,
     KeyIssuanceCommitError,
     OperationConflictError,
@@ -687,6 +689,124 @@ def test_project_activation_binding_is_unique_per_tenant_and_revisions_are_immut
         )
     finally:
         connection.close()
+
+
+def test_alias_activation_reconciles_lost_commit_acknowledgement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh exact read turns a lost COMMIT acknowledgement into success."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+    original_connect = store._connect
+
+    class CommitAfterEffectConnection:
+        """Raise only after SQLite has applied COMMIT."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            """Wrap one configured SQLite connection."""
+            self.connection = connection
+
+        def execute(self, statement: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+            """Delegate SQL and lose the COMMIT acknowledgement."""
+            result = self.connection.execute(statement, parameters)
+            if statement == "COMMIT":
+                raise sqlite3.OperationalError("injected commit acknowledgement failure")
+            return result
+
+    @contextmanager
+    def commit_after_effect() -> Iterator[CommitAfterEffectConnection]:
+        """Yield one connection with an ambiguous reported COMMIT."""
+        with original_connect() as connection:
+            yield CommitAfterEffectConnection(connection)
+
+    monkeypatch.setattr(store, "_connect", commit_after_effect)
+    store.activate_alias_revision(
+        organization_id="org-one",
+        alias_id="alias-one",
+        alias_name="coding",
+        revision_id="revision-one",
+        target=DirectTarget(pool_id="pool-one"),
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        row = connection.execute(
+            "SELECT active_revision_id FROM gateway_aliases WHERE alias_id = 'alias-one'"
+        ).fetchone()
+    assert row == ("revision-one",)
+
+
+def test_alias_activation_types_only_unreadable_commit_outcome_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Body failures stay definite while an unreadable COMMIT outcome is explicitly unknown."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+    original_connect = store._connect
+    connect_calls = 0
+
+    class CommitAfterEffectConnection:
+        """Raise only after SQLite has applied COMMIT."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            """Wrap one configured SQLite connection."""
+            self.connection = connection
+
+        def execute(self, statement: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+            """Delegate SQL and lose the COMMIT acknowledgement."""
+            result = self.connection.execute(statement, parameters)
+            if statement == "COMMIT":
+                raise sqlite3.OperationalError("injected commit acknowledgement failure")
+            return result
+
+    @contextmanager
+    def commit_then_unreadable() -> Iterator[CommitAfterEffectConnection]:
+        """Commit once, then make the fresh reconciliation connection unavailable."""
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls > 1:
+            raise sqlite3.OperationalError("injected reconciliation read failure")
+        with original_connect() as connection:
+            yield CommitAfterEffectConnection(connection)
+
+    monkeypatch.setattr(store, "_connect", commit_then_unreadable)
+    with pytest.raises(AliasActivationOutcomeUnknownError, match="operation_outcome_unknown"):
+        store.activate_alias_revision(
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="revision-one",
+            target=DirectTarget(pool_id="pool-one"),
+            snapshot_ref="snapshot-one",
+            catalog_sha256=_DIGEST,
+        )
+    assert connect_calls == 2
+
+    connect_calls = 0
+    with pytest.raises(GatewayStoreError, match="catalog snapshot reference is not registered"):
+        store.activate_alias_revision(
+            organization_id="org-one",
+            alias_id="alias-two",
+            alias_name="analysis",
+            revision_id="revision-two",
+            target=DirectTarget(pool_id="pool-two"),
+            snapshot_ref="missing-snapshot",
+            catalog_sha256=_DIGEST,
+        )
+    assert connect_calls == 1
 
 
 def test_cross_tenant_grant_is_rejected_by_composite_foreign_keys(tmp_path: Path) -> None:

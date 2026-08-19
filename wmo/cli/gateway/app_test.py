@@ -23,6 +23,7 @@ from wmo.common.models import load_model_catalog
 from wmo.runtime.gateway.auth import IssuedVirtualKey, issue_key_material
 from wmo.runtime.gateway.management import GatewayManagement
 from wmo.runtime.gateway.sqlite import key_delivery
+from wmo.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 from wmo.runtime.gateway.sqlite.store import OperationOutcomeUnknownError, SQLiteGatewayStore
 
 
@@ -293,17 +294,36 @@ def test_pool_certification_rolls_back_activation_failure_and_replays_exact_rece
     )
     catalog_before = (tmp_path / "models.toml").read_bytes()
     aliases_before = GatewayManagement(tmp_path).aliases()
+    preflight = GatewayManagement.preflight_direct_alias_activation
+    preflight_calls = 0
 
     def fail_activation(_manager: GatewayManagement, **_kwargs: object) -> bool:
         """Inject a failure after the catalog update but before SQLite activation."""
         raise RuntimeError("injected activation failure")
 
+    def fail_if_reconciliation_is_attempted(
+        manager: GatewayManagement,
+        **kwargs: object,
+    ) -> bool:
+        """Allow initial preflight but make any inappropriate recovery read fail."""
+        nonlocal preflight_calls
+        preflight_calls += 1
+        if preflight_calls > 1:
+            raise OSError("injected reconciliation read failure")
+        return preflight(manager, **kwargs)  # ty: ignore[invalid-argument-type]
+
     with monkeypatch.context() as patch:
         patch.setattr(GatewayManagement, "activate_direct_alias", fail_activation)
+        patch.setattr(
+            GatewayManagement,
+            "preflight_direct_alias_activation",
+            fail_if_reconciliation_is_attempted,
+        )
         failed = runner.invoke(app, command)
 
     assert failed.exit_code == 1
     assert isinstance(failed.exception, RuntimeError)
+    assert preflight_calls == 1
     assert (tmp_path / "models.toml").read_bytes() == catalog_before
     assert GatewayManagement(tmp_path).aliases() == aliases_before
 
@@ -354,11 +374,11 @@ def test_pool_certification_rolls_back_snapshot_failure_before_activation(
     assert json.loads(retried.stdout)["changed"] is True
 
 
-def test_pool_certification_reconciles_post_commit_activation_exception(
+def test_pool_certification_preserves_desired_catalog_for_typed_commit_unknown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An exact committed revision remains success when the activation outcome is unknown."""
+    """Only a typed COMMIT ambiguity preserves desired catalog for manual recovery."""
     runner, catalog_sha256 = _prepare_pool_certification_root(tmp_path)
     command = _pool_certification_command(
         tmp_path,
@@ -390,99 +410,13 @@ def test_pool_certification_reconciles_post_commit_activation_exception(
             catalog_sha256=catalog_sha256,
             refusal_failover=refusal_failover,
         )
-        raise RuntimeError("injected post-commit acknowledgement loss")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(GatewayManagement, "activate_direct_alias", commit_then_raise)
-        committed = runner.invoke(app, command)
-
-    replayed = runner.invoke(app, command)
-
-    assert committed.exit_code == 0, committed.output
-    assert replayed.exit_code == 0, replayed.output
-    assert json.loads(committed.stdout)["changed"] is True
-    assert json.loads(replayed.stdout)["changed"] is False
-    alias = next(
-        item for item in GatewayManagement(tmp_path).aliases() if item.alias_id == "coding"
-    )
-    assert alias.revision_id == "revision-waterfall-one"
-    assert "coding" in load_model_catalog(tmp_path / "models.toml").gateway_pools
-
-
-def test_pool_certification_preserves_desired_catalog_when_reconciliation_is_unknown(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An unreadable post-commit outcome never rolls an active revision's catalog back."""
-    runner, catalog_sha256 = _prepare_pool_certification_root(tmp_path)
-    command = _pool_certification_command(
-        tmp_path,
-        alias="coding",
-        revision="revision-waterfall-one",
-        expected_catalog_sha256=catalog_sha256,
-    )
-    activate = GatewayManagement.activate_direct_alias
-    preflight = GatewayManagement.preflight_direct_alias_activation
-
-    def commit_then_raise(
-        manager: GatewayManagement,
-        *,
-        alias_id: str,
-        alias_name: str,
-        revision_id: str,
-        pool_id: str,
-        snapshot_ref: str,
-        catalog_sha256: str,
-        refusal_failover: bool = False,
-    ) -> bool:
-        """Commit exact authority and then simulate a lost acknowledgement."""
-        activate(
-            manager,
+        raise AliasActivationOutcomeUnknownError(
             alias_id=alias_id,
-            alias_name=alias_name,
             revision_id=revision_id,
-            pool_id=pool_id,
-            snapshot_ref=snapshot_ref,
-            catalog_sha256=catalog_sha256,
-            refusal_failover=refusal_failover,
-        )
-        raise RuntimeError("injected post-commit acknowledgement loss")
-
-    def fail_committed_preflight(
-        manager: GatewayManagement,
-        *,
-        alias_id: str,
-        alias_name: str,
-        revision_id: str,
-        pool_id: str,
-        snapshot_ref: str,
-        catalog_sha256: str,
-        refusal_failover: bool = False,
-    ) -> bool:
-        """Make only the post-commit reconciliation read inconclusive."""
-        if any(
-            item.revision_id == revision_id and item.alias_id == alias_id
-            for item in manager.aliases()
-        ):
-            raise OSError("injected reconciliation read failure")
-        return preflight(
-            manager,
-            alias_id=alias_id,
-            alias_name=alias_name,
-            revision_id=revision_id,
-            pool_id=pool_id,
-            snapshot_ref=snapshot_ref,
-            catalog_sha256=catalog_sha256,
-            refusal_failover=refusal_failover,
         )
 
     with monkeypatch.context() as patch:
         patch.setattr(GatewayManagement, "activate_direct_alias", commit_then_raise)
-        patch.setattr(
-            GatewayManagement,
-            "preflight_direct_alias_activation",
-            fail_committed_preflight,
-        )
         unknown = runner.invoke(app, command)
 
     assert unknown.exit_code == 1

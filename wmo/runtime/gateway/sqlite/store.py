@@ -31,6 +31,7 @@ from wmo.runtime.gateway.contracts import (
 )
 from wmo.runtime.gateway.interfaces import GatewayClock
 from wmo.runtime.gateway.sqlite import key_delivery
+from wmo.runtime.gateway.sqlite.alias_activation import alias_activation_transaction
 from wmo.runtime.gateway.sqlite.migrations import connect_database, initialize_database
 from wmo.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
@@ -466,7 +467,17 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         if isinstance(target, ProjectTarget) and target.catalog_sha256 != catalog_sha256:
             raise GatewayStoreError("project target catalog digest differs from alias activation")
         now = utc_text(self._clock.now())
-        with self._transaction() as connection:
+        with alias_activation_transaction(
+            connect=self._connect,
+            organization_id=organization_id,
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            target=target,
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            refusal_failover=refusal_failover,
+        ) as connection:
             snapshot = connection.execute(
                 """
                 SELECT 1 FROM catalog_snapshot_refs
