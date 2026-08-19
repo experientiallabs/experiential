@@ -7,16 +7,16 @@ from pathlib import Path
 
 import typer
 
-from wmo.cli.gateway.catalog import (
+from wmo.cli.gateway.receipts import GatewayReceipt, emit_receipt
+from wmo.cli.options import ROOT_OPTION, usage_error
+from wmo.common.core.locks import FileLockTimeout, file_write_lock
+from wmo.common.models import GatewayEquivalenceCertification
+from wmo.runtime.gateway.catalog_authority import (
     GatewayCatalogAuthoringError,
     apply_certified_pool_update,
     plan_certified_pool_update,
     rollback_certified_pool_update,
 )
-from wmo.cli.gateway.receipts import GatewayReceipt, emit_receipt
-from wmo.cli.options import ROOT_OPTION, usage_error
-from wmo.common.core.locks import FileLockTimeout, file_write_lock
-from wmo.common.models import GatewayEquivalenceCertification
 from wmo.runtime.gateway.management import GatewayManagement
 from wmo.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
@@ -93,23 +93,33 @@ def pool_certify(
                 allow_existing_desired_state=True,
             )
             snapshot_ref = f"catalog-snapshots/{update.snapshot.name}"
-            activation_arguments = {
-                "alias_id": alias,
-                "alias_name": alias,
-                "revision_id": revision,
-                "pool_id": alias,
-                "snapshot_ref": snapshot_ref,
-                "catalog_sha256": update.normalized.identity_sha256(),
-                "refusal_failover": refusal_failover,
-            }
-            activation_changed = manager.preflight_direct_alias_activation(**activation_arguments)
+            catalog_sha256 = update.normalized.identity_sha256()
+            provider_connections = manager.provider_bindings(update.updated)
+            activation_changed = manager.preflight_direct_alias_activation(
+                alias_id=alias,
+                alias_name=alias,
+                revision_id=revision,
+                pool_id=alias,
+                snapshot_ref=snapshot_ref,
+                catalog_sha256=catalog_sha256,
+                refusal_failover=refusal_failover,
+            )
             if not update.observed_matches_expected and activation_changed:
                 raise GatewayCatalogAuthoringError(
                     "gateway catalog changed; refresh its digest before certifying the pool"
                 )
             try:
                 apply_certified_pool_update(root, update)
-                activation_changed = manager.activate_direct_alias(**activation_arguments)
+                activation_changed = manager.activate_direct_alias(
+                    alias_id=alias,
+                    alias_name=alias,
+                    revision_id=revision,
+                    pool_id=alias,
+                    snapshot_ref=snapshot_ref,
+                    catalog_sha256=catalog_sha256,
+                    provider_connections=provider_connections,
+                    refusal_failover=refusal_failover,
+                )
             except AliasActivationOutcomeUnknownError as activation_error:
                 emit_receipt(
                     GatewayReceipt(

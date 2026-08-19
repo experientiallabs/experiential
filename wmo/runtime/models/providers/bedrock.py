@@ -40,7 +40,6 @@ from wmo.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
-from wmo.runtime.models.providers.gateway_requests import gateway_model_request
 from wmo.runtime.models.providers.openai_compatible import normalize_embedding_vector
 from wmo.runtime.models.providers.protocol import BoundedSyncModelClientAdapter
 from wmo.runtime.models.providers.transport import (
@@ -48,6 +47,7 @@ from wmo.runtime.models.providers.transport import (
     RetryPolicy,
     run_with_retry,
 )
+from wmo.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 AWS_REGION_ENV = "AWS_REGION"
 AWS_DEFAULT_REGION_ENV = "AWS_DEFAULT_REGION"

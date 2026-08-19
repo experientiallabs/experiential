@@ -34,11 +34,11 @@ from wmo.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
-from wmo.runtime.models.providers.gateway_requests import gateway_model_request
 from wmo.runtime.models.providers.gemini_streaming import start_gemini_generate_stream
 from wmo.runtime.models.providers.openai_compatible import normalize_embedding_vector
 from wmo.runtime.models.providers.streaming import NormalizedProviderStream
 from wmo.runtime.models.providers.transport import RetryPolicy
+from wmo.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 

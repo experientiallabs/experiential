@@ -17,14 +17,15 @@ from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
-from wmo.cli.gateway import catalog as gateway_catalog
 from wmo.cli.gateway import key_output as gateway_key_output
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import BillingSource, load_model_catalog, normalize_gateway_catalog
+from wmo.runtime.gateway import catalog_authority as gateway_catalog
 from wmo.runtime.gateway.auth import IssuedVirtualKey, issue_key_material
 from wmo.runtime.gateway.management import GatewayManagement
 from wmo.runtime.gateway.sqlite import key_delivery
 from wmo.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
+from wmo.runtime.gateway.sqlite.provider_authority import ProviderConnectionBinding
 from wmo.runtime.gateway.sqlite.store import OperationOutcomeUnknownError, SQLiteGatewayStore
 
 
@@ -445,6 +446,7 @@ def test_pool_certification_preserves_desired_catalog_for_typed_commit_unknown(
         pool_id: str,
         snapshot_ref: str,
         catalog_sha256: str,
+        provider_connections: tuple[ProviderConnectionBinding, ...] = (),
         refusal_failover: bool = False,
     ) -> bool:
         """Commit exact authority and then simulate a lost acknowledgement."""
@@ -456,6 +458,7 @@ def test_pool_certification_preserves_desired_catalog_for_typed_commit_unknown(
             pool_id=pool_id,
             snapshot_ref=snapshot_ref,
             catalog_sha256=catalog_sha256,
+            provider_connections=provider_connections,
             refusal_failover=refusal_failover,
         )
         raise AliasActivationOutcomeUnknownError(
