@@ -55,6 +55,7 @@ def _catalog(
     api_version: str | None = None,
     region: str | None = None,
     capabilities: ModelCapabilities | None = _DEFAULT_CAPABILITIES,
+    served_model_id: str | None = None,
 ) -> ModelCatalog:
     """Build a minimum one-alias local catalog for deterministic resolution tests."""
     return ModelCatalog(
@@ -71,6 +72,7 @@ def _catalog(
             "fixture-model": ModelRecord(
                 connection="primary",
                 model="fixture-model",
+                served_model_id=served_model_id,
                 capabilities=capabilities,
             )
         },
@@ -210,6 +212,36 @@ def test_resolution_rejects_unsupported_connection_and_incomplete_compatible_url
         unsupported.snapshot("fixture-model")
     with pytest.raises(ModelConnectionError, match="needs connection.base_url"):
         compatible.resolve("fixture-model")
+
+
+def test_resolution_carries_the_cataloged_served_model_identity() -> None:
+    """An openai-compatible alias exposes its declared served identity for response checks.
+
+    A vLLM endpoint may publish an alias in /models yet echo the canonical served name in every
+    completion; the resolved identity must carry that declared exception.
+    """
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="openai-compatible",
+            base_url="https://models.example.test/v1",
+            served_model_id="served-canonical-name",
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    resolved = catalog.resolve("fixture-model")
+
+    assert resolved.served_model_id == "served-canonical-name"
+    assert resolved.snapshot.model_id == "fixture-model"
+
+    default = RuntimeModelCatalog(
+        _catalog(),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    assert default.resolve("fixture-model").served_model_id is None
 
 
 def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent() -> None:
