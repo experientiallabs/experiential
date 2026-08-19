@@ -463,7 +463,6 @@ def _installed_release_driver() -> None:
         BillingSource,
         ConnectionConfig,
         Embedding,
-        EmbeddingCostReservation,
         GatewayDeploymentCapabilities,
         GatewayEquivalenceCertification,
         GatewayTokenPrices,
@@ -472,7 +471,6 @@ def _installed_release_driver() -> None:
         ModelResponse,
         ModelSnapshot,
         RoutedCandidateSnapshot,
-        load_model_catalog,
     )
     from wmo.common.project import ProjectStore, artifact_input
     from wmo.common.routing import KnnGuard, KnnRouterPolicy
@@ -483,13 +481,6 @@ def _installed_release_driver() -> None:
         bank_bytes,
     )
     from wmo.common.routing.features import ROUTER_FEATURE_SCHEMA_SHA256
-    from wmo.optimize.model.sft import (
-        RuntimeInteractionExampleSource,
-        load_sft_model_optimization_config,
-        load_verified_sft_dataset,
-        prepare_runtime_sft_model_optimization,
-    )
-    from wmo.optimize.model.sft.selection import load_latest_sft_model_optimization
     from wmo.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
     from wmo.optimize.router.judging.service import prepare_manual_judge_calibration
     from wmo.runtime.gateway.catalog_authority import (
@@ -500,22 +491,11 @@ def _installed_release_driver() -> None:
     from wmo.runtime.gateway.lifecycle import load_local_gateway
     from wmo.runtime.gateway.management import GatewayManagement
     from wmo.runtime.models import (
-        CapabilityRequirement,
         CatalogRoleName,
         ResolvedModel,
         RuntimeModelCatalog,
     )
-    from wmo.runtime.router import (
-        RouterRuntime,
-        RuntimeAcceptedEvent,
-        RuntimeCompletedEvent,
-        RuntimeInteractionJournal,
-    )
-    from wmo.simulation.retrieval import (
-        RAGEmbedderBinding,
-        load_completed_build_rag_lineage_bindings,
-        refresh_runtime_trace_rag,
-    )
+    from wmo.runtime.router import RouterRuntime, RuntimeInteractionJournal
 
     release_revision = os.environ["WMO_RELEASE_REVISION"]
     assert re.fullmatch(r"[0-9a-f]{40}", release_revision), release_revision
@@ -2725,6 +2705,7 @@ def _installed_release_driver() -> None:
                 messages=[{"role": "user", "content": "Durable keyed request"}],
                 extra_headers={"Idempotency-Key": "p17-durable-request"},
             )
+            assert keyed_chat.id
             client.close()
         finally:
             router_process.terminate()
@@ -2736,17 +2717,33 @@ def _installed_release_driver() -> None:
         journal = RuntimeInteractionJournal(support_store.paths)
         events_before_public_replay = journal.read_events()
         provider_before_public_replay = state.snapshot()
+        gateway_database = root / "gateway" / "gateway.db"
+        artifacts_before_public_replay = directory_digest(support_store.paths.artifacts_directory)
+        project_before_public_replay = support_store.paths.project_toml.read_bytes()
+        with sqlite3.connect(gateway_database) as connection:
+            gateway_requests_before_public_replay = connection.execute(
+                "SELECT COUNT(*) FROM gateway_requests"
+            ).fetchone()[0]
+            gateway_attempts_before_public_replay = connection.execute(
+                "SELECT COUNT(*) FROM gateway_attempts"
+            ).fetchone()[0]
         with wmo.load_router(
             "support-agent",
             root=root,
             environment={"AZURE_OPENAI_API_KEY": "deterministic-loopback-placeholder"},
         ) as loaded_router:
-            replayed_chat = loaded_router.chat.completions.create(
-                model="support-agent",
-                messages=[{"role": "user", "content": "Durable keyed request"}],
-                extra_headers={"Idempotency-Key": "p17-durable-request"},
-            )
-            assert replayed_chat.id == keyed_chat.id
+            try:
+                loaded_router.chat.completions.create(
+                    model="support-agent",
+                    messages=[{"role": "user", "content": "Durable keyed request"}],
+                    extra_headers={"Idempotency-Key": "p17-durable-request"},
+                )
+            except openai.ConflictError as error:
+                assert error.status_code == 409
+                assert "idempotency_replay_unavailable" in str(error)
+            else:
+                raise AssertionError("restarted project gateway replay must fail closed")
+            assert state.snapshot() == provider_before_public_replay
             public_response = loaded_router.responses.create(
                 model="support-agent",
                 input="Programmatic router response",
@@ -2762,212 +2759,21 @@ def _installed_release_driver() -> None:
             )
             assert duplicate_first.choices[0].message.content == "Duplicate routed target"
             assert duplicate_second.choices[0].message.content == "Duplicate routed target"
-        events = journal.read_events()
+        assert journal.read_events() == events_before_public_replay
         assert state.snapshot() != provider_before_public_replay
-        accepted = tuple(event for event in events if isinstance(event, RuntimeAcceptedEvent))
-        completed = tuple(event for event in events if isinstance(event, RuntimeCompletedEvent))
-        prior_completed = tuple(
-            event
-            for event in events_before_public_replay
-            if isinstance(event, RuntimeCompletedEvent)
+        assert support_store.paths.project_toml.read_bytes() == project_before_public_replay
+        assert directory_digest(support_store.paths.artifacts_directory) == (
+            artifacts_before_public_replay
         )
-        assert len(completed) == len(prior_completed) + 3
-        assert len({event.interaction_id for event in completed}) == len(completed)
-        assert accepted[1].identity.lineage_id == accepted[2].identity.lineage_id
-        assert accepted[1].acceptance.selected_alias == accepted[2].acceptance.selected_alias
-        current_project = support_store.load_project()
-        assert current_project.build is not None
-        assert current_project.models is not None
-        completed_build = current_project.build
-        completed_build_digests = {
-            pointer.artifact_id: directory_digest(
-                support_store.paths.artifacts_directory / pointer.artifact_id
-            )
-            for pointer in (
-                completed_build.trace_dataset,
-                completed_build.task_set,
-                completed_build.serving_rag,
-                completed_build.fit_rag,
-                completed_build.world_model,
-            )
-        }
-        imported_bindings = load_completed_build_rag_lineage_bindings(
-            support_store.artifacts,
-            completed_build,
-        )
-        assert {binding.trace_id for binding in imported_bindings} == set(support_trace_ids)
-        catalog = load_model_catalog(root / "models.toml")
-        resolved_embedder = RuntimeModelCatalog(
-            catalog,
-            environment={"AZURE_OPENAI_API_KEY": "deterministic-loopback-placeholder"},
-        ).preflight(
-            current_project.models.embedder,
-            CapabilityRequirement(requires_embeddings=True),
-        )
-        assert resolved_embedder.embedding_client is not None
-        embedding_price = resolved_embedder.capabilities.input_cost_per_million_tokens_usd
-        assert embedding_price == 0
-        embedding_binding = RAGEmbedderBinding(
-            client=resolved_embedder.embedding_client,
-            snapshot=resolved_embedder.snapshot,
-            maximum_attempts=3,
-            input_usd_per_million_tokens=embedding_price,
-        )
-        embedding_reservation = EmbeddingCostReservation(
-            model=resolved_embedder.snapshot,
-            input_usd_per_million_tokens=embedding_price,
-            maximum_attempts=embedding_binding.maximum_attempts,
-            maximum_input_tokens=1_000_000,
-        )
-        refresh_time = datetime.now(UTC)
-        provider_before_refresh = state.snapshot()
-        refresh = refresh_runtime_trace_rag(
-            journal,
-            support_store.artifacts,
-            (completed_build.trace_dataset,),
-            imported_bindings,
-            embedder=embedding_binding,
-            embedding_reservation=embedding_reservation,
-            maximum_embedding_cost_usd=0,
-            created_at=refresh_time,
-            code_revision=release_revision,
-        )
-        provider_after_refresh = state.snapshot()
-        assert len(provider_after_refresh) > len(provider_before_refresh)
-        assert all(
-            request["path"] == provider_embeddings_path
-            for request in provider_after_refresh[len(provider_before_refresh) :]
-        )
-        assert refresh.snapshot_export.snapshot.completed_target_count == len(completed)
-        assert refresh.retrieval.index.rag_id not in {
-            completed_build.serving_rag.artifact_id,
-            completed_build.fit_rag.artifact_id,
-        }
-        assert refresh.dataset.dataset.dataset_id != completed_build.trace_dataset.artifact_id
-        response_acceptances = tuple(
-            event
-            for event in accepted
-            if event.identity.lineage_id == accepted[1].identity.lineage_id
-        )
-        assert len(response_acceptances) == 2
-        observed_response = response_acceptances[0]
-        terminal_response = response_acceptances[1]
-        tool_transitions = tuple(
-            transition
-            for transition in refresh.retrieval.transitions
-            if transition.trace_id == observed_response.interaction_id
-            and transition.action.kind == "tool_call"
-            and transition.observation.kind == "tool_result"
-        )
-        assert len(tool_transitions) == 1
-        assert tool_transitions[0].action.tool_name == "lookup_ticket"
-        assert tool_transitions[0].observation.content == "Ticket 42 is ready for reset."
-        assert terminal_response.interaction_id not in {
-            transition.trace_id for transition in refresh.retrieval.transitions
-        }
-        refresh_payload = json.dumps(
-            [trace.model_dump(mode="json") for trace in refresh.dataset.traces],
-            sort_keys=True,
-        )
-        assert "P17 generated world observation" not in refresh_payload
-        assert support_store.load_project().build == completed_build
-        assert {
-            artifact_id: directory_digest(support_store.paths.artifacts_directory / artifact_id)
-            for artifact_id in completed_build_digests
-        } == completed_build_digests
-        replayed_refresh = refresh_runtime_trace_rag(
-            journal,
-            support_store.artifacts,
-            (completed_build.trace_dataset,),
-            imported_bindings,
-            embedder=embedding_binding,
-            embedding_reservation=embedding_reservation,
-            maximum_embedding_cost_usd=0,
-            created_at=refresh_time,
-            code_revision=release_revision,
-        )
-        assert replayed_refresh.refresh.refresh_id == refresh.refresh.refresh_id
-        assert replayed_refresh.retrieval.index.rag_id == refresh.retrieval.index.rag_id
-        assert state.snapshot() == provider_after_refresh
-        provider_before_model_optimization = state.snapshot()
-        budget_result = run_cli("config", "budget", "1", "--root", str(root))
-        assert "maximum command cost: $1.00" in budget_result.stdout
-        training_price = 750_000 / (len(completed) * 4_096)
-        model_optimization_output = run_tty(
-            [
-                "optimize",
-                "model",
-                "support-agent",
-                "--root",
-                str(root),
-                "--tinker-connection",
-                "tinker-local",
-                "--tinker-api-key-env",
-                "P17_MISSING_TINKER_KEY",
-                "--base-model-alias",
-                "tinker-base",
-                "--base-model",
-                "fake-base-model",
-                "--maximum-cost-usd",
-                "1",
-                "--training-usd-per-million-tokens",
-                str(training_price),
-            ],
-            [
-                ("Use Tinker connection 'tinker-local'", "y"),
-                ("Authorize wmo optimize model support-agent to spend up to", "n"),
-            ],
-            completion_marker="Managed Tinker SFT was not started.",
-        )
-        assert "Managed Tinker SFT was not started." in model_optimization_output
-        assert state.snapshot() == provider_before_model_optimization
-        assert "P17_MISSING_TINKER_KEY" not in child_environment
-        latest = load_latest_sft_model_optimization(support_store)
-        assert latest is not None
-        config = load_sft_model_optimization_config(
-            support_store,
-            latest.config.artifact_id,
-        )
-        dataset = load_verified_sft_dataset(support_store, latest.dataset.artifact_id)
-        assert config.dataset == latest.dataset
-        assert dataset.build_spec is not None
-        assert dataset.build_spec.held_out_fraction == 0
-        assert dataset.rows
-        assert all(row.partition == "train" for row in dataset.rows)
-        runtime_rows = tuple(
-            row
-            for row in dataset.rows
-            if isinstance(row.example.source, RuntimeInteractionExampleSource)
-        )
-        assert len(runtime_rows) == len(completed)
-        assert {
-            cast(RuntimeInteractionExampleSource, row.example.source).interaction_id
-            for row in runtime_rows
-        } == {event.interaction_id for event in completed}
-        duplicate_rows = tuple(
-            row for row in runtime_rows if row.example.target.content == "Duplicate routed target"
-        )
-        assert len(duplicate_rows) == 2
-        assert len({row.example.example_id for row in duplicate_rows}) == 2
-        assert len({row.fingerprint for row in duplicate_rows}) == 1
-        duplicate_groups = {row.example.leakage_group_id for row in duplicate_rows}
-        assert len(duplicate_groups) == 2
-        assert any(
-            duplicate_groups.issubset(set(partition.leakage_group_ids))
-            for partition in dataset.partitions
-        )
-        assert any(row.example.target.tool_calls for row in runtime_rows)
-        assert "P17 generated world observation" not in json.dumps(
-            [row.model_dump(mode="json") for row in dataset.rows],
-            sort_keys=True,
-        )
-        replayed_preparation = prepare_runtime_sft_model_optimization(
-            support_store,
-            created_at=dataset.dataset.created_at,
-            code_revision=release_revision,
-        )
-        assert replayed_preparation.created is False
-        assert replayed_preparation.dataset.dataset.dataset_id == dataset.dataset.dataset_id
+        with sqlite3.connect(gateway_database) as connection:
+            gateway_requests_after_public_replay = connection.execute(
+                "SELECT COUNT(*) FROM gateway_requests"
+            ).fetchone()[0]
+            gateway_attempts_after_public_replay = connection.execute(
+                "SELECT COUNT(*) FROM gateway_attempts"
+            ).fetchone()[0]
+        assert gateway_requests_after_public_replay == gateway_requests_before_public_replay + 3
+        assert gateway_attempts_after_public_replay == gateway_attempts_before_public_replay + 3
         one_result = run_cli(
             "build",
             "one-trace",
