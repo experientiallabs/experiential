@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes, stable_id
+from wmo.common.core.artifacts import ArtifactInput, stable_id
 from wmo.common.judging import (
     HumanLabelSet,
     HumanScoreReview,
@@ -22,7 +22,7 @@ from wmo.common.judging import (
 from wmo.common.judging.evidence import DEFAULT_JUDGE_OUTPUT_TOKENS
 from wmo.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from wmo.common.models import ModelCatalog, ModelSnapshot, PricingSource
-from wmo.common.project import ArtifactCorruptionError, ProjectStore, artifact_input
+from wmo.common.project import ProjectStore, artifact_input
 from wmo.common.tasks import TaskCase, load_task_set
 from wmo.common.traces import Trace, load_trace_dataset
 from wmo.optimize.router.judging.artifacts import (
@@ -72,6 +72,12 @@ from wmo.optimize.router.judging.selection import (
     representative_pairs,
     representative_pairwise_pairs,
     trace_preview,
+)
+from wmo.optimize.router.judging.setup_store import (
+    read_setup_artifact as _read_setup,
+)
+from wmo.optimize.router.judging.setup_store import (
+    write_setup_artifact as _write_setup,
 )
 from wmo.optimize.router.judging.template_bind import (
     DEFAULT_JUDGE_TEMPLATE,
@@ -254,7 +260,7 @@ def commit_manual_judge_setup(
         )
         if not same_contract:
             if _is_template_version_upgrade(saved, plan, saved_rubric, saved_rubric_input):
-                return _adopt_current_template_version(store, plan, saved)
+                return _persist_setup(store, plan, inputs=saved.inputs, rubric=saved.rubric)
             raise ManualJudgeError("project already has a different finalized judge setup")
         return saved
     review = RubricReview.open(
@@ -272,6 +278,27 @@ def commit_manual_judge_setup(
             key=lambda item: item.artifact_id,
         )
     )
+    return _persist_setup(store, plan, inputs=inputs, rubric=rubric_input)
+
+
+def _persist_setup(
+    store: ProjectStore,
+    plan: ManualJudgeSetupPlan,
+    *,
+    inputs: tuple[ArtifactInput, ...],
+    rubric: ArtifactInput,
+) -> ManualJudgeSetupArtifact:
+    """Write one finalized setup and point fresh review state at it.
+
+    Args:
+        store: Project-local artifact and mutable review store.
+        plan: Confirmed setup plan to persist.
+        inputs: Ordered exact manifest inputs binding the setup.
+        rubric: Verified manifest pointer of the finalized rubric.
+
+    Returns:
+        The newly persisted immutable setup artifact.
+    """
     setup_id = stable_id(
         "manual-judge-setup",
         {
@@ -294,7 +321,7 @@ def commit_manual_judge_setup(
         prompt_template=plan.prompt_template,
         trace_dataset=plan.build.trace_dataset,
         task_set=plan.build.task_set,
-        rubric=rubric_input,
+        rubric=rubric,
         previews=plan.previews,
     )
     setup_input = _write_setup(store, setup)
@@ -310,6 +337,11 @@ def _is_template_version_upgrade(
 ) -> bool:
     """Report whether the plan only advances a saved setup to the current template version.
 
+    Previews are intentionally not compared: they are operator-facing renderings whose
+    count is a display choice, not part of the judged contract. The saved setup, its
+    probes, and any approved audit stay immutable in the artifact store, and review
+    state restarts with no drafts, audit, or approval.
+
     Args:
         saved: Existing finalized setup persisted under an earlier template version.
         plan: Confirmed replacement plan built from the same project evidence.
@@ -317,8 +349,8 @@ def _is_template_version_upgrade(
         saved_rubric_input: Verified manifest pointer of the saved rubric.
 
     Returns:
-        True when every other contract field matches and only the template version moves
-        from 2 to 3.
+        True when every judged contract field matches and only the template version
+        moves from 2 to 3.
     """
     return (
         saved.prompt_template.template_version == "2"
@@ -329,60 +361,9 @@ def _is_template_version_upgrade(
         and saved.judge_model == plan.judge_model
         and saved.trace_dataset == plan.build.trace_dataset
         and saved.task_set == plan.build.task_set
-        and saved.previews == plan.previews
         and saved_rubric_input == saved.rubric
         and saved_rubric.dimensions == plan.dimensions
     )
-
-
-def _adopt_current_template_version(
-    store: ProjectStore,
-    plan: ManualJudgeSetupPlan,
-    saved: ManualJudgeSetupArtifact,
-) -> ManualJudgeSetupArtifact:
-    """Replace a version 2 setup with its version 3 equivalent and restart calibration.
-
-    The saved setup, its probes, and any approved audit stay immutable in the artifact
-    store. Review state moves to the new setup with no drafts, audit, or approval, so
-    calibration and production judging proceed only under the version 3 evidence
-    projection the operator just confirmed.
-
-    Args:
-        store: Project-local artifact and mutable review store.
-        plan: Confirmed plan whose template only advances the version.
-        saved: Existing finalized setup persisted under template version 2.
-
-    Returns:
-        The newly persisted setup bound to the current template version.
-    """
-    setup_id = stable_id(
-        "manual-judge-setup",
-        {
-            "project_id": plan.project_id,
-            "judge_alias": plan.judge_alias,
-            "judge_model": plan.judge_model.model_dump(mode="json"),
-            "prompt_template": plan.prompt_template.model_dump(mode="json"),
-            "inputs": [item.model_dump(mode="json") for item in saved.inputs],
-        },
-    )
-    setup = ManualJudgeSetupArtifact(
-        schema_version=1,
-        created_at=plan.created_at,
-        inputs=saved.inputs,
-        code_revision=plan.code_revision,
-        setup_id=setup_id,
-        project_id=plan.project_id,
-        judge_alias=plan.judge_alias,
-        judge_model=plan.judge_model,
-        prompt_template=plan.prompt_template,
-        trace_dataset=plan.build.trace_dataset,
-        task_set=plan.build.task_set,
-        rubric=saved.rubric,
-        previews=plan.previews,
-    )
-    setup_input = _write_setup(store, setup)
-    write_review_state(store, ManualJudgeReviewState(setup=setup_input))
-    return setup
 
 
 def prepare_manual_judge_calibration(
@@ -771,81 +752,6 @@ def calibrate_manual_judge(
         approved_at=created_at,
         provider_calls_made=collection.provider_calls_made,
     )
-
-
-def _write_setup(store: ProjectStore, setup: ManualJudgeSetupArtifact) -> ArtifactInput:
-    """Persist or verify one finalized manual judge setup.
-
-    Args:
-        store: Project-local immutable artifact store.
-        setup: Confirmed setup contract.
-
-    Returns:
-        Exact manifest pointer for the stored setup.
-
-    Raises:
-        ManualJudgeError: An existing artifact conflicts or cannot be verified.
-    """
-    try:
-        _stored, manifest = store.artifacts.write_or_replay(
-            artifact_id=setup.setup_id,
-            artifact_type="manual-judge-setup",
-            envelope=setup,
-            envelope_path="setup.json",
-            envelope_type=ManualJudgeSetupArtifact,
-            files={"setup.json": canonical_json_bytes(setup)},
-        )
-    except ArtifactCorruptionError as exc:
-        raise ManualJudgeError("existing manual judge setup cannot be resumed safely") from exc
-    except ValueError as exc:
-        raise ManualJudgeError("existing manual judge setup conflicts with confirmation") from exc
-    return artifact_input(manifest)
-
-
-def _read_setup(store: ProjectStore, expected: ArtifactInput) -> ManualJudgeSetupArtifact:
-    """Read one setup and require its exact manifest pointer.
-
-    Args:
-        store: Project-local immutable artifact store.
-        expected: Review-state setup pointer.
-
-    Returns:
-        Verified setup contract.
-
-    Raises:
-        ManualJudgeError: The artifact is absent, malformed, or changed.
-    """
-    saved, saved_input = _read_setup_with_input(store, expected.artifact_id)
-    if saved_input != expected:
-        raise ManualJudgeError("manual judge setup manifest differs from review state")
-    return saved
-
-
-def _read_setup_with_input(
-    store: ProjectStore, artifact_id: str
-) -> tuple[ManualJudgeSetupArtifact, ArtifactInput]:
-    """Read a setup artifact through the shared provenance verifier.
-
-    Args:
-        store: Project-local immutable artifact store.
-        artifact_id: Setup artifact identifier.
-
-    Returns:
-        Verified setup and canonical manifest input.
-
-    Raises:
-        ManualJudgeError: The setup cannot be verified.
-    """
-    try:
-        return read_artifact_json(
-            store,
-            artifact_id=artifact_id,
-            expected_artifact_type="manual-judge-setup",
-            relative_path="setup.json",
-            model_type=ManualJudgeSetupArtifact,
-        )
-    except JudgingProvenanceError as exc:
-        raise ManualJudgeError("completed manual judge setup is unavailable") from exc
 
 
 def _validate_labels(

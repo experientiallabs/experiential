@@ -1157,6 +1157,7 @@ def test_setup_commit_upgrades_template_version_and_restarts_calibration(
         store,
         _catalog(),
         prompt_template=DEFAULT_JUDGE_TEMPLATE.model_copy(update={"template_version": "2"}),
+        preview_count=2,
         created_at=_TIME,
         code_revision="test-revision",
     )
