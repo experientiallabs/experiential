@@ -2633,9 +2633,21 @@ def _installed_release_driver() -> None:
         try:
             wait_for_loopback(router_port, router_process)
             assert state.snapshot() == provider_calls_before_run
+            compatibility_key_directory = root / "gateway" / "compatibility-keys"
+            compatibility_key_files = tuple(compatibility_key_directory.glob("*.txt"))
+            assert len(compatibility_key_files) == 1
+            compatibility_key_file = compatibility_key_files[0]
+            compatibility_key = compatibility_key_file.read_text(encoding="utf-8").strip()
+            assert compatibility_key.startswith("wmo_vk_")
+            assert stat.S_IMODE(compatibility_key_file.stat().st_mode) == 0o600
+            assert not key_output_marker_path(compatibility_key_file).exists()
+            assert (
+                tuple(compatibility_key_directory.glob(f".{compatibility_key_file.name}.*.reserve"))
+                == ()
+            )
             client = OpenAI(
                 base_url=f"http://127.0.0.1:{router_port}/v1",
-                api_key="unused-loopback-client-key",
+                api_key=compatibility_key,
             )
             chat = client.chat.completions.create(
                 model="support-agent",
