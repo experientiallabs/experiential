@@ -41,8 +41,18 @@ from wmo.runtime.gateway.execution import (
     GatewayExecutionStream,
     GatewayExecutor,
 )
-from wmo.runtime.gateway.openai.requests import decode_chat
-from wmo.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute, GatewayRoutingError
+from wmo.runtime.gateway.openai.requests import decode_chat, decode_responses
+from wmo.runtime.gateway.openai.state import (
+    BoundedContinuationStore,
+    ContinuationState,
+    ProtocolNamespace,
+)
+from wmo.runtime.gateway.routing import (
+    CatalogRouteResolver,
+    GatewayRoute,
+    GatewayRoutingError,
+    project_episode_identity,
+)
 from wmo.runtime.gateway.service import GatewayDrainingError, GatewayService, create_gateway_app
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.models.providers import RequestDeadline
@@ -314,6 +324,28 @@ class _ProjectResolver:
         )
 
 
+class _FailOnceContinuationStore(BoundedContinuationStore):
+    """Reject the first continuation write, then retain subsequent state normally."""
+
+    def __init__(self) -> None:
+        """Initialize one deterministic fallible continuation store."""
+        super().__init__()
+        self.calls = 0
+
+    async def remember(
+        self,
+        *,
+        namespace: ProtocolNamespace,
+        response_id: str,
+        state: ContinuationState,
+    ) -> None:
+        """Fail the first retention attempt before delegating later calls."""
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("continuation write failed")
+        await super().remember(namespace=namespace, response_id=response_id, state=state)
+
+
 def _catalog() -> tuple[NormalizedGatewayCatalog, ExactModelDeployment]:
     """Build one launch-safe singleton gateway catalog."""
     deployment = ExactModelDeployment(
@@ -348,6 +380,7 @@ def _service(
     provider: _Provider,
     *,
     terminal_flusher: Callable[[], object] | None = None,
+    continuation_store: BoundedContinuationStore | None = None,
 ) -> tuple[GatewayService, _ControlStore, _Ledger, ExecutionSnapshot]:
     """Compose the full launch data plane with deterministic injected dependencies."""
     catalog, deployment = _catalog()
@@ -393,6 +426,7 @@ def _service(
         ),
         clock=_Clock(),
         readiness_probe=readiness_probe,
+        continuation_store=continuation_store,
         terminal_flusher=flush,
     )
     control.raw_keys_seen.clear()
@@ -553,6 +587,14 @@ def test_project_route_rejects_ambiguous_matching_deployments() -> None:
             )
 
     asyncio.run(scenario())
+
+
+def test_project_episode_identity_cannot_collide_through_component_delimiters() -> None:
+    """Tenant and episode component boundaries survive arbitrary delimiter-like text."""
+    first = project_episode_identity(("a", "b\x1fc", "d", "e"))
+    second = project_episode_identity(("a\x1fb", "c", "d", "e"))
+
+    assert first != second
 
 
 def test_executor_rejects_runtime_client_drift_before_attempt_or_network() -> None:
@@ -804,5 +846,43 @@ def test_http_boundary_authenticates_before_json_decode_and_returns_openai_400()
         assert malformed.status_code == 400
         assert malformed.json()["error"]["code"] == "invalid_json"
         assert control.raw_keys_seen == ["caller-secret"]
+
+    asyncio.run(scenario())
+
+
+def test_responses_replay_commits_only_after_continuation_retention_succeeds() -> None:
+    """A failed continuation write abandons replay ownership so a keyed retry redispatches."""
+
+    async def scenario() -> None:
+        """Fail first retention, then prove the retry executes and completes normally."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TEXT_DELTA,
+                        sequence_number=0,
+                        text_delta="hello",
+                    ),
+                    GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+                )
+            )
+        )
+        continuations = _FailOnceContinuationStore()
+        service, _control, _ledger, _proof = _service(
+            provider,
+            continuation_store=continuations,
+        )
+        decoded = decode_responses(
+            {"model": "public-model", "input": "hello"},
+            idempotency_key="operation-one",
+        )
+
+        with pytest.raises(RuntimeError, match="continuation write failed"):
+            await service.complete(raw_key="caller-secret", decoded=decoded)
+        response = await service.complete(raw_key="caller-secret", decoded=decoded)
+
+        assert response.status_code == 200
+        assert len(provider.streams) == 2
+        assert continuations.calls == 2
 
     asyncio.run(scenario())

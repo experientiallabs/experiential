@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from wmo.common.core.artifacts import ContractModel
+from wmo.common.core.artifacts import ArtifactId, ContractModel, stable_id
 from wmo.common.models import AssistantAction, ModelMessage, ModelRequest, ToolChoice
 from wmo.common.models.gateway_catalog import (
     ExactModelDeployment,
@@ -256,7 +256,7 @@ class RouterProjectTargetResolver:
         deadline = RequestDeadline(deadline_monotonic)
         await self._acquire(deadline)
         model_request = gateway_model_request(request)
-        episode_id = "\x1f".join(episode_namespace)
+        episode_id = project_episode_identity(episode_namespace)
         task = asyncio.create_task(
             asyncio.to_thread(
                 runtime._select_unretained,
@@ -351,4 +351,27 @@ def gateway_model_request(request: GatewayRequest) -> ModelRequest:
         tool_choice=choice,
         temperature=request.temperature,
         maximum_output_tokens=request.maximum_output_tokens,
+    )
+
+
+def project_episode_identity(
+    namespace: tuple[ArtifactId, ArtifactId, ArtifactId, str],
+) -> str:
+    """Encode tenant-scoped episode components without delimiter collisions.
+
+    Args:
+        namespace: Organization, identity, alias revision, and caller episode key.
+
+    Returns:
+        Stable content-addressed identity with explicit component boundaries.
+    """
+    organization_id, identity_id, alias_revision_id, episode_key = namespace
+    return stable_id(
+        "gateway-project-episode",
+        {
+            "organization_id": organization_id,
+            "identity_id": identity_id,
+            "alias_revision_id": alias_revision_id,
+            "episode_key": episode_key,
+        },
     )

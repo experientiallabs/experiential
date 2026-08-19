@@ -559,17 +559,22 @@ class GatewayService:
             headers=tuple(sorted(headers.items())),
             body=encoded,
         )
-        if lease is not None:
-            await lease.complete(cached)
-        if request.surface == GatewayApiSurface.RESPONSES:
-            await self._remember_continuation(
-                request=request,
-                namespace=namespace,
-                request_id=authorization.request_id,
-                episode=episode,
-                events=retained,
-                response_id=cast(str, body["id"]),
-            )
+        try:
+            if request.surface == GatewayApiSurface.RESPONSES:
+                await self._remember_continuation(
+                    request=request,
+                    namespace=namespace,
+                    request_id=authorization.request_id,
+                    episode=episode,
+                    events=retained,
+                    response_id=cast(str, body["id"]),
+                )
+            if lease is not None:
+                await lease.complete(cached)
+        except BaseException:
+            if lease is not None:
+                await _abandon_quietly(lease)
+            raise
         return _cached_response(cached)
 
     async def _remember_continuation(

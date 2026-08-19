@@ -39,7 +39,7 @@ from wmo.common.models import (
     Usage,
 )
 from wmo.common.project import ArtifactStore, ProjectPaths, artifact_input
-from wmo.common.routing import KnnGuard, KnnRouterPolicy
+from wmo.common.routing import KnnGuard, KnnRouterPolicy, RoutingDecision
 from wmo.common.routing.bank import (
     CandidateEvidenceCount,
     KnnBankManifest,
@@ -785,6 +785,40 @@ def test_cached_selection_and_completion_reuse_sealed_activation_without_rehashi
     with pytest.raises(ValueError, match="cannot set WRITEABLE flag"):
         runtime.bank.scores.setflags(write=True)
     assert runtime.select(request, episode_id="episode-a") == decision
+
+
+def test_complete_survives_concurrent_lru_eviction_of_its_internal_selection() -> None:
+    """A valid internally selected decision remains consumable after bounded cache eviction."""
+    policy, manifest, bank, snapshots, client = _fixture()
+    runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _Catalog(snapshots, client)),
+        pricing_snapshot_id=policy.pricing_snapshot_id,
+        pricing_snapshot_sha256=policy.pricing_snapshot_sha256,
+        pricing_candidate_aliases=manifest.candidate_aliases,
+        decision_capacity=1,
+    )
+    original_select = runtime.select
+
+    def select_then_evict(
+        request: ModelRequest,
+        *,
+        episode_id: str | None = None,
+        retain: bool = True,
+    ) -> RoutingDecision:
+        """Evict the returned decision before ``complete`` reaches its cache check."""
+        selected = original_select(request, episode_id=episode_id, retain=retain)
+        original_select(_request(tool_name="evict"), episode_id="other-episode")
+        return selected
+
+    runtime.__dict__["select"] = select_then_evict
+
+    result = runtime.complete(_request(), episode_id="episode-a")
+
+    assert result.decision.episode_id_sha256 == hashlib.sha256(b"episode-a").hexdigest()
+    assert client.complete_calls == 1
 
 
 def test_sticky_decision_identity_hashes_all_retained_evidence() -> None:

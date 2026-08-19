@@ -665,7 +665,7 @@ class RouterRuntime:
             request_key = (expected_episode_sha256, request_sha256)
             cached = self._request_decisions.get(request_key)
             episode_decision = self._episode_decisions.get(expected_episode_sha256)
-            if cached is None and decision is not None:
+            if cached is None:
                 if selected.decision_id != _decision_content_id(selected):
                     raise ValueError(
                         "routing decision does not match this policy, request, or episode"
