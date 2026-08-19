@@ -52,6 +52,7 @@ from wmo.runtime.models import (
 from wmo.runtime.models.preflight import preflight_capabilities
 from wmo.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
 from wmo.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
+from wmo.simulation.engines.text.errors import SimulationContentionError
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.ingest.sources import CANONICAL_TRACE_SOURCES, load_trace_source
 from wmo.simulation.retrieval import (
@@ -207,6 +208,13 @@ def build(
             _console.print(
                 "Completed paid work is saved. Run the wizard again to resume; finished "
                 "steps replay exactly without new spend."
+            )
+            raise typer.Exit(code=1) from exc
+        except SimulationContentionError as exc:
+            _console.print(f"[red]error[/red] {exc}")
+            _console.print(
+                "Another process owns in-flight paid work. Completed paid work is saved; "
+                "run the wizard again to resume once that process finishes."
             )
             raise typer.Exit(code=1) from exc
         return

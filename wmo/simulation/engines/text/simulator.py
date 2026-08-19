@@ -249,6 +249,7 @@ class WorldModelSimulator:
         )
         completed = self._load_completed_rollouts(cells, bindings, resolution_input)
         pending = tuple(cell for cell in cells if cell.cell_id not in completed)
+        pending = self._stale_recovery_first(pending, resolution, resolution_input, bindings)
 
         observe_cells = cell_progress_reporter(self._progress, cells, completed)
         observe_cells()
@@ -480,6 +481,41 @@ class WorldModelSimulator:
             if rollout is not None:
                 completed[cell.cell_id] = rollout
         return completed
+
+    def _stale_recovery_first(
+        self,
+        pending: tuple[EvaluationCell, ...],
+        resolution: SimulationResolution,
+        resolution_input: ArtifactInput,
+        bindings: dict[ArtifactId, SimulationCellBinding],
+    ) -> tuple[EvaluationCell, ...]:
+        """Order pending cells so dead prior claims are recovered before budget admission.
+
+        A stale unknown-spend claim reserves the whole finite ceiling until its own cell
+        persists recovery evidence, so running those cells first keeps every sibling cell
+        admissible instead of timing out on a barrier only the stale cell can clear.
+
+        Args:
+            pending: Cells without a persisted final rollout, in plan order.
+            resolution: Persisted binding between the spec and its resolved models.
+            resolution_input: Immutable pointer to the persisted resolution artifact.
+            bindings: Exact per-cell bindings for the resolution.
+
+        Returns:
+            Pending cells with stale-recovery cells first, otherwise in plan order.
+        """
+        pins = self._pins(resolution_input)
+        recovery: list[EvaluationCell] = []
+        rest: list[EvaluationCell] = []
+        for cell in pending:
+            binding = bindings[cell.cell_id]
+            attempt, _existing = resolve_cell_attempt(self._store, cell, binding, pins)
+            lease_id = lease_id_for_binding(resolution, binding, attempt=attempt)
+            if self._leases.stale_recovery_pending(lease_id):
+                recovery.append(cell)
+            else:
+                rest.append(cell)
+        return (*recovery, *rest)
 
     def _execute_and_persist_cell(
         self,

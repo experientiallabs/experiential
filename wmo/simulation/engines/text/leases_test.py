@@ -135,6 +135,8 @@ def test_expired_dead_paid_claim_is_recovered_as_stale_without_replay(tmp_path: 
     assert recovered.lease.reserved_cost_usd == 1.0
     assert allowed.state == TextCellLeaseState.CONTENDED
     assert allowed.retryable
+    assert blocked_store.stale_recovery_pending("lease-a")
+    assert not blocked_store.stale_recovery_pending("lease-b")
 
 
 def test_live_paid_claim_returns_retryable_contention_at_finite_deadline(
