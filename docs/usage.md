@@ -9,7 +9,7 @@ The root surface is deliberately small:
 | `wmo optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `wmo run --root ROOT [--check]` | Validate or start the initialized authenticated multi-alias gateway on loopback. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `wmo run PROJECT --root ROOT [--ghost]` | Load a frozen policy and expose it on development-only loopback. | Local OpenAI-compatible endpoint with durable journaling by default or no saved traffic in ghost mode. |
-| `wmo config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
+| `wmo config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, certified exact-model pools, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
 | `wmo config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. | Local `.wmo/models.toml`. |
 | `wmo config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command. | Local `.wmo/settings.toml`. |
 | `wmo config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.wmo/settings.toml`. |
@@ -39,6 +39,38 @@ states, and attributed estimated cost. Estimated cost is not provider invoice co
 One-time virtual-key material appears only in the successful key-issue receipt or a newly created
 mode-`0600` output file. Human key issuance on a non-terminal requires `--json` or `--output`.
 Provider configuration accepts an environment variable name, never a raw credential value.
+
+To add ordered failover, first author each deployment as a direct alias with the same
+`--exact-model`. Then certify their equivalence and order with:
+
+```console
+wmo config gateway pool certify PUBLIC_ALIAS \
+  --deployment-alias PRIMARY --deployment-alias SECONDARY \
+  --exact-model EXACT_MODEL --certification-id CERTIFICATION \
+  --provenance PROVENANCE --evidence-sha256 SHA256 \
+  --certified-at TIMESTAMP --expected-catalog-sha256 CATALOG_SHA256 \
+  --revision REVISION --root ROOT --non-interactive --json
+```
+
+`--expected-catalog-sha256` prevents stale authoring from activating a different catalog. Every
+pool member must resolve to the same exact model identity. Retryable transport, availability, rate,
+and malformed precommit failures may advance through the certified order. Refusal fallback requires
+the explicit `--refusal-failover` option and is persisted on that alias revision. No failure can
+switch providers after outward text, refusal, or tool-call output commits the response.
+
+Official OpenAI SDK clients use the issued virtual key and loopback base URL:
+
+```python
+from openai import OpenAI
+
+with OpenAI(api_key=VIRTUAL_KEY, base_url="http://127.0.0.1:8000/v1") as client:
+    response = client.responses.create(model="PUBLIC_ALIAS", input="hello")
+```
+
+Release evidence fixes the SDK at OpenAI `3.0.0` and covers `OpenAI` plus `AsyncOpenAI`, Chat
+Completions plus Responses, and stream plus non-stream calls. Provider protocol fixtures are
+deterministic. Hosted-provider runs require credentials and are reported separately in
+[`release-scope.md`](release-scope.md); fixture success is not presented as a live-provider result.
 
 Build stops at review readiness. `wmo optimize router` creates the bounded fit and held-out
 evaluation chain after candidate and manual judge setup. It never invokes world-model fidelity

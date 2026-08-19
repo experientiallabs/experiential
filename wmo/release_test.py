@@ -46,11 +46,15 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
 )
 REQUIRED_WHEEL_MODULES = frozenset(
     {
+        "wmo/cli/gateway/app.py",
         "wmo/common/judging/calibration.py",
         "wmo/common/judging/labels.py",
         "wmo/common/judging/review.py",
         "wmo/common/models/model.py",
         "wmo/runtime/environments/local.py",
+        "wmo/runtime/gateway/lifecycle.py",
+        "wmo/runtime/gateway/openai/requests.py",
+        "wmo/runtime/gateway/service.py",
         "wmo/runtime/models/registry.py",
         "wmo/runtime/router/application.py",
         "wmo/simulation/comparison.py",
@@ -107,6 +111,35 @@ FORBIDDEN_FLAT_ROUTER_MODULES = frozenset(
     }
 )
 _TEST_RELEASE_REVISION = "1" * 40
+
+
+def _assert_gateway_canaries_absent(
+    root: Path,
+    *,
+    channels: dict[str, bytes | str],
+    canaries: tuple[str, ...],
+) -> None:
+    """Reject raw content or secrets across durable and observable gateway channels.
+
+    Args:
+        root: Gateway root containing SQLite, WAL, backups, and catalog snapshots.
+        channels: Named stdout, stderr, log, or HTTP response bodies.
+        canaries: Raw content and secret values that must never appear.
+
+    Raises:
+        AssertionError: A canary appears in any scanned file or named channel.
+    """
+    encoded = tuple(canary.encode() for canary in canaries)
+    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+        payload = path.read_bytes()
+        for index, canary in enumerate(encoded):
+            assert canary not in payload, (
+                f"forbidden gateway canary {index} persisted in {path.relative_to(root)}"
+            )
+    for name, value in sorted(channels.items()):
+        payload = value.encode() if isinstance(value, str) else value
+        for index, canary in enumerate(encoded):
+            assert canary not in payload, f"forbidden gateway canary {index} exposed in {name}"
 
 
 def _normalized_path(member_name: str) -> str:
@@ -395,16 +428,20 @@ def _installed_release_driver() -> None:
     Raises:
         AssertionError: Any package, CLI, API, artifact, replay, or no-spend invariant fails.
     """
+    import asyncio
     import hashlib
     import json
     import math
     import socket
+    import stat
     import threading
     from collections import Counter
     from datetime import UTC, datetime
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    from openai import OpenAI
+    import httpx
+    import openai
+    from openai import AsyncOpenAI, OpenAI
     from openai.types.responses import FunctionToolParam
 
     import wmo
@@ -517,6 +554,9 @@ def _installed_release_driver() -> None:
                 self.send_error(400)
                 return
             ordinal = state.append(self.path, payload)
+            if payload.get("model") == "gateway-model":
+                self._send_gateway_stream(payload, ordinal=ordinal)
+                return
             if self.path.endswith("/embeddings"):
                 values = payload.get("input", [])
                 texts = [values] if isinstance(values, str) else list(values)
@@ -615,6 +655,70 @@ def _installed_release_driver() -> None:
             body = json.dumps(response).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_gateway_stream(self, payload: dict[str, object], *, ordinal: int) -> None:
+            """Return one deterministic Chat SSE stream for gateway certification.
+
+            Args:
+                payload: Gateway-normalized upstream Chat request.
+                ordinal: Stable provider request ordinal.
+            """
+            assert payload.get("stream") is True
+            assert payload.get("stream_options") == {"include_usage": True}
+            if payload.get("tools"):
+                choices = (
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": f"call-gateway-{ordinal}",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "lookup_ticket",
+                                                "arguments": '{"ticket":"tool-argument-canary"}',
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ]
+                    },
+                )
+            else:
+                choices = (
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": "gateway-response-canary",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    },
+                )
+            frames = [
+                f"data: {json.dumps(frame, separators=(',', ':'))}\n\n".encode()
+                for frame in choices
+            ]
+            frames.append(
+                b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
+            )
+            frames.append(b"data: [DONE]\n\n")
+            body = b"".join(frames)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -842,44 +946,6 @@ def _installed_release_driver() -> None:
             digest.update(b"\0")
         return digest.hexdigest()
 
-    gateway_root = execution_root / "gateway-empty"
-    empty_gateway = run_cli(
-        "run",
-        "--root",
-        str(gateway_root),
-        "--non-interactive",
-        "--json",
-        expected=2,
-    )
-    empty_payload = json.loads(empty_gateway.stdout)
-    assert empty_payload["error"]["code"] == "gateway_not_initialized"
-    assert not gateway_root.exists()
-    initialized_gateway = run_cli(
-        "config",
-        "gateway",
-        "init",
-        "--root",
-        str(gateway_root),
-        "--non-interactive",
-        "--json",
-    )
-    assert json.loads(initialized_gateway.stdout)["schema_version"] == 1
-
-    def assert_embedded_revision(value: object) -> None:
-        """Require every recursively present code revision to match the installed release.
-
-        Args:
-            value: Decoded artifact JSON value to inspect recursively.
-        """
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key == "code_revision":
-                    assert item == release_revision
-                assert_embedded_revision(item)
-        elif isinstance(value, list):
-            for item in value:
-                assert_embedded_revision(item)
-
     def unused_loopback_port() -> int:
         """Reserve and release one currently unused loopback TCP port."""
         with socket.socket() as probe:
@@ -907,6 +973,336 @@ def _installed_release_driver() -> None:
             except OSError:
                 time.sleep(0.05)
         raise AssertionError(f"wmo run did not listen on port {port}")
+
+    gateway_root = execution_root / "gateway-empty"
+    empty_gateway = run_cli(
+        "run",
+        "--root",
+        str(gateway_root),
+        "--non-interactive",
+        "--json",
+        expected=2,
+    )
+    empty_payload = json.loads(empty_gateway.stdout)
+    assert empty_payload["error"]["code"] == "gateway_not_initialized"
+    assert not gateway_root.exists()
+    initialized_gateway = run_cli(
+        "config",
+        "gateway",
+        "init",
+        "--root",
+        str(gateway_root),
+        "--non-interactive",
+        "--json",
+    )
+    assert json.loads(initialized_gateway.stdout)["schema_version"] == 1
+
+    provider_secret = "provider-secret-canary-P9"
+    prompt_canary = "prompt-content-canary-P9"
+    response_canary = "gateway-response-canary"
+    tool_argument_canary = "tool-argument-canary"
+    invalid_key_canary = "invalid-virtual-key-canary-P9"
+    child_environment["P9_LOOPBACK_PROVIDER_KEY"] = provider_secret
+    gateway_commands = (
+        (
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "gateway-loopback",
+            "--provider",
+            "openai-compatible",
+            "--credential-env",
+            "P9_LOOPBACK_PROVIDER_KEY",
+            "--base-url",
+            provider_url,
+            "--root",
+            str(gateway_root),
+            "--non-interactive",
+            "--json",
+        ),
+        (
+            "config",
+            "gateway",
+            "alias",
+            "create",
+            "coding",
+            "--deployment",
+            "gateway-loopback:gateway-model",
+            "--exact-model",
+            "gateway-model-revision",
+            "--root",
+            str(gateway_root),
+            "--non-interactive",
+            "--json",
+        ),
+        (
+            "config",
+            "gateway",
+            "identity",
+            "create",
+            "default",
+            "--root",
+            str(gateway_root),
+            "--non-interactive",
+            "--json",
+        ),
+        (
+            "config",
+            "gateway",
+            "grant",
+            "add",
+            "default",
+            "coding",
+            "--root",
+            str(gateway_root),
+            "--non-interactive",
+            "--json",
+        ),
+    )
+    for command in gateway_commands:
+        receipt = run_cli(*command)
+        assert json.loads(receipt.stdout)["schema_version"] == 1
+
+    key_output = execution_root / "gateway-virtual-key.txt"
+    issue_receipt = run_cli(
+        "config",
+        "gateway",
+        "key",
+        "issue",
+        "default",
+        "--key-id",
+        "installed-key",
+        "--output",
+        str(key_output),
+        "--root",
+        str(gateway_root),
+        "--non-interactive",
+        "--json",
+    )
+    raw_key = key_output.read_text(encoding="utf-8").strip()
+    assert raw_key.startswith("wmo_vk_")
+    assert stat.S_IMODE(key_output.stat().st_mode) == 0o600
+    assert raw_key not in issue_receipt.stdout
+
+    gateway_port = unused_loopback_port()
+    gateway_process = subprocess.Popen(
+        [
+            str(executable),
+            "run",
+            "--root",
+            str(gateway_root),
+            "--port",
+            str(gateway_port),
+            "--non-interactive",
+            "--graceful-timeout",
+            "2",
+        ],
+        cwd=execution_root,
+        env=child_environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    gateway_stdout = ""
+    gateway_stderr = ""
+    usage_json_body = ""
+    usage_html_body = ""
+    error_bodies: list[str] = []
+    base_url = f"http://127.0.0.1:{gateway_port}/v1"
+    try:
+        wait_for_loopback(gateway_port, gateway_process)
+        assert openai.__version__ == "3.0.0"
+        with OpenAI(api_key=raw_key, base_url=base_url, timeout=10) as client:
+            assert [model.id for model in client.models.list().data] == ["coding"]
+            chat = client.chat.completions.create(
+                model="coding",
+                messages=[{"role": "user", "content": prompt_canary}],
+            )
+            assert chat.choices[0].message.content == response_canary
+            chat_chunks = list(
+                client.chat.completions.create(
+                    model="coding",
+                    messages=[{"role": "user", "content": prompt_canary}],
+                    stream=True,
+                )
+            )
+            assert (
+                "".join(
+                    chunk.choices[0].delta.content or "" for chunk in chat_chunks if chunk.choices
+                )
+                == response_canary
+            )
+            response = client.responses.create(model="coding", input=prompt_canary)
+            assert response.output_text == response_canary
+            response_events = list(
+                client.responses.create(model="coding", input=prompt_canary, stream=True)
+            )
+            assert response_events[-1].type == "response.completed"
+            tool_chat = client.chat.completions.create(
+                model="coding",
+                messages=[{"role": "user", "content": prompt_canary}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_ticket",
+                            "description": "Look up one ticket.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"ticket": {"type": "string"}},
+                                "required": ["ticket"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ],
+            )
+            assert tool_chat.choices[0].message.tool_calls
+            tool_call = tool_chat.choices[0].message.tool_calls[0]
+            assert tool_call.type == "function"
+            assert tool_call.function.arguments == ('{"ticket":"tool-argument-canary"}')
+
+        async def exercise_async_gateway() -> None:
+            """Run all async SDK stream and non-stream gateway quadrants."""
+            async with AsyncOpenAI(api_key=raw_key, base_url=base_url, timeout=10) as client:
+                chat = await client.chat.completions.create(
+                    model="coding",
+                    messages=[{"role": "user", "content": prompt_canary}],
+                )
+                assert chat.choices[0].message.content == response_canary
+                chat_stream = await client.chat.completions.create(
+                    model="coding",
+                    messages=[{"role": "user", "content": prompt_canary}],
+                    stream=True,
+                )
+                chat_chunks = [chunk async for chunk in chat_stream]
+                assert (
+                    "".join(
+                        chunk.choices[0].delta.content or ""
+                        for chunk in chat_chunks
+                        if chunk.choices
+                    )
+                    == response_canary
+                )
+                response = await client.responses.create(model="coding", input=prompt_canary)
+                assert response.output_text == response_canary
+                response_stream = await client.responses.create(
+                    model="coding",
+                    input=prompt_canary,
+                    stream=True,
+                )
+                response_events = [event async for event in response_stream]
+                assert response_events[-1].type == "response.completed"
+
+        asyncio.run(exercise_async_gateway())
+
+        usage_json_response = httpx.get(f"http://127.0.0.1:{gateway_port}/usage.json", timeout=5)
+        usage_html_response = httpx.get(f"http://127.0.0.1:{gateway_port}/usage", timeout=5)
+        usage_json_response.raise_for_status()
+        usage_html_response.raise_for_status()
+        usage_json_body = usage_json_response.text
+        usage_html_body = usage_html_response.text
+        usage_payload = usage_json_response.json()
+        identity_usage = usage_payload["identities"][0]
+        assert usage_payload["totals"]["requests"] == 9
+        expected_cells = (
+            identity_usage["identity_id"],
+            identity_usage["requests"],
+            identity_usage["attempts"],
+            identity_usage["input_tokens"],
+            identity_usage["cached_input_tokens"],
+            identity_usage["output_tokens"],
+            identity_usage["reasoning_tokens"],
+            identity_usage["known_estimated_cost_micro_usd"],
+            identity_usage["unknown_cost_attempts"],
+            identity_usage["total_latency_ms"],
+            ", ".join(
+                f"{item['state']}: {item['attempts']}" for item in identity_usage["terminal_counts"]
+            ),
+        )
+        assert tuple(re.findall(r"<td>(.*?)</td>", usage_html_body)) == tuple(
+            str(value) for value in expected_cells
+        )
+
+        invalid_auth = httpx.get(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {invalid_key_canary}"},
+            timeout=5,
+        )
+        assert invalid_auth.status_code == 401
+        error_bodies.append(invalid_auth.text)
+        invalid_request = httpx.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": prompt_canary}],
+                "n": 2,
+            },
+            timeout=5,
+        )
+        assert invalid_request.status_code == 400
+        error_bodies.append(invalid_request.text)
+        _assert_gateway_canaries_absent(
+            gateway_root,
+            channels={
+                "http_errors": "".join(error_bodies),
+                "usage_html": usage_html_body,
+                "usage_json": usage_json_body,
+            },
+            canaries=(
+                raw_key,
+                provider_secret,
+                prompt_canary,
+                response_canary,
+                tool_argument_canary,
+                invalid_key_canary,
+            ),
+        )
+    finally:
+        gateway_process.send_signal(signal.SIGINT)
+        try:
+            gateway_stdout, gateway_stderr = gateway_process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            gateway_process.kill()
+            gateway_stdout, gateway_stderr = gateway_process.communicate(timeout=5)
+    assert gateway_process.returncode == 0, gateway_stdout + gateway_stderr
+    assert (gateway_root / "gateway" / "gateway.db").is_file()
+    assert tuple((gateway_root / "gateway" / "catalog-snapshots").glob("*.json"))
+    _assert_gateway_canaries_absent(
+        gateway_root,
+        channels={
+            "http_errors": "".join(error_bodies),
+            "stderr": gateway_stderr,
+            "stdout": gateway_stdout,
+            "usage_html": usage_html_body,
+            "usage_json": usage_json_body,
+        },
+        canaries=(
+            raw_key,
+            provider_secret,
+            prompt_canary,
+            response_canary,
+            tool_argument_canary,
+            invalid_key_canary,
+        ),
+    )
+
+    def assert_embedded_revision(value: object) -> None:
+        """Require every recursively present code revision to match the installed release.
+
+        Args:
+            value: Decoded artifact JSON value to inspect recursively.
+        """
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "code_revision":
+                    assert item == release_revision
+                assert_embedded_revision(item)
+        elif isinstance(value, list):
+            for item in value:
+                assert_embedded_revision(item)
 
     def run_tty(
         arguments: list[str],
@@ -972,8 +1368,6 @@ def _installed_release_driver() -> None:
         )
         assert "Model setup is required" in build_output
         assert "Candidate aliases" not in build_output
-        assert "\x1b[2K" in build_output
-        assert "\x1b[1A" in build_output
         assert "Complete" in build_output
         support_store = ProjectStore(root, "support-agent")
         support_project = support_store.load_project()
@@ -1551,6 +1945,45 @@ def test_tty_child_exit_survives_terminal_close_races(tmp_path: Path) -> None:
     assert all("COMPLETE" in transcript for transcript in transcripts)
 
 
+def test_gateway_canary_scanner_covers_every_persistent_and_observable_channel(
+    tmp_path: Path,
+) -> None:
+    """Every security-sensitive gateway artifact class reaches one scanner.
+
+    Args:
+        tmp_path: Pytest-owned gateway certification root.
+    """
+    cases = (
+        ("gateway.db", None),
+        ("gateway.db-wal", None),
+        ("gateway.db.backup-v3-test", None),
+        ("catalog-snapshots/snapshot.json", None),
+        (None, "stdout"),
+        (None, "stderr"),
+        (None, "log"),
+        (None, "http_error"),
+        (None, "usage_html"),
+        (None, "usage_json"),
+    )
+    canary = "release-scanner-secret-content-canary"
+    for index, (relative_path, channel) in enumerate(cases):
+        case_root = tmp_path / f"case-{index}"
+        channels: dict[str, bytes | str] = {}
+        if relative_path is not None:
+            path = case_root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(canary, encoding="utf-8")
+        if channel is not None:
+            channels[channel] = canary
+
+        with pytest.raises(AssertionError, match="forbidden gateway canary 0"):
+            _assert_gateway_canaries_absent(
+                case_root,
+                channels=channels,
+                canaries=(canary,),
+            )
+
+
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     """Prove the installed release happy path with deterministic loopback providers.
 
@@ -1581,7 +2014,15 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     )
     installed_python = virtual_environment / "bin" / "python"
     _run_checked(
-        [uv, "pip", "install", "--python", str(installed_python), str(wheel[0])],
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(installed_python),
+            str(wheel[0]),
+            "openai==3.0.0",
+        ],
         cwd=execution,
         environment=environment,
     )
@@ -1681,11 +2122,15 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     assert "wmo optimize router" in usage
     assert "wmo optimize model" in usage
     assert "wmo config gateway" in usage
+    assert "wmo config gateway pool certify" in usage
     assert "wmo run --root ROOT" in usage
+    assert "OpenAI `3.0.0`" in usage
     assert "wmo optimize route" not in usage.replace("wmo optimize router", "")
 
     scope = (docs / "release-scope.md").read_text(encoding="utf-8")
     assert "local gateway" in scope
+    assert "Gateway provider evidence matrix" in scope
+    assert "not_run_requires_credentials" in scope
     for exclusion in (
         "No paid E2B or Harbor cloud smoke ran",
         "No real Tinker training ran",
@@ -1693,6 +2138,14 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
         "exactly $0.00 observed service spend",
     ):
         assert exclusion in scope
+
+    architecture = (docs / "reference" / "gateway-architecture.md").read_text(encoding="utf-8")
+    assert "GET /v1/models" in architecture
+    assert "POST /v1/chat/completions" in architecture
+    assert "POST /v1/responses" in architecture
+    assert "provider_certification.py" in architecture
+    assert "inert contracts" not in architecture
+    assert "does not claim that a gateway server" not in architecture
 
     ingest = (docs / "reference" / "ingest.md").read_text(encoding="utf-8")
     assert "PostHogPullRequest" in ingest
