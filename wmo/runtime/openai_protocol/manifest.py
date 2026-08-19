@@ -1,4 +1,4 @@
-"""Executable closed compatibility manifests for both public OpenAI surfaces."""
+"""Executable closed compatibility manifests for both shared OpenAI surfaces."""
 
 from __future__ import annotations
 

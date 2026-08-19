@@ -1,11 +1,11 @@
-"""Tests for commit-aware gateway response headers."""
+"""Tests for commit-aware shared response headers."""
 
 from __future__ import annotations
 
 import pytest
 
-from wmo.runtime.gateway.openai.errors import OpenAIProtocolError
-from wmo.runtime.gateway.openai.headers import (
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
+from wmo.runtime.openai_protocol.headers import (
     COMMIT_DEPENDENT_HEADERS,
     COMMIT_INDEPENDENT_HEADERS,
     commit_dependent_headers,

@@ -1,4 +1,4 @@
-"""True Chat SSE and Responses lifecycle encoding from normalized gateway events."""
+"""Encode normalized serving events as Chat and Responses SSE lifecycles."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from wmo.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
-from wmo.runtime.gateway.openai.errors import OpenAIProtocolError, public_failure_error
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 
 
 def stable_public_id(prefix: str, request_id: str) -> str:

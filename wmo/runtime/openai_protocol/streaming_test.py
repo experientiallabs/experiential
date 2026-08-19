@@ -19,8 +19,8 @@ from wmo.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
-from wmo.runtime.gateway.openai.errors import OpenAIProtocolError
-from wmo.runtime.gateway.openai.streaming import (
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
+from wmo.runtime.openai_protocol.streaming import (
     ChatSseEncoder,
     ResponsesSseEncoder,
     encode_chat_events,

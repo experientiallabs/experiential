@@ -7,8 +7,8 @@ import asyncio
 import pytest
 
 from wmo.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage
-from wmo.runtime.gateway.openai.errors import OpenAIProtocolError
-from wmo.runtime.gateway.openai.state import (
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
+from wmo.runtime.openai_protocol.state import (
     BoundedContinuationStore,
     BoundedReplayStore,
     CachedResponse,

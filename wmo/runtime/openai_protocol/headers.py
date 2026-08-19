@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from wmo.runtime.gateway.openai.errors import OpenAIProtocolError
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError
 
 COMMIT_INDEPENDENT_HEADERS = frozenset(
     {

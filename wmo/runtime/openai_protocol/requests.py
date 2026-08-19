@@ -1,4 +1,4 @@
-"""Separate Chat Completions and Responses decoders into canonical gateway requests."""
+"""Decode Chat Completions and Responses into canonical serving requests."""
 
 from __future__ import annotations
 
@@ -29,8 +29,8 @@ from wmo.runtime.gateway.contracts import (
     GatewayToolDefinition,
     StructuredTextFormat,
 )
-from wmo.runtime.gateway.openai.errors import OpenAIProtocolError, invalid_field, unsupported_field
-from wmo.runtime.gateway.openai.manifest import (
+from wmo.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
+from wmo.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     RESPONSES_MANIFEST,
     disposition_map,
