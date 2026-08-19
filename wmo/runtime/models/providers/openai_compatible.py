@@ -22,6 +22,8 @@ from wmo.common.models import (
 )
 from wmo.runtime.models.providers.base import ProviderHttpClient
 from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
     ProviderResponseError,
     require_array,
     require_integer,
@@ -113,6 +115,13 @@ def openai_compatible_response(
         raise OpenAICompatibleResponseError("OpenAI-compatible response has no choices")
     choice = require_object(choices[0], "choices[0]")
     message = require_object(choice.get("message"), "choices[0].message")
+    if choice.get("finish_reason") in {"content_filter", "safety"} or isinstance(
+        message.get("refusal"), str
+    ):
+        raise ProviderRefusalError(
+            provider="openai-compatible",
+            signal=ProviderRefusalSignal.CONTENT_POLICY,
+        )
     content_value = message.get("content")
     content = content_value if isinstance(content_value, str) else None
     tool_call_values = _array_or_empty(message)

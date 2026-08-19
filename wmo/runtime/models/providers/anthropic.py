@@ -20,6 +20,8 @@ from wmo.runtime.models.providers.base import (
     ProviderHttpClient,
 )
 from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
     ProviderResponseError,
     require_array,
     require_integer,
@@ -96,6 +98,11 @@ def anthropic_messages_response(
     Raises:
         ProviderResponseError: The completed response has malformed or unsupported content.
     """
+    if payload.get("stop_reason") == "refusal":
+        raise ProviderRefusalError(
+            provider="anthropic",
+            signal=ProviderRefusalSignal.PROVIDER_REFUSAL,
+        )
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
     for index, value in enumerate(require_array(payload.get("content"), "Anthropic content")):
@@ -106,6 +113,11 @@ def anthropic_messages_response(
             if not isinstance(text, str):
                 raise ProviderResponseError(f"Anthropic content[{index}].text must be text")
             text_parts.append(text)
+        elif block_type == "refusal":
+            raise ProviderRefusalError(
+                provider="anthropic",
+                signal=ProviderRefusalSignal.PROVIDER_REFUSAL,
+            )
         elif block_type == "tool_use":
             tool_calls.append(_anthropic_tool_call(block, index))
         else:

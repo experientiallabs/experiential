@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import abc
+import asyncio
 import time
-from collections.abc import Mapping
+from collections.abc import Coroutine, Mapping
 from typing import ClassVar
+from uuid import uuid4
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import ModelRequest, ModelResponse, ModelSnapshot
+from wmo.runtime.models.providers.async_transport import (
+    AsyncJsonHttpTransport,
+    RequestDeadline,
+    as_async_transport,
+    post_json_async,
+    run_with_retry_async,
+)
 from wmo.runtime.models.providers.errors import ProviderRetryableResponseError
 from wmo.runtime.models.providers.transport import (
-    HttpxJsonTransport,
     JsonHttpTransport,
+    ProviderTransportError,
     RetryClassification,
     RetryPolicy,
-    post_json,
-    run_with_retry,
+    classify_retry,
 )
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -24,32 +32,24 @@ DEFAULT_RETRY_POLICY = RetryPolicy()
 DEFAULT_MAXIMUM_OUTPUT_TOKENS = 4096
 
 COMPLETION_SECONDS_PER_OUTPUT_TOKEN = 0.03
-"""Per-token completion time allowance, a conservative ~33 output tokens per second."""
+"""Per-token completion allowance, a conservative approximately 33 tokens per second."""
 
 MAXIMUM_COMPLETION_TIMEOUT_SECONDS = 600.0
-"""Hard ceiling on any derived completion attempt timeout, matching the Bedrock read bound."""
+"""Hard ceiling for a derived completion-attempt timeout."""
 
 
 def completion_timeout_seconds(
     configured_timeout_seconds: float,
     maximum_output_tokens: int | None,
 ) -> float:
-    """Derive one bounded per-attempt completion timeout from the requested output budget.
-
-    A fixed timeout cannot cover a long generation: at a conservative decode rate of about
-    33 output tokens per second, a 16000-token request needs roughly 480 seconds. The
-    derived value scales linearly with the requested maximum output tokens under
-    ``COMPLETION_SECONDS_PER_OUTPUT_TOKEN``, never drops below the client's configured
-    timeout, and caps the scaled value at ``MAXIMUM_COMPLETION_TIMEOUT_SECONDS`` so no
-    attempt waits unbounded.
+    """Derive one bounded completion timeout from the requested output budget.
 
     Args:
         configured_timeout_seconds: Positive per-attempt floor configured on the client.
-        maximum_output_tokens: Requested output token ceiling, or ``None`` when the request
-            leaves the provider default in place.
+        maximum_output_tokens: Requested output ceiling, or ``None`` for the provider default.
 
     Returns:
-        A finite timeout between the configured floor and the scaled bounded ceiling.
+        A finite timeout between the configured floor and scaled ceiling.
     """
     if maximum_output_tokens is None:
         return configured_timeout_seconds
@@ -68,7 +68,7 @@ class ProviderHttpClient(abc.ABC):
         model: ModelSnapshot,
         api_key: str,
         base_url: str,
-        transport: JsonHttpTransport | None = None,
+        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
@@ -80,9 +80,8 @@ class ProviderHttpClient(abc.ABC):
             base_url: Endpoint root that exposes the provider's HTTP routes.
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
-            timeout_seconds: Per-attempt timeout floor. Completion attempts scale above it
-                with the requested maximum output tokens through
-                ``completion_timeout_seconds``; every other route uses it exactly.
+            timeout_seconds: Per-attempt timeout floor. Completion calls scale above it from the
+                requested maximum output tokens, while non-completion routes use it exactly.
         """
         if not api_key:
             raise ValueError(f"{type(self).__name__} requires a non-empty API key")
@@ -91,7 +90,7 @@ class ProviderHttpClient(abc.ABC):
         self._model = model
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
-        self._transport = transport or HttpxJsonTransport()
+        self._transport = as_async_transport(transport)
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
 
@@ -100,10 +99,7 @@ class ProviderHttpClient(abc.ABC):
 
         A completed response that decodes to no usable output, such as a reasoning model
         spending its whole output budget without visible text, is dispatched again under the
-        client's bounded retry policy before the last error surfaces to the caller. Each
-        attempt's timeout scales with the requested maximum output tokens through
-        ``completion_timeout_seconds`` so long generations are not cut off by the fixed
-        floor, while every wait stays finite.
+        client's bounded retry policy before the last error surfaces to the caller.
 
         Args:
             request: Visible messages, tool schemas, and sampling controls to send.
@@ -111,21 +107,72 @@ class ProviderHttpClient(abc.ABC):
         Returns:
             The typed non-streaming model response with observed request economics.
         """
-        payload = self._build_request(request)
-        timeout_seconds = completion_timeout_seconds(
-            self._timeout_seconds, request.maximum_output_tokens
+        completion_timeout = completion_timeout_seconds(
+            self._timeout_seconds,
+            request.maximum_output_tokens,
         )
+        return _run_sync(self.complete_async(request), timeout_seconds=completion_timeout)
 
-        def attempt() -> ModelResponse:
-            """Post and parse one complete request attempt."""
+    async def complete_async(
+        self,
+        request: ModelRequest,
+        *,
+        deadline: RequestDeadline | None = None,
+        idempotency_key: str | None = None,
+    ) -> ModelResponse:
+        """Complete one request through one deadline-aware async attempt loop.
+
+        Transport failures and completed empty-output responses share one retry policy instead of
+        multiplying nested retry counts. The same idempotency identity is sent on every safe retry.
+
+        Args:
+            request: Visible messages, tool schemas, and sampling controls to send.
+            deadline: Optional request-wide deadline supplied by gateway execution.
+            idempotency_key: Optional stable caller or gateway attempt identity.
+
+        Returns:
+            The typed completed response with observed request economics.
+        """
+        completion_timeout = completion_timeout_seconds(
+            self._timeout_seconds,
+            request.maximum_output_tokens,
+        )
+        request_deadline = deadline or RequestDeadline.after(completion_timeout)
+        payload = self._build_request(request)
+        path = self._request_path(self._completion_path())
+        url = f"{self._base_url}/{path}"
+        request_headers = {
+            name: value
+            for name, value in self._headers().items()
+            if name.lower() != "idempotency-key"
+        }
+        request_headers["Idempotency-Key"] = idempotency_key or f"wmo-{uuid4().hex}"
+
+        async def attempt(timeout_seconds: float) -> ModelResponse:
+            """Send and parse one provider attempt under its remaining time bound."""
             started_at = time.monotonic()
-            response = self._post(self._completion_path(), payload, timeout_seconds=timeout_seconds)
-            return self._parse_response(response, latency_seconds=time.monotonic() - started_at)
+            response = await self._transport.post(
+                url,
+                headers=request_headers,
+                payload=payload,
+                timeout_seconds=timeout_seconds,
+            )
+            if not 200 <= response.status_code < 300:
+                raise ProviderTransportError(
+                    f"provider returned HTTP {response.status_code}",
+                    status_code=response.status_code,
+                )
+            return self._parse_response(
+                response.body,
+                latency_seconds=time.monotonic() - started_at,
+            )
 
-        return run_with_retry(
+        return await run_with_retry_async(
             attempt,
             policy=self._retry_policy,
-            classify=_classify_empty_output_retry,
+            deadline=request_deadline,
+            attempt_timeout_seconds=completion_timeout,
+            classify=_classify_complete_retry,
         )
 
     def _headers(self) -> dict[str, str]:
@@ -136,32 +183,54 @@ class ProviderHttpClient(abc.ABC):
             **self.default_headers,
         }
 
-    def _post(
+    def _post(self, path: str, payload: JsonObject) -> JsonObject:
+        """Post one JSON payload through the bounded sync compatibility path."""
+        return _run_sync(
+            self._post_async(path, payload),
+            timeout_seconds=self._timeout_seconds,
+        )
+
+    async def _post_async(
         self,
         path: str,
         payload: JsonObject,
         *,
-        timeout_seconds: float | None = None,
+        deadline: RequestDeadline | None = None,
+        idempotency_key: str | None = None,
     ) -> JsonObject:
-        """Post one JSON payload to a provider route below the configured base URL.
+        """Post one JSON payload through the shared async transport.
 
         Args:
             path: Provider route below the configured base URL.
-            payload: JSON request body.
-            timeout_seconds: Optional per-attempt timeout override; the configured client
-                timeout applies when omitted.
+            payload: Complete JSON request object.
+            deadline: Optional request-wide deadline.
+            idempotency_key: Optional stable identity for same-endpoint retries.
 
         Returns:
-            The decoded JSON response body.
+            The first successful decoded provider body.
         """
-        return post_json(
+        request_deadline = deadline or RequestDeadline.after(self._timeout_seconds)
+        return await post_json_async(
             self._transport,
-            f"{self._base_url}/{path}",
+            f"{self._base_url}/{self._request_path(path)}",
             headers=self._headers(),
             payload=payload,
-            timeout_seconds=(self._timeout_seconds if timeout_seconds is None else timeout_seconds),
+            deadline=request_deadline,
             retry_policy=self._retry_policy,
+            idempotency_key=idempotency_key,
+            attempt_timeout_seconds=self._timeout_seconds,
         )
+
+    def _request_path(self, path: str) -> str:
+        """Return the provider-specific wire path for one logical route.
+
+        Args:
+            path: Logical route below the configured base URL.
+
+        Returns:
+            Wire path including any provider-specific query parameters.
+        """
+        return path
 
     @abc.abstractmethod
     def _completion_path(self) -> str:
@@ -176,11 +245,8 @@ class ProviderHttpClient(abc.ABC):
         """Convert one decoded provider payload into the shared response contract."""
 
 
-def _classify_empty_output_retry(exception: Exception) -> RetryClassification:
-    """Retry only completed provider responses that decoded to no usable output.
-
-    Transport failures already retry inside each posted attempt, so this outer classifier
-    stays closed to everything except the explicit retryable empty-output signal.
+def _classify_complete_retry(exception: Exception) -> RetryClassification:
+    """Classify transport and empty-output failures in one shared attempt loop.
 
     Args:
         exception: Error raised by one post-and-parse attempt.
@@ -190,4 +256,47 @@ def _classify_empty_output_retry(exception: Exception) -> RetryClassification:
     """
     if isinstance(exception, ProviderRetryableResponseError):
         return RetryClassification(retryable=True, reason="empty_completed_output")
-    return RetryClassification(retryable=False, reason="non_retryable_response")
+    return classify_retry(exception)
+
+
+def _run_sync[ResultT](
+    operation: Coroutine[object, object, ResultT],
+    *,
+    timeout_seconds: float,
+) -> ResultT:
+    """Run one async provider operation for a non-event-loop compatibility caller.
+
+    Args:
+        operation: Async transport operation to execute.
+        timeout_seconds: Total caller-side bound including cancellation cleanup.
+
+    Returns:
+        The completed operation result.
+
+    Raises:
+        RuntimeError: Called from an event-loop thread, where the async method is required.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_wait_for(operation, timeout_seconds=timeout_seconds))
+    operation.close()
+    raise RuntimeError("sync provider compatibility cannot run on an event loop; use async APIs")
+
+
+async def _wait_for[ResultT](
+    operation: Coroutine[object, object, ResultT],
+    *,
+    timeout_seconds: float,
+) -> ResultT:
+    """Bound one compatibility coroutine by the configured total timeout.
+
+    Args:
+        operation: Provider coroutine to await.
+        timeout_seconds: Positive total wait bound.
+
+    Returns:
+        The provider result before timeout.
+    """
+    async with asyncio.timeout(timeout_seconds):
+        return await operation

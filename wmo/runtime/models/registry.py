@@ -19,6 +19,10 @@ from wmo.common.models import (
 from wmo.runtime.models.credentials import read_connection_api_key
 from wmo.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
 from wmo.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
+from wmo.runtime.models.providers.async_transport import (
+    AsyncJsonHttpTransport,
+    HttpxAsyncJsonTransport,
+)
 from wmo.runtime.models.providers.azure import AzureClient, bind_azure_api_key
 from wmo.runtime.models.providers.bedrock import BedrockClient, BedrockRuntimeFactory
 from wmo.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
@@ -34,7 +38,9 @@ from wmo.runtime.models.providers.tinker_sampling import (
     TinkerSamplingClient,
     create_tinker_sampler,
 )
-from wmo.runtime.models.providers.transport import HttpxJsonTransport, JsonHttpTransport
+from wmo.runtime.models.providers.transport import JsonHttpTransport
+
+ProviderTransport = AsyncJsonHttpTransport | JsonHttpTransport
 
 CatalogRoleName = Literal["world_model", "judge", "candidate"]
 """Completion role whose catalog-configured reasoning effort shapes resolved requests."""
@@ -75,7 +81,7 @@ class _HttpClientFactory(Protocol):
         model: ModelSnapshot,
         api_key: str,
         base_url: str,
-        transport: JsonHttpTransport,
+        transport: ProviderTransport,
     ) -> ModelClient:
         """Return a focused completion client for one resolved connection.
 
@@ -111,7 +117,7 @@ class RuntimeModelCatalog:
         catalog: ModelCatalog,
         *,
         environment: Mapping[str, str] | None = None,
-        transport_factory: Callable[[], JsonHttpTransport] = HttpxJsonTransport,
+        transport_factory: Callable[[], ProviderTransport] = HttpxAsyncJsonTransport,
         tinker_sampler_factory: TinkerSamplerFactory | None = None,
         bedrock_runtime_factory: BedrockRuntimeFactory | None = None,
     ) -> None:
