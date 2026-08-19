@@ -272,9 +272,9 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     pinned_traces: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Walk build, setup, labeling, calibration, and approval on the pinned public export."""
-    monkeypatch.setattr("wmo.cli.build_cmd.RuntimeModelCatalog", _RuntimeCatalog)
-    monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
-    monkeypatch.setattr("wmo.cli.judge_config.RuntimeModelCatalog", _RuntimeCatalog)
+    monkeypatch.setattr("wmo.cli.build.app.RuntimeModelCatalog", _RuntimeCatalog)
+    monkeypatch.setattr("wmo.cli.build.app.capture_build_completed", lambda **_kwargs: None)
+    monkeypatch.setattr("wmo.cli.judge.app.RuntimeModelCatalog", _RuntimeCatalog)
     _RuntimeCatalog.judge_clients = []
     _RuntimeCatalog.judge_fail_after = None
     root = tmp_path / ".wmo"
@@ -282,7 +282,9 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     _write_catalog(root)
     runner = CliRunner()
 
-    build = runner.invoke(app, ["build", _PROJECT, str(pinned_traces), "--root", str(root)])
+    build = runner.invoke(
+        app, ["build", _PROJECT, "--traces", str(pinned_traces), "--root", str(root)]
+    )
     assert build.exit_code == 0, build.output
     setup = runner.invoke(
         app, ["config", "judge", "setup", _PROJECT, "--root", str(root), "--approve"]
@@ -312,11 +314,8 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     refused = runner.invoke(app, over_budget)
     assert refused.exit_code == 2
     refused_text = " ".join(unstyle(refused.output).replace("│", " ").split())
-    assert "Cost preflight wmo config judge calibrate terminal-tasks" in refused_text
-    assert "estimated cost $0.73728" in refused_text
-    assert "of the $0.50 per-command budget" in refused_text
-    assert "judge judge: openai/judge-id" in refused_text
-    assert "5 remaining judge calls with up to 3 attempts each" in refused_text
+    assert "conservative estimate $0.74 exceeds the configured per-command budget" in refused_text
+    assert "$0.50" in refused_text
     assert "--yes cannot override" in refused_text
     assert "missing labels" not in refused_text
     assert _RuntimeCatalog.judge_clients == []

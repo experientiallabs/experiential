@@ -33,15 +33,29 @@ uv run pytest -q
 - The root CLI command set is exact: `build`, `config`, `optimize`, and `run`;
   `wmo/cli/app_test.py` and the release tests enforce the current command and distribution shape.
 
+## CLI package ownership
+
+- `wmo/cli/app.py` owns root command composition only. Command implementations live in the
+  `build/`, `config/`, `judge/`, `optimize/`, `run/`, and `gateway/` packages.
+- `wmo/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
+  commands. Command-specific orchestration stays with its command package. In particular,
+  router-candidate collection belongs to `wmo/cli/optimize/`.
+- `wmo/cli/shared/` owns reusable terminal, Typer, consent, picker, and progress primitives. It
+  must not import command packages. `wmo/cli/providers/` may import `shared/`, but it must not
+  import command packages.
+- Keep the `wmo/cli/` root closed to new command implementation modules. Package-wide CLI tests
+  may live in `wmo/cli/tests/`; module tests stay beside the module they cover.
+
 ## Evidence, simulation, and routing lifecycle
 
 - `wmo/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
   current engines, orchestration, artifact construction, and comparisons. New modules for those
   responsibilities go inside `wmo/simulation/`, never at the flat `wmo/` root.
-- `wmo build TRACE_FILE --source otlp|posthog --project PROJECT --root ROOT` is the only CLI path
+- `wmo build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` is the only CLI path
   from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
-  writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, and makes no
-  model, provider, or judge calls. Route each corpus through an explicit canonical source loader.
+  writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, builds both
+  RAG indexes under a strict embedding-cost ceiling, and binds the grounded world model without a
+  completion or judge call. Route each corpus through an explicit canonical source loader.
 - New trace sources belong in `wmo/simulation/ingest/`, normalize into the `Trace` and `TraceSpan`
   contracts in `wmo/common/traces/`, support file ingestion, and register from
   `wmo/simulation/ingest/__init__.py`.
@@ -52,9 +66,10 @@ uv run pytest -q
   opens only after fit evidence, policy locking, and remaining-budget checks pass. Router fitting
   never runs or consumes world-model fidelity evaluation.
 - `wmo optimize router PROJECT --root ROOT` discovers the completed build, fit-only RAG, grounded
-  world model, approved manual judge calibration, and confirmed router candidates from the
-  project. It freezes one shared provider ceiling before calls, simulates and judges missing
-  fit evidence, locks the fit policy before held-out execution, and exactly replays completed work.
+  world model, judge syllabus and provenance, and confirmed router candidates from the project.
+  Human calibration is recommended but optional. The command freezes one shared provider ceiling
+  before calls, simulates and judges missing fit evidence, locks the fit policy before held-out
+  execution, and exactly replays completed work.
   World-model fidelity testing is a separately invoked common-evaluation mode with no authority
   over router fitting or runtime activation. Its reports contain measurements only and never carry
   an approval, denial, gate, threshold, or decision.
@@ -105,7 +120,7 @@ uv run pytest -q
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
-- Every paid CLI command uses `wmo.cli.consent.require_spend_consent` after a credential-free
+- Every paid CLI command uses `wmo.cli.shared.consent.require_spend_consent` after a credential-free
   conservative estimate and before credential or provider-client construction. The setting in
   `.wmo/settings.toml` is a hard per-command ceiling. Estimates at or below half run automatically,
   higher in-budget estimates need explicit confirmation, and `--yes` never overrides the ceiling.
@@ -193,10 +208,10 @@ uv run pytest -q
 
    **Agents must never create a new top-level directory.** Not for scratch work, not for a
    one-off script, not for output, not "temporarily". If work does not fit an existing surface,
-   put it under the closest one and say so — do not invent a sibling. The only way a new
+   put it under the closest one and say so - do not invent a sibling. The only way a new
    top-level directory is ever added is that a human names the exact directory and grants
    permission for that name; then, in the same change, it is added to `ALLOWED_TOP_DIRS` in
-   `wmo/repo_layout_test.py` and documented here. Blanket approval to "restructure" or "add whatever
+   `wmo/tests/repo_layout_test.py` and documented here. Blanket approval to "restructure" or "add whatever
    you need" is not permission for a directory name. Absent that, an agent that wants a new surface
    asks and waits. The same rule binds top-level FILES, against `ALLOWED_TOP_FILES` in the same
    test. Both lists are enforced by the gate, so an unapproved path fails CI rather than landing
@@ -207,7 +222,7 @@ uv run pytest -q
      pipeline on one benchmark, each step one real CLI command plus the artifact it creates),
      plus two root pages: `docs/usage.md` (the terse map of the CLI surface: one line of purpose
      and one artifact per command) and `docs/release-scope.md` (the supported and explicitly
-     excluded claims of the current release, checked by `wmo/release_test.py`). Nothing else: raw
+     excluded claims of the current release, checked by `wmo/tests/release_test.py`). Nothing else: raw
      result JSONs, vector sources, design notes, and drafts stay out of the repo. `docs/README.md`
      indexes every doc and records its purpose. Update or remove superseded material only after
      checking references and retaining durable evidence.

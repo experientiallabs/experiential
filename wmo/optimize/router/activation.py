@@ -105,11 +105,11 @@ def verify_automatic_router_policy(
     policy: KnnRouterPolicy,
     catalog: RuntimeModelCatalog,
 ) -> None:
-    """Verify automatic execution and capability inputs before credential access.
+    """Verify the immutable execution graph for an automatic router policy.
 
-    Plans without automatic artifacts remain eligible for the provider-free offline path.
-    Automatic plans must bind exactly one execution contract and one runtime capability contract,
-    and both contracts must agree with the selected policy and credential-free catalog snapshot.
+    Human calibration is optional. The policy's judgment status remains part of its immutable
+    provenance and is visible at runtime, while both provisional and human-calibrated policies
+    must bind the same complete execution and capability evidence.
 
     Args:
         store: Project-local immutable artifact store.

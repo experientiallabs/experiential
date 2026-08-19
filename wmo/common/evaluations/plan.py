@@ -24,6 +24,14 @@ class EvaluationCell(ContractModel):
 
     @model_validator(mode="after")
     def _require_explicit_evidence_shape(self) -> EvaluationCell:
+        """Validate the evidence references required by this cell's execution mode.
+
+        Returns:
+            The validated evaluation cell.
+
+        Raises:
+            ValueError: The execution mode and evidence references disagree.
+        """
         if self.execution == "observed" and self.observed_rollout_id is None:
             raise ValueError("observed evaluation cells require observed_rollout_id")
         if self.execution == "simulate" and self.observed_rollout_id is not None:
@@ -52,6 +60,17 @@ class EvaluationPlan(ArtifactEnvelope):
     def _require_unique_candidates(
         cls, value: tuple[RoutedCandidateSnapshot, ...]
     ) -> tuple[RoutedCandidateSnapshot, ...]:
+        """Require a nonempty candidate sequence with unique aliases.
+
+        Args:
+            value: Candidate snapshots in plan order.
+
+        Returns:
+            The validated candidate snapshots.
+
+        Raises:
+            ValueError: The sequence is empty or repeats an alias.
+        """
         aliases = tuple(candidate.alias for candidate in value)
         if not aliases:
             raise ValueError("an evaluation plan needs at least one candidate")
@@ -62,6 +81,17 @@ class EvaluationPlan(ArtifactEnvelope):
     @field_validator("cells")
     @classmethod
     def _require_unique_cells(cls, value: tuple[EvaluationCell, ...]) -> tuple[EvaluationCell, ...]:
+        """Require a nonempty cell sequence with unique cell identities.
+
+        Args:
+            value: Evaluation cells in plan order.
+
+        Returns:
+            The validated evaluation cells.
+
+        Raises:
+            ValueError: The sequence is empty or repeats a cell identity.
+        """
         cell_ids = tuple(cell.cell_id for cell in value)
         if not cell_ids:
             raise ValueError("an evaluation plan needs at least one cell")
@@ -71,6 +101,14 @@ class EvaluationPlan(ArtifactEnvelope):
 
     @model_validator(mode="after")
     def _require_consistent_cell_references(self) -> EvaluationPlan:
+        """Validate candidate scope, unique coordinates, and fidelity comparisons.
+
+        Returns:
+            The validated evaluation plan.
+
+        Raises:
+            ValueError: A cell falls outside the plan scope or has invalid references.
+        """
         fidelity_cells = tuple(cell for cell in self.cells if cell.purpose == "fidelity")
         if bool(fidelity_cells) != (self.fidelity_protocol_sha256 is not None):
             raise ValueError("fidelity cells and protocol identity must be present together")

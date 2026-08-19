@@ -63,6 +63,28 @@ def test_model_catalog_round_trip_preserves_aliases_and_environment_name(tmp_pat
     assert "api_key =" not in path.read_text(encoding="utf-8")
 
 
+def test_model_record_round_trips_an_alternate_served_identity(tmp_path: Path) -> None:
+    """A declared served identity persists so vLLM alias endpoints stay resolvable."""
+    path = tmp_path / "models.toml"
+    catalog = _catalog()
+    record = catalog.models["candidate-economy"]
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                "candidate-economy": record.model_copy(
+                    update={"served_model_id": "deepseek-v4-flash"}
+                )
+            }
+        }
+    )
+
+    write_model_catalog(path, catalog)
+
+    loaded = load_model_catalog(path)
+    assert loaded.models["candidate-economy"].served_model_id == "deepseek-v4-flash"
+    assert loaded == catalog
+
+
 def test_current_model_records_require_explicit_billing_source() -> None:
     """New catalog construction cannot silently infer who owns a provider credential."""
     with pytest.raises(ValidationError, match="billing_source"):

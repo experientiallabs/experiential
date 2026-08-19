@@ -34,7 +34,7 @@ from wmo.optimize.router.errors import (
 from wmo.simulation.engines.text.resume import reexecutable_dispatch_failure
 
 if TYPE_CHECKING:
-    from wmo.optimize.router.composition import ApprovedRouterReview, RouterEvaluationSetup
+    from wmo.optimize.router.composition import RouterEvaluationSetup, RouterReviewProvenance
 
 logger = logging.getLogger(__name__)
 
@@ -491,7 +491,7 @@ def complete_cell_evidence(
     cells: tuple[EvaluationCell, ...],
     simulated_rollout_ids: tuple[str, ...],
     setup: RouterEvaluationSetup,
-    review: ApprovedRouterReview,
+    review: RouterReviewProvenance,
     judge: Judge,
     maximum_judgments: int,
     *,
@@ -748,7 +748,7 @@ def _record_judgment_exclusion(
     plan_input: ArtifactInput,
     cell: EvaluationCell,
     rollout_id: str,
-    review: ApprovedRouterReview,
+    review: RouterReviewProvenance,
     protocol: EvaluationProtocol,
     *,
     reason: JudgmentExclusionReason,

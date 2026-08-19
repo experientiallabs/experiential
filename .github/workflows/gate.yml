@@ -32,9 +32,9 @@ jobs:
           uv run pytest -n 4 --dist worksteal -q -k "not live"
           wmo
           --ignore=wmo/optimize/model/sft/tinker_test.py
-          --ignore=wmo/optimize/router/composition_evidence_test.py
-          --ignore=wmo/simulation/comparison_evidence_test.py
-          --deselect=wmo/release_test.py::test_installed_wheel_no_spend_release_evidence
+          --ignore=wmo/optimize/router/tests/composition_evidence_test.py
+          --ignore=wmo/simulation/tests/comparison_evidence_test.py
+          --deselect=wmo/tests/release_test.py::test_installed_wheel_no_spend_release_evidence
 
   w16-darwin-evidence:
     runs-on: macos-latest
@@ -50,8 +50,8 @@ jobs:
         run: >-
           uv run pytest -q
           --junitxml=w16-darwin-evidence.xml
-          wmo/optimize/router/composition_evidence_test.py
-          wmo/simulation/comparison_evidence_test.py
+          wmo/optimize/router/tests/composition_evidence_test.py
+          wmo/simulation/tests/comparison_evidence_test.py
       - name: Upload W16 Darwin evidence result
         if: always()
         uses: actions/upload-artifact@v4

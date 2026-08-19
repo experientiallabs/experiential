@@ -47,6 +47,19 @@ def test_maintained_metadata_fills_values_the_provider_omits() -> None:
     assert resolved.pricing_source is PricingSource.WMO_CATALOG
 
 
+def test_maintained_sampling_pins_flow_into_resolved_capabilities() -> None:
+    """A reasoning model's pinned sampling and effort reach the persisted catalog snapshot."""
+    pinned = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.6-luna"))
+    unpinned = resolve_discovered_model(
+        DiscoveredModel(provider="anthropic", model="claude-sonnet-5")
+    )
+
+    assert not pinned.capabilities.supports_temperature
+    assert pinned.capabilities.reasoning_effort == "medium"
+    assert unpinned.capabilities.supports_temperature
+    assert unpinned.capabilities.reasoning_effort is None
+
+
 def test_unknown_model_keeps_every_capability_and_price_unknown() -> None:
     """An unverified model claims nothing and can serve no build role."""
     resolved = resolve_discovered_model(

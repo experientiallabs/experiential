@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Literal
 
-_SNAPSHOT_SUFFIX_PATTERN = re.compile(r"(?:[-@]\d{8}|-latest)$")
+_SNAPSHOT_SUFFIX_PATTERN = re.compile(r"(?:[-@]\d{8}|-\d{4}-\d{2}-\d{2}|-latest)$")
 _GEMINI_PREFIX = "models/"
 
 
@@ -258,6 +259,123 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         supports_temperature=False,
         supports_reasoning_effort=True,
     ),
+    "gpt-4.1": _chat(
+        input_usd=2.0,
+        cached_input_usd=0.5,
+        cache_write_usd=0.0,
+        output_usd=8.0,
+        context_window_tokens=1_047_576,
+        maximum_output_tokens=32_768,
+    ),
+    "gpt-4.1-mini": _chat(
+        input_usd=0.4,
+        cached_input_usd=0.1,
+        cache_write_usd=0.0,
+        output_usd=1.6,
+        context_window_tokens=1_047_576,
+        maximum_output_tokens=32_768,
+    ),
+    "gpt-4.1-nano": _chat(
+        input_usd=0.1,
+        cached_input_usd=0.025,
+        cache_write_usd=0.0,
+        output_usd=0.4,
+        context_window_tokens=1_047_576,
+        maximum_output_tokens=32_768,
+    ),
+    "gpt-4o": _chat(
+        input_usd=2.5,
+        cached_input_usd=1.25,
+        cache_write_usd=0.0,
+        output_usd=10.0,
+        context_window_tokens=128_000,
+        maximum_output_tokens=16_384,
+    ),
+    "gpt-4o-mini": _chat(
+        input_usd=0.15,
+        cached_input_usd=0.075,
+        cache_write_usd=0.0,
+        output_usd=0.6,
+        context_window_tokens=128_000,
+        maximum_output_tokens=16_384,
+    ),
+    "gpt-4-turbo": _chat(
+        input_usd=10.0,
+        output_usd=30.0,
+        context_window_tokens=128_000,
+        maximum_output_tokens=4_096,
+        supports_structured_output=False,
+    ),
+    "gpt-4": _chat(
+        input_usd=30.0,
+        output_usd=60.0,
+        context_window_tokens=8_192,
+        maximum_output_tokens=8_192,
+        supports_structured_output=False,
+    ),
+    "gpt-3.5-turbo": _chat(
+        input_usd=0.5,
+        output_usd=1.5,
+        context_window_tokens=16_385,
+        maximum_output_tokens=4_096,
+        supports_structured_output=False,
+    ),
+    "o1": _chat(
+        input_usd=15.0,
+        cached_input_usd=7.5,
+        cache_write_usd=0.0,
+        output_usd=60.0,
+        context_window_tokens=200_000,
+        maximum_output_tokens=100_000,
+        supports_temperature=False,
+        supports_reasoning_effort=True,
+    ),
+    "o1-pro": _chat(
+        input_usd=150.0,
+        output_usd=600.0,
+        context_window_tokens=200_000,
+        maximum_output_tokens=100_000,
+        supports_temperature=False,
+        supports_reasoning_effort=True,
+    ),
+    "o3": _chat(
+        input_usd=2.0,
+        cached_input_usd=0.5,
+        cache_write_usd=0.0,
+        output_usd=8.0,
+        context_window_tokens=200_000,
+        maximum_output_tokens=100_000,
+        supports_temperature=False,
+        supports_reasoning_effort=True,
+    ),
+    "o3-mini": _chat(
+        input_usd=1.1,
+        cached_input_usd=0.55,
+        cache_write_usd=0.0,
+        output_usd=4.4,
+        context_window_tokens=200_000,
+        maximum_output_tokens=100_000,
+        supports_temperature=False,
+        supports_reasoning_effort=True,
+    ),
+    "o3-pro": _chat(
+        input_usd=20.0,
+        output_usd=80.0,
+        context_window_tokens=200_000,
+        maximum_output_tokens=100_000,
+        supports_temperature=False,
+        supports_reasoning_effort=True,
+    ),
+    "o4-mini": _chat(
+        input_usd=1.1,
+        cached_input_usd=0.275,
+        cache_write_usd=0.0,
+        output_usd=4.4,
+        context_window_tokens=200_000,
+        maximum_output_tokens=100_000,
+        supports_temperature=False,
+        supports_reasoning_effort=True,
+    ),
     "text-embedding-3-small": _embedding(input_usd=0.02, context_window_tokens=8_192),
     "text-embedding-3-large": _embedding(input_usd=0.13, context_window_tokens=8_192),
     "text-embedding-ada-002": _embedding(input_usd=0.1, context_window_tokens=8_192),
@@ -393,3 +511,62 @@ def known_model_metadata(provider: str, model: str) -> KnownModel | None:
     if models is None:
         return None
     return models.get(canonical_model_id(provider, model))
+
+
+_RECOMMENDED_MODELS: dict[
+    str,
+    dict[Literal["world_model", "judge", "embedder", "router_candidate"], tuple[str, ...]],
+] = {
+    "openai": {
+        "world_model": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
+        "judge": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
+        "embedder": (
+            "text-embedding-3-large",
+            "text-embedding-3-small",
+            "text-embedding-ada-002",
+        ),
+        "router_candidate": ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
+    },
+    "anthropic": {
+        "world_model": ("claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"),
+        "judge": ("claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"),
+        "embedder": (),
+        "router_candidate": ("claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"),
+    },
+    "gemini": {
+        "world_model": ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"),
+        "judge": ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"),
+        "embedder": ("gemini-embedding-001",),
+        "router_candidate": (
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+        ),
+    },
+}
+
+
+def recommended_model_rank(
+    provider: str,
+    model: str,
+    role: Literal["world_model", "judge", "embedder", "router_candidate"],
+) -> int | None:
+    """Return the maintained recommendation position for one verified available model.
+
+    Args:
+        provider: Canonical provider kind.
+        model: Exact provider-published model ID.
+        role: Wizard role being assigned.
+
+    Returns:
+        Zero-based maintained rank, or ``None`` when deterministic capability and cost fallback
+        should decide among otherwise eligible models.
+    """
+    provider_roles = _RECOMMENDED_MODELS.get(provider)
+    if provider_roles is None:
+        return None
+    identity = canonical_model_id(provider, model)
+    try:
+        return provider_roles[role].index(identity)
+    except ValueError:
+        return None

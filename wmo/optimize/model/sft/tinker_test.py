@@ -232,6 +232,7 @@ class _TrainingClient:
 
 def test_datum_fixture_is_shifted_cross_entropy_with_only_target_tokens_and_weights() -> None:
     """The frozen local datum fixture pins cookbook conversion to the current CE wire contract."""
+    pytest.importorskip("tinker")
     renderer = _DatumRenderer()
     client = _TrainingClient()
     session = TinkerTrainerSession(
@@ -295,6 +296,7 @@ def test_backend_restores_before_renderer_setup_with_an_injected_local_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The backend restores state before tokenizer or renderer access, with no real client."""
+    pytest.importorskip("tinker_cookbook")
     import tinker_cookbook.model_info
     import tinker_cookbook.renderers
 
@@ -327,6 +329,7 @@ def test_backend_restores_before_renderer_setup_with_an_injected_local_service(
 
 def test_context_truncation_retains_the_complete_two_token_target() -> None:
     """A tight datum limit removes prompt context without dropping either target token."""
+    pytest.importorskip("tinker")
     renderer = _DatumRenderer()
     session = TinkerTrainerSession(
         client=cast("tinker.TrainingClient", _TrainingClient()),
@@ -357,6 +360,7 @@ def test_backend_cost_bound_uses_explicit_price_and_maximum_tokens() -> None:
 
 def test_datum_limit_rejects_instead_of_truncating_the_two_token_target() -> None:
     """A limit too small for the complete target fails before any training dispatch."""
+    pytest.importorskip("tinker")
     session = TinkerTrainerSession(
         client=cast("tinker.TrainingClient", _TrainingClient()),
         renderer=cast("Renderer", _DatumRenderer()),

@@ -39,6 +39,17 @@ class ObservedProductionCell(ContractModel):
     @field_validator("repeat")
     @classmethod
     def _require_nonnegative_repeat(cls, value: int) -> int:
+        """Require a nonnegative observed-production repeat index.
+
+        Args:
+            value: Repeat index to validate.
+
+        Returns:
+            The validated repeat index.
+
+        Raises:
+            ValueError: The repeat index is negative.
+        """
         if value < 0:
             raise ValueError("observed production repeat must be nonnegative")
         return value
@@ -417,6 +428,8 @@ def _fidelity_cells(
     planned_overlaps: int,
 ) -> tuple[EvaluationCell, ...]:
     """Select deterministic observed fit cells from distinct lineages for fidelity only."""
+    if planned_overlaps == 0:
+        return ()
     eligible = [
         cell for cell in main_cells if cell.purpose == "fit" and cell.execution == "observed"
     ]

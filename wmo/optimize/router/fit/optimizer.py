@@ -708,7 +708,19 @@ def _require_protocol_compatibility(
     tasks: Sequence[TaskCase],
     evaluation_inputs: Sequence[ArtifactInput],
 ) -> None:
-    """Require all usable fit evidence to share agent, rubric, judge, and pricing identity."""
+    """Require all usable fit evidence to share agent, judge, and pricing identity.
+
+    Args:
+        store: Project-local immutable artifact store.
+        dataset: Fit evaluation dataset under verification.
+        pricing_snapshot_id: Exact frozen candidate pricing identity.
+        judgment_status: Required judge calibration status.
+        tasks: Exact task-set cases bound to the evaluation plan.
+        evaluation_inputs: Recursively verified evaluation artifact inputs.
+
+    Raises:
+        RouterOptimizationError: Eligible protocols or their immutable identities disagree.
+    """
     protocols = {item.protocol_id: item for item in dataset.manifest.protocols}
     used_protocol_ids = {
         row.protocol_id

@@ -19,8 +19,8 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
-from wmo.cli.build_cmd import _build_grounded_artifacts
-from wmo.cli.router_candidate_setup import collect_router_candidate_setup
+from wmo.cli.build.app import _build_grounded_artifacts
+from wmo.cli.optimize.router_candidates import collect_router_candidates
 from wmo.common.core.artifacts import SourceIdentity, canonical_json_bytes
 from wmo.common.models import (
     AssistantAction,
@@ -73,7 +73,12 @@ from wmo.optimize.router.automatic.service import (
     persist_router_candidate_setup,
 )
 from wmo.optimize.router.composition import RouterCandidateSetupPlan
-from wmo.optimize.router.judging.artifacts import read_audit, write_audit, write_review_state
+from wmo.optimize.router.judging.artifacts import (
+    read_audit,
+    read_review_state,
+    write_audit,
+    write_review_state,
+)
 from wmo.optimize.router.judging.contracts import (
     ManualJudgeAxisDecision,
     ManualJudgeError,
@@ -81,6 +86,7 @@ from wmo.optimize.router.judging.contracts import (
     ManualJudgeReviewState,
 )
 from wmo.optimize.router.judging.labels import calibration_sample_digest
+from wmo.optimize.router.judging.provisional import bootstrap_provisional_judge
 from wmo.optimize.router.judging.review import (
     ManualJudgeTraceProposal,
     completed_trace_review_count,
@@ -108,6 +114,178 @@ _TIME = datetime(2026, 8, 14, tzinfo=UTC)
 _REVISION = "a" * 40
 _RUNNER = CliRunner()
 _CUSTOM_AGENT_CONSTRUCTIONS = 0
+
+
+def test_provisional_router_runs_and_human_calibration_creates_successor(
+    tmp_path: Path,
+) -> None:
+    """Provisional routing is runnable and later approval creates an immutable successor.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+    """
+    store, catalog, state = _completed_project(tmp_path)
+    setup_plan = prepare_manual_judge_setup(
+        store,
+        catalog,
+        preview_count=1,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    commit_manual_judge_setup(store, setup_plan, confirmed=True)
+    calibration_plan = prepare_manual_judge_calibration(store, sample_size=2)
+    provisional = bootstrap_provisional_judge(
+        store,
+        catalog,
+        calibration_plan,
+        created_at=_TIME,
+        code_revision=_REVISION,
+    )
+    plan = collect_router_candidates(
+        store.model_catalog_path,
+        catalog,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    options = AutomaticRouterOptions(
+        maximum_judgments=20,
+        maximum_model_calls=1,
+        simulation_maximum_output_tokens=8_000,
+    )
+    result = optimize_project_router(
+        store,
+        plan,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        options=options,
+        provider_spend_consented=True,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision=_REVISION,
+    )
+
+    policy = result.composition.optimization.optimization.policy
+    assert result.preflight.judgment_status == "provisional"
+    assert result.preflight.calibration_id == provisional.calibration_id
+    assert policy.judgment_status == "provisional"
+    runtime = load_project_router(
+        "support",
+        store.paths.root,
+        policy_id=policy.policy_id,
+        runtime_catalog=cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+    )
+    assert runtime.policy.policy_id == policy.policy_id
+    provisional_policy_bytes = store.artifacts.read_bytes(policy.policy_id, "policy.json")
+
+    before_credentials = state.credential_resolutions
+    before_embeddings = tuple(state.embedding_calls)
+    before_completions = tuple(state.completion_calls)
+    replay = find_completed_automatic_router_replay(
+        store,
+        result.preflight,
+        options=options,
+        code_revision=_REVISION,
+    )
+
+    assert replay is not None
+    assert state.credential_resolutions == before_credentials
+    assert tuple(state.embedding_calls) == before_embeddings
+    assert tuple(state.completion_calls) == before_completions
+
+    _approve_manual_judge(store, catalog, state)
+    approved_catalog = load_model_catalog(store.model_catalog_path)
+    approved_plan = collect_router_candidates(
+        store.model_catalog_path,
+        approved_catalog,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    approved = optimize_project_router(
+        store,
+        approved_plan,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(approved_catalog, state)),
+        options=options,
+        provider_spend_consented=True,
+        created_at=_TIME + timedelta(hours=2),
+        code_revision=_REVISION,
+    )
+
+    assert approved.preflight.judgment_status == "human_calibrated"
+    assert approved.preflight.calibration_id != provisional.calibration_id
+    approved_policy = approved.composition.optimization.optimization.policy
+    assert approved_policy.judgment_status == "human_calibrated"
+    assert approved_policy.policy_id != policy.policy_id
+    assert store.artifacts.read_bytes(policy.policy_id, "policy.json") == provisional_policy_bytes
+    old_runtime = load_project_router(
+        "support",
+        store.paths.root,
+        policy_id=policy.policy_id,
+        runtime_catalog=cast(RuntimeModelCatalog, _RuntimeCatalog(approved_catalog, state)),
+    )
+    assert old_runtime.policy.judgment_status == "provisional"
+
+
+def test_identity_free_history_runs_full_fresh_candidate_schedule(
+    tmp_path: Path,
+) -> None:
+    """Missing source identity reuses no cells and runs the normal simulated router schedule.
+
+    Args:
+        tmp_path: Isolated project whose source spans omit generator identity.
+    """
+    store, catalog, state = _completed_project(tmp_path, without_identity=True)
+    _approve_manual_judge(store, catalog, state)
+    plan = collect_router_candidates(
+        store.model_catalog_path,
+        catalog,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    options = AutomaticRouterOptions(
+        maximum_provider_cost_usd=25.0,
+        maximum_judgments=20,
+        maximum_model_calls=1,
+        simulation_maximum_output_tokens=8_000,
+    )
+    calls_before_router = len(state.completion_calls)
+
+    result = optimize_project_router(
+        store,
+        plan,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        options=options,
+        provider_spend_consented=True,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision=_REVISION,
+    )
+
+    task_count = len(result.preflight.tasks)
+    candidate_count = len(result.preflight.candidates)
+    assert result.preflight.observed_traces == ()
+    assert result.preflight.cost_plan.reusable_observed_count == 0
+    assert result.preflight.cost_plan.simulated_episode_count == task_count * candidate_count
+    assert result.preflight.cost_plan.maximum_judgments == task_count * candidate_count
+    assert result.artifacts.attribution_input is None
+    assert not any(
+        store.artifacts.read(artifact_id).manifest.artifact_type == "router-observed-attribution"
+        for artifact_id in store.artifacts.list_ids()
+    )
+    assert all(cell.execution == "simulate" for cell in result.composition.plan.cells)
+    assert all(cell.purpose != "fidelity" for cell in result.composition.plan.cells)
+    assert len(state.completion_calls) > calls_before_router
+    policy = result.composition.optimization.optimization.policy
+    assert policy.judgment_status == "human_calibrated"
+    runtime = load_project_router(
+        "support",
+        store.paths.root,
+        policy_id=policy.policy_id,
+        runtime_catalog=cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+    )
+    assert runtime.policy.policy_id == policy.policy_id
 
 
 @dataclass
@@ -294,7 +472,7 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=candidate_order,
@@ -503,7 +681,7 @@ def test_replay_restores_discovered_candidate_records_before_reporting_success(
         tmp_path: Isolated local WMO root.
         monkeypatch: Test patching seam for the CLI's already-collected candidate plan.
     """
-    import wmo.cli.router_app as router_app
+    import wmo.cli.optimize.router as router_app
 
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
@@ -580,7 +758,7 @@ def test_replay_restores_discovered_candidate_records_before_reporting_success(
     )
     monkeypatch.setattr(
         router_app,
-        "collect_router_candidate_setup",
+        "collect_router_candidates",
         lambda *_args, **_kwargs: replay_plan,
     )
     before_credentials = state.credential_resolutions
@@ -628,7 +806,7 @@ def test_automatic_router_refuses_spend_before_credentials_calls_or_writes(
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -733,7 +911,7 @@ def test_provider_model_only_telemetry_composes_with_inferred_unique_attribution
     """
     store, catalog, state = _completed_project(tmp_path, inferred_identity=True)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -780,7 +958,7 @@ def test_duplicate_candidate_identities_fail_before_stateful_boundaries(tmp_path
             }
         }
     )
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         ambiguous,
         candidates=("candidate-a", "candidate-b"),
@@ -829,7 +1007,7 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -869,6 +1047,7 @@ def test_completed_replay_rejects_attribution_tamper_before_provider_access(
             )
         assert store.artifacts.list_ids() == before_artifacts
         return
+    assert result.artifacts.attribution_input is not None
     attribution_id = result.artifacts.attribution_input.artifact_id
     stored = store.artifacts.read(attribution_id)
     if tamper == "payload":
@@ -943,7 +1122,7 @@ def test_completed_custom_agent_replay_does_not_import_or_construct_factory(
         ),
     )
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -1003,7 +1182,7 @@ def test_automatic_router_rejects_confirmed_catalog_drift_before_credentials(
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -1103,7 +1282,7 @@ def test_automatic_router_rejects_substituted_manual_judge_audit_before_calls(
     )
     substituted_input = artifact_input(store.artifacts.read(substituted.audit_id).manifest)
     write_review_state(store, selected.model_copy(update={"audit": substituted_input}))
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -1249,7 +1428,7 @@ def test_preflight_accepts_calibration_resumed_after_a_failed_first_pass(
         reviewer=_accept,
     )
     assert result.approved_calibration is not None
-    candidate_plan = collect_router_candidate_setup(
+    candidate_plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -1289,7 +1468,7 @@ def test_runtime_activation_rejects_automatic_contract_tamper_before_credentials
     """
     store, catalog, state = _completed_project(tmp_path)
     _approve_manual_judge(store, catalog, state)
-    plan = collect_router_candidate_setup(
+    plan = collect_router_candidates(
         store.model_catalog_path,
         catalog,
         candidates=("candidate-a", "candidate-b"),
@@ -1352,6 +1531,7 @@ def _completed_project(
     *,
     agent: AgentConfiguration | None = None,
     inferred_identity: bool = False,
+    without_identity: bool = False,
 ) -> tuple[ProjectStore, ModelCatalog, _ProviderState]:
     """Create one exact completed build with candidate-attributed real traces.
 
@@ -1360,6 +1540,7 @@ def _completed_project(
         agent: Optional exact custom agent configuration frozen during build.
         inferred_identity: Whether source model digests use telemetry fallbacks rather than the
             selected catalog snapshot.
+        without_identity: Whether every source span intentionally omits generator identity.
 
     Returns:
         Completed project, catalog, and shared provider counters.
@@ -1402,6 +1583,15 @@ def _completed_project(
         else candidate_model
     )
     traces = tuple(_trace(index, recorded_model) for index in range(12))
+    if without_identity:
+        traces = tuple(
+            trace.model_copy(
+                update={
+                    "spans": tuple(span.model_copy(update={"model": None}) for span in trace.spans)
+                }
+            )
+            for trace in traces
+        )
     built = build_project(
         TraceNormalizationResult(
             traces=traces,
@@ -1419,10 +1609,12 @@ def _completed_project(
             semantic_duplicate_threshold=1.0,
         ),
     )
+    world_snapshot, _world_capabilities = runtime.snapshot("world")
     completed = _build_grounded_artifacts(
         store,
         built,
-        resolved_world=runtime.resolve("world"),
+        world_alias="world",
+        world_snapshot=world_snapshot,
         resolved_embedder=runtime.resolve("embedder"),
         top_k=2,
     )
@@ -1446,6 +1638,8 @@ def _approve_manual_judge(
     store: ProjectStore,
     catalog: ModelCatalog,
     state: _ProviderState,
+    *,
+    runtime_catalog: RuntimeModelCatalog | None = None,
 ) -> None:
     """Persist one explicitly approved real-trace judge calibration.
 
@@ -1453,15 +1647,17 @@ def _approve_manual_judge(
         store: Completed project store.
         catalog: Exact build-time catalog.
         state: Shared provider counters.
+        runtime_catalog: Optional resolver matching alternate catalog aliases.
     """
-    setup_plan = prepare_manual_judge_setup(
-        store,
-        catalog,
-        preview_count=1,
-        created_at=_TIME,
-        code_revision=_REVISION,
-    )
-    commit_manual_judge_setup(store, setup_plan, confirmed=True)
+    if read_review_state(store) is None:
+        setup_plan = prepare_manual_judge_setup(
+            store,
+            catalog,
+            preview_count=1,
+            created_at=_TIME,
+            code_revision=_REVISION,
+        )
+        commit_manual_judge_setup(store, setup_plan, confirmed=True)
     plan = prepare_manual_judge_calibration(store, sample_size=2)
     labels = tuple(
         ManualJudgeLabel(
@@ -1471,14 +1667,24 @@ def _approve_manual_judge(
         )
         for trace in plan.traces
     )
+    judge_alias = catalog.roles.judge
+    assert judge_alias is not None
+    capabilities = catalog.models[judge_alias].capabilities
+    assert capabilities is not None
+    assert capabilities.input_cost_per_million_tokens_usd is not None
+    assert capabilities.output_cost_per_million_tokens_usd is not None
+    assert capabilities.context_window_tokens is not None
     budget = estimate_manual_judge_budget(
         plan,
-        input_usd_per_million_tokens=1.0,
-        output_usd_per_million_tokens=2.0,
-        maximum_input_tokens_per_call=32_768,
-        maximum_cost_usd=1.0,
+        input_usd_per_million_tokens=capabilities.input_cost_per_million_tokens_usd,
+        output_usd_per_million_tokens=capabilities.output_cost_per_million_tokens_usd,
+        maximum_input_tokens_per_call=min(
+            32_768,
+            capabilities.context_window_tokens - 4_096,
+        ),
+        maximum_cost_usd=100.0,
     )
-    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    runtime = runtime_catalog or cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
     calibrate_manual_judge(
         store,
         runtime,

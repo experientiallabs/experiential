@@ -6,10 +6,10 @@ import logging
 
 import typer
 
-from wmo.cli.build_cmd import build
-from wmo.cli.config_cmd import config_app
-from wmo.cli.defer import add_deferred_typer
-from wmo.cli.run_cmd import run
+from wmo.cli.build.app import build
+from wmo.cli.config.app import config_app
+from wmo.cli.run.app import run
+from wmo.cli.shared.defer import add_deferred_typer
 from wmo.common.config import load_env_file
 
 app = typer.Typer(
@@ -20,7 +20,7 @@ app.add_typer(config_app, name="config")
 add_deferred_typer(
     app,
     name="optimize",
-    module="wmo.cli.optimize_app",
+    module="wmo.cli.optimize.app",
     attr="optimize_app",
     help="Optimize supported frozen project artifacts.",
     known_names=("router", "model"),

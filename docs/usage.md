@@ -4,8 +4,8 @@ The root surface is deliberately small:
 
 | Command | Purpose | Local result |
 |---|---|---|
-| `wmo build PROJECT TRACES --source SOURCE --root ROOT [--provider NAME ...]` | Normalize 100 through 1000 local traces from one [declared source](reference/ingest.md) and mine representative tasks. First-build setup uses a keyboard provider list, or exact `--provider` flags. | Manifest-bound `TraceDataset`, `TaskSet`, and `proposals_pending` review state. |
-| `wmo optimize router PROJECT --root ROOT [--yes]` | Complete bounded fit simulation and judgment, lock a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
+| `wmo build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
+| `wmo optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `wmo optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `wmo run --root ROOT [--check]` | Validate or start the initialized authenticated multi-alias gateway on loopback. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `wmo run PROJECT --root ROOT [--ghost]` | Activate a frozen policy as one project-backed alias and launch the normal gateway. | The same authenticated OpenAI endpoint and SQLite accounting as no-argument `wmo run`. |
@@ -15,15 +15,18 @@ The root surface is deliberately small:
 | `wmo config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.wmo/settings.toml`. |
 
 `build`, judge calibration, `optimize router`, and `optimize model` use the same cost authorization
-policy. Each displays the command, conservative estimate, configured per-command budget, and major
-cost assumptions. An estimate at or below 50% of the budget runs automatically. A higher estimate
+policy. An estimate at or below 50% of the budget runs automatically. A higher estimate
 up to the budget requires a clear terminal confirmation or `--yes`; an estimate above the budget
-fails before credentials or provider clients. Set the deterministic ceiling with
+warns and requires an explicit interactive override that defaults to no, and fails closed before
+credentials or provider clients when no terminal is available. Set the deterministic ceiling with
 `wmo config budget USD --root ROOT`. `--yes` confirms only an in-budget invocation and never raises
 the ceiling. Exact completed replays report a zero-dollar estimate and do not prompt.
 
 Successful build, router, simulation, and SFT operations preserve anonymous aggregate PostHog
 product telemetry, which may send unless disabled. `run` makes no provider call at startup.
+`build --dry-run` and exact completed-build replay make zero paid provider calls. A new grounded
+build calls only the configured embedder; automatic router optimization separately executes the
+bounded candidate, world-model, and judge schedule shown in its cost preflight.
 An authenticated gateway request is the explicit online model-call boundary. Project selectors
 remain frozen for the process lifetime and return only an exact model pool. `--ghost` remains a
 compatibility flag for project-journal behavior; gateway authentication, replay, attempts, and
@@ -107,9 +110,15 @@ Completions plus Responses, and stream plus non-stream calls. Provider protocol 
 deterministic. Hosted-provider runs require credentials and are reported separately in
 [`release-scope.md`](release-scope.md); fixture success is not presented as a live-provider result.
 
-Build stops at review readiness. `wmo optimize router` creates the bounded fit and held-out
-evaluation chain after candidate and manual judge setup. It never invokes world-model fidelity
-testing. Applications that need a world-model quality measurement can call the separate
-`build_fidelity_evaluation_plan` and `build_fidelity_report` APIs; those results never enter router
-fitting or activation. Fidelity reports contain measurements only, never an approval or denial.
-See the [router contracts](reference/router_optimization_config.md).
+The guided build uses one bounded consent to create simulation evidence, separate serving and fit
+RAG indexes, a judge syllabus, closed-loop candidate evaluations, and a runnable router. Human
+judge calibration is recommended but optional: provisional judgment provenance remains visible,
+and later approval plus another build creates an immutable human-calibrated successor. Running the
+endpoint records traffic by default so a later optimization can use newly attributed outcomes.
+Explicit trace automation can still stop after the grounded build, then use
+[`router-optimization.json`](reference/router_optimization_config.md) with `wmo optimize router`.
+Router fitting never invokes world-model fidelity testing. Applications that need a world-model
+quality measurement can call the separate `build_fidelity_evaluation_plan` and
+`build_fidelity_report` APIs; those results never enter router fitting or activation. Fidelity
+reports contain measurements only, never an approval or denial. See the
+[router contracts](reference/router_optimization_config.md).

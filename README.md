@@ -16,20 +16,22 @@ WMO optimizes agent workflows from traces through a three-step process:
 
 ## Getting Started
 
-To get started, install the package and build a project using collected OpenTelemetry traces from
-your current agent:
+First, collect OpenTelemetry traces from your current agent. If you just want to try it out, grab
+the public [terminal-tasks OTLP dataset](https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces):
+
+```bash
+curl -L -o traces.otel.jsonl \
+  https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl
+```
+
+Then install the package and build a project. The build command walks you through providers,
+models, and budget, and asks for your trace file:
 
 ```bash
 pip install world-model-optimizer
 
-# Collect secret-free provider connections, including azure and bedrock
-wmo config providers
-
-# Build simulation from your agent traces
-wmo build support-agent traces.otel.jsonl
-
-# Optimize a router against the simulation to use the best model for every task
-wmo optimize router support-agent
+# Build simulation from your agent traces and optimize a router against it
+wmo build support-agent
 
 # Run your router as an OpenAI compatible endpoint
 wmo run support-agent
@@ -38,16 +40,6 @@ wmo run support-agent
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
-```
-
-To exercise the build path with a public trace export, download the
-[terminal-tasks OTLP dataset](https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces)
-and pass it to the same command without a source adapter or conversion step:
-
-```bash
-curl -L -o traces.otel.jsonl \
-  https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl
-wmo build terminal-tasks traces.otel.jsonl
 ```
 
 After collecting traces from your router, fine-tune an open source model you own using
