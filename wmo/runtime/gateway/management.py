@@ -463,6 +463,42 @@ class GatewayManagement:
             refusal_failover=refusal_failover,
         )
 
+    def preflight_direct_alias_activation(
+        self,
+        *,
+        alias_id: str,
+        alias_name: str,
+        revision_id: str,
+        pool_id: str,
+        snapshot_ref: str,
+        catalog_sha256: str,
+        refusal_failover: bool = False,
+    ) -> bool:
+        """Validate direct activation invariants without changing SQLite authority.
+
+        Args:
+            alias_id: Stable alias resource identifier.
+            alias_name: Public model name.
+            revision_id: Immutable revision identifier.
+            pool_id: Direct target pool identifier.
+            snapshot_ref: Content-addressed catalog snapshot reference.
+            catalog_sha256: Exact normalized catalog digest.
+            refusal_failover: Whether typed precommit refusals may advance.
+
+        Returns:
+            Whether activation would create a new immutable revision.
+        """
+        changed, _snapshot_registered = self._alias_activation_preflight(
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            target=DirectTarget(pool_id=pool_id),
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            refusal_failover=refusal_failover,
+        )
+        return changed
+
     def activate_project_alias(
         self,
         *,
@@ -603,52 +639,23 @@ class GatewayManagement:
     ) -> bool:
         """Register one snapshot and activate an idempotent immutable alias revision."""
         store = self.require_initialized()
-        connection = connect_database(self.database_path)
-        try:
-            existing = connection.execute(
-                """
-                SELECT a.alias_name, r.target_kind, r.pool_id, r.project_ref,
-                       r.activation_ref, r.snapshot_ref, r.catalog_sha256,
-                       r.refusal_failover
-                FROM alias_revisions AS r
-                JOIN gateway_aliases AS a
-                  ON a.organization_id = r.organization_id AND a.alias_id = r.alias_id
-                WHERE r.organization_id = ? AND r.revision_id = ?
-                """,
-                (self.organization_id, revision_id),
-            ).fetchone()
-            snapshot = connection.execute(
-                """
-                SELECT snapshot_ref FROM catalog_snapshot_refs
-                WHERE organization_id = ? AND catalog_sha256 = ?
-                """,
-                (self.organization_id, catalog_sha256),
-            ).fetchone()
-        finally:
-            connection.close()
-        if existing is not None:
-            expected = (
-                alias_name,
-                target.kind,
-                target.pool_id if isinstance(target, DirectTarget) else None,
-                target.project_ref if isinstance(target, ProjectTarget) else None,
-                target.activation_ref if isinstance(target, ProjectTarget) else None,
-                snapshot_ref,
-                catalog_sha256,
-                int(refusal_failover),
-            )
-            actual = tuple(existing[index] for index in range(8))
-            if actual != expected:
-                raise GatewayStoreError("alias revision ID was reused with different input")
+        changed, snapshot_registered = self._alias_activation_preflight(
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            target=target,
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            refusal_failover=refusal_failover,
+        )
+        if not changed:
             return False
-        if snapshot is None:
+        if not snapshot_registered:
             store.register_catalog_snapshot(
                 organization_id=self.organization_id,
                 snapshot_ref=snapshot_ref,
                 catalog_sha256=catalog_sha256,
             )
-        elif str(snapshot["snapshot_ref"]) != snapshot_ref:
-            raise GatewayStoreError("catalog digest is already registered under another snapshot")
         store.activate_alias_revision(
             organization_id=self.organization_id,
             alias_id=alias_id,
@@ -661,6 +668,100 @@ class GatewayManagement:
             refusal_failover=refusal_failover,
         )
         return True
+
+    def _alias_activation_preflight(
+        self,
+        *,
+        alias_id: str,
+        alias_name: str,
+        revision_id: str,
+        target: DirectTarget | ProjectTarget,
+        snapshot_ref: str,
+        catalog_sha256: str,
+        refusal_failover: bool,
+    ) -> tuple[bool, bool]:
+        """Return activation and snapshot change status after read-only validation."""
+        self.require_initialized()
+        connection = connect_database(self.database_path)
+        try:
+            existing = connection.execute(
+                """
+                SELECT r.organization_id, r.alias_id, a.alias_name,
+                       r.target_kind, r.pool_id, r.project_ref,
+                       r.activation_ref, r.snapshot_ref, r.catalog_sha256,
+                       r.refusal_failover
+                FROM alias_revisions AS r
+                JOIN gateway_aliases AS a
+                  ON a.organization_id = r.organization_id AND a.alias_id = r.alias_id
+                WHERE r.revision_id = ?
+                """,
+                (revision_id,),
+            ).fetchone()
+            alias_by_id = connection.execute(
+                """
+                SELECT organization_id, alias_name FROM gateway_aliases
+                WHERE alias_id = ?
+                """,
+                (alias_id,),
+            ).fetchone()
+            alias_by_name = connection.execute(
+                """
+                SELECT alias_id FROM gateway_aliases
+                WHERE organization_id = ? AND alias_name = ?
+                """,
+                (self.organization_id, alias_name),
+            ).fetchone()
+            snapshot_by_digest = connection.execute(
+                """
+                SELECT snapshot_ref FROM catalog_snapshot_refs
+                WHERE organization_id = ? AND catalog_sha256 = ?
+                """,
+                (self.organization_id, catalog_sha256),
+            ).fetchone()
+            snapshot_by_ref = connection.execute(
+                """
+                SELECT organization_id, catalog_sha256 FROM catalog_snapshot_refs
+                WHERE snapshot_ref = ?
+                """,
+                (snapshot_ref,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if existing is not None:
+            expected = (
+                self.organization_id,
+                alias_id,
+                alias_name,
+                target.kind,
+                target.pool_id if isinstance(target, DirectTarget) else None,
+                target.project_ref if isinstance(target, ProjectTarget) else None,
+                target.activation_ref if isinstance(target, ProjectTarget) else None,
+                snapshot_ref,
+                catalog_sha256,
+                int(refusal_failover),
+            )
+            actual = tuple(existing[index] for index in range(10))
+            if actual != expected:
+                raise GatewayStoreError("alias revision ID was reused with different input")
+            return False, True
+        if alias_by_id is not None and (
+            str(alias_by_id["organization_id"]) != self.organization_id
+            or str(alias_by_id["alias_name"]) != alias_name
+        ):
+            raise GatewayStoreError("alias ID cannot be renamed or reused across organizations")
+        if alias_by_name is not None and str(alias_by_name["alias_id"]) != alias_id:
+            raise GatewayStoreError("alias name is already assigned to another alias ID")
+        if (
+            snapshot_by_digest is not None
+            and str(snapshot_by_digest["snapshot_ref"]) != snapshot_ref
+        ):
+            raise GatewayStoreError("catalog digest is already registered under another snapshot")
+        if snapshot_by_ref is not None and (
+            str(snapshot_by_ref["organization_id"]) != self.organization_id
+            or str(snapshot_by_ref["catalog_sha256"]) != catalog_sha256
+        ):
+            raise GatewayStoreError("catalog snapshot reference was reused with another digest")
+        return True, snapshot_by_digest is not None
 
     def _rows(
         self, query: str, parameters: tuple[str, ...] | None = None

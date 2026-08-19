@@ -7,10 +7,15 @@ from pathlib import Path
 
 import typer
 
-from wmo.cli.gateway.catalog import upsert_certified_pool
+from wmo.cli.gateway.catalog import (
+    GatewayCatalogAuthoringError,
+    apply_certified_pool_update,
+    plan_certified_pool_update,
+    rollback_certified_pool_update,
+)
 from wmo.cli.gateway.receipts import GatewayReceipt, emit_receipt
 from wmo.cli.options import ROOT_OPTION, usage_error
-from wmo.common.core.locks import FileLockTimeout
+from wmo.common.core.locks import FileLockTimeout, file_write_lock
 from wmo.common.models import GatewayEquivalenceCertification
 from wmo.runtime.gateway.management import GatewayManagement
 
@@ -74,24 +79,49 @@ def pool_certify(
             evidence_sha256=evidence_sha256,
             certified_at=datetime.fromisoformat(certified_at),
         )
-        normalized, snapshot, catalog_changed = upsert_certified_pool(
-            root,
-            pool_id=alias,
-            exact_model_id=exact_model,
-            deployment_aliases=tuple(deployment_aliases),
-            certification=certification,
-            expected_catalog_sha256=expected_catalog_sha256,
-            replace=replace,
-        )
-        activation_changed = manager.activate_direct_alias(
-            alias_id=alias,
-            alias_name=alias,
-            revision_id=revision,
-            pool_id=alias,
-            snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-            catalog_sha256=normalized.identity_sha256(),
-            refusal_failover=refusal_failover,
-        )
+        catalog_path = root / "models.toml"
+        with file_write_lock(catalog_path, what="the gateway exact-model pool activation"):
+            update = plan_certified_pool_update(
+                root,
+                pool_id=alias,
+                exact_model_id=exact_model,
+                deployment_aliases=tuple(deployment_aliases),
+                certification=certification,
+                expected_catalog_sha256=expected_catalog_sha256,
+                replace=replace,
+                allow_existing_desired_state=True,
+            )
+            snapshot_ref = f"catalog-snapshots/{update.snapshot.name}"
+            activation_arguments = {
+                "alias_id": alias,
+                "alias_name": alias,
+                "revision_id": revision,
+                "pool_id": alias,
+                "snapshot_ref": snapshot_ref,
+                "catalog_sha256": update.normalized.identity_sha256(),
+                "refusal_failover": refusal_failover,
+            }
+            activation_changed = manager.preflight_direct_alias_activation(**activation_arguments)
+            if not update.observed_matches_expected and activation_changed:
+                raise GatewayCatalogAuthoringError(
+                    "gateway catalog changed; refresh its digest before certifying the pool"
+                )
+            apply_certified_pool_update(root, update)
+            try:
+                activation_changed = manager.activate_direct_alias(**activation_arguments)
+            except BaseException:
+                try:
+                    activation_committed = not manager.preflight_direct_alias_activation(
+                        **activation_arguments
+                    )
+                except BaseException:  # noqa: BLE001 - preserve the primary activation failure
+                    activation_committed = False
+                if not activation_committed:
+                    rollback_certified_pool_update(root, update)
+                    raise
+                activation_changed = True
+        normalized = update.normalized
+        catalog_changed = update.changed
     emit_receipt(
         GatewayReceipt(
             operation="pool.certify",

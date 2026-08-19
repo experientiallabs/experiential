@@ -242,6 +242,139 @@ def test_noninteractive_pool_certification_activates_ordered_alias_with_receipt(
     assert alias.revision_id == "revision-waterfall-one"
 
 
+def test_pool_certification_preflights_revision_conflict_before_catalog_write(
+    tmp_path: Path,
+) -> None:
+    """A reused immutable revision cannot leave a second certified pool behind."""
+    runner, catalog_sha256 = _prepare_pool_certification_root(tmp_path)
+    first = runner.invoke(
+        app,
+        _pool_certification_command(
+            tmp_path,
+            alias="coding",
+            revision="revision-waterfall-one",
+            expected_catalog_sha256=catalog_sha256,
+        ),
+    )
+    assert first.exit_code == 0, first.output
+    current_sha256 = json.loads(first.stdout)["data"]["catalog_sha256"]
+    catalog_before = (tmp_path / "models.toml").read_bytes()
+    aliases_before = GatewayManagement(tmp_path).aliases()
+
+    conflicting = runner.invoke(
+        app,
+        _pool_certification_command(
+            tmp_path,
+            alias="analysis",
+            revision="revision-waterfall-one",
+            expected_catalog_sha256=current_sha256,
+        ),
+    )
+
+    assert conflicting.exit_code == 2
+    assert "revision ID was reused" in conflicting.output
+    assert (tmp_path / "models.toml").read_bytes() == catalog_before
+    assert GatewayManagement(tmp_path).aliases() == aliases_before
+    assert "analysis" not in load_model_catalog(tmp_path / "models.toml").gateway_pools
+
+
+def test_pool_certification_rolls_back_activation_failure_and_replays_exact_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed authority write restores the catalog and the exact retry is idempotent."""
+    runner, catalog_sha256 = _prepare_pool_certification_root(tmp_path)
+    command = _pool_certification_command(
+        tmp_path,
+        alias="coding",
+        revision="revision-waterfall-one",
+        expected_catalog_sha256=catalog_sha256,
+    )
+    catalog_before = (tmp_path / "models.toml").read_bytes()
+    aliases_before = GatewayManagement(tmp_path).aliases()
+
+    def fail_activation(_manager: GatewayManagement, **_kwargs: object) -> bool:
+        """Inject a failure after the catalog update but before SQLite activation."""
+        raise RuntimeError("injected activation failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(GatewayManagement, "activate_direct_alias", fail_activation)
+        failed = runner.invoke(app, command)
+
+    assert failed.exit_code == 1
+    assert isinstance(failed.exception, RuntimeError)
+    assert (tmp_path / "models.toml").read_bytes() == catalog_before
+    assert GatewayManagement(tmp_path).aliases() == aliases_before
+
+    retried = runner.invoke(app, command)
+    replayed = runner.invoke(app, command)
+
+    assert retried.exit_code == 0, retried.output
+    assert replayed.exit_code == 0, replayed.output
+    assert json.loads(retried.stdout)["changed"] is True
+    assert json.loads(replayed.stdout)["changed"] is False
+    certified_aliases = tuple(
+        item for item in GatewayManagement(tmp_path).aliases() if item.alias_id == "coding"
+    )
+    assert len(certified_aliases) == 1
+    assert certified_aliases[0].revision_id == "revision-waterfall-one"
+
+
+def test_pool_certification_reconciles_post_commit_activation_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact committed revision remains success when the activation outcome is unknown."""
+    runner, catalog_sha256 = _prepare_pool_certification_root(tmp_path)
+    command = _pool_certification_command(
+        tmp_path,
+        alias="coding",
+        revision="revision-waterfall-one",
+        expected_catalog_sha256=catalog_sha256,
+    )
+    activate = GatewayManagement.activate_direct_alias
+
+    def commit_then_raise(
+        manager: GatewayManagement,
+        *,
+        alias_id: str,
+        alias_name: str,
+        revision_id: str,
+        pool_id: str,
+        snapshot_ref: str,
+        catalog_sha256: str,
+        refusal_failover: bool = False,
+    ) -> bool:
+        """Commit exact authority and then simulate a lost acknowledgement."""
+        activate(
+            manager,
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            pool_id=pool_id,
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            refusal_failover=refusal_failover,
+        )
+        raise RuntimeError("injected post-commit acknowledgement loss")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(GatewayManagement, "activate_direct_alias", commit_then_raise)
+        committed = runner.invoke(app, command)
+
+    replayed = runner.invoke(app, command)
+
+    assert committed.exit_code == 0, committed.output
+    assert replayed.exit_code == 0, replayed.output
+    assert json.loads(committed.stdout)["changed"] is True
+    assert json.loads(replayed.stdout)["changed"] is False
+    alias = next(
+        item for item in GatewayManagement(tmp_path).aliases() if item.alias_id == "coding"
+    )
+    assert alias.revision_id == "revision-waterfall-one"
+    assert "coding" in load_model_catalog(tmp_path / "models.toml").gateway_pools
+
+
 def test_pool_certification_rejects_a_stale_catalog_digest_before_activation(
     tmp_path: Path,
 ) -> None:
@@ -331,6 +464,99 @@ def test_pool_certification_rejects_a_stale_catalog_digest_before_activation(
     assert "refresh its digest" in result.output
     assert "coding" not in load_model_catalog(tmp_path / "models.toml").gateway_pools
     assert all(item.alias_id != "coding" for item in GatewayManagement(tmp_path).aliases())
+
+
+def _prepare_pool_certification_root(tmp_path: Path) -> tuple[CliRunner, str]:
+    """Create two compatible deployments and return their latest catalog digest."""
+    runner = CliRunner()
+    initialized = runner.invoke(
+        app,
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+    )
+    assert initialized.exit_code == 0, initialized.output
+    provider = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "provider-main",
+            "--provider",
+            "openai-compatible",
+            "--credential-env",
+            "TEST_PROVIDER_KEY",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert provider.exit_code == 0, provider.output
+    catalog_sha256 = ""
+    for deployment_alias in ("primary", "secondary"):
+        created = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "alias",
+                "create",
+                deployment_alias,
+                "--deployment",
+                f"provider-main:{deployment_alias}-model",
+                "--exact-model",
+                "model-revision-exact",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        assert created.exit_code == 0, created.output
+        catalog_sha256 = json.loads(created.stdout)["data"]["catalog_sha256"]
+    return runner, catalog_sha256
+
+
+def _pool_certification_command(
+    root: Path,
+    *,
+    alias: str,
+    revision: str,
+    expected_catalog_sha256: str,
+) -> list[str]:
+    """Build one noninteractive certified-pool command with deterministic evidence."""
+    return [
+        "config",
+        "gateway",
+        "pool",
+        "certify",
+        alias,
+        "--deployment-alias",
+        "primary",
+        "--deployment-alias",
+        "secondary",
+        "--exact-model",
+        "model-revision-exact",
+        "--certification-id",
+        "certification-one",
+        "--provenance",
+        "operator-reviewed deployment manifests",
+        "--evidence-sha256",
+        "a" * 64,
+        "--certified-at",
+        "2026-08-18T00:00:00Z",
+        "--expected-catalog-sha256",
+        expected_catalog_sha256,
+        "--revision",
+        revision,
+        "--root",
+        str(root),
+        "--non-interactive",
+        "--json",
+    ]
 
 
 def test_key_output_collision_is_rejected_before_key_issuance(tmp_path: Path) -> None:
