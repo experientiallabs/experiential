@@ -272,7 +272,9 @@ def test_resolution_threads_catalog_served_model_pin_to_every_http_provider(
         transport_factory=ScriptedJsonTransport,
     )
     unpinned = RuntimeModelCatalog(
-        _catalog(provider=provider, base_url=base_url, api_version="v1" if provider == "azure" else None),
+        _catalog(
+            provider=provider, base_url=base_url, api_version="v1" if provider == "azure" else None
+        ),
         environment={"FIXTURE_API_KEY": "fixture-key"},
         transport_factory=ScriptedJsonTransport,
     )

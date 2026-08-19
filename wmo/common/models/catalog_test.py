@@ -68,7 +68,10 @@ def test_model_catalog_round_trip_preserves_served_model_id(tmp_path: Path) -> N
     path = tmp_path / "models.toml"
     base = _catalog()
     record = base.models["candidate-economy"].model_copy(
-        update={"model": "deepseek-ai/DeepSeek-V4-Flash-0731", "served_model_id": "deepseek-v4-flash"}
+        update={
+            "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+            "served_model_id": "deepseek-v4-flash",
+        }
     )
     catalog = base.model_copy(update={"models": {"candidate-economy": record}})
 
