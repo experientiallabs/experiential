@@ -17,8 +17,8 @@ from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
-from wmo.cli.gateway import key_output as gateway_key_output
 from wmo.cli.gateway import catalog as gateway_catalog
+from wmo.cli.gateway import key_output as gateway_key_output
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import BillingSource, load_model_catalog, normalize_gateway_catalog
 from wmo.runtime.gateway.auth import IssuedVirtualKey, issue_key_material
