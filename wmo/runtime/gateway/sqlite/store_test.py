@@ -21,7 +21,10 @@ from wmo.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from wmo.runtime.gateway.sqlite import key_delivery
-from wmo.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
+from wmo.runtime.gateway.sqlite.alias_activation import (
+    AliasActivationOutcomeUnknownError,
+    reconcile_alias_activation,
+)
 from wmo.runtime.gateway.sqlite.provider_authority import (
     ProviderAuthorityError,
     ProviderConnectionBinding,
@@ -691,11 +694,11 @@ def test_project_activation_binding_is_unique_per_tenant_and_revisions_are_immut
         connection.close()
 
 
-def test_alias_activation_reconciles_lost_commit_acknowledgement(
+def test_alias_activation_reconciles_lost_commit_acknowledgement_after_supersession(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fresh exact read turns a lost COMMIT acknowledgement into success."""
+    """Immutable revision A proves its commit even when concurrent revision B supersedes it."""
     store = SQLiteGatewayStore(tmp_path / "gateway.db")
     store.create_organization(organization_id="org-one", slug="one", display_name="One")
     store.register_catalog_snapshot(
@@ -704,6 +707,7 @@ def test_alias_activation_reconciles_lost_commit_acknowledgement(
         catalog_sha256=_DIGEST,
     )
     original_connect = store._connect
+    superseding_store = SQLiteGatewayStore(tmp_path / "gateway.db")
 
     class CommitAfterEffectConnection:
         """Raise only after SQLite has applied COMMIT."""
@@ -716,6 +720,15 @@ def test_alias_activation_reconciles_lost_commit_acknowledgement(
             """Delegate SQL and lose the COMMIT acknowledgement."""
             result = self.connection.execute(statement, parameters)
             if statement == "COMMIT":
+                superseding_store.activate_alias_revision(
+                    organization_id="org-one",
+                    alias_id="alias-one",
+                    alias_name="coding",
+                    revision_id="revision-two",
+                    target=DirectTarget(pool_id="pool-one"),
+                    snapshot_ref="snapshot-one",
+                    catalog_sha256=_DIGEST,
+                )
                 raise KeyboardInterrupt("injected post-COMMIT interrupt")
             return result
 
@@ -740,7 +753,35 @@ def test_alias_activation_reconciles_lost_commit_acknowledgement(
         row = connection.execute(
             "SELECT active_revision_id FROM gateway_aliases WHERE alias_id = 'alias-one'"
         ).fetchone()
-    assert row == ("revision-one",)
+    assert row == ("revision-two",)
+    assert (
+        reconcile_alias_activation(
+            connect=original_connect,
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="missing-revision",
+            target=DirectTarget(pool_id="pool-one"),
+            snapshot_ref="snapshot-one",
+            catalog_sha256=_DIGEST,
+            refusal_failover=False,
+        )
+        is False
+    )
+    assert (
+        reconcile_alias_activation(
+            connect=original_connect,
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="revision-one",
+            target=DirectTarget(pool_id="wrong-pool"),
+            snapshot_ref="snapshot-one",
+            catalog_sha256=_DIGEST,
+            refusal_failover=False,
+        )
+        is False
+    )
 
 
 def test_alias_activation_types_only_unreadable_commit_outcome_as_unknown(

@@ -133,8 +133,7 @@ def reconcile_alias_activation(
         with connect() as connection:
             row = connection.execute(
                 """
-                SELECT a.alias_name, a.active, a.active_revision_id,
-                       r.target_kind, r.pool_id, r.project_ref, r.activation_ref,
+                SELECT a.alias_name, r.target_kind, r.pool_id, r.project_ref, r.activation_ref,
                        r.snapshot_ref, r.catalog_sha256, r.refusal_failover
                 FROM alias_revisions AS r
                 JOIN gateway_aliases AS a
@@ -149,8 +148,6 @@ def reconcile_alias_activation(
         return False
     expected = (
         alias_name,
-        1,
-        revision_id,
         target.kind,
         target.pool_id if isinstance(target, DirectTarget) else None,
         target.project_ref if isinstance(target, ProjectTarget) else None,
@@ -159,4 +156,4 @@ def reconcile_alias_activation(
         catalog_sha256,
         int(refusal_failover),
     )
-    return tuple(row[index] for index in range(10)) == expected
+    return tuple(row[index] for index in range(8)) == expected
