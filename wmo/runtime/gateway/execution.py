@@ -828,12 +828,16 @@ def _require_deployment_identity(
     deployment: ExactModelDeployment,
     resolved: ResolvedModel,
 ) -> None:
-    """Fail before accounting or network work when runtime resolution drifts from authority."""
-    served_model = resolved.served_model_id or resolved.snapshot.model_id
+    """Fail before accounting or network work when runtime resolution drifts from authority.
+
+    A catalog record may pin a response-only served-model identity that differs from the
+    requested provider model. The frozen deployment names the requested model, so either the
+    resolved requested identity or the pinned served identity may match it.
+    """
     if (
         resolved.alias != deployment.source_alias
         or resolved.snapshot.provider != deployment.provider
-        or served_model != deployment.provider_model
+        or deployment.provider_model not in {resolved.snapshot.model_id, resolved.served_model_id}
         or resolved.snapshot.revision != deployment.revision
         or resolved.snapshot.connection_sha256 != deployment.connection_sha256
         or resolved.snapshot.billing_source != deployment.billing_source

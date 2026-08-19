@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 
@@ -39,6 +40,7 @@ from wmo.runtime.gateway.contracts import (
 from wmo.runtime.gateway.execution import (
     GatewayExecutionError,
     GatewayExecutor,
+    _require_deployment_identity,
 )
 from wmo.runtime.gateway.routing import (
     CatalogRouteResolver,
@@ -601,6 +603,24 @@ def test_project_episode_identity_cannot_collide_through_component_delimiters() 
     second = project_episode_identity(("a\x1fb", "c", "d", "e"))
 
     assert first != second
+
+
+def test_deployment_identity_accepts_a_catalog_pinned_served_model_id() -> None:
+    """A response-only served-model pin never rejects the matching frozen deployment."""
+    _, deployment = _catalog()
+    provider = _Provider(
+        lambda: _EventStream((GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0),))
+    )
+    resolved = _RuntimeCatalog(provider).resolve("source-one")
+    pinned = replace(resolved, served_model_id="normalized-served-name")
+    rebound = replace(
+        resolved,
+        snapshot=resolved.snapshot.model_copy(update={"model_id": "different-model"}),
+    )
+
+    _require_deployment_identity(deployment, pinned)
+    with pytest.raises(ValueError, match="frozen gateway deployment"):
+        _require_deployment_identity(deployment, rebound)
 
 
 @pytest.mark.parametrize(
