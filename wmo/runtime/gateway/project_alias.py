@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Protocol
 
 from wmo.common.core.artifacts import ArtifactId, sha256_json, stable_id
+from wmo.common.models import (
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
+    load_model_catalog,
+    write_model_catalog,
+)
 from wmo.runtime.gateway.catalog_authority import snapshot_current_catalog
 from wmo.runtime.gateway.management import GatewayManagement
 from wmo.runtime.models import RuntimeModelCatalog
@@ -74,6 +80,10 @@ def prepare_project_gateway_alias(
         environment=environment,
         runtime_catalog=runtime_catalog,
     )
+    metadata_changed = _migrate_legacy_project_gateway_metadata(
+        root,
+        aliases=tuple(candidate.alias for candidate in runtime.policy.candidates),
+    )
     serving_connections = {
         item.connection_id: item.config for item in manager.provider_connections()
     }
@@ -126,5 +136,40 @@ def prepare_project_gateway_alias(
         alias_revision_id=revision_id,
         identity_id=identity_id,
         policy_id=runtime.policy.policy_id,
-        changed=alias_changed or identity_changed or grant_changed,
+        changed=metadata_changed or alias_changed or identity_changed or grant_changed,
     )
+
+
+def _migrate_legacy_project_gateway_metadata(
+    root: Path,
+    *,
+    aliases: tuple[str, ...],
+) -> bool:
+    """Declare the shared streaming transport for pre-gateway project models.
+
+    Args:
+        root: WMO root containing the authored model catalog.
+        aliases: Exact frozen project candidates eligible for serving.
+
+    Returns:
+        Whether legacy candidate records were upgraded and written atomically.
+    """
+    path = root / "models.toml"
+    catalog = load_model_catalog(path)
+    models = dict(catalog.models)
+    changed = False
+    for alias in aliases:
+        record = models.get(alias)
+        if record is None or record.gateway is not None:
+            continue
+        models[alias] = record.model_copy(
+            update={
+                "gateway": GatewayDeploymentMetadata(
+                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+                )
+            }
+        )
+        changed = True
+    if changed:
+        write_model_catalog(path, catalog.model_copy(update={"models": models}))
+    return changed
