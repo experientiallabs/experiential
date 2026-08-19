@@ -9,6 +9,7 @@ import pytest
 from fastapi import FastAPI
 from openai import OpenAI
 
+from wmo.common.routing import RoutingDecision
 from wmo.runtime.gateway.project_alias import ProjectGatewayAlias
 from wmo.runtime.router.application import RouterApplicationError, load_router
 
@@ -26,9 +27,12 @@ def test_load_router_uses_the_normal_gateway_application_and_revokes_its_key(
         return {"object": "list", "data": []}
 
     prepared: list[tuple[str, Path, str | None]] = []
-    loaded: list[tuple[Path, frozenset[str] | None]] = []
+    loaded: list[tuple[Path, object, frozenset[str] | None]] = []
     issued: list[tuple[str, str]] = []
     revoked: list[str] = []
+
+    def decision_sink(_decision: RoutingDecision) -> None:
+        """Accept one served project selection."""
 
     class Management:
         """Capture the virtual-key lifecycle owned by the compatibility client."""
@@ -73,11 +77,12 @@ def test_load_router_uses_the_normal_gateway_application_and_revokes_its_key(
         graceful_timeout_seconds: float,
         environment: object,
         project_repository: object,
+        decision_sink: object,
         only_aliases: frozenset[str] | None,
     ) -> object:
         """Return the same gateway application used by the CLI launch path."""
         del graceful_timeout_seconds, environment, project_repository
-        loaded.append((root, only_aliases))
+        loaded.append((root, decision_sink, only_aliases))
         return SimpleNamespace(app=application)
 
     monkeypatch.setattr("wmo.runtime.router.application.GatewayManagement", Management)
@@ -87,13 +92,18 @@ def test_load_router_uses_the_normal_gateway_application_and_revokes_its_key(
     )
     monkeypatch.setattr("wmo.runtime.router.application.load_local_gateway", load_gateway)
 
-    client = load_router("support", root=tmp_path, policy_id="policy-a")
+    client = load_router(
+        "support",
+        root=tmp_path,
+        policy_id="policy-a",
+        decision_sink=decision_sink,
+    )
     assert isinstance(client, OpenAI)
     assert client.models.list().data == []
     client.close()
 
     assert prepared == [("support", tmp_path, "policy-a")]
-    assert loaded == [(tmp_path, frozenset({"support"}))]
+    assert loaded == [(tmp_path, decision_sink, frozenset({"support"}))]
     assert issued[0][0] == "project-identity"
     assert revoked == [issued[0][1]]
 

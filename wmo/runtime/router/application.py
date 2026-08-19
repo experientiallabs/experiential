@@ -152,6 +152,7 @@ def load_router(
             graceful_timeout_seconds=10,
             environment=environment,
             project_repository=repository,
+            decision_sink=decision_sink,
             only_aliases=frozenset({alias.alias}),
         )
     except BaseException:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +29,7 @@ from wmo.common.models import (
     load_model_catalog,
     write_model_catalog,
 )
+from wmo.common.routing import RoutingDecision
 from wmo.runtime.gateway.catalog_authority import (
     upsert_certified_pool,
     upsert_connection,
@@ -49,6 +51,8 @@ class _ReadinessProjectRuntime:
 
     def __init__(self, *aliases: str) -> None:
         """Build one minimal policy view from ordered candidate aliases."""
+        self.project_ref = "project-one"
+        self.activation_ref = "activation-one"
         self.policy = SimpleNamespace(
             candidates=tuple(SimpleNamespace(alias=alias) for alias in aliases)
         )
@@ -85,9 +89,11 @@ def _repository_for_runtime(
         cls: type[RouterRuntime],
         activation: ProjectActivation,
         catalog: RuntimeModelCatalog,
+        *,
+        decision_sink: object | None = None,
     ) -> RouterRuntime:
         """Return the runtime represented by this test's opaque activation."""
-        del cls, catalog
+        del cls, catalog, decision_sink
         return cast(RouterRuntime, activation)
 
     monkeypatch.setattr(RouterRuntime, "from_activation", classmethod(from_activation))
@@ -370,6 +376,7 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
     """Real lifecycle uses RouterRuntime selection only, then owns provider fallback."""
     dispatched: list[str] = []
     provider_requests: list[str] = []
+    recorded: list[RoutingDecision] = []
 
     class ProjectProviderHandler(BaseHTTPRequestHandler):
         """Serve one precommit failure followed by deterministic Chat SSE."""
@@ -451,10 +458,13 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
                     },
                 )
             ),
+            decision_sink=recorded.append,
         )
         assert provider_requests == []
+        assert recorded == []
         with TestClient(runtime.app) as client:
             assert provider_requests == []
+            assert recorded == []
             response = client.post(
                 "/v1/chat/completions",
                 headers={"Authorization": f"Bearer {raw_key}"},
@@ -467,6 +477,8 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
         assert response.json()["choices"][0]["message"]["content"] == ("project-response-canary")
         assert provider_requests[0].endswith("/embeddings")
         assert dispatched == ["cheap-model", "cheap-model", "baseline-model"]
+        assert len(recorded) == 1
+        assert recorded[0].selected_alias == "cheap"
         with sqlite3.connect(manager.database_path) as connection:
             attempts = connection.execute(
                 """
@@ -489,6 +501,74 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
             durable += wal.read_bytes()
         assert b"project-prompt-canary" not in durable
         assert b"project-response-canary" not in durable
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("mismatch", ["project", "activation"])
+def test_project_activation_authority_mismatch_fails_before_selection_or_provider_work(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    """Repository authority drift cannot bind, mutate decisions, or contact a provider."""
+    provider_requests: list[str] = []
+    recorded: list[RoutingDecision] = []
+
+    class ProviderHandler(BaseHTTPRequestHandler):
+        """Record any provider call that escapes authority validation."""
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            """Suppress nondeterministic loopback server logs."""
+            del format, args
+
+        def do_POST(self) -> None:
+            """Record an unexpected provider request and reject it."""
+            provider_requests.append(self.path)
+            self.send_response(500)
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_port}/v1"
+        _manager, _raw_key = _configured_project_pool(
+            tmp_path,
+            deployment_aliases=("cheap", "baseline"),
+            base_url=base_url,
+        )
+        environment = {
+            "CHEAP_PROVIDER_KEY": "available",
+            "BASELINE_PROVIDER_KEY": "available",
+        }
+        activation = _project_activation(
+            tmp_path,
+            candidate_aliases=("baseline", "cheap"),
+            environment=environment,
+        )
+        if mismatch == "project":
+            activation = replace(activation, project_ref="other-project")
+        else:
+            policy = activation.policy.model_copy(update={"policy_id": "other-activation"})
+            activation = replace(
+                activation,
+                activation_ref="other-activation",
+                policy=policy,
+            )
+
+        with pytest.raises(GatewayLifecycleError, match=f"returned {mismatch} reference"):
+            load_local_gateway(
+                tmp_path,
+                graceful_timeout_seconds=1,
+                environment=environment,
+                project_repository=_ReadinessProjectRepository(activation),
+                decision_sink=recorded.append,
+            )
+
+        assert provider_requests == []
+        assert recorded == []
     finally:
         server.shutdown()
         server.server_close()

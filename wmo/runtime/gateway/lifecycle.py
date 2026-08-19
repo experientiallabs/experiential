@@ -37,7 +37,7 @@ from wmo.runtime.gateway.execution import GatewayExecutor
 from wmo.runtime.gateway.interfaces import ProjectTargetResolver
 from wmo.runtime.gateway.ledger import SQLiteAttemptLedger
 from wmo.runtime.gateway.management import GatewayAliasView, GatewayManagement
-from wmo.runtime.gateway.project_activation import ProjectActivationRepository
+from wmo.runtime.gateway.project_activation import ProjectActivation, ProjectActivationRepository
 from wmo.runtime.gateway.routing import (
     CatalogRouteResolver,
     GatewayRoutingError,
@@ -49,7 +49,7 @@ from wmo.runtime.gateway.usage import read_usage_report
 from wmo.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from wmo.runtime.models.credentials import ModelCredentialError
 from wmo.runtime.router.errors import RouterApplicationError
-from wmo.runtime.router.runtime import RouterRuntime
+from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
 
 
 class GatewayLifecycleError(ValueError):
@@ -175,6 +175,7 @@ def load_local_gateway(
     graceful_timeout_seconds: float,
     environment: Mapping[str, str] | None = None,
     project_repository: ProjectActivationRepository | None = None,
+    decision_sink: DecisionSink | None = None,
     only_aliases: frozenset[str] | None = None,
 ) -> LocalGatewayRuntime:
     """Load all granted active aliases and compose the loopback application.
@@ -184,6 +185,7 @@ def load_local_gateway(
         graceful_timeout_seconds: Shutdown drain bound.
         environment: Optional provider credential mapping used by tests.
         project_repository: Repository for verified immutable project activations.
+        decision_sink: Optional aggregate-safe recorder for served project selections.
         only_aliases: Optional exact public aliases to expose from the shared application.
 
     Returns:
@@ -243,7 +245,16 @@ def load_local_gateway(
                 activation_ref,
                 runtime_catalog=runtime_catalog,
             )
-            runtime = RouterRuntime.from_activation(activation, runtime_catalog)
+            _require_activation_authority(
+                activation,
+                project_ref=project_ref,
+                activation_ref=activation_ref,
+            )
+            runtime = RouterRuntime.from_activation(
+                activation,
+                runtime_catalog,
+                decision_sink=decision_sink,
+            )
             proof = _project_readiness(
                 manager,
                 alias,
@@ -509,3 +520,22 @@ def _required(value: str | None, name: str, alias: GatewayAliasView) -> str:
     if value is None:
         raise GatewayLifecycleError(f"alias {alias.alias_name!r} is missing {name}")
     return value
+
+
+def _require_activation_authority(
+    activation: ProjectActivation,
+    *,
+    project_ref: str,
+    activation_ref: str,
+) -> None:
+    """Require repository output to match the exact authorized project target."""
+    if activation.project_ref != project_ref:
+        raise GatewayLifecycleError(
+            f"project activation repository returned project reference "
+            f"{activation.project_ref!r}, expected {project_ref!r}"
+        )
+    if activation.activation_ref != activation_ref:
+        raise GatewayLifecycleError(
+            f"project activation repository returned activation reference "
+            f"{activation.activation_ref!r}, expected {activation_ref!r}"
+        )
