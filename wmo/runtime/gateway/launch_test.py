@@ -16,12 +16,15 @@ import pytest
 import uvicorn
 from openai import AsyncOpenAI, OpenAI
 
-from wmo.cli.gateway.catalog import upsert_connection, upsert_singleton_deployment
 from wmo.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
+)
+from wmo.runtime.gateway.catalog_authority import (
+    upsert_connection,
+    upsert_singleton_deployment,
 )
 from wmo.runtime.gateway.lifecycle import load_local_gateway
 from wmo.runtime.gateway.management import GatewayManagement

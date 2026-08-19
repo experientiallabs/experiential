@@ -8,12 +8,15 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from wmo.cli.gateway.catalog import upsert_connection, upsert_singleton_deployment
 from wmo.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
+)
+from wmo.runtime.gateway.catalog_authority import (
+    upsert_connection,
+    upsert_singleton_deployment,
 )
 from wmo.runtime.gateway.lifecycle import (
     GatewayLifecycleError,

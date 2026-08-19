@@ -1,4 +1,4 @@
-"""Role-free singleton gateway authoring over the shared local model catalog."""
+"""Immutable serving catalog authoring over shared model metadata."""
 
 from __future__ import annotations
 
@@ -117,6 +117,7 @@ def upsert_singleton_deployment(
     prices: GatewayTokenPrices,
     pricing_source: str | None,
     replace: bool,
+    serving_connections: dict[str, ConnectionConfig] | None = None,
 ) -> tuple[NormalizedGatewayCatalog, Path, bool]:
     """Author one singleton deployment and persist its normalized immutable snapshot.
 
@@ -132,6 +133,7 @@ def upsert_singleton_deployment(
         prices: Integer attribution rates, with unknown represented by ``None``.
         pricing_source: Optional provenance label for the rates.
         replace: Whether an existing deployment alias may change.
+        serving_connections: SQLite-authoritative connection metadata for serving snapshots.
 
     Returns:
         Normalized catalog, immutable snapshot path, and whether authored metadata changed.
@@ -140,7 +142,20 @@ def upsert_singleton_deployment(
     validate_artifact_id(exact_model_id)
     path = root / "models.toml"
     with file_write_lock(path, what="the gateway deployment catalog"):
-        current = load_model_catalog(path)
+        if path.exists():
+            current = load_model_catalog(path)
+            if serving_connections is not None:
+                current = current.model_copy(update={"connections": serving_connections})
+        elif serving_connections:
+            current = ModelCatalog(
+                connections=serving_connections,
+                models={},
+                roles=ModelRoles(),
+            )
+        else:
+            raise GatewayCatalogAuthoringError(
+                "gateway deployment authoring requires SQLite provider connections"
+            )
         if connection_name not in current.connections:
             raise GatewayCatalogAuthoringError(
                 f"unknown provider connection {connection_name!r}; add it first"
@@ -173,9 +188,15 @@ def upsert_singleton_deployment(
     return normalized, snapshot, changed
 
 
-def snapshot_current_catalog(root: Path) -> tuple[ModelCatalog, NormalizedGatewayCatalog, Path]:
-    """Persist and return the immutable normalized view of the current authored catalog."""
+def snapshot_current_catalog(
+    root: Path,
+    *,
+    serving_connections: dict[str, ConnectionConfig] | None = None,
+) -> tuple[ModelCatalog, NormalizedGatewayCatalog, Path]:
+    """Persist the immutable view with optional SQLite-authoritative connections."""
     catalog = load_model_catalog(root / "models.toml")
+    if serving_connections is not None:
+        catalog = catalog.model_copy(update={"connections": serving_connections})
     normalized = normalize_gateway_catalog(catalog)
     snapshot = _write_catalog_snapshot(root, catalog, normalized)
     return catalog, normalized, snapshot

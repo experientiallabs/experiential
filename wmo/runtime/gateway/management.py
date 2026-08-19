@@ -8,11 +8,16 @@ from pathlib import Path
 
 from pydantic import Field
 
-from wmo.common.core.artifacts import ContractModel
+from wmo.common.core.artifacts import ContractModel, stable_id
+from wmo.common.models import ConnectionConfig, ModelCatalog, load_model_catalog
 from wmo.runtime.gateway.auth import IssuedVirtualKey
 from wmo.runtime.gateway.contracts import DirectTarget, ProjectTarget
 from wmo.runtime.gateway.sqlite import key_delivery
 from wmo.runtime.gateway.sqlite.migrations import connect_database
+from wmo.runtime.gateway.sqlite.provider_authority import (
+    ProviderConnectionAuthority,
+    ProviderConnectionBinding,
+)
 from wmo.runtime.gateway.sqlite.store import GatewayStoreError, SQLiteGatewayStore
 
 
@@ -68,6 +73,7 @@ class GatewayStatus(ContractModel):
     active_identities: int = Field(default=0, ge=0)
     active_keys: int = Field(default=0, ge=0)
     active_aliases: int = Field(default=0, ge=0)
+    active_provider_connections: int = Field(default=0, ge=0)
     grants: int = Field(default=0, ge=0)
 
 
@@ -117,6 +123,7 @@ class GatewayManagement:
             )
         elif str(row["display_name"]) != display_name:
             raise GatewayStoreError("gateway organization already exists with another display name")
+        self.migrate_legacy_provider_connections()
         return self.status()
 
     def store(self) -> SQLiteGatewayStore:
@@ -130,6 +137,116 @@ class GatewayManagement:
                 "gateway is not initialized; run 'wmo config gateway init' first"
             )
         return self.store()
+
+    def upsert_provider_connection(
+        self,
+        *,
+        connection_id: str,
+        config: ConnectionConfig,
+        replace: bool = False,
+    ) -> tuple[bool, ProviderConnectionAuthority]:
+        """Create or revise one SQLite-authoritative serving connection."""
+        revision_id = stable_id(
+            "provider-connection-revision",
+            {
+                "connection_id": connection_id,
+                "config": config.model_dump(mode="json", exclude_none=False),
+            },
+        )
+        return self.require_initialized().upsert_provider_connection(
+            organization_id=self.organization_id,
+            connection_id=connection_id,
+            revision_id=revision_id,
+            config=config,
+            replace=replace,
+        )
+
+    def provider_connections(self) -> tuple[ProviderConnectionAuthority, ...]:
+        """Return active SQLite-authoritative serving connections."""
+        if not self.initialized:
+            return ()
+        return self.require_initialized().provider_connections(
+            organization_id=self.organization_id,
+        )
+
+    def disable_provider_connection(self, *, connection_id: str) -> bool:
+        """Disable one provider connection not used by an active alias revision."""
+        return self.require_initialized().disable_provider_connection(
+            organization_id=self.organization_id,
+            connection_id=connection_id,
+        )
+
+    def import_legacy_provider_connections(self, catalog: ModelCatalog) -> int:
+        """Import legacy models.toml connection metadata into SQLite exactly once.
+
+        Existing equal records are stable replays. Existing different records fail closed so a
+        catalog file can never silently override current serving authority.
+        """
+        imported = 0
+        for connection_id, config in sorted(catalog.connections.items()):
+            changed, _authority = self.upsert_provider_connection(
+                connection_id=connection_id,
+                config=config,
+                replace=False,
+            )
+            imported += int(changed)
+        return imported
+
+    def migrate_legacy_provider_connections(self) -> int:
+        """Import a legacy models.toml only when SQLite has no serving connections."""
+        if self.provider_connections():
+            return 0
+        path = self.root / "models.toml"
+        if not path.is_file():
+            return 0
+        return self.import_legacy_provider_connections(load_model_catalog(path))
+
+    def provider_bindings(self, catalog: ModelCatalog) -> tuple[ProviderConnectionBinding, ...]:
+        """Resolve an authored snapshot to exact active SQLite connection revisions."""
+        authorities = {item.connection_id: item for item in self.provider_connections()}
+        bindings: list[ProviderConnectionBinding] = []
+        for connection_id, config in sorted(catalog.connections.items()):
+            authority = authorities.get(connection_id)
+            if authority is None or authority.config != config:
+                raise GatewayStoreError(
+                    f"provider connection {connection_id!r} differs from SQLite authority"
+                )
+            bindings.append(
+                ProviderConnectionBinding(
+                    connection_id=connection_id,
+                    connection_revision_id=authority.revision_id,
+                    connection_sha256=authority.connection_sha256,
+                )
+            )
+        return tuple(bindings)
+
+    def ensure_alias_provider_bindings(
+        self,
+        *,
+        alias_id: str,
+        alias_revision_id: str,
+        catalog: ModelCatalog,
+    ) -> tuple[ProviderConnectionAuthority, ...]:
+        """Migrate and return exact provider revisions for one legacy alias."""
+        store = self.require_initialized()
+        existing = store.alias_provider_connections(
+            organization_id=self.organization_id,
+            alias_id=alias_id,
+            alias_revision_id=alias_revision_id,
+        )
+        if existing:
+            return existing
+        store.bind_existing_alias_provider_connections(
+            organization_id=self.organization_id,
+            alias_id=alias_id,
+            alias_revision_id=alias_revision_id,
+            provider_connections=self.provider_bindings(catalog),
+        )
+        return store.alias_provider_connections(
+            organization_id=self.organization_id,
+            alias_id=alias_id,
+            alias_revision_id=alias_revision_id,
+        )
 
     def create_identity(
         self,
@@ -329,6 +446,7 @@ class GatewayManagement:
         pool_id: str,
         snapshot_ref: str,
         catalog_sha256: str,
+        provider_connections: tuple[ProviderConnectionBinding, ...] = (),
     ) -> bool:
         """Activate one singleton direct alias against an immutable catalog snapshot."""
         return self._activate_alias(
@@ -338,6 +456,7 @@ class GatewayManagement:
             target=DirectTarget(pool_id=pool_id),
             snapshot_ref=snapshot_ref,
             catalog_sha256=catalog_sha256,
+            provider_connections=provider_connections,
         )
 
     def activate_project_alias(
@@ -350,6 +469,7 @@ class GatewayManagement:
         activation_ref: str,
         snapshot_ref: str,
         catalog_sha256: str,
+        provider_connections: tuple[ProviderConnectionBinding, ...] = (),
     ) -> bool:
         """Activate one verified frozen project as exactly one public alias."""
         return self._activate_alias(
@@ -363,6 +483,7 @@ class GatewayManagement:
             ),
             snapshot_ref=snapshot_ref,
             catalog_sha256=catalog_sha256,
+            provider_connections=provider_connections,
         )
 
     def disable_alias(self, *, alias_id: str) -> bool:
@@ -436,6 +557,8 @@ class GatewayManagement:
                        AND (expires_at IS NULL OR expires_at > ?)),
                     (SELECT COUNT(*) FROM gateway_aliases
                      WHERE organization_id = ? AND active = 1),
+                    (SELECT COUNT(*) FROM provider_connections
+                     WHERE organization_id = ? AND active = 1),
                     (SELECT COUNT(*) FROM identity_alias_grants
                      WHERE organization_id = ?)
                 """,
@@ -443,6 +566,7 @@ class GatewayManagement:
                     self.organization_id,
                     self.organization_id,
                     datetime.now().astimezone().isoformat(),
+                    self.organization_id,
                     self.organization_id,
                     self.organization_id,
                 ),
@@ -455,7 +579,8 @@ class GatewayManagement:
             active_identities=int(counts[0]),
             active_keys=int(counts[1]),
             active_aliases=int(counts[2]),
-            grants=int(counts[3]),
+            active_provider_connections=int(counts[3]),
+            grants=int(counts[4]),
         )
 
     def _activate_alias(
@@ -467,6 +592,7 @@ class GatewayManagement:
         target: DirectTarget | ProjectTarget,
         snapshot_ref: str,
         catalog_sha256: str,
+        provider_connections: tuple[ProviderConnectionBinding, ...],
     ) -> bool:
         """Register one snapshot and activate an idempotent immutable alias revision."""
         store = self.require_initialized()
@@ -522,6 +648,7 @@ class GatewayManagement:
             target=target,
             snapshot_ref=snapshot_ref,
             catalog_sha256=catalog_sha256,
+            provider_connections=provider_connections,
         )
         return True
 

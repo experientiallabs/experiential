@@ -90,6 +90,8 @@ class SystemGatewayClock:
 class SQLiteGatewayStore(ProviderConnectionStoreMixin):
     """SQLite implementation of gateway authority and management operations."""
 
+    _store_error = GatewayStoreError
+
     def __init__(
         self,
         database_path: Path,

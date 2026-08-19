@@ -7,11 +7,6 @@ from pathlib import Path
 
 import typer
 
-from wmo.cli.gateway.catalog import (
-    parse_deployment,
-    snapshot_current_catalog,
-    upsert_singleton_deployment,
-)
 from wmo.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
 from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.core.artifacts import sha256_json
@@ -20,8 +15,15 @@ from wmo.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
+    ModelCatalog,
 )
 from wmo.optimize.router.activation import load_project_router
+from wmo.runtime.gateway.catalog_authority import (
+    authored_snapshot_path,
+    parse_deployment,
+    snapshot_current_catalog,
+    upsert_singleton_deployment,
+)
 from wmo.runtime.gateway.management import GatewayManagement
 
 alias_app = typer.Typer(help="Manage public gateway model aliases.", no_args_is_help=True)
@@ -220,6 +222,10 @@ def _activate(
         raise ValueError("choose exactly one of --deployment or --project")
     manager = GatewayManagement(root)
     manager.require_initialized()
+    manager.migrate_legacy_provider_connections()
+    serving_connections = {
+        item.connection_id: item.config for item in manager.provider_connections()
+    }
     revision_id = _revision_id(alias, revision=revision, operation_id=operation_id)
     if deployment is not None:
         if exact_model is None:
@@ -248,7 +254,9 @@ def _activate(
             prices=prices,
             pricing_source=pricing_source,
             replace=replace,
+            serving_connections=serving_connections,
         )
+        authored = ModelCatalog.model_validate_json(authored_snapshot_path(snapshot).read_bytes())
         return (
             manager.activate_direct_alias(
                 alias_id=alias,
@@ -257,11 +265,15 @@ def _activate(
                 pool_id=alias,
                 snapshot_ref=f"catalog-snapshots/{snapshot.name}",
                 catalog_sha256=normalized.identity_sha256(),
+                provider_connections=manager.provider_bindings(authored),
             ),
             revision_id,
         )
     runtime = load_project_router(project or "", root, policy_id=policy)
-    _catalog, normalized, snapshot = snapshot_current_catalog(root)
+    catalog, normalized, snapshot = snapshot_current_catalog(
+        root,
+        serving_connections=serving_connections,
+    )
     deployment_aliases = {item.source_alias for item in normalized.deployments}
     missing = sorted(
         candidate.alias
@@ -281,6 +293,7 @@ def _activate(
             activation_ref=runtime.policy.policy_id,
             snapshot_ref=f"catalog-snapshots/{snapshot.name}",
             catalog_sha256=normalized.identity_sha256(),
+            provider_connections=manager.provider_bindings(catalog),
         ),
         revision_id,
     )

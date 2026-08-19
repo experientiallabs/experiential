@@ -8,12 +8,16 @@ from pathlib import Path
 
 import typer
 
-from wmo.cli.gateway.catalog import upsert_connection, upsert_singleton_deployment
 from wmo.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
+    ModelCatalog,
+)
+from wmo.runtime.gateway.catalog_authority import (
+    authored_snapshot_path,
+    upsert_singleton_deployment,
 )
 from wmo.runtime.gateway.management import GatewayManagement
 
@@ -61,16 +65,17 @@ def interactive_gateway_setup(root: Path) -> InteractiveSetupResult:
         raise typer.Abort()
 
     manager.initialize()
-    upsert_connection(
-        root,
-        name=provider_name,
-        connection=ConnectionConfig(
+    _changed, _authority = manager.upsert_provider_connection(
+        connection_id=provider_name,
+        config=ConnectionConfig(
             provider=provider,
             base_url=base_url or None,
             api_key_env=credential_env,
         ),
-        replace=False,
     )
+    serving_connections = {
+        item.connection_id: item.config for item in manager.provider_connections()
+    }
     normalized, snapshot, _changed = upsert_singleton_deployment(
         root,
         deployment_alias=alias,
@@ -83,7 +88,9 @@ def interactive_gateway_setup(root: Path) -> InteractiveSetupResult:
         prices=GatewayTokenPrices(),
         pricing_source=None,
         replace=False,
+        serving_connections=serving_connections,
     )
+    authored = ModelCatalog.model_validate_json(authored_snapshot_path(snapshot).read_bytes())
     revision_id = f"revision-{uuid.uuid4().hex}"
     manager.activate_direct_alias(
         alias_id=alias,
@@ -92,6 +99,7 @@ def interactive_gateway_setup(root: Path) -> InteractiveSetupResult:
         pool_id=alias,
         snapshot_ref=f"catalog-snapshots/{snapshot.name}",
         catalog_sha256=normalized.identity_sha256(),
+        provider_connections=manager.provider_bindings(authored),
     )
     manager.create_identity(identity_id=identity_id, display_name=identity_id)
     manager.add_grant(identity_id=identity_id, alias_id=alias)

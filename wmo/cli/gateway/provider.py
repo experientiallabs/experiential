@@ -6,12 +6,12 @@ from pathlib import Path
 
 import typer
 
-from wmo.cli.gateway.catalog import list_connections, remove_connection, upsert_connection
 from wmo.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
 from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.core.artifacts import ContractModel
 from wmo.common.core.locks import FileLockTimeout
 from wmo.common.models import ConnectionConfig
+from wmo.runtime.gateway.management import GatewayManagement
 
 provider_app = typer.Typer(
     help="Manage role-free gateway provider connections.", no_args_is_help=True
@@ -47,7 +47,8 @@ def provider_list(root: Path = ROOT_OPTION, json_output: bool = _JSON_OPTION) ->
             api_version=connection.api_version,
             region=connection.region,
         )
-        for name, connection in list_connections(root)
+        for authority in GatewayManagement(root).provider_connections()
+        for name, connection in ((authority.connection_id, authority.config),)
     )
     emit_items("providers", items, json_output=json_output)
 
@@ -68,10 +69,9 @@ def provider_add(
     """Add one environment-reference-only provider connection."""
     del non_interactive
     with usage_error(ValueError, FileLockTimeout):
-        changed = upsert_connection(
-            root,
-            name=name,
-            connection=ConnectionConfig(
+        changed, _authority = GatewayManagement(root).upsert_provider_connection(
+            connection_id=name,
+            config=ConnectionConfig(
                 provider=provider,
                 base_url=base_url,
                 api_key_env=credential_env,
@@ -129,7 +129,7 @@ def _remove_provider(
 ) -> None:
     """Remove one unreferenced provider for disable and remove commands."""
     with usage_error(ValueError, FileLockTimeout):
-        changed = remove_connection(root, name=name)
+        changed = GatewayManagement(root).disable_provider_connection(connection_id=name)
     emit_receipt(
         GatewayReceipt(
             operation=operation,

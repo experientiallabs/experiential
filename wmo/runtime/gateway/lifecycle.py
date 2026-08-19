@@ -162,6 +162,7 @@ def load_local_gateway(
     graceful_timeout_seconds: float,
     environment: Mapping[str, str] | None = None,
     project_loader: ProjectLoader | None = None,
+    only_aliases: frozenset[str] | None = None,
 ) -> LocalGatewayRuntime:
     """Load all granted active aliases and compose the loopback application.
 
@@ -170,6 +171,7 @@ def load_local_gateway(
         graceful_timeout_seconds: Shutdown drain bound.
         environment: Optional provider credential mapping used by tests.
         project_loader: CLI-injected verified project activation loader.
+        only_aliases: Optional exact public aliases to expose from the shared application.
 
     Returns:
         Composed service, application, health state, and recovery counts.
@@ -181,9 +183,12 @@ def load_local_gateway(
         raise GatewayLifecycleError("graceful timeout must be positive")
     manager = GatewayManagement(root)
     store = manager.require_initialized()
+    manager.migrate_legacy_provider_connections()
     ledger = SQLiteAttemptLedger(manager.database_path)
     expired, unknown = ledger.reconcile_crashed_requests(cleanup_grace=timedelta(seconds=5))
     aliases = _granted_active_aliases(manager)
+    if only_aliases is not None:
+        aliases = tuple(item for item in aliases if item.alias_name in only_aliases)
     if not aliases:
         raise GatewayLifecycleError(
             "gateway has no granted active alias; create an identity, alias, and grant first"
@@ -372,7 +377,7 @@ def _load_snapshot(
     authored = snapshot.with_suffix(".models.json")
     try:
         normalized = NormalizedGatewayCatalog.model_validate_json(snapshot.read_bytes())
-        catalog = ModelCatalog.model_validate_json(authored.read_bytes())
+        authored_catalog = ModelCatalog.model_validate_json(authored.read_bytes())
     except (OSError, ValueError) as exc:
         raise GatewayLifecycleError(
             f"alias {alias.alias_name!r} has an unreadable catalog snapshot"
@@ -380,6 +385,18 @@ def _load_snapshot(
     catalog_sha256 = _required(alias.catalog_sha256, "catalog digest", alias)
     if normalized.identity_sha256() != catalog_sha256:
         raise GatewayLifecycleError(f"alias {alias.alias_name!r} catalog digest does not match")
+    revision_id, _digest = _required_revision(alias)
+    authorities = manager.ensure_alias_provider_bindings(
+        alias_id=alias.alias_id,
+        alias_revision_id=revision_id,
+        catalog=authored_catalog,
+    )
+    connections = {item.connection_id: item.config for item in authorities}
+    if set(connections) != set(authored_catalog.connections):
+        raise GatewayLifecycleError(
+            f"alias {alias.alias_name!r} provider bindings differ from its snapshot"
+        )
+    catalog = authored_catalog.model_copy(update={"connections": connections})
     if normalize_gateway_catalog(catalog) != normalized:
         raise GatewayLifecycleError(
             f"alias {alias.alias_name!r} authored catalog differs from normalized authority"

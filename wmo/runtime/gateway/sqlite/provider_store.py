@@ -11,7 +11,9 @@ from wmo.runtime.gateway.auth import utc_text
 from wmo.runtime.gateway.interfaces import GatewayClock
 from wmo.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionAuthority,
+    ProviderConnectionBinding,
     active_provider_connections,
+    bind_alias_provider_connections,
     bound_provider_connections,
     disable_provider_connection,
     upsert_provider_connection,
@@ -22,6 +24,7 @@ class _ProviderStore(Protocol):
     """Structural view of store facilities used by the provider facade."""
 
     _clock: GatewayClock
+    _store_error: type[ValueError]
 
     def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         """Open one configured SQLite connection."""
@@ -86,6 +89,60 @@ class ProviderConnectionStoreMixin:
                 alias_id=alias_id,
                 alias_revision_id=alias_revision_id,
             )
+
+    def bind_existing_alias_provider_connections(
+        self,
+        *,
+        organization_id: str,
+        alias_id: str,
+        alias_revision_id: str,
+        provider_connections: tuple[ProviderConnectionBinding, ...],
+    ) -> bool:
+        """Migrate one legacy alias revision to explicit provider bindings."""
+        store = cast(_ProviderStore, self)
+        with store._transaction() as connection:
+            existing = bound_provider_connections(
+                connection,
+                organization_id=organization_id,
+                alias_id=alias_id,
+                alias_revision_id=alias_revision_id,
+            )
+            if existing:
+                expected = tuple(
+                    (
+                        item.connection_id,
+                        item.connection_revision_id,
+                        item.connection_sha256,
+                    )
+                    for item in provider_connections
+                )
+                actual = tuple(
+                    (item.connection_id, item.revision_id, item.connection_sha256)
+                    for item in existing
+                )
+                if actual != expected:
+                    raise store._store_error(
+                        "legacy alias provider bindings differ from SQLite authority"
+                    )
+                return False
+            revision = connection.execute(
+                """
+                SELECT 1 FROM alias_revisions
+                WHERE organization_id = ? AND alias_id = ? AND revision_id = ?
+                """,
+                (organization_id, alias_id, alias_revision_id),
+            ).fetchone()
+            if revision is None:
+                raise store._store_error("legacy alias revision is not registered")
+            bind_alias_provider_connections(
+                connection,
+                organization_id=organization_id,
+                alias_id=alias_id,
+                alias_revision_id=alias_revision_id,
+                bindings=provider_connections,
+                now=utc_text(store._clock.now()),
+            )
+            return True
 
     def disable_provider_connection(
         self,
