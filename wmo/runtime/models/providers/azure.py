@@ -120,7 +120,8 @@ class AzureClient(OpenAICompatibleClient):
             api_version: ``v1`` or a dated Azure OpenAI API version.
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
-            timeout_seconds: Timeout for every transport attempt.
+            timeout_seconds: Per-attempt timeout floor. Completion calls scale above it from the
+                requested maximum output tokens.
 
         Raises:
             ValueError: The key, endpoint, API version, or timeout is missing or invalid.

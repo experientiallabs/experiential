@@ -99,7 +99,9 @@ class ProviderHttpClient(abc.ABC):
 
         A completed response that decodes to no usable output, such as a reasoning model
         spending its whole output budget without visible text, is dispatched again under the
-        client's bounded retry policy before the last error surfaces to the caller.
+        client's bounded retry policy before the last error surfaces to the caller. The request's
+        output budget scales both the default request deadline and each transport-attempt ceiling,
+        while an injected request-wide deadline remains authoritative.
 
         Args:
             request: Visible messages, tool schemas, and sampling controls to send.
