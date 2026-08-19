@@ -7,12 +7,15 @@ from wmo.runtime.openai_protocol.requests import (
     decode_chat,
     decode_responses,
 )
+from wmo.runtime.openai_protocol.response import completed_body, stream_encoder
 
 __all__ = [
     "DecodedGatewayRequest",
     "OpenAIProtocolError",
     "decode_chat",
     "decode_responses",
+    "completed_body",
     "model_request",
     "model_response_events",
+    "stream_encoder",
 ]

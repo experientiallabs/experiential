@@ -1,4 +1,4 @@
-"""Bounded public response assembly from normalized gateway events."""
+"""OpenAI response assembly from normalized serving events."""
 
 from __future__ import annotations
 

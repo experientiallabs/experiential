@@ -33,13 +33,6 @@ from wmo.runtime.gateway.execution import (
 )
 from wmo.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayControlStore
 from wmo.runtime.gateway.ledger import IdempotencyConflictError, IdempotencyReplayUnavailableError
-from wmo.runtime.gateway.response import (
-    assistant_message,
-    capture_frame,
-    completed_body,
-    is_terminal,
-    stream_encoder,
-)
 from wmo.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute, GatewayRoutingError
 from wmo.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
@@ -57,6 +50,13 @@ from wmo.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
     decode_chat,
     decode_responses,
+)
+from wmo.runtime.openai_protocol.response import (
+    assistant_message,
+    capture_frame,
+    completed_body,
+    is_terminal,
+    stream_encoder,
 )
 from wmo.runtime.openai_protocol.state import (
     BoundedContinuationStore,
