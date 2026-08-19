@@ -149,7 +149,7 @@ def test_snapshot_identity_excludes_workflow_metadata_added_to_existing_catalogs
     assert original.identity_sha256() == sha256_json(
         {
             "supports_tools": True,
-            "supports_embeddings": False,
+            "supports_embeddings": None,
             "context_window_tokens": None,
             "maximum_output_tokens": 16_000,
         }
@@ -200,12 +200,12 @@ def test_snapshot_connection_digest_is_normalized_and_endpoint_specific() -> Non
 def test_preflight_rejects_capability_before_reading_missing_credentials() -> None:
     """A known unsupported requirement fails locally and cannot trigger a paid request."""
     catalog = RuntimeModelCatalog(
-        _catalog(provider="anthropic", capabilities=ModelCapabilities()),
+        _catalog(provider="anthropic", capabilities=ModelCapabilities(supports_embeddings=False)),
         environment={},
         transport_factory=ScriptedJsonTransport,
     )
 
-    with pytest.raises(ModelCapabilityError, match="does not support embeddings"):
+    with pytest.raises(ModelCapabilityError, match="declares no embedding support"):
         catalog.preflight(
             "fixture-model",
             CapabilityRequirement(requires_embeddings=True),
@@ -243,6 +243,46 @@ def test_resolution_rejects_unsupported_connection_and_incomplete_compatible_url
         compatible.resolve("fixture-model")
 
 
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("openai", None),
+        ("openai-compatible", "https://models.example.test/v1"),
+        ("azure", "https://resource.example.test"),
+    ],
+)
+def test_resolution_threads_catalog_served_model_pin_to_every_http_provider(
+    provider: str,
+    base_url: str | None,
+) -> None:
+    """A cataloged served-model pin reaches the resolved identity for each HTTP provider.
+
+    Args:
+        provider: Catalog connection provider under test.
+        base_url: Explicit endpoint for providers that require one.
+    """
+    pinned = RuntimeModelCatalog(
+        _catalog(
+            provider=provider,
+            base_url=base_url,
+            api_version="v1" if provider == "azure" else None,
+            served_model_id="fixture-model-served",
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    unpinned = RuntimeModelCatalog(
+        _catalog(
+            provider=provider, base_url=base_url, api_version="v1" if provider == "azure" else None
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    assert pinned.resolve("fixture-model").served_model_id == "fixture-model-served"
+    assert unpinned.resolve("fixture-model").served_model_id is None
+
+
 def test_resolution_carries_the_cataloged_served_model_identity() -> None:
     """An openai-compatible alias exposes its declared served identity for response checks.
 
@@ -273,8 +313,8 @@ def test_resolution_carries_the_cataloged_served_model_identity() -> None:
     assert default.resolve("fixture-model").served_model_id is None
 
 
-def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent() -> None:
-    """Model records, not provider names, prove protocol support and W8 capacity boundaries."""
+def test_model_capability_snapshot_has_exact_limits_and_stays_permissive_when_absent() -> None:
+    """Explicit declarations bound preflight while an undeclared model stays usable."""
     capabilities = ModelCapabilities(
         supports_tools=True,
         context_window_tokens=32_768,
@@ -311,14 +351,20 @@ def test_model_capability_snapshot_has_exact_limits_and_fails_closed_when_absent
         transport_factory=ScriptedJsonTransport,
     )
     assert unknown.snapshot("fixture-model")[1] == ModelCapabilities()
-    assert unknown.resolve("fixture-model").embedding_client is None
-    with pytest.raises(ModelCapabilityError, match="does not support tool calls"):
-        unknown.preflight("fixture-model", CapabilityRequirement(requires_tools=True))
-    with pytest.raises(ModelCapabilityError, match="does not report a context window"):
-        unknown.preflight(
-            "fixture-model",
-            CapabilityRequirement(minimum_context_window_tokens=1),
-        )
+    assert unknown.resolve("fixture-model").embedding_client is not None
+    unknown.preflight("fixture-model", CapabilityRequirement(requires_tools=True))
+    unknown.preflight(
+        "fixture-model",
+        CapabilityRequirement(minimum_context_window_tokens=1),
+    )
+
+    declared_unsupported = RuntimeModelCatalog(
+        _catalog(capabilities=ModelCapabilities(supports_tools=False)),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    with pytest.raises(ModelCapabilityError, match="declares no tool call support"):
+        declared_unsupported.preflight("fixture-model", CapabilityRequirement(requires_tools=True))
 
 
 def test_tinker_resolution_uses_runtime_owned_default_construction(

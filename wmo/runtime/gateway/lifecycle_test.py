@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,12 +16,20 @@ import pytest
 from fastapi.testclient import TestClient
 
 from wmo.common.models import (
+    BillingSource,
+    CandidateTokenPrice,
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayEquivalenceCertification,
     GatewayTokenPrices,
     ModelCapabilities,
+    ModelRecord,
+    PricingSnapshot,
+    RoutedCandidateSnapshot,
+    load_model_catalog,
+    write_model_catalog,
 )
+from wmo.common.routing import RoutingDecision
 from wmo.runtime.gateway.catalog_authority import (
     upsert_certified_pool,
     upsert_connection,
@@ -32,7 +41,16 @@ from wmo.runtime.gateway.lifecycle import (
     load_local_gateway,
 )
 from wmo.runtime.gateway.management import GatewayManagement
+from wmo.runtime.gateway.project_activation import ProjectActivation
 from wmo.runtime.models import RuntimeModelCatalog
+from wmo.runtime.openai_protocol.state import (
+    BoundedContinuationStore,
+    BoundedReplayStore,
+    ContinuationState,
+    ProtocolNamespace,
+    ReplayKey,
+    ReplayLease,
+)
 from wmo.runtime.router.runtime import RouterRuntime
 
 
@@ -41,9 +59,159 @@ class _ReadinessProjectRuntime:
 
     def __init__(self, *aliases: str) -> None:
         """Build one minimal policy view from ordered candidate aliases."""
+        self.project_ref = "project-one"
+        self.activation_ref = "activation-one"
         self.policy = SimpleNamespace(
             candidates=tuple(SimpleNamespace(alias=alias) for alias in aliases)
         )
+
+
+class _ReadinessProjectRepository:
+    """Return one caller-supplied activation object without filesystem access."""
+
+    def __init__(self, activation: ProjectActivation) -> None:
+        """Store one immutable activation for exact-reference lookup."""
+        self.activation = activation
+
+    def load(
+        self,
+        project_ref: str,
+        activation_ref: str | None,
+        *,
+        runtime_catalog: RuntimeModelCatalog,
+    ) -> ProjectActivation:
+        """Return the supplied activation after checking requested identifiers."""
+        del runtime_catalog
+        assert project_ref == "project-one"
+        assert activation_ref == "activation-one"
+        return self.activation
+
+
+class _ObjectReplayStore:
+    """Object-backed replay adapter injected through gateway composition."""
+
+    def __init__(self) -> None:
+        """Create one adapter around the bounded local replay implementation."""
+        self._store = BoundedReplayStore()
+        self.claim_calls = 0
+
+    async def claim(self, key: ReplayKey) -> ReplayLease:
+        """Record and delegate one replay ownership claim."""
+        self.claim_calls += 1
+        return await self._store.claim(key)
+
+
+class _ObjectContinuationStore:
+    """Object-backed continuation adapter injected through gateway composition."""
+
+    def __init__(self) -> None:
+        """Create one adapter around the bounded local continuation implementation."""
+        self._store = BoundedContinuationStore()
+
+    async def remember(
+        self,
+        *,
+        namespace: ProtocolNamespace,
+        response_id: str,
+        state: ContinuationState,
+    ) -> None:
+        """Delegate one namespaced continuation publication."""
+        await self._store.remember(
+            namespace=namespace,
+            response_id=response_id,
+            state=state,
+        )
+
+    async def resolve(
+        self,
+        *,
+        namespace: ProtocolNamespace,
+        previous_response_id: str,
+    ) -> ContinuationState:
+        """Delegate one namespaced continuation lookup."""
+        return await self._store.resolve(
+            namespace=namespace,
+            previous_response_id=previous_response_id,
+        )
+
+
+def _repository_for_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: RouterRuntime,
+) -> _ReadinessProjectRepository:
+    """Adapt an existing selection runtime to the activation repository seam."""
+
+    def from_activation(
+        cls: type[RouterRuntime],
+        activation: ProjectActivation,
+        catalog: RuntimeModelCatalog,
+        *,
+        decision_sink: object | None = None,
+    ) -> RouterRuntime:
+        """Return the runtime represented by this test's opaque activation."""
+        del cls, catalog, decision_sink
+        return cast(RouterRuntime, activation)
+
+    monkeypatch.setattr(RouterRuntime, "from_activation", classmethod(from_activation))
+    return _ReadinessProjectRepository(cast(ProjectActivation, runtime))
+
+
+def _project_activation(
+    root: Path,
+    *,
+    candidate_aliases: tuple[str, ...],
+    environment: dict[str, str],
+) -> ProjectActivation:
+    """Build immutable learned-selection material matching one gateway catalog."""
+    from wmo.runtime.router.runtime_test import _fixture
+
+    policy, manifest, bank, _snapshots, _client = _fixture()
+    catalog = RuntimeModelCatalog(load_model_catalog(root / "models.toml"), environment=environment)
+    snapshots = {alias: catalog.snapshot(alias)[0] for alias in (*candidate_aliases, "embedder")}
+    candidates = tuple(
+        RoutedCandidateSnapshot(alias=alias, model=snapshots[alias]) for alias in candidate_aliases
+    )
+    policy = policy.model_copy(
+        update={
+            "policy_id": "activation-one",
+            "baseline_alias": (
+                "baseline" if "baseline" in candidate_aliases else candidate_aliases[-1]
+            ),
+            "candidates": candidates,
+            "embedder_alias": "embedder",
+            "embedder": snapshots["embedder"],
+        }
+    )
+    manifest = manifest.model_copy(
+        update={
+            "candidate_aliases": candidate_aliases,
+            "embedder_alias": "embedder",
+            "embedder": snapshots["embedder"],
+        }
+    )
+    pricing = PricingSnapshot(
+        schema_version=1,
+        created_at=policy.created_at,
+        code_revision="test",
+        pricing_snapshot_id=policy.pricing_snapshot_id,
+        candidate_prices=tuple(
+            CandidateTokenPrice(
+                candidate_alias=alias,
+                input_usd_per_million_tokens=1,
+                output_usd_per_million_tokens=2,
+            )
+            for alias in candidate_aliases
+        ),
+    )
+    return ProjectActivation(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        policy=policy,
+        bank_manifest=manifest,
+        bank=bank,
+        pricing=pricing,
+        pricing_sha256=policy.pricing_snapshot_sha256,
+    )
 
 
 def test_local_gateway_preflights_real_state_and_serves_health_and_usage(
@@ -229,22 +397,15 @@ def test_live_alias_revision_drift_is_removed_from_discovery_and_dispatch(
 
 def test_project_certified_pool_preflight_resolves_all_siblings_and_reloads(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Project startup accepts one candidate inside an available certified pool."""
     manager, raw_key = _configured_project_pool(tmp_path)
 
-    def load_project(
-        project: str,
-        root: Path,
-        *,
-        policy_id: str,
-        runtime_catalog: RuntimeModelCatalog,
-    ) -> RouterRuntime:
-        """Return a selection-only runtime naming the pool's primary deployment."""
-        del root, runtime_catalog
-        assert project == "project-one"
-        assert policy_id == "activation-one"
-        return cast(RouterRuntime, _ReadinessProjectRuntime("primary"))
+    repository = _repository_for_runtime(
+        monkeypatch,
+        cast(RouterRuntime, _ReadinessProjectRuntime("primary")),
+    )
 
     for _reload in range(2):
         runtime = load_local_gateway(
@@ -254,7 +415,7 @@ def test_project_certified_pool_preflight_resolves_all_siblings_and_reloads(
                 "PRIMARY_PROVIDER_KEY": "primary-available",
                 "SECONDARY_PROVIDER_KEY": "secondary-available",
             },
-            project_loader=load_project,
+            project_repository=repository,
         )
         with TestClient(runtime.app) as client:
             models = client.get(
@@ -265,13 +426,15 @@ def test_project_certified_pool_preflight_resolves_all_siblings_and_reloads(
     assert manager.aliases()[0].target_kind == "project"
 
 
-def test_real_project_selection_dispatches_frozen_pool_without_router_completion(
+def test_object_project_activation_uses_factory_and_injected_protocol_state(
     tmp_path: Path,
 ) -> None:
-    """Real lifecycle uses RouterRuntime selection only, then owns provider fallback."""
-    from wmo.runtime.router.runtime_test import _runtime
-
+    """Object activation uses the shared factory with injectable protocol state."""
     dispatched: list[str] = []
+    provider_requests: list[str] = []
+    recorded: list[RoutingDecision] = []
+    replay = _ObjectReplayStore()
+    continuations = _ObjectContinuationStore()
 
     class ProjectProviderHandler(BaseHTTPRequestHandler):
         """Serve one precommit failure followed by deterministic Chat SSE."""
@@ -287,6 +450,21 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length))
             model = str(payload["model"])
+            provider_requests.append(self.path)
+            if self.path.endswith("/embeddings"):
+                body = json.dumps(
+                    {
+                        "data": [{"embedding": [1.0, 0.0], "index": 0}],
+                        "model": model,
+                        "usage": {"prompt_tokens": 3, "total_tokens": 3},
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             dispatched.append(model)
             if model == "cheap-model":
                 body = b'{"error":{"message":"temporary project route failure"}}'
@@ -321,21 +499,6 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
             deployment_aliases=("cheap", "baseline"),
             base_url=base_url,
         )
-        project_runtime, project_client = _runtime()
-
-        def load_project(
-            project: str,
-            root: Path,
-            *,
-            policy_id: str,
-            runtime_catalog: RuntimeModelCatalog,
-        ) -> RouterRuntime:
-            """Inject one real frozen runtime without completing through it."""
-            del root, runtime_catalog
-            assert project == "project-one"
-            assert policy_id == "activation-one"
-            return project_runtime
-
         runtime = load_local_gateway(
             tmp_path,
             graceful_timeout_seconds=1,
@@ -343,12 +506,33 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
                 "CHEAP_PROVIDER_KEY": "available",
                 "BASELINE_PROVIDER_KEY": "available",
             },
-            project_loader=load_project,
+            project_repository=_ReadinessProjectRepository(
+                _project_activation(
+                    tmp_path,
+                    candidate_aliases=("baseline", "cheap"),
+                    environment={
+                        "CHEAP_PROVIDER_KEY": "available",
+                        "BASELINE_PROVIDER_KEY": "available",
+                    },
+                )
+            ),
+            decision_sink=recorded.append,
+            replay=replay,
+            continuations=continuations,
         )
+        assert provider_requests == []
+        assert recorded == []
+        assert runtime.service._replays is replay  # noqa: SLF001 - composition seam evidence
+        assert runtime.service._continuations is continuations  # noqa: SLF001
         with TestClient(runtime.app) as client:
+            assert provider_requests == []
+            assert recorded == []
             response = client.post(
                 "/v1/chat/completions",
-                headers={"Authorization": f"Bearer {raw_key}"},
+                headers={
+                    "Authorization": f"Bearer {raw_key}",
+                    "Idempotency-Key": "object-project-selection",
+                },
                 json={
                     "model": "coding",
                     "messages": [{"role": "user", "content": "project-prompt-canary"}],
@@ -356,10 +540,11 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
             )
         assert response.status_code == 200
         assert response.json()["choices"][0]["message"]["content"] == ("project-response-canary")
+        assert provider_requests[0].endswith("/embeddings")
         assert dispatched == ["cheap-model", "cheap-model", "baseline-model"]
-        assert project_client.embed_calls == 1
-        assert project_client.complete_calls == 0
-        assert project_runtime.records_decisions is False
+        assert replay.claim_calls == 1
+        assert len(recorded) == 1
+        assert recorded[0].selected_alias == "cheap"
         with sqlite3.connect(manager.database_path) as connection:
             attempts = connection.execute(
                 """
@@ -388,29 +573,90 @@ def test_real_project_selection_dispatches_frozen_pool_without_router_completion
         thread.join(timeout=2)
 
 
+@pytest.mark.parametrize("mismatch", ["project", "activation"])
+def test_project_activation_authority_mismatch_fails_before_selection_or_provider_work(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    """Repository authority drift cannot bind, mutate decisions, or contact a provider."""
+    provider_requests: list[str] = []
+    recorded: list[RoutingDecision] = []
+
+    class ProviderHandler(BaseHTTPRequestHandler):
+        """Record any provider call that escapes authority validation."""
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            """Suppress nondeterministic loopback server logs."""
+            del format, args
+
+        def do_POST(self) -> None:
+            """Record an unexpected provider request and reject it."""
+            provider_requests.append(self.path)
+            self.send_response(500)
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_port}/v1"
+        _manager, _raw_key = _configured_project_pool(
+            tmp_path,
+            deployment_aliases=("cheap", "baseline"),
+            base_url=base_url,
+        )
+        environment = {
+            "CHEAP_PROVIDER_KEY": "available",
+            "BASELINE_PROVIDER_KEY": "available",
+        }
+        activation = _project_activation(
+            tmp_path,
+            candidate_aliases=("baseline", "cheap"),
+            environment=environment,
+        )
+        if mismatch == "project":
+            activation = replace(activation, project_ref="other-project")
+        else:
+            policy = activation.policy.model_copy(update={"policy_id": "other-activation"})
+            activation = replace(
+                activation,
+                activation_ref="other-activation",
+                policy=policy,
+            )
+
+        with pytest.raises(GatewayLifecycleError, match=f"returned {mismatch} reference"):
+            load_local_gateway(
+                tmp_path,
+                graceful_timeout_seconds=1,
+                environment=environment,
+                project_repository=_ReadinessProjectRepository(activation),
+                decision_sink=recorded.append,
+            )
+
+        assert provider_requests == []
+        assert recorded == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_project_certified_pool_is_unavailable_when_any_sibling_cannot_resolve(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Project startup fails closed before dispatch when a pool sibling lacks credentials."""
     _manager, _raw_key = _configured_project_pool(tmp_path)
-
-    def load_project(
-        project: str,
-        root: Path,
-        *,
-        policy_id: str,
-        runtime_catalog: RuntimeModelCatalog,
-    ) -> RouterRuntime:
-        """Return the same frozen candidate without touching provider clients."""
-        del project, root, policy_id, runtime_catalog
-        return cast(RouterRuntime, _ReadinessProjectRuntime("primary"))
 
     with pytest.raises(GatewayLifecycleError, match="no granted active alias is locally available"):
         load_local_gateway(
             tmp_path,
             graceful_timeout_seconds=1,
             environment={"PRIMARY_PROVIDER_KEY": "primary-available"},
-            project_loader=load_project,
+            project_repository=_repository_for_runtime(
+                monkeypatch,
+                cast(RouterRuntime, _ReadinessProjectRuntime("primary")),
+            ),
         )
 
 
@@ -477,6 +723,16 @@ def _configured_project_pool(
             ),
             replace=False,
         )
+    authored = load_model_catalog(root / "models.toml")
+    primary_connection = f"{deployment_aliases[0]}-provider"
+    models = dict(authored.models)
+    models["embedder"] = ModelRecord(
+        connection=primary_connection,
+        model="embedder-model",
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        capabilities=ModelCapabilities(supports_embeddings=True),
+    )
+    write_model_catalog(root / "models.toml", authored.model_copy(update={"models": models}))
     normalized = None
     for deployment_alias in deployment_aliases:
         normalized, _snapshot, _changed = upsert_singleton_deployment(

@@ -12,10 +12,13 @@ from wmo.common.models import (
     AssistantAction,
     BillingSource,
     CompletionCostReservation,
+    ConnectionConfig,
     EmbeddingCostReservation,
     ModelCapabilities,
+    ModelCatalog,
     ModelFinishReason,
     ModelMessage,
+    ModelRecord,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
@@ -28,9 +31,12 @@ from wmo.common.rollouts import StopReason
 from wmo.common.tasks import TaskCase
 from wmo.runtime.models import ResolvedModel
 from wmo.runtime.models.providers.openai import openai_responses_response
+from wmo.runtime.models.providers.transport import ScriptedJsonTransport
+from wmo.runtime.models.registry import RuntimeModelCatalog
 from wmo.simulation.engines.text.recording import (
     RecordingCandidateClient,
     TextSimulationError,
+    _require_response_identity,
 )
 from wmo.simulation.retrieval import RAGMatch, RAGQuery, TraceRAGRetriever
 from wmo.simulation.world_model import GroundedWorldModel, GroundedWorldModelArtifact
@@ -621,6 +627,42 @@ def test_recorder_fails_closed_on_rebound_response_identity_but_allows_explicit_
         ).output.content
         == "served"
     )
+
+
+def test_response_identity_accepts_a_catalog_pinned_served_model_id() -> None:
+    """A catalog-resolved alias accepts responses named by its pinned served identity."""
+    catalog = RuntimeModelCatalog(
+        ModelCatalog(
+            connections={
+                "hosted": ConnectionConfig(
+                    provider="openai-compatible",
+                    base_url="https://models.example.test/v1",
+                    api_key_env="FIXTURE_API_KEY",
+                )
+            },
+            models={
+                "candidate-a": ModelRecord(
+                    connection="hosted",
+                    model="deepseek-ai/DeepSeek-V4-Flash-0731",
+                    served_model_id="deepseek-v4-flash",
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    capabilities=ModelCapabilities(
+                        context_window_tokens=100_000,
+                        maximum_output_tokens=16_000,
+                    ),
+                )
+            },
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("candidate-a")
+    served = resolved.snapshot.model_copy(update={"model_id": "deepseek-v4-flash"})
+    rebound = resolved.snapshot.model_copy(update={"model_id": "another-model"})
+
+    _require_response_identity(_response("served", model=served), resolved, role="candidate")
+    with pytest.raises(TextSimulationError, match="identity"):
+        _require_response_identity(_response("wrong", model=rebound), resolved, role="candidate")
 
 
 def test_default_recorder_warns_once_and_continues_after_spend_reaches_the_ceiling(

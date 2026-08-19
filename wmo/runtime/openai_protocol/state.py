@@ -8,6 +8,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from enum import StrEnum
+from typing import Protocol
 
 from pydantic import Field
 
@@ -59,35 +60,115 @@ class ReplayClaimKind(StrEnum):
 
 
 class _ReplayEntry:
-    """One in-flight or completed response future with bounded retention metadata."""
+    """One in-flight or completed response signal with bounded retention metadata."""
 
-    def __init__(self, future: asyncio.Future[CachedResponse], expires_at: float) -> None:
-        """Create an empty replay entry around one event-loop future."""
-        self.future = future
+    def __init__(self, expires_at: float) -> None:
+        """Create an unpublished replay entry."""
+        self.published = asyncio.Event()
+        self.response: CachedResponse | None = None
         self.expires_at = expires_at
         self.size_bytes = 0
 
 
-class ReplayLease:
-    """One caller's ownership or join handle for a keyed response."""
+class ReplayLease(Protocol):
+    """Ownership-scoped operations for one claimed replay key.
+
+    Implementations must make publication conditional on ownership established by
+    :meth:`ResponseReplayStore.claim`. Cancelling a caller waiting on :meth:`result` must not
+    cancel shared work.
+    """
+
+    @property
+    def kind(self) -> ReplayClaimKind:
+        """Return whether this caller owns, joins, or replays the operation."""
+        ...
+
+    async def result(self) -> CachedResponse:
+        """Join in-flight work or return the already completed exact response."""
+        ...
+
+    async def complete(self, response: CachedResponse) -> None:
+        """Publish one exact successful response from the unique owner."""
+        ...
+
+    async def abandon(self) -> None:
+        """Release this claim only when it still owns unpublished work."""
+        ...
+
+
+class ResponseReplayStore(Protocol):
+    """Atomic completed-response ownership, joining, and replay operations.
+
+    A claim is scoped by the complete :class:`ReplayKey`. Reusing a caller operation within its
+    namespace and surface for another canonical body must fail closed. Implementations must
+    return exactly one owner while work is unpublished, join matching concurrent claims, and
+    replay only a response that its owner successfully published. Cancellation before a claim
+    returns must not strand ownership. A shared implementation must expire ownership left by
+    worker loss within a finite implementation-defined lease so joiners cannot wait forever.
+    """
+
+    async def claim(self, key: ReplayKey) -> ReplayLease:
+        """Claim original work, join an in-flight duplicate, or replay completion."""
+        ...
+
+
+class ResponseContinuationStore(Protocol):
+    """Namespaced state operations required by Responses continuations.
+
+    Implementations must apply their finite retention policy to the complete namespace and public
+    response identity. Missing, expired, evicted, or cross-namespace state must fail closed.
+    """
+
+    async def remember(
+        self,
+        *,
+        namespace: ProtocolNamespace,
+        response_id: str,
+        state: ContinuationState,
+    ) -> None:
+        """Retain one completed Responses continuation within implementation bounds."""
+        ...
+
+    async def resolve(
+        self,
+        *,
+        namespace: ProtocolNamespace,
+        previous_response_id: str,
+    ) -> ContinuationState:
+        """Resolve an exact namespaced continuation or fail closed."""
+        ...
+
+
+class _BoundedReplayLease:
+    """One local caller's ownership or join handle for a keyed response."""
 
     def __init__(
         self,
         *,
         store: BoundedReplayStore,
         key: ReplayKey,
-        future: asyncio.Future[CachedResponse],
+        entry: _ReplayEntry,
         kind: ReplayClaimKind,
     ) -> None:
         """Bind one replay claim to its store entry."""
         self._store = store
         self._key = key
-        self._future = future
+        self._entry = entry
         self.kind = kind
 
     async def result(self) -> CachedResponse:
         """Join in-flight work or return the already completed exact response."""
-        return await asyncio.shield(self._future)
+        await asyncio.shield(self._entry.published.wait())
+        response = self._entry.response
+        if response is None:
+            raise OpenAIProtocolError(
+                status_code=409,
+                code="idempotency_replay_unavailable",
+                message="The original keyed request ended before publishing a replayable result.",
+                error_type="api_error",
+                param="Idempotency-Key",
+            )
+        return response
 
     async def complete(self, response: CachedResponse) -> None:
         """Publish one exact response from the unique owner.
@@ -105,12 +186,12 @@ class ReplayLease:
                 message="Only the original keyed request may publish its result.",
                 param="Idempotency-Key",
             )
-        await self._store._complete(self._key, self._future, response)
+        await self._store._complete(self._key, self._entry, response)
 
     async def abandon(self) -> None:
         """Remove failed owner work so no joiner receives invented response content."""
         if self.kind == ReplayClaimKind.OWNER:
-            await self._store._abandon(self._key, self._future)
+            await self._store._abandon(self._key, self._entry)
 
 
 class BoundedReplayStore:
@@ -169,29 +250,30 @@ class BoundedReplayStore:
             entry = self._entries.get(key)
             if entry is not None:
                 self._entries.move_to_end(key)
-                kind = ReplayClaimKind.REPLAY if entry.future.done() else ReplayClaimKind.JOIN
-                return ReplayLease(store=self, key=key, future=entry.future, kind=kind)
+                kind = (
+                    ReplayClaimKind.REPLAY if entry.response is not None else ReplayClaimKind.JOIN
+                )
+                return _BoundedReplayLease(store=self, key=key, entry=entry, kind=kind)
             self._make_capacity()
-            future = asyncio.get_running_loop().create_future()
-            entry = _ReplayEntry(future, self._clock() + self._ttl_seconds)
+            entry = _ReplayEntry(self._clock() + self._ttl_seconds)
             self._entries[key] = entry
             self._evict_completed()
-            return ReplayLease(
+            return _BoundedReplayLease(
                 store=self,
                 key=key,
-                future=future,
+                entry=entry,
                 kind=ReplayClaimKind.OWNER,
             )
 
     async def _complete(
         self,
         key: ReplayKey,
-        future: asyncio.Future[CachedResponse],
+        claimed_entry: _ReplayEntry,
         response: CachedResponse,
     ) -> None:
         """Atomically publish an owner result and apply retention bounds."""
         if response.size_bytes > self._byte_cap:
-            await self._abandon(key, future)
+            await self._abandon(key, claimed_entry)
             raise OpenAIProtocolError(
                 status_code=500,
                 code="idempotency_replay_unavailable",
@@ -200,7 +282,7 @@ class BoundedReplayStore:
             )
         async with self._lock:
             entry = self._entries.get(key)
-            if entry is None or entry.future is not future or future.done():
+            if entry is None or entry is not claimed_entry or entry.published.is_set():
                 raise OpenAIProtocolError(
                     status_code=409,
                     code="idempotency_conflict",
@@ -210,22 +292,23 @@ class BoundedReplayStore:
             entry.size_bytes = response.size_bytes
             entry.expires_at = self._clock() + self._ttl_seconds
             self._response_bytes += entry.size_bytes
-            future.set_result(response)
+            entry.response = response
+            entry.published.set()
             self._entries.move_to_end(key)
             self._evict_completed()
 
-    async def _abandon(self, key: ReplayKey, future: asyncio.Future[CachedResponse]) -> None:
+    async def _abandon(self, key: ReplayKey, claimed_entry: _ReplayEntry) -> None:
         """Remove matching in-flight work without erasing a published result."""
         async with self._lock:
             entry = self._entries.get(key)
-            if entry is not None and entry.future is future and not future.done():
+            if entry is not None and entry is claimed_entry and not entry.published.is_set():
                 self._entries.pop(key)
-                future.cancel()
+                entry.published.set()
 
     def _expire(self, now: float) -> None:
         """Drop completed expired entries without evicting active work."""
         for key, entry in tuple(self._entries.items()):
-            if entry.future.done() and entry.expires_at <= now:
+            if entry.response is not None and entry.expires_at <= now:
                 self._entries.pop(key)
                 self._response_bytes -= entry.size_bytes
 
@@ -233,7 +316,11 @@ class BoundedReplayStore:
         """Evict oldest completed entries until count and byte bounds hold."""
         while len(self._entries) > self._capacity or self._response_bytes > self._byte_cap:
             completed = next(
-                ((key, entry) for key, entry in self._entries.items() if entry.future.done()),
+                (
+                    (key, entry)
+                    for key, entry in self._entries.items()
+                    if entry.response is not None
+                ),
                 None,
             )
             if completed is None:
@@ -246,7 +333,11 @@ class BoundedReplayStore:
         """Evict completed work or reject when every bounded slot is in flight."""
         while len(self._entries) >= self._capacity:
             completed = next(
-                ((key, entry) for key, entry in self._entries.items() if entry.future.done()),
+                (
+                    (key, entry)
+                    for key, entry in self._entries.items()
+                    if entry.response is not None
+                ),
                 None,
             )
             if completed is None:

@@ -101,12 +101,13 @@ def _run_gateway(
 
     from wmo.cli.gateway.compatibility import prepare_project_gateway
     from wmo.cli.gateway.setup import interactive_gateway_setup
-    from wmo.optimize.router.activation import load_project_router
+    from wmo.optimize.router.activation import verify_automatic_router_policy
     from wmo.runtime.gateway.lifecycle import (
         gateway_instance_lock,
         load_local_gateway,
     )
     from wmo.runtime.gateway.management import GatewayManagement
+    from wmo.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
 
     setup = None
     manager = GatewayManagement(root)
@@ -122,10 +123,14 @@ def _run_gateway(
 
     with usage_error(ValueError):
         with gateway_instance_lock(root, port=port):
+            project_repository = LocalArtifactProjectActivationRepository(
+                root,
+                verifier=verify_automatic_router_policy,
+            )
             runtime = load_local_gateway(
                 root,
                 graceful_timeout_seconds=graceful_timeout,
-                project_loader=load_project_router,
+                project_repository=project_repository,
                 only_aliases=(None if compatibility is None else frozenset({compatibility.alias})),
             )
             asyncio.run(runtime.service.preflight())

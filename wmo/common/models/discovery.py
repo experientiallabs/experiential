@@ -83,7 +83,7 @@ def serves_role(capabilities: ModelCapabilities, role: SetupRole) -> bool:
     """
     if role is SetupRole.EMBEDDER:
         return (
-            capabilities.supports_embeddings
+            capabilities.supports_embeddings is True
             and capabilities.input_cost_per_million_tokens_usd is not None
         )
     if not _priced_completion_model(capabilities):

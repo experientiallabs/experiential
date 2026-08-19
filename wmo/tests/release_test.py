@@ -55,6 +55,7 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "wmo/common/judging/review.py",
         "wmo/common/models/model.py",
         "wmo/runtime/environments/local.py",
+        "wmo/runtime/gateway/composition.py",
         "wmo/runtime/gateway/lifecycle.py",
         "wmo/runtime/gateway/budgets.py",
         "wmo/runtime/gateway/ledger.py",
@@ -465,16 +466,21 @@ def _installed_release_driver() -> None:
     from wmo.cli.gateway.key_output import key_output_marker_path
     from wmo.common.models import (
         BillingSource,
+        CandidateTokenPrice,
         ConnectionConfig,
         Embedding,
         GatewayDeploymentCapabilities,
         GatewayEquivalenceCertification,
         GatewayTokenPrices,
         ModelCapabilities,
+        ModelRecord,
         ModelRequest,
         ModelResponse,
         ModelSnapshot,
+        PricingSnapshot,
         RoutedCandidateSnapshot,
+        load_model_catalog,
+        write_model_catalog,
     )
     from wmo.common.project import ProjectStore, artifact_input
     from wmo.common.routing import KnnGuard, KnnRouterPolicy
@@ -494,6 +500,7 @@ def _installed_release_driver() -> None:
     )
     from wmo.runtime.gateway.lifecycle import load_local_gateway
     from wmo.runtime.gateway.management import GatewayManagement
+    from wmo.runtime.gateway.project_activation import ProjectActivation
     from wmo.runtime.models import (
         CatalogRoleName,
         ResolvedModel,
@@ -2190,6 +2197,18 @@ def _installed_release_driver() -> None:
             ),
             replace=False,
         )
+    authored_project_catalog = load_model_catalog(project_root / "models.toml")
+    authored_models = dict(authored_project_catalog.models)
+    authored_models["embedder"] = ModelRecord(
+        connection="project-cheap",
+        model="project-embedder-model",
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        capabilities=ModelCapabilities(supports_embeddings=True),
+    )
+    write_model_catalog(
+        project_root / "models.toml",
+        authored_project_catalog.model_copy(update={"models": authored_models}),
+    )
     project_catalog = None
     for alias, provider_model, billing_source in (
         ("cheap", "project-primary-model", BillingSource.HOST_MANAGED),
@@ -2243,19 +2262,64 @@ def _installed_release_driver() -> None:
         key_id="project-key",
     ).raw_key
     learned_runtime, learned_client = installed_project_runtime()
+    activation_catalog = RuntimeModelCatalog(
+        load_model_catalog(project_root / "models.toml"),
+        environment={"P9_LOOPBACK_PROVIDER_KEY": provider_secret},
+    )
+    activation_snapshots = {
+        alias: activation_catalog.snapshot(alias)[0] for alias in ("baseline", "cheap", "embedder")
+    }
+    activation_candidates = tuple(
+        RoutedCandidateSnapshot(alias=alias, model=activation_snapshots[alias])
+        for alias in ("baseline", "cheap")
+    )
+    activation_policy = learned_runtime.policy.model_copy(
+        update={
+            "candidates": activation_candidates,
+            "embedder": activation_snapshots["embedder"],
+        }
+    )
+    activation_manifest = learned_runtime.manifest.model_copy(
+        update={"embedder": activation_snapshots["embedder"]}
+    )
+    installed_activation = ProjectActivation(
+        project_ref="installed-project",
+        activation_ref="installed-project-policy",
+        policy=activation_policy,
+        bank_manifest=activation_manifest,
+        bank=learned_runtime.bank,
+        pricing=PricingSnapshot(
+            schema_version=1,
+            created_at=activation_policy.created_at,
+            code_revision=release_revision,
+            pricing_snapshot_id=activation_policy.pricing_snapshot_id,
+            candidate_prices=tuple(
+                CandidateTokenPrice(
+                    candidate_alias=alias,
+                    input_usd_per_million_tokens=1,
+                    output_usd_per_million_tokens=2,
+                )
+                for alias in ("baseline", "cheap")
+            ),
+        ),
+        pricing_sha256=activation_policy.pricing_snapshot_sha256,
+    )
 
-    def load_installed_project(
-        project: str,
-        root: Path,
-        *,
-        policy_id: str,
-        runtime_catalog: RuntimeModelCatalog,
-    ) -> RouterRuntime:
-        """Inject one real installed selection runtime without project completion."""
-        del root, runtime_catalog
-        assert project == "installed-project"
-        assert policy_id == "installed-project-policy"
-        return learned_runtime
+    class InstalledActivationRepository:
+        """Return one installed immutable activation without local project state."""
+
+        def load(
+            self,
+            project_ref: str,
+            activation_ref: str | None,
+            *,
+            runtime_catalog: RuntimeModelCatalog,
+        ) -> ProjectActivation:
+            """Return the exact caller-owned activation without provider work."""
+            del runtime_catalog
+            assert project_ref == "installed-project"
+            assert activation_ref == "installed-project-policy"
+            return installed_activation
 
     project_provider_before_load = state.snapshot()
     project_primary_before = state.count_containing("project-primary-model")
@@ -2264,7 +2328,7 @@ def _installed_release_driver() -> None:
         project_root,
         graceful_timeout_seconds=2,
         environment={"P9_LOOPBACK_PROVIDER_KEY": provider_secret},
-        project_loader=load_installed_project,
+        project_repository=InstalledActivationRepository(),
     )
     assert state.snapshot() == project_provider_before_load
     project_port = unused_loopback_port()
@@ -2301,7 +2365,7 @@ def _installed_release_driver() -> None:
     assert not project_thread.is_alive()
     assert state.count_containing("project-primary-model") == project_primary_before + 2
     assert state.count_containing("project-secondary-model") == project_secondary_before + 1
-    assert learned_client.embed_calls == 1
+    assert learned_client.embed_calls == 0
     assert learned_client.complete_calls == 0
     assert learned_runtime.records_decisions is False
     assert not (project_root / "projects").exists()

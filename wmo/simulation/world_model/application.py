@@ -370,8 +370,6 @@ def load_world_model(
         if resolved_embedder.embedding_client is None:
             raise WorldModelLoadError("project embedder alias has no embedding client")
         embedding_price = resolved_embedder.capabilities.input_cost_per_million_tokens_usd
-        if embedding_price is None:
-            raise WorldModelLoadError("project embedder alias has no explicit input price")
         runtime = load_grounded_world_model(
             store.artifacts,
             config.build.world_model.artifact_id,
@@ -380,7 +378,7 @@ def load_world_model(
                 client=resolved_embedder.embedding_client,
                 snapshot=resolved_embedder.snapshot,
                 maximum_attempts=RetryPolicy().maximum_attempts,
-                input_usd_per_million_tokens=embedding_price,
+                input_usd_per_million_tokens=(0.0 if embedding_price is None else embedding_price),
             ),
         )
         _require_project_binding(runtime, config.build.world_model, config.build.serving_rag)

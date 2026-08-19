@@ -37,18 +37,22 @@ def preflight_capabilities(
 ) -> None:
     """Verify known local model capabilities without contacting a provider.
 
+    Unknown declarations are permissive: only an explicit ``False`` support flag or an explicit
+    insufficient limit blocks the operation, so an undeclared or newly released model stays
+    usable and the provider itself reports any real protocol gap.
+
     Args:
         alias: Stable catalog alias used in any failure message.
         capabilities: Static capabilities resolved from the connection type.
         requirement: Caller requirements for the pending operation.
 
     Raises:
-        ModelCapabilityError: The provider cannot prove a requirement before a paid request.
+        ModelCapabilityError: An explicit capability declaration rules out a requirement.
     """
-    if requirement.requires_tools and not capabilities.supports_tools:
-        raise ModelCapabilityError(f"model alias {alias!r} does not support tool calls")
-    if requirement.requires_embeddings and not capabilities.supports_embeddings:
-        raise ModelCapabilityError(f"model alias {alias!r} does not support embeddings")
+    if requirement.requires_tools and capabilities.supports_tools is False:
+        raise ModelCapabilityError(f"model alias {alias!r} declares no tool call support")
+    if requirement.requires_embeddings and capabilities.supports_embeddings is False:
+        raise ModelCapabilityError(f"model alias {alias!r} declares no embedding support")
     _require_capacity(
         alias,
         label="context window",
@@ -70,13 +74,9 @@ def _require_capacity(
     available: int | None,
     required: int | None,
 ) -> None:
-    """Reject unavailable or insufficient capacity when a caller names an exact minimum."""
-    if required is None:
+    """Reject only an explicitly declared capacity that is below a caller's exact minimum."""
+    if required is None or available is None:
         return
-    if available is None:
-        raise ModelCapabilityError(
-            f"model alias {alias!r} does not report a {label}; cannot preflight {required} tokens"
-        )
     if available < required:
         raise ModelCapabilityError(
             f"model alias {alias!r} has {available} {label} tokens, below required {required}"

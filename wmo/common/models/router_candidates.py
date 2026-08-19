@@ -30,6 +30,10 @@ class RouterCandidateSetupError(ValueError):
 def router_candidate_capabilities_sha256(capabilities: ModelCapabilities) -> Sha256:
     """Hash the exact non-price candidate execution contract.
 
+    Unknown tool support hashes as its own tri-state value: runtime dispatch treats unknown
+    support permissively and an explicit ``False`` as a hard denial, so moving between them is
+    a semantic change that must invalidate frozen plans and policies.
+
     Args:
         capabilities: Explicit current candidate capability declaration.
 

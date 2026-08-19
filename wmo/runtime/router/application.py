@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,28 +11,19 @@ from fastapi.testclient import TestClient
 from openai import OpenAI
 
 from wmo.common.core.artifacts import ArtifactId
-from wmo.common.evaluations.evidence import read_evaluation_plan
 from wmo.common.models import load_model_catalog
-from wmo.common.project import (
-    ArtifactStore,
-    ArtifactStoreError,
-    ProjectStore,
-    ProjectStoreError,
-    artifact_input,
-)
-from wmo.common.routing import KnnRouterPolicy
 from wmo.runtime.gateway.lifecycle import load_local_gateway
 from wmo.runtime.gateway.management import GatewayManagement
+from wmo.runtime.gateway.project_activation import (
+    LocalArtifactProjectActivationRepository,
+    ProjectActivationVerifier,
+)
 from wmo.runtime.gateway.project_alias import prepare_project_gateway_alias
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router.errors import RouterApplicationError
 from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
 
-RouterPolicyVerifier = Callable[[ArtifactStore, KnnRouterPolicy, RuntimeModelCatalog], None]
-
-_AUTOMATIC_POLICY_INPUT_TYPES = frozenset(
-    {"router-execution-contract", "router-runtime-capabilities"}
-)
+RouterPolicyVerifier = ProjectActivationVerifier
 
 
 class _RevokingGatewayClient(TestClient):
@@ -79,33 +70,30 @@ def load_project_router(
     Raises:
         RouterApplicationError: Project, policy, catalog, or frozen identity is invalid.
     """
-    project_store = ProjectStore(root, project)
     try:
-        project_store.load_project()
-        resolved_policy_id = policy_id or _only_policy(project_store.artifacts)
-        policy = _load_policy(project_store.artifacts, resolved_policy_id)
         catalog = runtime_catalog
         if catalog is None:
             catalog = RuntimeModelCatalog(
-                load_model_catalog(project_store.model_catalog_path),
+                load_model_catalog(root / "models.toml"),
                 environment=environment,
             )
-        _verify_policy_activation(
-            project_store.artifacts,
-            policy,
-            catalog,
-            policy_verifier=policy_verifier,
+        repository = LocalArtifactProjectActivationRepository(
+            root,
+            verifier=policy_verifier,
         )
-        return RouterRuntime.load(
-            project_store.artifacts,
-            resolved_policy_id,
+        activation = repository.load(
+            project,
+            policy_id,
+            runtime_catalog=catalog,
+        )
+        return RouterRuntime.from_activation(
+            activation,
             catalog,
-            pricing_snapshot_id=policy.pricing_snapshot_id,
             decision_sink=decision_sink,
         )
     except RouterApplicationError:
         raise
-    except (ArtifactStoreError, OSError, ProjectStoreError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         raise RouterApplicationError(str(exc)) from exc
 
 
@@ -142,30 +130,16 @@ def load_router(
         raise RouterApplicationError("ghost mode cannot use a routing decision sink")
     del ghost
 
-    def project_loader(
-        project: str,
-        root: Path,
-        *,
-        policy_id: ArtifactId | None = None,
-        environment: Mapping[str, str] | None = None,
-        runtime_catalog: RuntimeModelCatalog | None = None,
-    ) -> RouterRuntime:
-        """Load the caller-selected immutable policy for gateway selection only."""
-        return load_project_router(
-            project,
-            root,
-            policy_id=policy_id,
-            environment=environment,
-            runtime_catalog=runtime_catalog,
-            decision_sink=decision_sink,
-            policy_verifier=policy_verifier,
-        )
+    repository = LocalArtifactProjectActivationRepository(
+        root,
+        verifier=policy_verifier,
+    )
 
     alias = prepare_project_gateway_alias(
         project,
         root,
         policy_id=policy_id,
-        project_loader=project_loader,
+        project_repository=repository,
         environment=environment,
         runtime_catalog=runtime_catalog,
     )
@@ -177,7 +151,8 @@ def load_router(
             root,
             graceful_timeout_seconds=10,
             environment=environment,
-            project_loader=project_loader,
+            project_repository=repository,
+            decision_sink=decision_sink,
             only_aliases=frozenset({alias.alias}),
         )
     except BaseException:
@@ -193,72 +168,3 @@ def load_router(
         base_url="http://wmo.local/v1",
         http_client=transport,
     )
-
-
-def _only_policy(store: ArtifactStore) -> ArtifactId:
-    """Resolve the only completed router policy, failing on absent or ambiguous state."""
-    policies = tuple(
-        artifact_id
-        for artifact_id in store.list_ids()
-        if store.read(artifact_id).manifest.artifact_type == "router-policy"
-    )
-    if not policies:
-        raise RouterApplicationError("project has no frozen router policy; run wmo optimize router")
-    if len(policies) > 1:
-        raise RouterApplicationError(
-            "project has multiple frozen router policies; pass --policy with one of: "
-            + ", ".join(policies)
-        )
-    return policies[0]
-
-
-def _load_policy(store: ArtifactStore, policy_id: ArtifactId) -> KnnRouterPolicy:
-    """Load one manifest-verified policy envelope for runtime activation."""
-    stored = store.read(policy_id)
-    if stored.manifest.artifact_type != "router-policy":
-        raise RouterApplicationError(f"artifact {policy_id} is not a frozen router policy")
-    policy = KnnRouterPolicy.model_validate_json(store.read_bytes(policy_id, "policy.json"))
-    if policy.policy_id != policy_id:
-        raise RouterApplicationError("router policy identity differs from its artifact")
-    return policy
-
-
-def _verify_policy_activation(
-    store: ArtifactStore,
-    policy: KnnRouterPolicy,
-    catalog: RuntimeModelCatalog,
-    *,
-    policy_verifier: RouterPolicyVerifier | None,
-) -> None:
-    """Require optimizer verification whenever a plan contains automatic artifacts.
-
-    Runtime owns provider activation but does not depend on offline optimization. Automatic plans
-    therefore require their optimizer owner to inject the complete artifact verifier. Plans with
-    no automatic inputs retain the provider-free runtime loading path.
-
-    Args:
-        store: Project-local immutable artifact store.
-        policy: Selected frozen router policy.
-        catalog: Current credential-free catalog resolver.
-        policy_verifier: Optional optimizer-owned automatic artifact verifier.
-
-    Raises:
-        RouterApplicationError: Plan inputs drift or automatic verification is unavailable.
-    """
-    plan, _plan_input = read_evaluation_plan(store, policy.evaluation_plan_id)
-    automatic_inputs = []
-    for item in plan.inputs:
-        stored = store.read(item.artifact_id)
-        if artifact_input(stored.manifest) != item:
-            raise RouterApplicationError(
-                f"router plan input {item.artifact_id!r} differs from its manifest"
-            )
-        if stored.manifest.artifact_type in _AUTOMATIC_POLICY_INPUT_TYPES:
-            automatic_inputs.append(item)
-    if policy_verifier is not None:
-        policy_verifier(store, policy, catalog)
-        return
-    if automatic_inputs:
-        raise RouterApplicationError(
-            "automatic router policy requires optimizer-owned activation verification"
-        )

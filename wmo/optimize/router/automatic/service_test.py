@@ -66,13 +66,17 @@ from wmo.optimize.router.automatic.preflight import (
     AutomaticRouterPreflightError,
     preflight_automatic_router,
 )
-from wmo.optimize.router.automatic.replay import find_completed_automatic_router_replay
+from wmo.optimize.router.automatic.replay import (
+    AutomaticRouterReplayError,
+    find_completed_automatic_router_replay,
+)
 from wmo.optimize.router.automatic.service import (
     AutomaticRouterError,
     optimize_project_router,
     persist_router_candidate_setup,
 )
 from wmo.optimize.router.composition import RouterCandidateSetupPlan
+from wmo.optimize.router.fit.report import HeldOutRouterReport
 from wmo.optimize.router.judging.artifacts import (
     read_audit,
     read_review_state,
@@ -669,6 +673,231 @@ def test_configless_automatic_router_composes_and_replays_without_dispatch(
         )
         is None
     )
+
+
+def test_interrupted_automatic_router_resumes_and_publishes_report_without_refit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A locked policy with no report resumes to a published report instead of failing.
+
+    A crash after the immutable policy lock leaves the frozen policy and its lock but
+    no held-out report. Replay detection must treat that as an interrupted optimization
+    and return no replay, and one further invocation must publish the report without
+    refitting. The completed chain then replays exactly with zero provider dispatches.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+        monkeypatch: Patch fixture proving the resume never refits.
+    """
+    store, catalog, state = _completed_project(tmp_path)
+    _approve_manual_judge(store, catalog, state)
+    plan = collect_router_candidates(
+        store.model_catalog_path,
+        catalog,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    options = AutomaticRouterOptions(
+        maximum_provider_cost_usd=25.0,
+        maximum_judgments=20,
+        maximum_model_calls=1,
+        simulation_maximum_output_tokens=8_000,
+    )
+
+    def _crash_after_lock(phase: str) -> None:
+        """Crash once after the immutable policy lock persists.
+
+        Args:
+            phase: Composition phase boundary name.
+
+        Raises:
+            RuntimeError: The policy-locked boundary on the interrupted invocation.
+        """
+        if phase == "policy_locked":
+            raise RuntimeError("simulated crash after policy lock")
+
+    with pytest.raises(RuntimeError, match="after policy lock"):
+        optimize_project_router(
+            store,
+            plan,
+            cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+            options=options,
+            provider_spend_consented=True,
+            created_at=_TIME + timedelta(hours=1),
+            code_revision=_REVISION,
+            phase_hook=_crash_after_lock,
+        )
+
+    def _artifact_ids(artifact_type: str) -> tuple[str, ...]:
+        """Return persisted artifact IDs of one exact manifest type.
+
+        Args:
+            artifact_type: Exact immutable manifest artifact type.
+
+        Returns:
+            Matching persisted artifact identifiers.
+        """
+        return tuple(
+            artifact_id
+            for artifact_id in store.artifacts.list_ids()
+            if store.artifacts.read(artifact_id).manifest.artifact_type == artifact_type
+        )
+
+    assert len(_artifact_ids("router-policy")) == 1
+    assert len(_artifact_ids("router-policy-lock")) == 1
+    assert not _artifact_ids("router-report")
+    resume_plan = collect_router_candidates(
+        store.model_catalog_path,
+        load_model_catalog(store.model_catalog_path),
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    interrupted_preflight = preflight_automatic_router(
+        store,
+        resume_plan.selection,
+        catalog_override=resume_plan.prospective_catalog,
+        options=options,
+    )
+    before_credentials = state.credential_resolutions
+    before_completion = tuple(state.completion_calls)
+    before_embedding = tuple(state.embedding_calls)
+
+    assert (
+        find_completed_automatic_router_replay(
+            store,
+            interrupted_preflight,
+            options=options,
+            code_revision=_REVISION,
+        )
+        is None
+    )
+
+    assert state.credential_resolutions == before_credentials
+    assert tuple(state.completion_calls) == before_completion
+    assert tuple(state.embedding_calls) == before_embedding
+
+    from wmo.optimize.router import composition as workflow_module
+
+    monkeypatch.setattr(
+        workflow_module,
+        "fit_router",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("fit repeated")),
+    )
+    result = optimize_project_router(
+        store,
+        resume_plan,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        options=options,
+        provider_spend_consented=True,
+        created_at=_TIME + timedelta(hours=2),
+        code_revision=_REVISION,
+    )
+
+    report_id = result.composition.optimization.optimization.report.report_id
+    assert _artifact_ids("router-report") == (report_id,)
+    assert len(_artifact_ids("router-policy-lock")) == 1
+    completed_completion = tuple(state.completion_calls)
+    completed_embedding = tuple(state.embedding_calls)
+    completed_credentials = state.credential_resolutions
+
+    replay = find_completed_automatic_router_replay(
+        store,
+        result.preflight,
+        options=options,
+        code_revision=_REVISION,
+    )
+
+    assert replay is not None
+    assert replay.policy_id == result.composition.optimization.optimization.policy.policy_id
+    assert replay.report_id == report_id
+    assert tuple(state.completion_calls) == completed_completion
+    assert tuple(state.embedding_calls) == completed_embedding
+    assert state.credential_resolutions == completed_credentials
+
+    cli = _RUNNER.invoke(
+        app,
+        [
+            "optimize",
+            "router",
+            "support",
+            "--root",
+            str(store.paths.root),
+            "--maximum-judgments",
+            "20",
+            "--maximum-model-calls",
+            "1",
+            "--simulation-maximum-output-tokens",
+            "8000",
+            "--non-interactive",
+        ],
+        env={"WMO_RELEASE_REVISION": _REVISION},
+    )
+
+    assert cli.exit_code == 0, cli.output
+    assert "replay: verified completed optimization" in unstyle(cli.output)
+    assert tuple(state.completion_calls) == completed_completion
+    assert tuple(state.embedding_calls) == completed_embedding
+
+
+def test_multiple_matching_router_reports_still_fail_closed(tmp_path: Path) -> None:
+    """More than one report naming the frozen policy stays a fail-closed replay error.
+
+    Args:
+        tmp_path: Isolated local WMO root.
+    """
+    store, catalog, state = _completed_project(tmp_path)
+    _approve_manual_judge(store, catalog, state)
+    plan = collect_router_candidates(
+        store.model_catalog_path,
+        catalog,
+        candidates=("candidate-a", "candidate-b"),
+        incumbent="candidate-a",
+        non_interactive=True,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    options = AutomaticRouterOptions(
+        maximum_provider_cost_usd=25.0,
+        maximum_judgments=20,
+        maximum_model_calls=1,
+        simulation_maximum_output_tokens=8_000,
+    )
+    result = optimize_project_router(
+        store,
+        plan,
+        cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state)),
+        options=options,
+        provider_spend_consented=True,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision=_REVISION,
+    )
+    report_id = result.composition.optimization.optimization.report.report_id
+    report = HeldOutRouterReport.model_validate_json(
+        store.artifacts.read_bytes(report_id, "report.json")
+    )
+    forged_id = f"{report_id}-duplicate"
+    forged = report.model_copy(update={"report_id": forged_id})
+    store.artifacts.write_or_verify_exact(
+        artifact_id=forged_id,
+        artifact_type="router-report",
+        envelope=forged,
+        files={"report.json": canonical_json_bytes(forged)},
+    )
+
+    with pytest.raises(
+        AutomaticRouterReplayError,
+        match="2 matching router report artifacts",
+    ):
+        find_completed_automatic_router_replay(
+            store,
+            result.preflight,
+            options=options,
+            code_revision=_REVISION,
+        )
 
 
 def test_replay_restores_discovered_candidate_records_before_reporting_success(

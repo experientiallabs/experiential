@@ -15,8 +15,6 @@ from wmo.common.core.artifacts import (
     ArtifactId,
     ContractModel,
     Sha256,
-    envelope_matches_manifest,
-    sha256_json,
 )
 from wmo.common.models import (
     CandidateTokenPrice,
@@ -26,14 +24,15 @@ from wmo.common.models import (
     ModelResponse,
     OperationEconomics,
 )
-from wmo.common.project import ArtifactCorruptionError, ArtifactStore
+from wmo.common.project import ArtifactStore
 from wmo.common.routing import (
     KnnRouterPolicy,
     RouterFeatureExtractor,
     RoutingDecision,
 )
-from wmo.common.routing.bank import KnnBankManifest, KnnEvidenceBank, bank_bytes, load_knn_bank
+from wmo.common.routing.bank import KnnBankManifest, KnnEvidenceBank, bank_bytes
 from wmo.common.routing.decision import policy_content_sha256, select_from_bank
+from wmo.runtime.gateway.project_activation import ProjectActivation, load_project_activation
 from wmo.runtime.models import ResolvedModel, RuntimeModelCatalog
 from wmo.runtime.router.economics import (
     BillingSourceEconomics,
@@ -172,7 +171,7 @@ class RouterRuntime:
             raise RouterRuntimeIntegrityError(
                 "runtime model catalog cannot resolve policy pins"
             ) from exc
-        if embedder.embedding_client is None or not embedder.capabilities.supports_embeddings:
+        if embedder.embedding_client is None or embedder.capabilities.supports_embeddings is False:
             raise RouterRuntimeIntegrityError("frozen router embedder lacks embedding capability")
         self._embedder = embedder.embedding_client
         self._embedder_billing_source = embedder.snapshot.billing_source
@@ -208,88 +207,51 @@ class RouterRuntime:
         Raises:
             RouterRuntimeIntegrityError: Any artifact or runtime identity is invalid.
         """
-        from wmo.common.models import load_pricing_snapshot
-        from wmo.common.project import artifact_input
-
         try:
-            from wmo.common.evaluations import load_evaluation_dataset
-            from wmo.common.evaluations.evidence import read_evaluation_plan
-            from wmo.common.tasks import load_task_set
-
-            pricing, pricing_sha256 = load_pricing_snapshot(store, pricing_snapshot_id)
-            pricing_input = artifact_input(store.read(pricing_snapshot_id).manifest)
-            stored = store.read(policy_id)
-            if stored.manifest.artifact_type != "router-policy":
-                raise ValueError(f"artifact {policy_id} is not a router policy")
-            policy = KnnRouterPolicy.model_validate_json(store.read_bytes(policy_id, "policy.json"))
-            if policy.policy_id != policy_id:
-                raise ValueError("router policy ID differs from its artifact")
-            if not envelope_matches_manifest(policy, stored.manifest):
-                raise ValueError("router policy payload differs from its artifact manifest")
-            manifest, bank = load_knn_bank(
-                store, policy.bank_artifact_id, expected_sha256=policy.bank_sha256
+            activation = load_project_activation(
+                store,
+                project_ref=store.project_directory.name,
+                activation_ref=policy_id,
             )
-            bank_input = artifact_input(store.read(policy.bank_artifact_id).manifest)
-            evaluation = load_evaluation_dataset(store, policy.fit_evaluation_id)
-            evaluation_input = artifact_input(store.read(policy.fit_evaluation_id).manifest)
-            plan, plan_input = read_evaluation_plan(store, policy.evaluation_plan_id)
-            load_task_set(store, policy.task_set_id)
-            task_input = artifact_input(store.read(policy.task_set_id).manifest)
-            expected_policy_inputs = tuple(
-                sorted((evaluation_input, bank_input), key=lambda item: item.artifact_id)
-            )
-            expected_bank_inputs = tuple(
-                sorted(
-                    (evaluation_input, plan_input, task_input, pricing_input),
-                    key=lambda item: item.artifact_id,
-                )
-            )
-            protocol_scope_sha256 = sha256_json(
-                [item.model_dump(mode="json") for item in evaluation.manifest.protocols]
-            )
-            if policy.inputs != expected_policy_inputs:
-                raise ValueError("router policy inputs differ from the canonical fit lock")
-            if manifest.inputs != expected_bank_inputs:
-                raise ValueError("router bank inputs differ from the canonical fit evidence")
-            evaluation_checks = (
-                (evaluation.manifest.evaluation_plan_id, policy.evaluation_plan_id),
-                (evaluation.manifest.evaluation_plan_sha256, policy.evaluation_plan_sha256),
-                (evaluation.manifest.task_set_id, policy.task_set_id),
-                (evaluation.manifest.candidate_snapshots, policy.candidates),
-                (protocol_scope_sha256, policy.evaluation_protocols_sha256),
-                (plan_input.sha256, policy.evaluation_plan_sha256),
-                (task_input.sha256, policy.task_set_sha256),
-                (evaluation.manifest.fit_task_ids, manifest.task_ids),
-                (evaluation.manifest.held_out_task_ids, ()),
-                (plan.task_set_id, policy.task_set_id),
-                (plan.candidate_snapshots, policy.candidates),
-                (plan.pricing_snapshot_id, policy.pricing_snapshot_id),
-                (plan.pricing_snapshot_sha256, policy.pricing_snapshot_sha256),
-            )
-            if any(actual != expected for actual, expected in evaluation_checks):
-                raise ValueError("router fit evidence differs from the frozen policy scope")
-            required_evaluation_inputs = {
-                plan_input,
-                task_input,
-                pricing_input,
-            }
-            if not required_evaluation_inputs.issubset(evaluation.manifest.inputs):
-                raise ValueError("router evaluation omits a frozen scope input")
-            if task_input not in plan.inputs or pricing_input not in plan.inputs:
-                raise ValueError("router evaluation plan omits task or pricing scope")
-        except (ArtifactCorruptionError, ValueError) as exc:
+        except ValueError as exc:
             raise RouterRuntimeIntegrityError(f"router policy {policy_id} is invalid") from exc
-        return cls(
-            policy,
-            manifest,
-            bank,
+        if pricing_snapshot_id != activation.pricing.pricing_snapshot_id:
+            raise RouterRuntimeIntegrityError(f"router policy {policy_id} is invalid")
+        return cls.from_activation(
+            activation,
             catalog,
-            pricing_snapshot_id=pricing_snapshot_id,
-            pricing_snapshot_sha256=pricing_sha256,
+            decision_sink=decision_sink,
+        )
+
+    @classmethod
+    def from_activation(
+        cls,
+        activation: ProjectActivation,
+        catalog: RuntimeModelCatalog,
+        *,
+        decision_sink: DecisionSink | None = None,
+    ) -> RouterRuntime:
+        """Bind immutable selection material to runtime-owned model resolution.
+
+        Args:
+            activation: Verified project identifiers, policy, bank, and pricing material.
+            catalog: Active catalog used to resolve the embedder and verify candidate pins.
+            decision_sink: Optional aggregate-safe routing-decision recorder.
+
+        Returns:
+            Selection runtime with no candidate provider request issued during activation.
+        """
+        return cls(
+            activation.policy,
+            activation.bank_manifest,
+            activation.bank,
+            catalog,
+            pricing_snapshot_id=activation.pricing.pricing_snapshot_id,
+            pricing_snapshot_sha256=activation.pricing_sha256,
             pricing_candidate_aliases=tuple(
-                item.candidate_alias for item in pricing.candidate_prices
+                item.candidate_alias for item in activation.pricing.candidate_prices
             ),
-            pricing_candidate_prices=pricing.candidate_prices,
+            pricing_candidate_prices=activation.pricing.candidate_prices,
             decision_sink=decision_sink,
         )
 
@@ -699,13 +661,14 @@ class RouterRuntime:
                     request_key, RoutedSpendDisposition.DEFINITELY_NOT_INCURRED
                 )
         resolved = self._resolve(selected.selected_alias)
-        if _requires_tool_protocol(request) and not resolved.capabilities.supports_tools:
+        if _requires_tool_protocol(request) and resolved.capabilities.supports_tools is False:
             raise RouterModelCapabilityError(
                 f"routed model alias {selected.selected_alias!r} does not support tool calls"
             )
-        if request.maximum_output_tokens is not None and (
-            resolved.capabilities.maximum_output_tokens is None
-            or request.maximum_output_tokens > resolved.capabilities.maximum_output_tokens
+        if (
+            request.maximum_output_tokens is not None
+            and resolved.capabilities.maximum_output_tokens is not None
+            and request.maximum_output_tokens > resolved.capabilities.maximum_output_tokens
         ):
             raise RouterModelCapabilityError(
                 f"routed model alias {selected.selected_alias!r} cannot prove the requested "

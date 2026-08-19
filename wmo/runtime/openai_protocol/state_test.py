@@ -131,6 +131,99 @@ def test_replay_capacity_rejects_new_work_without_evicting_inflight_owners() -> 
     asyncio.run(scenario())
 
 
+def test_cancelled_replay_joiner_does_not_cancel_shared_ownership() -> None:
+    """Cancelling one waiter preserves owner publication and later exact replay."""
+
+    async def scenario() -> None:
+        """Cancel a join, publish through the owner, and replay the result."""
+        store = BoundedReplayStore(capacity=2, byte_cap=1_024, ttl_seconds=60)
+        key = replay_key(
+            namespace=_namespace(),
+            surface=GatewayApiSurface.RESPONSES,
+            caller_operation="operation-one",
+            canonical_request_sha256=_REQUEST_DIGEST,
+        )
+        assert key is not None
+        owner = await store.claim(key)
+        joiner = await store.claim(key)
+        waiting = asyncio.create_task(joiner.result())
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+
+        response = CachedResponse(
+            status_code=200,
+            media_type="application/json",
+            body=b'{"id":"response-one"}',
+        )
+        await owner.complete(response)
+        replay = await store.claim(key)
+        assert replay.kind == ReplayClaimKind.REPLAY
+        assert await replay.result() == response
+
+    asyncio.run(scenario())
+
+
+def test_abandoned_replay_owner_wakes_joiners_with_unavailable_error() -> None:
+    """Owner cancellation releases joiners through a defined fail-closed result."""
+
+    async def scenario() -> None:
+        """Abandon one owner and prove its joiner can fail without cancellation."""
+        store = BoundedReplayStore(capacity=2, byte_cap=1_024, ttl_seconds=60)
+        key = replay_key(
+            namespace=_namespace(),
+            surface=GatewayApiSurface.RESPONSES,
+            caller_operation="operation-one",
+            canonical_request_sha256=_REQUEST_DIGEST,
+        )
+        assert key is not None
+        owner = await store.claim(key)
+        joiner = await store.claim(key)
+        waiting = asyncio.create_task(joiner.result())
+        await asyncio.sleep(0)
+        await owner.abandon()
+
+        with pytest.raises(OpenAIProtocolError) as captured:
+            await waiting
+        assert captured.value.detail.code == "idempotency_replay_unavailable"
+        replacement = await store.claim(key)
+        assert replacement.kind == ReplayClaimKind.OWNER
+        await replacement.abandon()
+
+    asyncio.run(scenario())
+
+
+def test_replay_rejects_unretainable_response_and_releases_ownership() -> None:
+    """An oversized result fails closed and leaves no false completed replay."""
+
+    async def scenario() -> None:
+        """Reject one publication, then prove the operation can be owned again."""
+        store = BoundedReplayStore(capacity=1, byte_cap=8, ttl_seconds=60)
+        key = replay_key(
+            namespace=_namespace(),
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            caller_operation="operation-one",
+            canonical_request_sha256=_REQUEST_DIGEST,
+        )
+        assert key is not None
+        owner = await store.claim(key)
+        with pytest.raises(OpenAIProtocolError) as captured:
+            await owner.complete(
+                CachedResponse(
+                    status_code=200,
+                    media_type="application/json",
+                    body=b"response exceeds the bound",
+                )
+            )
+        assert captured.value.detail.code == "idempotency_replay_unavailable"
+        replacement = await store.claim(key)
+        assert replacement.kind == ReplayClaimKind.OWNER
+        await replacement.abandon()
+
+    asyncio.run(scenario())
+
+
 def test_continuation_is_bounded_namespaced_and_restart_unavailable() -> None:
     """Responses history obeys identity, alias revision, capacity, TTL, and restart boundaries."""
 
@@ -160,12 +253,15 @@ def test_continuation_is_bounded_namespaced_and_restart_unavailable() -> None:
                 namespace=_namespace(identity="identity-two"),
                 previous_response_id="resp_one",
             )
+        await store.remember(namespace=_namespace(), response_id="resp_two", state=state)
+        with pytest.raises(OpenAIProtocolError, match="unavailable or expired"):
+            await store.resolve(namespace=_namespace(), previous_response_id="resp_one")
         restarted = BoundedContinuationStore()
         with pytest.raises(OpenAIProtocolError, match="unavailable or expired"):
             await restarted.resolve(namespace=_namespace(), previous_response_id="resp_one")
 
         now[0] = 111.0
         with pytest.raises(OpenAIProtocolError, match="unavailable or expired"):
-            await store.resolve(namespace=_namespace(), previous_response_id="resp_one")
+            await store.resolve(namespace=_namespace(), previous_response_id="resp_two")
 
     asyncio.run(scenario())

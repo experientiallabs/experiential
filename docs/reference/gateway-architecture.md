@@ -15,6 +15,41 @@ It serves:
 same gateway application. It does not create a router HTTP server. Gateway startup and readiness
 perform no provider request. Only an authorized model request may cross the provider boundary.
 
+## Embeddable worker composition
+
+Platform workers use the public `create_gateway_runtime` seam. The worker supplies storage,
+provider, secret, project-selection, clock, readiness, and usage implementations, then owns the
+returned lifecycle handle:
+
+```python
+runtime = wmo.create_gateway_runtime(
+    config=wmo.GatewayRuntimeConfig(graceful_timeout_seconds=10),
+    authority=authority,
+    ledger=ledger,
+    routes=routes,
+    executor=executor,
+    clock=clock,
+    readiness=readiness,
+    usage=usage,
+    replay=replay,
+    continuations=continuations,
+)
+
+app = runtime.app
+# Serve app with the platform's ASGI worker, including ASGI lifespan.
+```
+
+The factory performs no filesystem, SQLite, environment, lock, or server access. A worker may use
+any `SecretResolver` while constructing its provider executor and any `ProjectTargetResolver`
+while constructing its catalog route resolver. The composed application always mounts the same
+`create_gateway_app` data plane used by the local CLI. The lifecycle exposes explicit preflight,
+readiness, bounded drain, and shutdown operations in addition to its ASGI lifespan.
+
+An ASGI host that drives application lifespan owns preflight and shutdown automatically. A host
+that does not drive lifespan calls `runtime.preflight()` before admission and
+`runtime.shutdown()` during teardown. Shutdown is idempotent across those paths: one runtime starts
+one bounded drain and one terminal flush, then remains permanently not ready.
+
 ## Authority and management
 
 `wmo config gateway` owns explicit local setup. Its provider, identity, key, grant, alias, pool, and

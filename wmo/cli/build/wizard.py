@@ -184,14 +184,18 @@ def run_build_wizard(
                 f"${cost_plan.required_provider_cost_usd:.2f}; increase "
                 "--max-router-cost-usd or omit it"
             )
-    if not plan.build_reused and plan.build_estimate_usd > maximum_build_cost_usd:
+    if (
+        not plan.build_reused
+        and plan.build_estimate_usd is not None
+        and plan.build_estimate_usd > maximum_build_cost_usd
+    ):
         raise ValueError(
             f"grounded build requires ${plan.build_estimate_usd:.2f}, above the configured "
             f"${maximum_build_cost_usd:.2f} ceiling; increase --max-build-cost-usd"
         )
     build_estimate = 0.0 if plan.build_reused else plan.build_estimate_usd
-    total_estimate = math.fsum((build_estimate, router_ceiling))
-    if total_estimate > 0 and not require_spend_consent(
+    total_estimate = None if build_estimate is None else math.fsum((build_estimate, router_ceiling))
+    if (total_estimate is None or total_estimate > 0) and not require_spend_consent(
         console,
         root=root,
         yes=False,

@@ -63,6 +63,18 @@ def test_model_catalog_round_trip_preserves_aliases_and_environment_name(tmp_pat
     assert "api_key =" not in path.read_text(encoding="utf-8")
 
 
+def test_model_record_rejects_empty_and_oversized_served_model_id() -> None:
+    """The served-model pin keeps the same bounded shape as the requested model ID."""
+    for invalid in ("", "x" * 2_049):
+        with pytest.raises(ValidationError, match="served_model_id"):
+            ModelRecord(
+                connection="openrouter",
+                model="deepseek/deepseek-v4-flash",
+                served_model_id=invalid,
+                billing_source=BillingSource.HOST_MANAGED,
+            )
+
+
 def test_model_record_round_trips_an_alternate_served_identity(tmp_path: Path) -> None:
     """A declared served identity persists so vLLM alias endpoints stay resolvable."""
     path = tmp_path / "models.toml"

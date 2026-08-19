@@ -83,7 +83,7 @@ def _authorize(
     console: Console,
     root: Path,
     *,
-    estimate: float,
+    estimate: float | None,
     yes: bool = False,
     non_interactive: bool = False,
     previously_confirmed: bool = False,
@@ -378,3 +378,69 @@ def test_invalid_estimate_fails_closed(tmp_path: Path, estimate: float) -> None:
 
     with pytest.raises(typer.BadParameter, match="finite and nonnegative"):
         _authorize(console, tmp_path / ".wmo", estimate=estimate, yes=True)
+
+
+def test_undefined_cost_warns_and_requires_an_explicit_interactive_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive_stdin: None,
+) -> None:
+    """An unpriced model never runs automatically and asks for a manual override."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(True)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, buffer = _console(terminal=True)
+
+    assert _authorize(console, root, estimate=None)
+    assert len(answer.asked) == 1
+    assert "undefined amount" in answer.asked[0]
+    assert answer.defaults == [False]
+    assert "cost of this command is undefined" in _flat(buffer)
+
+
+def test_undefined_cost_interactive_decline_authorizes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interactive_stdin: None,
+) -> None:
+    """Declining the undefined-cost override refuses the spend."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(False)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, _buffer = _console(terminal=True)
+
+    assert not _authorize(console, root, estimate=None)
+    assert len(answer.asked) == 1
+
+
+def test_undefined_cost_accepts_an_explicit_yes_flag_with_a_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit --yes is the manual override for an undefined estimate."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    answer = _Answer(False)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
+    console, buffer = _console(terminal=False)
+
+    assert _authorize(console, root, estimate=None, yes=True)
+    assert answer.asked == []
+    assert "cost of this command is undefined" in _flat(buffer)
+
+
+def test_undefined_cost_noninteractive_without_yes_exits_without_spend(
+    tmp_path: Path,
+) -> None:
+    """A session that cannot prompt fails closed on an undefined estimate."""
+    root = tmp_path / ".wmo"
+    set_maximum_command_cost_usd(20.0, root)
+    console, buffer = _console(terminal=False)
+
+    with pytest.raises(typer.Exit) as caught:
+        _authorize(console, root, estimate=None, non_interactive=True)
+
+    assert caught.value.exit_code == NO_CONSENT_EXIT_CODE
+    assert "manual override" in _flat(buffer)

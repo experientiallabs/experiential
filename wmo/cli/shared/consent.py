@@ -45,7 +45,7 @@ def require_spend_consent(
     *,
     root: str | Path = ARTIFACT_DIR,
     yes: bool,
-    estimated_cost_usd: float,
+    estimated_cost_usd: float | None,
     command: str,
     non_interactive: bool = False,
     previously_confirmed: bool = False,
@@ -58,11 +58,18 @@ def require_spend_consent(
     can override, defaulting to no; without a terminal the invocation fails before credentials
     or provider clients, and ``--yes`` never overrides the ceiling.
 
+    An undefined estimate (``None``) means the catalog carries no pricing for a selected model,
+    so no ceiling comparison is possible. WMO reports the cost as undefined honestly instead of
+    fabricating a number: execution is never automatic and always requires a manual override,
+    either ``--yes``, a prior immutable confirmation, or an explicit terminal answer after the
+    undefined-cost warning.
+
     Args:
         console: Command-owned output console.
         root: WMO root that owns ``settings.toml``.
         yes: Explicit invocation confirmation for an in-budget estimate.
-        estimated_cost_usd: Conservative upper-bound estimate for this invocation.
+        estimated_cost_usd: Conservative upper-bound estimate, or ``None`` when the selected
+            models carry no catalog pricing and the cost cannot be estimated.
         command: Complete command identity shown to the operator.
         non_interactive: Whether this invocation forbids terminal questions.
         previously_confirmed: Whether immutable command state records an earlier confirmation.
@@ -75,6 +82,14 @@ def require_spend_consent(
             configured budget without a terminal able to override it.
         typer.Exit: No explicit confirmation is available in a noninteractive session.
     """
+    if estimated_cost_usd is None:
+        return _confirm_undefined_cost(
+            console,
+            command=command,
+            yes=yes,
+            non_interactive=non_interactive,
+            previously_confirmed=previously_confirmed,
+        )
     estimate = _cost_decimal(estimated_cost_usd, label="estimated command cost")
     try:
         configured = resolve_command_budget_usd(root, None)
@@ -94,6 +109,58 @@ def require_spend_consent(
         return Confirm.ask(prompt, default=False, console=console)
     except EOFError:
         _refuse_unanswered(console, command=command, estimate=estimate, budget=budget)
+
+
+def _confirm_undefined_cost(
+    console: Console,
+    *,
+    command: str,
+    yes: bool,
+    non_interactive: bool,
+    previously_confirmed: bool,
+) -> bool:
+    """Warn that the cost is undefined and require a manual override before any spend.
+
+    Args:
+        console: Command-owned output console.
+        command: Complete command identity.
+        yes: Explicit invocation confirmation flag.
+        non_interactive: Whether this invocation forbids terminal questions.
+        previously_confirmed: Whether immutable command state records an earlier confirmation.
+
+    Returns:
+        True only after an explicit override; a blank answer or a decline authorizes nothing.
+
+    Raises:
+        typer.Exit: No manual override is available in a noninteractive session, or terminal
+            input ended before an answer.
+    """
+    console.print(
+        "[yellow]warning[/yellow] the cost of this command is undefined: a selected model has "
+        "no catalog pricing, so WMO cannot estimate the spend or enforce the configured budget."
+    )
+    if yes or previously_confirmed:
+        return True
+    if non_interactive or not can_prompt(console):
+        console.print(
+            "authorization: an undefined cost always requires a manual override. This session "
+            f"cannot prompt; re-run {escape(command)} with --yes to accept the undefined cost, "
+            "or record explicit model pricing to restore budget enforcement."
+        )
+        raise typer.Exit(NO_CONSENT_EXIT_CODE)
+    prompt = f"Authorize {command} to spend an undefined amount?"
+    try:
+        confirmed = Confirm.ask(prompt, default=False, console=console)
+    except EOFError:
+        console.print(
+            "authorization: input ended before confirmation. No spend was authorized. Re-run "
+            f"{escape(command)} with --yes to accept the undefined cost."
+        )
+        raise typer.Exit(NO_CONSENT_EXIT_CODE) from None
+    if confirmed:
+        return True
+    console.print("No spend was authorized.")
+    return False
 
 
 def _confirm_over_budget(

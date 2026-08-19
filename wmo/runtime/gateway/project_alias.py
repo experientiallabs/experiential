@@ -5,9 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
 
-from wmo.common.core.artifacts import ArtifactId, sha256_json, stable_id
+from wmo.common.core.artifacts import sha256_json, stable_id
 from wmo.common.models import (
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
@@ -16,24 +15,11 @@ from wmo.common.models import (
 )
 from wmo.runtime.gateway.catalog_authority import snapshot_current_catalog
 from wmo.runtime.gateway.management import GatewayManagement
+from wmo.runtime.gateway.project_activation import (
+    ProjectActivationRepository,
+    require_project_activation_authority,
+)
 from wmo.runtime.models import RuntimeModelCatalog
-from wmo.runtime.router.runtime import RouterRuntime
-
-
-class ProjectAliasLoader(Protocol):
-    """Load one exact frozen project runtime without provider execution."""
-
-    def __call__(
-        self,
-        project: str,
-        root: Path,
-        *,
-        policy_id: ArtifactId | None = None,
-        environment: Mapping[str, str] | None = None,
-        runtime_catalog: RuntimeModelCatalog | None = None,
-    ) -> RouterRuntime:
-        """Return one verified selection-only router runtime."""
-        ...
 
 
 @dataclass(frozen=True)
@@ -52,7 +38,7 @@ def prepare_project_gateway_alias(
     root: Path,
     *,
     policy_id: str | None,
-    project_loader: ProjectAliasLoader,
+    project_repository: ProjectActivationRepository,
     environment: Mapping[str, str] | None = None,
     runtime_catalog: RuntimeModelCatalog | None = None,
 ) -> ProjectGatewayAlias:
@@ -62,27 +48,34 @@ def prepare_project_gateway_alias(
         project: Existing immutable project name and public compatibility alias.
         root: WMO artifact and gateway root.
         policy_id: Optional exact frozen router policy.
-        project_loader: Verified selection-only runtime loader.
+        project_repository: Verified immutable project activation repository.
         environment: Optional provider environment used by compatibility clients.
         runtime_catalog: Optional preconstructed catalog used by deterministic callers.
 
     Returns:
         Exact alias, identity, and policy authority for the shared gateway.
     """
+    catalog_for_activation = runtime_catalog or RuntimeModelCatalog(
+        load_model_catalog(root / "models.toml"),
+        environment=environment,
+    )
+    activation = project_repository.load(
+        project,
+        policy_id,
+        runtime_catalog=catalog_for_activation,
+    )
+    require_project_activation_authority(
+        activation,
+        project_ref=project,
+        activation_ref=policy_id,
+    )
     manager = GatewayManagement(root)
     if not manager.initialized:
         manager.initialize()
     manager.migrate_legacy_provider_connections()
-    runtime = project_loader(
-        project,
-        root,
-        policy_id=policy_id,
-        environment=environment,
-        runtime_catalog=runtime_catalog,
-    )
     metadata_changed = _migrate_legacy_project_gateway_metadata(
         root,
-        aliases=tuple(candidate.alias for candidate in runtime.policy.candidates),
+        aliases=activation.candidate_aliases,
     )
     serving_connections = {
         item.connection_id: item.config for item in manager.provider_connections()
@@ -94,7 +87,7 @@ def prepare_project_gateway_alias(
     deployment_aliases = {item.source_alias for item in normalized.deployments}
     missing = sorted(
         candidate.alias
-        for candidate in runtime.policy.candidates
+        for candidate in activation.policy.candidates
         if candidate.alias not in deployment_aliases
     )
     if missing:
@@ -107,7 +100,7 @@ def prepare_project_gateway_alias(
         "project-gateway-alias-revision",
         {
             "project": project,
-            "policy_id": runtime.policy.policy_id,
+            "policy_id": activation.activation_ref,
             "catalog_sha256": catalog_sha256,
         },
     )
@@ -116,7 +109,7 @@ def prepare_project_gateway_alias(
         alias_name=project,
         revision_id=revision_id,
         project_ref=project,
-        activation_ref=runtime.policy.policy_id,
+        activation_ref=activation.activation_ref,
         snapshot_ref=f"catalog-snapshots/{snapshot.name}",
         catalog_sha256=catalog_sha256,
         provider_connections=manager.provider_bindings(catalog),
@@ -135,7 +128,7 @@ def prepare_project_gateway_alias(
         alias=project,
         alias_revision_id=revision_id,
         identity_id=identity_id,
-        policy_id=runtime.policy.policy_id,
+        policy_id=activation.activation_ref,
         changed=metadata_changed or alias_changed or identity_changed or grant_changed,
     )
 
