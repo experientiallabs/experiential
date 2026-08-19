@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import ValidationError
+from pydantic import ValidationError, field_validator
 
 from wmo.common.core.artifacts import ContractModel, Sha256, canonical_json_bytes, sha256_json
 from wmo.runtime.gateway.auth import utc_text
@@ -59,6 +59,23 @@ class _KeyOutputMarker(ContractModel):
     target_path_sha256: Sha256
     output_sha256: Sha256
     output_length: Literal[64]
+    reservation_name: str
+    target_device: int
+    target_inode: int
+
+    @field_validator("reservation_name")
+    @classmethod
+    def _require_reservation_basename(cls, value: str) -> str:
+        """Reject reservation paths that could escape the output directory."""
+        if (
+            not value
+            or value in {".", ".."}
+            or Path(value).name != value
+            or not value.startswith(".")
+            or not value.endswith(".reserve")
+        ):
+            raise ValueError("key output reservation must be one basename")
+        return value
 
     def evidence(self) -> key_delivery.KeyDeliveryEvidence:
         """Return the exact database reconciliation identity."""
@@ -114,20 +131,39 @@ def deliver_key_output(
     payload = f"{raw_key}\n".encode()
     if len(payload) != _KEY_OUTPUT_LENGTH:
         raise ValueError("virtual key output has an unexpected length")
-    marker = _KeyOutputMarker(
-        **asdict(evidence),
-        target_path_sha256=_target_path_sha256(path),
-        output_sha256=hashlib.sha256(payload).hexdigest(),
-        output_length=_KEY_OUTPUT_LENGTH,
-    )
+    reservation = path.with_name(f".{path.name}.{uuid.uuid4().hex}.reserve")
     marker_path = key_output_marker_path(path)
-    marker_identity = _write_marker_once(marker_path, marker)
     descriptor = -1
-    published = False
-    output_identity: _FileIdentity | None = None
+    reservation_identity: _FileIdentity | None = None
+    marker: _KeyOutputMarker | None = None
+    marker_identity: _FileIdentity | None = None
+    target_linked = False
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        published = True
+        descriptor = os.open(
+            reservation,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        created = os.fstat(descriptor)
+        reservation_identity = _identity_from_stat(created)
+        marker = _KeyOutputMarker(
+            **asdict(evidence),
+            target_path_sha256=_target_path_sha256(path),
+            output_sha256=hashlib.sha256(payload).hexdigest(),
+            output_length=_KEY_OUTPUT_LENGTH,
+            reservation_name=reservation.name,
+            target_device=created.st_dev,
+            target_inode=created.st_ino,
+        )
+        marker_identity = _write_marker_once(marker_path, marker)
+        os.link(reservation, path, follow_symlinks=False)
+        target_linked = True
+        _fsync_directory(path.parent)
+        reservation_identity = _recorded_inode_identity(reservation, marker)
+        if reservation_identity is None or reservation_identity.size != 0:
+            raise KeyOutputRecoveryError("key output reservation changed before publication")
+        _unlink_exact_inode(reservation, reservation_identity)
+        _fsync_directory(reservation.parent)
         written = 0
         while written < len(payload):
             count = os.write(descriptor, payload[written:])
@@ -136,27 +172,45 @@ def deliver_key_output(
             written += count
         os.fchmod(descriptor, 0o600)
         os.fsync(descriptor)
-        output_identity = _identity_from_stat(os.fstat(descriptor))
         os.close(descriptor)
         descriptor = -1
         _fsync_directory(path.parent)
     except BaseException as publication_error:
         if descriptor >= 0:
-            output_identity = _identity_from_stat(os.fstat(descriptor))
             os.close(descriptor)
-        if published:
-            if output_identity is None:
+        if marker is not None and target_linked and _lexists(path):
+            target_identity = _recorded_inode_identity(path, marker)
+            if target_identity is None:
                 raise KeyOutputRecoveryError(
-                    "key output identity is unavailable; preserving recovery evidence"
+                    "key output changed during publication; preserving recovery evidence"
                 ) from publication_error
-            _unlink_exact_inode(path, output_identity)
+            _unlink_exact_inode(path, target_identity)
             _fsync_directory(path.parent)
-        _unlink_exact_inode(marker_path, marker_identity)
-        _fsync_directory(marker_path.parent)
+        if _lexists(reservation):
+            current_reservation = (
+                _recorded_inode_identity(reservation, marker)
+                if marker is not None
+                else reservation_identity
+            )
+            if current_reservation is None:
+                raise KeyOutputRecoveryError(
+                    "key output reservation changed; preserving recovery evidence"
+                ) from publication_error
+            _unlink_exact_inode(reservation, current_reservation)
+            _fsync_directory(reservation.parent)
+        if marker_identity is not None:
+            _unlink_exact_inode(marker_path, marker_identity)
+            _fsync_directory(marker_path.parent)
         raise
+
+    assert marker is not None
 
     def rollback() -> None:
         """Remove only exact-owned output after SQLite proves rollback."""
+        if _lexists(_reservation_path(path, marker)):
+            raise KeyOutputRecoveryError(
+                "key output reservation still exists; preserving recovery evidence"
+            )
         identity = _require_exact_output(path, marker)
         _unlink_exact_inode(path, identity)
         _fsync_directory(path.parent)
@@ -204,6 +258,7 @@ def recover_key_output(
     if not _lexists(marker_path):
         return None
     marker, marker_identity = _read_marker(marker_path)
+    reservation = _reservation_path(path, marker)
     expected_request_sha256 = sha256_json(
         {
             "organization_id": organization_id,
@@ -230,22 +285,39 @@ def recover_key_output(
         evidence=marker.evidence(),
     )
     output_exists = _lexists(path)
+    reservation_exists = _lexists(reservation)
     output_identity = _exact_output_identity(path, marker) if output_exists else None
     if outcome is False:
-        if output_exists and output_identity is None:
+        rollback_identity = _recorded_inode_identity(path, marker) if output_exists else None
+        reservation_identity = (
+            _recorded_inode_identity(reservation, marker) if reservation_exists else None
+        )
+        if output_exists and rollback_identity is None:
             raise KeyOutputRecoveryError(
                 "interrupted key output differs from its durable ownership evidence"
             )
-        if output_identity is not None:
-            _unlink_exact_inode(path, output_identity)
+        if reservation_exists and (reservation_identity is None or reservation_identity.size != 0):
+            raise KeyOutputRecoveryError(
+                "interrupted key output reservation differs from its ownership evidence"
+            )
+        if rollback_identity is not None:
+            _unlink_exact_inode(path, rollback_identity)
             _fsync_directory(path.parent)
+        if reservation_identity is not None:
+            current_reservation = _recorded_inode_identity(reservation, marker)
+            if current_reservation is None or current_reservation.size != 0:
+                raise KeyOutputRecoveryError(
+                    "key output reservation changed before recovery cleanup"
+                )
+            _unlink_exact_inode(reservation, current_reservation)
+            _fsync_directory(reservation.parent)
         _unlink_exact_inode(marker_path, marker_identity)
         _fsync_directory(marker_path.parent)
         return None
     if outcome is True:
-        if output_identity is None:
+        if output_identity is None or reservation_exists:
             raise KeyOutputRecoveryError(
-                "committed key output is missing or differs from its ownership evidence"
+                "committed key output or reservation differs from its ownership evidence"
             )
         return RecoveredKeyOutput(key_id=marker.key_id, prefix=marker.prefix)
     raise KeyOutputOutcomeUnknownError(key_id=marker.key_id, prefix=marker.prefix)
@@ -262,6 +334,11 @@ def settle_key_output(path: Path) -> None:
     """
     marker_path = key_output_marker_path(path)
     marker, marker_identity = _read_marker(marker_path)
+    reservation = _reservation_path(path, marker)
+    if _lexists(reservation):
+        raise KeyOutputRecoveryError(
+            "key output reservation still exists; preserving recovery evidence"
+        )
     _require_exact_output(path, marker)
     _unlink_exact_inode(marker_path, marker_identity)
     _fsync_directory(marker_path.parent)
@@ -339,6 +416,41 @@ def _exact_output_identity(path: Path, marker: _KeyOutputMarker) -> _FileIdentit
     return identity
 
 
+def _recorded_inode_identity(path: Path, marker: _KeyOutputMarker) -> _FileIdentity | None:
+    """Return one bounded private file matching the recorded reservation inode."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            metadata = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_mode & 0o077
+        or metadata.st_size > marker.output_length
+        or (metadata.st_dev, metadata.st_ino) != (marker.target_device, marker.target_inode)
+    ):
+        return None
+    return _identity_from_stat(metadata)
+
+
+def _reservation_path(path: Path, marker: _KeyOutputMarker) -> Path:
+    """Resolve and validate the marker-bound reservation beside one output."""
+    prefix = f".{path.name}."
+    suffix = ".reserve"
+    name = marker.reservation_name
+    token = name[len(prefix) : -len(suffix)] if name.startswith(prefix) else ""
+    if (
+        not name.endswith(suffix)
+        or len(token) != 32
+        or any(character not in "0123456789abcdef" for character in token)
+    ):
+        raise KeyOutputRecoveryError("key output reservation identity is invalid")
+    return path.with_name(name)
+
+
 def _read_private_regular(
     path: Path,
     *,
@@ -367,6 +479,12 @@ def _read_private_regular(
 
 def _unlink_exact_inode(path: Path, identity: _FileIdentity) -> None:
     """Unlink only when a final no-follow stat still names the verified inode."""
+    _require_exact_inode(path, identity)
+    path.unlink()
+
+
+def _require_exact_inode(path: Path, identity: _FileIdentity) -> None:
+    """Require a final no-follow stat to retain every verified file attribute."""
     metadata = os.stat(path, follow_symlinks=False)
     if not stat.S_ISREG(metadata.st_mode) or (
         metadata.st_dev,
@@ -382,7 +500,6 @@ def _unlink_exact_inode(path: Path, identity: _FileIdentity) -> None:
         identity.changed_ns,
     ):
         raise KeyOutputRecoveryError("key output state changed before cleanup")
-    path.unlink()
 
 
 def _identity_from_stat(metadata: os.stat_result) -> _FileIdentity:

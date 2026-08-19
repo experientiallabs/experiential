@@ -258,12 +258,22 @@ def test_key_output_failure_rolls_back_key_receipt_and_partial_file(
     assert len(manager.keys()) == 1
 
 
-@pytest.mark.parametrize("crash_phase", ("precommit", "postcommit"))
+@pytest.mark.parametrize(
+    ("crash_phase", "return_code"),
+    (("reserved", 68), ("linked", 69), ("partial", 70), ("precommit", 71), ("postcommit", 72)),
+)
 def test_key_output_process_crash_recovers_exact_delivery(
     tmp_path: Path,
     crash_phase: str,
+    return_code: int,
 ) -> None:
-    """Restart reconciles exact output across pre- and post-COMMIT process death."""
+    """Restart reconciles each durable publication transition after process death.
+
+    Args:
+        tmp_path: Pytest-owned gateway root and output directory.
+        crash_phase: Durable key-publication transition that kills the child.
+        return_code: Expected child-process exit status.
+    """
     manager = GatewayManagement(tmp_path)
     manager.initialize()
     manager.create_identity(identity_id="default", display_name="Default")
@@ -274,7 +284,7 @@ import sys
 from functools import partial
 from pathlib import Path
 
-from wmo.cli.gateway.key_output import deliver_key_output
+from wmo.cli.gateway import key_output
 from wmo.runtime.gateway.management import GatewayManagement
 
 root = Path(sys.argv[1])
@@ -282,6 +292,24 @@ output = Path(sys.argv[2])
 phase = sys.argv[3]
 manager = GatewayManagement(root)
 store = manager.require_initialized()
+original_link = key_output.os.link
+original_write = key_output.os.write
+if phase in {"reserved", "linked"}:
+    def crash_around_target_link(source, target, *args, **kwargs):
+        if Path(target) == output and phase == "reserved":
+            os._exit(68)
+        result = original_link(source, target, *args, **kwargs)
+        if Path(target) == output:
+            os._exit(69)
+        return result
+    key_output.os.link = crash_around_target_link
+if phase == "partial":
+    def crash_mid_output(descriptor, payload):
+        if payload.startswith(b"wmo_vk_"):
+            original_write(descriptor, payload[:8])
+            os._exit(70)
+        return original_write(descriptor, payload)
+    key_output.os.write = crash_mid_output
 if phase == "precommit":
     def crash_before_commit(*_args, **_kwargs):
         os._exit(71)
@@ -291,7 +319,7 @@ store.issue_virtual_key(
     identity_id="default",
     key_id="key-one",
     operation_id="operation-one",
-    secret_delivery=partial(deliver_key_output, output),
+    secret_delivery=partial(key_output.deliver_key_output, output),
 )
 os._exit(72)
 """
@@ -303,11 +331,14 @@ os._exit(72)
         text=True,
     )
 
-    assert crashed.returncode == (71 if crash_phase == "precommit" else 72)
+    assert crashed.returncode == return_code
     marker = gateway_key_output.key_output_marker_path(output)
-    assert output.is_file()
     assert marker.is_file()
-    before = output.read_bytes()
+    if crash_phase == "reserved":
+        assert not output.exists()
+    else:
+        assert output.is_file()
+    before = output.read_bytes() if output.exists() else b""
     runner = CliRunner()
     retried = runner.invoke(
         app,
@@ -339,6 +370,7 @@ os._exit(72)
         assert "status" not in receipt["data"]
         assert receipt["changed"] is True
     assert not marker.exists()
+    assert tuple(tmp_path.glob(".issued-key.*.reserve")) == ()
     assert len(manager.keys()) == 1
 
 
@@ -370,6 +402,7 @@ def test_key_output_crash_recovery_preserves_mismatched_output(tmp_path: Path) -
     )
     gateway_key_output.deliver_key_output(output, raw_key, evidence)
     marker = gateway_key_output.key_output_marker_path(output)
+    output.unlink()
     output.write_text("tampered\n", encoding="utf-8")
 
     result = CliRunner().invoke(
@@ -429,7 +462,10 @@ def test_key_output_delivery_failure_preserves_replacement(
         return written
 
     monkeypatch.setattr(gateway_key_output.os, "write", replace_output)
-    with pytest.raises(gateway_key_output.KeyOutputRecoveryError, match="changed before cleanup"):
+    with pytest.raises(
+        gateway_key_output.KeyOutputRecoveryError,
+        match="changed during publication",
+    ):
         gateway_key_output.deliver_key_output(output, raw_key, evidence)
 
     assert output.read_text(encoding="utf-8") == "unrelated"
