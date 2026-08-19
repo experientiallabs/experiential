@@ -706,6 +706,7 @@ def _require_deployment_identity(
         or served_model != deployment.provider_model
         or resolved.snapshot.revision != deployment.revision
         or resolved.snapshot.connection_sha256 != deployment.connection_sha256
+        or resolved.snapshot.billing_source != deployment.billing_source
         or (
             deployment.capabilities is not None and resolved.capabilities != deployment.capabilities
         )

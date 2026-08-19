@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Callable
 import httpx
 import pytest
 
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 from wmo.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEventKind,
@@ -127,6 +127,7 @@ def _client(
     snapshot = ModelSnapshot(
         provider=provider,
         model_id="deployment-one" if provider == "azure" else "vendor/model-one",
+        billing_source=BillingSource.CUSTOMER_MANAGED,
         capabilities_sha256="a" * 64,
         connection_sha256="b" * 64,
     )

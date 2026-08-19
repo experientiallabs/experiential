@@ -131,6 +131,7 @@ def upsert_singleton_deployment(
     gateway_capabilities: GatewayDeploymentCapabilities,
     prices: GatewayTokenPrices,
     pricing_source: str | None,
+    billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
     replace: bool,
     serving_connections: dict[str, ConnectionConfig] | None = None,
 ) -> tuple[NormalizedGatewayCatalog, Path, bool]:
@@ -147,6 +148,7 @@ def upsert_singleton_deployment(
         gateway_capabilities: Gateway protocol capability declaration.
         prices: Integer attribution rates, with unknown represented by ``None``.
         pricing_source: Optional provenance label for the rates.
+        billing_source: Credential ownership frozen for every dispatched attempt.
         replace: Whether an existing deployment alias may change.
         serving_connections: SQLite-authoritative connection metadata for serving snapshots.
 
@@ -179,7 +181,7 @@ def upsert_singleton_deployment(
             connection=connection_name,
             model=provider_model,
             revision=revision,
-            billing_source=BillingSource.CUSTOMER_MANAGED,
+            billing_source=billing_source,
             capabilities=capabilities,
             gateway=GatewayDeploymentMetadata(
                 exact_model_id=exact_model_id,

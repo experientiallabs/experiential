@@ -8,7 +8,7 @@ from collections.abc import Iterator, Mapping
 
 import pytest
 
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 from wmo.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEventKind,
@@ -328,6 +328,7 @@ def _client(runtime: _Runtime) -> BoundedBedrockClient:
             model=ModelSnapshot(
                 provider="bedrock",
                 model_id="exact-model",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
                 capabilities_sha256="a" * 64,
                 connection_sha256="b" * 64,
             ),

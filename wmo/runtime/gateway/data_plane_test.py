@@ -602,7 +602,17 @@ def test_project_episode_identity_cannot_collide_through_component_delimiters() 
     assert first != second
 
 
-def test_executor_rejects_runtime_client_drift_before_attempt_or_network() -> None:
+@pytest.mark.parametrize(
+    "deployment_update",
+    (
+        {"provider_model": "different-model"},
+        {"billing_source": BillingSource.HOST_MANAGED},
+    ),
+    ids=("served-model", "billing-source"),
+)
+def test_executor_rejects_runtime_client_drift_before_attempt_or_network(
+    deployment_update: dict[str, object],
+) -> None:
     """Revision-scoped execution verifies the frozen provider client before dispatch."""
 
     async def scenario() -> None:
@@ -630,7 +640,7 @@ def test_executor_rejects_runtime_client_drift_before_attempt_or_network() -> No
                 pool_id="pool-one",
                 deployment_ids=("deployment-one",),
             ),
-            deployment=deployment.model_copy(update={"provider_model": "different-model"}),
+            deployment=deployment.model_copy(update=deployment_update),
             route_reason="direct",
         )
         executor = GatewayExecutor(

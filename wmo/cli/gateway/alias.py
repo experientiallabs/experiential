@@ -12,6 +12,7 @@ from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.core.locks import FileLockTimeout
 from wmo.common.models import (
+    BillingSource,
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
@@ -39,6 +40,7 @@ _PRICING_SOURCE_OPTION = typer.Option(None, "--pricing-source")
 _MAXIMUM_OUTPUT_OPTION = typer.Option(None, "--maximum-output-tokens", min=1)
 _PRICE_OPTION = typer.Option(None, min=0)
 _REFUSAL_FAILOVER_OPTION = typer.Option(False, "--refusal-failover")
+_BILLING_SOURCE_OPTION = typer.Option(None, "--billing-source")
 
 
 @alias_app.command("list")
@@ -68,6 +70,7 @@ def alias_create(
     output_price: int | None = typer.Option(None, "--output-price", min=0),
     reasoning_price: int | None = typer.Option(None, "--reasoning-price", min=0),
     pricing_source: str | None = _PRICING_SOURCE_OPTION,
+    billing_source: BillingSource | None = _BILLING_SOURCE_OPTION,
     refusal_failover: bool = _REFUSAL_FAILOVER_OPTION,
     non_interactive: bool = _NON_INTERACTIVE_OPTION,
     json_output: bool = _JSON_OPTION,
@@ -97,6 +100,7 @@ def alias_create(
                 reasoning_micro_usd_per_million_tokens=reasoning_price,
             ),
             pricing_source=pricing_source,
+            billing_source=billing_source,
             refusal_failover=refusal_failover,
             replace=False,
         )
@@ -110,6 +114,11 @@ def alias_create(
                 "alias": alias,
                 "catalog_sha256": catalog_sha256,
                 "refusal_failover": refusal_failover,
+                **(
+                    {"billing_source": (billing_source or BillingSource.CUSTOMER_MANAGED).value}
+                    if deployment is not None
+                    else {}
+                ),
             },
         ),
         json_output=json_output,
@@ -138,6 +147,7 @@ def alias_update(
     output_price: int | None = typer.Option(None, "--output-price", min=0),
     reasoning_price: int | None = typer.Option(None, "--reasoning-price", min=0),
     pricing_source: str | None = _PRICING_SOURCE_OPTION,
+    billing_source: BillingSource | None = _BILLING_SOURCE_OPTION,
     refusal_failover: bool = _REFUSAL_FAILOVER_OPTION,
     non_interactive: bool = _NON_INTERACTIVE_OPTION,
     json_output: bool = _JSON_OPTION,
@@ -167,6 +177,7 @@ def alias_update(
                 reasoning_micro_usd_per_million_tokens=reasoning_price,
             ),
             pricing_source=pricing_source,
+            billing_source=billing_source,
             refusal_failover=refusal_failover,
             replace=True,
         )
@@ -180,6 +191,11 @@ def alias_update(
                 "alias": alias,
                 "catalog_sha256": catalog_sha256,
                 "refusal_failover": refusal_failover,
+                **(
+                    {"billing_source": (billing_source or BillingSource.CUSTOMER_MANAGED).value}
+                    if deployment is not None
+                    else {}
+                ),
             },
         ),
         json_output=json_output,
@@ -228,12 +244,15 @@ def _activate(
     maximum_output_tokens: int | None,
     prices: GatewayTokenPrices,
     pricing_source: str | None,
+    billing_source: BillingSource | None,
     refusal_failover: bool,
     replace: bool,
 ) -> tuple[bool, str, str]:
     """Author and activate one exact direct or project-backed alias revision."""
     if (deployment is None) == (project is None):
         raise ValueError("choose exactly one of --deployment or --project")
+    if deployment is None and billing_source is not None:
+        raise ValueError("--billing-source applies only to direct --deployment aliases")
     manager = GatewayManagement(root)
     manager.require_initialized()
     manager.migrate_legacy_provider_connections()
@@ -267,6 +286,7 @@ def _activate(
             ),
             prices=prices,
             pricing_source=pricing_source,
+            billing_source=billing_source or BillingSource.CUSTOMER_MANAGED,
             replace=replace,
             serving_connections=serving_connections,
         )

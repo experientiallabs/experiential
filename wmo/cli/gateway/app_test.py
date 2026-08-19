@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 from click import unstyle
@@ -19,7 +20,7 @@ from wmo.cli.app import app
 from wmo.cli.gateway import key_output as gateway_key_output
 from wmo.cli.gateway import catalog as gateway_catalog
 from wmo.common.core.artifacts import sha256_json
-from wmo.common.models import load_model_catalog
+from wmo.common.models import BillingSource, load_model_catalog, normalize_gateway_catalog
 from wmo.runtime.gateway.auth import IssuedVirtualKey, issue_key_material
 from wmo.runtime.gateway.management import GatewayManagement
 from wmo.runtime.gateway.sqlite import key_delivery
@@ -173,7 +174,13 @@ def test_noninteractive_pool_certification_activates_ordered_alias_with_receipt(
         result = runner.invoke(app, command)
         assert result.exit_code == 0, result.output
     catalog_sha256 = ""
+    alias_receipts: dict[str, dict[str, object]] = {}
     for deployment_alias in ("primary", "secondary"):
+        billing_arguments = (
+            ["--billing-source", BillingSource.HOST_MANAGED.value]
+            if deployment_alias == "primary"
+            else []
+        )
         result = runner.invoke(
             app,
             [
@@ -186,6 +193,7 @@ def test_noninteractive_pool_certification_activates_ordered_alias_with_receipt(
                 f"provider-main:{deployment_alias}-model",
                 "--exact-model",
                 "model-revision-exact",
+                *billing_arguments,
                 "--root",
                 str(tmp_path),
                 "--non-interactive",
@@ -193,7 +201,13 @@ def test_noninteractive_pool_certification_activates_ordered_alias_with_receipt(
             ],
         )
         assert result.exit_code == 0, result.output
-        catalog_sha256 = json.loads(result.stdout)["data"]["catalog_sha256"]
+        receipt = cast(dict[str, object], json.loads(result.stdout))
+        data = cast(dict[str, object], receipt["data"])
+        alias_receipts[deployment_alias] = data
+        catalog_sha256 = cast(str, data["catalog_sha256"])
+
+    assert alias_receipts["primary"]["billing_source"] == "host_managed"
+    assert alias_receipts["secondary"]["billing_source"] == "customer_managed"
 
     certified = runner.invoke(
         app,
@@ -237,11 +251,44 @@ def test_noninteractive_pool_certification_activates_ordered_alias_with_receipt(
     assert "TEST_PROVIDER_KEY" not in certified.stdout
     catalog = load_model_catalog(tmp_path / "models.toml")
     assert catalog.gateway_pools["coding"].deployment_aliases == ("primary", "secondary")
+    assert catalog.models["primary"].billing_source is BillingSource.HOST_MANAGED
+    assert catalog.models["secondary"].billing_source is BillingSource.CUSTOMER_MANAGED
+    normalized = normalize_gateway_catalog(catalog)
+    pool = next(item for item in normalized.pools if item.pool_id == "coding")
+    deployments = {deployment.deployment_id: deployment for deployment in normalized.deployments}
+    assert tuple(
+        deployments[deployment_id].billing_source for deployment_id in pool.deployment_ids
+    ) == (BillingSource.HOST_MANAGED, BillingSource.CUSTOMER_MANAGED)
     alias = next(
         item for item in GatewayManagement(tmp_path).aliases() if item.alias_id == "coding"
     )
     assert alias.pool_id == "coding"
     assert alias.revision_id == "revision-waterfall-one"
+
+
+def test_project_alias_rejects_deployment_billing_source(tmp_path: Path) -> None:
+    """Credential ownership cannot be falsely attributed to a project target."""
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "create",
+            "project-model",
+            "--project",
+            "project-one",
+            "--billing-source",
+            BillingSource.HOST_MANAGED.value,
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--billing-source applies only to direct --deployment aliases" in result.output
 
 
 def test_pool_certification_preflights_revision_conflict_before_catalog_write(

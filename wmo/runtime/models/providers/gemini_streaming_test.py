@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Sequence
 
 import httpx
 
-from wmo.common.models import ModelSnapshot
+from wmo.common.models import BillingSource, ModelSnapshot
 from wmo.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEventKind,
@@ -222,6 +222,7 @@ def _client(http_client: httpx.AsyncClient) -> GeminiClient:
         model=ModelSnapshot(
             provider="gemini",
             model_id="gemini-2.5-pro",
+            billing_source=BillingSource.CUSTOMER_MANAGED,
             capabilities_sha256="a" * 64,
             connection_sha256="b" * 64,
         ),

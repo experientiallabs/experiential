@@ -612,6 +612,7 @@ class _WaterfallRuntimeCatalog:
                 provider=deployment.provider,
                 model_id=deployment.provider_model,
                 revision=deployment.revision,
+                billing_source=deployment.billing_source,
                 capabilities_sha256=capabilities.identity_sha256(),
                 connection_sha256=deployment.connection_sha256,
             ),
