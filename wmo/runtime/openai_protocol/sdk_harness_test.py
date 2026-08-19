@@ -9,6 +9,7 @@ from typing import cast
 import httpx2
 import openai
 from openai import AsyncOpenAI, OpenAI
+from openai.types.responses import FunctionToolParam
 
 from wmo.common.core.artifacts import JsonObject
 from wmo.runtime.gateway.contracts import (
@@ -147,6 +148,31 @@ def test_sync_openai_300_parses_both_advertised_streaming_surfaces() -> None:
     assert responses[1].type == "response.in_progress"
     assert responses[-1].type == "response.completed"
     assert harness.responder_calls == 2
+
+
+def test_sync_openai_300_accepts_nullable_responses_tool_strictness() -> None:
+    """OpenAI 3.0.0 may serialize an omitted Responses tool strict flag as null."""
+    harness = _SdkHarness()
+    http = httpx2.Client(transport=httpx2.MockTransport(harness))
+    tool = FunctionToolParam(
+        type="function",
+        name="lookup_ticket",
+        description="Look up one ticket.",
+        parameters={"type": "object"},
+        strict=None,
+    )
+    with OpenAI(api_key="sdk-test", base_url="http://gateway.test/v1", http_client=http) as client:
+        events = list(
+            client.responses.create(
+                model="coding",
+                input="look up ticket 42",
+                tools=[tool],
+                stream=True,
+            )
+        )
+
+    assert events[-1].type == "response.completed"
+    assert harness.responder_calls == 1
 
 
 def test_async_openai_300_parses_both_advertised_streaming_surfaces() -> None:

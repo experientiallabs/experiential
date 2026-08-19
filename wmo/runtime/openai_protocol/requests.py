@@ -182,7 +182,7 @@ class _ResponseTool(_WireModel):
     name: str = Field(min_length=1, max_length=256)
     description: str | None = Field(default=None, max_length=8_192)
     parameters: JsonObject = Field(default_factory=dict)
-    strict: bool = False
+    strict: bool | None = None
 
 
 class _ResponseFunctionCall(_WireModel):
@@ -462,7 +462,7 @@ def _response_tool(tool: _ResponseTool) -> GatewayToolDefinition:
         name=tool.name,
         description=tool.description,
         parameters=tool.parameters,
-        strict=tool.strict,
+        strict=bool(tool.strict),
     )
 
 
