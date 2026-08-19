@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import threading
+from collections.abc import Awaitable, Callable
 from http.server import ThreadingHTTPServer
 from inspect import Parameter, signature
 from pathlib import Path
@@ -14,9 +16,16 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import JsonValue
 
-from wmo.runtime.gateway.composition import GatewayRuntimeConfig, create_gateway_runtime
+from wmo.runtime.gateway.composition import (
+    GatewayRuntime,
+    GatewayRuntimeConfig,
+    GatewayTerminalFlusher,
+    create_gateway_runtime,
+)
+from wmo.runtime.gateway.contracts import ExecutionSnapshot
 from wmo.runtime.gateway.ledger import SQLiteAttemptLedger
-from wmo.runtime.gateway.lifecycle import load_local_gateway
+from wmo.runtime.gateway.lifecycle import LocalGatewayRuntime, load_local_gateway
+from wmo.runtime.gateway.management import GatewayManagement
 from wmo.runtime.gateway.tests.launch_test import _configure_gateway, _LoopbackProvider
 from wmo.runtime.gateway.usage import read_usage_report
 
@@ -44,6 +53,109 @@ def test_public_factory_is_injected_and_worker_owned() -> None:
     assert all(item.kind is Parameter.KEYWORD_ONLY for item in parameters.values())
     with pytest.raises(ValueError, match="finite and positive"):
         GatewayRuntimeConfig(graceful_timeout_seconds=float("inf"))
+
+
+def test_readiness_recovers_after_one_transient_reprobe_failure(tmp_path: Path) -> None:
+    """A transient readiness failure returns 503 once, then re-probes to recovery."""
+    manager, _raw_key = _configure_gateway(
+        tmp_path,
+        base_url="http://127.0.0.1:9/v1",
+    )
+    local = load_local_gateway(
+        tmp_path,
+        graceful_timeout_seconds=1,
+        environment={"LOOPBACK_PROVIDER_KEY": "provider-secret-canary"},
+    )
+
+    async def original_proof() -> ExecutionSnapshot:
+        """Resolve the local credential-free proof on a dedicated loop."""
+        return await local.service._readiness_probe()  # noqa: SLF001 - injected probe fixture
+
+    proof = asyncio.run(original_proof())
+    calls = 0
+
+    async def fail_once() -> ExecutionSnapshot:
+        """Fail the first post-startup re-probe, then return healthy proof."""
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("transient readiness failure")
+        return proof
+
+    runtime = _compose_from_local(local, manager, readiness=fail_once)
+
+    with TestClient(runtime.app) as client:
+        failed = client.get("/health/ready")
+        recovered = client.get("/health/ready")
+
+        assert failed.status_code == 503
+        assert failed.json() == {"status": "not_ready"}
+        assert recovered.status_code == 200
+        assert recovered.json() == {"status": "ready"}
+        assert runtime.state.ready
+    assert calls == 3
+    assert not runtime.state.ready
+
+
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    (float("nan"), float("inf"), float("-inf"), 0.0, -1.0),
+    ids=("nan", "positive-infinity", "negative-infinity", "zero", "negative"),
+)
+def test_drain_rejects_every_invalid_timeout_override(
+    tmp_path: Path,
+    timeout_seconds: float,
+) -> None:
+    """Every per-call drain override must preserve the finite positive bound."""
+    manager, _raw_key = _configure_gateway(
+        tmp_path,
+        base_url="http://127.0.0.1:9/v1",
+    )
+    local = load_local_gateway(
+        tmp_path,
+        graceful_timeout_seconds=1,
+        environment={"LOOPBACK_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    runtime = _compose_from_local(local, manager)
+
+    asyncio.run(runtime.preflight())
+    assert runtime.state.ready
+    with pytest.raises(ValueError, match="timeout_seconds must be finite and positive"):
+        asyncio.run(runtime.drain(timeout_seconds=timeout_seconds))
+    assert runtime.state.ready
+
+
+def test_explicit_shutdown_and_lifespan_teardown_flush_once(tmp_path: Path) -> None:
+    """One lifecycle owner makes explicit and ASGI shutdown idempotent."""
+    manager, _raw_key = _configure_gateway(
+        tmp_path,
+        base_url="http://127.0.0.1:9/v1",
+    )
+    local = load_local_gateway(
+        tmp_path,
+        graceful_timeout_seconds=1,
+        environment={"LOOPBACK_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    flushes: list[bool] = []
+
+    async def flush() -> None:
+        """Record one terminal accounting flush."""
+        flushes.append(True)
+
+    runtime = _compose_from_local(local, manager, terminal_flusher=flush)
+
+    async def scenario() -> None:
+        """Mix explicit shutdown with automatic lifespan teardown on one loop."""
+        async with runtime.app.router.lifespan_context(runtime.app):
+            assert runtime.state.ready
+            assert await runtime.shutdown()
+            assert not runtime.state.ready
+            assert not await runtime.readiness()
+        assert await runtime.shutdown()
+
+    asyncio.run(scenario())
+
+    assert flushes == [True]
 
 
 def test_injected_runtime_matches_local_http_surface_end_to_end(tmp_path: Path) -> None:
@@ -91,6 +203,29 @@ def test_injected_runtime_matches_local_http_surface_end_to_end(tmp_path: Path) 
     assert local_results == injected_results
     assert _LoopbackProvider.calls == 8
     assert not provider_thread.is_alive()
+
+
+def _compose_from_local(
+    local: LocalGatewayRuntime,
+    manager: GatewayManagement,
+    *,
+    readiness: Callable[[], Awaitable[ExecutionSnapshot]] | None = None,
+    terminal_flusher: GatewayTerminalFlusher | None = None,
+) -> GatewayRuntime:
+    """Recompose local dependencies through the fully injected hosted seam."""
+    service = local.service
+    ledger = cast(SQLiteAttemptLedger, service._ledger)  # noqa: SLF001 - parity seam evidence
+    return create_gateway_runtime(
+        config=GatewayRuntimeConfig(graceful_timeout_seconds=1),
+        authority=service._control,  # noqa: SLF001 - parity seam evidence
+        ledger=ledger,
+        routes=service._routes,  # noqa: SLF001 - parity seam evidence
+        executor=service._executor,  # noqa: SLF001 - parity seam evidence
+        clock=service._clock,  # noqa: SLF001 - parity seam evidence
+        readiness=readiness or service._readiness_probe,  # noqa: SLF001
+        usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
+        terminal_flusher=terminal_flusher,
+    )
 
 
 def _exercise_surface(client: TestClient, *, raw_key: str) -> dict[str, JsonValue]:

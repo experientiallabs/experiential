@@ -35,10 +35,8 @@ runtime = wmo.create_gateway_runtime(
     continuations=continuations,
 )
 
-await runtime.preflight()
 app = runtime.app
-# Serve app with the platform's ASGI worker.
-await runtime.shutdown()
+# Serve app with the platform's ASGI worker, including ASGI lifespan.
 ```
 
 The factory performs no filesystem, SQLite, environment, lock, or server access. A worker may use
@@ -46,6 +44,11 @@ any `SecretResolver` while constructing its provider executor and any `ProjectTa
 while constructing its catalog route resolver. The composed application always mounts the same
 `create_gateway_app` data plane used by the local CLI. The lifecycle exposes explicit preflight,
 readiness, bounded drain, and shutdown operations in addition to its ASGI lifespan.
+
+An ASGI host that drives application lifespan owns preflight and shutdown automatically. A host
+that does not drive lifespan calls `runtime.preflight()` before admission and
+`runtime.shutdown()` during teardown. Shutdown is idempotent across those paths: one runtime starts
+one bounded drain and one terminal flush, then remains permanently not ready.
 
 ## Authority and management
 

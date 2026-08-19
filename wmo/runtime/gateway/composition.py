@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -22,6 +24,15 @@ from wmo.runtime.openai_protocol.state import BoundedContinuationStore, BoundedR
 GatewayReadinessProbe = Callable[[], Awaitable[ExecutionSnapshot]]
 GatewayUsageSupplier = Callable[[], GatewayUsageReport]
 GatewayTerminalFlusher = Callable[[], Awaitable[None]]
+
+
+class _GatewayLifecyclePhase(StrEnum):
+    """Process-local admission and shutdown phases for one owned runtime."""
+
+    STARTING = "starting"
+    READY = "ready"
+    DRAINING = "draining"
+    STOPPED = "stopped"
 
 
 @dataclass(frozen=True)
@@ -46,7 +57,12 @@ class GatewayRuntimeConfig:
 class GatewayLifecycleState:
     """Track whether an owned application accepts readiness traffic."""
 
-    ready: bool = False
+    phase: _GatewayLifecyclePhase = _GatewayLifecyclePhase.STARTING
+
+    @property
+    def ready(self) -> bool:
+        """Return whether the runtime most recently passed preflight and still admits work."""
+        return self.phase is _GatewayLifecyclePhase.READY
 
 
 @dataclass
@@ -57,32 +73,60 @@ class GatewayRuntime:
     state: GatewayLifecycleState
     config: GatewayRuntimeConfig
     app: FastAPI = field(init=False)
+    _drain_task: asyncio.Task[bool] | None = field(default=None, init=False, repr=False)
 
     async def preflight(self) -> ExecutionSnapshot:
         """Prove one route ready and expose readiness only after proof succeeds."""
-        proof = await self.service.preflight()
-        self.state.ready = True
+        try:
+            proof = await self.service.preflight()
+        except Exception:
+            if self.state.phase is _GatewayLifecyclePhase.READY:
+                self.state.phase = _GatewayLifecyclePhase.STARTING
+            raise
+        if self.state.phase not in {
+            _GatewayLifecyclePhase.DRAINING,
+            _GatewayLifecyclePhase.STOPPED,
+        }:
+            self.state.phase = _GatewayLifecyclePhase.READY
         return proof
 
     async def readiness(self) -> bool:
-        """Return current readiness after rechecking process-local service health."""
-        if not self.state.ready:
+        """Re-probe recoverably unless this runtime has begun fail-closed shutdown."""
+        if self.state.phase in {
+            _GatewayLifecyclePhase.DRAINING,
+            _GatewayLifecyclePhase.STOPPED,
+        }:
             return False
         try:
-            await self.service.preflight()
+            await self.preflight()
         except Exception:  # noqa: BLE001 - readiness converts all failures to not-ready.
-            self.state.ready = False
-        return self.state.ready
+            return False
+        return self.state.phase is _GatewayLifecyclePhase.READY
 
     async def drain(self, *, timeout_seconds: float | None = None) -> bool:
-        """Stop admission and drain owned work within an explicit finite bound."""
+        """Stop admission once and drain owned work within an explicit finite bound."""
         bound = self.config.graceful_timeout_seconds if timeout_seconds is None else timeout_seconds
-        self.state.ready = False
-        return await self.service.drain(timeout_seconds=bound)
+        if not math.isfinite(bound) or bound <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        task = self._drain_task
+        if task is None:
+            self.state.phase = _GatewayLifecyclePhase.DRAINING
+            task = asyncio.create_task(self._drain_once(bound))
+            self._drain_task = task
+        if task.done():
+            return task.result()
+        return await asyncio.shield(task)
 
     async def shutdown(self) -> bool:
         """Drain this worker using its configured graceful shutdown bound."""
         return await self.drain()
+
+    async def _drain_once(self, timeout_seconds: float) -> bool:
+        """Run the sole service drain and permanently close lifecycle admission."""
+        try:
+            return await self.service.drain(timeout_seconds=timeout_seconds)
+        finally:
+            self.state.phase = _GatewayLifecyclePhase.STOPPED
 
 
 def create_gateway_runtime(
