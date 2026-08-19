@@ -427,6 +427,7 @@ class GatewayService:
         replayable = True
         retainable = True
         terminal = False
+        terminal_frames: list[bytes] = []
         events = BoundedGatewayEvents()
         current_task = asyncio.current_task()
         if current_task is not None:
@@ -449,6 +450,7 @@ class GatewayService:
                     except GatewayAggregationOverflowError:
                         retainable = False
                         replayable = False
+                event_is_terminal = is_terminal(event)
                 for frame in encoder.feed(event):
                     data = frame.encode()
                     replayable = capture_frame(
@@ -457,8 +459,11 @@ class GatewayService:
                         replayable,
                         maximum_bytes=_STREAM_REPLAY_CAPTURE_BYTES,
                     )
-                    yield data
-                if is_terminal(event):
+                    if event_is_terminal:
+                        terminal_frames.append(data)
+                    else:
+                        yield data
+                if event_is_terminal:
                     terminal = True
             if request.surface == GatewayApiSurface.RESPONSES and terminal and retainable:
                 await self._remember_continuation(
@@ -480,6 +485,15 @@ class GatewayService:
                     )
                 else:
                     await lease.abandon()
+                    if terminal:
+                        raise OpenAIProtocolError(
+                            status_code=500,
+                            code="idempotency_replay_unavailable",
+                            message="The completed stream exceeds the bounded replay cache.",
+                            error_type="api_error",
+                        )
+            for data in terminal_frames:
+                yield data
         except BaseException as exc:
             if not terminal:
                 await _settle_stream_quietly(stream, exc)

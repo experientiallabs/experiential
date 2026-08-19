@@ -41,6 +41,7 @@ from wmo.runtime.gateway.execution import (
     GatewayExecutionStream,
     GatewayExecutor,
 )
+from wmo.runtime.gateway.openai.errors import OpenAIProtocolError
 from wmo.runtime.gateway.openai.requests import decode_chat, decode_responses
 from wmo.runtime.gateway.openai.state import (
     BoundedContinuationStore,
@@ -884,5 +885,110 @@ def test_responses_replay_commits_only_after_continuation_retention_succeeds() -
         assert response.status_code == 200
         assert len(provider.streams) == 2
         assert continuations.calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_streaming_responses_withholds_success_until_continuation_and_replay_commit() -> None:
+    """A keyed stream exposes success only after retention and exact replay are durable."""
+
+    async def consume(response: StreamingResponse) -> bytes:
+        """Consume one public streaming response into exact emitted bytes.
+
+        Args:
+            response: Streaming response returned by the gateway service.
+
+        Returns:
+            Concatenated public SSE frames emitted before completion or failure.
+        """
+        frames: list[bytes] = []
+        async for frame in cast(AsyncIterator[bytes], response.body_iterator):
+            frames.append(frame)
+        return b"".join(frames)
+
+    async def scenario() -> None:
+        """Fail first retention, then prove visible success is replayed without redispatch."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TEXT_DELTA,
+                        sequence_number=0,
+                        text_delta="hello",
+                    ),
+                    GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+                )
+            )
+        )
+        continuations = _FailOnceContinuationStore()
+        service, _control, _ledger, _proof = _service(
+            provider,
+            continuation_store=continuations,
+        )
+        decoded = decode_responses(
+            {"model": "public-model", "input": "hello", "stream": True},
+            idempotency_key="stream-operation-one",
+        )
+
+        failed = await service.complete(raw_key="caller-secret", decoded=decoded)
+        assert isinstance(failed, StreamingResponse)
+        emitted = bytearray()
+        with pytest.raises(RuntimeError, match="continuation write failed"):
+            async for frame in cast(AsyncIterator[bytes], failed.body_iterator):
+                emitted.extend(frame)
+        assert b"hello" in emitted
+        assert b"response.completed" not in emitted
+
+        completed = await service.complete(raw_key="caller-secret", decoded=decoded)
+        assert isinstance(completed, StreamingResponse)
+        completed_body = await consume(completed)
+        assert b"response.completed" in completed_body
+        assert len(provider.streams) == 2
+
+        replay = await service.complete(raw_key="caller-secret", decoded=decoded)
+        assert replay.status_code == 200
+        assert b"response.completed" in replay.body
+        assert len(provider.streams) == 2
+        assert continuations.calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_keyed_stream_capture_overflow_never_exposes_success_before_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreplayable keyed stream fails before its terminal frame becomes visible."""
+    monkeypatch.setattr("wmo.runtime.gateway.service._STREAM_REPLAY_CAPTURE_BYTES", 1)
+
+    async def scenario() -> None:
+        """Overflow two attempts and prove neither emits a terminal success frame."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TEXT_DELTA,
+                        sequence_number=0,
+                        text_delta="hello",
+                    ),
+                    GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+                )
+            )
+        )
+        service, _control, _ledger, _proof = _service(provider)
+        decoded = decode_responses(
+            {"model": "public-model", "input": "hello", "stream": True},
+            idempotency_key="overflow-operation-one",
+        )
+
+        for expected_dispatches in (1, 2):
+            response = await service.complete(raw_key="caller-secret", decoded=decoded)
+            assert isinstance(response, StreamingResponse)
+            emitted = bytearray()
+            with pytest.raises(OpenAIProtocolError) as captured:
+                async for frame in cast(AsyncIterator[bytes], response.body_iterator):
+                    emitted.extend(frame)
+            assert captured.value.detail.code == "idempotency_replay_unavailable"
+            assert b"response.completed" not in emitted
+            assert len(provider.streams) == expected_dispatches
 
     asyncio.run(scenario())
