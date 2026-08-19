@@ -113,3 +113,35 @@ def test_retryable_dispatch_failure_requires_provider_dispatch_transport_class()
     assert retryable_dispatch_failure(_failure(exception_type="ValueError")) is False
     assert retryable_dispatch_failure(_failure(code=FailureCode.BUDGET)) is False
     assert retryable_dispatch_failure(_failure(details={"phase": "paid_cell_stale_lease"})) is False
+
+
+def test_retryable_dispatch_failure_accepts_stochastic_world_model_protocol_output() -> None:
+    """Malformed world-model transitions are stochastic and qualify for re-execution."""
+    protocol_details: dict[str, JsonValue] = {"phase": "world_model_protocol"}
+    assert (
+        retryable_dispatch_failure(
+            _failure(
+                retryable=True,
+                exception_type="TextWorldModelProtocolError",
+                details=protocol_details,
+            )
+        )
+        is True
+    )
+    assert (
+        retryable_dispatch_failure(
+            _failure(exception_type="TextWorldModelProtocolError", details=protocol_details)
+        )
+        is False
+    )
+    assert (
+        retryable_dispatch_failure(
+            _failure(
+                code=FailureCode.VALIDATION,
+                retryable=True,
+                exception_type="TextWorldModelProtocolError",
+                details=protocol_details,
+            )
+        )
+        is False
+    )

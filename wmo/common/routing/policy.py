@@ -73,6 +73,7 @@ class KnnRouterPolicy(ArtifactEnvelope):
     kind: Literal["knn"] = "knn"
     policy_id: ArtifactId
     baseline_alias: ModelAlias
+    baseline_uncovered_fit_task_ids: tuple[ArtifactId, ...] = ()
     candidates: tuple[RoutedCandidateSnapshot, ...]
     embedder_alias: ModelAlias
     embedder: ModelSnapshot
@@ -100,6 +101,9 @@ class KnnRouterPolicy(ArtifactEnvelope):
             raise ValueError("router policy candidate aliases must be unique")
         if self.baseline_alias not in aliases:
             raise ValueError("router policy baseline_alias must name a candidate")
+        uncovered = self.baseline_uncovered_fit_task_ids
+        if len(set(uncovered)) != len(uncovered):
+            raise ValueError("router policy uncovered baseline fit tasks must be unique")
         return self
 
 

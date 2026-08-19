@@ -479,6 +479,7 @@ class RecordingCandidateClient:
                 str(exc),
                 phase="world_model_protocol",
                 exception_type=type(exc).__name__,
+                retryable=True,
             ) from exc
         self._transitions.append(transition)
         self._visible_transcript = (
@@ -861,13 +862,27 @@ def _text_failure(
     *,
     phase: str,
     exception_type: str | None = None,
+    retryable: bool = False,
 ) -> TextSimulationError:
-    """Build one non-secret structured simulator failure with a stable phase label."""
+    """Build one non-secret structured simulator failure with a stable phase label.
+
+    Args:
+        stop_reason: Terminal classification recorded with the failed episode.
+        code: Structured failure code persisted with the evidence.
+        message: Non-secret operator-facing failure description.
+        phase: Stable simulator phase label persisted in the failure details.
+        exception_type: Optional exception class name retained for diagnostics.
+        retryable: Whether resume may supersede this failure with a fresh attempt.
+
+    Returns:
+        One artifact-safe terminal simulator error.
+    """
     return TextSimulationError(
         stop_reason,
         StructuredFailure(
             code=code,
             message=message,
+            retryable=retryable,
             exception_type=exception_type,
             attribution=FailureAttribution.MODEL,
             details={"phase": phase},
