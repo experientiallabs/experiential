@@ -15,6 +15,7 @@ from wmo.runtime.openai_protocol.state import (
     ContinuationState,
     ProtocolNamespace,
     ReplayClaimKind,
+    ReplayKey,
     episode_namespace,
     replay_key,
 )
@@ -294,5 +295,43 @@ def test_continuation_is_bounded_namespaced_and_restart_unavailable() -> None:
         now[0] = 111.0
         with pytest.raises(OpenAIProtocolError, match="unavailable or expired"):
             await store.resolve(namespace=_namespace(), previous_response_id="resp_two")
+
+    asyncio.run(scenario())
+
+
+def test_replay_operation_index_stays_aligned_across_expiry_and_abandonment() -> None:
+    """Conflicts last exactly as long as a live entry, and both maps stay aligned."""
+
+    async def scenario() -> None:
+        """Expire and abandon keyed entries, then re-claim with changed bodies."""
+        now = [100.0]
+        store = BoundedReplayStore(capacity=4, byte_cap=4_096, ttl_seconds=10, clock=lambda: now[0])
+
+        def keyed(operation: str, canonical: str) -> ReplayKey:
+            """Return one non-optional replay key for this test namespace."""
+            key = replay_key(
+                namespace=_namespace(),
+                surface=GatewayApiSurface.CHAT_COMPLETIONS,
+                caller_operation=operation,
+                canonical_request_sha256=canonical,
+            )
+            assert key is not None
+            return key
+
+        completed = keyed("op-completed", "a" * 64)
+        owner = await store.claim(completed)
+        await owner.complete(
+            CachedResponse(status_code=200, media_type="application/json", headers=(), body=b"{}")
+        )
+        with pytest.raises(OpenAIProtocolError, match="different request body"):
+            await store.claim(keyed("op-completed", "b" * 64))
+        now[0] += 11
+        retry = await store.claim(keyed("op-completed", "b" * 64))
+        assert retry.kind == ReplayClaimKind.OWNER
+        await retry.abandon()
+        reclaimed = await store.claim(keyed("op-completed", "c" * 64))
+        assert reclaimed.kind == ReplayClaimKind.OWNER
+        await reclaimed.abandon()
+        assert len(store._operations) == len(store._entries)  # noqa: SLF001 - invariant probe.
 
     asyncio.run(scenario())

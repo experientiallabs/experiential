@@ -249,6 +249,7 @@ class BoundedReplayStore:
         self._clock = clock
         self._lock = asyncio.Lock()
         self._entries: OrderedDict[ReplayKey, _ReplayEntry] = OrderedDict()
+        self._operations: dict[tuple[ProtocolNamespace, GatewayApiSurface, Sha256], Sha256] = {}
         self._response_bytes = 0
 
     async def claim(self, key: ReplayKey) -> ReplayLease:
@@ -262,19 +263,14 @@ class BoundedReplayStore:
         """
         async with self._lock:
             self._expire(self._clock())
-            for existing_key in self._entries:
-                if (
-                    existing_key.namespace == key.namespace
-                    and existing_key.surface == key.surface
-                    and existing_key.caller_operation_sha256 == key.caller_operation_sha256
-                    and existing_key.canonical_request_sha256 != key.canonical_request_sha256
-                ):
-                    raise OpenAIProtocolError(
-                        status_code=409,
-                        code="idempotency_conflict",
-                        message="The caller operation was reused with a different request body.",
-                        param="Idempotency-Key",
-                    )
+            canonical = self._operations.get(_operation_index_key(key))
+            if canonical is not None and canonical != key.canonical_request_sha256:
+                raise OpenAIProtocolError(
+                    status_code=409,
+                    code="idempotency_conflict",
+                    message="The caller operation was reused with a different request body.",
+                    param="Idempotency-Key",
+                )
             entry = self._entries.get(key)
             if entry is not None:
                 self._entries.move_to_end(key)
@@ -285,6 +281,7 @@ class BoundedReplayStore:
             self._make_capacity()
             entry = _ReplayEntry(self._clock() + self._ttl_seconds)
             self._entries[key] = entry
+            self._operations[_operation_index_key(key)] = key.canonical_request_sha256
             self._evict_completed()
             return _BoundedReplayLease(
                 store=self,
@@ -330,15 +327,20 @@ class BoundedReplayStore:
         async with self._lock:
             entry = self._entries.get(key)
             if entry is not None and entry is claimed_entry and not entry.published.is_set():
-                self._entries.pop(key)
+                self._remove(key, entry)
                 entry.published.set()
+
+    def _remove(self, key: ReplayKey, entry: _ReplayEntry) -> None:
+        """Drop one retained entry with its operation index and byte accounting."""
+        self._entries.pop(key)
+        self._operations.pop(_operation_index_key(key), None)
+        self._response_bytes -= entry.size_bytes
 
     def _expire(self, now: float) -> None:
         """Drop completed expired entries without evicting active work."""
         for key, entry in tuple(self._entries.items()):
             if entry.response is not None and entry.expires_at <= now:
-                self._entries.pop(key)
-                self._response_bytes -= entry.size_bytes
+                self._remove(key, entry)
 
     def _evict_completed(self) -> None:
         """Evict oldest completed entries until count and byte bounds hold."""
@@ -354,8 +356,7 @@ class BoundedReplayStore:
             if completed is None:
                 return
             key, entry = completed
-            self._entries.pop(key)
-            self._response_bytes -= entry.size_bytes
+            self._remove(key, entry)
 
     def _make_capacity(self) -> None:
         """Evict completed work or reject when every bounded slot is in flight."""
@@ -376,8 +377,12 @@ class BoundedReplayStore:
                     error_type="api_error",
                 )
             key, entry = completed
-            self._entries.pop(key)
-            self._response_bytes -= entry.size_bytes
+            self._remove(key, entry)
+
+
+def _operation_index_key(key: ReplayKey) -> tuple[ProtocolNamespace, GatewayApiSurface, Sha256]:
+    """Return the namespaced caller-operation identity indexing one live replay entry."""
+    return (key.namespace, key.surface, key.caller_operation_sha256)
 
 
 class ContinuationState(ContractModel):

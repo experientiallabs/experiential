@@ -219,13 +219,13 @@ class GatewayService:
         """Forget one bounded cleanup task only after it actually exits."""
         self._cleanup_tasks.discard(task)
 
-    def models(self, *, raw_key: str) -> tuple[str, ...]:
+    async def models(self, *, raw_key: str) -> tuple[str, ...]:
         """Return only aliases granted to one authenticated key-derived identity."""
-        return self._control.granted_aliases(raw_key=raw_key)
+        return await asyncio.to_thread(self._control.granted_aliases, raw_key=raw_key)
 
-    def authenticate(self, *, raw_key: str) -> None:
-        """Authenticate a key before the HTTP boundary performs full protocol decoding."""
-        self._control.authenticate_key(raw_key=raw_key)
+    async def authenticate(self, *, raw_key: str) -> None:
+        """Authenticate a key off the event loop before full protocol decoding."""
+        await asyncio.to_thread(self._control.authenticate_key, raw_key=raw_key)
 
     async def complete(
         self,
@@ -267,7 +267,8 @@ class GatewayService:
     ) -> Response:
         """Execute one request after lifecycle admission has been reserved."""
         deadline = self._clock.monotonic() + self._request_timeout_seconds
-        authorization = self._control.authorize_request(
+        authorization = await asyncio.to_thread(
+            self._control.authorize_request,
             raw_key=raw_key,
             alias=decoded.alias,
             request=decoded.request,
@@ -291,7 +292,7 @@ class GatewayService:
             return _cached_response(await lease.result(timeout_seconds=remaining))
         accepted = False
         try:
-            self._ledger.accept_request(authorization=authorization)
+            await asyncio.to_thread(self._ledger.accept_request, authorization=authorization)
             accepted = True
             route = await self._routes.resolve(
                 authorization=authorization,
@@ -302,7 +303,7 @@ class GatewayService:
         except BaseException as exc:
             request_finalized = isinstance(exc, GatewayExecutionError) and exc.request_finalized
             if accepted and not request_finalized:
-                _finish_request_quietly(
+                await _finish_request_quietly(
                     self._ledger,
                     authorization=authorization,
                     failure=_failure_for_exception(exc),
@@ -419,16 +420,20 @@ class GatewayService:
         headers: dict[str, str],
         episode: tuple[str, str, str, str],
     ) -> AsyncIterator[bytes]:
-        """Encode true provider events while capturing only a bounded replay result."""
+        """Encode true provider events, retaining and capturing only what is consumed.
+
+        Events are retained only for Responses continuation assembly, and frames are
+        captured only while a keyed replay lease can publish them.
+        """
         encoder = stream_encoder(
             request=request,
             authorization=authorization,
             created_at=self._wall_clock(),
         )
         capture = bytearray()
-        replayable = True
+        replayable = lease is not None
         replay_completed = False
-        retainable = True
+        retainable = request.surface == GatewayApiSurface.RESPONSES
         terminal = False
         failed = False
         terminal_frames: list[bytes] = []
@@ -635,7 +640,7 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
         """List only aliases granted to the presented virtual key."""
         try:
             raw_key = _bearer_key(authorization)
-            aliases = service.models(raw_key=raw_key)
+            aliases = await service.models(raw_key=raw_key)
             return JSONResponse(
                 {
                     "object": "list",
@@ -697,7 +702,7 @@ async def _dispatch(
     """Decode one body and translate every sanitized gateway boundary failure."""
     try:
         raw_key = _bearer_key(authorization)
-        service.authenticate(raw_key=raw_key)
+        await service.authenticate(raw_key=raw_key)
         try:
             payload = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -896,7 +901,7 @@ def _failure_for_exception(exception: BaseException) -> GatewayFailure:
     return normalized_provider_failure(exception)
 
 
-def _finish_request_quietly(
+async def _finish_request_quietly(
     ledger: AttemptLedger,
     *,
     authorization: AuthorizationSnapshot,
@@ -905,7 +910,13 @@ def _finish_request_quietly(
 ) -> None:
     """Attempt durable pre-dispatch finalization without masking the primary failure."""
     try:
-        ledger.finish_request(authorization=authorization, failure=failure)
+        await asyncio.to_thread(
+            ledger.finish_request,
+            authorization=authorization,
+            failure=failure,
+        )
+    except asyncio.CancelledError:
+        return
     except BaseException:  # noqa: BLE001 - primary request failure remains authoritative
         accounting_failure()
         return

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -44,6 +45,27 @@ def test_pepper_rejects_group_readable_and_symlink_state(tmp_path: Path) -> None
     path.symlink_to(target)
     with pytest.raises(GatewayAuthError, match="regular"):
         pepper_file.current()
+
+
+def test_pepper_cache_serves_unchanged_state_and_reloads_on_file_replacement(
+    tmp_path: Path,
+) -> None:
+    """Unchanged pepper state is served from cache while a replaced file is reparsed."""
+    path = tmp_path / "pepper.json"
+    pepper_file = FingerprintPepperFile(path)
+    first = pepper_file.current()
+
+    assert pepper_file.current().value == first.value
+    assert pepper_file.key(1).value == first.value
+
+    replacement = tmp_path / "replacement.json"
+    FingerprintPepperFile(replacement).current()
+    os.replace(replacement, path)
+
+    rotated = pepper_file.current()
+    assert rotated.version == 1
+    assert rotated.value != first.value
+    assert pepper_file.key(1).value == rotated.value
 
 
 def test_virtual_key_has_256_random_bits_and_parseable_prefix() -> None:

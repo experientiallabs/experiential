@@ -4,20 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import cast
 
 import pytest
 from fastapi.responses import StreamingResponse
 
+from wmo.runtime.gateway.aggregation import BoundedGatewayEvents
 from wmo.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayRequest,
 )
 from wmo.runtime.gateway.tests.data_plane_test import (
     _BlockingStream,
+    _ControlStore,
     _EventStream,
     _Provider,
     _service,
@@ -67,6 +72,137 @@ async def _consume(response: StreamingResponse) -> bytes:
     async for frame in cast(AsyncIterator[bytes], response.body_iterator):
         frames.append(frame)
     return b"".join(frames)
+
+
+class _SleepingControlStore:
+    """Delegate authority calls after a blocking sleep that would stall a shared loop."""
+
+    def __init__(self, inner: _ControlStore, *, sleep_seconds: float) -> None:
+        """Wrap one deterministic control store with a synchronous delay."""
+        self._inner = inner
+        self._sleep_seconds = sleep_seconds
+
+    def authenticate_key(self, *, raw_key: str) -> None:
+        """Block synchronously, then delegate authentication."""
+        time.sleep(self._sleep_seconds)
+        self._inner.authenticate_key(raw_key=raw_key)
+
+    def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
+        """Block synchronously, then delegate alias discovery."""
+        time.sleep(self._sleep_seconds)
+        return self._inner.granted_aliases(raw_key=raw_key)
+
+    def authorize_request(
+        self,
+        *,
+        raw_key: str,
+        alias: str,
+        request: GatewayRequest,
+        deadline_monotonic: float,
+    ) -> AuthorizationSnapshot:
+        """Block synchronously, then delegate authorization."""
+        time.sleep(self._sleep_seconds)
+        return self._inner.authorize_request(
+            raw_key=raw_key,
+            alias=alias,
+            request=request,
+            deadline_monotonic=deadline_monotonic,
+        )
+
+
+def test_blocking_store_calls_run_off_the_event_loop() -> None:
+    """Synchronous authority and ledger work cannot stall concurrent loop progress."""
+
+    async def scenario() -> None:
+        """Heartbeat a sibling coroutine while one request blocks in the control store."""
+        provider = _Provider(_completed_events)
+        service, control, _ledger, _proof = _service(provider)
+        service._control = _SleepingControlStore(  # noqa: SLF001 - inject the blocking seam
+            control,
+            sleep_seconds=0.2,
+        )
+        ticks = 0
+
+        async def heartbeat() -> None:
+            """Count loop turns available while the store call blocks its thread."""
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        beat = asyncio.create_task(heartbeat())
+        try:
+            response = await service.complete(
+                raw_key="caller-secret",
+                decoded=decode_chat(
+                    {
+                        "model": "public-model",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }
+                ),
+            )
+        finally:
+            beat.cancel()
+            await asyncio.gather(beat, return_exceptions=True)
+
+        assert response.status_code == 200
+        assert ticks >= 5
+
+    asyncio.run(scenario())
+
+
+def test_streaming_chat_retains_no_events_and_cannot_trip_aggregation_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chat streams pass events through without retention, so bounded retention never trips."""
+
+    class _ExplodingEvents(BoundedGatewayEvents):
+        """Fail the test on any retention attempt during a chat stream."""
+
+        def append(self, event: GatewayEvent) -> None:
+            """Reject retention outright."""
+            del event
+            raise AssertionError("chat streams must not retain events")
+
+    monkeypatch.setattr("wmo.runtime.gateway.service.BoundedGatewayEvents", _ExplodingEvents)
+
+    async def scenario() -> None:
+        """Stream one chat completion and prove every frame is emitted unretained."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    *(
+                        GatewayEvent(
+                            kind=GatewayEventKind.TEXT_DELTA,
+                            sequence_number=index,
+                            text_delta="delta-payload",
+                        )
+                        for index in range(16)
+                    ),
+                    GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=16),
+                )
+            )
+        )
+        service, _control, _ledger, _proof = _service(provider)
+        response = await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_chat(
+                {
+                    "model": "public-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                }
+            ),
+        )
+        assert isinstance(response, StreamingResponse)
+        emitted = bytearray()
+        async for frame in cast(AsyncIterator[bytes], response.body_iterator):
+            emitted.extend(frame)
+
+        assert emitted.count(b"delta-payload") == 16
+        assert b"[DONE]" in emitted
+
+    asyncio.run(scenario())
 
 
 def test_keyed_failed_stream_is_not_cached_and_a_retry_redispatches() -> None:

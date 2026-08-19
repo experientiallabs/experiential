@@ -10,6 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import cast
 
+import httpx
 from fastapi import FastAPI
 from filelock import FileLock, Timeout
 
@@ -53,6 +54,7 @@ from wmo.runtime.gateway.sqlite.store import SQLiteGatewayStore, SystemGatewayCl
 from wmo.runtime.gateway.usage import read_usage_report
 from wmo.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from wmo.runtime.models.credentials import ModelCredentialError
+from wmo.runtime.models.providers import HttpxAsyncJsonTransport
 from wmo.runtime.openai_protocol.state import ResponseContinuationStore, ResponseReplayStore
 from wmo.runtime.router.errors import RouterApplicationError
 from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
@@ -225,12 +227,21 @@ def load_local_gateway(
     exact_models: dict[tuple[str, str, str, str], str] = {}
     readiness: list[ExecutionSnapshot] = []
     unavailable_aliases: list[str] = []
+    http_client = httpx.AsyncClient()
+
+    async def _close_shared_transport() -> None:
+        """Release pooled provider connections after the drain completes."""
+        await http_client.aclose()
 
     for alias in aliases:
         revision_id, catalog_sha256 = _required_revision(alias)
         catalog, normalized = _load_snapshot(manager, alias)
         key = (revision_id, catalog_sha256)
-        runtime_catalog = RuntimeModelCatalog(catalog, environment=environment)
+        runtime_catalog = RuntimeModelCatalog(
+            catalog,
+            environment=environment,
+            transport_factory=lambda: HttpxAsyncJsonTransport(http_client),
+        )
         if alias.target_kind == "direct":
             try:
                 proof = _direct_readiness(manager, alias, normalized, runtime_catalog)
@@ -325,6 +336,7 @@ def load_local_gateway(
         usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
         replay=replay,
         continuations=continuations,
+        terminal_flusher=_close_shared_transport,
     )
     return LocalGatewayRuntime(
         runtime=runtime,

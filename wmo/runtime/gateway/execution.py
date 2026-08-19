@@ -379,7 +379,8 @@ class GatewayExecutionStream:
                 usage=current.latest_usage,
             )
             try:
-                self._ledger.finish_attempt(
+                await asyncio.to_thread(
+                    self._ledger.finish_attempt,
                     attempt_id=current.attempt_id,
                     terminal_event=terminal,
                     failure=failure,
@@ -447,7 +448,8 @@ class GatewayExecutionStream:
         attempt_id: str | None = None
         try:
             self._deadline.attempt_timeout()
-            attempt_id = self._ledger.start_attempt(
+            attempt_id = await asyncio.to_thread(
+                self._ledger.start_attempt,
                 snapshot=self._route.snapshot,
                 deployment=binding.deployment,
                 attempt_ordinal=self._total_attempts,
@@ -459,7 +461,8 @@ class GatewayExecutionStream:
             )
             self._attempt_counts[route_index] += 1
             self._total_attempts += 1
-            self._ledger.record_route_context(
+            await asyncio.to_thread(
+                self._ledger.record_route_context,
                 attempt_id=attempt_id,
                 route_reason=self._route.route_reason,
                 fallback_reason=self._route.fallback_reason,
@@ -508,7 +511,8 @@ class GatewayExecutionStream:
     ) -> None:
         """Settle one provider opening failure before another physical dispatch."""
         try:
-            self._ledger.finish_attempt(
+            await asyncio.to_thread(
+                self._ledger.finish_attempt,
                 attempt_id=dispatch_failure.attempt_id,
                 terminal_event=None,
                 failure=dispatch_failure.failure,
@@ -536,7 +540,8 @@ class GatewayExecutionStream:
             if current.settled:
                 return
             try:
-                self._ledger.finish_attempt(
+                await asyncio.to_thread(
+                    self._ledger.finish_attempt,
                     attempt_id=current.attempt_id,
                     terminal_event=terminal,
                     failure=failure,
@@ -545,6 +550,8 @@ class GatewayExecutionStream:
                 current.settled = True
                 if finalize_request:
                     self._parent_finalized = True
+            except asyncio.CancelledError:
+                raise
             except BaseException:
                 self._accounting_failure()
                 raise
@@ -644,7 +651,8 @@ class GatewayExecutionStream:
         if self._parent_finalized:
             return
         try:
-            self._ledger.finish_request(
+            await asyncio.to_thread(
+                self._ledger.finish_request,
                 authorization=self._route.snapshot.authorization,
                 failure=failure,
             )

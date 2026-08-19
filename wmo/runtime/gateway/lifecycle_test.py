@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -247,6 +248,85 @@ def test_local_gateway_preflights_real_state_and_serves_health_and_usage(
     assert "provider-secret-canary" not in page.text
     assert raw_key not in page.text
     assert manager.status().active_aliases == 1
+
+
+def test_pooled_provider_client_serves_every_request_and_closes_after_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One shared provider client handles all dispatches and closes with the lifespan."""
+    created: list[httpx.AsyncClient] = []
+    real_client = httpx.AsyncClient
+
+    class _RecordingClient(real_client):
+        """Record every constructed async client instance."""
+
+        def __init__(self) -> None:
+            """Construct normally while registering this instance."""
+            super().__init__()
+            created.append(self)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _RecordingClient)
+
+    class _ChatProviderHandler(BaseHTTPRequestHandler):
+        """Serve one deterministic Chat Completions SSE response."""
+
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            """Suppress nondeterministic loopback server logs."""
+            del format, args
+
+        def do_POST(self) -> None:
+            """Return one short streamed completion with usage."""
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            body = b"".join(
+                (
+                    b'data: {"choices":[{"index":0,"delta":{"content":'
+                    b'"pooled-response"},"finish_reason":"stop"}]}\n\n',
+                    b'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n',
+                    b"data: [DONE]\n\n",
+                )
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ChatProviderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _manager, raw_key = _configured_gateway(
+            tmp_path,
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+        )
+        runtime = load_local_gateway(
+            tmp_path,
+            graceful_timeout_seconds=1,
+            environment={"TEST_PROVIDER_KEY": "available"},
+        )
+        assert len(created) == 1
+        with TestClient(runtime.app) as client:
+            for _request in range(2):
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {raw_key}"},
+                    json={
+                        "model": "coding",
+                        "messages": [{"role": "user", "content": "pooled"}],
+                    },
+                )
+                assert response.status_code == 200
+                assert response.json()["choices"][0]["message"]["content"] == "pooled-response"
+        assert len(created) == 1
+        assert created[0].is_closed
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_instance_lock_rejects_a_second_owner_for_the_same_root(tmp_path: Path) -> None:
@@ -663,7 +743,11 @@ def test_project_certified_pool_is_unavailable_when_any_sibling_cannot_resolve(
         )
 
 
-def _configured_gateway(root: Path) -> tuple[GatewayManagement, str]:
+def _configured_gateway(
+    root: Path,
+    *,
+    base_url: str = "http://127.0.0.1:9/v1",
+) -> tuple[GatewayManagement, str]:
     """Create one explicit direct alias, identity, grant, and key in real SQLite."""
     manager = GatewayManagement(root)
     manager.initialize()
@@ -671,7 +755,7 @@ def _configured_gateway(root: Path) -> tuple[GatewayManagement, str]:
         connection_id="provider-main",
         config=ConnectionConfig(
             provider="openai-compatible",
-            base_url="http://127.0.0.1:9/v1",
+            base_url=base_url,
             api_key_env="TEST_PROVIDER_KEY",
         ),
     )

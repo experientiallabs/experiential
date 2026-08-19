@@ -53,6 +53,7 @@ class FingerprintPepperFile:
         """
         self._path = path
         self._lock = threading.RLock()
+        self._cached: tuple[tuple[int, int, int], tuple[int, dict[int, bytes]]] | None = None
 
     @property
     def path(self) -> Path:
@@ -111,7 +112,11 @@ class FingerprintPepperFile:
             raise
 
     def _read(self) -> tuple[int, dict[int, bytes]]:
-        """Validate permissions and decode all retained key versions."""
+        """Validate permissions every call and decode or reuse retained key versions.
+
+        Parsed keys are cached against the file's mtime, size, and inode so unchanged
+        state is served without rereading, while any replacement file is reparsed.
+        """
         try:
             metadata = self._path.lstat()
         except FileNotFoundError as exc:
@@ -120,6 +125,10 @@ class FingerprintPepperFile:
             raise GatewayAuthError(
                 "virtual-key fingerprint pepper must be a regular mode-0600 file"
             )
+        signature = (metadata.st_mtime_ns, metadata.st_size, metadata.st_ino)
+        if self._cached is not None and self._cached[0] == signature:
+            current_version, keys = self._cached[1]
+            return current_version, dict(keys)
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
             current_version = int(payload["current_version"])
@@ -135,6 +144,7 @@ class FingerprintPepperFile:
             raise GatewayAuthError("virtual-key fingerprint pepper is invalid") from exc
         if current_version not in keys or any(len(value) != 32 for value in keys.values()):
             raise GatewayAuthError("virtual-key fingerprint pepper is invalid")
+        self._cached = (signature, (current_version, dict(keys)))
         return current_version, keys
 
     @staticmethod
