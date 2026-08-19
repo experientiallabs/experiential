@@ -19,7 +19,12 @@ from typer.testing import CliRunner
 from wmo.cli.app import app
 from wmo.cli.gateway import key_output as gateway_key_output
 from wmo.common.core.artifacts import sha256_json
-from wmo.common.models import BillingSource, load_model_catalog, normalize_gateway_catalog
+from wmo.common.models import (
+    BillingSource,
+    ModelCatalog,
+    load_model_catalog,
+    normalize_gateway_catalog,
+)
 from wmo.runtime.gateway import catalog_authority as gateway_catalog
 from wmo.runtime.gateway.auth import IssuedVirtualKey, issue_key_material
 from wmo.runtime.gateway.management import GatewayManagement
@@ -388,6 +393,86 @@ def test_pool_certification_rolls_back_activation_failure_and_replays_exact_rece
     )
     assert len(certified_aliases) == 1
     assert certified_aliases[0].revision_id == "revision-waterfall-one"
+
+
+def test_pool_certification_reports_unproven_catalog_compensation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed rollback preserves evidence and emits a content-free recovery receipt."""
+    runner, catalog_sha256 = _prepare_pool_certification_root(tmp_path)
+    command = _pool_certification_command(
+        tmp_path,
+        alias="coding",
+        revision="revision-waterfall-one",
+        expected_catalog_sha256=catalog_sha256,
+    )
+    original = load_model_catalog(tmp_path / "models.toml")
+    write_catalog = gateway_catalog.write_model_catalog
+
+    def fail_activation(_manager: GatewayManagement, **_kwargs: object) -> bool:
+        """Inject a definite precommit alias activation failure."""
+        raise RuntimeError("injected activation failure")
+
+    def fail_exact_rollback(path: Path, catalog: ModelCatalog) -> None:
+        """Leave the desired catalog durable when exact preimage restoration fails."""
+        if catalog == original:
+            raise OSError("injected rollback failure")
+        write_catalog(path, catalog)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(GatewayManagement, "activate_direct_alias", fail_activation)
+        patch.setattr(gateway_catalog, "write_model_catalog", fail_exact_rollback)
+        failed = runner.invoke(app, command)
+
+    assert failed.exit_code == 1
+    receipt = json.loads(failed.stdout)
+    assert receipt["changed"] is None
+    assert receipt["data"]["status"] == "catalog_compensation_outcome_unknown"
+    assert receipt["data"]["alias_activation"] == "not_committed"
+    assert receipt["data"]["recovery"] == (
+        "inspect the catalog digest and alias status before retrying"
+    )
+    assert "injected" not in failed.stdout
+    assert "coding" in load_model_catalog(tmp_path / "models.toml").gateway_pools
+    assert all(item.alias_id != "coding" for item in GatewayManagement(tmp_path).aliases())
+
+
+def test_pool_certification_accepts_acknowledgement_lost_after_exact_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rollback write that landed before raising is reconciled as exact restoration."""
+    runner, catalog_sha256 = _prepare_pool_certification_root(tmp_path)
+    command = _pool_certification_command(
+        tmp_path,
+        alias="coding",
+        revision="revision-waterfall-one",
+        expected_catalog_sha256=catalog_sha256,
+    )
+    catalog_before = (tmp_path / "models.toml").read_bytes()
+    original = load_model_catalog(tmp_path / "models.toml")
+    write_catalog = gateway_catalog.write_model_catalog
+
+    def fail_activation(_manager: GatewayManagement, **_kwargs: object) -> bool:
+        """Inject a definite precommit alias activation failure."""
+        raise RuntimeError("injected activation failure")
+
+    def restore_then_raise(path: Path, catalog: ModelCatalog) -> None:
+        """Persist the exact preimage and lose only its acknowledgement."""
+        write_catalog(path, catalog)
+        if catalog == original:
+            raise OSError("injected rollback acknowledgement loss")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(GatewayManagement, "activate_direct_alias", fail_activation)
+        patch.setattr(gateway_catalog, "write_model_catalog", restore_then_raise)
+        failed = runner.invoke(app, command)
+
+    assert failed.exit_code == 1
+    assert isinstance(failed.exception, RuntimeError)
+    assert (tmp_path / "models.toml").read_bytes() == catalog_before
+    assert all(item.alias_id != "coding" for item in GatewayManagement(tmp_path).aliases())
 
 
 def test_pool_certification_rolls_back_snapshot_failure_before_activation(

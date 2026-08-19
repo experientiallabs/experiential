@@ -13,6 +13,7 @@ from wmo.common.core.locks import FileLockTimeout, file_write_lock
 from wmo.common.models import GatewayEquivalenceCertification
 from wmo.runtime.gateway.catalog_authority import (
     GatewayCatalogAuthoringError,
+    GatewayCatalogCompensationError,
     apply_certified_pool_update,
     plan_certified_pool_update,
     rollback_certified_pool_update,
@@ -144,7 +145,34 @@ def pool_certify(
                 )
                 raise typer.Exit(code=1) from activation_error
             except BaseException:
-                rollback_certified_pool_update(root, update)
+                try:
+                    rollback_certified_pool_update(root, update)
+                except GatewayCatalogCompensationError as compensation_error:
+                    emit_receipt(
+                        GatewayReceipt(
+                            operation="pool.certify",
+                            resource_kind="alias_revision",
+                            resource_id=revision,
+                            changed=None,
+                            data={
+                                "status": "catalog_compensation_outcome_unknown",
+                                "alias": alias,
+                                "pool_id": alias,
+                                "catalog_sha256": update.normalized.identity_sha256(),
+                                "revision": revision,
+                                "alias_activation": "not_committed",
+                                "recovery": (
+                                    "inspect the catalog digest and alias status before retrying"
+                                ),
+                            },
+                        ),
+                        json_output=json_output,
+                        human=(
+                            "catalog_compensation_outcome_unknown: alias activation did not "
+                            f"commit; inspect catalog and alias {alias!r} before retrying"
+                        ),
+                    )
+                    raise typer.Exit(code=1) from compensation_error
                 raise
         normalized = update.normalized
         catalog_changed = update.changed

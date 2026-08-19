@@ -32,6 +32,10 @@ class GatewayCatalogAuthoringError(ValueError):
     """A gateway catalog mutation is incomplete or conflicts with active metadata."""
 
 
+class GatewayCatalogCompensationError(GatewayCatalogAuthoringError):
+    """A failed activation's catalog rollback could not be proven complete."""
+
+
 @dataclass(frozen=True)
 class CertifiedPoolUpdate:
     """One lock-scoped certified-pool catalog update and its durable preimage."""
@@ -334,18 +338,50 @@ def rollback_certified_pool_update(root: Path, update: CertifiedPoolUpdate) -> N
         update: Applied mutation plan whose authority activation failed.
 
     Raises:
-        GatewayCatalogAuthoringError: Another writer bypassed the catalog lock after the update.
+        GatewayCatalogCompensationError: The exact catalog preimage could not be proven restored.
     """
     if not update.changed:
         return
-    current = load_model_catalog(root / "models.toml")
+    path = root / "models.toml"
+    try:
+        current = load_model_catalog(path)
+    except BaseException as exc:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback outcome is unknown; inspect catalog authority before retrying"
+        ) from exc
     if current == update.original:
         return
     if current != update.updated:
-        raise GatewayCatalogAuthoringError(
-            "gateway catalog changed during alias activation; refusing unsafe rollback"
+        raise GatewayCatalogCompensationError(
+            "gateway catalog changed during alias activation; inspect authority before retrying"
         )
-    write_model_catalog(root / "models.toml", update.original)
+    try:
+        write_model_catalog(path, update.original)
+    except BaseException as exc:
+        try:
+            restored = load_model_catalog(path)
+        except BaseException as reconciliation_error:
+            raise GatewayCatalogCompensationError(
+                "gateway catalog rollback outcome is unknown; inspect catalog authority "
+                "before retrying"
+            ) from reconciliation_error
+        if restored == update.original:
+            return
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback did not restore its exact preimage; inspect authority "
+            "before retrying"
+        ) from exc
+    try:
+        restored = load_model_catalog(path)
+    except BaseException as exc:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback could not be verified; inspect authority before retrying"
+        ) from exc
+    if restored != update.original:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback did not restore its exact preimage; inspect authority "
+            "before retrying"
+        )
 
 
 def snapshot_current_catalog(
