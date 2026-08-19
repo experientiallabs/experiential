@@ -26,6 +26,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
+from exp.runtime.gateway.discovery import public_model_object, require_granted_authority
 from exp.runtime.gateway.execution import (
     GatewayExecutionError,
     GatewayExecutionStream,
@@ -237,6 +238,17 @@ class GatewayService:
     def models(self, *, raw_key: str) -> tuple[str, ...]:
         """Return only aliases granted to one authenticated key-derived identity."""
         return self._control.granted_aliases(raw_key=raw_key)
+
+    def model_authorities(self, *, raw_key: str) -> tuple[tuple[str, str, str], ...]:
+        """Return granted alias, revision, and catalog digest triples for one key."""
+        return self._control.granted_alias_authorities(raw_key=raw_key)
+
+    def model_authority(self, *, raw_key: str, model_id: str) -> tuple[str, str, str]:
+        """Return one granted alias authority or raise the shared no-oracle 404."""
+        return require_granted_authority(
+            self._control.granted_alias_authorities(raw_key=raw_key),
+            model_id,
+        )
 
     def authenticate(self, *, raw_key: str) -> None:
         """Authenticate a key before the HTTP boundary performs full protocol decoding."""
@@ -639,16 +651,26 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
         """List only aliases granted to the presented virtual key."""
         try:
             raw_key = _bearer_key(authorization)
-            aliases = service.models(raw_key=raw_key)
+            authorities = service.model_authorities(raw_key=raw_key)
             return JSONResponse(
                 {
                     "object": "list",
-                    "data": [
-                        {"id": alias, "object": "model", "created": 0, "owned_by": "exp"}
-                        for alias in aliases
-                    ],
+                    "data": [public_model_object(authority) for authority in authorities],
                 }
             )
+        except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
+            return _exception_response(exc)
+
+    @app.get("/v1/models/{model_id}")
+    async def model_detail(
+        model_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Response:
+        """Describe one granted alias, answering 404 for every other model ID."""
+        try:
+            raw_key = _bearer_key(authorization)
+            authority = service.model_authority(raw_key=raw_key, model_id=model_id)
+            return JSONResponse(public_model_object(authority))
         except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
             return _exception_response(exc)
 

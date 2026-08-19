@@ -131,6 +131,11 @@ class _ControlStore:
         self.raw_keys_seen.append(raw_key)
         return ("public-model",)
 
+    def granted_alias_authorities(self, *, raw_key: str) -> tuple[tuple[str, str, str], ...]:
+        """Return the only granted alias with its frozen revision and digest."""
+        self.raw_keys_seen.append(raw_key)
+        return (("public-model", "revision-one", self._catalog_sha256),)
+
 
 class _Ledger:
     """Capture content-free request and attempt accounting calls."""
@@ -1372,5 +1377,45 @@ def test_cancelling_terminal_delivery_preserves_completed_keyed_replay() -> None
         assert replay.status_code == 200
         assert b"response.completed" in replay.body
         assert len(provider.streams) == 1
+
+    asyncio.run(scenario())
+
+
+def test_model_discovery_is_enriched_and_detail_is_not_an_existence_oracle() -> None:
+    """Discovery lists granted authority metadata; every other model ID is one 404."""
+
+    async def scenario() -> None:
+        """Exercise the models list and detail routes on a dedicated event loop."""
+        provider = _Provider(lambda: _EventStream(()))
+        service, _control, _ledger, _proof = _service(provider)
+        digest = _catalog()[0].identity_sha256()
+        expected = {
+            "id": "public-model",
+            "object": "model",
+            "created": 0,
+            "owned_by": "wmo",
+            "wmo": {"alias_revision_id": "revision-one", "catalog_sha256": digest},
+        }
+        transport = httpx.ASGITransport(app=create_gateway_app(service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+            headers = {"authorization": "Bearer caller-secret"}
+            listed = await client.get("/v1/models", headers=headers)
+            granted = await client.get("/v1/models/public-model", headers=headers)
+            ungranted = await client.get("/v1/models/other-model", headers=headers)
+            unauthenticated = await client.get("/v1/models/public-model")
+
+        assert listed.status_code == 200
+        assert listed.json() == {"object": "list", "data": [expected]}
+        assert granted.status_code == 200
+        assert granted.json() == expected
+        assert ungranted.status_code == 404
+        error = ungranted.json()["error"]
+        assert error["code"] == "model_not_found"
+        assert error["param"] == "model"
+        assert "does not exist or is not granted" in error["message"]
+        assert "GET /v1/models lists the model aliases available to this key." in error["message"]
+        assert "other-model" not in error["message"]
+        assert unauthenticated.status_code == 401
+        assert len(provider.streams) == 0
 
     asyncio.run(scenario())

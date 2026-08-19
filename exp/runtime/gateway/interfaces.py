@@ -42,6 +42,10 @@ class GatewayControlStore(Protocol):
         """Return active aliases explicitly granted to the key-derived identity."""
         ...
 
+    def granted_alias_authorities(self, *, raw_key: str) -> tuple[tuple[str, str, str], ...]:
+        """Return granted alias, active revision, and catalog digest triples."""
+        ...
+
 
 class SecretResolver(Protocol):
     """Late-bound resolver for opaque provider credential references."""

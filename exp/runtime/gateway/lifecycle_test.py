@@ -244,6 +244,21 @@ def test_local_gateway_preflights_real_state_and_serves_health_and_usage(
         )
         assert models.status_code == 200
         assert [item["id"] for item in models.json()["data"]] == ["coding"]
+        detail = client.get(
+            "/v1/models/coding",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+        assert detail.status_code == 200
+        assert detail.json() == models.json()["data"][0]
+        assert detail.json()["object"] == "model"
+        assert detail.json()["wmo"]["alias_revision_id"]
+        assert detail.json()["wmo"]["catalog_sha256"]
+        missing = client.get(
+            "/v1/models/ungranted",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "model_not_found"
         usage = client.get("/usage.json")
         page = client.get("/usage")
 

@@ -6,6 +6,7 @@ No-argument `exp run` starts an authenticated multi-alias gateway on `127.0.0.1`
 It serves:
 
 - `GET /v1/models`
+- `GET /v1/models/{model_id}`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `GET /health/live` and `GET /health/ready`
@@ -150,6 +151,14 @@ are accumulated in original order and validated only at the complete-call bounda
 Commit-independent headers are available before streaming begins. Route-dependent headers are
 emitted only after an execution snapshot exists. Stable public IDs do not expose raw key,
 idempotency, request, or provider values.
+
+`GET /v1/models` lists only the aliases granted to the presented key, as OpenAI model objects
+enriched with a `wmo` object carrying the alias revision and catalog digest of the granted
+authority. `GET /v1/models/{model_id}` describes one granted alias with the same object and
+returns the identical `model_not_found` 404 for every other model ID, so the route never confirms
+whether an ungranted alias exists. Quota-exhausted and throttled 429 responses and the draining
+503 advertise a `Retry-After` wait, and monthly quota exhaustion reports its exact UTC
+calendar-month reset boundary in the error message.
 
 OpenAI `3.0.0` `OpenAI` and `AsyncOpenAI` clients are release-certified for Chat Completions and
 Responses in synchronous and asynchronous, streaming and non-streaming forms. Responses
