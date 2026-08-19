@@ -215,13 +215,15 @@ grep -q -- '--label' "$CAL_LOG"
 Extract every printed label key and rerun with the uniform score of `1` plus a paired
 `--judgment` rationale, so a label that corrects the judge proposal is complete on the same
 pass. The second pass replays the already-paid proposals, applies the labels, and approves.
+The error renders in a wrapped panel that can split `--label` from its key, so match the
+`KEY=SCORE` token directly instead of the flag prefix.
 
 ```bash
 CAL_ARGS=()
 while IFS= read -r key; do
   CAL_ARGS+=(--label "${key}=1")
   CAL_ARGS+=(--judgment "${key}=Uniform path-exercise label pinned to the top score.")
-done < <(grep -oE -- '--label [^ ]+=SCORE' "$CAL_LOG" | awk '{print $2}' | sed 's/=SCORE$//' | sort -u)
+done < <(grep -oE '[A-Za-z0-9_:-]+=SCORE' "$CAL_LOG" | sed 's/=SCORE$//' | sort -u)
 test "${#CAL_ARGS[@]}" -ge 2
 bench judge-calibrate uv run wmo config judge calibrate "$PROJECT" \
   --root "$ROOT" \
@@ -266,6 +268,13 @@ Success prints a policy ID and a report ID. The second run must print
 `replay: verified completed optimization` and make no new provider calls. Per-cell exclusions
 for retry-exhausted or unusable judge cells are durable evidence, not failures; record any that
 appear.
+
+Known blocker: a malformed world-model transition (`TextWorldModelProtocolError`, failure phase
+`world_model_protocol`) is persisted as a permanent failed rollout with no retry. The cell then
+carries no score, and fitting fails closed with `named incumbent dsflash lacks score evidence on
+every fit task` whenever any incumbent cell fails this way. The failure is durable in the work
+root, so rerunning the same root replays it instead of retrying. If this happens, stop and report
+the exact failure counts per candidate; do not delete the root to reroll the dice.
 
 ## 7. Serve the router and send official traffic
 
