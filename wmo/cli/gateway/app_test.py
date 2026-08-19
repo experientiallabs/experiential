@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
@@ -256,6 +257,45 @@ def test_key_output_failure_rolls_back_key_receipt_and_partial_file(
     assert retried.exit_code == 0, retried.output
     assert output.read_text(encoding="utf-8").strip().startswith("wmo_vk_")
     assert len(manager.keys()) == 1
+
+
+def test_duplicate_key_id_is_a_content_free_controlled_cli_error(tmp_path: Path) -> None:
+    """A duplicate key ID never exposes a raw SQLite failure or second secret."""
+    runner = CliRunner()
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+    manager.create_identity(identity_id="default", display_name="Default")
+    issued = manager.issue_key(identity_id="default", key_id="key-one")
+    output = tmp_path / "duplicate-key"
+
+    result = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "key",
+            "issue",
+            "default",
+            "--key-id",
+            "key-one",
+            "--root",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2
+    normalized = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert "virtual key issuance conflicts with existing gateway authority" in normalized
+    assert "Traceback" not in normalized
+    assert "IntegrityError" not in normalized
+    assert issued.raw_key not in normalized
+    assert not output.exists()
+    assert not gateway_key_output.key_output_marker_path(output).exists()
+    assert tuple(tmp_path.glob(".duplicate-key.*.reserve")) == ()
+    assert tuple(item.key_id for item in manager.keys()) == ("key-one",)
 
 
 @pytest.mark.parametrize(

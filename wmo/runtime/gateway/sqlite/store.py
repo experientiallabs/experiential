@@ -75,6 +75,10 @@ class KeyIssuanceCommitError(GatewayStoreError):
     """A virtual-key transaction was proven not to have committed."""
 
 
+class KeyIssuanceConflictError(GatewayStoreError):
+    """Virtual-key issuance conflicts with existing gateway authority."""
+
+
 class SystemGatewayClock:
     """Production wall and monotonic clock implementation."""
 
@@ -237,6 +241,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             One-time receipt containing the raw key.
 
         Raises:
+            KeyIssuanceConflictError: The requested key conflicts with existing authority.
             OperationOutcomeUnknownError: Commit outcome cannot be proven after delivery.
             OperationReplayUnavailableError: A retry names an already issued key operation.
         """
@@ -338,6 +343,10 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                     raise body_error from rollback_error
                 if delivery_hooks is not None:
                     delivery_hooks.rollback()
+                if isinstance(body_error, sqlite3.IntegrityError):
+                    raise KeyIssuanceConflictError(
+                        "virtual key issuance conflicts with existing gateway authority"
+                    ) from None
                 raise
 
         if commit_error is None:
