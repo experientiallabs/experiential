@@ -394,7 +394,6 @@ class GatewayService:
             request.model_copy(
                 update={
                     "messages": (*continuation.messages, *request.messages),
-                    "previous_response_id": None,
                 }
             ),
             (

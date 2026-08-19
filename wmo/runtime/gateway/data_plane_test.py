@@ -889,6 +889,47 @@ def test_responses_replay_commits_only_after_continuation_retention_succeeds() -
     asyncio.run(scenario())
 
 
+def test_responses_continuation_preserves_public_previous_response_id() -> None:
+    """A gateway-local continuation still reports its public parent response identity."""
+
+    async def scenario() -> None:
+        """Complete one response, continue it, and inspect the second public envelope."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TEXT_DELTA,
+                        sequence_number=0,
+                        text_delta="hello",
+                    ),
+                    GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+                )
+            )
+        )
+        service, _control, _ledger, _proof = _service(provider)
+        first = await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_responses({"model": "public-model", "input": "first"}),
+        )
+        first_body = json.loads(bytes(first.body))
+        second = await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_responses(
+                {
+                    "model": "public-model",
+                    "input": "second",
+                    "previous_response_id": first_body["id"],
+                }
+            ),
+        )
+        second_body = json.loads(bytes(second.body))
+
+        assert second_body["previous_response_id"] == first_body["id"]
+        assert len(provider.streams) == 2
+
+    asyncio.run(scenario())
+
+
 def test_streaming_responses_withholds_success_until_continuation_and_replay_commit() -> None:
     """A keyed stream exposes success only after retention and exact replay are durable."""
 
