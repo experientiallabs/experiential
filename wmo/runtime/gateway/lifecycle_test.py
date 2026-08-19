@@ -143,6 +143,67 @@ def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) 
     assert runtime.reconciled_expired_requests == 0
 
 
+def test_live_alias_revision_drift_is_removed_from_discovery_and_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A running process advertises only the exact revision proven ready at startup."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    runtime = load_local_gateway(
+        tmp_path,
+        graceful_timeout_seconds=1,
+        environment={"TEST_PROVIDER_KEY": "available"},
+    )
+    alias = manager.aliases()[0]
+
+    with TestClient(runtime.app) as client:
+        initial = client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+        manager.activate_direct_alias(
+            alias_id="coding",
+            alias_name="coding",
+            revision_id="revision-two",
+            pool_id="coding",
+            snapshot_ref=str(alias.snapshot_ref),
+            catalog_sha256=str(alias.catalog_sha256),
+        )
+        drifted = client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+        unavailable = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": "revision-drift-canary"}],
+            },
+        )
+
+    assert [item["id"] for item in initial.json()["data"]] == ["coding"]
+    assert drifted.json()["data"] == []
+    assert unavailable.status_code == 503
+    assert unavailable.json()["error"]["code"] == "unavailable_route"
+    connection = sqlite3.connect(manager.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone()[0] == 0
+    finally:
+        connection.close()
+    reloaded = load_local_gateway(
+        tmp_path,
+        graceful_timeout_seconds=1,
+        environment={"TEST_PROVIDER_KEY": "available"},
+    )
+    with TestClient(reloaded.app) as client:
+        refreshed = client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+    assert [item["id"] for item in refreshed.json()["data"]] == ["coding"]
+
+
 def _configured_gateway(root: Path) -> tuple[GatewayManagement, str]:
     """Create one explicit direct alias, identity, grant, and key in real SQLite."""
     manager = GatewayManagement(root)

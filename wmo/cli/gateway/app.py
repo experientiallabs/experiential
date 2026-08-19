@@ -20,6 +20,7 @@ from wmo.cli.options import ROOT_OPTION, usage_error
 from wmo.common.core.artifacts import JsonObject
 from wmo.runtime.gateway.ledger import SQLiteAttemptLedger
 from wmo.runtime.gateway.management import GatewayManagement
+from wmo.runtime.gateway.sqlite.store import OperationOutcomeUnknownError
 from wmo.runtime.gateway.usage import read_usage_report
 
 gateway_app = typer.Typer(
@@ -251,7 +252,7 @@ def key_issue(
     if output is not None and output.exists():
         raise typer.BadParameter(f"refusing to overwrite existing secret output {output}")
     delivery = None if output is None else partial(_deliver_secret_once, output)
-    with usage_error(ValueError, OSError):
+    try:
         issued = _management(root).issue_key(
             identity_id=identity_id,
             key_id=key_id,
@@ -259,6 +260,35 @@ def key_issue(
             operation_id=operation_id,
             secret_delivery=delivery,
         )
+    except OperationOutcomeUnknownError as exc:
+        data: JsonObject = {
+            "status": "operation_outcome_unknown",
+            "prefix": exc.issued.prefix,
+        }
+        if output is None:
+            data["raw_key"] = exc.issued.raw_key
+        else:
+            data["output_path"] = str(output)
+        emit_receipt(
+            GatewayReceipt(
+                operation="key.issue",
+                resource_kind="virtual_key",
+                resource_id=exc.issued.key_id,
+                changed=None,
+                data=data,
+            ),
+            json_output=json_output,
+            human=(
+                "operation_outcome_unknown: secret preserved at "
+                f"{output}; inspect key status before retrying"
+                if output is not None
+                else "operation_outcome_unknown: key may be active; preserve one-time secret "
+                f"{exc.issued.raw_key} and inspect key status before retrying"
+            ),
+        )
+        raise typer.Exit(code=1) from None
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from None
     data: JsonObject = issued.model_dump(mode="json") if json_output else {"prefix": issued.prefix}
     if output is not None:
         data = {"prefix": issued.prefix, "output_path": str(output)}

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -11,7 +13,9 @@ from typer.testing import CliRunner
 
 from wmo.cli.app import app
 from wmo.cli.gateway import app as gateway_cli_app
+from wmo.runtime.gateway.auth import IssuedVirtualKey, issue_key_material
 from wmo.runtime.gateway.management import GatewayManagement
+from wmo.runtime.gateway.sqlite.store import OperationOutcomeUnknownError
 
 
 def test_noninteractive_management_story_emits_stable_secret_safe_json(
@@ -247,3 +251,66 @@ def test_key_output_failure_rolls_back_key_receipt_and_partial_file(
     assert retried.exit_code == 0, retried.output
     assert output.read_text(encoding="utf-8").strip().startswith("wmo_vk_")
     assert len(manager.keys()) == 1
+
+
+def test_unknown_key_commit_emits_content_free_recovery_and_retains_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambiguous commit preserves the secret file and emits an explicit status."""
+    runner = CliRunner()
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+    manager.create_identity(identity_id="default", display_name="Default")
+    output = tmp_path / "issued-key"
+    prefix, raw_key = issue_key_material()
+    issued = IssuedVirtualKey(
+        key_id="key-one",
+        organization_id="local",
+        identity_id="default",
+        prefix=prefix,
+        raw_key=raw_key,
+        expires_at=None,
+        created_at=datetime.now(UTC),
+    )
+
+    def unknown_issue(
+        _manager: GatewayManagement,
+        *,
+        secret_delivery: Callable[[str], Callable[[], None]] | None = None,
+        **_kwargs: object,
+    ) -> IssuedVirtualKey:
+        """Publish the secret and inject an inconclusive commit acknowledgement."""
+        assert secret_delivery is not None
+        secret_delivery(raw_key)
+        raise OperationOutcomeUnknownError(issued=issued)
+
+    monkeypatch.setattr(GatewayManagement, "issue_key", unknown_issue)
+    result = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "key",
+            "issue",
+            "default",
+            "--key-id",
+            "key-one",
+            "--operation-id",
+            "operation-one",
+            "--root",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    receipt = json.loads(result.stdout)
+    assert receipt["data"]["status"] == "operation_outcome_unknown"
+    assert receipt["data"]["output_path"] == str(output)
+    assert "raw_key" not in receipt["data"]
+    assert raw_key not in result.stdout
+    assert output.read_text(encoding="utf-8").strip() == raw_key
+    assert output.stat().st_mode & 0o777 == 0o600

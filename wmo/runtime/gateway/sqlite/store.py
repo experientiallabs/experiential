@@ -30,6 +30,7 @@ from wmo.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from wmo.runtime.gateway.interfaces import GatewayClock
+from wmo.runtime.gateway.sqlite import key_delivery
 from wmo.runtime.gateway.sqlite.migrations import connect_database, initialize_database
 from wmo.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
@@ -56,6 +57,18 @@ class OperationConflictError(GatewayStoreError):
 
 class OperationReplayUnavailableError(GatewayStoreError):
     """A completed one-time key operation cannot reveal its raw key again."""
+
+
+class OperationOutcomeUnknownError(GatewayStoreError):
+    """A one-time key operation could not prove its durable commit outcome."""
+
+    def __init__(self, *, issued: IssuedVirtualKey) -> None:
+        """Create a content-free recovery error for one non-secret key identifier."""
+        self.issued = issued
+        super().__init__(
+            "operation_outcome_unknown: preserve the delivered secret and inspect key status "
+            f"for {issued.key_id!r} before retrying"
+        )
 
 
 class SystemGatewayClock:
@@ -213,6 +226,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             One-time receipt containing the raw key.
 
         Raises:
+            OperationOutcomeUnknownError: Commit outcome cannot be proven after delivery.
             OperationReplayUnavailableError: A retry names an already issued key operation.
         """
         expires_text = None if expires_at is None else utc_text(expires_at)
@@ -231,9 +245,20 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         fingerprint = fingerprint_virtual_key(raw_key, pepper)
         created_at = self._clock.now()
         created_text = utc_text(created_at)
+        issued = IssuedVirtualKey(
+            key_id=key_id,
+            organization_id=organization_id,
+            identity_id=identity_id,
+            prefix=prefix,
+            raw_key=raw_key,
+            expires_at=expires_at,
+            created_at=created_at,
+        )
         delivery_cleanup: Callable[[], None] | None = None
-        try:
-            with self._transaction() as connection:
+        commit_error: Exception | None = None
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
                 replay = self._operation_replay(
                     connection,
                     organization_id=organization_id,
@@ -275,19 +300,44 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                     resource_id=key_id,
                     created_at=created_text,
                 )
-        except BaseException:
-            if delivery_cleanup is not None:
-                delivery_cleanup()
-            raise
-        return IssuedVirtualKey(
-            key_id=key_id,
+            except BaseException as body_error:
+                try:
+                    connection.execute("ROLLBACK")
+                except BaseException as rollback_error:
+                    if delivery_cleanup is not None:
+                        raise OperationOutcomeUnknownError(issued=issued) from rollback_error
+                    raise body_error from rollback_error
+                if delivery_cleanup is not None:
+                    delivery_cleanup()
+                raise
+            try:
+                connection.execute("COMMIT")
+            except Exception as error:  # noqa: BLE001 - commit outcome requires reconciliation
+                commit_error = error
+
+        if commit_error is None:
+            return issued
+        outcome = key_delivery.reconcile_key_issue(
+            self.database_path,
+            busy_timeout_ms=self._busy_timeout_ms,
             organization_id=organization_id,
             identity_id=identity_id,
+            key_id=key_id,
             prefix=prefix,
-            raw_key=raw_key,
-            expires_at=expires_at,
-            created_at=created_at,
+            fingerprint_version=pepper.version,
+            fingerprint=fingerprint,
+            expires_at=expires_text,
+            created_at=created_text,
+            operation_id=operation_id,
+            request_sha256=request_sha256,
         )
+        if outcome is True:
+            return issued
+        if outcome is False:
+            if delivery_cleanup is not None:
+                delivery_cleanup()
+            raise commit_error
+        raise OperationOutcomeUnknownError(issued=issued) from commit_error
 
     def revoke_virtual_key(self, *, organization_id: str, key_id: str) -> bool:
         """Revoke a key idempotently.
@@ -655,21 +705,45 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         Returns:
             Granted public alias names in stable order.
         """
+        return tuple(
+            alias for alias, _revision, _digest in self.granted_alias_authorities(raw_key=raw_key)
+        )
+
+    def granted_alias_authorities(self, *, raw_key: str) -> tuple[tuple[str, str, str], ...]:
+        """Return exact active authorities granted to the key-derived identity.
+
+        Args:
+            raw_key: Caller virtual key.
+
+        Returns:
+            Alias name, active revision, and catalog digest tuples in stable order.
+        """
         with self._transaction() as connection:
             organization_id, identity_id, _ = self._authenticate_in_transaction(connection, raw_key)
             rows = connection.execute(
                 """
-                SELECT a.alias_name
+                SELECT a.alias_name, a.active_revision_id, r.catalog_sha256
                 FROM identity_alias_grants AS g
                 JOIN gateway_aliases AS a
                   ON a.organization_id = g.organization_id AND a.alias_id = g.alias_id
+                JOIN alias_revisions AS r
+                  ON r.organization_id = a.organization_id
+                 AND r.alias_id = a.alias_id
+                 AND r.revision_id = a.active_revision_id
                 WHERE g.organization_id = ? AND g.identity_id = ?
                   AND a.active = 1 AND a.active_revision_id IS NOT NULL
                 ORDER BY a.alias_name
                 """,
                 (organization_id, identity_id),
             ).fetchall()
-        return tuple(str(row["alias_name"]) for row in rows)
+        return tuple(
+            (
+                str(row["alias_name"]),
+                str(row["active_revision_id"]),
+                str(row["catalog_sha256"]),
+            )
+            for row in rows
+        )
 
     def rotate_fingerprint_pepper(self) -> int:
         """Rotate future key fingerprints while retaining old key authentication."""

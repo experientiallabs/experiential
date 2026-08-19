@@ -96,9 +96,10 @@ class _ReadyControlStore:
 
     def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
         """Return granted aliases that were ready in this process snapshot."""
-        available = {alias for alias, _revision, _digest in self.authorities}
         return tuple(
-            alias for alias in self.store.granted_aliases(raw_key=raw_key) if alias in available
+            alias
+            for alias, revision, digest in self.store.granted_alias_authorities(raw_key=raw_key)
+            if (alias, revision, digest) in self.authorities
         )
 
     def authorize_request(

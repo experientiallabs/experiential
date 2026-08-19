@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from wmo.runtime.gateway.contracts import (
     GatewayRequest,
     ProjectTarget,
 )
+from wmo.runtime.gateway.sqlite import key_delivery
 from wmo.runtime.gateway.sqlite.provider_authority import (
     ProviderAuthorityError,
     ProviderConnectionBinding,
@@ -27,6 +29,7 @@ from wmo.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
     InvalidVirtualKeyError,
     OperationConflictError,
+    OperationOutcomeUnknownError,
     OperationReplayUnavailableError,
     SQLiteGatewayStore,
 )
@@ -372,6 +375,134 @@ def test_failed_key_receipt_commit_invokes_delivery_cleanup(
         assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
     finally:
         connection.close()
+
+
+def test_commit_error_after_effect_reconciles_success_and_retains_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A COMMIT that took effect remains a successful recoverable issuance."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.create_identity(
+        organization_id="org-one",
+        identity_id="identity-one",
+        display_name="Identity",
+    )
+    original_connect = store._connect
+    delivered: list[str] = []
+
+    class CommitAfterEffectConnection:
+        """Raise only after delegating a durable COMMIT to SQLite."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            """Wrap one configured SQLite connection."""
+            self.connection = connection
+
+        def execute(self, statement: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+            """Delegate SQL and inject an error after COMMIT takes effect."""
+            result = self.connection.execute(statement, parameters)
+            if statement == "COMMIT":
+                raise sqlite3.OperationalError("injected commit acknowledgement failure")
+            return result
+
+    @contextmanager
+    def commit_after_effect() -> Iterator[CommitAfterEffectConnection]:
+        """Yield one connection that loses only the COMMIT acknowledgement."""
+        with original_connect() as connection:
+            yield CommitAfterEffectConnection(connection)
+
+    def deliver(raw_key: str) -> Callable[[], None]:
+        """Capture one delivered key and provide observable cleanup."""
+        delivered.append(raw_key)
+
+        def cleanup() -> None:
+            """Remove the delivered key if the transaction is absent."""
+            delivered.clear()
+
+        return cleanup
+
+    monkeypatch.setattr(store, "_connect", commit_after_effect)
+    issued = store.issue_virtual_key(
+        organization_id="org-one",
+        identity_id="identity-one",
+        key_id="key-one",
+        operation_id="operation-key",
+        secret_delivery=deliver,
+    )
+
+    assert delivered == [issued.raw_key]
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM virtual_keys").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 1
+    durable = (tmp_path / "gateway.db").read_bytes()
+    wal = tmp_path / "gateway.db-wal"
+    if wal.exists():
+        durable += wal.read_bytes()
+    assert issued.raw_key.encode() not in durable
+
+
+def test_unknown_commit_outcome_retains_delivery_for_manual_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inconclusive fresh read never deletes the only delivered secret."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.create_identity(
+        organization_id="org-one",
+        identity_id="identity-one",
+        display_name="Identity",
+    )
+    original_connect = store._connect
+    delivered: list[str] = []
+
+    class CommitAfterEffectConnection:
+        """Raise after the database has applied COMMIT."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            """Wrap one configured SQLite connection."""
+            self.connection = connection
+
+        def execute(self, statement: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+            """Delegate SQL and lose the COMMIT acknowledgement."""
+            result = self.connection.execute(statement, parameters)
+            if statement == "COMMIT":
+                raise sqlite3.OperationalError("injected commit acknowledgement failure")
+            return result
+
+    @contextmanager
+    def commit_after_effect() -> Iterator[CommitAfterEffectConnection]:
+        """Yield one connection with an ambiguous reported commit."""
+        with original_connect() as connection:
+            yield CommitAfterEffectConnection(connection)
+
+    def deliver(raw_key: str) -> Callable[[], None]:
+        """Capture the secret that manual recovery must retain."""
+        delivered.append(raw_key)
+
+        def cleanup() -> None:
+            """Remove the delivered secret only after a proven rollback."""
+            delivered.clear()
+
+        return cleanup
+
+    def unknown_outcome(_database_path: Path, **_kwargs: object) -> None:
+        """Make the injected post-COMMIT fresh read inconclusive."""
+        return None
+
+    monkeypatch.setattr(store, "_connect", commit_after_effect)
+    monkeypatch.setattr(key_delivery, "reconcile_key_issue", unknown_outcome)
+    with pytest.raises(OperationOutcomeUnknownError, match="operation_outcome_unknown") as caught:
+        store.issue_virtual_key(
+            organization_id="org-one",
+            identity_id="identity-one",
+            key_id="key-one",
+            operation_id="operation-key",
+            secret_delivery=deliver,
+        )
+
+    assert delivered == [caught.value.issued.raw_key]
 
 
 def test_project_activation_binding_is_unique_per_tenant_and_revisions_are_immutable(
