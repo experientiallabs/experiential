@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from urllib.parse import urlsplit
 
-from wmo.common.core.artifacts import JsonObject
 from wmo.common.models import ModelSnapshot
 from wmo.runtime.models.credentials import ModelCredentialError
+from wmo.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from wmo.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
 from wmo.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from wmo.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
@@ -107,7 +107,7 @@ class AzureClient(OpenAICompatibleClient):
         endpoint: str,
         api_key: str,
         api_version: str,
-        transport: JsonHttpTransport | None = None,
+        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
@@ -120,8 +120,8 @@ class AzureClient(OpenAICompatibleClient):
             api_version: ``v1`` or a dated Azure OpenAI API version.
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
-            timeout_seconds: Per-attempt timeout floor; completion attempts scale above it
-                with the requested maximum output tokens.
+            timeout_seconds: Per-attempt timeout floor. Completion calls scale above it from the
+                requested maximum output tokens.
 
         Raises:
             ValueError: The key, endpoint, API version, or timeout is missing or invalid.
@@ -147,27 +147,18 @@ class AzureClient(OpenAICompatibleClient):
             "Content-Type": "application/json",
         }
 
-    def _post(
-        self,
-        path: str,
-        payload: JsonObject,
-        *,
-        timeout_seconds: float | None = None,
-    ) -> JsonObject:
-        """Post below the Azure root, appending the dated API version when one is configured.
+    def _request_path(self, path: str) -> str:
+        """Append the dated API version to one logical Azure route.
 
         Args:
             path: Provider route below the configured base URL.
-            payload: JSON request body.
-            timeout_seconds: Optional per-attempt timeout override; the configured client
-                timeout applies when omitted.
 
         Returns:
-            The decoded JSON response body.
+            Wire path with the configured API version when required.
         """
         if self._api_version != _V1_API_VERSION:
             path = f"{path}?api-version={self._api_version}"
-        return super()._post(path, payload, timeout_seconds=timeout_seconds)
+        return path
 
 
 def _canonical_azure_endpoint(value: str) -> tuple[str, str, int | None, str]:

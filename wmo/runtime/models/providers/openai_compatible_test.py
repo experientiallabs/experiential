@@ -21,10 +21,15 @@ from wmo.common.models import (
     ToolChoice,
 )
 from wmo.common.tasks import ToolSchema
+from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
+)
 from wmo.runtime.models.providers.openai_compatible import (
     OpenAICompatibleClient,
     OpenAICompatibleResponseError,
     openai_compatible_request,
+    openai_compatible_response,
 )
 from wmo.runtime.models.providers.transport import (
     JsonHttpResponse,
@@ -174,7 +179,12 @@ def test_openai_compatible_client_converts_tool_usage_and_resolved_identity() ->
     assert response.model.model_id == "served-model-20260811"
     assert response.output.content is None
     assert response.output.tool_calls == (
-        ToolCall(call_id="call-new", name="create_ticket", arguments={"priority": "urgent"}),
+        ToolCall(
+            call_id="call-new",
+            name="create_ticket",
+            arguments={"priority": "urgent"},
+            raw_arguments='{"priority":"urgent"}',
+        ),
     )
     assert response.economics.usage is not None
     assert response.economics.usage.input_tokens == 12
@@ -298,3 +308,25 @@ def test_openai_compatible_conversion_rejects_malformed_tool_arguments() -> None
 
     with pytest.raises(OpenAICompatibleResponseError, match="arguments is not JSON"):
         client.complete(_request())
+
+
+def test_openai_compatible_refusal_is_typed_without_exposing_content() -> None:
+    """Content-filter finish state must not be folded into visible assistant text."""
+    canary = "compatible-refusal-canary"
+
+    with pytest.raises(ProviderRefusalError) as error:
+        openai_compatible_response(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "content_filter",
+                        "message": {"content": canary},
+                    }
+                ]
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0.1,
+        )
+
+    assert error.value.signal is ProviderRefusalSignal.CONTENT_POLICY
+    assert canary not in str(error.value)

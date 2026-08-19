@@ -139,6 +139,29 @@ def test_messages_preserve_complete_target_action_and_tool_context() -> None:
     ]
 
 
+def test_messages_canonicalize_provider_tool_argument_formatting() -> None:
+    """Training inputs use semantic JSON even when runtime retained provider wire bytes."""
+    example = _example()
+    target = example.target.model_copy(
+        update={
+            "tool_calls": (
+                ToolCall(
+                    call_id="call-target",
+                    name="send_confirmation",
+                    arguments={"channel": "email", "priority": 1},
+                    raw_arguments='{ "priority": 1, "channel": "email" }',
+                ),
+            )
+        }
+    )
+
+    messages = tinker_messages_from_example(example.model_copy(update={"target": target}))
+
+    assert messages[-1]["tool_calls"][0]["function"]["arguments"] == (
+        '{"channel":"email","priority":1}'
+    )
+
+
 class _DatumRenderer:
     """Return fixed local token and weight tensors without fetching a tokenizer or model."""
 

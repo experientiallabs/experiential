@@ -11,6 +11,9 @@ from wmo.common.core.artifacts import ArtifactInput, sha256_json
 from wmo.common.models import (
     BillingSource,
     ConnectionConfig,
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
+    GatewayTokenPrices,
     ModelCapabilities,
     ModelCatalog,
     ModelCatalogError,
@@ -247,6 +250,57 @@ def test_legacy_catalog_rejects_nested_sft_billing_source_injection(tmp_path: Pa
 
     with pytest.raises(ModelCatalogError, match="schema-v1 SFT base model"):
         load_model_catalog(path)
+
+
+def test_connections_only_catalog_round_trips_without_optimizer_roles(tmp_path: Path) -> None:
+    """A gateway may author a real provider connection before it creates any model records."""
+    path = tmp_path / "models.toml"
+    catalog = ModelCatalog(
+        connections={"openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")},
+        models={},
+    )
+
+    write_model_catalog(path, catalog)
+
+    assert load_model_catalog(path) == catalog
+    assert load_model_catalog(path).roles == ModelRoles()
+
+
+def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) -> None:
+    """Gateway protocol and integer pricing metadata persist outside frozen capabilities."""
+    path = tmp_path / "models.toml"
+    capabilities = ModelCapabilities(supports_tools=True)
+    original_identity = capabilities.identity_sha256()
+    catalog = ModelCatalog(
+        connections={"openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")},
+        models={
+            "coding": ModelRecord(
+                connection="openai",
+                model="gpt-coding",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=capabilities,
+                gateway=GatewayDeploymentMetadata(
+                    exact_model_id="coding-exact-v1",
+                    capabilities=GatewayDeploymentCapabilities(
+                        supports_streaming=True,
+                        supports_streaming_tool_arguments=True,
+                    ),
+                    prices=GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_250_000,
+                    ),
+                    pricing_source="operator",
+                ),
+            )
+        },
+    )
+
+    write_model_catalog(path, catalog)
+    loaded = load_model_catalog(path)
+
+    assert loaded == catalog
+    assert loaded.models["coding"].capabilities is not None
+    assert loaded.models["coding"].capabilities.identity_sha256() == original_identity
+    assert "input_micro_usd_per_million_tokens = 1250000" in path.read_text(encoding="utf-8")
 
 
 def test_model_catalog_rejects_credential_values_and_embedded_url_credentials(

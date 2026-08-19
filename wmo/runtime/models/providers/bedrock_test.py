@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,7 @@ from wmo.common.models import (
     ToolChoice,
 )
 from wmo.common.tasks import ToolSchema
+from wmo.runtime.models.providers.async_transport import RequestDeadline
 from wmo.runtime.models.providers.bedrock import (
     AWS_DEFAULT_REGION_ENV,
     AWS_REGION_ENV,
@@ -35,12 +37,17 @@ from wmo.runtime.models.providers.bedrock import (
     BedrockClient,
     BedrockRegionError,
     BedrockRuntime,
+    BoundedBedrockClient,
     converse_request,
     converse_response,
     create_bedrock_runtime_client,
     resolve_bedrock_region,
 )
-from wmo.runtime.models.providers.errors import ProviderResponseError
+from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
+    ProviderResponseError,
+)
 from wmo.runtime.models.providers.transport import ProviderTransportError, ScriptedJsonTransport
 from wmo.runtime.models.registry import RuntimeModelCatalog
 
@@ -372,11 +379,23 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
     response = resolved.client.complete(_request())
     vectors = embedder.embedding_client.embed(["hello"]) if embedder.embedding_client else ()
 
+    async def complete_through_bounded_lane() -> str | None:
+        """Exercise the catalog-exposed bounded async completion contract."""
+        assert isinstance(resolved.client, BoundedBedrockClient)
+        async_response = await resolved.client.complete_async(
+            _request(),
+            deadline=RequestDeadline.after(1),
+        )
+        return async_response.output.content
+
     assert snapshot.provider == "bedrock"
     assert snapshot.model_id == "us.anthropic.claude-sonnet-4-5"
-    assert isinstance(resolved.client, BedrockClient)
-    assert embedder.embedding_client is embedder.client
+    assert isinstance(resolved.client, BoundedBedrockClient)
+    assert isinstance(embedder.client, BoundedBedrockClient)
+    assert embedder.embedding_client is not embedder.client
+    assert isinstance(embedder.embedding_client, BedrockClient)
     assert response.output.content == "ok"
+    assert asyncio.run(complete_through_bounded_lane()) == "ok"
     assert vectors[0].values == (0.6, 0.8)
 
 
@@ -576,7 +595,7 @@ def test_converse_response_maps_length_and_rejects_unsupported_blocks() -> None:
             configured_model=_snapshot(),
             latency_seconds=0.1,
         )
-    with pytest.raises(ProviderResponseError, match="not supported"):
+    with pytest.raises(ProviderRefusalError) as refusal_error:
         converse_response(
             {
                 "output": {"message": {"content": [{"text": "blocked"}]}},
@@ -585,3 +604,5 @@ def test_converse_response_maps_length_and_rejects_unsupported_blocks() -> None:
             configured_model=_snapshot(),
             latency_seconds=0.1,
         )
+    assert refusal_error.value.signal is ProviderRefusalSignal.GUARDRAIL
+    assert "blocked" not in str(refusal_error.value)

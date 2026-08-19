@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast, runtime_checkable
 
@@ -272,7 +271,7 @@ def _tinker_prompt(request: ModelRequest, renderer: CookbookRenderer) -> tinker.
                     id=call.call_id,
                     function=CookbookToolCall.FunctionBody(
                         name=call.name,
-                        arguments=json.dumps(call.arguments, sort_keys=True),
+                        arguments=call.arguments_json(sort_keys=True),
                     ),
                 )
                 for call in message.assistant_action.tool_calls

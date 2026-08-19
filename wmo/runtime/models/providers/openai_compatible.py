@@ -20,13 +20,21 @@ from wmo.common.models import (
     ToolCall,
     Usage,
 )
+from wmo.runtime.gateway.contracts import GatewayRequest
+from wmo.runtime.models.providers.async_transport import RequestDeadline
 from wmo.runtime.models.providers.base import ProviderHttpClient
 from wmo.runtime.models.providers.errors import (
+    ProviderRefusalError,
+    ProviderRefusalSignal,
     ProviderResponseError,
     require_array,
     require_integer,
     require_object,
     require_string,
+)
+from wmo.runtime.models.providers.streaming import (
+    NormalizedProviderStream,
+    start_openai_compatible_stream,
 )
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -113,6 +121,13 @@ def openai_compatible_response(
         raise OpenAICompatibleResponseError("OpenAI-compatible response has no choices")
     choice = require_object(choices[0], "choices[0]")
     message = require_object(choice.get("message"), "choices[0].message")
+    if choice.get("finish_reason") in {"content_filter", "safety"} or isinstance(
+        message.get("refusal"), str
+    ):
+        raise ProviderRefusalError(
+            provider="openai-compatible",
+            signal=ProviderRefusalSignal.CONTENT_POLICY,
+        )
     content_value = message.get("content")
     content = content_value if isinstance(content_value, str) else None
     tool_call_values = _array_or_empty(message)
@@ -189,7 +204,41 @@ class OpenAIEmbeddingMixin(ProviderHttpClient):
 
 
 class OpenAICompatibleClient(OpenAIEmbeddingMixin):
-    """Calls one explicit OpenAI-compatible connection without streaming or failover."""
+    """Calls one explicit OpenAI-compatible connection without cross-provider failover."""
+
+    async def stream(
+        self,
+        request: GatewayRequest,
+        *,
+        deadline: RequestDeadline,
+        idempotency_key: str,
+    ) -> NormalizedProviderStream:
+        """Start one true Chat Completions stream under the gateway deadline.
+
+        Args:
+            request: Canonical streaming gateway request.
+            deadline: Immutable request-wide deadline.
+            idempotency_key: Stable identity for safe pre-commit opening retries.
+
+        Returns:
+            A cancellable provider-neutral event stream.
+
+        Raises:
+            ValueError: The canonical request did not ask for streaming.
+        """
+        if not request.stream:
+            raise ValueError("gateway provider stream requires request.stream")
+        return await start_openai_compatible_stream(
+            self._transport,
+            f"{self._base_url}/{self._request_path(self._completion_path())}",
+            headers=self._headers(),
+            request=request,
+            model_id=self._model.model_id,
+            deadline=deadline,
+            idempotency_key=idempotency_key,
+            retry_policy=self._retry_policy,
+            timeout_seconds=self._timeout_seconds,
+        )
 
     def _completion_path(self) -> str:
         """Return the shared Chat Completions route."""
@@ -237,7 +286,7 @@ def _openai_message(message: ModelMessage) -> JsonObject:
             {
                 "id": call.call_id,
                 "type": "function",
-                "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+                "function": {"name": call.name, "arguments": call.arguments_json()},
             }
             for call in action.tool_calls
         ]
@@ -275,7 +324,12 @@ def parse_openai_wire_tool_call(value: object, index: int) -> ToolCall:
         raise OpenAICompatibleResponseError(
             f"tool_calls[{index}].function.arguments must decode to an object"
         )
-    return ToolCall(call_id=call_id, name=name, arguments=arguments)
+    return ToolCall(
+        call_id=call_id,
+        name=name,
+        arguments=arguments,
+        raw_arguments=raw_arguments,
+    )
 
 
 def _array_or_empty(message: JsonObject) -> list[JsonValue]:

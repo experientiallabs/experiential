@@ -9,9 +9,10 @@ from typing import Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
-from pydantic import Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
+    ArtifactId,
     ArtifactInput,
     ContractModel,
     JsonObject,
@@ -177,6 +178,51 @@ class SFTModelProvenance(ContractModel):
     sampling_handle_sha256: Sha256
 
 
+class GatewayDeploymentCapabilities(ContractModel):
+    """Gateway protocol capabilities declared for one provider deployment.
+
+    These fields are intentionally separate from ``ModelCapabilities``. The latter participates
+    in frozen optimizer and runtime identities, while this declaration can evolve with the
+    gateway protocol without invalidating existing router artifacts.
+    """
+
+    supports_developer_messages: bool = False
+    supports_streaming: bool = False
+    supports_streaming_tool_arguments: bool = False
+    supports_strict_tools: bool = False
+    supports_parallel_tool_calls: bool = False
+    supports_structured_text: bool = False
+    supports_stop_sequences: bool = False
+    reports_refusals: bool = False
+    reports_cached_input_tokens: bool = False
+    reports_reasoning_tokens: bool = False
+
+
+class GatewayTokenPrices(ContractModel):
+    """Integer gateway attribution rates for one provider deployment.
+
+    Values are micro-USD per million provider-reported tokens. ``None`` means the rate is unknown;
+    it must never be interpreted as zero. Existing optimizer float pricing remains unchanged.
+    """
+
+    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+
+
+class GatewayDeploymentMetadata(ContractModel):
+    """Optional gateway-only metadata authored beside one existing model record."""
+
+    exact_model_id: ArtifactId | None = None
+    capabilities: GatewayDeploymentCapabilities = Field(
+        default_factory=GatewayDeploymentCapabilities
+    )
+    prices: GatewayTokenPrices = Field(default_factory=GatewayTokenPrices)
+    pricing_source: str | None = Field(default=None, min_length=1, max_length=512)
+    pricing_effective_at: AwareDatetime | None = None
+
+
 class ModelRecord(ContractModel):
     """A stable local alias, exact capability snapshot, and provider-side model name.
 
@@ -195,6 +241,7 @@ class ModelRecord(ContractModel):
     served_model_id: str | None = Field(default=None, min_length=1, max_length=2_048)
     billing_source: BillingSource
     capabilities: ModelCapabilities | None = None
+    gateway: GatewayDeploymentMetadata | None = None
     sft_provenance: SFTModelProvenance | None = None
 
     @model_validator(mode="after")
@@ -217,6 +264,9 @@ class ModelRecord(ContractModel):
                         self.capabilities.model_dump(mode="json")
                         if self.capabilities is not None
                         else None
+                    ),
+                    "gateway": (
+                        self.gateway.model_dump(mode="json") if self.gateway is not None else None
                     ),
                     "sft_provenance": (
                         self.sft_provenance.model_dump(mode="json")
@@ -308,8 +358,6 @@ class ModelCatalog(ContractModel):
     @field_validator("models")
     @classmethod
     def _require_valid_model_aliases(cls, value: dict[str, ModelRecord]) -> dict[str, ModelRecord]:
-        if not value:
-            raise ValueError("models.toml needs at least one model alias")
         for alias in value:
             validate_artifact_id(alias)
         return value
