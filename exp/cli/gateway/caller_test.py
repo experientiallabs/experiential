@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 import httpx
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from exp.cli.app import app
@@ -212,7 +213,7 @@ def test_missing_key_names_the_exact_ways_to_provide_one() -> None:
     result = CliRunner().invoke(app, ["config", "gateway", "call", "coding", "hello"])
 
     assert result.exit_code == 2
-    normalized = " ".join(result.output.replace("│", " ").split())
+    normalized = " ".join(unstyle(result.output).replace("│", " ").split())
     assert "pass --key" in normalized
     assert "EXP_GATEWAY_KEY" in normalized
     assert "exp config gateway key issue" in normalized
@@ -234,7 +235,7 @@ def test_unreachable_gateway_is_a_usage_error_naming_the_url(
     )
 
     assert result.exit_code == 2
-    normalized = " ".join(result.output.replace("│", " ").split())
+    normalized = " ".join(unstyle(result.output).replace("│", " ").split())
     assert "no gateway answered at http://127.0.0.1:9/v1" in normalized
     assert "exp run" in normalized
 
