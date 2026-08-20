@@ -116,6 +116,39 @@ def test_call_surfaces_a_terminal_stream_error_after_http_200(
     assert "gateway error insufficient_quota: quota is exhausted" in result.output
 
 
+@pytest.mark.parametrize(
+    "frames",
+    (
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n\ndata: not-json\n\n',
+    ),
+)
+def test_call_rejects_a_stream_without_the_done_terminal_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    frames: str,
+) -> None:
+    """A clean or malformed premature EOF cannot be reported as success."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        """Serve a stream that closes without a valid terminal frame."""
+        del request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=frames.encode(),
+        )
+
+    _mock_gateway(monkeypatch, respond)
+    result = CliRunner().invoke(
+        app,
+        ["config", "gateway", "call", "coding", "hello", "--key", _RAW_KEY],
+    )
+
+    assert result.exit_code == 1
+    assert "gateway error incomplete_stream" in result.output
+    assert "[DONE] terminal marker" in result.output
+
+
 def test_call_json_prints_the_raw_completion_envelope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

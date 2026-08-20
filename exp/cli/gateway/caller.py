@@ -201,7 +201,11 @@ def _stream_completion(
                 response.read()
                 _require_success(response)
             emitted = False
+            saw_done = False
             for line in response.iter_lines():
+                if _stream_done(line):
+                    saw_done = True
+                    break
                 stream_error = _stream_error_detail(line)
                 if stream_error is not None:
                     if emitted:
@@ -215,8 +219,27 @@ def _stream_completion(
                     emitted = True
             if emitted:
                 typer.echo("")
+            if not saw_done:
+                typer.echo(
+                    "gateway error incomplete_stream: The gateway stream ended before the "
+                    "[DONE] terminal marker.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
     except httpx.HTTPError:
         raise _unreachable_gateway(url) from None
+
+
+def _stream_done(line: str) -> bool:
+    """Return whether one SSE line carries the protocol terminal marker.
+
+    Args:
+        line: One raw server-sent-event line.
+
+    Returns:
+        ``True`` only for the exact OpenAI-compatible ``[DONE]`` data frame.
+    """
+    return line.startswith("data: ") and line[len("data: ") :].strip() == "[DONE]"
 
 
 def _stream_error_detail(line: str) -> tuple[str, str] | None:
