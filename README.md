@@ -36,8 +36,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## Using the API
 
-Create a local gateway programmatically with the default `.exp` root and ten-second graceful
-shutdown:
+Create a local gateway programmatically:
 
 ```python
 import uvicorn
