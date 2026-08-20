@@ -376,10 +376,13 @@ def collect_provider_connection(
         )
     api_key_env = CANONICAL_CREDENTIAL_ENV.get(provider)
     if provider == "openai-compatible":
-        api_key_env = ask_text(
-            "Credential environment variable name",
-            console=console,
-            default=CANONICAL_CREDENTIAL_ENV[provider],
+        api_key_env = (
+            ask_text(
+                "Credential environment variable name",
+                console=console,
+                default=CANONICAL_CREDENTIAL_ENV[provider],
+            ).strip()
+            or CANONICAL_CREDENTIAL_ENV[provider]
         )
     return ConnectionConfig(
         provider=provider,

@@ -121,6 +121,25 @@ def test_openai_compatible_provider_connection_collects_endpoint(
     )
 
 
+def test_openai_compatible_provider_connection_defaults_whitespace_credential_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whitespace-only compatible credential input falls back to the canonical variable."""
+    answers = iter(("https://gateway.example.test/v1", "   "))
+
+    monkeypatch.setattr(provider_picker, "ask_text", lambda _text, **_kwargs: next(answers))
+
+    connection = provider_picker.collect_provider_connection(
+        "openai-compatible", console=ScriptedConsole("")
+    )
+
+    assert connection == ConnectionConfig(
+        provider="openai-compatible",
+        base_url="https://gateway.example.test/v1",
+        api_key_env="OPENAI_COMPATIBLE_API_KEY",
+    )
+
+
 def test_bedrock_provider_connection_uses_the_aws_credential_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
