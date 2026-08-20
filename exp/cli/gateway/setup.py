@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import typer
+from rich.console import Console
 
+from exp.cli.shared.picker import PickerAction, PickerKeyReader, PickerOption, choose_one
 from exp.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
@@ -21,6 +23,16 @@ from exp.runtime.gateway.catalog_authority import (
 )
 from exp.runtime.gateway.management import GatewayManagement
 
+_GATEWAY_PROVIDER_OPTIONS = tuple(
+    PickerOption(value=provider, label=provider)
+    for provider in ("openai", "anthropic", "azure", "bedrock")
+)
+_CANONICAL_CREDENTIAL_ENV = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
+}
+
 
 @dataclass(frozen=True)
 class InteractiveSetupResult:
@@ -29,6 +41,76 @@ class InteractiveSetupResult:
     identity_id: str
     alias: str
     raw_key: str
+
+
+def select_gateway_provider(
+    *,
+    console: Console,
+    read_key: PickerKeyReader | None = None,
+) -> str:
+    """Select the first-run gateway provider with the builder wizard's picker.
+
+    Args:
+        console: Interactive terminal used to render the provider selector.
+        read_key: Optional keyboard source used by tests instead of the controlling terminal.
+
+    Returns:
+        One of the supported first-run provider kinds.
+
+    Raises:
+        typer.Abort: The operator cancels the selector.
+    """
+    while True:
+        result = choose_one(
+            console,
+            title="Provider",
+            options=_GATEWAY_PROVIDER_OPTIONS,
+            default="openai",
+            read_key=read_key,
+        )
+        if result.action is PickerAction.CANCEL:
+            raise typer.Abort()
+        if result.action is PickerAction.BACK:
+            console.print("[yellow]This is the first screen.[/yellow]")
+            continue
+        if not result.values:
+            raise ValueError("provider selector returned no provider")
+        return result.values[0]
+
+
+def _collect_provider_connection(provider: str) -> ConnectionConfig:
+    """Collect the provider-specific fields required by the gateway catalog.
+
+    Args:
+        provider: Provider selected in the first-run selector.
+
+    Returns:
+        Secret-free connection metadata using the provider's canonical credential reference.
+
+    Raises:
+        ValueError: The provider is not one of the first-run selector choices.
+    """
+    if provider in _CANONICAL_CREDENTIAL_ENV:
+        if provider == "azure":
+            base_url = typer.prompt("Azure base URL")
+            api_version = typer.prompt("Azure OpenAI API version", default="v1")
+            return ConnectionConfig(
+                provider=provider,
+                base_url=base_url,
+                api_key_env=_CANONICAL_CREDENTIAL_ENV[provider],
+                api_version=api_version,
+            )
+        return ConnectionConfig(
+            provider=provider,
+            api_key_env=_CANONICAL_CREDENTIAL_ENV[provider],
+        )
+    if provider == "bedrock":
+        region = typer.prompt(
+            "AWS region (empty uses AWS_REGION or the AWS configuration)",
+            default="",
+        )
+        return ConnectionConfig(provider=provider, region=region or None)
+    raise ValueError(f"unsupported first-run provider {provider!r}")
 
 
 def interactive_gateway_setup(root: Path) -> InteractiveSetupResult:
@@ -48,16 +130,16 @@ def interactive_gateway_setup(root: Path) -> InteractiveSetupResult:
     if manager.initialized:
         raise ValueError("interactive first-run setup requires an uninitialized gateway")
     typer.echo(f"Gateway state will be stored under {root / 'gateway'}.")
-    provider_name = typer.prompt("Provider connection name")
-    provider = typer.prompt("Provider adapter (openai, anthropic, openai-compatible)")
-    credential_env = typer.prompt("Credential environment variable name")
-    base_url = typer.prompt("Base URL (leave empty for provider default)", default="")
+    provider = select_gateway_provider(console=Console())
+    connection = _collect_provider_connection(provider)
+    provider_name = provider
     provider_model = typer.prompt("Exact provider model ID")
     exact_model_id = typer.prompt("Exact logical model identity")
     alias = typer.prompt("Public model alias")
     identity_id = typer.prompt("Default identity", default="default")
     typer.echo("\nPlanned local mutations:")
-    typer.echo(f"  provider: {provider_name} ({provider}, credential env {credential_env})")
+    credential_reference = connection.api_key_env or "AWS credential chain"
+    typer.echo(f"  provider: {provider_name} ({provider}, credential env {credential_reference})")
     typer.echo(f"  singleton: {alias} -> {provider_model} ({exact_model_id})")
     typer.echo(f"  identity and grant: {identity_id} -> {alias}")
     typer.echo("  issue one virtual key and reveal it once")
@@ -67,11 +149,7 @@ def interactive_gateway_setup(root: Path) -> InteractiveSetupResult:
     manager.initialize()
     _changed, _authority = manager.upsert_provider_connection(
         connection_id=provider_name,
-        config=ConnectionConfig(
-            provider=provider,
-            base_url=base_url or None,
-            api_key_env=credential_env,
-        ),
+        config=connection,
     )
     serving_connections = {
         item.connection_id: item.config for item in manager.provider_connections()
