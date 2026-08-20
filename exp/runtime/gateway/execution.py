@@ -25,6 +25,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.interfaces import AttemptLedger, ProviderStream
+from exp.runtime.gateway.ledger import GatewayLedgerError
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers import (
@@ -484,13 +485,14 @@ class GatewayExecutionStream:
             raise _BudgetRouteSkipped(exc.scope_kind) from exc
         except BaseException as exc:
             if attempt_id is None:
+                # A reservation that raised before returning an attempt id wrote nothing
+                # durable, so no terminal accounting is lost and readiness must not latch.
+                # The settlement path terminalizes the accepted request and latches only if
+                # that write is itself lost.
                 self._health.release_probe(binding.health_key)
-                if isinstance(exc, ProviderDeadlineExceeded):
-                    raise GatewayExecutionError(normalized_provider_failure(exc)) from exc
-                if not isinstance(exc, asyncio.CancelledError):
-                    self._accounting_failure()
-                    raise GatewayExecutionError(normalized_provider_failure(exc)) from exc
-                raise
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise GatewayExecutionError(_pre_dispatch_failure(exc)) from exc
             failure = normalized_provider_failure(exc)
             raise _DispatchFailure(
                 attempt_id,
@@ -881,6 +883,29 @@ def _all_routes_unavailable() -> GatewayFailure:
         failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
         safe_message="all exact-model deployments are unavailable",
     )
+
+
+def _pre_dispatch_failure(exception: BaseException) -> GatewayFailure:
+    """Classify a failure raised before any attempt row was durably written.
+
+    A reservation that raises before ``start_attempt`` returns an id persists nothing:
+    ledger invariant checks and rolled-back transactions leave no attempt row, so no
+    terminal accounting is lost. A ledger failure surfaces as an honest internal error
+    rather than a provider failure, and every other cause reuses the shared provider
+    taxonomy (for example a deadline maps to a timeout).
+
+    Args:
+        exception: The pre-dispatch cause raised while opening one physical attempt.
+
+    Returns:
+        One sanitized failure for the public boundary and the durable request settlement.
+    """
+    if isinstance(exception, GatewayLedgerError):
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.INTERNAL,
+            safe_message="gateway could not reserve attempt accounting before dispatch",
+        )
+    return normalized_provider_failure(exception)
 
 
 def _budget_quota_failure() -> GatewayFailure:

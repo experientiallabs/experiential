@@ -40,6 +40,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.execution import GatewayExecutionError, GatewayExecutor
 from exp.runtime.gateway.health import DeploymentHealthRegistry
+from exp.runtime.gateway.ledger import GatewayLedgerError
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
 from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers import ProviderDeadlineExceeded, RequestDeadline
@@ -399,6 +400,37 @@ def test_all_opening_failures_settle_the_last_attempt_as_parent_owner() -> None:
         assert raised.value.request_finalized
         assert [entry[2] for entry in ledger.finished] == [False, True]
         assert ledger.parent_finishes == []
+
+    asyncio.run(scenario())
+
+
+def test_pre_dispatch_start_failure_does_not_latch_and_still_serves() -> None:
+    """A lost pre-dispatch reservation surfaces one internal failure without latching."""
+
+    async def scenario() -> None:
+        """Fail one reservation before dispatch, then reserve and serve a later request."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        ledger = _WaterfallLedger()
+        ledger.fail_starts = True
+        provider = _ScriptedProvider([_completed_stream("served")])
+        executor = _executor((first,), {first.source_alias: provider}, ledger)
+
+        with pytest.raises(GatewayExecutionError) as raised:
+            await executor.start(route=_route((first,)), request=_request())
+        assert raised.value.failure.failure_class == GatewayFailureClass.INTERNAL
+        assert not raised.value.request_finalized
+        assert ledger.started == []
+        assert ledger.finished == []
+        assert ledger.parent_finishes == []
+
+        executor.require_healthy()
+
+        ledger.fail_starts = False
+        stream = await executor.start(route=_route((first,)), request=_request())
+        events = [event async for event in stream]
+        assert events[-1].kind == GatewayEventKind.COMPLETED
+        assert len(ledger.started) == 1
+        executor.require_healthy()
 
     asyncio.run(scenario())
 
@@ -987,6 +1019,7 @@ class _WaterfallLedger:
         self.rejected_deployments = rejected_deployments or set()
         self.rejected_scope = rejected_scope
         self.budget_checks: list[str] = []
+        self.fail_starts = False
 
     def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Accept a parent request when a service-level test requires it."""
@@ -1005,6 +1038,8 @@ class _WaterfallLedger:
         del maximum_cost_micro_usd
         assert deployment.deployment_id in snapshot.deployment_ids
         self.budget_checks.append(deployment.deployment_id)
+        if self.fail_starts:
+            raise GatewayLedgerError("attempt reservation unavailable")
         if deployment.deployment_id in self.rejected_deployments:
             raise BudgetReservationRejected(
                 scope_kind=self.rejected_scope,

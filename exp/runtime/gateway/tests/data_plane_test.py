@@ -43,6 +43,7 @@ from exp.runtime.gateway.execution import (
     GatewayExecutor,
     _require_deployment_identity,
 )
+from exp.runtime.gateway.ledger import GatewayLedgerError
 from exp.runtime.gateway.routing import (
     CatalogRouteResolver,
     GatewayRoute,
@@ -140,6 +141,7 @@ class _Ledger:
         self.routes: list[tuple[str | None, str | None]] = []
         self.finished: list[tuple[GatewayEvent | None, GatewayFailure | None]] = []
         self.fail_finishes = False
+        self.fail_starts = False
 
     def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Capture accepted authority only."""
@@ -156,6 +158,8 @@ class _Ledger:
     ) -> str:
         """Capture dispatch identity and return a deterministic attempt ID."""
         del deployment, attempt_ordinal, route_depth, maximum_cost_micro_usd
+        if self.fail_starts:
+            raise GatewayLedgerError("attempt reservation unavailable")
         self.started.append(snapshot)
         return f"attempt-{len(self.started)}"
 
@@ -859,6 +863,45 @@ def test_terminal_ledger_failure_releases_admission_and_latches_readiness() -> N
             await service.preflight()
 
         ledger.fail_finishes = False
+        response = await asyncio.wait_for(
+            service.complete(raw_key="caller-secret", decoded=decoded),
+            timeout=0.5,
+        )
+        assert response.status_code == 200
+
+    asyncio.run(scenario())
+
+
+def test_pre_dispatch_start_failure_keeps_readiness_and_serves_other_requests() -> None:
+    """A lost pre-dispatch reservation fails one request without latching readiness."""
+
+    async def scenario() -> None:
+        """Fail one reservation before dispatch, then prove readiness and a later request."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0),)
+            )
+        )
+        service, _control, ledger, _proof = _service(provider)
+        service._executor._permits = asyncio.Semaphore(1)  # noqa: SLF001 - admission regression
+        ledger.fail_starts = True
+        decoded = decode_chat(
+            {
+                "model": "public-model",
+                "messages": [{"role": "user", "content": "account"}],
+            }
+        )
+
+        with pytest.raises(GatewayExecutionError) as raised:
+            await service.complete(raw_key="caller-secret", decoded=decoded)
+        assert raised.value.failure.failure_class == GatewayFailureClass.INTERNAL
+        assert not raised.value.request_finalized
+        assert ledger.started == []
+        assert ledger.finished == [(None, raised.value.failure)]
+
+        await service.preflight()
+
+        ledger.fail_starts = False
         response = await asyncio.wait_for(
             service.complete(raw_key="caller-secret", decoded=decoded),
             timeout=0.5,
