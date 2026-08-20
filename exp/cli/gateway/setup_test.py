@@ -5,9 +5,16 @@ from __future__ import annotations
 import pytest
 
 from exp.cli.gateway import setup
+from exp.cli.providers import provider_picker
 from exp.cli.shared.picker import PickerKey
 from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.models import ConnectionConfig
+
+
+def test_gateway_setup_uses_the_shared_provider_setup_seams() -> None:
+    """Gateway first-run setup does not maintain a second provider picker implementation."""
+    assert setup.select_single_provider is provider_picker.select_single_provider
+    assert setup.collect_provider_connection is provider_picker.collect_provider_connection
 
 
 @pytest.mark.parametrize(
@@ -15,9 +22,9 @@ from exp.common.models import ConnectionConfig
     (
         ("1", "openai"),
         ("2", "anthropic"),
-        ("3", "azure"),
-        ("4", "bedrock"),
         ("5", "openai-compatible"),
+        ("6", "azure"),
+        ("7", "bedrock"),
     ),
 )
 def test_gateway_provider_selector_exposes_primary_and_legacy_providers(
@@ -25,9 +32,9 @@ def test_gateway_provider_selector_exposes_primary_and_legacy_providers(
     provider: str,
 ) -> None:
     """The line fallback presents the four primary providers and the legacy compatible path."""
-    console = ScriptedConsole(f"{answer}\n")
+    console = ScriptedConsole(f"{answer}\n\n")
 
-    selected = setup.select_gateway_provider(console=console)
+    selected = provider_picker.select_single_provider(console=console, environment={})
 
     assert selected == provider
     for expected in ("openai", "anthropic", "azure", "bedrock", "openai-compatible"):
@@ -36,13 +43,25 @@ def test_gateway_provider_selector_exposes_primary_and_legacy_providers(
 
 def test_gateway_provider_selector_uses_the_builder_keyboard_picker() -> None:
     """The gateway selector accepts the same Up, Down, and Enter interaction as the builder."""
-    keys = iter((PickerKey.DOWN, PickerKey.DOWN, PickerKey.ENTER))
+    keys = iter(
+        (
+            *(PickerKey.DOWN for _ in range(5)),
+            PickerKey.ENTER,
+            PickerKey.DOWN,
+            PickerKey.DOWN,
+            PickerKey.ENTER,
+        )
+    )
     console = ScriptedConsole("")
 
-    selected = setup.select_gateway_provider(console=console, read_key=lambda: next(keys))
+    selected = provider_picker.select_single_provider(
+        console=console,
+        environment={},
+        read_key=lambda: next(keys),
+    )
 
     assert selected == "azure"
-    assert "Provider" in console.output
+    assert "Providers" in console.output
     assert "openai" in console.output
     assert "bedrock" in console.output
 
@@ -56,7 +75,7 @@ def test_native_provider_connection_uses_its_canonical_credential_env(
     credential_env: str,
 ) -> None:
     """Native providers use the same canonical credential references as builder setup."""
-    connection = setup._collect_provider_connection(provider)  # noqa: SLF001
+    connection = provider_picker.collect_provider_connection(provider, console=ScriptedConsole(""))
 
     assert connection == ConnectionConfig(provider=provider, api_key_env=credential_env)
 
@@ -71,9 +90,9 @@ def test_azure_provider_connection_collects_required_endpoint_fields(
         """Return the next scripted Azure connection field."""
         return next(answers)
 
-    monkeypatch.setattr(setup.typer, "prompt", _prompt)
+    monkeypatch.setattr(provider_picker, "ask_text", _prompt)
 
-    connection = setup._collect_provider_connection("azure")  # noqa: SLF001
+    connection = provider_picker.collect_provider_connection("azure", console=ScriptedConsole(""))
 
     assert connection == ConnectionConfig(
         provider="azure",
@@ -89,13 +108,11 @@ def test_openai_compatible_provider_connection_collects_endpoint(
     """OpenAI-compatible setup retains its endpoint and credential-variable override."""
     answers = iter(("https://gateway.example.test/v1", "COMPATIBLE_API_KEY"))
 
-    monkeypatch.setattr(
-        setup.typer,
-        "prompt",
-        lambda _text, **_kwargs: next(answers),
-    )
+    monkeypatch.setattr(provider_picker, "ask_text", lambda _text, **_kwargs: next(answers))
 
-    connection = setup._collect_provider_connection("openai-compatible")  # noqa: SLF001
+    connection = provider_picker.collect_provider_connection(
+        "openai-compatible", console=ScriptedConsole("")
+    )
 
     assert connection == ConnectionConfig(
         provider="openai-compatible",
@@ -108,12 +125,8 @@ def test_bedrock_provider_connection_uses_the_aws_credential_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Bedrock setup records only an optional region and never invents an API-key variable."""
-    monkeypatch.setattr(
-        setup.typer,
-        "prompt",
-        lambda _text, **_kwargs: "us-east-1",
-    )
+    monkeypatch.setattr(provider_picker, "ask_text", lambda _text, **_kwargs: "us-east-1")
 
-    connection = setup._collect_provider_connection("bedrock")  # noqa: SLF001
+    connection = provider_picker.collect_provider_connection("bedrock", console=ScriptedConsole(""))
 
     assert connection == ConnectionConfig(provider="bedrock", region="us-east-1")

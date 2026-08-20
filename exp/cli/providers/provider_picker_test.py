@@ -605,8 +605,8 @@ def test_an_identical_configured_connection_is_reused_instead_of_duplicated() ->
 
 
 def test_openai_compatible_endpoint_asks_only_for_its_base_url() -> None:
-    """A compatible endpoint needs an explicit base URL and nothing else by hand."""
-    console = ScriptedConsole("https://models.example.test/v1\n")
+    """A compatible endpoint defaults its credential variable after its explicit base URL."""
+    console = ScriptedConsole("https://models.example.test/v1\n\n")
     lister = _FakeLister(
         {
             "openai-compatible": [

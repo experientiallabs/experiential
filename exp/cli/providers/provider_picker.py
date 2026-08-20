@@ -26,6 +26,7 @@ from exp.cli.shared.picker import (
     choose_one,
 )
 from exp.common.models import (
+    ConnectionConfig,
     ModelCapabilities,
     PricingSource,
     ProviderConnection,
@@ -276,6 +277,37 @@ def select_providers(
         return providers, any(provider in _MANUAL_MODEL_PROVIDERS for provider in providers)
 
 
+def select_single_provider(
+    *,
+    console: Console,
+    environment: MutableMapping[str, str],
+    read_key: PickerKeyReader | None = None,
+) -> str | None:
+    """Use the shared provider screen when a gateway needs one provider.
+
+    Args:
+        console: Terminal used for the shared provider screen.
+        environment: Process environment passed through the common provider-selection seam.
+        read_key: Optional keyboard source used by tests instead of the controlling terminal.
+
+    Returns:
+        The one selected provider, or ``None`` when the operator cancels.
+    """
+    while True:
+        selection = select_providers(
+            SetupSession(),
+            console=console,
+            environment=environment,
+            read_key=read_key,
+        )
+        if selection is None:
+            return None
+        providers, _manual_models = selection
+        if len(providers) == 1:
+            return providers[0]
+        console.print("[yellow]Select exactly one provider for the gateway.[/yellow]")
+
+
 def _select_provider_rows(
     console: Console,
     *,
@@ -301,6 +333,60 @@ def _select_provider_rows(
         preselected=preselected,
         read_key=read_key,
         visible_rows=_PROVIDER_VISIBLE_ROWS,
+    )
+
+
+def collect_provider_connection(
+    provider: str,
+    *,
+    console: Console,
+) -> ConnectionConfig | None:
+    """Collect the provider-specific connection metadata shared by setup entry points.
+
+    Args:
+        provider: Supported provider selected on the shared provider screen.
+        console: Terminal used for provider-specific fields.
+
+    Returns:
+        Secret-free connection metadata, or ``None`` when an optional endpoint field is skipped.
+
+    Raises:
+        ValueError: The provider is unsupported or the collected metadata is invalid.
+    """
+    if provider not in SETUP_PROVIDER_LABELS:
+        raise ValueError(f"unsupported provider {provider!r}")
+    base_url = None
+    api_version = None
+    region = None
+    if provider in ("openai-compatible", "azure"):
+        base_url = ask_text(f"{SETUP_PROVIDER_LABELS[provider]} base URL", console=console)
+        if not base_url:
+            return None
+    if provider == "azure":
+        api_version = ask_text("Azure OpenAI API version", console=console, default="v1")
+        if not api_version:
+            return None
+    if provider == "bedrock":
+        region = (
+            ask_text(
+                "AWS region (empty uses the AWS credential or session configuration)",
+                console=console,
+            )
+            or None
+        )
+    api_key_env = CANONICAL_CREDENTIAL_ENV.get(provider)
+    if provider == "openai-compatible":
+        api_key_env = ask_text(
+            "Credential environment variable name",
+            console=console,
+            default=CANONICAL_CREDENTIAL_ENV[provider],
+        )
+    return ConnectionConfig(
+        provider=provider,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        api_version=api_version,
+        region=region,
     )
 
 
@@ -415,43 +501,26 @@ def _resolve_endpoint(
         SetupCancelled: The user cancelled setup at a prompt.
     """
     label = SETUP_PROVIDER_LABELS[provider]
-    base_url = None
-    api_version = None
-    region = None
-    if provider in ("openai-compatible", "azure"):
-        base_url = ask_text(f"{label} base URL", console=console)
-        if not base_url:
-            return None
-    if provider == "azure":
-        api_version = ask_text("Azure OpenAI API version", console=console, default="v1")
-        if not api_version:
-            return None
-    if provider == "bedrock":
-        region = (
-            ask_text(
-                "AWS region (empty uses the AWS credential or session configuration)",
-                console=console,
-            )
-            or None
-        )
-    api_key_env = CANONICAL_CREDENTIAL_ENV.get(provider)
+    config = collect_provider_connection(provider, console=console)
+    if config is None:
+        return None
     connection = _reused_connection(
         existing_connections,
         provider=provider,
-        api_key_env=api_key_env,
-        base_url=base_url,
-        api_version=api_version,
-        region=region,
+        api_key_env=config.api_key_env,
+        base_url=config.base_url,
+        api_version=config.api_version,
+        region=config.region,
     )
     configured = connection is not None
     if connection is None:
         connection = ProviderConnection(
             name=derive_connection_name(provider, taken_names),
             provider=provider,
-            api_key_env=api_key_env,
-            base_url=base_url,
-            api_version=api_version,
-            region=region,
+            api_key_env=config.api_key_env,
+            base_url=config.base_url,
+            api_version=config.api_version,
+            region=config.region,
         )
     if provider == "bedrock":
         return PreparedEndpoint(connection=connection, api_key="", configured=configured)
