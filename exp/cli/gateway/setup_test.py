@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from exp.cli.gateway import setup
@@ -13,8 +15,8 @@ from exp.common.models import ConnectionConfig
 
 def test_gateway_setup_uses_the_shared_provider_setup_seams() -> None:
     """Gateway first-run setup does not maintain a second provider picker implementation."""
-    assert setup.select_single_provider is provider_picker.select_single_provider
-    assert setup.collect_provider_connection is provider_picker.collect_provider_connection
+    assert setup.select_providers is provider_picker.select_providers
+    assert setup.collect_provider_connections is provider_picker.collect_provider_connections
 
 
 @pytest.mark.parametrize(
@@ -34,11 +36,24 @@ def test_gateway_provider_selector_exposes_primary_and_legacy_providers(
     """The line fallback presents the four primary providers and the legacy compatible path."""
     console = ScriptedConsole(f"{answer}\n\n")
 
-    selected = provider_picker.select_single_provider(console=console, environment={})
+    selected = provider_picker.select_providers(
+        provider_picker.SetupSession(), console=console, environment={}
+    )
 
-    assert selected == provider
+    assert selected == ((provider,), provider in {"azure", "bedrock"})
     for expected in ("openai", "anthropic", "azure", "bedrock", "openai-compatible"):
         assert expected in console.output
+
+
+def test_gateway_provider_selector_accepts_multiple_providers() -> None:
+    """The gateway uses the builder's multi-select semantics instead of forcing one provider."""
+    console = ScriptedConsole("1,2,6,7\n\n")
+
+    selected = provider_picker.select_providers(
+        provider_picker.SetupSession(), console=console, environment={}
+    )
+
+    assert selected == (("openai", "anthropic", "azure", "bedrock"), True)
 
 
 def test_gateway_provider_selector_uses_the_builder_keyboard_picker() -> None:
@@ -54,16 +69,62 @@ def test_gateway_provider_selector_uses_the_builder_keyboard_picker() -> None:
     )
     console = ScriptedConsole("")
 
-    selected = provider_picker.select_single_provider(
+    selected = provider_picker.select_providers(
+        provider_picker.SetupSession(),
         console=console,
         environment={},
         read_key=lambda: next(keys),
     )
 
-    assert selected == "azure"
+    assert selected == (("azure",), True)
     assert "Providers" in console.output
     assert "openai" in console.output
     assert "bedrock" in console.output
+
+
+def test_gateway_setup_creates_one_alias_for_each_selected_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-run gateway setup persists every selected provider instead of discarding extras."""
+    connections = (
+        ("openai", ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")),
+        ("anthropic", ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")),
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai", "anthropic"), False),
+    )
+    monkeypatch.setattr(
+        setup, "collect_provider_connections", lambda *_args, **_kwargs: connections
+    )
+    answers = iter(
+        (
+            "gpt-5",
+            "logical-openai",
+            "openai-alias",
+            "claude-sonnet",
+            "logical-anthropic",
+            "anthropic-alias",
+            "default",
+        )
+    )
+    monkeypatch.setattr(setup.typer, "prompt", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(setup.typer, "confirm", lambda *_args, **_kwargs: True)
+
+    result = setup.interactive_gateway_setup(tmp_path)
+
+    assert result.aliases == ("openai-alias", "anthropic-alias")
+    manager = setup.GatewayManagement(tmp_path)
+    assert {item.connection_id for item in manager.provider_connections()} == {
+        "openai",
+        "anthropic",
+    }
+    assert {item.alias_id for item in manager.aliases()} == {
+        "openai-alias",
+        "anthropic-alias",
+    }
 
 
 @pytest.mark.parametrize(

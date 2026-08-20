@@ -277,37 +277,6 @@ def select_providers(
         return providers, any(provider in _MANUAL_MODEL_PROVIDERS for provider in providers)
 
 
-def select_single_provider(
-    *,
-    console: Console,
-    environment: MutableMapping[str, str],
-    read_key: PickerKeyReader | None = None,
-) -> str | None:
-    """Use the shared provider screen when a gateway needs one provider.
-
-    Args:
-        console: Terminal used for the shared provider screen.
-        environment: Process environment passed through the common provider-selection seam.
-        read_key: Optional keyboard source used by tests instead of the controlling terminal.
-
-    Returns:
-        The one selected provider, or ``None`` when the operator cancels.
-    """
-    while True:
-        selection = select_providers(
-            SetupSession(),
-            console=console,
-            environment=environment,
-            read_key=read_key,
-        )
-        if selection is None:
-            return None
-        providers, _manual_models = selection
-        if len(providers) == 1:
-            return providers[0]
-        console.print("[yellow]Select exactly one provider for the gateway.[/yellow]")
-
-
 def _select_provider_rows(
     console: Console,
     *,
@@ -391,6 +360,34 @@ def collect_provider_connection(
         api_version=api_version,
         region=region,
     )
+
+
+def collect_provider_connections(
+    providers: Sequence[str],
+    *,
+    console: Console,
+) -> tuple[tuple[str, ConnectionConfig], ...]:
+    """Collect connection metadata for every provider selected in the shared screen.
+
+    Args:
+        providers: Supported providers returned by ``select_providers``.
+        console: Terminal used for provider-specific fields.
+
+    Returns:
+        Provider names paired with the metadata accepted for each provider. A provider whose
+        optional endpoint field is left empty is skipped using the same rule as normal setup.
+
+    Raises:
+        ValueError: A provider is unsupported or its collected metadata is invalid.
+    """
+    connections: list[tuple[str, ConnectionConfig]] = []
+    for provider in providers:
+        connection = collect_provider_connection(provider, console=console)
+        if connection is None:
+            console.print(f"[yellow]Skipping {SETUP_PROVIDER_LABELS[provider]}.[/yellow]")
+            continue
+        connections.append((provider, connection))
+    return tuple(connections)
 
 
 def prepare_providers(

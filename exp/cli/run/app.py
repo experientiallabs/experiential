@@ -230,7 +230,7 @@ def _emit_gateway_ready(
         if not isinstance(setup, InteractiveSetupResult):
             raise TypeError("interactive setup returned an invalid result")
         typer.echo(f"Default identity: {setup.identity_id}")
-        typer.echo(f"Granted aliases: {setup.alias}")
+        typer.echo(f"Granted aliases: {', '.join(setup.aliases)}")
         typer.echo("")
         typer.echo(f"export OPENAI_BASE_URL=http://{_LOOPBACK_HOST}:{port}/v1")
         typer.echo(f"export OPENAI_API_KEY={setup.raw_key}")

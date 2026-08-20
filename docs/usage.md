@@ -33,8 +33,9 @@ compatibility flag for project-journal behavior; gateway authentication, replay,
 usage accounting stay enabled.
 
 Both `exp run` forms use one gateway lifecycle. It binds only `127.0.0.1`, starts with no
-provider call, and requires an explicit provider environment reference, exact model alias, identity,
-grant, and virtual key. `exp run --non-interactive --json` returns `gateway_not_initialized` plus
+provider call, and requires explicit provider environment references, exact model aliases, identity,
+grants, and a virtual key. Interactive first-run setup can configure multiple providers and aliases
+in one session. `exp run --non-interactive --json` returns `gateway_not_initialized` plus
 exact next commands on an empty root. `exp run --check` validates local readiness without binding.
 The gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets to SQLite.
 `GET /usage` and `GET /usage.json` expose the same schema-v2 content-free overall and per-identity

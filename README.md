@@ -16,8 +16,8 @@ Experiential is an open source gateway and router for agent workflows:
 
 ## Getting Started
 
-Start a local OpenAI-compatible gateway. On first run, the setup wizard asks for a provider,
-model, and public alias, then prints a one-time virtual key:
+Start a local OpenAI-compatible gateway. On first run, the setup wizard lets you select multiple
+providers, collects a model and public alias for each, then prints a one-time virtual key:
 
 ```bash
 pip install experiential
