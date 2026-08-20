@@ -534,6 +534,107 @@ def test_anthropic_text_stream_emits_text_usage_and_completion() -> None:
     assert committed is True
 
 
+def test_anthropic_stream_skips_extended_thinking_blocks_and_deltas() -> None:
+    """Thinking blocks and their deltas are skipped, not rejected as a malformed stream."""
+    frames = b"".join(
+        (
+            _sse(
+                {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 3,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                        }
+                    },
+                },
+                event="message_start",
+            ),
+            _sse(
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+                event="content_block_start",
+            ),
+            _sse(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "weighing options"},
+                },
+                event="content_block_delta",
+            ),
+            _sse(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "signature_delta", "signature": "sig-xyz"},
+                },
+                event="content_block_delta",
+            ),
+            _sse({"type": "content_block_stop", "index": 0}, event="content_block_stop"),
+            _sse(
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                event="content_block_start",
+            ),
+            _sse(
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": "hi"},
+                },
+                event="content_block_delta",
+            ),
+            _sse({"type": "content_block_stop", "index": 1}, event="content_block_stop"),
+            _sse(
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 2},
+                },
+                event="message_delta",
+            ),
+            _sse({"type": "message_stop"}, event="message_stop"),
+        )
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        """Return the Anthropic extended-thinking fixture."""
+        return httpx.Response(200, stream=_ChunkStream((frames,)))
+
+    async def scenario() -> list[GatewayEvent]:
+        """Consume one native Messages stream that includes an extended-thinking block."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = AnthropicClient(
+                model=_snapshot("anthropic"),
+                api_key="fixture-key",
+                base_url="https://anthropic.test/v1",
+                transport=HttpxAsyncJsonTransport(http_client),
+            )
+            stream = await client.stream(
+                _request(GatewayApiSurface.CHAT_COMPLETIONS),
+                deadline=RequestDeadline.after(2),
+                idempotency_key="anthropic-thinking-attempt",
+            )
+            return await _collect(stream)
+
+    events = asyncio.run(scenario())
+
+    assert [event.kind for event in events] == [
+        GatewayEventKind.TEXT_DELTA,
+        GatewayEventKind.USAGE,
+        GatewayEventKind.COMPLETED,
+    ]
+    assert events[0].text_delta == "hi"
+
+
 def test_openai_compatible_stream_emits_refusal_reasoning_usage_and_terminal() -> None:
     """Generic Chat streaming retains refusal semantics and reported reasoning units."""
     frames = b"".join(

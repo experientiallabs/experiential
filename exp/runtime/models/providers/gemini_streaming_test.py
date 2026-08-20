@@ -216,6 +216,55 @@ def test_gemini_stream_cancellation_closes_the_active_http_response() -> None:
     asyncio.run(scenario())
 
 
+def test_gemini_stream_skips_reasoning_parts_and_thought_signatures() -> None:
+    """Thought parts and bare thought signatures are skipped, not rejected as malformed."""
+
+    async def scenario() -> None:
+        """Consume a stream that interleaves reasoning parts with visible text."""
+        upstream = _ChunkStream(
+            (
+                _sse(
+                    {
+                        "candidates": [
+                            {"content": {"parts": [{"text": "pondering", "thought": True}]}}
+                        ]
+                    }
+                ),
+                _sse({"candidates": [{"content": {"parts": [{"thoughtSignature": "sig-abc"}]}}]}),
+                _sse({"candidates": [{"content": {"parts": [{"text": ""}]}}]}),
+                _sse({"candidates": [{"content": {"parts": [{"text": "answer"}]}}]}),
+                _sse(
+                    {
+                        "candidates": [{"finishReason": "STOP"}],
+                        "usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 2},
+                    }
+                ),
+            )
+        )
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            """Return the scripted reasoning-and-text SSE response."""
+            return httpx.Response(200, stream=upstream)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            stream = await _client(http_client).stream(
+                _request(),
+                deadline=RequestDeadline.after(10),
+                idempotency_key="reasoning-operation",
+                retry_policy=RetryPolicy(1, 0, 0),
+            )
+            events = [event async for event in stream]
+
+        assert [event.kind for event in events] == [
+            GatewayEventKind.TEXT_DELTA,
+            GatewayEventKind.USAGE,
+            GatewayEventKind.COMPLETED,
+        ]
+        assert events[0].text_delta == "answer"
+
+    asyncio.run(scenario())
+
+
 def _client(http_client: httpx.AsyncClient) -> GeminiClient:
     """Construct one native Gemini client over the injected async transport."""
     return GeminiClient(

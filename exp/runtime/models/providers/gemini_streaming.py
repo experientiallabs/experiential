@@ -114,9 +114,9 @@ async def _gemini_events(sse: _SseDecoder) -> AsyncIterator[GatewayEvent]:
             )
             for raw_part in parts:
                 part = require_object(raw_part, "Gemini candidate part")
-                text = part.get("text")
-                if isinstance(text, str) and text:
-                    yield factory.create(GatewayEventKind.TEXT_DELTA, text_delta=text)
+                if part.get("thought") is True:
+                    # Reasoning parts (thought text and thought signatures) are not
+                    # gateway-visible output, so they carry nothing to surface.
                     continue
                 if part.get("functionCall") is not None:
                     async for event in _tool_events(
@@ -127,9 +127,16 @@ async def _gemini_events(sse: _SseDecoder) -> AsyncIterator[GatewayEvent]:
                         yield event
                     tool_index += 1
                     continue
+                text = part.get("text")
+                if isinstance(text, str):
+                    if text:
+                        yield factory.create(GatewayEventKind.TEXT_DELTA, text_delta=text)
+                    continue
                 if text is not None:
                     raise ProviderResponseError("Gemini text part must be text")
-                raise ProviderResponseError("Gemini stream emitted an unsupported part")
+                # A part with neither visible text nor a function call (for example a
+                # bare thought signature) carries no gateway-visible output; skip it.
+                continue
         finish_reason = candidate.get("finishReason")
         if finish_reason is None:
             continue

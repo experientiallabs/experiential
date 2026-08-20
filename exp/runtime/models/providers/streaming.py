@@ -699,8 +699,8 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
                     GatewayEventKind.REFUSAL_DELTA,
                     text_delta=_optional_string(block.get("refusal"), "Anthropic refusal"),
                 )
-            else:
-                raise ProviderResponseError("Anthropic stream emitted an unsupported content block")
+            # Content blocks that carry no gateway-visible output, such as
+            # extended-thinking blocks, are skipped rather than rejected.
         elif event_type == "content_block_delta":
             index = require_integer(payload.get("index"), "Anthropic content index")
             delta = require_object(payload.get("delta"), "Anthropic content delta")
@@ -724,8 +724,8 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
                     GatewayEventKind.REFUSAL_DELTA,
                     text_delta=_optional_string(delta.get("refusal"), "Anthropic refusal delta"),
                 )
-            else:
-                raise ProviderResponseError("Anthropic stream emitted an unsupported content delta")
+            # Deltas for non-visible blocks, such as thinking_delta and
+            # signature_delta on an extended-thinking block, are skipped.
         elif event_type == "content_block_stop":
             index = require_integer(payload.get("index"), "Anthropic content index")
             if index in tools and not tools[index].completed:
