@@ -1405,7 +1405,11 @@ def test_model_discovery_is_enriched_and_detail_is_not_an_existence_oracle() -> 
             unauthenticated = await client.get("/v1/models/public-model")
 
         assert listed.status_code == 200
-        assert listed.json() == {"object": "list", "data": [expected]}
+        assert listed.json() == {
+            "object": "list",
+            "data": [expected],
+            "wmo": {"authority_schema_version": 1},
+        }
         assert granted.status_code == 200
         assert granted.json() == expected
         assert ungranted.status_code == 404

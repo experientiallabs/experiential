@@ -8,6 +8,9 @@ from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 AliasAuthority = tuple[str, str, str]
 """Granted alias name, active revision, and catalog digest."""
 
+MODEL_AUTHORITY_SCHEMA_VERSION = 1
+"""Version of the gateway-specific model-list authority envelope."""
+
 
 def public_model_object(authority: AliasAuthority) -> JsonObject:
     """Build one OpenAI model object enriched with the granted alias authority.
@@ -29,6 +32,22 @@ def public_model_object(authority: AliasAuthority) -> JsonObject:
         "created": 0,
         "owned_by": "wmo",
         "wmo": {"alias_revision_id": revision, "catalog_sha256": digest},
+    }
+
+
+def public_model_list(authorities: tuple[AliasAuthority, ...]) -> JsonObject:
+    """Build a caller model list with an authority marker even when it is empty.
+
+    Args:
+        authorities: Granted alias, revision, and catalog digest triples.
+
+    Returns:
+        OpenAI-compatible model-list envelope with the gateway authority marker.
+    """
+    return {
+        "object": "list",
+        "data": [public_model_object(authority) for authority in authorities],
+        "wmo": {"authority_schema_version": MODEL_AUTHORITY_SCHEMA_VERSION},
     }
 
 

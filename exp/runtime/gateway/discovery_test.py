@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from exp.runtime.gateway.discovery import public_model_object, require_granted_authority
+from exp.runtime.gateway.discovery import (
+    public_model_list,
+    public_model_object,
+    require_granted_authority,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 _AUTHORITY = ("coding", "revision-one", "a" * 64)
@@ -18,6 +22,15 @@ def test_public_model_object_keeps_the_openai_keys_and_adds_authority() -> None:
         "created": 0,
         "owned_by": "wmo",
         "wmo": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
+    }
+
+
+def test_public_model_list_marks_even_an_empty_authority_envelope() -> None:
+    """The caller can identify an authenticated gateway with no granted aliases."""
+    assert public_model_list(()) == {
+        "object": "list",
+        "data": [],
+        "wmo": {"authority_schema_version": 1},
     }
 
 

@@ -255,6 +255,7 @@ def test_models_prints_the_caller_view_with_granted_revisions(
                 "wmo": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
             }
         ],
+        "wmo": {"authority_schema_version": 1},
     }
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -298,6 +299,7 @@ def test_key_check_reports_granted_aliases_without_echoing_the_key(
                         },
                     }
                 ],
+                "wmo": {"authority_schema_version": 1},
             },
         )
 
@@ -355,6 +357,43 @@ def test_key_check_rejects_http_200_without_gateway_authority_shape(
         "message": "HTTP 200 did not contain the EXP gateway model-authority response shape.",
     }
     assert _RAW_KEY not in result.output
+
+
+def test_key_check_accepts_a_gateway_authority_envelope_with_no_grants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A marked empty gateway list proves authentication without inventing grants."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        """Serve the gateway's authenticated no-grants envelope."""
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [],
+                "wmo": {"authority_schema_version": 1},
+            },
+        )
+
+    _mock_gateway(monkeypatch, respond)
+    human = CliRunner().invoke(app, ["config", "gateway", "key", "check", "--key", _RAW_KEY])
+    raw = CliRunner().invoke(
+        app,
+        ["config", "gateway", "key", "check", "--key", _RAW_KEY, "--json"],
+    )
+
+    assert human.exit_code == 0, human.output
+    assert human.output == (
+        "key valid; no aliases granted (add one with 'exp config gateway grant')\n"
+    )
+    assert raw.exit_code == 0, raw.output
+    assert json.loads(raw.stdout) == {
+        "schema_version": 1,
+        "operation": "key.check",
+        "valid": True,
+        "granted_aliases": [],
+    }
 
 
 def test_key_check_rejects_an_invalid_key_with_the_gateway_remediation(

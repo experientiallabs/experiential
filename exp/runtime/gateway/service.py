@@ -26,7 +26,11 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
-from exp.runtime.gateway.discovery import public_model_object, require_granted_authority
+from exp.runtime.gateway.discovery import (
+    public_model_list,
+    public_model_object,
+    require_granted_authority,
+)
 from exp.runtime.gateway.execution import (
     GatewayExecutionError,
     GatewayExecutionStream,
@@ -652,12 +656,7 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
         try:
             raw_key = _bearer_key(authorization)
             authorities = service.model_authorities(raw_key=raw_key)
-            return JSONResponse(
-                {
-                    "object": "list",
-                    "data": [public_model_object(authority) for authority in authorities],
-                }
-            )
+            return JSONResponse(public_model_list(authorities))
         except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
             return _exception_response(exc)
 

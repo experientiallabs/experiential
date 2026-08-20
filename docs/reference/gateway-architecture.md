@@ -154,7 +154,9 @@ idempotency, request, or provider values.
 
 `GET /v1/models` lists only the aliases granted to the presented key, as OpenAI model objects
 enriched with a `wmo` object carrying the alias revision and catalog digest of the granted
-authority. `GET /v1/models/{model_id}` describes one granted alias with the same object and
+authority. Its list envelope carries `wmo.authority_schema_version`, including when `data` is
+empty, so caller-side key validation can distinguish this gateway from a generic OpenAI proxy.
+`GET /v1/models/{model_id}` describes one granted alias with the same object and
 returns the identical `model_not_found` 404 for every other model ID, so the route never confirms
 whether an ungranted alias exists. Quota-exhausted and throttled 429 responses and the draining
 503 advertise a `Retry-After` wait, and monthly quota exhaustion reports its exact UTC
