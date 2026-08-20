@@ -171,12 +171,14 @@ class GatewayRequest(ContractModel):
 
 
 class GatewayUsage(ContractModel):
-    """Normalized token counts from one provider attempt."""
+    """Normalized token counts and invoked tool names from one provider attempt."""
 
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     reasoning_tokens: int | None = Field(default=None, ge=0)
+    tool_names: tuple[str, ...] = ()
+    """Invoked tool names in first-use order, names only and never arguments."""
 
 
 class GatewayEventKind(StrEnum):

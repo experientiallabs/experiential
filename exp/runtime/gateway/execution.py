@@ -87,6 +87,7 @@ class _PhysicalAttempt:
     stream: ProviderStream | None = None
     iterator: AsyncIterator[GatewayEvent] | None = None
     latest_usage: GatewayUsage | None = None
+    tool_names: list[str] = field(default_factory=list)
     last_provider_sequence: int = -1
     withheld_refusals: list[GatewayEvent] = field(default_factory=list)
     withheld_refusal_bytes: int = 0
@@ -222,6 +223,9 @@ class GatewayExecutionStream:
             current.last_provider_sequence = event.sequence_number
             if event.usage is not None:
                 current.latest_usage = event.usage
+            if event.kind == GatewayEventKind.TOOL_CALL_COMPLETED and event.tool_call is not None:
+                if event.tool_call.name not in current.tool_names:
+                    current.tool_names.append(event.tool_call.name)
             if (
                 event.kind == GatewayEventKind.REFUSAL_DELTA
                 and self._refusal_failover
@@ -249,7 +253,9 @@ class GatewayExecutionStream:
                 if self._committed:
                     return self._outward(event)
                 continue
-            terminal = _with_latest_usage(event, current.latest_usage)
+            terminal = _stamp_tool_names(
+                _with_latest_usage(event, current.latest_usage), current.tool_names
+            )
             withheld_non_refusal_failure = False
             typed_refusal = (
                 terminal.kind == GatewayEventKind.FAILED
@@ -371,11 +377,14 @@ class GatewayExecutionStream:
             if self._settled or current.settled:
                 return
             owns_cancel = True
-            terminal = GatewayEvent(
-                kind=GatewayEventKind.FAILED,
-                sequence_number=current.last_provider_sequence + 1,
-                failure=failure,
-                usage=current.latest_usage,
+            terminal = _stamp_tool_names(
+                GatewayEvent(
+                    kind=GatewayEventKind.FAILED,
+                    sequence_number=current.last_provider_sequence + 1,
+                    failure=failure,
+                    usage=current.latest_usage,
+                ),
+                current.tool_names,
             )
             try:
                 self._ledger.finish_attempt(
@@ -873,6 +882,23 @@ def _with_latest_usage(
     if latest_usage is None or event.usage is not None:
         return event
     return event.model_copy(update={"usage": latest_usage})
+
+
+def _stamp_tool_names(event: GatewayEvent, tool_names: list[str]) -> GatewayEvent:
+    """Stamp invoked tool names onto a terminal event's usage.
+
+    Args:
+        event: Terminal event whose usage should carry the invoked tool names.
+        tool_names: Deduplicated invoked tool names in first-use order.
+
+    Returns:
+        The event unchanged when it has no usage or no tool was invoked, otherwise a copy
+        whose usage lists the invoked tool names.
+    """
+    if event.usage is None or not tool_names:
+        return event
+    usage = event.usage.model_copy(update={"tool_names": tuple(tool_names)})
+    return event.model_copy(update={"usage": usage})
 
 
 def _all_routes_unavailable() -> GatewayFailure:
