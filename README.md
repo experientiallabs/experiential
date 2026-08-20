@@ -36,23 +36,26 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## Using the API
 
-Call the gateway programmatically with any OpenAI-compatible client:
+Create an embeddable gateway runtime from your provider, routing, and storage components:
 
 ```python
-import os
+import exp
 
-from openai import OpenAI
-
-client = OpenAI(
-    api_key=os.environ["EXP_GATEWAY_KEY"],
-    base_url="http://127.0.0.1:8000/v1",
+runtime = exp.create_gateway_runtime(
+    config=exp.GatewayRuntimeConfig(graceful_timeout_seconds=10),
+    authority=authority,
+    ledger=ledger,
+    routes=routes,
+    executor=executor,
+    clock=clock,
+    readiness=readiness,
+    usage=usage,
+    replay=replay,
+    continuations=continuations,
 )
 
-response = client.chat.completions.create(
-    model="support-agent",
-    messages=[{"role": "user", "content": "Help me reset my password"}],
-)
-print(response.choices[0].message.content)
+app = runtime.app
+# Serve app with your ASGI worker, including ASGI lifespan.
 ```
 
 ## Optimize from Traffic
