@@ -10,7 +10,7 @@ uploads machine-readable JSON plus JUnit output. Symbolic or mismatched revision
 
 ## Router workflow
 
-`wmo/optimize/router/tests/composition_evidence_test.py` drives `wmo.compose_router` from 100 normalized traces.
+`exp/optimize/router/tests/composition_evidence_test.py` drives `exp.compose_router` from 100 normalized traces.
 The build produces 50 fit tasks and 20 sealed held-out tasks. A reviewed rubric and calibration,
 two frozen candidates, one pricing snapshot, ten production overlaps, and one frozen embedder feed
 the real text `WorldModelSimulator`, W10 fit lock and held-out report, and W11 HTTP runtime.
@@ -23,13 +23,13 @@ The exact deterministic run retains these denominators:
 - one shared simulation ceiling of $2.00 and exactly $0.00 observed fake-client spend
 
 Exact replay adds no model, world-model, judge, or telemetry delivery; crash-and-resume at
-both durable phase boundaries is pinned by wmo/optimize/router/composition_test.py. Two HTTP turns
+both durable phase boundaries is pinned by exp/optimize/router/composition_test.py. Two HTTP turns
 with one episode ID retain one hashed episode identity and one sticky routed alias without exposing
 the raw episode ID.
 
 ## Text and local process comparison
 
-`wmo/simulation/tests/comparison_evidence_test.py` runs both the real text simulator and the bounded
+`exp/simulation/tests/comparison_evidence_test.py` runs both the real text simulator and the bounded
 Darwin `LocalProcessEnvironmentRuntime` through `SandboxSimulator`. Two exact post-lock pairs are
 retained: both are paired, one is usable, and one records an explicit malformed sandbox response.
 The report therefore keeps one sandbox failure in the denominator instead of silently dropping it.
@@ -39,8 +39,8 @@ workspace process directory. Terminal agreement is structural, not a task-qualit
 Run the evidence with:
 
 ```console
-uv run pytest -q wmo/optimize/router/tests/composition_evidence_test.py \
-  wmo/simulation/tests/comparison_evidence_test.py
+uv run pytest -q exp/optimize/router/tests/composition_evidence_test.py \
+  exp/simulation/tests/comparison_evidence_test.py
 ```
 
 The local process case is intentionally skipped outside Darwin because that runtime's containment

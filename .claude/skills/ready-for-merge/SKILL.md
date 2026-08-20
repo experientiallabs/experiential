@@ -87,17 +87,17 @@ Read `AGENTS.md` in full and audit the PR's complete diff (`gh pr diff <number>`
 rule. In particular verify:
 
 - Checks are clean, scoped to the diff: `uv run ruff check .` and `uv run ty check` (both fast)
-  always; pytest targeted at the packages the PR touches (`uv run pytest wmo/<pkg>/ -q`) during
+  always; pytest targeted at the packages the PR touches (`uv run pytest exp/<pkg>/ -q`) during
   fix iterations. Run the full `uv run pytest -q` only once, before the final hand-off, and only
-  when the PR touches `wmo/` code at all (docs/skills-only diffs skip it).
+  when the PR touches `exp/` code at all (docs/skills-only diffs skip it).
 - Module docstrings and Google-style docstrings on significant classes/functions.
 - Tests live inline next to the code (`foo.py` → `foo_test.py`); new behavior has a test or eval
   that would catch its regression.
 - No `Any`, bare `dict`/`object`, or untyped `**kwargs` where a concrete type is practical.
 - NO new top-level directory or file, of any name, unless the PR description records that a
   human granted permission for that exact name (AGENTS.md rule 5). The tracked top level is
-  closed: `wmo/`, `docs/`, `.claude/`, `.github/`. Reusable code goes in `wmo/`
-  (shared contracts in `wmo/common/` and runtime adapters in `wmo/runtime/`), finished reports in
+  closed: `exp/`, `docs/`, `.claude/`, `.github/`. Reusable code goes in `exp/`
+  (shared contracts in `exp/common/` and runtime adapters in `exp/runtime/`), finished reports in
   `docs/`, and scratch work outside the repo entirely. Benchmark data is a dependency, never a
   directory.
 - Imports at module scope, fail-fast; no silent `ImportError` fallbacks.
@@ -116,7 +116,7 @@ Push any fixes made in Steps 1–3, then report a checklist to the user:
 - [ ] All review comments resolved (list each commenter and how their comments were handled)
 - [ ] AGENTS.md audit clean (note any rules that required fixes)
 - [ ] Checks green (lint/types always; tests scoped to the diff, one full run before hand-off
-      when the PR touches `wmo/`)
+      when the PR touches `exp/`)
 - [ ] Final polled quiet window after the last push produced zero new comments
 
 If every box is checked, end by telling the user:

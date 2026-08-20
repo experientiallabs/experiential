@@ -1,7 +1,7 @@
 # Portable Project bundles
 
-WMO can export one Project's selected durable state as a deterministic bundle and restore it under
-a different local WMO root. The supported package-root API is limited to
+Experiential can export one Project's selected durable state as a deterministic bundle and restore it under
+a different local Experiential root. The supported package-root API is limited to
 `export_project_bundle`, `restore_project_bundle`, and `ExportedProjectBundle`.
 
 ## Selected immutable state
@@ -49,7 +49,7 @@ the staging root and leaves no partially selected Project.
 Transport-neutral Project events use the stages `preparing_traces`, `building_world_model`,
 `optimizing_router`, and `completing_report`. Their event kinds are `started`, bounded `progress`,
 `completed`, and `failed`. Completion carries exact immutable output pointers; failure carries a
-typed redacted code and retryability, not provider text. WMO defines these domain records but does
+typed redacted code and retryability, not provider text. Experiential defines these domain records but does
 not provide an event bus, persistence service, or delivery guarantee.
 
 The bundle contains completed immutable build state only. A currently running operation belongs to

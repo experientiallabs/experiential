@@ -474,6 +474,67 @@ wheels = [
 ]
 
 [[package]]
+name = "experiential"
+version = "0.4.0"
+source = { editable = "." }
+dependencies = [
+    { name = "boto3" },
+    { name = "botocore" },
+    { name = "click" },
+    { name = "fastapi" },
+    { name = "filelock" },
+    { name = "httpx" },
+    { name = "numpy" },
+    { name = "openai" },
+    { name = "posthog" },
+    { name = "pydantic" },
+    { name = "rich" },
+    { name = "tomli-w" },
+    { name = "typer" },
+    { name = "uvicorn" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-xdist" },
+    { name = "ruff" },
+    { name = "tinker" },
+    { name = "tinker-cookbook" },
+    { name = "ty" },
+]
+sft = [
+    { name = "tinker" },
+    { name = "tinker-cookbook" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "boto3", specifier = ">=1.35,<2" },
+    { name = "botocore", specifier = ">=1.35,<2" },
+    { name = "click", specifier = ">=8.2" },
+    { name = "experiential", extras = ["sft"], marker = "extra == 'dev'" },
+    { name = "fastapi", specifier = ">=0.128" },
+    { name = "filelock", specifier = ">=3.12" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "numpy", specifier = ">=1.26" },
+    { name = "openai", specifier = ">=3.0,<4" },
+    { name = "posthog", specifier = ">=7.0" },
+    { name = "pydantic", specifier = ">=2.6" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.8" },
+    { name = "rich", specifier = ">=14.1" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
+    { name = "tinker", marker = "extra == 'sft'", specifier = ">=0.23,<0.24" },
+    { name = "tinker-cookbook", marker = "extra == 'sft'", specifier = ">=0.4.3,<0.5" },
+    { name = "tomli-w", specifier = ">=1.0" },
+    { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a1" },
+    { name = "typer", specifier = ">=0.16" },
+    { name = "uvicorn", specifier = ">=0.38" },
+]
+provides-extras = ["sft", "dev"]
+
+[[package]]
 name = "fastapi"
 version = "0.139.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2589,67 +2650,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/2e/41/06cce5dbb9f775915
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a0/3a/eb70620ca2bf8213603d5c731460687c49fee38b0072f0b4a637781f0a53/uvicorn-0.50.0-py3-none-any.whl", hash = "sha256:05f0eb19edf38208f79f43df8a63081b48df31b0cd1e5997be957a4dc97d1b19", size = 72716, upload-time = "2026-07-04T05:03:24.848Z" },
 ]
-
-[[package]]
-name = "world-model-optimizer"
-version = "0.3.0"
-source = { editable = "." }
-dependencies = [
-    { name = "boto3" },
-    { name = "botocore" },
-    { name = "click" },
-    { name = "fastapi" },
-    { name = "filelock" },
-    { name = "httpx" },
-    { name = "numpy" },
-    { name = "openai" },
-    { name = "posthog" },
-    { name = "pydantic" },
-    { name = "rich" },
-    { name = "tomli-w" },
-    { name = "typer" },
-    { name = "uvicorn" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-xdist" },
-    { name = "ruff" },
-    { name = "tinker" },
-    { name = "tinker-cookbook" },
-    { name = "ty" },
-]
-sft = [
-    { name = "tinker" },
-    { name = "tinker-cookbook" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "boto3", specifier = ">=1.35,<2" },
-    { name = "botocore", specifier = ">=1.35,<2" },
-    { name = "click", specifier = ">=8.2" },
-    { name = "fastapi", specifier = ">=0.128" },
-    { name = "filelock", specifier = ">=3.12" },
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "numpy", specifier = ">=1.26" },
-    { name = "openai", specifier = ">=3.0,<4" },
-    { name = "posthog", specifier = ">=7.0" },
-    { name = "pydantic", specifier = ">=2.6" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.8" },
-    { name = "rich", specifier = ">=14.1" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
-    { name = "tinker", marker = "extra == 'sft'", specifier = ">=0.23,<0.24" },
-    { name = "tinker-cookbook", marker = "extra == 'sft'", specifier = ">=0.4.3,<0.5" },
-    { name = "tomli-w", specifier = ">=1.0" },
-    { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a1" },
-    { name = "typer", specifier = ">=0.16" },
-    { name = "uvicorn", specifier = ">=0.38" },
-    { name = "world-model-optimizer", extras = ["sft"], marker = "extra == 'dev'" },
-]
-provides-extras = ["sft", "dev"]
 
 [[package]]
 name = "xxhash"

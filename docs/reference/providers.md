@@ -1,10 +1,10 @@
 # Model providers
 
-WMO resolves models from a secret-free `.wmo/models.toml` catalog. `RuntimeModelCatalog` is the
+Experiential resolves models from a secret-free `.exp/models.toml` catalog. `RuntimeModelCatalog` is the
 only construction service. Provider names do not imply capabilities or prices. Every completion or
 embedding alias must declare the protocol features and token prices it uses.
 
-Configure connections with `wmo config providers` or the first `wmo build` on a clean checkout.
+Configure connections with `exp config providers` or the first `exp build` on a clean checkout.
 An interactive terminal opens a provider list: Up and Down move focus, Enter selects or deselects
 the focused provider, and the Complete row submits the selection. Agents skip that list with
 repeatable `--provider` flags (`openai`, `anthropic`, `gemini`, `openrouter`,
@@ -39,7 +39,7 @@ Use `provider = "azure"`. The connection needs:
 - `api_version`: `v1` for the current Azure OpenAI and Foundry `/openai/v1` routes, or a dated
   Azure OpenAI version such as `2024-10-21` for classic deployment-in-path routing
 
-The model record `model` field is the exact Azure deployment identifier sent on the wire. WMO never
+The model record `model` field is the exact Azure deployment identifier sent on the wire. Experiential never
 derives a deployment from an alias or a base-model name. Use a separate alias for an embedding
 deployment.
 

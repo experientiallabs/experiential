@@ -7,7 +7,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "README.md"
-      - "wmo/**"
+      - "exp/**"
   push:
     branches: [main]
     paths:
@@ -15,7 +15,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "README.md"
-      - "wmo/**"
+      - "exp/**"
   release:
     types: [published]
   workflow_dispatch:
@@ -53,50 +53,50 @@ jobs:
         id: source_revision
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: astral-sh/setup-uv@v6
-      - name: Build the WMO distribution
-        run: uv build --package world-model-optimizer --no-sources
+      - name: Build the EXP distribution
+        run: uv build --package experiential --no-sources
       - name: Smoke test the wheel
         run: |
-          uv venv /tmp/wmo-wheel-smoke
-          uv pip install --python /tmp/wmo-wheel-smoke/bin/python dist/*.whl "openai==3.0.0"
+          uv venv /tmp/exp-wheel-smoke
+          uv pip install --python /tmp/exp-wheel-smoke/bin/python dist/*.whl "openai==3.0.0"
           cd /tmp
-          /tmp/wmo-wheel-smoke/bin/python - <<'PY'
-          import wmo
-          import wmo.common.models
-          import wmo.runtime.models
-          from wmo.runtime.environments import LocalProcessEnvironmentRuntime
-          from wmo.runtime.openai_protocol import decode_chat, stream_encoder
-          from wmo.runtime.router import RouterRuntime
-          from wmo.simulation import compare_text_and_sandbox
-          from wmo.simulation.engines import SandboxSimulator
-          from wmo.optimize.router import RouterCompositionResult
-          from wmo.simulation import SimulationSpec
+          /tmp/exp-wheel-smoke/bin/python - <<'PY'
+          import exp
+          import exp.common.models
+          import exp.runtime.models
+          from exp.runtime.environments import LocalProcessEnvironmentRuntime
+          from exp.runtime.openai_protocol import decode_chat, stream_encoder
+          from exp.runtime.router import RouterRuntime
+          from exp.simulation import compare_text_and_sandbox
+          from exp.simulation.engines import SandboxSimulator
+          from exp.optimize.router import RouterCompositionResult
+          from exp.simulation import SimulationSpec
 
-          assert callable(wmo.compose_router)
-          assert callable(wmo.load_project_router)
-          assert callable(wmo.load_router)
+          assert callable(exp.compose_router)
+          assert callable(exp.load_project_router)
+          assert callable(exp.load_router)
           assert callable(decode_chat)
           assert callable(stream_encoder)
-          assert wmo.RouterRuntime is RouterRuntime
-          assert wmo.RouterCompositionResult is RouterCompositionResult
-          assert "create_project_router_app" not in wmo.__all__
+          assert exp.RouterRuntime is RouterRuntime
+          assert exp.RouterCompositionResult is RouterCompositionResult
+          assert "create_project_router_app" not in exp.__all__
           assert callable(compare_text_and_sandbox)
-          assert SimulationSpec.__module__ == "wmo.simulation.specs.simulation"
-          assert SandboxSimulator.__module__ == "wmo.simulation.engines.sandbox"
-          assert LocalProcessEnvironmentRuntime.__module__ == "wmo.runtime.environments.local"
+          assert SimulationSpec.__module__ == "exp.simulation.specs.simulation"
+          assert SandboxSimulator.__module__ == "exp.simulation.engines.sandbox"
+          assert LocalProcessEnvironmentRuntime.__module__ == "exp.runtime.environments.local"
           PY
-          /tmp/wmo-wheel-smoke/bin/wmo --help
+          /tmp/exp-wheel-smoke/bin/exp --help
       - name: Installed-wheel no-spend release evidence
         env:
           PYTHONNOUSERSITE: "1"
           TERM: xterm-256color
-          WMO_INSTALLED_RELEASE_EVIDENCE: "1"
-          WMO_RELEASE_REVISION: ${{ steps.source_revision.outputs.sha }}
-          WMO_SOURCE_CHECKOUT: ${{ github.workspace }}
-          WMO_TELEMETRY: "0"
+          EXP_INSTALLED_RELEASE_EVIDENCE: "1"
+          EXP_RELEASE_REVISION: ${{ steps.source_revision.outputs.sha }}
+          EXP_SOURCE_CHECKOUT: ${{ github.workspace }}
+          EXP_TELEMETRY: "0"
         run: |
-          cp wmo/tests/release_test.py /tmp/wmo-wheel-smoke/installed_release_evidence.py
-          cd /tmp/wmo-wheel-smoke
+          cp exp/tests/release_test.py /tmp/exp-wheel-smoke/installed_release_evidence.py
+          cd /tmp/exp-wheel-smoke
           ./bin/python installed_release_evidence.py
       - uses: actions/upload-artifact@v4
         with:

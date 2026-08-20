@@ -2,7 +2,7 @@
 
 ## Supported surface
 
-No-argument `wmo run` starts an authenticated multi-alias gateway on `127.0.0.1`.
+No-argument `exp run` starts an authenticated multi-alias gateway on `127.0.0.1`.
 It serves:
 
 - `GET /v1/models`
@@ -11,7 +11,7 @@ It serves:
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 
-`wmo run PROJECT` is compatibility sugar that activates one project-backed alias and launches this
+`exp run PROJECT` is compatibility sugar that activates one project-backed alias and launches this
 same gateway application. It does not create a router HTTP server. Gateway startup and readiness
 perform no provider request. Only an authorized model request may cross the provider boundary.
 
@@ -22,8 +22,8 @@ provider, secret, project-selection, clock, readiness, and usage implementations
 returned lifecycle handle:
 
 ```python
-runtime = wmo.create_gateway_runtime(
-    config=wmo.GatewayRuntimeConfig(graceful_timeout_seconds=10),
+runtime = exp.create_gateway_runtime(
+    config=exp.GatewayRuntimeConfig(graceful_timeout_seconds=10),
     authority=authority,
     ledger=ledger,
     routes=routes,
@@ -52,7 +52,7 @@ one bounded drain and one terminal flush, then remains permanently not ready.
 
 ## Authority and management
 
-`wmo config gateway` owns explicit local setup. Its provider, identity, key, grant, alias, pool, and
+`exp config gateway` owns explicit local setup. Its provider, identity, key, grant, alias, pool, and
 monthly budget commands produce versioned receipts suitable for interactive or non-interactive
 callers. There are no runtime seeds. A usable installation requires an organization, active
 identity, active virtual key, explicit identity-to-alias grant, active alias revision, immutable
@@ -87,7 +87,7 @@ An alias targets either:
 1. a direct exact-model pool, or
 2. one immutable project activation.
 
-A singleton alias creates a one-deployment pool. `wmo config gateway pool certify` can replace that
+A singleton alias creates a one-deployment pool. `exp config gateway pool certify` can replace that
 with an ordered pool only when every member has the same exact logical model identity and an
 operator-supplied equivalence certification. The certification records an ID, provenance, evidence
 digest, time, and exact deployment order. Project policy selection still chooses one exact logical
@@ -138,7 +138,7 @@ deployments.
 
 ## OpenAI-compatible protocol
 
-`wmo/runtime/openai_protocol` is the only OpenAI wire implementation. Chat Completions and
+`exp/runtime/openai_protocol` is the only OpenAI wire implementation. Chat Completions and
 Responses have separate allowlist decoders and field-specific OpenAI error responses, but both
 convert to one canonical gateway request without conflating their wire contracts. The package also
 owns headers, response assembly, SSE framing, tool-call reconstruction, and official SDK
@@ -178,7 +178,7 @@ subprocess-bound loopback gateway, a real loopback upstream, and the official SD
 scanner checks database, WAL, backups when present, catalog snapshots, stdout, stderr, logs, usage
 responses, and error bodies for raw content and secret canaries.
 
-`wmo/runtime/gateway/provider_certification.py` is the dated provider capability matrix. Each cell
+`exp/runtime/gateway/provider_certification.py` is the dated provider capability matrix. Each cell
 names the official client SDK, public gateway surfaces, provider wire surface, fixture result, and
 credential-gated live status. OpenAI and Anthropic have native fixtures; generic OpenAI-compatible,
 Azure, and OpenRouter share compatible-stream coverage; Gemini and Bedrock have native deterministic

@@ -1,0 +1,123 @@
+"""Frozen project-selection runtime for gateway-backed aliases."""
+
+from __future__ import annotations
+
+from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from exp.runtime.router.errors import RouterApplicationError as RouterApplicationError
+
+from exp.runtime.router.completion import (
+    JournaledRouterCompletionService,
+    RouterCompletionConflictError,
+    RouterCompletionFailedError,
+    RouterCompletionInProgressError,
+    RouterCompletionService,
+)
+from exp.runtime.router.economics import (
+    BillingSourceEconomics,
+    RoutedCompletionEconomics,
+    RoutedProviderComponent,
+    RoutedProviderOperation,
+    RoutedSpendDisposition,
+    RoutedSpendLedger,
+)
+from exp.runtime.router.journal import (
+    RuntimeAcceptedEvent,
+    RuntimeAttemptFailedEvent,
+    RuntimeCompletedEvent,
+    RuntimeIdempotencyConflictError,
+    RuntimeInteractionFailedError,
+    RuntimeInteractionInProgressError,
+    RuntimeInteractionJournal,
+    RuntimeJournalError,
+    RuntimeJournalEvent,
+)
+from exp.runtime.router.journal_service import JournaledRouterRuntime
+from exp.runtime.router.runtime import (
+    RoutedModelResponse,
+    RouterEpisodeConflictError,
+    RouterModelCapabilityError,
+    RouterRuntime,
+    RouterRuntimeIntegrityError,
+)
+from exp.runtime.router.snapshot import (
+    LoadedRuntimeTraceSnapshot,
+    PersistedRuntimeTraceExport,
+    RuntimeTraceAttempt,
+    RuntimeTraceInteraction,
+    RuntimeTraceSnapshot,
+    RuntimeTraceSnapshotError,
+    load_runtime_trace_snapshot,
+    routed_task_text,
+    seal_runtime_trace_snapshot,
+)
+
+_SERVER_EXPORT_MODULES = {
+    "RouterApplicationError": "exp.runtime.router.errors",
+}
+
+__all__ = [
+    "BillingSourceEconomics",
+    "RoutedCompletionEconomics",
+    "RoutedProviderComponent",
+    "RoutedProviderOperation",
+    "RoutedSpendDisposition",
+    "RoutedSpendLedger",
+    "RoutedModelResponse",
+    "JournaledRouterRuntime",
+    "JournaledRouterCompletionService",
+    "RuntimeAcceptedEvent",
+    "RuntimeAttemptFailedEvent",
+    "RuntimeCompletedEvent",
+    "RuntimeIdempotencyConflictError",
+    "RuntimeInteractionFailedError",
+    "RuntimeInteractionInProgressError",
+    "RuntimeInteractionJournal",
+    "RuntimeJournalError",
+    "RuntimeJournalEvent",
+    "RouterEpisodeConflictError",
+    "RouterModelCapabilityError",
+    "RouterCompletionService",
+    "RouterCompletionConflictError",
+    "RouterCompletionInProgressError",
+    "RouterCompletionFailedError",
+    "RouterRuntime",
+    "RouterRuntimeIntegrityError",
+    "LoadedRuntimeTraceSnapshot",
+    "PersistedRuntimeTraceExport",
+    "RuntimeTraceAttempt",
+    "RuntimeTraceInteraction",
+    "RuntimeTraceSnapshot",
+    "RuntimeTraceSnapshotError",
+    "load_runtime_trace_snapshot",
+    "routed_task_text",
+    "seal_runtime_trace_snapshot",
+    "RouterApplicationError",
+]
+
+
+def __getattr__(name: str) -> object:
+    """Resolve one server-facing router service without loading FastAPI at package import.
+
+    Args:
+        name: Package attribute requested by Python.
+
+    Returns:
+        The supported public server object loaded from its owning module.
+
+    Raises:
+        AttributeError: The name is not a lazy server-facing export.
+    """
+    module_name = _SERVER_EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Return module globals plus supported lazy server exports."""
+    return sorted(set(globals()) | set(_SERVER_EXPORT_MODULES))

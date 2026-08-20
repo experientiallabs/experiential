@@ -1,12 +1,12 @@
 [project]
-name = "world-model-optimizer"
-version = "0.3.0"
+name = "experiential"
+version = "0.4.0"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
-    # because `wmo.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
+    # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
     "filelock>=3.12",
     "typer>=0.16",
     "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
@@ -16,7 +16,7 @@ dependencies = [
     "numpy>=1.26",
     "httpx>=0.27",
     "rich>=14.1",
-    "tomli-w>=1.0",  # writing project and telemetry TOML; every `wmo build` needs it
+    "tomli-w>=1.0",  # writing project and telemetry TOML; every `exp build` needs it
     "posthog>=7.0",
     # Public router request and response types follow the official OpenAI-generated schemas.
     "openai>=3.0,<4",
@@ -33,25 +33,25 @@ dev = [
     "pytest-xdist>=3.8",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-optimizer[sft]",
+    "experiential[sft]",
 ]
 
 [project.scripts]
-wmo = "wmo.cli:main"
+exp = "exp.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["wmo"]
-# Test-only code is named for pytest discovery, and `wmo/conftest.py` is a pytest fixture module.
-exclude = ["**/*_test.py", "wmo/conftest.py"]
+packages = ["exp"]
+# Test-only code is named for pytest discovery, and `exp/conftest.py` is a pytest fixture module.
+exclude = ["**/*_test.py", "exp/conftest.py"]
 
 [tool.hatch.build.targets.sdist]
-# One flagship distribution: everything importable lives under /wmo.
+# One flagship distribution: everything importable lives under /exp.
 include = [
-    "/wmo",
+    "/exp",
     "/assets",
     "/docs/reference/gateway-architecture.md",
     "/docs/release-scope.md",
@@ -66,7 +66,7 @@ include = [
 # directory when they cover the package as a whole.
 python_files = ["*_test.py"]
 # One root gate over the single package.
-testpaths = ["wmo"]
+testpaths = ["exp"]
 
 [tool.ruff]
 line-length = 100

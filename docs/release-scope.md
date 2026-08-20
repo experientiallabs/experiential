@@ -13,7 +13,7 @@ on the exact release checkout.
   provider fallback, Chat Completions, Responses, bounded in-memory continuation and replay,
   content-free SQLite accounting, monthly integer micro-USD enforcement, and loopback-only health
   and usage views.
-- Both no-argument gateway launch and the retained `wmo run PROJECT [--ghost]` compatibility form
+- Both no-argument gateway launch and the retained `exp run PROJECT [--ghost]` compatibility form
   are installed-wheel surfaces. Gateway startup is provider-idle and requires explicit authority.
 - The installed-wheel gateway lane uses real SQLite, a real subprocess listener, a real loopback
   upstream, and OpenAI `3.0.0`. It covers `OpenAI` and `AsyncOpenAI` across Chat Completions and
@@ -59,7 +59,7 @@ credentials. `Not run` means exactly that; it is not inferred from fixture cover
 | Amazon Bedrock | Native EventStream fixtures for text, incremental tool arguments, usage, bounded cancellation, refusal, and single dispatch | Not run; requires an authorized AWS account and region |
 
 The machine-readable dated matrix is
-`wmo/runtime/gateway/provider_certification.py`. Its live cells are
+`exp/runtime/gateway/provider_certification.py`. Its live cells are
 `not_run_requires_credentials`. Gemini complete structured function arguments are explicitly not
 labeled as provider-byte incremental tool-argument streaming.
 

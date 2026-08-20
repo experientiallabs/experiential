@@ -1,0 +1,249 @@
+"""Provider-neutral errors and shared wire validation for completed provider responses."""
+
+from __future__ import annotations
+
+import asyncio
+from enum import StrEnum
+
+from pydantic import JsonValue
+
+from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
+from exp.runtime.models.providers.transport import ProviderTransportError
+
+
+class ProviderResponseError(ValueError):
+    """A provider returned a completed response that violates EXP's typed contract."""
+
+
+class ProviderRetryableResponseError(ProviderResponseError):
+    """A completed response decoded to no usable output and merits one bounded re-dispatch.
+
+    Reasoning models can consume an entire output budget on hidden reasoning and return
+    neither visible text nor a tool call. The response is well formed on the wire, so the
+    request is safe to dispatch again under the client's bounded retry policy.
+    """
+
+
+class ProviderRefusalSignal(StrEnum):
+    """Content-free refusal signals normalized from provider-specific wire values."""
+
+    CONTENT_POLICY = "content_policy"
+    SAFETY = "safety"
+    COPYRIGHT = "copyright"
+    SENSITIVE_INFORMATION = "sensitive_information"
+    GUARDRAIL = "guardrail"
+    PROVIDER_REFUSAL = "provider_refusal"
+
+
+class ProviderRefusalError(ProviderResponseError):
+    """A provider refused the request without retaining or exposing refusal content."""
+
+    def __init__(self, *, provider: str, signal: ProviderRefusalSignal) -> None:
+        """Record only the provider family and normalized content-free signal.
+
+        Args:
+            provider: Stable provider family name.
+            signal: Sanitized refusal category derived from the wire response.
+        """
+        super().__init__(f"{provider} refused the request")
+        self.provider = provider
+        self.signal = signal
+
+
+class ProviderCapabilityError(ValueError):
+    """A request requires gateway behavior the deployment cannot preserve."""
+
+    def __init__(self, *, capability: str) -> None:
+        """Name the unsupported public capability without provider content.
+
+        Args:
+            capability: Stable capability field rejected before dispatch.
+        """
+        super().__init__(f"provider deployment does not support {capability}")
+        self.capability = capability
+
+
+def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
+    """Convert an execution error into one stable sanitized gateway failure.
+
+    Args:
+        exception: Provider, transport, deadline, cancellation, or preflight failure.
+
+    Returns:
+        A content-free failure safe for public errors, ledgers, and logs.
+    """
+    if isinstance(exception, asyncio.CancelledError):
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.CANCELLED,
+            safe_message="provider request was cancelled",
+        )
+    if isinstance(exception, ProviderDeadlineExceeded):
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.TIMEOUT,
+            safe_message="provider request deadline exceeded",
+            failover_eligible=True,
+        )
+    if isinstance(exception, ProviderRefusalError):
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.REFUSAL,
+            safe_message="provider refused the request",
+            safe_details={"signal": exception.signal.value},
+        )
+    if isinstance(exception, ProviderCapabilityError):
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
+            safe_message="provider deployment cannot preserve the requested capability",
+            safe_details={"capability": exception.capability},
+        )
+    if isinstance(exception, ProviderTransportError):
+        return _transport_failure(exception.status_code)
+    if isinstance(exception, ProviderResponseError):
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.MALFORMED_RESPONSE,
+            safe_message="provider returned a malformed response",
+            failover_eligible=True,
+        )
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.INTERNAL,
+        safe_message="provider execution failed",
+    )
+
+
+def _transport_failure(status_code: int | None) -> GatewayFailure:
+    """Classify one sanitized HTTP or connection failure by status only.
+
+    Args:
+        status_code: Provider HTTP status, or ``None`` for a connection failure.
+
+    Returns:
+        Stable retry and failover policy without response content.
+    """
+    details: JsonObject = {}
+    if status_code is not None:
+        details["status_code"] = status_code
+    if status_code in {401, 403}:
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+            safe_message="provider authentication failed",
+            failover_eligible=True,
+            safe_details=details,
+        )
+    if status_code == 404:
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_NOT_FOUND,
+            safe_message="provider deployment was not found",
+            failover_eligible=True,
+            safe_details=details,
+        )
+    if status_code == 429:
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request",
+            failover_eligible=True,
+            safe_details=details,
+        )
+    if status_code == 408:
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.TIMEOUT,
+            safe_message="provider request timed out",
+            retryable_same_deployment=True,
+            failover_eligible=True,
+            safe_details=details,
+        )
+    if status_code is not None and status_code >= 500:
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+            safe_message="provider service failed",
+            retryable_same_deployment=True,
+            failover_eligible=True,
+            safe_details=details,
+        )
+    if status_code is not None:
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+            safe_message="provider rejected the request",
+            safe_details=details,
+        )
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT,
+        safe_message="provider transport failed",
+        retryable_same_deployment=True,
+        failover_eligible=True,
+    )
+
+
+def require_array(value: JsonValue | None, label: str) -> list[JsonValue]:
+    """Return a response JSON array or raise a focused conversion error.
+
+    Args:
+        value: Decoded response value to validate.
+        label: Provider-prefixed wire location used in the error message.
+
+    Returns:
+        The value unchanged when it is a JSON array.
+
+    Raises:
+        ProviderResponseError: The value is not a JSON array.
+    """
+    if not isinstance(value, list):
+        raise ProviderResponseError(f"{label} must be an array")
+    return value
+
+
+def require_object(value: JsonValue | None, label: str) -> JsonObject:
+    """Return a response JSON object or raise a focused conversion error.
+
+    Args:
+        value: Decoded response value to validate.
+        label: Provider-prefixed wire location used in the error message.
+
+    Returns:
+        The value unchanged when it is a JSON object.
+
+    Raises:
+        ProviderResponseError: The value is not a JSON object.
+    """
+    if not isinstance(value, dict):
+        raise ProviderResponseError(f"{label} must be an object")
+    return value
+
+
+def require_string(value: JsonValue | None, label: str) -> str:
+    """Return a required non-empty response string or raise a focused conversion error.
+
+    Args:
+        value: Decoded response value to validate.
+        label: Provider-prefixed wire location used in the error message.
+
+    Returns:
+        The value unchanged when it is a non-empty string.
+
+    Raises:
+        ProviderResponseError: The value is not a non-empty string.
+    """
+    if not isinstance(value, str) or not value:
+        raise ProviderResponseError(f"{label} must be a non-empty string")
+    return value
+
+
+def require_integer(value: JsonValue | None, label: str) -> int:
+    """Read an optional non-negative response integer, counting an absent field as zero.
+
+    Args:
+        value: Decoded response value to validate.
+        label: Provider-prefixed wire location used in the error message.
+
+    Returns:
+        The value when it is a non-negative integer, or zero when absent, because providers
+        omit usage fields whose count is zero.
+
+    Raises:
+        ProviderResponseError: The value is present but not a non-negative integer.
+    """
+    if value is None:
+        return 0
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ProviderResponseError(f"{label} must be a non-negative integer")
+    return value

@@ -13,7 +13,7 @@ the same failure. Never tune a judge from intuition or from unverified caller da
 
 - Start from one local project and its completed rollout, judgment, rubric, label, lineage, and
   calibration artifacts.
-- Use `wmo.common.judging.Judge` as the scoring boundary. A judge receives recursively verified
+- Use `exp.common.judging.Judge` as the scoring boundary. A judge receives recursively verified
   artifact IDs through `judge_persisted` and returns a structured `Judgment`.
 - Use `RubricReview`, `HumanScoreReview`, and `JudgeCalibrationService` to inspect judgments,
   record human score corrections, refresh calibration reports, and explicitly approve
@@ -22,7 +22,7 @@ the same failure. Never tune a judge from intuition or from unverified caller da
 - Keep raw review and run output under the local project root or `/tmp`. Do not commit customer
   evidence or operator-local outputs.
 
-For a composed router workflow, read the judgments persisted by `wmo.compose_router`. The workflow
+For a composed router workflow, read the judgments persisted by `exp.compose_router`. The workflow
 injects its approved review supplier, setup supplier, simulator factory, judge, model catalog, and
 finite budgets. Do not create a second scoring or evaluation path around that composition seam.
 
@@ -45,7 +45,7 @@ the target disagreement improves.
 Read the stored prompt identity, model snapshot, raw dimension scores, critique, human history,
 and calibration report before proposing a change. Attribute the miss to one owner:
 
-- Rubric or prompt semantics in `wmo/common/judging/`.
+- Rubric or prompt semantics in `exp/common/judging/`.
 - Model capability or request behavior behind the injected common model client.
 - Missing or excessive context in the persisted rollout and rubric inputs.
 - Calibration behavior in `JudgeCalibrationService` and its leakage-safe grouped metrics.
@@ -58,7 +58,7 @@ identity whenever scoring semantics change.
 
 Add the smallest failing regression beside the common judging owner. Prefer focused tests for the
 rubric, LM judge, calibration metrics, provenance, review, or risk-acceptance layer. For workflow
-behavior, add coverage beside `wmo/optimize/router/composition_test.py`.
+behavior, add coverage beside `exp/optimize/router/composition_test.py`.
 
 Use a counter-control for every change that could overcorrect. Model comparisons use the same
 frozen rollout, rubric, human labels, prompt identity, and lineage split. Never compare runs whose
@@ -77,4 +77,4 @@ inputs or failover behavior differ.
 
 Stop when a fresh reviewed sample produces no disagreement worth encoding. Keep the canonical
 artifact chain intact and do not add compatibility aliases, parallel judge modules, or product
-commands outside the approved `wmo config judge` surface.
+commands outside the approved `exp config judge` surface.

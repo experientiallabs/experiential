@@ -7,11 +7,11 @@ cells and fidelity reports are not router inputs. The supported sequence is:
 2. Fit and lock the bank and policy.
 3. Open held-out evidence and write the report.
 
-`wmo optimize router PROJECT --root ROOT` assembles this sequence from the completed project build,
+`exp optimize router PROJECT --root ROOT` assembles this sequence from the completed project build,
 confirmed candidates, approved manual judge calibration, and one bounded provider budget. It does
 not run world-model fidelity evaluation before fitting.
 
-Hosted applications use `wmo.run_hosted_router_workflow` instead. That noninteractive service
+Hosted applications use `exp.run_hosted_router_workflow` instead. That noninteractive service
 starts from a restored Project with prepared trace/task evidence, applies one late secret-free
 `HostedRouterWorkflowSetup`, constructs the grounded build, records automatic judge setup only as
 `provisional` machine evidence, and runs the same automatic router composition without a human or
@@ -52,7 +52,7 @@ visible only after the caller atomically acknowledges the exact verified bundle 
 after that acknowledgment. Restarts use `restore_hosted_project_bundle` with the externally
 committed digest and can resume only from that latest committed provider stage.
 
-Python applications can use `wmo.compose_router` to run the same sequence with injected review and
+Python applications can use `exp.compose_router` to run the same sequence with injected review and
 setup suppliers, simulator, judge, runtime catalog, and finite budgets. Provider-free callers with
 already completed evidence can use `fit_router`, `report_router`, or `optimize_router` directly.
 
@@ -95,13 +95,13 @@ Each `EvaluationInputs` object contains only:
 There is no `fidelity_report_ids` field. Generate the exact schema from the installed package:
 
 ```bash
-uv run python -c 'import json; from wmo.optimize.router import RouterOptimizationConfig; print(json.dumps(RouterOptimizationConfig.model_json_schema(), indent=2))'
+uv run python -c 'import json; from exp.optimize.router import RouterOptimizationConfig; print(json.dumps(RouterOptimizationConfig.model_json_schema(), indent=2))'
 ```
 
 The direct Python boundary is:
 
 ```python
-from wmo import fit_router, report_router
+from exp import fit_router, report_router
 
 fit = fit_router(store, fit_config)
 result = report_router(store, fit, report_config)
@@ -118,7 +118,7 @@ the exact world-model protocol digest. Execute its fidelity cells, then call
 `build_fidelity_report` to measure agreement.
 
 ```python
-from wmo.common.evaluations import (
+from exp.common.evaluations import (
     build_fidelity_evaluation_plan,
     build_fidelity_report,
 )

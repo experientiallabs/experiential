@@ -4,7 +4,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
-.wmo/
+.exp/
 dist/
 *.egg-info/
 .pytest_cache/
@@ -19,10 +19,10 @@ DESIGN.md
 demos/
 
 # baseline-grid run scratch (not artifacts)
-.wmo-rebuild/
+.exp-rebuild/
 logs/
 
-.wmo-fixed/
+.exp-fixed/
 
 # Local per-project settings (telemetry ids etc.) — never committed, wherever the root is.
 settings.toml

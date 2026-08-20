@@ -1,8 +1,8 @@
-# Agent guide — world-model-optimizer
+# Agent guide — experiential
 
-WMO builds immutable task evidence from agent traces, composes and fits frozen model routers,
+Experiential builds immutable task evidence from agent traces, composes and fits frozen model routers,
 runs those routers on loopback, and executes bounded SFT from persisted datasets. All importable
-code lives under `wmo/`; benchmark data arrives as a dependency (see rule 6).
+code lives under `exp/`; benchmark data arrives as a dependency (see rule 6).
 
 ## Toolchain
 
@@ -31,41 +31,41 @@ uv run pytest -q
   orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
   every current forbidden edge directly and proves that the package graph is acyclic.
 - The root CLI command set is exact: `build`, `config`, `optimize`, and `run`;
-  `wmo/cli/app_test.py` and the release tests enforce the current command and distribution shape.
+  `exp/cli/app_test.py` and the release tests enforce the current command and distribution shape.
 
 ## CLI package ownership
 
-- `wmo/cli/app.py` owns root command composition only. Command implementations live in the
+- `exp/cli/app.py` owns root command composition only. Command implementations live in the
   `build/`, `config/`, `judge/`, `optimize/`, `run/`, and `gateway/` packages.
-- `wmo/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
+- `exp/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
   commands. Command-specific orchestration stays with its command package. In particular,
-  router-candidate collection belongs to `wmo/cli/optimize/`.
-- `wmo/cli/shared/` owns reusable terminal, Typer, consent, picker, and progress primitives. It
-  must not import command packages. `wmo/cli/providers/` may import `shared/`, but it must not
+  router-candidate collection belongs to `exp/cli/optimize/`.
+- `exp/cli/shared/` owns reusable terminal, Typer, consent, picker, and progress primitives. It
+  must not import command packages. `exp/cli/providers/` may import `shared/`, but it must not
   import command packages.
-- Keep the `wmo/cli/` root closed to new command implementation modules. Package-wide CLI tests
-  may live in `wmo/cli/tests/`; module tests stay beside the module they cover.
+- Keep the `exp/cli/` root closed to new command implementation modules. Package-wide CLI tests
+  may live in `exp/cli/tests/`; module tests stay beside the module they cover.
 
 ## Evidence, simulation, and routing lifecycle
 
-- `wmo/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
+- `exp/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
   current engines, orchestration, artifact construction, and comparisons. New modules for those
-  responsibilities go inside `wmo/simulation/`, never at the flat `wmo/` root.
-- `wmo build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` is the only CLI path
+  responsibilities go inside `exp/simulation/`, never at the flat `exp/` root.
+- `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` is the only CLI path
   from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
   writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, builds both
   RAG indexes under a strict embedding-cost ceiling, and binds the grounded world model without a
   completion or judge call. Route each corpus through an explicit canonical source loader.
-- New trace sources belong in `wmo/simulation/ingest/`, normalize into the `Trace` and `TraceSpan`
-  contracts in `wmo/common/traces/`, support file ingestion, and register from
-  `wmo/simulation/ingest/__init__.py`.
-- Python applications use `wmo.compose_router` to complete review, plan-bound simulation,
+- New trace sources belong in `exp/simulation/ingest/`, normalize into the `Trace` and `TraceSpan`
+  contracts in `exp/common/traces/`, support file ingestion, and register from
+  `exp/simulation/ingest/__init__.py`.
+- Python applications use `exp.compose_router` to complete review, plan-bound simulation,
   judgment, fitting, held-out verification, reporting, and runtime loading. Callers inject the
   approved review and setup suppliers, simulator factory, judge, runtime catalog, and finite
   simulation-dollar and judgment-call ceilings. Preserve its phase boundary: held-out evidence
   opens only after fit evidence, policy locking, and remaining-budget checks pass. Router fitting
   never runs or consumes world-model fidelity evaluation.
-- `wmo optimize router PROJECT --root ROOT` discovers the completed build, fit-only RAG, grounded
+- `exp optimize router PROJECT --root ROOT` discovers the completed build, fit-only RAG, grounded
   world model, judge syllabus and provenance, and confirmed router candidates from the project.
   Human calibration is recommended but optional. The command freezes one shared provider ceiling
   before calls, simulates and judges missing fit evidence, locks the fit policy before held-out
@@ -73,22 +73,22 @@ uv run pytest -q
   World-model fidelity testing is a separately invoked common-evaluation mode with no authority
   over router fitting or runtime activation. Its reports contain measurements only and never carry
   an approval, denial, gate, threshold, or decision.
-- `wmo run` starts the initialized authenticated multi-alias gateway on loopback.
-  `wmo run PROJECT --root ROOT --port PORT [--ghost]` retains the single-project compatibility
+- `exp run` starts the initialized authenticated multi-alias gateway on loopback.
+  `exp run PROJECT --root ROOT --port PORT [--ghost]` retains the single-project compatibility
   server. Both expose OpenAI Chat Completions, Responses, and Models routes. Public request and
   response types come
   from the official OpenAI SDK. Chat retries use the standard `Idempotency-Key`; Responses
-  continuations use `previous_response_id`. WMO never joins unrelated Chat callers by transcript
+  continuations use `previous_response_id`. Experiential never joins unrelated Chat callers by transcript
   prefix and requires no proprietary request fields or headers. Durable journaling is the default;
   ghost mode performs routed calls without saving traffic or replay state. Request-time embedding
   failure uses the frozen conservative baseline, and neither path mutates policy or evidence.
 
 ## Worker-agent execution
 
-- Agent execution code lives under `wmo/runtime/`: whole-episode customer agents, executable
+- Agent execution code lives under `exp/runtime/`: whole-episode customer agents, executable
   environments, model clients, and frozen router execution. Optimization may depend on runtime;
   runtime code must not depend on simulation or optimization algorithms.
-- No-argument `wmo run` serves only explicit active gateway aliases. The legacy project form serves
+- No-argument `exp run` serves only explicit active gateway aliases. The legacy project form serves
   one frozen router policy. Simulation callers choose an `AgentRuntime` and `EnvironmentRuntime`
   directly, in process.
 - Local Pi and process-environment adapters execute external code on the user's machine only when
@@ -105,13 +105,13 @@ uv run pytest -q
 
 ## Optimization surfaces
 
-- Customer agent execution lives only in `wmo/runtime/agents/`, executable environments live only
-  in `wmo/runtime/environments/`, and sandbox simulation lives only in
-  `wmo/simulation/engines/sandbox.py`. Agent-search and benchmark-scoring work belongs to the
+- Customer agent execution lives only in `exp/runtime/agents/`, executable environments live only
+  in `exp/runtime/environments/`, and sandbox simulation lives only in
+  `exp/simulation/engines/sandbox.py`. Agent-search and benchmark-scoring work belongs to the
   private `agent-optimization` repo; send it there.
-- `wmo/optimize/router/` owns provider-free offline fit, policy locking, held-out reporting,
+- `exp/optimize/router/` owns provider-free offline fit, policy locking, held-out reporting,
   application composition, and their immutable artifacts. Online selection and provider execution
-  belong to `wmo/runtime/router/`. Keep those two boundaries explicit.
+  belong to `exp/runtime/router/`. Keep those two boundaries explicit.
 - Router application entrypoints stay in `composition.py` and `activation.py`. Automatic evidence
   orchestration lives in `automatic/`, manual judge calibration in `judging/`, offline policy work
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
@@ -120,13 +120,13 @@ uv run pytest -q
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
-- Every paid CLI command uses `wmo.cli.shared.consent.require_spend_consent` after a credential-free
+- Every paid CLI command uses `exp.cli.shared.consent.require_spend_consent` after a credential-free
   conservative estimate and before credential or provider-client construction. The setting in
-  `.wmo/settings.toml` is a hard per-command ceiling. Estimates at or below half run automatically,
+  `.exp/settings.toml` is a hard per-command ceiling. Estimates at or below half run automatically,
   higher in-budget estimates need explicit confirmation, and `--yes` never overrides the ceiling.
 - Long-lived gateway serving is exempt from one-shot spend consent. Startup performs no provider
   call; every later request requires key-derived authority and content-free attempt accounting.
-- `wmo optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
+- `exp optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
   It never builds a dataset, creates teacher rollouts, changes routing roles, or launches a
   simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
   digest, and credential-reference digest without persisting any secret. A finite cap requires a
@@ -172,38 +172,38 @@ uv run pytest -q
    has unrelated failures, record them and keep them out of the patch; fix them only when they are
    in scope or prevent meaningful validation.
 
-2. **Tests live inline, one test file per module.** `wmo/optimize/router/composition.py` is tested by
-   `wmo/optimize/router/composition_test.py`, next to it. Pytest is configured (`python_files =
+2. **Tests live inline, one test file per module.** `exp/optimize/router/composition.py` is tested by
+   `exp/optimize/router/composition_test.py`, next to it. Pytest is configured (`python_files =
    ["*_test.py"]`) to find these, and there is no top-level `tests/` directory.
 
    - Give every module a `_test.py` beside it.
    - Leaving that file empty is fine, and better than a vacuous test.
    - Do not create a `_test.py` whose module does not exist. A test that covers a whole package
-     goes in that package's own `tests/` directory, such as `wmo/simulation/tests/`.
+     goes in that package's own `tests/` directory, such as `exp/simulation/tests/`.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
-   JSON use `wmo.common.core.artifacts.JsonObject`, not `Any`.
+   JSON use `exp.common.core.artifacts.JsonObject`, not `Any`.
 
 4. **Keep the structure coherent and the command surface intentional.** Agent execution is nested
-   under `wmo/runtime/`; evidence construction and simulation are nested under `wmo/simulation/`;
-   router fitting, application orchestration, and SFT are nested under `wmo/optimize/`; shared
-   contracts, model metadata, minimal configuration, and product telemetry are under `wmo/common/`.
-   Provider execution belongs under `wmo/runtime/models/providers/`. Common, runtime, and simulation
+   under `exp/runtime/`; evidence construction and simulation are nested under `exp/simulation/`;
+   router fitting, application orchestration, and SFT are nested under `exp/optimize/`; shared
+   contracts, model metadata, minimal configuration, and product telemetry are under `exp/common/`.
+   Provider execution belongs under `exp/runtime/models/providers/`. Common, runtime, and simulation
    must not import optimize. Keep the locked CLI small and do not return production modules to the
-   flat `wmo/` namespace.
+   flat `exp/` namespace.
    Provider-neutral gateway request, stream-event, target, and persistence interfaces live under
-   `wmo/runtime/gateway/`. `lifecycle.py` composes them only for the explicit local launch. Exact
-   deployment metadata and singleton catalog normalization live under `wmo/common/models/`.
+   `exp/runtime/gateway/`. `lifecycle.py` composes them only for the explicit local launch. Exact
+   deployment metadata and singleton catalog normalization live under `exp/common/models/`.
    Gateway-only protocol and integer-pricing fields must not be added to `ModelCapabilities`:
    its existing identity digest remains frozen for router artifact compatibility.
 
-5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `wmo/`,
+5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `exp/`,
    `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.
 
    `.agents/` is the one sanctioned scratchpad: a local, gitignored working directory for agent
    sessions (notes, probe scripts, run outputs). It is never tracked, never part of a PR, and
-   nothing under `wmo/` or `docs/` may reference a path inside it. Anything in a scratchpad worth
+   nothing under `exp/` or `docs/` may reference a path inside it. Anything in a scratchpad worth
    keeping gets promoted into a real surface or an external repo before the work merges.
 
    **Agents must never create a new top-level directory.** Not for scratch work, not for a
@@ -211,7 +211,7 @@ uv run pytest -q
    put it under the closest one and say so - do not invent a sibling. The only way a new
    top-level directory is ever added is that a human names the exact directory and grants
    permission for that name; then, in the same change, it is added to `ALLOWED_TOP_DIRS` in
-   `wmo/tests/repo_layout_test.py` and documented here. Blanket approval to "restructure" or "add whatever
+   `exp/tests/repo_layout_test.py` and documented here. Blanket approval to "restructure" or "add whatever
    you need" is not permission for a directory name. Absent that, an agent that wants a new surface
    asks and waits. The same rule binds top-level FILES, against `ALLOWED_TOP_FILES` in the same
    test. Both lists are enforced by the gate, so an unapproved path fails CI rather than landing
@@ -222,20 +222,20 @@ uv run pytest -q
      pipeline on one benchmark, each step one real CLI command plus the artifact it creates),
      plus two root pages: `docs/usage.md` (the terse map of the CLI surface: one line of purpose
      and one artifact per command) and `docs/release-scope.md` (the supported and explicitly
-     excluded claims of the current release, checked by `wmo/tests/release_test.py`). Nothing else: raw
+     excluded claims of the current release, checked by `exp/tests/release_test.py`). Nothing else: raw
      result JSONs, vector sources, design notes, and drafts stay out of the repo. `docs/README.md`
      indexes every doc and records its purpose. Update or remove superseded material only after
      checking references and retaining durable evidence.
-     Reproduction lives in the report itself, quoted as public `wmo` API/CLI plus the exact
+     Reproduction lives in the report itself, quoted as public `exp` API/CLI plus the exact
      parameter pins.
      Everything generated stays out of git: project evidence and model artifacts under the local
-     `.wmo/` root, distribution archives under ignored `dist/`, and external benchmark inputs.
+     `.exp/` root, distribution archives under ignored `dist/`, and external benchmark inputs.
      Never commit local settings files (`settings.toml` anywhere).
    - `assets/` contains the small, reviewed visual assets referenced by the README and public docs.
-   - `wmo/` is the flagship package and the only importable code. Domain subpackages own their
+   - `exp/` is the flagship package and the only importable code. Domain subpackages own their
      area under the rule 4 hierarchy. Provider-neutral model contracts live under
-     `wmo/common/models/`, and explicit HTTP-backed clients live under
-     `wmo/runtime/models/providers/`.
+     `exp/common/models/`, and explicit HTTP-backed clients live under
+     `exp/runtime/models/providers/`.
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
    - `.github/` — CI workflows.
@@ -243,14 +243,14 @@ uv run pytest -q
    Scratch work has no home in this repo. One-off scripts, experiment runners, scratchpads, and
    drafts go outside the checkout (`/tmp`, a personal directory, or the Notion experiments area
    under Research). When such work matures, promote its durable output into a real surface:
-   writeup → `docs/research/`, verified how-to → `docs/reference/`, reusable code → `wmo/`.
+   writeup → `docs/research/`, verified how-to → `docs/reference/`, reusable code → `exp/`.
 
-6. **Benchmark data is external input, not a repository directory.** Give `wmo build` one explicit
+6. **Benchmark data is external input, not a repository directory.** Give `exp build` one explicit
    local OTLP or PostHog export, then use only the locked `config`, `optimize`, and `run` surfaces
    for persisted project artifacts. Do not vendor benchmark data, gold dirs, or capture scripts.
 
-7. **Give reusable workflows a clear owner.** A workflow has exactly one home, inside `wmo/`.
-   If a workflow is generally useful, implement it in `wmo/` and expose it through the CLI. When a
+7. **Give reusable workflows a clear owner.** A workflow has exactly one home, inside `exp/`.
+   If a workflow is generally useful, implement it in `exp/` and expose it through the CLI. When a
    published dependency already owns the right contract, prefer its public API; use a separate
    implementation when requirements differ materially and document the boundary.
 
@@ -261,7 +261,7 @@ uv run pytest -q
 9. **Design every public surface from the perspective of a dev using it.** Before implementing a
    feature, write the call site first — the Python snippet or CLI invocation an outside developer
    would type — and judge it: is it obvious, minimal, and hard to misuse? Public surfaces (the
-   `wmo` Python API, CLI commands, pydantic models) stay small, composable, and explicitly typed.
+   `exp` Python API, CLI commands, pydantic models) stay small, composable, and explicitly typed.
    Extend via the existing seam for that concern (a canonical trace loader, simulator, runtime
    model client, or router catalog) when that seam matches the new behavior. If it does not,
    introduce a focused abstraction and document why; do not force distinct semantics through an
@@ -315,22 +315,22 @@ uv run pytest -q
 
 ## One package
 
-This repo publishes **one distribution**: `world-model-optimizer`, whose importable code is all of
-`wmo/` and nothing else. Rules of the road:
+This repo publishes **one distribution**: `experiential`, whose importable code is all of
+`exp/` and nothing else. Rules of the road:
 
 - **One package, no workspace**: a dependency is either a normal PyPI requirement in
-  `[project.dependencies]` or it is code under `wmo/`. `pyproject.toml` declares no uv workspace
+  `[project.dependencies]` or it is code under `exp/`. `pyproject.toml` declares no uv workspace
   and no path sources, and a member directory would need a new top-level directory that rule 5
   forbids.
 - **Keep dependency ownership explicit**: published shared building blocks are normal PyPI
   requirements. Provider-neutral catalog metadata and immutable snapshots live under
-  `wmo/common/models/`; explicit runtime clients use the shared HTTP transport. A release resolves
-  entirely from published requirements plus `wmo/`.
+  `exp/common/models/`; explicit runtime clients use the shared HTTP transport. A release resolves
+  entirely from published requirements plus `exp/`.
 - **Gate scoping**: the root gate is `uv run ruff check .`, `uv run ty check`, `uv run pytest -q`,
-  all over the single `testpaths = ["wmo"]`. Tests are inline `*_test.py` beside the module they
+  all over the single `testpaths = ["exp"]`. Tests are inline `*_test.py` beside the module they
   cover. There is exactly one ruff config and one ty config, at the root.
 - **Publishing**: `.github/workflows/python-package.yml` builds and publishes the flagship
-  `world-model-optimizer` distribution; the publish job runs only for a GitHub release and uses
+  `experiential` distribution; the publish job runs only for a GitHub release and uses
   the `pypi` trusted-publisher environment.
 
 ## Docs
