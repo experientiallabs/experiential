@@ -13,6 +13,7 @@ def test_chat_accepted_fields_pin_the_closed_surface() -> None:
             "messages",
             "max_tokens",
             "max_completion_tokens",
+            "top_p",
             "stop",
             "temperature",
             "stream",
