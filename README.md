@@ -44,48 +44,42 @@ curl -L -o traces.otel.jsonl \
   https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl
 ```
 
-Then install the package and build a project. The build command walks you through providers,
+Then build a project. The build command walks you through providers,
 models, and budget, and asks for your trace file:
 
 ```bash
 # Build simulation from your agent traces and optimize a router against it
 exp build support-agent
-
-# Run your router as an OpenAI compatible endpoint
-exp run support-agent
-
-# Send a request to your endpoint
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
 ```
+
+## Using the API
+
+Call the gateway programmatically with any OpenAI-compatible client:
+
+```python
+import os
+
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["EXP_GATEWAY_KEY"],
+    base_url="http://127.0.0.1:8000/v1",
+)
+
+response = client.chat.completions.create(
+    model="support-agent",
+    messages=[{"role": "user", "content": "Help me reset my password"}],
+)
+print(response.choices[0].message.content)
+```
+
+## Optimize a Model
 
 After collecting traces from your router, fine-tune an open source model you own using
 [Tinker](https://tinker.thinkingmachines.ai/).
 
 ```bash
 exp optimize model support-agent
-```
-
-## Using the API
-
-Call an optimized router programmatically:
-
-```python
-from pathlib import Path
-
-from exp import load_project_router
-from exp.common.models import ModelMessage, ModelRequest
-
-router = load_project_router("support-agent", Path(".exp"))
-
-result = router.complete(
-    ModelRequest(
-        messages=(
-            ModelMessage(role="user", content="Help me reset my password"),
-        ),
-    )
-)
 ```
 
 ## Telemetry
