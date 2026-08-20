@@ -44,9 +44,8 @@ import uvicorn
 
 from exp.runtime.gateway.lifecycle import load_local_gateway
 
-if __name__ == "__main__":
-    gateway = load_local_gateway()
-    uvicorn.run(gateway.app, lifespan="on")
+gateway = load_local_gateway()
+uvicorn.run(gateway.app, lifespan="on")
 ```
 
 For hosted workers with their own storage and provider services, use the lower-level
