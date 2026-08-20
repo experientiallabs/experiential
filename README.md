@@ -14,7 +14,7 @@ Experiential optimizes agent workflows from traces through a three-step process:
   <a href="https://discord.gg/B6sM8xTVwU"><img src="https://cdn.simpleicons.org/discord/5865F2" alt="" width="16" height="16"> Discord</a>
 </p>
 
-## Gateway
+## Getting Started
 
 Start a local OpenAI-compatible gateway. On first run, the setup wizard asks for a provider,
 model, and public alias, then prints a one-time virtual key:
