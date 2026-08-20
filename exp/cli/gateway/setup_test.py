@@ -82,11 +82,11 @@ def test_gateway_provider_selector_uses_the_builder_keyboard_picker() -> None:
     assert "bedrock" in console.output
 
 
-def test_gateway_setup_creates_one_alias_for_each_selected_provider(
+def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """First-run gateway setup persists every selected provider instead of discarding extras."""
+    """First-run setup persists selected connections without inventing public aliases."""
     connections = (
         ("openai", ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")),
         ("anthropic", ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")),
@@ -104,9 +104,6 @@ def test_gateway_setup_creates_one_alias_for_each_selected_provider(
             "gpt-5",
             "logical-openai",
             "openai-alias",
-            "claude-sonnet",
-            "logical-anthropic",
-            "anthropic-alias",
             "default",
         )
     )
@@ -115,16 +112,13 @@ def test_gateway_setup_creates_one_alias_for_each_selected_provider(
 
     result = setup.interactive_gateway_setup(tmp_path)
 
-    assert result.aliases == ("openai-alias", "anthropic-alias")
+    assert result.alias == "openai-alias"
     manager = setup.GatewayManagement(tmp_path)
     assert {item.connection_id for item in manager.provider_connections()} == {
         "openai",
         "anthropic",
     }
-    assert {item.alias_id for item in manager.aliases()} == {
-        "openai-alias",
-        "anthropic-alias",
-    }
+    assert {item.alias_id for item in manager.aliases()} == {"openai-alias"}
 
 
 @pytest.mark.parametrize(

@@ -7,7 +7,7 @@ The root surface is deliberately small:
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
-| `exp run --root ROOT [--check]` | Validate or start the initialized authenticated multi-alias gateway on loopback. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
+| `exp run --root ROOT [--check]` | Validate or start the initialized authenticated gateway on loopback. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp run PROJECT --root ROOT [--ghost]` | Activate a frozen policy as one project-backed alias and launch the normal gateway. | The same authenticated OpenAI endpoint and SQLite accounting as no-argument `exp run`. |
 | `exp config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, certified exact-model pools, monthly limits, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
 | `exp config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. | Local `.exp/models.toml`. |
@@ -33,9 +33,10 @@ compatibility flag for project-journal behavior; gateway authentication, replay,
 usage accounting stay enabled.
 
 Both `exp run` forms use one gateway lifecycle. It binds only `127.0.0.1`, starts with no
-provider call, and requires explicit provider environment references, exact model aliases, identity,
-grants, and a virtual key. Interactive first-run setup can configure multiple providers and aliases
-in one session. `exp run --non-interactive --json` returns `gateway_not_initialized` plus
+provider call, and requires an explicit provider environment reference, exact model alias, identity,
+grant, and a virtual key. Interactive first-run setup can persist multiple provider connections and
+creates one initial gateway alias; additional deployments and certified pools remain explicit
+gateway configuration. `exp run --non-interactive --json` returns `gateway_not_initialized` plus
 exact next commands on an empty root. `exp run --check` validates local readiness without binding.
 The gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets to SQLite.
 `GET /usage` and `GET /usage.json` expose the same schema-v2 content-free overall and per-identity
