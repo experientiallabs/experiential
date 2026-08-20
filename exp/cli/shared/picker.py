@@ -14,8 +14,6 @@ from __future__ import annotations
 import os
 import select
 import sys
-import termios
-import tty
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -293,9 +291,11 @@ def uses_keyboard_list(console: Console) -> bool:
         console: Terminal used for the screen.
 
     Returns:
-        True only when both stdout and stdin belong to an interactive terminal.
+        True only on POSIX when both stdout and stdin belong to an interactive terminal.
+        Windows consoles can report a TTY without Unix terminal I/O, so they use the
+        line-based path.
     """
-    return console.is_terminal and _stdin_is_tty()
+    return os.name == "posix" and console.is_terminal and _stdin_is_tty()
 
 
 def interpret_key_bytes(data: bytes) -> PickerEvent:
@@ -436,6 +436,9 @@ def _terminal_key_reader(
     if read_key is not None:
         yield read_key
         return
+    import termios
+    import tty
+
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:

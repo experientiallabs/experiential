@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import errno
 import os
-import pty
 import re
 import select
 import shutil
@@ -12,7 +11,6 @@ import signal
 import subprocess
 import sys
 import tarfile
-import termios
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -22,6 +20,18 @@ from click import unstyle
 
 if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
+
+    _POSIX_TTY_ONLY = pytest.mark.skipif(
+        os.name != "posix",
+        reason="pseudo-terminal child runner requires POSIX",
+    )
+else:
+
+    def _keep_for_installed_evidence(function: object) -> object:
+        """Installed-wheel evidence imports this module without pytest."""
+        return function
+
+    _POSIX_TTY_ONLY = _keep_for_installed_evidence
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
 FORBIDDEN_REQUIREMENT = re.compile(
@@ -338,6 +348,9 @@ def _run_tty_child(
             required completion marker.
         OSError: The pseudo-terminal fails for a reason other than normal slave closure.
     """
+    import pty
+    import termios
+
     master, slave = pty.openpty()
     process = subprocess.Popen(
         command,
@@ -2918,6 +2931,7 @@ def _installed_release_driver() -> None:
         assert not server_thread.is_alive()
 
 
+@_POSIX_TTY_ONLY
 def test_tty_child_exit_survives_terminal_close_races(tmp_path: Path) -> None:
     """Treat terminal closure before child reaping as a clean bounded exit.
 

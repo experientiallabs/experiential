@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
-import pty
 import re
 import select
 import struct
 import subprocess
 import sys
-import termios
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -191,6 +188,10 @@ def _run_terminal_child(
     Returns:
         The transcript, the still-visible screen, and the child exit status.
     """
+    import fcntl
+    import pty
+    import termios
+
     master, slave = pty.openpty()
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", size[0], size[1], 0, 0))
     child_environment = dict(os.environ if environment is None else environment)
@@ -270,7 +271,12 @@ def terminal_child() -> Callable[..., TerminalRun]:
 
     Returns:
         The callable used by keyboard picker and installed distribution tests.
+
+    Raises:
+        pytest.skip.Exception: The host is not POSIX, so a pseudo-terminal is unavailable.
     """
+    if os.name != "posix":
+        pytest.skip("pseudo-terminal child runner requires POSIX")
     return _run_terminal_child
 
 

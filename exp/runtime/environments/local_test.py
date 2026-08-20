@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 import subprocess
 import sys
@@ -349,6 +348,8 @@ def _pid_is_running(pid: int) -> bool:
 
 def _open_file_descriptors() -> frozenset[int]:
     """Return low numbered open FDs without allocating a directory-enumeration descriptor."""
+    import fcntl
+
     open_fds: set[int] = set()
     for file_descriptor in range(256):
         try:

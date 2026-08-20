@@ -9,6 +9,7 @@ from collections.abc import Callable
 import pytest
 from rich.console import Console
 
+from exp.cli.shared import picker as picker_module
 from exp.cli.shared.picker import (
     PickerAction,
     PickerEvent,
@@ -19,6 +20,7 @@ from exp.cli.shared.picker import (
     select_many_list,
     select_one,
     select_one_list,
+    uses_keyboard_list,
 )
 from exp.conftest import TerminalRun
 
@@ -92,6 +94,14 @@ def _options(count: int) -> tuple[PickerOption, ...]:
         PickerOption(value=f"model-{index}", label=f"model-{index}", detail=f"detail {index}")
         for index in range(1, count + 1)
     )
+
+
+def test_uses_keyboard_list_requires_posix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-POSIX process stays on the line-based path even when stdin is a TTY."""
+    monkeypatch.setattr(picker_module.os, "name", "nt")
+    monkeypatch.setattr(picker_module, "_stdin_is_tty", lambda: True)
+    console = Console(force_terminal=True, file=io.StringIO())
+    assert uses_keyboard_list(console) is False
 
 
 def test_numbers_and_ranges_toggle_rows_before_an_empty_line_accepts() -> None:
