@@ -1,6 +1,6 @@
 """Canonical provenance, identity, hashing, and failure contracts.
 
-The models in this module are the small pieces shared by every new immutable EXP artifact.
+The models in this module are the small pieces shared by every new immutable WMO artifact.
 They deliberately contain no provider connection details or credential references.
 """
 
