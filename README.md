@@ -6,7 +6,7 @@ Experiential is an open source gateway and router for agent workflows:
 2. Control which users and agents can use which models, for which use cases, and how much they can spend.
 3. Turn production traffic into a custom router or model optimized for quality, speed, and cost.
 
-![Your traces flow through simulation into routing and training optimization](https://raw.githubusercontent.com/experientiallabs/experiential/main/assets/experiential-workflow.png)
+![Experiential workspace usage dashboard showing model traffic, identities, and spend](https://raw.githubusercontent.com/experientiallabs/experiential/main/assets/experiential-workflow.png)
 
 <p align="center">
   🌐 <a href="https://platform.experientiallabs.ai">Platform</a> |
