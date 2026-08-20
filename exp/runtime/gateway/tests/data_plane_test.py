@@ -699,6 +699,114 @@ def test_terminal_usage_tool_names_default_empty_without_tool_calls() -> None:
     asyncio.run(scenario())
 
 
+def test_terminal_tool_names_survive_when_provider_omits_usage() -> None:
+    """A usage-less completed attempt retains invoked names without fabricating token counts."""
+
+    async def scenario() -> None:
+        """Drive one tool completion directly into a terminal event without usage."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+                        sequence_number=0,
+                        tool_call=ToolCall(
+                            call_id="call-a", name="search", arguments={}, raw_arguments="{}"
+                        ),
+                    ),
+                    GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+                )
+            )
+        )
+        service, _control, ledger, _proof = _service(provider)
+
+        await service.preflight()
+        response = await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_chat(
+                {
+                    "model": "public-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            ),
+        )
+
+        body = json.loads(cast(bytes, response.body))
+        terminal = ledger.finished[0][0]
+        assert response.status_code == 200
+        assert body["usage"] is None
+        assert terminal is not None
+        assert terminal.usage == GatewayUsage(tool_names=("search",))
+        assert terminal.usage is not None
+        assert terminal.usage.input_tokens is None
+        assert terminal.usage.output_tokens is None
+
+    asyncio.run(scenario())
+
+
+def test_abort_preserves_tool_names_when_provider_omits_usage() -> None:
+    """An aborted attempt retains invoked names even when no usage event arrived."""
+
+    async def scenario() -> None:
+        """Abort after a completed tool call and inspect the durable terminal event."""
+        catalog, _deployment = _catalog()
+        ledger = _Ledger()
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+                        sequence_number=0,
+                        tool_call=ToolCall(
+                            call_id="call-a", name="search", arguments={}, raw_arguments="{}"
+                        ),
+                    ),
+                )
+            )
+        )
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="abort"),),
+        )
+        authorization = _ControlStore(catalog.identity_sha256()).authorize_request(
+            raw_key="caller-secret",
+            alias="public-model",
+            request=request,
+            deadline_monotonic=time.monotonic() + 30,
+        )
+        route = await CatalogRouteResolver(
+            {("revision-one", catalog.identity_sha256()): catalog}
+        ).resolve(
+            authorization=authorization,
+            request=request,
+            episode_namespace=("org", "identity", "revision-one", "episode"),
+        )
+        executor = GatewayExecutor(
+            {
+                ("revision-one", catalog.identity_sha256()): cast(
+                    RuntimeModelCatalog, _RuntimeCatalog(provider)
+                )
+            },
+            ledger,
+        )
+        stream = await executor.start(route=route, request=request)
+        event = await stream.__anext__()
+        assert event.kind is GatewayEventKind.TOOL_CALL_COMPLETED
+
+        await stream.abort(
+            GatewayFailure(
+                failure_class=GatewayFailureClass.CANCELLED,
+                safe_message="provider request was cancelled",
+            )
+        )
+
+        terminal = ledger.finished[0][0]
+        assert terminal is not None
+        assert terminal.usage == GatewayUsage(tool_names=("search",))
+
+    asyncio.run(scenario())
+
+
 def test_project_route_uses_selection_only_and_preserves_fallback_context() -> None:
     """Project targets resolve to one singleton deployment through the selection-only seam."""
 

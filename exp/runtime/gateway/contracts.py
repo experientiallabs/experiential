@@ -171,14 +171,36 @@ class GatewayRequest(ContractModel):
 
 
 class GatewayUsage(ContractModel):
-    """Normalized token counts and invoked tool names from one provider attempt."""
+    """Normalized token counts and invoked tool names from one provider attempt.
 
-    input_tokens: int = Field(ge=0)
-    output_tokens: int = Field(ge=0)
+    A terminal event may carry only ``tool_names`` when the provider omits token usage. In that
+    case both token totals remain unknown instead of being represented as zero.
+    """
+
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     reasoning_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
+
+    @model_validator(mode="after")
+    def _require_complete_tokens_or_tool_names(self) -> GatewayUsage:
+        """Require complete token totals unless this is tool-only terminal metadata."""
+        totals = (self.input_tokens, self.output_tokens)
+        if (totals[0] is None) != (totals[1] is None):
+            raise ValueError("input and output token counts must be reported together")
+        if totals[0] is None:
+            if self.cached_input_tokens is not None or self.reasoning_tokens is not None:
+                raise ValueError("token detail counts require input and output totals")
+            if not self.tool_names:
+                raise ValueError("usage requires token totals or invoked tool names")
+        return self
+
+    @property
+    def has_token_counts(self) -> bool:
+        """Return whether both provider token totals are known."""
+        return self.input_tokens is not None and self.output_tokens is not None
 
 
 class GatewayEventKind(StrEnum):
@@ -230,8 +252,9 @@ class GatewayEvent(ContractModel):
                 raise ValueError("tool argument delta requires index and raw fragment")
         elif self.kind == GatewayEventKind.TOOL_CALL_COMPLETED and self.tool_call is None:
             raise ValueError("tool-call completion requires the complete tool call")
-        elif self.kind == GatewayEventKind.USAGE and self.usage is None:
-            raise ValueError("usage event requires normalized usage")
+        elif self.kind == GatewayEventKind.USAGE:
+            if self.usage is None or not self.usage.has_token_counts:
+                raise ValueError("usage event requires complete normalized token usage")
         elif self.kind == GatewayEventKind.FAILED and self.failure is None:
             raise ValueError("failed event requires a normalized failure")
         return self

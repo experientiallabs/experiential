@@ -75,7 +75,7 @@ class ChatSseEncoder:
             OpenAIProtocolError: Event order, tool identity, or terminal state is invalid.
         """
         self._require_event(event)
-        if event.usage is not None:
+        if event.usage is not None and event.usage.has_token_counts:
             self._usage = event.usage
         if event.kind == GatewayEventKind.TEXT_DELTA:
             return (self._chunk(delta={"content": event.text_delta}),)
@@ -281,7 +281,7 @@ class ResponsesSseEncoder:
     def feed(self, event: GatewayEvent) -> tuple[str, ...]:
         """Encode one ordered normalized event into Responses lifecycle frames."""
         self._require_event(event)
-        if event.usage is not None:
+        if event.usage is not None and event.usage.has_token_counts:
             self._usage = event.usage
         if event.kind == GatewayEventKind.TEXT_DELTA:
             return self._content_delta("text", _required_text(event.text_delta))
@@ -695,6 +695,10 @@ def _chat_data(payload: JsonObject) -> str:
 
 def _chat_usage(usage: GatewayUsage) -> JsonObject:
     """Map normalized usage to the official Chat token accounting shape."""
+    if not usage.has_token_counts:
+        raise ValueError("Chat usage encoding requires complete token usage")
+    assert usage.input_tokens is not None
+    assert usage.output_tokens is not None
     return {
         "prompt_tokens": usage.input_tokens,
         "completion_tokens": usage.output_tokens,
@@ -706,8 +710,10 @@ def _chat_usage(usage: GatewayUsage) -> JsonObject:
 
 def _responses_usage(usage: GatewayUsage | None) -> JsonObject | None:
     """Map normalized usage to the official Responses accounting shape."""
-    if usage is None:
+    if usage is None or not usage.has_token_counts:
         return None
+    assert usage.input_tokens is not None
+    assert usage.output_tokens is not None
     return {
         "input_tokens": usage.input_tokens,
         "input_tokens_details": {"cached_tokens": usage.cached_input_tokens or 0},

@@ -787,8 +787,10 @@ def _estimated_cost(
     reasoning_rate: int | None,
 ) -> int | None:
     """Compute attributed integer micro-USD or preserve unknown pricing."""
-    if usage is None:
+    if usage is None or not usage.has_token_counts:
         return None
+    assert usage.input_tokens is not None
+    assert usage.output_tokens is not None
     dimensions = (
         (usage.input_tokens, input_rate),
         (usage.cached_input_tokens or 0, cached_input_rate),

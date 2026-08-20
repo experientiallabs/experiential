@@ -126,7 +126,14 @@ def completed_body(
         ]
         or None,
     }
-    usage = next((event.usage for event in reversed(events) if event.usage is not None), None)
+    usage = next(
+        (
+            event.usage
+            for event in reversed(events)
+            if event.usage is not None and event.usage.has_token_counts
+        ),
+        None,
+    )
     return {
         "id": stable_public_id("chatcmpl", request_id),
         "object": "chat.completion",
@@ -152,8 +159,10 @@ def completed_body(
 
 def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
     """Encode normalized usage in the Chat completion shape."""
-    if usage is None:
+    if usage is None or not usage.has_token_counts:
         return None
+    assert usage.input_tokens is not None
+    assert usage.output_tokens is not None
     details: JsonObject = {}
     if usage.cached_input_tokens is not None:
         details["cached_tokens"] = usage.cached_input_tokens

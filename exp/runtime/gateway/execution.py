@@ -885,19 +885,23 @@ def _with_latest_usage(
 
 
 def _stamp_tool_names(event: GatewayEvent, tool_names: list[str]) -> GatewayEvent:
-    """Stamp invoked tool names onto a terminal event's usage.
+    """Stamp invoked tool names onto a terminal event without inventing token counts.
 
     Args:
         event: Terminal event whose usage should carry the invoked tool names.
         tool_names: Deduplicated invoked tool names in first-use order.
 
     Returns:
-        The event unchanged when it has no usage or no tool was invoked, otherwise a copy
-        whose usage lists the invoked tool names.
+        The event unchanged when no tool was invoked, otherwise a copy whose usage lists the
+        invoked tool names. When token usage is absent, the copied usage contains only the names.
     """
-    if event.usage is None or not tool_names:
+    if not tool_names:
         return event
-    usage = event.usage.model_copy(update={"tool_names": tuple(tool_names)})
+    usage = (
+        GatewayUsage(tool_names=tuple(tool_names))
+        if event.usage is None
+        else event.usage.model_copy(update={"tool_names": tuple(tool_names)})
+    )
     return event.model_copy(update={"usage": usage})
 
 
