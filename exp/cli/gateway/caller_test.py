@@ -325,6 +325,7 @@ def test_key_check_reports_granted_aliases_without_echoing_the_key(
     "envelope",
     (
         {"object": "list"},
+        {"object": "list", "data": []},
         {"object": "list", "data": [{"id": "generic-model", "object": "model"}]},
     ),
 )

@@ -146,12 +146,7 @@ def caller_key_check(
                     )
                 )
                 return
-            if aliases:
-                typer.echo(f"key valid; granted aliases: {', '.join(aliases)}")
-            else:
-                typer.echo(
-                    "key valid; no aliases granted (add one with 'exp config gateway grant')"
-                )
+            typer.echo(f"key valid; granted aliases: {', '.join(aliases)}")
             return
         code = "invalid_gateway_response"
         message = "HTTP 200 did not contain the EXP gateway model-authority response shape."
@@ -407,8 +402,8 @@ def _listed_authority_models(response: httpx.Response) -> list[JsonObject] | Non
         response: Successful response from the caller's ``GET /v1/models`` request.
 
     Returns:
-        Validated model objects, including an empty list for a valid key with no grants,
-        or ``None`` when the response is not the EXP gateway authority shape.
+        Validated non-empty model objects, or ``None`` when the response is not the EXP
+        gateway authority shape. An empty list has no authority evidence and fails closed.
     """
     try:
         payload = response.json()
@@ -417,7 +412,7 @@ def _listed_authority_models(response: httpx.Response) -> list[JsonObject] | Non
     if not isinstance(payload, dict) or payload.get("object") != "list":
         return None
     data = payload.get("data")
-    if not isinstance(data, list):
+    if not isinstance(data, list) or not data:
         return None
     models: list[JsonObject] = []
     for item in data:
