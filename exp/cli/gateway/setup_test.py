@@ -86,11 +86,13 @@ def test_azure_provider_connection_collects_required_endpoint_fields(
 def test_openai_compatible_provider_connection_collects_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OpenAI-compatible setup retains its explicit endpoint and canonical credential reference."""
+    """OpenAI-compatible setup retains its endpoint and credential-variable override."""
+    answers = iter(("https://gateway.example.test/v1", "COMPATIBLE_API_KEY"))
+
     monkeypatch.setattr(
         setup.typer,
         "prompt",
-        lambda _text, **_kwargs: "https://gateway.example.test/v1",
+        lambda _text, **_kwargs: next(answers),
     )
 
     connection = setup._collect_provider_connection("openai-compatible")  # noqa: SLF001
@@ -98,7 +100,7 @@ def test_openai_compatible_provider_connection_collects_endpoint(
     assert connection == ConnectionConfig(
         provider="openai-compatible",
         base_url="https://gateway.example.test/v1",
-        api_key_env="OPENAI_COMPATIBLE_API_KEY",
+        api_key_env="COMPATIBLE_API_KEY",
     )
 
 

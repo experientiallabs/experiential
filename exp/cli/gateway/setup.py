@@ -105,7 +105,10 @@ def _collect_provider_connection(provider: str) -> ConnectionConfig:
             return ConnectionConfig(
                 provider=provider,
                 base_url=typer.prompt("OpenAI-compatible base URL"),
-                api_key_env=_CANONICAL_CREDENTIAL_ENV[provider],
+                api_key_env=typer.prompt(
+                    "Credential environment variable name",
+                    default=_CANONICAL_CREDENTIAL_ENV[provider],
+                ),
             )
         return ConnectionConfig(
             provider=provider,
