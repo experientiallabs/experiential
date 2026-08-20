@@ -1,9 +1,12 @@
-# Experiential
+# World Model Optimizer
 
-Experiential is an OpenAI-compatible gateway for agent workflows. It routes requests across
-provider models, keeps serving budgets and usage accountable, and can run locally on loopback.
+WMO optimizes agent workflows from traces through a three-step process:
 
-![Requests flow through the Experiential gateway](https://raw.githubusercontent.com/experientiallabs/world-model-optimizer/main/assets/experiential-workflow.png)
+1. Build a simulation using text world models grounded on your traces.
+2. Fit a router that determines which model every request should be sent to.
+3. Train custom open source models just for your agent.
+
+![Your traces flow through simulation into routing and training optimization](https://raw.githubusercontent.com/experientiallabs/world-model-optimizer/main/assets/wmo-workflow.png)
 
 <p align="center">
   🌐 <a href="https://platform.experientiallabs.ai">Platform</a> |
@@ -13,43 +16,72 @@ provider models, keeps serving budgets and usage accountable, and can run locall
 
 ## Getting Started
 
-Install the package and start the local gateway. The first run guides you through setup:
+First, collect OpenTelemetry traces from your current agent. If you just want to try it out, grab
+the public [terminal-tasks OTLP dataset](https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces):
 
 ```bash
-pip install experiential
-exp run
+curl -L -o traces.otel.jsonl \
+  https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl
 ```
 
-Use it with the OpenAI SDK:
+Then install the package and build a project. The build command walks you through providers,
+models, and budget, and asks for your trace file:
+
+```bash
+pip install world-model-optimizer
+
+# Build simulation from your agent traces and optimize a router against it
+wmo build support-agent
+
+# Run your router as an OpenAI compatible endpoint
+wmo run support-agent
+
+# Send a request to your endpoint
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
+```
+
+After collecting traces from your router, fine-tune an open source model you own using
+[Tinker](https://tinker.thinkingmachines.ai/).
+
+```bash
+wmo optimize model support-agent
+```
+
+## Using the API
+
+Call an optimized router programmatically:
 
 ```python
-from openai import OpenAI
+from pathlib import Path
 
-client = OpenAI(
-    api_key="YOUR_EXPERIENTIAL_KEY",
-    base_url="http://127.0.0.1:8000/v1",
+from wmo import load_project_router
+from wmo.common.models import ModelMessage, ModelRequest
+
+router = load_project_router("support-agent", Path(".wmo"))
+
+result = router.complete(
+    ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="Help me reset my password"),
+        ),
+    )
 )
-
-response = client.responses.create(model="YOUR_ALIAS", input="Help me")
-print(response.output_text)
 ```
 
-The gateway exposes OpenAI Chat Completions, Responses, and Models routes. Usage and serving
-limits are available at `http://127.0.0.1:8000/usage`.
+## Telemetry
 
-## Build a Router
-
-When you want to optimize a workflow from traces, build a project and fit its router:
+Anonymous aggregate PostHog product telemetry is enabled by default. It never includes prompts,
+traces, actions, observations, paths, model names, credentials, or raw customer content.
 
 ```bash
-exp build support-agent traces.otel.jsonl
-exp optimize router support-agent
-exp run support-agent
+wmo config telemetry status
+wmo config telemetry disable
+wmo config telemetry enable
 ```
 
-The build path turns OpenTelemetry traces into grounded task evidence and a frozen routing policy.
-See the [docs](https://github.com/experientiallabs/world-model-optimizer/tree/main/docs) for the
-full CLI and configuration surface.
+The preference is stored locally in `.wmo/settings.toml`.
 
 ## Development
 
@@ -60,3 +92,5 @@ uv run ruff check .
 uv run ty check
 uv run pytest -q
 ```
+
+Repository and documentation conventions live in [AGENTS.md](./AGENTS.md).
