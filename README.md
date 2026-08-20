@@ -36,27 +36,30 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## Using the API
 
-Create an embeddable gateway runtime from your provider, routing, and storage components:
+Create a local gateway programmatically from an initialized `.exp` root:
 
 ```python
-import exp
+from pathlib import Path
 
-runtime = exp.create_gateway_runtime(
-    config=exp.GatewayRuntimeConfig(graceful_timeout_seconds=10),
-    authority=authority,
-    ledger=ledger,
-    routes=routes,
-    executor=executor,
-    clock=clock,
-    readiness=readiness,
-    usage=usage,
-    replay=replay,
-    continuations=continuations,
+import uvicorn
+
+from exp.runtime.gateway.lifecycle import load_local_gateway
+
+gateway = load_local_gateway(
+    Path(".exp"),
+    graceful_timeout_seconds=10,
 )
 
-app = runtime.app
-# Serve app with your ASGI worker, including ASGI lifespan.
+uvicorn.run(
+    gateway.app,
+    host="127.0.0.1",
+    port=8000,
+    lifespan="on",
+)
 ```
+
+For hosted workers with their own storage and provider services, use the lower-level
+`exp.create_gateway_runtime(...)` composition API.
 
 ## Optimize from Traffic
 
