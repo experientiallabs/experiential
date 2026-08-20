@@ -134,6 +134,15 @@ class PreparedEndpoint:
     configured: bool
 
 
+@dataclass(frozen=True)
+class _ProviderDiscoveryResult:
+    """One provider endpoint plus the models discovered through it."""
+
+    endpoint: PreparedEndpoint
+    models: tuple[AvailableModel, ...]
+    skipped: bool = False
+
+
 @dataclass
 class SetupSession:
     """Answers already given, kept across back navigation and provider retries."""
@@ -347,16 +356,22 @@ def prepare_providers(
             console.print(f"[dim]{label}: declare deployment model IDs on the model screen[/dim]")
             discovered: tuple[AvailableModel, ...] | None = ()
         else:
-            discovered = _discover_models(
+            discovery = _discover_models(
                 endpoint,
                 provider=provider,
                 console=console,
                 lister=lister,
                 taken_aliases=frozenset(taken_aliases),
                 configured_identities=configured_identities,
+                environment=environment,
             )
-        if discovered is None:
-            return None
+            if discovery is None:
+                return None
+            endpoint = discovery.endpoint
+            discovered = discovery.models
+            if discovery.skipped:
+                console.print(f"[yellow]Skipping {label}.[/yellow]")
+                continue
         if (
             not discovered
             and provider not in _MANUAL_MODEL_PROVIDERS
@@ -480,6 +495,7 @@ def _resolve_credential(
     api_key_env: str,
     console: Console,
     environment: MutableMapping[str, str],
+    force_prompt: bool = False,
 ) -> str | None:
     """Read one provider credential from the environment, or accept a masked paste.
 
@@ -488,6 +504,7 @@ def _resolve_credential(
         api_key_env: Credential environment-variable name for this connection.
         console: Terminal used for the masked prompt.
         environment: Process environment consulted and updated for pasted credentials.
+        force_prompt: Whether to ignore the current environment value and ask again.
 
     Returns:
         The resolved credential, or ``None`` when the provider is skipped.
@@ -495,7 +512,7 @@ def _resolve_credential(
     Raises:
         SetupCancelled: The prompt reached end of input.
     """
-    existing = environment.get(api_key_env, "").strip()
+    existing = "" if force_prompt else environment.get(api_key_env, "").strip()
     if existing:
         return existing
     console.print(f"[dim]{label} needs {api_key_env}.[/dim]")
@@ -521,7 +538,8 @@ def _discover_models(
     lister: ProviderModelLister,
     taken_aliases: frozenset[str],
     configured_identities: frozenset[tuple[str, str]] = frozenset(),
-) -> tuple[AvailableModel, ...] | None:
+    environment: MutableMapping[str, str],
+) -> _ProviderDiscoveryResult | None:
     """List one provider account's models and keep the ones with usable metadata.
 
     Args:
@@ -532,9 +550,11 @@ def _discover_models(
         taken_aliases: Aliases already used by the catalog or this session.
         configured_identities: Canonical (provider, model) identities already in the
             catalog; rediscovered matches reuse the existing row instead of a new alias.
+        environment: Mutable process environment used when a rejected credential is replaced.
 
     Returns:
-        Configurable models, or ``None`` when the user asked to change providers.
+        The current endpoint and configurable models, or ``None`` when the user asked to change
+        providers.
 
     Raises:
         SetupCancelled: The user cancelled setup during recovery.
@@ -554,8 +574,30 @@ def _discover_models(
             console.print(f"[red]{exc}[/red]")
             recovery = _recover(f"{label} model listing failed", console=console)
             if recovery == _RECOVERY_RETRY:
+                if _is_credential_rejection(exc):
+                    api_key_env = endpoint.connection.api_key_env
+                    assert api_key_env is not None
+                    api_key = _resolve_credential(
+                        label,
+                        api_key_env=api_key_env,
+                        console=console,
+                        environment=environment,
+                        force_prompt=True,
+                    )
+                    if api_key is None:
+                        return _ProviderDiscoveryResult(endpoint, (), skipped=True)
+                    endpoint = PreparedEndpoint(
+                        connection=endpoint.connection,
+                        api_key=api_key,
+                        configured=endpoint.configured,
+                    )
+                    request = ProviderEndpoint(
+                        provider=provider,
+                        api_key=api_key,
+                        base_url=endpoint.connection.base_url,
+                    )
                 continue
-            return () if recovery == _RECOVERY_SKIP else None
+            return _ProviderDiscoveryResult(endpoint, ()) if recovery == _RECOVERY_SKIP else None
         resolved = tuple(resolve_discovered_model(model) for model in discovered)
         usable = _canonical_models(
             tuple(model for model in resolved if served_roles(model.capabilities)),
@@ -566,7 +608,7 @@ def _discover_models(
             recovery = _recover(f"{label} has no configurable model", console=console)
             if recovery == _RECOVERY_RETRY:
                 continue
-            return () if recovery == _RECOVERY_SKIP else None
+            return _ProviderDiscoveryResult(endpoint, ()) if recovery == _RECOVERY_SKIP else None
         fresh = tuple(
             model
             for model in usable
@@ -574,7 +616,7 @@ def _discover_models(
         )
         if not fresh:
             console.print(f"  [green]\u2713[/green] {label}: models already configured")
-            return ()
+            return _ProviderDiscoveryResult(endpoint, ())
         console.print(f"  [green]\u2713[/green] {label}: {len(fresh)} models")
         models = []
         for model in fresh:
@@ -591,7 +633,12 @@ def _discover_models(
                     configured=False,
                 )
             )
-        return tuple(models)
+        return _ProviderDiscoveryResult(endpoint, tuple(models))
+
+
+def _is_credential_rejection(error: ProviderListingError) -> bool:
+    """Return whether a listing error asks the user to replace a rejected credential."""
+    return str(error).endswith(" rejected the configured credential")
 
 
 def _canonical_models(

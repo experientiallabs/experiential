@@ -436,6 +436,43 @@ def test_invalid_credential_can_be_skipped_and_keeps_the_other_provider() -> Non
     assert "rejected the configured credential" in console.output
 
 
+def test_invalid_credential_retry_prompts_for_and_keeps_a_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retrying a rejected credential asks for a replacement and uses it for the endpoint."""
+    prompts: list[str] = []
+
+    def _fake_getpass(prompt: str = "") -> str:
+        """Answer the replacement credential prompt without echoing the credential."""
+        prompts.append(prompt)
+        return "replacement-key"
+
+    monkeypatch.setattr(provider_picker, "getpass", _fake_getpass)
+    console = ScriptedConsole("1\n")
+    lister = _FakeLister(
+        {
+            "openai": [
+                ProviderListingError("openai rejected the configured credential"),
+                (_LUNA,),
+            ]
+        }
+    )
+    environment = {"OPENAI_API_KEY": "rejected-key"}
+
+    prepared = _prepare(console, providers=("openai",), lister=lister, environment=environment)
+
+    assert prepared is not None
+    endpoints, _ = prepared
+    assert len(prompts) == 1
+    assert lister.requests == [
+        ProviderEndpoint(provider="openai", api_key="rejected-key"),
+        ProviderEndpoint(provider="openai", api_key="replacement-key"),
+    ]
+    assert endpoints[0].api_key == "replacement-key"
+    assert environment == {"OPENAI_API_KEY": "replacement-key"}
+    assert "replacement-key" not in console.output
+
+
 def test_listing_failure_can_return_to_the_provider_screen() -> None:
     """Choosing to reselect providers reports no prepared endpoints for this attempt."""
     console = ScriptedConsole("3\n")
