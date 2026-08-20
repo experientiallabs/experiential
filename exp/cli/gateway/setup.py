@@ -25,12 +25,13 @@ from exp.runtime.gateway.management import GatewayManagement
 
 _GATEWAY_PROVIDER_OPTIONS = tuple(
     PickerOption(value=provider, label=provider)
-    for provider in ("openai", "anthropic", "azure", "bedrock")
+    for provider in ("openai", "anthropic", "azure", "bedrock", "openai-compatible")
 )
 _CANONICAL_CREDENTIAL_ENV = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "azure": "AZURE_OPENAI_API_KEY",
+    "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
 }
 
 
@@ -99,6 +100,12 @@ def _collect_provider_connection(provider: str) -> ConnectionConfig:
                 base_url=base_url,
                 api_key_env=_CANONICAL_CREDENTIAL_ENV[provider],
                 api_version=api_version,
+            )
+        if provider == "openai-compatible":
+            return ConnectionConfig(
+                provider=provider,
+                base_url=typer.prompt("OpenAI-compatible base URL"),
+                api_key_env=_CANONICAL_CREDENTIAL_ENV[provider],
             )
         return ConnectionConfig(
             provider=provider,

@@ -12,19 +12,25 @@ from exp.common.models import ConnectionConfig
 
 @pytest.mark.parametrize(
     ("answer", "provider"),
-    (("1", "openai"), ("2", "anthropic"), ("3", "azure"), ("4", "bedrock")),
+    (
+        ("1", "openai"),
+        ("2", "anthropic"),
+        ("3", "azure"),
+        ("4", "bedrock"),
+        ("5", "openai-compatible"),
+    ),
 )
-def test_gateway_provider_selector_exposes_the_four_first_run_providers(
+def test_gateway_provider_selector_exposes_primary_and_legacy_providers(
     answer: str,
     provider: str,
 ) -> None:
-    """The line fallback presents and accepts each supported first-run provider."""
+    """The line fallback presents the four primary providers and the legacy compatible path."""
     console = ScriptedConsole(f"{answer}\n")
 
     selected = setup.select_gateway_provider(console=console)
 
     assert selected == provider
-    for expected in ("openai", "anthropic", "azure", "bedrock"):
+    for expected in ("openai", "anthropic", "azure", "bedrock", "openai-compatible"):
         assert expected in console.output
 
 
@@ -74,6 +80,25 @@ def test_azure_provider_connection_collects_required_endpoint_fields(
         base_url="https://resource.openai.azure.com",
         api_key_env="AZURE_OPENAI_API_KEY",
         api_version="v1",
+    )
+
+
+def test_openai_compatible_provider_connection_collects_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenAI-compatible setup retains its explicit endpoint and canonical credential reference."""
+    monkeypatch.setattr(
+        setup.typer,
+        "prompt",
+        lambda _text, **_kwargs: "https://gateway.example.test/v1",
+    )
+
+    connection = setup._collect_provider_connection("openai-compatible")  # noqa: SLF001
+
+    assert connection == ConnectionConfig(
+        provider="openai-compatible",
+        base_url="https://gateway.example.test/v1",
+        api_key_env="OPENAI_COMPATIBLE_API_KEY",
     )
 
 
