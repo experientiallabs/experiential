@@ -1,4 +1,4 @@
-"""World Model Optimizer public customer services with lazy package-root exports."""
+"""Experiential public customer services with lazy package-root exports."""
 
 from __future__ import annotations
 
