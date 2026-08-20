@@ -21,14 +21,14 @@ model, and public alias, then prints a one-time virtual key:
 
 ```bash
 pip install experiential
-exp run --root .exp --port 8822
+exp run
 ```
 
 Choose a public alias such as `support-agent`, capture the issued key, and send a request:
 
 ```bash
 export EXP_GATEWAY_KEY=...
-curl http://127.0.0.1:8822/v1/chat/completions \
+curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer $EXP_GATEWAY_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
