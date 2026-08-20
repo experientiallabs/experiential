@@ -34,24 +34,6 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
 ```
 
-## Optimize from Traffic
-
-First, collect OpenTelemetry traces from your current agent. If you just want to try it out, grab
-the public [terminal-tasks OTLP dataset](https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces):
-
-```bash
-curl -L -o traces.otel.jsonl \
-  https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl
-```
-
-Then build a project. The build command walks you through providers,
-models, and budget, and asks for your trace file:
-
-```bash
-# Build simulation from your agent traces and optimize a router against it
-exp build support-agent
-```
-
 ## Using the API
 
 Call the gateway programmatically with any OpenAI-compatible client:
@@ -73,7 +55,23 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-## Optimize a Model
+## Optimize from Traffic
+
+First, collect OpenTelemetry traces from your current agent. If you just want to try it out, grab
+the public [terminal-tasks OTLP dataset](https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces):
+
+```bash
+curl -L -o traces.otel.jsonl \
+  https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl
+```
+
+Then build a project. The build command walks you through providers,
+models, and budget, and asks for your trace file:
+
+```bash
+# Build simulation from your agent traces and optimize a router against it
+exp build support-agent
+```
 
 After collecting traces from your router, fine-tune an open source model you own using
 [Tinker](https://tinker.thinkingmachines.ai/).
