@@ -1,16 +1,16 @@
-# World Model Optimizer
+# Experiential
 
-WMO optimizes agent workflows from traces through a three-step process:
+Experiential optimizes agent workflows from traces through a three-step process:
 
 1. Build a simulation using text world models grounded on your traces.
 2. Fit a router that determines which model every request should be sent to.
 3. Train custom open source models just for your agent.
 
-![Your traces flow through simulation into routing and training optimization](https://raw.githubusercontent.com/experientiallabs/world-model-optimizer/main/assets/wmo-workflow.png)
+![Your traces flow through simulation into routing and training optimization](https://raw.githubusercontent.com/experientiallabs/experiential/main/assets/experiential-workflow.png)
 
 <p align="center">
   🌐 <a href="https://platform.experientiallabs.ai">Platform</a> |
-  📚 <a href="https://github.com/experientiallabs/world-model-optimizer/tree/main/docs">Docs</a> |
+  📚 <a href="https://github.com/experientiallabs/experiential/tree/main/docs">Docs</a> |
   <a href="https://discord.gg/B6sM8xTVwU"><img src="https://cdn.simpleicons.org/discord/5865F2" alt="" width="16" height="16"> Discord</a>
 </p>
 
@@ -28,13 +28,13 @@ Then install the package and build a project. The build command walks you throug
 models, and budget, and asks for your trace file:
 
 ```bash
-pip install world-model-optimizer
+pip install experiential
 
 # Build simulation from your agent traces and optimize a router against it
-wmo build support-agent
+exp build support-agent
 
 # Run your router as an OpenAI compatible endpoint
-wmo run support-agent
+exp run support-agent
 
 # Send a request to your endpoint
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -46,7 +46,7 @@ After collecting traces from your router, fine-tune an open source model you own
 [Tinker](https://tinker.thinkingmachines.ai/).
 
 ```bash
-wmo optimize model support-agent
+exp optimize model support-agent
 ```
 
 ## Using the API
@@ -56,10 +56,10 @@ Call an optimized router programmatically:
 ```python
 from pathlib import Path
 
-from wmo import load_project_router
-from wmo.common.models import ModelMessage, ModelRequest
+from exp import load_project_router
+from exp.common.models import ModelMessage, ModelRequest
 
-router = load_project_router("support-agent", Path(".wmo"))
+router = load_project_router("support-agent", Path(".exp"))
 
 result = router.complete(
     ModelRequest(
@@ -76,12 +76,12 @@ Anonymous aggregate PostHog product telemetry is enabled by default. It never in
 traces, actions, observations, paths, model names, credentials, or raw customer content.
 
 ```bash
-wmo config telemetry status
-wmo config telemetry disable
-wmo config telemetry enable
+exp config telemetry status
+exp config telemetry disable
+exp config telemetry enable
 ```
 
-The preference is stored locally in `.wmo/settings.toml`.
+The preference is stored locally in `.exp/settings.toml`.
 
 ## Development
 
