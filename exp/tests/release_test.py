@@ -80,6 +80,7 @@ REQUIRED_SDIST_MEMBERS = frozenset(
     {
         "README.md",
         "assets/experiential-workflow.png",
+        "assets/experiential-workspace.png",
         "docs/reference/gateway-architecture.md",
         "docs/release-scope.md",
         "docs/usage.md",
