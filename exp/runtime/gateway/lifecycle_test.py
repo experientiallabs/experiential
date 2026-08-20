@@ -8,6 +8,7 @@ import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -133,6 +134,14 @@ class _ObjectContinuationStore:
             namespace=namespace,
             previous_response_id=previous_response_id,
         )
+
+
+def test_local_gateway_uses_happy_path_defaults() -> None:
+    """The programmatic local loader defaults to the CLI's root and drain bound."""
+    parameters = signature(load_local_gateway).parameters
+
+    assert parameters["root"].default == Path(".exp")
+    assert parameters["graceful_timeout_seconds"].default == 10.0
 
 
 def _repository_for_runtime(

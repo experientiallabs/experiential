@@ -36,26 +36,17 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## Using the API
 
-Create a local gateway programmatically from an initialized `.exp` root:
+Create a local gateway programmatically with the default `.exp` root and ten-second graceful
+shutdown:
 
 ```python
-from pathlib import Path
-
 import uvicorn
 
 from exp.runtime.gateway.lifecycle import load_local_gateway
 
-gateway = load_local_gateway(
-    Path(".exp"),
-    graceful_timeout_seconds=10,
-)
-
-uvicorn.run(
-    gateway.app,
-    host="127.0.0.1",
-    port=8000,
-    lifespan="on",
-)
+if __name__ == "__main__":
+    gateway = load_local_gateway()
+    uvicorn.run(gateway.app, lifespan="on")
 ```
 
 For hosted workers with their own storage and provider services, use the lower-level

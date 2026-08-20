@@ -13,6 +13,7 @@ from typing import cast
 from fastapi import FastAPI
 from filelock import FileLock, Timeout
 
+from exp.common.config import ARTIFACT_DIR
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
     ModelCatalog,
@@ -56,6 +57,8 @@ from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.openai_protocol.state import ResponseContinuationStore, ResponseReplayStore
 from exp.runtime.router.errors import RouterApplicationError
 from exp.runtime.router.runtime import DecisionSink, RouterRuntime
+
+_DEFAULT_GRACEFUL_TIMEOUT_SECONDS = 10.0
 
 
 class GatewayLifecycleError(ValueError):
@@ -176,9 +179,9 @@ def gateway_instance_lock(root: Path, *, port: int) -> Iterator[None]:
 
 
 def load_local_gateway(
-    root: Path,
+    root: Path = Path(ARTIFACT_DIR),
     *,
-    graceful_timeout_seconds: float,
+    graceful_timeout_seconds: float = _DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
     environment: Mapping[str, str] | None = None,
     project_repository: ProjectActivationRepository | None = None,
     decision_sink: DecisionSink | None = None,
@@ -189,8 +192,8 @@ def load_local_gateway(
     """Load all granted active aliases and compose the loopback application.
 
     Args:
-        root: Initialized EXP root.
-        graceful_timeout_seconds: Shutdown drain bound.
+        root: Initialized EXP root. Defaults to the local ``.exp`` root.
+        graceful_timeout_seconds: Shutdown drain bound. Defaults to ten seconds.
         environment: Optional provider credential mapping used by tests.
         project_repository: Repository for verified immutable project activations.
         decision_sink: Optional aggregate-safe recorder for served project selections.
