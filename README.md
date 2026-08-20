@@ -14,7 +14,27 @@ Experiential optimizes agent workflows from traces through a three-step process:
   <a href="https://discord.gg/B6sM8xTVwU"><img src="https://cdn.simpleicons.org/discord/5865F2" alt="" width="16" height="16"> Discord</a>
 </p>
 
-## Getting Started
+## Gateway
+
+Start a local OpenAI-compatible gateway. On first run, the setup wizard asks for a provider,
+model, and public alias, then prints a one-time virtual key:
+
+```bash
+pip install experiential
+exp run --root .exp --port 8822
+```
+
+Choose a public alias such as `support-agent`, capture the issued key, and send a request:
+
+```bash
+export EXP_GATEWAY_KEY=...
+curl http://127.0.0.1:8822/v1/chat/completions \
+  -H "Authorization: Bearer $EXP_GATEWAY_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
+```
+
+## Optimize from Traffic
 
 First, collect OpenTelemetry traces from your current agent. If you just want to try it out, grab
 the public [terminal-tasks OTLP dataset](https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces):
@@ -28,8 +48,6 @@ Then install the package and build a project. The build command walks you throug
 models, and budget, and asks for your trace file:
 
 ```bash
-pip install experiential
-
 # Build simulation from your agent traces and optimize a router against it
 exp build support-agent
 
