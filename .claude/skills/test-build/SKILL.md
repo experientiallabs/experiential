@@ -1,6 +1,6 @@
 ---
 name: test-build
-description: Run the live WMO build-to-serve path as an unattended automation. Fits the pinned terminal-tasks trace export through the CLI, calibrates the judge non-interactively, fits a router, verifies exact replay, and serves the frozen policy on loopback. Use when asked to test the build path, verify cloud setup, or attach this skill to an automation.
+description: Run the live Experiential build-to-serve path as an unattended automation. Fits the pinned terminal-tasks trace export through the CLI, calibrates the judge non-interactively, fits a router, verifies exact replay, and serves the frozen policy on loopback. Use when asked to test the build path, verify cloud setup, or attach this skill to an automation.
 ---
 
 # Test the build path
@@ -9,12 +9,12 @@ Execute the current CLI path on one isolated local root. This is a live provider
 deterministic fixture test. It proves the commands complete, that the fitted router replays
 exactly, and that routed loopback traffic journals durably. It does not claim router quality.
 
-Every step is a `wmo` or standard shell command. Do not edit `models.toml`, project files, or
+Every step is an `exp` or standard shell command. Do not edit `models.toml`, project files, or
 artifacts by hand. Do not call internal Python APIs. If a step cannot be done through the CLI,
 stop and report the UX gap.
 
-Do not use OpenRouter. Do not run `wmo optimize model`. Do not start E2B sandboxes. Do not commit
-`.wmo/`, traces, or any generated artifact.
+Do not use OpenRouter. Do not run `exp optimize model`. Do not start E2B sandboxes. Do not commit
+`.exp/`, traces, or any generated artifact.
 
 Time every numbered step and report the table at the end.
 
@@ -24,12 +24,12 @@ This skill fits the pinned public terminal-tasks export by default. A caller may
 variable below; when overriding, the caller owns the digest. Record the effective values in the
 final report so the fitted dataset is unambiguous.
 
-- `WMO_TEST_BUILD_PROJECT` (default `terminal-tasks`): local project ID passed to every command
-- `WMO_TEST_BUILD_TRACES` (default `$HOME/wmo-fixtures/terminal-tasks-traces.otel.jsonl`):
+- `EXP_TEST_BUILD_PROJECT` (default `terminal-tasks`): local project ID passed to every command
+- `EXP_TEST_BUILD_TRACES` (default `$HOME/exp-fixtures/terminal-tasks-traces.otel.jsonl`):
   local trace-export file
-- `WMO_TEST_BUILD_TRACES_SHA256` (default
+- `EXP_TEST_BUILD_TRACES_SHA256` (default
   `21c62cba7e3372cbf03df051dc2408699fbf8ea3561ba661b599e4949f0e5d42`): lowercase hex digest
-- `WMO_TEST_BUILD_SOURCE` (default `otlp`): trace source format
+- `EXP_TEST_BUILD_SOURCE` (default `otlp`): trace source format
 
 When the default file is absent, download the pinned export once with `HF_TOKEN`:
 
@@ -40,7 +40,7 @@ https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/reso
 Do not skip the digest check. If the file is absent and cannot be downloaded, or the digest does
 not match, stop.
 
-Optional work root: `WMO_TEST_BUILD_ROOT` (default `/tmp/wmo-test-build`). Keep the trace file
+Optional work root: `EXP_TEST_BUILD_ROOT` (default `/tmp/exp-test-build`). Keep the trace file
 outside that directory. The skill deletes the work root at the start of the run.
 
 ## Secrets
@@ -78,7 +78,7 @@ Keep these exact. If a pin is unavailable, stop and report which one failed.
   `reasoning_effort` `xhigh`. Its `maximum_output_tokens` is `32000` because the judge
   preflight requires an output budget of at least `16384` and fails closed below it.
 - Embedder: OpenAI `text-embedding-3-small` as alias `embed`
-- Shared command budget: `$75` via `wmo config budget`
+- Shared command budget: `$75` via `exp config budget`
 - Build ceiling: `$5`
 - Judge calibration sample: `10` lineages, labeled non-interactively in two passes (see step 5)
 - Router ceilings: `$60` provider cost, `210` judgments, `10` model calls. Three candidates
@@ -99,12 +99,12 @@ is covered, with the uncovered task IDs surfaced in the frozen policy.
 ## Timing
 
 Keep the timing log outside the wiped work root. Wrap every numbered command with this helper
-except the long-running `wmo run` process, which is timed as `run-ready` until the listen line
+except the long-running `exp run` process, which is timed as `run-ready` until the listen line
 appears. Do not use Python.
 
 ```bash
-WORK="${WMO_TEST_BUILD_ROOT:-/tmp/wmo-test-build}"
-BENCH=/tmp/wmo-test-build-bench.tsv
+WORK="${EXP_TEST_BUILD_ROOT:-/tmp/exp-test-build}"
+BENCH=/tmp/exp-test-build-bench.tsv
 : > "$BENCH"
 bench() {
   local name="$1"
@@ -127,10 +127,10 @@ export PATH="$HOME/.local/bin:$PATH"
 test -n "$OPENAI_API_KEY"
 test -n "$EXP_WM_ENDPOINT"
 test -n "$EXP_WM_API_KEY"
-PROJECT="${WMO_TEST_BUILD_PROJECT:-terminal-tasks}"
-TRACES="${WMO_TEST_BUILD_TRACES:-$HOME/wmo-fixtures/terminal-tasks-traces.otel.jsonl}"
-TRACES_SHA256="${WMO_TEST_BUILD_TRACES_SHA256:-21c62cba7e3372cbf03df051dc2408699fbf8ea3561ba661b599e4949f0e5d42}"
-SOURCE="${WMO_TEST_BUILD_SOURCE:-otlp}"
+PROJECT="${EXP_TEST_BUILD_PROJECT:-terminal-tasks}"
+TRACES="${EXP_TEST_BUILD_TRACES:-$HOME/exp-fixtures/terminal-tasks-traces.otel.jsonl}"
+TRACES_SHA256="${EXP_TEST_BUILD_TRACES_SHA256:-21c62cba7e3372cbf03df051dc2408699fbf8ea3561ba661b599e4949f0e5d42}"
+SOURCE="${EXP_TEST_BUILD_SOURCE:-otlp}"
 if [ ! -f "$TRACES" ]; then
   test -n "$HF_TOKEN"
   mkdir -p "$(dirname "$TRACES")"
@@ -138,18 +138,18 @@ if [ ! -f "$TRACES" ]; then
     -o "$TRACES" \
     "https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl"
 fi
-printf '%s  %s\n' "$TRACES_SHA256" "$TRACES" > /tmp/wmo-test-build-traces.sha256
-bench verify-traces sha256sum -c /tmp/wmo-test-build-traces.sha256
-bench preconditions uv run wmo --help
+printf '%s  %s\n' "$TRACES_SHA256" "$TRACES" > /tmp/exp-test-build-traces.sha256
+bench verify-traces sha256sum -c /tmp/exp-test-build-traces.sha256
+bench preconditions uv run exp --help
 ```
 
 ## 2. Isolated work root
 
 ```bash
-WORK="${WMO_TEST_BUILD_ROOT:-/tmp/wmo-test-build}"
+WORK="${EXP_TEST_BUILD_ROOT:-/tmp/exp-test-build}"
 rm -rf "$WORK"
 mkdir -p "$WORK"
-ROOT="$WORK/.wmo"
+ROOT="$WORK/.exp"
 test -f "$TRACES"
 ```
 
@@ -162,7 +162,7 @@ so the catalog stores the URL, not a credential. `openai-compatible` requires `b
 ```bash
 case "$EXP_WM_ENDPOINT" in *\"*) echo "EXP_WM_ENDPOINT cannot contain double quotes" >&2; exit 1 ;; esac
 EXPWM_JSON="{\"name\":\"expwm\",\"provider\":\"openai-compatible\",\"api_key_env\":\"EXP_WM_API_KEY\",\"base_url\":\"$EXP_WM_ENDPOINT\"}"
-bench config-providers uv run wmo config providers \
+bench config-providers uv run exp config providers \
   --root "$ROOT" \
   --non-interactive \
   --connection-json '{"name":"openai","provider":"openai","api_key_env":"OPENAI_API_KEY"}' \
@@ -181,7 +181,7 @@ Confirm with `grep`, not by editing the file: `models.toml` names the four alias
 world-model alias mean self-hosted spend, not a missing price.
 
 ```bash
-bench config-budget uv run wmo config budget 75 --root "$ROOT"
+bench config-budget uv run exp config budget 75 --root "$ROOT"
 ```
 
 The default per-command budget is `$10`. The router step freezes a `$60` provider ceiling and
@@ -191,7 +191,7 @@ before that command or it fails closed.
 ## 4. Build
 
 ```bash
-bench build uv run wmo build "$PROJECT" "$TRACES" \
+bench build uv run exp build "$PROJECT" "$TRACES" \
   --source "$SOURCE" \
   --root "$ROOT" \
   --yes \
@@ -205,7 +205,7 @@ and world-model IDs from that output. Fail if the command asks for a prompt or e
 ## 5. Judge setup and calibration
 
 ```bash
-bench judge-setup uv run wmo config judge setup "$PROJECT" \
+bench judge-setup uv run exp config judge setup "$PROJECT" \
   --root "$ROOT" \
   --approve \
   --non-interactive
@@ -218,7 +218,7 @@ expression for every sampled lineage. That exit is expected; do not treat it as 
 ```bash
 CAL_LOG="$WORK/calibrate-propose.log"
 bench judge-calibrate-propose bash -c \
-  'uv run wmo config judge calibrate "$0" --root "$1" --sample-size 10 --yes --non-interactive > "$2" 2>&1; test $? -ne 0' \
+  'uv run exp config judge calibrate "$0" --root "$1" --sample-size 10 --yes --non-interactive > "$2" 2>&1; test $? -ne 0' \
   "$PROJECT" "$ROOT" "$CAL_LOG"
 grep -q -- '--label' "$CAL_LOG"
 ```
@@ -236,7 +236,7 @@ while IFS= read -r key; do
   CAL_ARGS+=(--judgment "${key}=Uniform path-exercise label pinned to the top score.")
 done < <(grep -oE '[A-Za-z0-9_:-]+=SCORE' "$CAL_LOG" | sed 's/=SCORE$//' | sort -u)
 test "${#CAL_ARGS[@]}" -ge 2
-bench judge-calibrate uv run wmo config judge calibrate "$PROJECT" \
+bench judge-calibrate uv run exp config judge calibrate "$PROJECT" \
   --root "$ROOT" \
   --sample-size 10 \
   --yes \
@@ -254,7 +254,7 @@ already configured, so no extra provider setup happens here. The two hosted cand
 one endpoint and exercise both of its served model IDs.
 
 ```bash
-bench optimize uv run wmo optimize router "$PROJECT" \
+bench optimize uv run exp optimize router "$PROJECT" \
   --root "$ROOT" \
   --candidate dsflash \
   --candidate dsflash0731 \
@@ -265,7 +265,7 @@ bench optimize uv run wmo optimize router "$PROJECT" \
   --maximum-model-calls 10 \
   --yes \
   --non-interactive
-bench optimize-replay uv run wmo optimize router "$PROJECT" \
+bench optimize-replay uv run exp optimize router "$PROJECT" \
   --root "$ROOT" \
   --candidate dsflash \
   --candidate dsflash0731 \
@@ -300,8 +300,8 @@ journaled completion with the same response ID, which proves durable journaling 
 new provider call.
 
 ```bash
-SERVE_LOG=/tmp/wmo-test-build-serve.log
-uv run wmo run "$PROJECT" --root "$ROOT" --port 8000 > "$SERVE_LOG" 2>&1 &
+SERVE_LOG=/tmp/exp-test-build-serve.log
+uv run exp run "$PROJECT" --root "$ROOT" --port 8000 > "$SERVE_LOG" 2>&1 &
 SERVER_PID=$!
 bench run-key bash -c "until grep -q 'Gateway key file:' $SERVE_LOG; do sleep 0.2; done"
 GATEWAY_KEY="$(tr -d '\n' < "$(sed -n 's/^Gateway key file: //p' "$SERVE_LOG" | head -1)")"
@@ -311,25 +311,25 @@ bench chat-smoke curl -sS --fail http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_KEY" \
   -H 'Content-Type: application/json' \
   -H "Idempotency-Key: $SMOKE_KEY" \
-  -o /tmp/wmo-test-build-chat-first.json \
+  -o /tmp/exp-test-build-chat-first.json \
   -d "{\"model\":\"$PROJECT\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word ready.\"}]}"
 bench chat-replay curl -sS --fail http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer $GATEWAY_KEY" \
   -H 'Content-Type: application/json' \
   -H "Idempotency-Key: $SMOKE_KEY" \
-  -o /tmp/wmo-test-build-chat-replay.json \
+  -o /tmp/exp-test-build-chat-replay.json \
   -d "{\"model\":\"$PROJECT\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word ready.\"}]}"
 kill "$SERVER_PID"
 wait "$SERVER_PID" || true
-grep -o '"id":"[^"]*"' /tmp/wmo-test-build-chat-first.json | head -1
-grep -o '"id":"[^"]*"' /tmp/wmo-test-build-chat-replay.json | head -1
+grep -o '"id":"[^"]*"' /tmp/exp-test-build-chat-first.json | head -1
+grep -o '"id":"[^"]*"' /tmp/exp-test-build-chat-replay.json | head -1
 ```
 
 Both responses must be HTTP 200 JSON with a completion choice, and the two response IDs must be
 identical. The listen line `Uvicorn running on http://127.0.0.1:8000` must appear in the serve
 log before the first request. The key stays in the local root and never enters the report.
 
-The locked `wmo config` surface has no retrieval-refresh command, so the durable journal
+The locked `exp config` surface has no retrieval-refresh command, so the durable journal
 produced here is the closed-loop evidence this skill verifies. Ingesting journaled traffic into
 a new retrieval index is out of scope for this skill.
 
