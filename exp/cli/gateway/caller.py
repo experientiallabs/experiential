@@ -130,26 +130,33 @@ def caller_key_check(
     with _gateway_client(url, timeout=timeout) as client:
         response = _gateway_request(client, "GET", "/models", raw_key=raw_key, url=url)
     if response.status_code == 200:
-        aliases = [str(model.get("id", "")) for model in _listed_models(response)]
-        if json_output:
-            typer.echo(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "operation": "key.check",
-                        "valid": True,
-                        "granted_aliases": aliases,
-                    },
-                    separators=(",", ":"),
+        models = _listed_authority_models(response)
+        if models is not None:
+            aliases = [str(model["id"]) for model in models]
+            if json_output:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "operation": "key.check",
+                            "valid": True,
+                            "granted_aliases": aliases,
+                        },
+                        separators=(",", ":"),
+                    )
                 )
-            )
+                return
+            if aliases:
+                typer.echo(f"key valid; granted aliases: {', '.join(aliases)}")
+            else:
+                typer.echo(
+                    "key valid; no aliases granted (add one with 'exp config gateway grant')"
+                )
             return
-        if aliases:
-            typer.echo(f"key valid; granted aliases: {', '.join(aliases)}")
-        else:
-            typer.echo("key valid; no aliases granted (add one with 'exp config gateway grant')")
-        return
-    code, message = _error_detail(response)
+        code = "invalid_gateway_response"
+        message = "HTTP 200 did not contain the EXP gateway model-authority response shape."
+    else:
+        code, message = _error_detail(response)
     if json_output:
         typer.echo(
             json.dumps(
@@ -195,6 +202,13 @@ def _stream_completion(
                 _require_success(response)
             emitted = False
             for line in response.iter_lines():
+                stream_error = _stream_error_detail(line)
+                if stream_error is not None:
+                    if emitted:
+                        typer.echo("")
+                    code, message = stream_error
+                    typer.echo(f"gateway error {code}: {message}", err=True)
+                    raise typer.Exit(code=1)
                 delta = _stream_text_delta(line)
                 if delta:
                     typer.echo(delta, nl=False)
@@ -203,6 +217,22 @@ def _stream_completion(
                 typer.echo("")
     except httpx.HTTPError:
         raise _unreachable_gateway(url) from None
+
+
+def _stream_error_detail(line: str) -> tuple[str, str] | None:
+    """Return the code and message from one terminal streamed error envelope.
+
+    Args:
+        line: One raw server-sent-event line.
+
+    Returns:
+        Stream error details, or ``None`` when the line is not a gateway error.
+    """
+    chunk = _stream_payload(line)
+    if chunk is None or not isinstance(chunk.get("error"), dict):
+        return None
+    error = cast(JsonObject, chunk["error"])
+    return str(error.get("code", "unknown")), str(error.get("message", ""))
 
 
 def _stream_text_delta(line: str) -> str:
@@ -214,16 +244,8 @@ def _stream_text_delta(line: str) -> str:
     Returns:
         Text delta content, or an empty string for control frames and other events.
     """
-    if not line.startswith("data: "):
-        return ""
-    payload = line[len("data: ") :].strip()
-    if not payload or payload == "[DONE]":
-        return ""
-    try:
-        chunk = json.loads(payload)
-    except json.JSONDecodeError:
-        return ""
-    if not isinstance(chunk, dict):
+    chunk = _stream_payload(line)
+    if chunk is None:
         return ""
     choices = chunk.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
@@ -233,6 +255,27 @@ def _stream_text_delta(line: str) -> str:
         return ""
     content = delta.get("content")
     return content if isinstance(content, str) else ""
+
+
+def _stream_payload(line: str) -> JsonObject | None:
+    """Decode one JSON server-sent-event data line into an object.
+
+    Args:
+        line: One raw server-sent-event line.
+
+    Returns:
+        JSON object payload, or ``None`` for control, malformed, and non-data lines.
+    """
+    if not line.startswith("data: "):
+        return None
+    payload = line[len("data: ") :].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        chunk = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return cast(JsonObject, chunk) if isinstance(chunk, dict) else None
 
 
 def _gateway_client(url: str, *, timeout: float) -> httpx.Client:
@@ -332,6 +375,60 @@ def _listed_models(response: httpx.Response) -> list[JsonObject]:
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         return []
     return [cast(JsonObject, item) for item in payload["data"] if isinstance(item, dict)]
+
+
+def _listed_authority_models(response: httpx.Response) -> list[JsonObject] | None:
+    """Return a validated EXP gateway model-authority list.
+
+    Args:
+        response: Successful response from the caller's ``GET /v1/models`` request.
+
+    Returns:
+        Validated model objects, including an empty list for a valid key with no grants,
+        or ``None`` when the response is not the EXP gateway authority shape.
+    """
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("object") != "list":
+        return None
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return None
+    models: list[JsonObject] = []
+    for item in data:
+        if not isinstance(item, dict):
+            return None
+        model = cast(JsonObject, item)
+        if not _is_authority_model(model):
+            return None
+        models.append(model)
+    return models
+
+
+def _is_authority_model(model: JsonObject) -> bool:
+    """Check the stable wire fields that identify an EXP authority model object.
+
+    Args:
+        model: One decoded model object from a models-list response.
+
+    Returns:
+        ``True`` only when the object carries the gateway authority metadata.
+    """
+    if (
+        model.get("object") != "model"
+        or model.get("created") != 0
+        or model.get("owned_by") != "wmo"
+    ):
+        return False
+    model_id = model.get("id")
+    authority = model.get("wmo")
+    if not isinstance(model_id, str) or not model_id or not isinstance(authority, dict):
+        return False
+    revision = authority.get("alias_revision_id")
+    digest = authority.get("catalog_sha256")
+    return isinstance(revision, str) and bool(revision) and isinstance(digest, str) and bool(digest)
 
 
 def _authorization(raw_key: str) -> dict[str, str]:

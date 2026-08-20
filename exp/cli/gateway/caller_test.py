@@ -86,6 +86,36 @@ def test_call_streams_text_deltas_to_stdout(monkeypatch: pytest.MonkeyPatch) -> 
     assert result.output == "Hello world\n"
 
 
+def test_call_surfaces_a_terminal_stream_error_after_http_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A streamed gateway error does not get hidden by the final done frame."""
+    frames = (
+        'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        'data: {"error":{"code":"insufficient_quota","message":"quota is exhausted"}}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        """Serve a successful stream that terminates with a gateway error."""
+        del request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=frames.encode(),
+        )
+
+    _mock_gateway(monkeypatch, respond)
+    result = CliRunner().invoke(
+        app,
+        ["config", "gateway", "call", "coding", "hello", "--key", _RAW_KEY],
+    )
+
+    assert result.exit_code == 1
+    assert "partial" in result.output
+    assert "gateway error insufficient_quota: quota is exhausted" in result.output
+
+
 def test_call_json_prints_the_raw_completion_envelope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -226,6 +256,7 @@ def test_key_check_reports_granted_aliases_without_echoing_the_key(
                     {
                         "id": "coding",
                         "object": "model",
+                        "created": 0,
                         "owned_by": "wmo",
                         "wmo": {
                             "alias_revision_id": "revision-one",
@@ -254,6 +285,41 @@ def test_key_check_reports_granted_aliases_without_echoing_the_key(
     }
     assert _RAW_KEY not in human.output
     assert _RAW_KEY not in raw.output
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    (
+        {"object": "list"},
+        {"object": "list", "data": [{"id": "generic-model", "object": "model"}]},
+    ),
+)
+def test_key_check_rejects_http_200_without_gateway_authority_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    envelope: dict[str, object],
+) -> None:
+    """An unrelated HTTP 200 model list cannot validate a gateway key."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        """Serve a malformed or generic OpenAI model-list response."""
+        del request
+        return httpx.Response(200, json=envelope)
+
+    _mock_gateway(monkeypatch, respond)
+    result = CliRunner().invoke(
+        app,
+        ["config", "gateway", "key", "check", "--key", _RAW_KEY, "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "schema_version": 1,
+        "operation": "key.check",
+        "valid": False,
+        "error_code": "invalid_gateway_response",
+        "message": "HTTP 200 did not contain the EXP gateway model-authority response shape.",
+    }
+    assert _RAW_KEY not in result.output
 
 
 def test_key_check_rejects_an_invalid_key_with_the_gateway_remediation(
