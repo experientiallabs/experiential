@@ -8,6 +8,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayNamedToolChoice
+from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
@@ -93,6 +94,34 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
     assert request.structured_text is not None and request.structured_text.strict
     assert request.include_usage
     assert request.metadata == {"cohort": "test"}
+
+
+def test_chat_legacy_max_tokens_reaches_native_responses_as_max_output_tokens() -> None:
+    """A Chat request using legacy max_tokens serves a native Responses max_output_tokens.
+
+    Chat clients (playground and agents) commonly send the legacy max_tokens field. On a
+    direct OpenAI deployment the native Responses API rejects max_tokens and wants
+    max_output_tokens, so the canonical request must translate the field and the native
+    payload must never carry max_tokens.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 256,
+            "stream": True,
+        }
+    )
+
+    assert decoded.request.maximum_output_tokens == 256
+    payload = openai_responses_stream_payload(
+        "gpt-fixture",
+        decoded.request,
+        supports_temperature=True,
+        reasoning_effort=None,
+    )
+    assert payload["max_output_tokens"] == 256
+    assert "max_tokens" not in payload
 
 
 def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> None:
