@@ -470,6 +470,87 @@ def test_structured_input_rejects_openai_compatible_without_capabilities(tmp_pat
     assert not (tmp_path / ".exp" / "models.toml").exists()
 
 
+def test_noninteractive_setup_authors_openai_compatible_identity_metadata(
+    tmp_path: Path,
+) -> None:
+    """Manual JSON is the deterministic path for an identity-only compatible host.
+
+    Args:
+        tmp_path: Temporary EXP root receiving the authored catalog.
+    """
+    root = tmp_path / ".exp"
+    connection = json.dumps(
+        {
+            "name": "hosted",
+            "provider": "openai-compatible",
+            "api_key_env": "HOSTED_API_KEY",
+            "base_url": "https://models.example.test/v1",
+        }
+    )
+    chat = json.dumps(
+        {
+            "alias": "hosted-chat",
+            "connection": "hosted",
+            "model": "hosted-chat",
+            "capabilities": {
+                "supports_completions": True,
+                "supports_structured_output": True,
+                "input_cost_per_million_tokens_usd": 1.5,
+                "output_cost_per_million_tokens_usd": 2.5,
+                "cached_input_cost_per_million_tokens_usd": 0,
+                "cache_write_cost_per_million_tokens_usd": 0,
+            },
+        }
+    )
+    embed = json.dumps(
+        {
+            "alias": "hosted-embed",
+            "connection": "hosted",
+            "model": "hosted-embed",
+            "capabilities": {
+                "supports_embeddings": True,
+                "input_cost_per_million_tokens_usd": 0.02,
+            },
+        }
+    )
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "config",
+            "providers",
+            "--root",
+            str(root),
+            "--non-interactive",
+            "--connection-json",
+            connection,
+            "--model-json",
+            chat,
+            "--model-json",
+            embed,
+            "--world-model",
+            "hosted-chat",
+            "--judge",
+            "hosted-chat",
+            "--embedder",
+            "hosted-embed",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    catalog = load_model_catalog(root / "models.toml")
+    assert catalog.roles.world_model == "hosted-chat"
+    assert catalog.roles.judge == "hosted-chat"
+    assert catalog.roles.embedder == "hosted-embed"
+    chat_caps = catalog.models["hosted-chat"].capabilities
+    assert chat_caps is not None
+    assert chat_caps.supports_completions is True
+    assert chat_caps.supports_tools is None
+    assert chat_caps.context_window_tokens is None
+    assert catalog.models["hosted-embed"].capabilities is not None
+    assert catalog.models["hosted-embed"].capabilities.supports_embeddings is True
+
+
 def _setup(
     root: Path,
     answers: str,

@@ -3167,6 +3167,7 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
 
     architecture = (docs / "reference" / "gateway-architecture.md").read_text(encoding="utf-8")
     assert "GET /v1/models" in architecture
+    assert "micro-USD-per-million-token" in architecture
     assert "POST /v1/chat/completions" in architecture
     assert "POST /v1/responses" in architecture
     assert "provider_certification.py" in architecture

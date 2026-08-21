@@ -30,6 +30,49 @@ Setup writes only secret-free catalog fields and never prints a credential value
 Native fixed-origin providers reject a custom `base_url`. Use `openai-compatible` for a trusted
 third-party OpenAI-compatible host.
 
+## OpenAI-compatible listing metadata
+
+`provider = "openai-compatible"` is the only OpenAI-shaped listing path that reads optional
+extension fields. Official `openai` listing stays identity-only: extra keys on a model object are
+discarded so unofficial metadata cannot become verified OpenAI capabilities or prices.
+
+Discovery and verification stay separate. `exp config providers --provider openai-compatible`
+lists every identity returned by a trusted operator-supplied endpoint. Official `openai` listing
+never becomes a capability source. When the compatible host also publishes the following optional
+fields, setup copies only values that match the declared types. Absent or wrongly typed fields
+stay unknown. No context window or cache-write price is inferred from a neighboring value.
+
+Identity-only rows remain visible and selectable. Setup labels them `unknown capabilities/prices`
+and does not assign a build role until the operator declares the minimum fields that role needs.
+The interactive flow confirms published values and asks only for missing required fields. The
+deterministic equivalent is `exp config providers --non-interactive` with `--connection-json` and
+`--model-json`, or a hand-authored `.exp/models.toml` record. Those declarations become configured
+catalog metadata. Downstream cost and router-candidate preflights stay fail-closed while a
+required price or limit remains unknown.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `supports_completions` | boolean | The alias serves chat or responses completions |
+| `supports_tools` | boolean | The alias accepts tools |
+| `supports_structured_output` | boolean | The alias accepts structured output |
+| `maximum_output_tokens` | positive integer | Declared output ceiling |
+| `context_window_tokens` | positive integer | Declared context window, only when the host publishes one |
+| `pricing.input_micro_usd_per_million_tokens` | integer `>= 0` | Configured input price in micro-USD per million tokens |
+| `pricing.output_micro_usd_per_million_tokens` | integer `>= 0` | Configured output price in micro-USD per million tokens |
+| `pricing.cached_input_micro_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in micro-USD per million tokens |
+
+Micro-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000`. A
+hosted Experiential gateway publishes these fields from the granted alias revision's direct
+singleton pool. Project aliases and multi-deployment pools stay identity-only. Published
+completion, tool, structured-output, and input/output price fields are enough to assign
+world-model and judge roles without a questionnaire. Router-candidate setup still requires a
+published or operator-declared context window and both cache prices. The gateway never invents
+those values, and setup never infers them.
+
+The hosted gateway `/v1/models` response keeps the standard OpenAI list shape (`object`, `data`,
+and the four OpenAI model keys) and only adds these extension fields plus the existing `wmo`
+authority marker.
+
 ## Azure
 
 Use `provider = "azure"`. The connection needs:

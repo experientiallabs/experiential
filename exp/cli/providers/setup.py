@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.prompt import Confirm
 
+from exp.cli.providers.declaration import merge_declared_models
 from exp.cli.providers.model_picker import (
     RoleAssignment,
     assign_roles,
@@ -424,9 +425,10 @@ def _collect_models_and_roles(
 ) -> ProviderSetupResult | None:
     """Run the role-first assignment and confirmation screens for one prepared provider set.
 
-    Discovered models go straight to one picker per role. Providers whose model IDs must be
-    declared by hand first run the model-declaration screen, then the same role pickers. Only
-    the models actually assigned a role are persisted.
+    Discovered models go straight to one picker per role. Identity-only OpenAI-compatible
+    models stay visible; assigning one collects an explicit capability and price declaration.
+    Providers whose model IDs must be declared by hand first run the model-declaration screen,
+    then the same role pickers. Only the models actually assigned a role are persisted.
 
     Args:
         session: Answers already collected in this setup session.
@@ -456,7 +458,11 @@ def _collect_models_and_roles(
                 continue
             return None
         used = {roles.world_model, roles.judge, roles.embedder, *roles.candidates}
-        chosen = tuple(item for item in pool if item.alias in used)
+        chosen = tuple(
+            item
+            for item in merge_declared_models(pool, roles.declared_models)
+            if item.alias in used
+        )
         result = build_result(
             chosen,
             roles=roles,

@@ -15,6 +15,7 @@ from exp.cli.providers.model_picker import (
     select_models,
 )
 from exp.cli.providers.provider_picker import (
+    UNKNOWN_METADATA_LABEL,
     AvailableModel,
     PreparedEndpoint,
     SetupCancelled,
@@ -422,6 +423,46 @@ def test_unassigned_and_unsupported_models_are_never_asked_for_effort() -> None:
     assert "World model effort (luna)" in console.output
     assert "(terra)" not in console.output.split("Router candidates")[-1]
     assert "Embedder effort" not in console.output
+
+
+def test_identity_only_openai_compatible_models_can_be_declared_for_a_role() -> None:
+    """Selecting an unknown compatible identity collects configured role metadata."""
+    chat = AvailableModel(
+        alias="hosted-chat",
+        connection="hosted",
+        provider="openai-compatible",
+        model="hosted-chat",
+        capabilities=None,
+        pricing_source=PricingSource.UNKNOWN,
+        configured=False,
+    )
+    embedder = AvailableModel(
+        alias="hosted-embed",
+        connection="hosted",
+        provider="openai-compatible",
+        model="hosted-embed",
+        capabilities=None,
+        pricing_source=PricingSource.UNKNOWN,
+        configured=False,
+    )
+    console = ScriptedConsole("1\n\n1.5\n2.5\n0\n0\n1\n\n\n\n\n\n\n2\n\n0.02\n")
+
+    roles = assign_roles((chat, embedder), role_inputs=SetupRoleInputs(), console=console)
+
+    assert roles is not None
+    assert (roles.world_model, roles.judge, roles.embedder) == (
+        "hosted-chat",
+        "hosted-chat",
+        "hosted-embed",
+    )
+    declared = {item.alias: item for item in roles.declared_models}
+    assert declared["hosted-chat"].pricing_source is PricingSource.CONFIGURED
+    assert declared["hosted-chat"].capabilities is not None
+    assert declared["hosted-chat"].capabilities.supports_structured_output
+    assert declared["hosted-chat"].capabilities.supports_tools is None
+    assert declared["hosted-embed"].capabilities is not None
+    assert declared["hosted-embed"].capabilities.supports_embeddings is True
+    assert UNKNOWN_METADATA_LABEL in console.output
 
 
 def test_manual_declaration_stays_behind_the_advanced_row() -> None:

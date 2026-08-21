@@ -27,6 +27,8 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.discovery import (
+    PublishedAliasMetadata,
+    listing_metadata_by_alias,
     public_model_list,
     public_model_object,
     require_granted_authority,
@@ -255,6 +257,14 @@ class GatewayService:
             model_id,
         )
 
+    def published_alias_metadata(
+        self, *, alias: str, revision_id: str, catalog_sha256: str
+    ) -> PublishedAliasMetadata | None:
+        """Return catalog-backed listing fields for one granted public alias."""
+        return self._routes.published_metadata(
+            alias=alias, revision_id=revision_id, catalog_sha256=catalog_sha256
+        )
+
     def authenticate(self, *, raw_key: str) -> None:
         """Authenticate a key before the HTTP boundary performs full protocol decoding."""
         self._control.authenticate_key(raw_key=raw_key)
@@ -321,18 +331,9 @@ class GatewayService:
         lease = None if key is None else await self._replays.claim(key)
         if lease is not None and lease.kind != ReplayClaimKind.OWNER:
             return _cached_response(await lease.result())
-        accepted = False
+        accept = asyncio.ensure_future(self._ledger.accept_request(authorization=authorization))
         try:
-            acceptance = asyncio.ensure_future(
-                self._ledger.accept_request(authorization=authorization)
-            )
-            try:
-                await asyncio.shield(acceptance)
-            except asyncio.CancelledError:
-                await abandoned_write_outcome(acceptance)
-                accepted = not acceptance.cancelled() and acceptance.exception() is None
-                raise
-            accepted = True
+            await asyncio.shield(accept)
             route = await self._routes.resolve(
                 authorization=authorization,
                 request=execution_request,
@@ -340,6 +341,9 @@ class GatewayService:
             )
             stream = await self._executor.start(route=route, request=execution_request)
         except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                await abandoned_write_outcome(accept)
+            accepted = accept.done() and not accept.cancelled() and accept.exception() is None
             request_finalized = isinstance(exc, GatewayExecutionError) and exc.request_finalized
             if accepted and not request_finalized:
                 await _finish_request_quietly(
@@ -665,7 +669,14 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
         try:
             raw_key = _bearer_key(authorization)
             authorities = service.model_authorities(raw_key=raw_key)
-            return JSONResponse(public_model_list(authorities))
+            return JSONResponse(
+                public_model_list(
+                    authorities,
+                    metadata_by_alias=listing_metadata_by_alias(
+                        authorities, service.published_alias_metadata
+                    ),
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
             return _exception_response(exc)
 
@@ -678,7 +689,14 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
         try:
             raw_key = _bearer_key(authorization)
             authority = service.model_authority(raw_key=raw_key, model_id=model_id)
-            return JSONResponse(public_model_object(authority))
+            return JSONResponse(
+                public_model_object(
+                    authority,
+                    metadata=listing_metadata_by_alias(
+                        (authority,), service.published_alias_metadata
+                    ).get(authority[0]),
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
             return _exception_response(exc)
 

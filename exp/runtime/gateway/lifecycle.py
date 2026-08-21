@@ -314,7 +314,20 @@ def load_local_gateway(
         ProjectTargetResolver | None,
         RouterProjectTargetResolver(activations, exact_models) if activations else None,
     )
-    routes = CatalogRouteResolver(normalized_catalogs, project_resolver=project_resolver)
+    listing_pools = {
+        (
+            item.authorization.alias,
+            item.authorization.alias_revision_id,
+            item.authorization.catalog_sha256,
+        ): item.authorization.target.pool_id
+        for item in readiness
+        if isinstance(item.authorization.target, DirectTarget)
+    }
+    routes = CatalogRouteResolver(
+        normalized_catalogs,
+        project_resolver=project_resolver,
+        listing_pools=listing_pools,
+    )
     write_ledger = GroupCommitAttemptLedger(ledger)
     executor = GatewayExecutor(runtime_catalogs, write_ledger)
     proof = readiness[0]

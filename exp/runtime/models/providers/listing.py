@@ -109,8 +109,10 @@ class HttpProviderModelLister:
             models = self._anthropic_models(endpoint)
         elif endpoint.provider == "openrouter":
             models = self._openrouter_models(endpoint)
-        elif endpoint.provider in ("openai", "openai-compatible"):
+        elif endpoint.provider == "openai":
             models = self._openai_models(endpoint)
+        elif endpoint.provider == "openai-compatible":
+            models = self._openai_compatible_models(endpoint)
         else:
             raise ProviderListingError(f"provider {endpoint.provider!r} cannot list models")
         return tuple(sorted(models, key=lambda model: model.model))
@@ -129,17 +131,35 @@ class HttpProviderModelLister:
             raise ProviderListingError(_listing_message(endpoint.provider, exc)) from exc
 
     def _openai_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
-        """List OpenAI or OpenAI-compatible models, which publish only model identities."""
+        """List official OpenAI models as identities only.
+
+        Official OpenAI listing objects may carry extra keys. Those keys are discarded so
+        setup never treats unofficial metadata as verified OpenAI capabilities or prices.
+        """
+        return [
+            DiscoveredModel(provider=endpoint.provider, model=identity)
+            for identity in _identities(endpoint.provider, self._openai_listing(endpoint), "id")
+        ]
+
+    def _openai_compatible_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
+        """List OpenAI-compatible models, keeping only validated optional metadata."""
+        models = []
+        for entry in _entries(endpoint.provider, self._openai_listing(endpoint)):
+            identity = _text(entry.get("id"))
+            if identity is None:
+                continue
+            models.append(_openai_compatible_model(endpoint.provider, identity, entry))
+        return models
+
+    def _openai_listing(self, endpoint: ProviderEndpoint) -> object:
+        """Read one OpenAI-shaped ``/models`` array from the configured origin."""
         base_url = _base_url(endpoint, default=OPENAI_BASE_URL)
         body = self._read(
             endpoint,
             f"{base_url}/models",
             {"Authorization": f"Bearer {endpoint.api_key}"},
         )
-        return [
-            DiscoveredModel(provider=endpoint.provider, model=identity)
-            for identity in _identities(endpoint.provider, body.get("data"), "id")
-        ]
+        return body.get("data")
 
     def _anthropic_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
         """List Anthropic models, which publish only model identities."""
@@ -196,6 +216,42 @@ class HttpProviderModelLister:
             if page_token is None:
                 break
         return models
+
+
+def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) -> DiscoveredModel:
+    """Build one discovered model from an OpenAI-compatible listing entry.
+
+    Only explicitly typed extension fields are kept. Unknown, absent, or wrongly typed
+    values stay unknown. Official OpenAI listing never calls this parser.
+
+    Args:
+        provider: Setup provider kind, always ``openai-compatible``.
+        identity: Provider-published model ID.
+        entry: One object from the OpenAI-shaped ``data`` array.
+
+    Returns:
+        The identity plus any validated optional capability, limit, and price fields.
+    """
+    pricing = entry.get("pricing")
+    prices: JsonObject = cast(JsonObject, pricing) if isinstance(pricing, dict) else {}
+    return DiscoveredModel(
+        provider=provider,
+        model=identity,
+        supports_completions=_strict_bool(entry.get("supports_completions")),
+        supports_tools=_strict_bool(entry.get("supports_tools")),
+        supports_structured_output=_strict_bool(entry.get("supports_structured_output")),
+        context_window_tokens=_strict_positive_int(entry.get("context_window_tokens")),
+        maximum_output_tokens=_strict_positive_int(entry.get("maximum_output_tokens")),
+        input_cost_per_million_tokens_usd=_micro_usd_price(
+            prices.get("input_micro_usd_per_million_tokens")
+        ),
+        output_cost_per_million_tokens_usd=_micro_usd_price(
+            prices.get("output_micro_usd_per_million_tokens")
+        ),
+        cached_input_cost_per_million_tokens_usd=_micro_usd_price(
+            prices.get("cached_input_micro_usd_per_million_tokens")
+        ),
+    )
 
 
 def _openrouter_model(provider: str, identity: str, entry: JsonObject) -> DiscoveredModel:
@@ -296,6 +352,34 @@ def _positive_int(value: object) -> int | None:
         return None
     limit = int(value)
     return limit if limit > 0 else None
+
+
+def _strict_positive_int(value: object) -> int | None:
+    """Read one exact positive integer, rejecting floats and other shapes."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
+def _strict_bool(value: object) -> bool | None:
+    """Read one exact boolean, rejecting truthy integers and other shapes."""
+    return value if isinstance(value, bool) else None
+
+
+def _micro_usd_price(value: object) -> float | None:
+    """Convert one configured micro-USD-per-million-token price to USD.
+
+    Args:
+        value: Integer micro-USD per million tokens published by the endpoint.
+
+    Returns:
+        USD per million tokens, or ``None`` when the value is absent or unusable.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value / 1_000_000
 
 
 def _million_token_price(value: object) -> float | None:
