@@ -487,6 +487,7 @@ class GatewayExecutionStream:
             if self._settled or current.settled:
                 await stream.cancel()
                 raise asyncio.CancelledError
+            self._health.dispatch_opened(binding.health_key)
             current.stream = stream
             current.iterator = stream.__aiter__()
         except BudgetReservationRejected as exc:
@@ -560,9 +561,17 @@ class GatewayExecutionStream:
                 raise
 
     def _initial_candidate(self) -> int | None:
-        """Claim the first currently healthy deployment in authored order."""
+        """Claim the first currently healthy deployment in authored order.
+
+        When every deployment is suppressed, one bounded last-resort probe per
+        deployment may still dispatch so recovery is observed by real traffic
+        instead of waiting out the full circuit cooldown.
+        """
         for route_index in range(len(self._resolved)):
             if self._health.claim(self._health_key(route_index)):
+                return route_index
+        for route_index in range(len(self._resolved)):
+            if self._health.claim_last_resort(self._health_key(route_index)):
                 return route_index
         return None
 
