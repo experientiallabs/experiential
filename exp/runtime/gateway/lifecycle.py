@@ -35,6 +35,7 @@ from exp.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from exp.runtime.gateway.execution import GatewayExecutor
+from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
@@ -72,6 +73,7 @@ class LocalGatewayRuntime:
     runtime: GatewayRuntime
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
+    write_ledger: GroupCommitAttemptLedger | None = None
 
     @property
     def app(self) -> FastAPI:
@@ -101,8 +103,11 @@ class LocalGatewayRuntime:
         return await self.runtime.drain(timeout_seconds=timeout_seconds)
 
     async def shutdown(self) -> bool:
-        """Shut down the shared runtime within its local bound."""
-        return await self.runtime.shutdown()
+        """Shut down the shared runtime, then stop the drained ledger writer."""
+        stopped = await self.runtime.shutdown()
+        if self.write_ledger is not None:
+            self.write_ledger.close()
+        return stopped
 
 
 @dataclass(frozen=True)
@@ -310,7 +315,8 @@ def load_local_gateway(
         RouterProjectTargetResolver(activations, exact_models) if activations else None,
     )
     routes = CatalogRouteResolver(normalized_catalogs, project_resolver=project_resolver)
-    executor = GatewayExecutor(runtime_catalogs, ledger)
+    write_ledger = GroupCommitAttemptLedger(ledger)
+    executor = GatewayExecutor(runtime_catalogs, write_ledger)
     proof = readiness[0]
 
     async def readiness_probe() -> ExecutionSnapshot:
@@ -331,7 +337,7 @@ def load_local_gateway(
             title="EXP local gateway",
         ),
         authority=_ReadyControlStore(store=store, authorities=ready_authorities),
-        ledger=ledger,
+        ledger=write_ledger,
         routes=routes,
         executor=executor,
         clock=SystemGatewayClock(),
@@ -339,9 +345,11 @@ def load_local_gateway(
         usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
         replay=replay,
         continuations=continuations,
+        terminal_flusher=write_ledger.flush,
     )
     return LocalGatewayRuntime(
         runtime=runtime,
+        write_ledger=write_ledger,
         reconciled_expired_requests=expired,
         reconciled_unknown_attempts=unknown,
     )

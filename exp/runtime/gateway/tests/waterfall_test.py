@@ -1147,11 +1147,11 @@ class _WaterfallLedger:
         self.budget_checks: list[str] = []
         self.fail_starts = False
 
-    def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
+    async def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Accept a parent request when a service-level test requires it."""
         del authorization
 
-    def start_attempt(
+    async def start_attempt(
         self,
         *,
         snapshot: ExecutionSnapshot,
@@ -1159,9 +1159,11 @@ class _WaterfallLedger:
         attempt_ordinal: int,
         route_depth: int,
         maximum_cost_micro_usd: int | None = None,
+        route_reason: str | None = None,
+        fallback_reason: str | None = None,
     ) -> str:
         """Record one durable physical dispatch before provider work."""
-        del maximum_cost_micro_usd
+        del maximum_cost_micro_usd, route_reason, fallback_reason
         assert deployment.deployment_id in snapshot.deployment_ids
         self.budget_checks.append(deployment.deployment_id)
         if self.fail_starts:
@@ -1174,17 +1176,7 @@ class _WaterfallLedger:
         self.started.append((deployment.deployment_id, attempt_ordinal, route_depth))
         return f"attempt-{len(self.started)}"
 
-    def record_route_context(
-        self,
-        *,
-        attempt_id: str,
-        route_reason: str | None,
-        fallback_reason: str | None,
-    ) -> None:
-        """Accept display-safe route context for the scripted attempt."""
-        del attempt_id, route_reason, fallback_reason
-
-    def finish_attempt(
+    async def finish_attempt(
         self,
         *,
         attempt_id: str,
@@ -1196,7 +1188,7 @@ class _WaterfallLedger:
         self.finished_events.append(terminal_event)
         self.finished.append((attempt_id, failure, finalize_request))
 
-    def finish_request(
+    async def finish_request(
         self,
         *,
         authorization: AuthorizationSnapshot,

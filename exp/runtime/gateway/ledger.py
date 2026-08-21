@@ -114,6 +114,11 @@ class SQLiteAttemptLedger:
         self._busy_timeout_ms = busy_timeout_ms
         initialize_database(database_path, busy_timeout_ms=busy_timeout_ms)
 
+    @property
+    def busy_timeout_ms(self) -> int:
+        """Return the configured SQLite lock-wait bound."""
+        return self._busy_timeout_ms
+
     def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Persist accepted authority before route selection or dispatch.
 
@@ -124,74 +129,91 @@ class SQLiteAttemptLedger:
             IdempotencyConflictError: The caller operation exists for another request.
             IdempotencyReplayUnavailableError: The matching operation already exists.
         """
+        with self._transaction() as connection:
+            self.apply_accept_request(connection, authorization=authorization)
+
+    def apply_accept_request(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        authorization: AuthorizationSnapshot,
+    ) -> None:
+        """Run the acceptance write inside the caller's open write transaction.
+
+        Args:
+            connection: Open write transaction owned by the caller.
+            authorization: Frozen authority and request identity.
+
+        Raises:
+            IdempotencyConflictError: The caller operation exists for another request.
+            IdempotencyReplayUnavailableError: The matching operation already exists.
+        """
         now = self._clock.now()
         remaining = max(0.0, authorization.deadline_monotonic - self._clock.monotonic())
         deadline_at = now + timedelta(seconds=remaining)
-        with self._transaction() as connection:
-            if authorization.caller_operation_sha256 is not None:
-                prior = connection.execute(
-                    """
-                    SELECT canonical_request_sha256, terminal_state
-                    FROM gateway_requests
-                    WHERE organization_id = ? AND identity_id = ?
-                      AND alias_revision_id = ? AND api_surface = ?
-                      AND caller_operation_sha256 = ?
-                    ORDER BY accepted_at DESC LIMIT 1
-                    """,
-                    (
-                        authorization.organization_id,
-                        authorization.identity_id,
-                        authorization.alias_revision_id,
-                        authorization.surface.value,
-                        authorization.caller_operation_sha256,
-                    ),
-                ).fetchone()
-                if prior is not None:
-                    if str(prior["canonical_request_sha256"]) != (
-                        authorization.canonical_request_sha256
-                    ):
-                        raise IdempotencyConflictError(
-                            "caller operation key was reused with different request content"
-                        )
-                    if str(prior["terminal_state"]) not in {
-                        "expired_before_dispatch",
-                        "unknown_after_crash",
-                    }:
-                        raise IdempotencyReplayUnavailableError(
-                            "matching keyed request exists but durable content replay "
-                            "is unavailable"
-                        )
-            alias_row = connection.execute(
+        if authorization.caller_operation_sha256 is not None:
+            prior = connection.execute(
                 """
-                SELECT alias_id FROM alias_revisions
-                WHERE organization_id = ? AND revision_id = ?
-                """,
-                (authorization.organization_id, authorization.alias_revision_id),
-            ).fetchone()
-            if alias_row is None:
-                raise GatewayLedgerError("authorized alias revision is not present in the ledger")
-            connection.execute(
-                """
-                INSERT INTO gateway_requests (
-                    request_id, organization_id, identity_id, key_id, alias_id,
-                    alias_revision_id, api_surface, canonical_request_sha256,
-                    caller_operation_sha256, accepted_at, deadline_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT canonical_request_sha256, terminal_state
+                FROM gateway_requests
+                WHERE organization_id = ? AND identity_id = ?
+                  AND alias_revision_id = ? AND api_surface = ?
+                  AND caller_operation_sha256 = ?
+                ORDER BY accepted_at DESC LIMIT 1
                 """,
                 (
-                    authorization.request_id,
                     authorization.organization_id,
                     authorization.identity_id,
-                    authorization.virtual_key_id,
-                    str(alias_row["alias_id"]),
                     authorization.alias_revision_id,
                     authorization.surface.value,
-                    authorization.canonical_request_sha256,
                     authorization.caller_operation_sha256,
-                    utc_text(now),
-                    utc_text(deadline_at),
                 ),
-            )
+            ).fetchone()
+            if prior is not None:
+                if str(prior["canonical_request_sha256"]) != (
+                    authorization.canonical_request_sha256
+                ):
+                    raise IdempotencyConflictError(
+                        "caller operation key was reused with different request content"
+                    )
+                if str(prior["terminal_state"]) not in {
+                    "expired_before_dispatch",
+                    "unknown_after_crash",
+                }:
+                    raise IdempotencyReplayUnavailableError(
+                        "matching keyed request exists but durable content replay is unavailable"
+                    )
+        alias_row = connection.execute(
+            """
+            SELECT alias_id FROM alias_revisions
+            WHERE organization_id = ? AND revision_id = ?
+            """,
+            (authorization.organization_id, authorization.alias_revision_id),
+        ).fetchone()
+        if alias_row is None:
+            raise GatewayLedgerError("authorized alias revision is not present in the ledger")
+        connection.execute(
+            """
+            INSERT INTO gateway_requests (
+                request_id, organization_id, identity_id, key_id, alias_id,
+                alias_revision_id, api_surface, canonical_request_sha256,
+                caller_operation_sha256, accepted_at, deadline_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                authorization.request_id,
+                authorization.organization_id,
+                authorization.identity_id,
+                authorization.virtual_key_id,
+                str(alias_row["alias_id"]),
+                authorization.alias_revision_id,
+                authorization.surface.value,
+                authorization.canonical_request_sha256,
+                authorization.caller_operation_sha256,
+                utc_text(now),
+                utc_text(deadline_at),
+            ),
+        )
 
     def start_attempt(
         self,
@@ -201,6 +223,8 @@ class SQLiteAttemptLedger:
         attempt_ordinal: int,
         route_depth: int,
         maximum_cost_micro_usd: int | None = None,
+        route_reason: str | None = None,
+        fallback_reason: str | None = None,
     ) -> AttemptId:
         """Durably mark a provider dispatch before starting network work.
 
@@ -210,10 +234,54 @@ class SQLiteAttemptLedger:
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
             maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            route_reason: Optional learned-selection reason code.
+            fallback_reason: Optional embedding or router fallback reason code.
 
         Returns:
             Stable new attempt ID.
         """
+        with self._transaction() as connection:
+            return self.apply_start_attempt(
+                connection,
+                snapshot=snapshot,
+                deployment=deployment,
+                attempt_ordinal=attempt_ordinal,
+                route_depth=route_depth,
+                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                route_reason=route_reason,
+                fallback_reason=fallback_reason,
+            )
+
+    def apply_start_attempt(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        snapshot: ExecutionSnapshot,
+        deployment: ExactModelDeployment,
+        attempt_ordinal: int,
+        route_depth: int,
+        maximum_cost_micro_usd: int | None = None,
+        route_reason: str | None = None,
+        fallback_reason: str | None = None,
+    ) -> AttemptId:
+        """Run the dispatch reservation inside the caller's open write transaction.
+
+        Args:
+            connection: Open write transaction owned by the caller.
+            snapshot: Route-bound immutable request plan.
+            deployment: Exact deployment about to receive the request.
+            attempt_ordinal: Zero-based physical dispatch position for this request.
+            route_depth: Zero-based operational route position.
+            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            route_reason: Optional learned-selection reason code.
+            fallback_reason: Optional embedding or router fallback reason code.
+
+        Returns:
+            Stable new attempt ID.
+        """
+        for value in (route_reason, fallback_reason):
+            if value is not None and (len(value) > 512 or any(ord(char) < 32 for char in value)):
+                raise GatewayLedgerError("route context must be a short display-safe code")
         if deployment.deployment_id not in snapshot.deployment_ids:
             raise GatewayLedgerError("attempt deployment is absent from the execution snapshot")
         if deployment.exact_model_id != snapshot.exact_model_id:
@@ -226,101 +294,76 @@ class SQLiteAttemptLedger:
         prices = deployment.gateway.prices
         now = self._clock.now()
         period_start = budget_period_start(current_budget_period(now))
-        with self._transaction() as connection:
-            request = connection.execute(
-                """
-                SELECT organization_id, identity_id, alias_id, terminal_state
-                FROM gateway_requests
-                WHERE request_id = ?
-                """,
-                (snapshot.authorization.request_id,),
-            ).fetchone()
-            if request is None:
-                raise GatewayLedgerError("attempt request was not durably accepted")
-            if str(request["organization_id"]) != snapshot.authorization.organization_id:
-                raise GatewayLedgerError("attempt authority differs from accepted request")
-            if request["terminal_state"] is not None:
-                raise GatewayLedgerError("attempt request is already terminal")
-            connection.execute(
-                """
-                INSERT INTO gateway_attempts (
-                    attempt_id, request_id, organization_id, attempt_ordinal, route_depth,
-                    deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
-                    billing_source,
-                    pricing_source, pricing_effective_at,
-                    input_rate, cached_input_rate, output_rate, reasoning_rate,
-                    state, started_at, budget_period_start, budget_reserved_micro_usd
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?
-                )
-                """,
+        request = connection.execute(
+            """
+            SELECT organization_id, identity_id, alias_id, terminal_state
+            FROM gateway_requests
+            WHERE request_id = ?
+            """,
+            (snapshot.authorization.request_id,),
+        ).fetchone()
+        if request is None:
+            raise GatewayLedgerError("attempt request was not durably accepted")
+        if str(request["organization_id"]) != snapshot.authorization.organization_id:
+            raise GatewayLedgerError("attempt authority differs from accepted request")
+        if request["terminal_state"] is not None:
+            raise GatewayLedgerError("attempt request is already terminal")
+        connection.execute(
+            """
+            INSERT INTO gateway_attempts (
+                attempt_id, request_id, organization_id, attempt_ordinal, route_depth,
+                deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
+                billing_source,
+                pricing_source, pricing_effective_at,
+                input_rate, cached_input_rate, output_rate, reasoning_rate,
+                route_reason, fallback_reason,
+                state, started_at, budget_period_start, budget_reserved_micro_usd
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                'dispatched', ?, ?, ?
+            )
+            """,
+            (
+                attempt_id,
+                snapshot.authorization.request_id,
+                snapshot.authorization.organization_id,
+                attempt_ordinal,
+                route_depth,
+                deployment.deployment_id,
+                deployment.provider,
+                snapshot.exact_model_id,
+                snapshot.pool_id,
+                snapshot.authorization.catalog_sha256,
+                deployment.billing_source.value,
+                deployment.gateway.pricing_source,
                 (
-                    attempt_id,
-                    snapshot.authorization.request_id,
-                    snapshot.authorization.organization_id,
-                    attempt_ordinal,
-                    route_depth,
-                    deployment.deployment_id,
-                    deployment.provider,
-                    snapshot.exact_model_id,
-                    snapshot.pool_id,
-                    snapshot.authorization.catalog_sha256,
-                    deployment.billing_source.value,
-                    deployment.gateway.pricing_source,
-                    (
-                        None
-                        if deployment.gateway.pricing_effective_at is None
-                        else utc_text(deployment.gateway.pricing_effective_at)
-                    ),
-                    prices.input_micro_usd_per_million_tokens,
-                    prices.cached_input_micro_usd_per_million_tokens,
-                    prices.output_micro_usd_per_million_tokens,
-                    prices.reasoning_micro_usd_per_million_tokens,
-                    utc_text(now),
-                    period_start,
-                    maximum_cost_micro_usd,
+                    None
+                    if deployment.gateway.pricing_effective_at is None
+                    else utc_text(deployment.gateway.pricing_effective_at)
                 ),
-            )
-            require_attempt_budget(
-                connection,
-                organization_id=snapshot.authorization.organization_id,
-                identity_id=str(request["identity_id"]),
-                alias_id=str(request["alias_id"]),
-                pool_id=snapshot.pool_id,
-                deployment_id=deployment.deployment_id,
-                attempt_id=attempt_id,
-                period_start=period_start,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
-            )
+                prices.input_micro_usd_per_million_tokens,
+                prices.cached_input_micro_usd_per_million_tokens,
+                prices.output_micro_usd_per_million_tokens,
+                prices.reasoning_micro_usd_per_million_tokens,
+                route_reason,
+                fallback_reason,
+                utc_text(now),
+                period_start,
+                maximum_cost_micro_usd,
+            ),
+        )
+        require_attempt_budget(
+            connection,
+            organization_id=snapshot.authorization.organization_id,
+            identity_id=str(request["identity_id"]),
+            alias_id=str(request["alias_id"]),
+            pool_id=snapshot.pool_id,
+            deployment_id=deployment.deployment_id,
+            attempt_id=attempt_id,
+            period_start=period_start,
+            maximum_cost_micro_usd=maximum_cost_micro_usd,
+        )
         return attempt_id
-
-    def record_route_context(
-        self,
-        *,
-        attempt_id: AttemptId,
-        route_reason: str | None,
-        fallback_reason: str | None,
-    ) -> None:
-        """Attach display-safe learned-route context without request content.
-
-        Args:
-            attempt_id: Stable dispatched attempt ID.
-            route_reason: Optional learned-selection reason code.
-            fallback_reason: Optional embedding or router fallback reason code.
-        """
-        for value in (route_reason, fallback_reason):
-            if value is not None and (len(value) > 512 or any(ord(char) < 32 for char in value)):
-                raise GatewayLedgerError("route context must be a short display-safe code")
-        with self._transaction() as connection:
-            result = connection.execute(
-                """
-                UPDATE gateway_attempts SET route_reason = ?, fallback_reason = ?
-                WHERE attempt_id = ? AND state = 'dispatched'
-                """,
-                (route_reason, fallback_reason, attempt_id),
-            )
-            if result.rowcount != 1:
-                raise GatewayLedgerError("route context requires a dispatched attempt")
 
     def finish_attempt(
         self,
@@ -338,72 +381,98 @@ class SQLiteAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
         """
-        state, normalized_failure, usage = _terminal_values(terminal_event, failure)
         with self._transaction() as connection:
-            row = connection.execute(
-                """
-                SELECT request_id, state, input_rate, cached_input_rate,
-                       output_rate, reasoning_rate, budget_reserved_micro_usd
-                FROM gateway_attempts WHERE attempt_id = ?
-                """,
-                (attempt_id,),
-            ).fetchone()
-            if row is None:
-                raise GatewayLedgerError("attempt does not exist")
-            current_state = str(row["state"])
-            if current_state != "dispatched":
-                if current_state == state:
-                    return
-                raise GatewayLedgerError("attempt is already settled with another terminal state")
-            cost = _estimated_cost(
-                usage,
-                input_rate=_optional_int(row["input_rate"]),
-                cached_input_rate=_optional_int(row["cached_input_rate"]),
-                output_rate=_optional_int(row["output_rate"]),
-                reasoning_rate=_optional_int(row["reasoning_rate"]),
-            )
-            budget_settlement = (
-                cost if cost is not None else _optional_int(row["budget_reserved_micro_usd"])
-            )
-            if budget_settlement is not None and budget_settlement > MAXIMUM_MICRO_USD:
-                raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
-            terminal_at = utc_text(self._clock.now())
-            connection.execute(
-                """
-                UPDATE gateway_attempts
-                SET state = ?, terminal_at = ?, failure_class = ?,
-                    input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
-                    reasoning_tokens = ?, usage_source = ?, estimated_cost_micro_usd = ?,
-                    budget_settled_micro_usd = ?
-                WHERE attempt_id = ? AND state = 'dispatched'
-                """,
-                (
-                    state,
-                    terminal_at,
-                    normalized_failure,
-                    None if usage is None else usage.input_tokens,
-                    None if usage is None else usage.cached_input_tokens,
-                    None if usage is None else usage.output_tokens,
-                    None if usage is None else usage.reasoning_tokens,
-                    "unknown" if usage is None else "observed",
-                    cost,
-                    budget_settlement,
-                    attempt_id,
-                ),
-            )
-            settle_attempt_budgets(
+            self.apply_finish_attempt(
                 connection,
                 attempt_id=attempt_id,
-                settled_micro_usd=budget_settlement,
+                terminal_event=terminal_event,
+                failure=failure,
+                finalize_request=finalize_request,
             )
-            if finalize_request and state in {"completed", "failed", "cancelled", "incomplete"}:
-                connection.execute(
-                    """
-                    UPDATE gateway_requests SET terminal_state = ?, terminal_at = ?
-                    WHERE request_id = ? AND terminal_state IS NULL
-                    """,
-                    (state, terminal_at, str(row["request_id"])),
-                )
+
+    def apply_finish_attempt(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        attempt_id: AttemptId,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+    ) -> None:
+        """Run the attempt settlement inside the caller's open write transaction.
+
+        Args:
+            connection: Open write transaction owned by the caller.
+            attempt_id: Stable attempt ID.
+            terminal_event: Provider terminal event, possibly carrying usage.
+            failure: Sanitized failure when no successful terminal event exists.
+            finalize_request: Whether this attempt is the final route for its parent request.
+        """
+        state, normalized_failure, usage = _terminal_values(terminal_event, failure)
+        row = connection.execute(
+            """
+            SELECT request_id, state, input_rate, cached_input_rate,
+                   output_rate, reasoning_rate, budget_reserved_micro_usd
+            FROM gateway_attempts WHERE attempt_id = ?
+            """,
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise GatewayLedgerError("attempt does not exist")
+        current_state = str(row["state"])
+        if current_state != "dispatched":
+            if current_state == state:
+                return
+            raise GatewayLedgerError("attempt is already settled with another terminal state")
+        cost = _estimated_cost(
+            usage,
+            input_rate=_optional_int(row["input_rate"]),
+            cached_input_rate=_optional_int(row["cached_input_rate"]),
+            output_rate=_optional_int(row["output_rate"]),
+            reasoning_rate=_optional_int(row["reasoning_rate"]),
+        )
+        budget_settlement = (
+            cost if cost is not None else _optional_int(row["budget_reserved_micro_usd"])
+        )
+        if budget_settlement is not None and budget_settlement > MAXIMUM_MICRO_USD:
+            raise GatewayLedgerError("attempt cost exceeds SQLite integer capacity")
+        terminal_at = utc_text(self._clock.now())
+        connection.execute(
+            """
+            UPDATE gateway_attempts
+            SET state = ?, terminal_at = ?, failure_class = ?,
+                input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
+                reasoning_tokens = ?, usage_source = ?, estimated_cost_micro_usd = ?,
+                budget_settled_micro_usd = ?
+            WHERE attempt_id = ? AND state = 'dispatched'
+            """,
+            (
+                state,
+                terminal_at,
+                normalized_failure,
+                None if usage is None else usage.input_tokens,
+                None if usage is None else usage.cached_input_tokens,
+                None if usage is None else usage.output_tokens,
+                None if usage is None else usage.reasoning_tokens,
+                "unknown" if usage is None else "observed",
+                cost,
+                budget_settlement,
+                attempt_id,
+            ),
+        )
+        settle_attempt_budgets(
+            connection,
+            attempt_id=attempt_id,
+            settled_micro_usd=budget_settlement,
+        )
+        if finalize_request and state in {"completed", "failed", "cancelled", "incomplete"}:
+            connection.execute(
+                """
+                UPDATE gateway_requests SET terminal_state = ?, terminal_at = ?
+                WHERE request_id = ? AND terminal_state IS NULL
+                """,
+                (state, terminal_at, str(row["request_id"])),
+            )
 
     def finish_request(
         self,
@@ -417,32 +486,48 @@ class SQLiteAttemptLedger:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
         """
+        with self._transaction() as connection:
+            self.apply_finish_request(connection, authorization=authorization, failure=failure)
+
+    def apply_finish_request(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+    ) -> None:
+        """Run the pre-dispatch settlement inside the caller's open write transaction.
+
+        Args:
+            connection: Open write transaction owned by the caller.
+            authorization: Frozen authority identifying the accepted request.
+            failure: Sanitized pre-dispatch terminal failure.
+        """
         state, normalized_failure, _ = _terminal_values(None, failure)
         del normalized_failure
-        with self._transaction() as connection:
-            row = connection.execute(
-                """
-                SELECT organization_id, terminal_state FROM gateway_requests
-                WHERE request_id = ?
-                """,
-                (authorization.request_id,),
-            ).fetchone()
-            if row is None:
-                raise GatewayLedgerError("request was not durably accepted")
-            if str(row["organization_id"]) != authorization.organization_id:
-                raise GatewayLedgerError("request authority differs from accepted request")
-            current = row["terminal_state"]
-            if current is not None:
-                if str(current) == state:
-                    return
-                raise GatewayLedgerError("request is already settled with another terminal state")
-            connection.execute(
-                """
-                UPDATE gateway_requests SET terminal_state = ?, terminal_at = ?
-                WHERE request_id = ? AND terminal_state IS NULL
-                """,
-                (state, utc_text(self._clock.now()), authorization.request_id),
-            )
+        row = connection.execute(
+            """
+            SELECT organization_id, terminal_state FROM gateway_requests
+            WHERE request_id = ?
+            """,
+            (authorization.request_id,),
+        ).fetchone()
+        if row is None:
+            raise GatewayLedgerError("request was not durably accepted")
+        if str(row["organization_id"]) != authorization.organization_id:
+            raise GatewayLedgerError("request authority differs from accepted request")
+        current = row["terminal_state"]
+        if current is not None:
+            if str(current) == state:
+                return
+            raise GatewayLedgerError("request is already settled with another terminal state")
+        connection.execute(
+            """
+            UPDATE gateway_requests SET terminal_state = ?, terminal_at = ?
+            WHERE request_id = ? AND terminal_state IS NULL
+            """,
+            (state, utc_text(self._clock.now()), authorization.request_id),
+        )
 
     def reconcile_crashed_requests(self, *, cleanup_grace: timedelta) -> tuple[int, int]:
         """Settle expired pre-dispatch and dispatched work after a crash.

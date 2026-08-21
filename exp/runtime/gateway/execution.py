@@ -388,7 +388,7 @@ class GatewayExecutionStream:
                 current.tool_names,
             )
             try:
-                self._ledger.finish_attempt(
+                await self._ledger.finish_attempt(
                     attempt_id=current.attempt_id,
                     terminal_event=terminal,
                     failure=failure,
@@ -456,7 +456,7 @@ class GatewayExecutionStream:
         attempt_id: str | None = None
         try:
             self._deadline.attempt_timeout()
-            attempt_id = self._ledger.start_attempt(
+            attempt_id = await self._ledger.start_attempt(
                 snapshot=self._route.snapshot,
                 deployment=binding.deployment,
                 attempt_ordinal=self._total_attempts,
@@ -465,14 +465,11 @@ class GatewayExecutionStream:
                     self._request,
                     binding.deployment,
                 ),
-            )
-            self._attempt_counts[route_index] += 1
-            self._total_attempts += 1
-            self._ledger.record_route_context(
-                attempt_id=attempt_id,
                 route_reason=self._route.route_reason,
                 fallback_reason=self._route.fallback_reason,
             )
+            self._attempt_counts[route_index] += 1
+            self._total_attempts += 1
             current = _PhysicalAttempt(
                 route_index=route_index,
                 attempt_id=attempt_id,
@@ -519,7 +516,7 @@ class GatewayExecutionStream:
     ) -> None:
         """Settle one provider opening failure before another physical dispatch."""
         try:
-            self._ledger.finish_attempt(
+            await self._ledger.finish_attempt(
                 attempt_id=dispatch_failure.attempt_id,
                 terminal_event=None,
                 failure=dispatch_failure.failure,
@@ -547,7 +544,7 @@ class GatewayExecutionStream:
             if current.settled:
                 return
             try:
-                self._ledger.finish_attempt(
+                await self._ledger.finish_attempt(
                     attempt_id=current.attempt_id,
                     terminal_event=terminal,
                     failure=failure,
@@ -666,7 +663,7 @@ class GatewayExecutionStream:
         if self._parent_finalized:
             return
         try:
-            self._ledger.finish_request(
+            await self._ledger.finish_request(
                 authorization=self._route.snapshot.authorization,
                 failure=failure,
             )

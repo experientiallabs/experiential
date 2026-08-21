@@ -56,13 +56,18 @@ class SecretResolver(Protocol):
 
 
 class AttemptLedger(Protocol):
-    """Content-free persistence seam for request and provider-attempt accounting."""
+    """Content-free persistence seam for request and provider-attempt accounting.
 
-    def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
+    Every method resolves only after its write is durable, so callers keep
+    write-through semantics regardless of how an implementation batches or
+    schedules the underlying commits.
+    """
+
+    async def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Persist one accepted request before selection or provider dispatch."""
         ...
 
-    def start_attempt(
+    async def start_attempt(
         self,
         *,
         snapshot: ExecutionSnapshot,
@@ -70,11 +75,13 @@ class AttemptLedger(Protocol):
         attempt_ordinal: int,
         route_depth: int,
         maximum_cost_micro_usd: int | None = None,
+        route_reason: str | None = None,
+        fallback_reason: str | None = None,
     ) -> AttemptId:
         """Atomically reserve cost and persist one attempt before provider dispatch."""
         ...
 
-    def finish_attempt(
+    async def finish_attempt(
         self,
         *,
         attempt_id: AttemptId,
@@ -85,23 +92,13 @@ class AttemptLedger(Protocol):
         """Settle one physical attempt and optionally finalize its parent request."""
         ...
 
-    def finish_request(
+    async def finish_request(
         self,
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
     ) -> None:
         """Terminalize accepted work that failed before a provider dispatch existed."""
-        ...
-
-    def record_route_context(
-        self,
-        *,
-        attempt_id: AttemptId,
-        route_reason: str | None,
-        fallback_reason: str | None,
-    ) -> None:
-        """Attach display-safe selection context to one dispatched attempt."""
         ...
 
 

@@ -322,7 +322,7 @@ class GatewayService:
             return _cached_response(await lease.result())
         accepted = False
         try:
-            self._ledger.accept_request(authorization=authorization)
+            await self._ledger.accept_request(authorization=authorization)
             accepted = True
             route = await self._routes.resolve(
                 authorization=authorization,
@@ -333,7 +333,7 @@ class GatewayService:
         except BaseException as exc:
             request_finalized = isinstance(exc, GatewayExecutionError) and exc.request_finalized
             if accepted and not request_finalized:
-                _finish_request_quietly(
+                await _finish_request_quietly(
                     self._ledger,
                     authorization=authorization,
                     failure=_failure_for_exception(exc),
@@ -956,7 +956,7 @@ def _failure_for_exception(exception: BaseException) -> GatewayFailure:
     return normalized_provider_failure(exception)
 
 
-def _finish_request_quietly(
+async def _finish_request_quietly(
     ledger: AttemptLedger,
     *,
     authorization: AuthorizationSnapshot,
@@ -965,7 +965,7 @@ def _finish_request_quietly(
 ) -> None:
     """Attempt durable pre-dispatch finalization without masking the primary failure."""
     try:
-        ledger.finish_request(authorization=authorization, failure=failure)
+        await ledger.finish_request(authorization=authorization, failure=failure)
     except BaseException:  # noqa: BLE001 - primary request failure remains authoritative
         accounting_failure()
         return
