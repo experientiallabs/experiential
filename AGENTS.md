@@ -30,13 +30,15 @@ uv run pytest -q
   may not import optimize or cli; optimize may not import cli. Optimize owns application
   orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
   every current forbidden edge directly and proves that the package graph is acyclic.
-- The root CLI command set is exact: `build`, `config`, `optimize`, and `run`;
-  `exp/cli/app_test.py` and the release tests enforce the current command and distribution shape.
+- The root CLI command set is exact: `build`, `config`, and `optimize`. An invocation without a
+  subcommand opens the default gateway home screen. `exp/cli/app_test.py` and the release tests
+  enforce the current command and distribution shape.
 
 ## CLI package ownership
 
 - `exp/cli/app.py` owns root command composition only. Command implementations live in the
-  `build/`, `config/`, `judge/`, `optimize/`, `run/`, and `gateway/` packages.
+  `build/`, `config/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
+  default home screen live under `gateway/`.
 - `exp/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
   commands. Command-specific orchestration stays with its command package. In particular,
   router-candidate collection belongs to `exp/cli/optimize/`.
@@ -73,9 +75,10 @@ uv run pytest -q
   World-model fidelity testing is a separately invoked common-evaluation mode with no authority
   over router fitting or runtime activation. Its reports contain measurements only and never carry
   an approval, denial, gate, threshold, or decision.
-- `exp run` starts the initialized authenticated multi-alias gateway on loopback.
-  `exp run PROJECT --root ROOT --port PORT [--ghost]` retains the single-project compatibility
-  server. Both expose OpenAI Chat Completions, Responses, and Models routes. Public request and
+- `exp` opens the branded home screen. Its `Default Gateway` choice starts the initialized
+  authenticated multi-alias gateway on loopback, while `exp --project PROJECT --root ROOT --port
+  PORT [--ghost]` retains the single-project compatibility server. Both expose OpenAI Chat
+  Completions, Responses, and Models routes. Public request and
   response types come
   from the official OpenAI SDK. Chat retries use the standard `Idempotency-Key`; Responses
   continuations use `previous_response_id`. Experiential never joins unrelated Chat callers by transcript
@@ -88,8 +91,8 @@ uv run pytest -q
 - Agent execution code lives under `exp/runtime/`: whole-episode customer agents, executable
   environments, model clients, and frozen router execution. Optimization may depend on runtime;
   runtime code must not depend on simulation or optimization algorithms.
-- No-argument `exp run` serves only explicit active gateway aliases. The legacy project form serves
-  one frozen router policy. Simulation callers choose an `AgentRuntime` and `EnvironmentRuntime`
+- No-subcommand `exp` serves only explicit active gateway aliases. The `--project` form serves one
+  frozen router policy. Simulation callers choose an `AgentRuntime` and `EnvironmentRuntime`
   directly, in process.
 - Local Pi and process-environment adapters execute external code on the user's machine only when
   a caller explicitly selects them. Preserve bounded processes, the explicit working directory,
@@ -116,7 +119,7 @@ uv run pytest -q
   orchestration lives in `automatic/`, manual judge calibration in `judging/`, offline policy work
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
-- The root CLI is locked to `build`, `optimize`, `run`, and `config`. The optimize group is locked
+- The root CLI is locked to `build`, `optimize`, and `config`. The optimize group is locked
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
@@ -246,7 +249,8 @@ uv run pytest -q
    writeup → `docs/research/`, verified how-to → `docs/reference/`, reusable code → `exp/`.
 
 6. **Benchmark data is external input, not a repository directory.** Give `exp build` one explicit
-   local OTLP or PostHog export, then use only the locked `config`, `optimize`, and `run` surfaces
+   local OTLP or PostHog export, then use only the locked `config` and `optimize` surfaces plus the
+   default gateway home screen
    for persisted project artifacts. Do not vendor benchmark data, gold dirs, or capture scripts.
 
 7. **Give reusable workflows a clear owner.** A workflow has exactly one home, inside `exp/`.

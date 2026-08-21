@@ -11,10 +11,14 @@ import typer
 from rich.console import Console
 from rich.text import Text
 
-from exp.cli.shared.options import ROOT_OPTION, usage_error
+from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
 
-_LOOPBACK_HOST = "127.0.0.1"
+LOOPBACK_HOST = "127.0.0.1"
+_LOOPBACK_HOST = LOOPBACK_HOST
+DEFAULT_GATEWAY_PORT = 8000
+DEFAULT_GRACEFUL_TIMEOUT_SECONDS = 10.0
+DEFAULT_MAX_ACTIVE_REQUESTS = 1024
 _console = Console(theme=EXP_THEME)
 _EXP_WORDMARK = "\n".join(
     (
@@ -26,70 +30,29 @@ _EXP_WORDMARK = "\n".join(
         "╚══════╝╚═╝  ╚═╝╚═╝     ",
     )
 )
-_POLICY_OPTION = typer.Option(
-    None,
-    "--policy",
-    help="Exact frozen policy ID for the optional project-backed alias.",
-)
-_PORT_OPTION = typer.Option(8000, "--port", min=1, max=65_535)
-_GHOST_OPTION = typer.Option(
-    False,
-    "--ghost",
-    help="Compatibility flag: project journals stay disabled while gateway accounting remains on.",
-)
-_NON_INTERACTIVE_OPTION = typer.Option(
-    False,
-    "--non-interactive",
-    help="Never open first-run prompts.",
-)
-_JSON_OPTION = typer.Option(False, "--json", help="Write a versioned launch receipt.")
-_CHECK_OPTION = typer.Option(False, "--check", help="Validate readiness and exit without binding.")
-_GRACEFUL_TIMEOUT_OPTION = typer.Option(
-    10.0,
-    "--graceful-timeout",
-    min=0.1,
-    help="Seconds to drain admitted gateway work during shutdown.",
-)
-_ENGINE_OPTION = typer.Option(
-    "auto",
-    "--engine",
-    help=(
-        "Data-plane engine: 'auto' (rust when built, otherwise python), 'rust' "
-        "(native data plane with an embedded python engine for Responses, "
-        "replay, and project aliases), or 'python' (uvicorn only)."
-    ),
-)
-_MAX_ACTIVE_REQUESTS_DEFAULT = 1024
-_MAX_ACTIVE_REQUESTS_OPTION = typer.Option(
-    _MAX_ACTIVE_REQUESTS_DEFAULT,
-    "--max-active-requests",
-    min=1,
-    help="Rust engine only: maximum concurrently admitted requests.",
-)
+_MAX_ACTIVE_REQUESTS_DEFAULT = DEFAULT_MAX_ACTIVE_REQUESTS
 
 
-def run(
-    project: str | None = typer.Argument(
-        None,
-        help="Optional project to expose as one project-backed gateway alias.",
-    ),
-    root: Path = ROOT_OPTION,
-    policy: str | None = _POLICY_OPTION,
-    port: int = _PORT_OPTION,
-    ghost: bool = _GHOST_OPTION,
-    non_interactive: bool = _NON_INTERACTIVE_OPTION,
-    json_output: bool = _JSON_OPTION,
-    check: bool = _CHECK_OPTION,
-    graceful_timeout: float = _GRACEFUL_TIMEOUT_OPTION,
-    engine: str = _ENGINE_OPTION,
-    max_active_requests: int = _MAX_ACTIVE_REQUESTS_OPTION,
+def start_gateway(
+    *,
+    project: str | None = None,
+    root: Path,
+    policy: str | None = None,
+    port: int = DEFAULT_GATEWAY_PORT,
+    ghost: bool = False,
+    non_interactive: bool = False,
+    json_output: bool = False,
+    check: bool = False,
+    graceful_timeout: float = DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
+    engine: str = "auto",
+    max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS,
 ) -> None:
     """Start the local gateway, optionally materializing one project-backed alias.
 
     Args:
         project: Optional project identifier and endpoint alias.
         root: Local artifact and model-catalog root.
-        policy: Exact policy for an ambiguous legacy project.
+        policy: Exact policy for an ambiguous project.
         port: Local loopback TCP port.
         ghost: Compatibility marker for project traffic, which always uses gateway accounting.
         non_interactive: Whether first-run gateway prompts are forbidden.
@@ -100,13 +63,13 @@ def run(
         max_active_requests: Rust engine concurrent-admission bound.
 
     Raises:
-        typer.BadParameter: The selected form or activation is invalid.
+        typer.BadParameter: The selected project form or activation is invalid.
     """
     if engine not in {"auto", "rust", "python"}:
         raise typer.BadParameter("--engine must be 'auto', 'rust', or 'python'")
     if policy is not None or ghost:
         if project is None:
-            raise typer.BadParameter("--policy and --ghost require the 'exp run PROJECT' form")
+            raise typer.BadParameter("--policy and --ghost require --project")
     if engine == "rust" and project is not None:
         raise typer.BadParameter(
             "--engine rust serves direct aliases only; project-backed serving "
@@ -401,7 +364,7 @@ def _run_rust_gateway(
                 if not fallback_thread.is_alive() or time.monotonic() > deadline:
                     raise typer.BadParameter(
                         "the embedded python fallback engine failed to start; "
-                        "inspect the gateway configuration with 'exp run --engine python'"
+                        "inspect the gateway configuration with 'exp --engine python'"
                     )
                 time.sleep(0.05)
             try:
@@ -463,12 +426,18 @@ def _gateway_not_initialized(*, json_output: bool) -> None:
     raise typer.Exit(2)
 
 
-def _emit_setup_credentials(*, port: int, setup: object) -> None:
+def _emit_setup_credentials(
+    *,
+    port: int,
+    setup: object,
+    console: Console | None = None,
+) -> None:
     """Deliver first-run gateway credentials before independent readiness checks run.
 
     Args:
         port: Loopback port that the gateway will serve when ready.
         setup: First-run setup result containing the one-time raw gateway key.
+        console: Optional console receiving the credentials.
 
     Raises:
         TypeError: The setup result is not the gateway setup contract.
@@ -477,8 +446,20 @@ def _emit_setup_credentials(*, port: int, setup: object) -> None:
 
     if not isinstance(setup, InteractiveSetupResult):
         raise TypeError("interactive setup returned an invalid result")
-    _console.print(f"export EXP_GATEWAY_URL=http://{_LOOPBACK_HOST}:{port}/v1", markup=False)
-    _console.print(f"export EXP_GATEWAY_KEY={setup.raw_key}", markup=False)
+    output = console or _console
+    output.print(f"export EXP_GATEWAY_URL=http://{_LOOPBACK_HOST}:{port}/v1", markup=False)
+    output.print(f"export EXP_GATEWAY_KEY={setup.raw_key}", markup=False)
+
+
+def emit_setup_credentials(*, port: int, setup: object, console: Console | None = None) -> None:
+    """Print the one-time credentials created by interactive gateway setup.
+
+    Args:
+        port: Loopback port used by the gateway.
+        setup: Result returned by the first-run setup flow.
+        console: Optional console receiving the user-facing exports.
+    """
+    _emit_setup_credentials(port=port, setup=setup, console=console)
 
 
 def _emit_setup_recovery(*, setup: object) -> None:
@@ -500,7 +481,7 @@ def _emit_setup_recovery(*, setup: object) -> None:
     )
     _console.print(
         "Keep the gateway credentials printed above, fix the listed provider configuration, "
-        "and rerun `exp run`.",
+        "and rerun `exp`.",
         markup=False,
     )
     _console.print(

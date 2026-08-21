@@ -4,12 +4,12 @@ The root surface is deliberately small:
 
 | Command | Purpose | Local result |
 |---|---|---|
-| `exp` | Shortcut for `exp run`; use `exp --help` or `exp help` for root CLI help. | Start the authenticated gateway on loopback. |
+| `exp` | Open the branded home screen. `Default Gateway` is the recommended setup-and-start path. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
-| `exp run --root ROOT [--check] [--engine auto\|rust\|python]` | Validate or start the initialized authenticated gateway on loopback; the default engine is the native data plane when built, with the python engine embedded for Responses, replay, and project aliases. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
-| `exp run PROJECT --root ROOT [--ghost]` | Activate a frozen policy as one project-backed alias and launch the normal gateway. | The same authenticated OpenAI endpoint and SQLite accounting as no-argument `exp run`. |
+| `exp --root ROOT [--check] [--engine auto\|rust\|python]` | Validate or start the initialized authenticated default gateway on loopback; the default engine is the native data plane when built, with the python engine embedded for Responses, replay, and project aliases. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
+| `exp --project PROJECT --root ROOT [--ghost]` | Activate a frozen policy as one project-backed alias and launch the normal gateway. | The same authenticated OpenAI endpoint and SQLite accounting as the default gateway. |
 | `exp config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, certified exact-model pools, monthly limits, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
 | `exp config gateway call ALIAS PROMPT [--json]` | Send one chat completion to a live gateway as a caller, streaming text to stdout. | One HTTP request against the running gateway; no local state. |
 | `exp config gateway models [--json]` | List the aliases a live gateway grants to the presented key (caller view of `GET /v1/models`). | One HTTP request against the running gateway; no local state. |
@@ -27,7 +27,7 @@ credentials or provider clients when no terminal is available. Set the determini
 the ceiling. Exact completed replays report a zero-dollar estimate and do not prompt.
 
 Successful build, router, simulation, and SFT operations preserve anonymous aggregate PostHog
-product telemetry, which may send unless disabled. `run` makes no provider call at startup.
+product telemetry, which may send unless disabled. Gateway startup makes no provider call.
 `build --dry-run` and exact completed-build replay make zero paid provider calls. A new grounded
 build calls only the configured embedder; automatic router optimization separately executes the
 bounded candidate, world-model, and judge schedule shown in its cost preflight.
@@ -36,16 +36,16 @@ remain frozen for the process lifetime and return only an exact model pool. `--g
 compatibility flag for project-journal behavior; gateway authentication, replay, attempts, and
 usage accounting stay enabled.
 
-Bare `exp` and both `exp run` forms use one gateway lifecycle. It binds only `127.0.0.1`, starts with no
+The default and project gateway forms use one gateway lifecycle. It binds only `127.0.0.1`, starts with no
 provider call, and requires an explicit provider environment reference, exact model alias, identity,
 grant, and a virtual key. Interactive first-run setup can persist multiple provider connections and
 creates one initial gateway alias; additional deployments and certified pools remain explicit
-gateway configuration. `exp run --non-interactive --json` returns `gateway_not_initialized` plus
-exact next commands on an empty root. `exp run --check` validates local readiness without binding.
+gateway configuration. `exp --non-interactive --json` returns `gateway_not_initialized` plus exact
+next commands on an empty root. `exp --check` validates local readiness without binding.
 First-run setup prints `EXP_GATEWAY_URL` and the newly issued `EXP_GATEWAY_KEY` before readiness is
 checked, so the credentials remain available even when a provider route is not ready. The gateway-
 specific variables avoid overwriting an upstream provider's `OPENAI_API_KEY`. The error names the
-unavailable alias and provider configuration; fix that configuration and rerun `exp run`. If the
+unavailable alias and provider configuration; fix that configuration and rerun `exp`. If the
 one-time key was not saved, issue a replacement with
 `exp config gateway key issue IDENTITY --key-id KEY --json`.
 The gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets to SQLite.

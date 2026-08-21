@@ -1374,13 +1374,13 @@ def _installed_release_driver() -> None:
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 output = process.stdout.read() if process.stdout is not None else ""
-                raise AssertionError(f"exp run exited before startup:\n{output}")
+                raise AssertionError(f"exp gateway exited before startup:\n{output}")
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                     return
             except OSError:
                 time.sleep(0.05)
-        raise AssertionError(f"exp run did not listen on port {port}")
+        raise AssertionError(f"exp gateway did not listen on port {port}")
 
     def start_gateway(root: Path) -> tuple[subprocess.Popen[str], int, str]:
         """Start one installed gateway subprocess on an unused loopback port.
@@ -1395,7 +1395,6 @@ def _installed_release_driver() -> None:
         process = subprocess.Popen(
             [
                 str(executable),
-                "run",
                 "--root",
                 str(root),
                 "--port",
@@ -1435,7 +1434,6 @@ def _installed_release_driver() -> None:
     gateway_root = execution_root / "gateway-empty"
     gateway_database = gateway_root / "gateway" / "gateway.db"
     empty_gateway = run_cli(
-        "run",
         "--root",
         str(gateway_root),
         "--non-interactive",
@@ -2714,7 +2712,7 @@ def _installed_release_driver() -> None:
         router_process = subprocess.Popen(
             [
                 str(executable),
-                "run",
+                "--project",
                 "support-agent",
                 "--root",
                 str(root),
@@ -3147,7 +3145,7 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     assert "exp optimize model" in usage
     assert "exp config gateway" in usage
     assert "exp config gateway pool certify" in usage
-    assert "exp run --root ROOT" in usage
+    assert "exp --root ROOT" in usage
     assert "OpenAI `3.0.0`" in usage
     assert "schema-v2" in usage
     assert "by_billing_source" in usage

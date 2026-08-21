@@ -21,7 +21,6 @@ from exp.cli.app import app
         ["config", "judge", "calibrate", "--help"],
         ["optimize", "router", "--help"],
         ["optimize", "model", "--help"],
-        ["run", "--help"],
     ],
     ids=[
         "root",
@@ -33,7 +32,6 @@ from exp.cli.app import app
         "judge-calibrate",
         "router",
         "model",
-        "run",
     ],
 )
 def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:

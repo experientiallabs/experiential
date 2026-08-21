@@ -319,7 +319,7 @@ def test_unavailable_alias_reports_its_provider_readiness_reason(tmp_path: Path)
 
     with pytest.raises(
         GatewayLifecycleError,
-        match=r"coding.*TEST_PROVIDER_KEY.*rerun 'exp run'",
+        match=r"coding.*TEST_PROVIDER_KEY.*rerun 'exp'",
     ):
         load_local_gateway(tmp_path, graceful_timeout_seconds=1, environment={})
 

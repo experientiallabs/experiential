@@ -55,10 +55,10 @@ exp config gateway alias create coding \
 exp config gateway identity create default --root ROOT --non-interactive --json
 exp config gateway grant add default coding --root ROOT --non-interactive --json
 exp config gateway key issue default --key-id key-one --root ROOT --json
-exp run --root ROOT --check --non-interactive --json
+exp --root ROOT --check --non-interactive --json
 ```
 
-`exp run --check` proves readiness without a paid call; drop `--check` to serve, then use
+`exp --check` proves readiness without a paid call; drop `--check` to serve, then use
 the caller loop (`exp config gateway key check`, `models`, and `call`) against the live
 gateway.
 

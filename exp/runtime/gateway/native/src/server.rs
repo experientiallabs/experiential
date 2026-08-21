@@ -34,7 +34,7 @@ use crate::upstream::open_stream;
 /// real chat history (the python engine imposes no explicit cap).
 const MAXIMUM_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Serve-time configuration passed from `exp run --engine rust`.
+/// Serve-time configuration passed from `exp --engine rust`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServeConfig {
     pub host: String,

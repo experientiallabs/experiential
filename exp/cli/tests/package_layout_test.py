@@ -23,7 +23,6 @@ CLI_PACKAGES = frozenset(
         "judge",
         "optimize",
         "providers",
-        "run",
         "shared",
     }
 )

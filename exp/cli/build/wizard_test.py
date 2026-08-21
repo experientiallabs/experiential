@@ -446,7 +446,7 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
         run_root: Path,
         *,
         graceful_timeout_seconds: float,
-        project_loader: object,
+        project_repository: object,
         only_aliases: frozenset[str] | None,
     ) -> SimpleNamespace:
         """Return a serving-ready gateway fixture for the mocked launch seam.
@@ -454,13 +454,13 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
         Args:
             run_root: Gateway and artifact root.
             graceful_timeout_seconds: Requested shutdown drain bound.
-            project_loader: Injected selection-only project loader.
+            project_repository: Injected selection-only project repository.
             only_aliases: Optional compatibility alias filter.
 
         Returns:
             Gateway runtime fixture passed to the normal server.
         """
-        del run_root, graceful_timeout_seconds, project_loader
+        del run_root, graceful_timeout_seconds, project_repository
         assert only_aliases == frozenset({"support"})
         return SimpleNamespace(
             app=object(),
@@ -484,10 +484,9 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
         )
         run_result = _RUNNER.invoke(
             app,
-            ["run", "support", "--root", str(root), "--port", "8123"],
+            ["--project", "support", "--root", str(root), "--port", "8123"],
         )
     assert run_result.exit_code == 0, run_result.output
-    assert f"policy {policy.policy_id}" in run_result.output
     assert "http://127.0.0.1:8123/v1" in run_result.output
     assert served == [("127.0.0.1", 8123)]
 

@@ -1,4 +1,4 @@
-"""Development-only loopback run-command tests."""
+"""Loopback gateway serving tests for the root default flow."""
 
 from __future__ import annotations
 
@@ -15,14 +15,14 @@ import typer
 from rich.console import Console
 from typer.testing import CliRunner
 
-import exp.cli.run.app as run_app
+import exp.cli.gateway.serve as run_app
 from exp.cli.app import app
 from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 from exp.cli.gateway.setup import InteractiveSetupResult
 
 
 @pytest.mark.parametrize("ghost", [False, True])
-def test_project_form_launches_the_normal_gateway_on_loopback(
+def test_project_option_launches_the_normal_gateway_on_loopback(
     monkeypatch: pytest.MonkeyPatch,
     ghost: bool,
 ) -> None:
@@ -119,7 +119,7 @@ def test_project_form_launches_the_normal_gateway_on_loopback(
     monkeypatch.setattr("uvicorn.run", serve)
 
     arguments = [
-        "run",
+        "--project",
         "project-a",
         "--root",
         "/tmp/local-exp",
@@ -142,14 +142,14 @@ def test_project_form_launches_the_normal_gateway_on_loopback(
     assert receipt["base_url"] == "http://127.0.0.1:8123/v1"
     assert receipt["project_alias"] == "project-a"
     assert receipt["gateway_accounting"] == "enabled"
-    assert "--host" not in CliRunner().invoke(app, ["run", "--help"]).output
+    assert "--host" not in CliRunner().invoke(app, ["--help"]).output
 
 
-def test_no_argument_noninteractive_run_returns_stable_empty_state_json(tmp_path: Path) -> None:
+def test_noninteractive_default_gateway_returns_stable_empty_state_json(tmp_path: Path) -> None:
     """Automation receives exact setup commands instead of prompts or runtime seeds."""
     result = CliRunner().invoke(
         app,
-        ["run", "--root", str(tmp_path), "--non-interactive", "--json"],
+        ["--root", str(tmp_path), "--non-interactive", "--json"],
     )
 
     assert result.exit_code == 2
@@ -171,7 +171,7 @@ def test_engine_rust_without_the_extension_is_an_actionable_error(tmp_path: Path
         return real_find_spec(name, package)
 
     with mock.patch.object(importlib.util, "find_spec", side_effect=missing_extension):
-        result = CliRunner().invoke(app, ["run", "--root", str(tmp_path), "--engine", "rust"])
+        result = CliRunner().invoke(app, ["--root", str(tmp_path), "--engine", "rust"])
     assert result.exit_code == 2
     assert "exp_gateway_native" in result.output
 
@@ -180,7 +180,7 @@ def test_engine_auto_falls_back_to_python_on_an_uninitialized_root(tmp_path: Pat
     """The default auto engine keeps the python empty-state contract."""
     result = CliRunner().invoke(
         app,
-        ["run", "--root", str(tmp_path), "--non-interactive", "--json"],
+        ["--root", str(tmp_path), "--non-interactive", "--json"],
     )
     assert result.exit_code == 2
     assert json.loads(result.stdout)["error"]["code"] == "gateway_not_initialized"
@@ -188,7 +188,7 @@ def test_engine_auto_falls_back_to_python_on_an_uninitialized_root(tmp_path: Pat
 
 def test_engine_rejects_unknown_values(tmp_path: Path) -> None:
     """An unknown engine name is a usage error."""
-    result = CliRunner().invoke(app, ["run", "--root", str(tmp_path), "--engine", "zig"])
+    result = CliRunner().invoke(app, ["--root", str(tmp_path), "--engine", "zig"])
     assert result.exit_code == 2
 
 
@@ -226,7 +226,7 @@ def test_first_run_delivers_credentials_before_readiness_failure(
             "no granted active alias is locally available: "
             "gpt-5-6-luna (connection credential environment variable "
             "'OPENAI_API_KEY' is not set); fix the listed provider configuration and rerun "
-            "'exp run'"
+            "'exp'"
         )
 
     @contextmanager
@@ -268,5 +268,5 @@ def test_first_run_delivers_credentials_before_readiness_failure(
     assert f"export EXP_GATEWAY_KEY={raw_key}" in transcript
     assert "export OPENAI_API_KEY" not in transcript
     assert "First-run gateway setup completed, but the gateway is not ready." in transcript
-    assert "fix the listed provider configuration and rerun 'exp run'" in str(failure.value)
+    assert "fix the listed provider configuration and rerun 'exp'" in str(failure.value)
     assert "exp config gateway key issue default --key-id RECOVERY_KEY --json" in transcript
