@@ -430,6 +430,123 @@ def test_unknown_historical_cost_fails_closed_only_after_limit_exists(tmp_path: 
     assert remaining.remaining_micro_usd == 0
 
 
+def _unknown_attempt(
+    store: SQLiteGatewayStore,
+    ledger: SQLiteAttemptLedger,
+    clock: _Clock,
+    key: str,
+    content: str,
+) -> str:
+    """Run one failed unpriced attempt whose cost is never learned."""
+    _request_value, snapshot = _accepted(store, ledger, clock, key, content)
+    attempt = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=_deployment(priced=False),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_micro_usd=None,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider transport failed",
+        ),
+    )
+    return attempt
+
+
+def test_reconcile_unknown_costs_restores_service_with_exact_attribution(
+    tmp_path: Path,
+) -> None:
+    """Reconciliation settles each unknown attempt at the assigned cost and reopens the limit."""
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(tmp_path, clock)
+    scope = BudgetScope(kind=BudgetScopeKind.TEAM)
+    first = _unknown_attempt(store, ledger, clock, key, "unknown-one")
+    second = _unknown_attempt(store, ledger, clock, key, "unknown-two")
+    budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=scope,
+        limit_micro_usd=1_000,
+    )
+    budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=scope,
+        limit_micro_usd=10_000,
+        replace=True,
+    )
+    _blocked_request, blocked_snapshot = _accepted(store, ledger, clock, key, "still-blocked")
+    with pytest.raises(BudgetReservationRejected, match="prior attempts with unknown cost"):
+        ledger.start_attempt(
+            snapshot=blocked_snapshot,
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            maximum_cost_micro_usd=100,
+        )
+
+    reconciled, remaining = budgets.reconcile_unknown_costs(
+        organization_id="org",
+        period="2026-08",
+        scope=scope,
+        assigned_cost_micro_usd=40,
+    )
+
+    assert reconciled == 2
+    assert remaining.unknown_cost_attempts == 0
+    assert remaining.settled_micro_usd == 80
+    assert remaining.remaining_micro_usd == 10_000 - 80
+    assert not remaining.exhausted
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        connection.row_factory = sqlite3.Row
+        charges = {
+            str(row["attempt_id"]): int(row["settled_micro_usd"])
+            for row in connection.execute(
+                """
+                SELECT attempt_id, settled_micro_usd FROM gateway_attempt_budget_charges
+                WHERE budget_id = ?
+                """,
+                (remaining.budget.budget_id,),
+            )
+        }
+    assert charges == {first: 40, second: 40}
+    _next_request, next_snapshot = _accepted(store, ledger, clock, key, "restored")
+    admitted = ledger.start_attempt(
+        snapshot=next_snapshot,
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_micro_usd=100,
+    )
+    assert admitted
+    again, unchanged = budgets.reconcile_unknown_costs(
+        organization_id="org",
+        period="2026-08",
+        scope=scope,
+        assigned_cost_micro_usd=40,
+    )
+    assert again == 0
+    assert unchanged.settled_micro_usd == 80
+
+
+def test_reconcile_requires_an_existing_limit(tmp_path: Path) -> None:
+    """Reconciliation refuses to invent a budget for a scope without a stored limit."""
+    clock = _Clock()
+    _store, _ledger, budgets, _key = _authority(tmp_path, clock)
+
+    with pytest.raises(ValueError, match="does not exist"):
+        budgets.reconcile_unknown_costs(
+            organization_id="org",
+            period="2026-08",
+            scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+            assigned_cost_micro_usd=1,
+        )
+
+
 def test_limit_created_midflight_adopts_and_settles_existing_reservation(
     tmp_path: Path,
 ) -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -16,7 +18,17 @@ from exp.common.models.gateway_catalog import (
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
-from exp.runtime.gateway.contracts import DirectTarget
+from exp.runtime.gateway.budgets import current_budget_period
+from exp.runtime.gateway.contracts import (
+    DirectTarget,
+    ExecutionSnapshot,
+    GatewayApiSurface,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayMessage,
+    GatewayRequest,
+)
+from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayManagement
 
 
@@ -187,3 +199,185 @@ def test_interactive_set_prompts_while_noninteractive_missing_values_fail(tmp_pa
     assert missing.exit_code == 2
     normalized = " ".join(click.unstyle(missing.output).replace("│", " ").split())
     assert "--period is required" in normalized
+
+
+def _record_unknown_attempt(manager: GatewayManagement) -> None:
+    """Run one failed unpriced attempt so the month carries an unknown cost."""
+    store = manager.require_initialized()
+    store.grant_alias(
+        organization_id=manager.organization_id,
+        identity_id="identity-one",
+        alias_id="coding",
+    )
+    key = store.issue_virtual_key(
+        organization_id=manager.organization_id,
+        identity_id="identity-one",
+        key_id="key-one",
+    ).raw_key
+    ledger = SQLiteAttemptLedger(manager.database_path)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="unpriced"),),
+        maximum_output_tokens=16,
+    )
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=time.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    snapshot = ExecutionSnapshot(
+        authorization=authorization,
+        exact_model_id="exact-one",
+        pool_id="pool-one",
+        deployment_ids=("azure-primary",),
+    )
+    attempt = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=_snapshot_catalog().deployments[0],
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_micro_usd=None,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider transport failed",
+        ),
+    )
+
+
+def test_noninteractive_reconcile_settles_unknown_costs_and_reports_recovery(
+    tmp_path: Path,
+) -> None:
+    """Automation can assign an explicit cost to unknown attempts and reopen the month."""
+    manager = _configured(tmp_path)
+    _record_unknown_attempt(manager)
+    runner = CliRunner()
+    period = current_budget_period(datetime.now(UTC))
+    set_result = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "budget",
+            "set",
+            "--period",
+            period,
+            "--scope",
+            "team",
+            "--limit-micro-usd",
+            "1000000",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert set_result.exit_code == 0, set_result.output
+
+    reconcile = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "budget",
+            "reconcile",
+            "--period",
+            period,
+            "--scope",
+            "team",
+            "--assigned-cost-micro-usd",
+            "250",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert reconcile.exit_code == 0, reconcile.output
+    receipt = json.loads(reconcile.stdout)
+    assert receipt["operation"] == "budget.reconcile"
+    assert receipt["changed"] is True
+    assert receipt["data"]["reconciled_attempts"] == 1
+    assert receipt["data"]["assigned_cost_micro_usd"] == 250
+    balance = receipt["data"]["remaining"]
+    assert balance["unknown_cost_attempts"] == 0
+    assert balance["settled_micro_usd"] == 250
+    assert balance["remaining_micro_usd"] == 1_000_000 - 250
+    assert balance["exhausted"] is False
+
+    repeat = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "budget",
+            "reconcile",
+            "--period",
+            period,
+            "--scope",
+            "team",
+            "--assigned-cost-micro-usd",
+            "250",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert repeat.exit_code == 0, repeat.output
+    repeated = json.loads(repeat.stdout)
+    assert repeated["changed"] is False
+    assert repeated["data"]["reconciled_attempts"] == 0
+
+
+def test_noninteractive_reconcile_requires_assigned_cost_and_existing_limit(
+    tmp_path: Path,
+) -> None:
+    """Automation fails fast without an assigned cost or a stored limit to reconcile."""
+    _configured(tmp_path)
+    runner = CliRunner()
+    missing_cost = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "budget",
+            "reconcile",
+            "--period",
+            "2026-08",
+            "--scope",
+            "team",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+        ],
+    )
+    assert missing_cost.exit_code == 2
+    normalized = " ".join(click.unstyle(missing_cost.output).replace("│", " ").split())
+    assert "--assigned-cost-micro-usd is required" in normalized
+
+    missing_budget = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "budget",
+            "reconcile",
+            "--period",
+            "2026-08",
+            "--scope",
+            "team",
+            "--assigned-cost-micro-usd",
+            "250",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+        ],
+    )
+    assert missing_budget.exit_code == 2
+    assert "does not exist" in missing_budget.output

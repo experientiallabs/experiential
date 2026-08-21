@@ -258,6 +258,96 @@ class SQLiteBudgetStore:
                 connection.rollback()
         return results
 
+    def reconcile_unknown_costs(
+        self,
+        *,
+        organization_id: str,
+        period: str,
+        scope: BudgetScope,
+        assigned_cost_micro_usd: int,
+    ) -> tuple[int, MonthlyBudgetRemaining]:
+        """Settle every unknown-cost attempt on one limit at an explicit assigned cost.
+
+        Fail-closed semantics stay intact: attempts with unknown cost block every new
+        reservation beneath the limit until an operator deliberately assigns an exact
+        integer micro-USD cost to each of them here. Each reconciled attempt keeps its
+        own charge row settled at the assigned cost, so per-attempt attribution stays
+        exact, and a later natural settlement of a reconciled attempt is skipped rather
+        than double-counted.
+
+        Args:
+            organization_id: Tenant whose allocation is reconciled.
+            period: Immutable UTC month in ``YYYY-MM`` form.
+            scope: Exact allocation target holding the unknown-cost attempts.
+            assigned_cost_micro_usd: Nonnegative integer micro-USD charged per attempt.
+
+        Returns:
+            Count of reconciled attempts and the resulting allocation balance.
+
+        Raises:
+            ValueError: The assigned cost is unrepresentable, the limit does not
+                exist, or settling would exceed SQLite integer capacity.
+        """
+        if not 0 <= assigned_cost_micro_usd <= MAXIMUM_MICRO_USD:
+            raise ValueError("assigned cost must fit a nonnegative SQLite integer")
+        period_start = budget_period_start(period)
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM gateway_monthly_budgets
+                WHERE organization_id = ? AND period_start = ? AND scope_key = ?
+                """,
+                (organization_id, period_start, scope.storage_key()),
+            ).fetchone()
+            if row is None:
+                raise ValueError("monthly budget does not exist for this scope and period")
+            budget_id = str(row["budget_id"])
+            charges = connection.execute(
+                """
+                SELECT attempt_id FROM gateway_attempt_budget_charges
+                WHERE budget_id = ?
+                  AND reserved_micro_usd IS NULL AND settled_micro_usd IS NULL
+                ORDER BY attempt_id
+                """,
+                (budget_id,),
+            ).fetchall()
+            if len(charges) != int(row["unknown_cost_attempts"]):
+                raise RuntimeError("monthly budget counters are inconsistent")
+            if not charges:
+                return 0, _remaining_from_row(row)
+            added = assigned_cost_micro_usd * len(charges)
+            if int(row["settled_micro_usd"]) + added > MAXIMUM_MICRO_USD:
+                raise ValueError("settled monthly gateway cost exceeds SQLite integer capacity")
+            for charge in charges:
+                updated = connection.execute(
+                    """
+                    UPDATE gateway_attempt_budget_charges SET settled_micro_usd = ?
+                    WHERE budget_id = ? AND attempt_id = ?
+                      AND reserved_micro_usd IS NULL AND settled_micro_usd IS NULL
+                    """,
+                    (assigned_cost_micro_usd, budget_id, str(charge["attempt_id"])),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("monthly budget counters are inconsistent")
+            updated = connection.execute(
+                """
+                UPDATE gateway_monthly_budgets
+                SET unknown_cost_attempts = unknown_cost_attempts - ?,
+                    settled_micro_usd = settled_micro_usd + ?
+                WHERE budget_id = ? AND unknown_cost_attempts >= ?
+                """,
+                (len(charges), added, budget_id, len(charges)),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("monthly budget counters are inconsistent")
+            fresh = connection.execute(
+                "SELECT * FROM gateway_monthly_budgets WHERE budget_id = ?",
+                (budget_id,),
+            ).fetchone()
+            if fresh is None:
+                raise RuntimeError("monthly budget disappeared inside its transaction")
+            return len(charges), _remaining_from_row(fresh)
+
     def _read_limit(
         self,
         connection: sqlite3.Connection,
