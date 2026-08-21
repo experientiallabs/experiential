@@ -36,6 +36,7 @@ from exp.runtime.gateway.execution import (
     GatewayExecutionStream,
     GatewayExecutor,
 )
+from exp.runtime.gateway.group_commit import abandoned_write_outcome
 from exp.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayControlStore
 from exp.runtime.gateway.ledger import IdempotencyConflictError, IdempotencyReplayUnavailableError
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute, GatewayRoutingError
@@ -322,7 +323,15 @@ class GatewayService:
             return _cached_response(await lease.result())
         accepted = False
         try:
-            await self._ledger.accept_request(authorization=authorization)
+            acceptance = asyncio.ensure_future(
+                self._ledger.accept_request(authorization=authorization)
+            )
+            try:
+                await asyncio.shield(acceptance)
+            except asyncio.CancelledError:
+                await abandoned_write_outcome(acceptance)
+                accepted = not acceptance.cancelled() and acceptance.exception() is None
+                raise
             accepted = True
             route = await self._routes.resolve(
                 authorization=authorization,

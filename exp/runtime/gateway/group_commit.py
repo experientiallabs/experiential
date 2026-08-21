@@ -61,6 +61,33 @@ def _resolve_exception(future: concurrent.futures.Future[object], error: BaseExc
         future.set_exception(error)
 
 
+async def abandoned_write_outcome[R](write: asyncio.Task[R]) -> R | None:
+    """Wait out a cancellation-abandoned durable write and return its result.
+
+    A shielded ledger write keeps running on the writer thread after the
+    awaiting task is cancelled, so callers that must know whether the write
+    committed (for example to settle a durably reserved attempt) wait here
+    for its real outcome, absorbing repeated cancellation of the waiter.
+
+    Args:
+        write: The in-flight write task, which is never itself cancelled here.
+
+    Returns:
+        The committed write result, or None when the write failed or the
+        task was cancelled before its operation was enqueued.
+    """
+    while not write.done():
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            continue
+        except Exception:  # noqa: BLE001 - the write failure is read below.
+            break
+    if write.cancelled() or write.exception() is not None:
+        return None
+    return write.result()
+
+
 @dataclass(frozen=True)
 class _PendingWrite:
     """One queued ledger operation and the future resolved after durable commit."""

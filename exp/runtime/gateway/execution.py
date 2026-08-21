@@ -23,6 +23,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.group_commit import abandoned_write_outcome
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.interfaces import AttemptLedger, ProviderStream
 from exp.runtime.gateway.ledger import GatewayLedgerError
@@ -473,7 +474,7 @@ class GatewayExecutionStream:
             try:
                 attempt_id = await asyncio.shield(reservation)
             except asyncio.CancelledError:
-                attempt_id = await _abandoned_reservation_outcome(reservation)
+                attempt_id = await abandoned_write_outcome(reservation)
                 raise
             self._attempt_counts[route_index] += 1
             self._total_attempts += 1
@@ -921,32 +922,6 @@ def _stamp_tool_names(event: GatewayEvent, tool_names: list[str]) -> GatewayEven
         else event.usage.model_copy(update={"tool_names": tuple(tool_names)})
     )
     return event.model_copy(update={"usage": usage})
-
-
-async def _abandoned_reservation_outcome(reservation: asyncio.Task[str]) -> str | None:
-    """Wait out a cancellation-abandoned reservation and return its attempt ID.
-
-    The durable reservation write keeps running on the ledger writer after the
-    dispatching task is cancelled, so this waits for its real outcome (absorbing
-    repeated cancellation of the waiter) to learn whether a dispatched attempt
-    now exists and must be settled instead of silently orphaned.
-
-    Args:
-        reservation: The in-flight attempt reservation, never itself cancelled.
-
-    Returns:
-        The durably committed attempt ID, or None when the write failed.
-    """
-    while not reservation.done():
-        try:
-            await asyncio.shield(reservation)
-        except asyncio.CancelledError:
-            continue
-        except Exception:  # noqa: BLE001 - the reservation failure is read below.
-            break
-    if reservation.cancelled() or reservation.exception() is not None:
-        return None
-    return reservation.result()
 
 
 def _all_routes_unavailable() -> GatewayFailure:
