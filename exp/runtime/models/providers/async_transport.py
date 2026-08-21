@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -25,6 +27,50 @@ from exp.runtime.models.providers.transport import (
 
 class ProviderDeadlineExceeded(TimeoutError):
     """One provider operation exhausted its immutable request-wide deadline."""
+
+
+_POOLED_MAX_CONNECTIONS = 256
+_POOLED_MAX_KEEPALIVE_CONNECTIONS = 64
+
+_shared_ssl_context: ssl.SSLContext | None = None
+_pooled_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _default_ssl_context() -> ssl.SSLContext:
+    """Return one process-wide verified TLS context shared by pooled clients.
+
+    Building an ``ssl.SSLContext`` loads the system trust store and takes tens of
+    milliseconds of blocking CPU, so every pooled client reuses one context instead
+    of paying that cost on the event loop per request.
+    """
+    global _shared_ssl_context  # noqa: PLW0603 - one lazily built process-wide context.
+    if _shared_ssl_context is None:
+        _shared_ssl_context = httpx.create_ssl_context()
+    return _shared_ssl_context
+
+
+def _pooled_client() -> httpx.AsyncClient:
+    """Return the shared keep-alive client bound to the running event loop.
+
+    Connections outlive individual requests so repeated provider calls reuse
+    established TCP and TLS sessions. Each event loop owns one client because
+    pooled sockets are loop-bound; the weak mapping lets a finished loop and its
+    client be reclaimed together.
+    """
+    loop = asyncio.get_running_loop()
+    client = _pooled_clients.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            verify=_default_ssl_context(),
+            limits=httpx.Limits(
+                max_connections=_POOLED_MAX_CONNECTIONS,
+                max_keepalive_connections=_POOLED_MAX_KEEPALIVE_CONNECTIONS,
+            ),
+        )
+        _pooled_clients[loop] = client
+    return client
 
 
 @dataclass(frozen=True)
@@ -165,10 +211,12 @@ class HttpxAsyncJsonTransport:
     """Production async transport backed by ``httpx.AsyncClient``."""
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        """Use a caller-owned pooled client or short-lived clients per request.
+        """Use a caller-owned client or the shared per-event-loop pooled client.
 
         Args:
             client: Optional async client whose lifecycle remains with the caller.
+                When omitted, requests run on one process-wide keep-alive client
+                per event loop so connections and the TLS context are reused.
         """
         self._client = client
 
@@ -193,19 +241,12 @@ class HttpxAsyncJsonTransport:
             ProviderTransportError: The request or response body fails safely.
         """
         try:
-            if self._client is not None:
-                response = await self._client.get(
-                    url,
-                    headers=dict(headers),
-                    timeout=timeout_seconds,
-                )
-            else:
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(
-                        url,
-                        headers=dict(headers),
-                        timeout=timeout_seconds,
-                    )
+            client = self._client if self._client is not None else _pooled_client()
+            response = await client.get(
+                url,
+                headers=dict(headers),
+                timeout=timeout_seconds,
+            )
         except httpx.TimeoutException as exc:
             raise ProviderTransportError("provider request timed out") from exc
         except httpx.TransportError as exc:
@@ -235,21 +276,13 @@ class HttpxAsyncJsonTransport:
             ProviderTransportError: The request or response body fails safely.
         """
         try:
-            if self._client is not None:
-                response = await self._client.post(
-                    url,
-                    headers=dict(headers),
-                    json=payload,
-                    timeout=timeout_seconds,
-                )
-            else:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(
-                        url,
-                        headers=dict(headers),
-                        json=payload,
-                        timeout=timeout_seconds,
-                    )
+            client = self._client if self._client is not None else _pooled_client()
+            response = await client.post(
+                url,
+                headers=dict(headers),
+                json=payload,
+                timeout=timeout_seconds,
+            )
         except httpx.TimeoutException as exc:
             raise ProviderTransportError("provider request timed out") from exc
         except httpx.TransportError as exc:
@@ -278,8 +311,7 @@ class HttpxAsyncJsonTransport:
         Raises:
             ProviderTransportError: The request cannot establish a response stream.
         """
-        client = self._client or httpx.AsyncClient()
-        owns_client = self._client is None
+        client = self._client if self._client is not None else _pooled_client()
         try:
             request = client.build_request(
                 "POST",
@@ -290,18 +322,10 @@ class HttpxAsyncJsonTransport:
             )
             response = await client.send(request, stream=True)
         except httpx.TimeoutException as exc:
-            if owns_client:
-                await client.aclose()
             raise ProviderTransportError("provider request timed out") from exc
         except httpx.TransportError as exc:
-            if owns_client:
-                await client.aclose()
             raise ProviderTransportError("provider transport request failed") from exc
-        except BaseException:
-            if owns_client:
-                await client.aclose()
-            raise
-        return _HttpxByteStream(response, client if owns_client else None)
+        return _HttpxByteStream(response, None)
 
 
 class _HttpxByteStream:
@@ -312,11 +336,12 @@ class _HttpxByteStream:
         response: httpx.Response,
         owned_client: httpx.AsyncClient | None,
     ) -> None:
-        """Bind one response and its optional short-lived client.
+        """Bind one response and its optional response-lifetime client.
 
         Args:
             response: Open streaming HTTPX response.
-            owned_client: Client created for this response, or ``None`` when caller-owned.
+            owned_client: Client created for this response, or ``None`` when pooled
+                or caller-owned.
         """
         self._response = response
         self._owned_client = owned_client

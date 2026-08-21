@@ -7,6 +7,7 @@ import asyncio
 import httpx
 import pytest
 
+from exp.runtime.models.providers import async_transport
 from exp.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
     ProviderDeadlineExceeded,
@@ -134,6 +135,20 @@ def test_cancellation_propagates_into_the_active_httpx_request() -> None:
             assert cancelled.is_set()
 
     asyncio.run(scenario())
+
+
+def test_default_transports_share_one_pooled_client_per_event_loop() -> None:
+    """Transports without an injected client reuse one loop-bound keep-alive client."""
+
+    async def scenario() -> tuple[object, object]:
+        """Return the pooled client observed by two independent lookups."""
+        return async_transport._pooled_client(), async_transport._pooled_client()
+
+    first, second = asyncio.run(scenario())
+    assert first is second
+
+    third = asyncio.run(scenario())[0]
+    assert third is not first
 
 
 def test_httpx_decode_failure_does_not_expose_body_or_headers() -> None:
