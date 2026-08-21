@@ -174,6 +174,19 @@ def test_bound_key_is_rejected_for_a_different_endpoint(tmp_path: Path) -> None:
     assert store.get("acme") == _SECRET
 
 
+def test_unbound_record_is_rejected_when_a_binding_is_required(tmp_path: Path) -> None:
+    """OpenCode-shaped records without endpoint identity cannot be used at a new endpoint."""
+    path = tmp_path / "auth.json"
+    store = _store(path)
+    store.put("acme", _SECRET)
+
+    with pytest.raises(StoredCredentialEndpointMismatch, match="does not match") as captured:
+        store.get("acme", binding=_BINDING)
+
+    assert _SECRET not in str(captured.value)
+    assert store.get("acme") == _SECRET
+
+
 def test_put_preserves_other_connection_bindings(tmp_path: Path) -> None:
     """Writing one connection leaves another connection's endpoint binding intact."""
     path = tmp_path / "auth.json"

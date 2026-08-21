@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.auth import ProviderAuthStore
+from exp.common.auth import ProviderAuthStore, StoredCredentialBinding
 from exp.common.models import ConnectionConfig
 from exp.runtime.models.credentials import (
     CredentialResolution,
@@ -32,11 +32,26 @@ def _openai(env_name: str = "OPENAI_API_KEY") -> ConnectionConfig:
     return ConnectionConfig(provider="openai", api_key_env=env_name)
 
 
+def _binding(connection: ConnectionConfig) -> StoredCredentialBinding:
+    """Return the endpoint binding persisted with one stored key.
+
+    Args:
+        connection: Secret-free connection metadata.
+
+    Returns:
+        Provider name plus catalog endpoint digest.
+    """
+    return StoredCredentialBinding(
+        provider=connection.provider,
+        endpoint_sha256=connection.identity_sha256(),
+    )
+
+
 def test_environment_overrides_store_without_rewriting_it(tmp_path: Path) -> None:
     """A non-empty environment value wins and leaves the stored credential unchanged."""
     store = ProviderAuthStore(tmp_path / "auth.json")
-    store.put("openai", _SECRET)
     connection = _openai()
+    store.put("openai", _SECRET, binding=_binding(connection))
 
     resolved = lookup_connection_credential(
         connection,
@@ -54,10 +69,11 @@ def test_environment_overrides_store_without_rewriting_it(tmp_path: Path) -> Non
 def test_empty_environment_falls_through_to_the_store(tmp_path: Path) -> None:
     """Whitespace-only environment values do not hide a stored credential."""
     store = ProviderAuthStore(tmp_path / "auth.json")
-    store.put("openai", _SECRET)
+    connection = _openai()
+    store.put("openai", _SECRET, binding=_binding(connection))
 
     resolved = lookup_connection_credential(
-        _openai(),
+        connection,
         connection_id="openai",
         environment={"OPENAI_API_KEY": "   "},
         store=store,
@@ -71,7 +87,8 @@ def test_empty_environment_falls_through_to_the_store(tmp_path: Path) -> None:
 def test_fresh_resolver_reads_the_store_written_by_another_instance(tmp_path: Path) -> None:
     """A new store and resolver pair still sees the persisted connection key."""
     path = tmp_path / "auth.json"
-    ProviderAuthStore(path).put("openai", _SECRET)
+    connection = _openai()
+    ProviderAuthStore(path).put("openai", _SECRET, binding=_binding(connection))
 
     api_key = read_connection_api_key(
         _openai(),
@@ -86,11 +103,11 @@ def test_fresh_resolver_reads_the_store_written_by_another_instance(tmp_path: Pa
 def test_store_resolves_when_the_connection_omits_an_env_name(tmp_path: Path) -> None:
     """A stored key is enough when the catalog has no environment override name."""
     store = ProviderAuthStore(tmp_path / "auth.json")
-    store.put("acme", _SECRET)
     connection = ConnectionConfig(
         provider="openai-compatible",
         base_url="https://acme.example/v1",
     )
+    store.put("acme", _SECRET, binding=_binding(connection))
 
     api_key = read_connection_api_key(
         connection,
@@ -105,9 +122,9 @@ def test_store_resolves_when_the_connection_omits_an_env_name(tmp_path: Path) ->
 def test_same_provider_connections_resolve_independently(tmp_path: Path) -> None:
     """Two OpenAI connections with the same env name keep distinct stored keys."""
     store = ProviderAuthStore(tmp_path / "auth.json")
-    store.put("openai", _SECRET)
-    store.put("openai-work", _ENV_SECRET)
     connection = _openai()
+    store.put("openai", _SECRET, binding=_binding(connection))
+    store.put("openai-work", _ENV_SECRET, binding=_binding(connection))
 
     first = read_connection_api_key(connection, connection_id="openai", environment={}, store=store)
     second = read_connection_api_key(
@@ -149,7 +166,8 @@ def test_prompt_persists_without_writing_the_environment(tmp_path: Path) -> None
 def test_prompt_is_skipped_when_environment_or_store_already_resolves(tmp_path: Path) -> None:
     """Interactive resolution does not prompt when a higher-precedence source exists."""
     store = ProviderAuthStore(tmp_path / "auth.json")
-    store.put("openai", _SECRET)
+    connection = _openai()
+    store.put("openai", _SECRET, binding=_binding(connection))
     prompted = {"called": False}
 
     def _forbidden() -> str:
@@ -176,8 +194,9 @@ def test_prompt_is_skipped_when_environment_or_store_already_resolves(tmp_path: 
 def test_force_prompt_replaces_the_stored_credential(tmp_path: Path) -> None:
     """An explicit replacement prompt overwrites only that connection's stored key."""
     store = ProviderAuthStore(tmp_path / "auth.json")
-    store.put("openai", _SECRET)
-    store.put("openai-work", _ENV_SECRET)
+    connection = _openai()
+    store.put("openai", _SECRET, binding=_binding(connection))
+    store.put("openai-work", _ENV_SECRET, binding=_binding(connection))
 
     api_key = resolve_or_prompt_connection_api_key(
         _openai(),

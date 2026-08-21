@@ -16,7 +16,7 @@ from typing import cast
 import pytest
 from fastapi.testclient import TestClient
 
-from exp.common.auth import ProviderAuthStore, default_auth_path
+from exp.common.auth import ProviderAuthStore, StoredCredentialBinding, default_auth_path
 from exp.common.models import (
     BillingSource,
     CandidateTokenPrice,
@@ -294,7 +294,19 @@ def test_readiness_requires_an_explicit_grant(tmp_path: Path) -> None:
 def test_launch_uses_stored_openai_compatible_credential(tmp_path: Path) -> None:
     """A stored connection key makes gateway readiness succeed without the env var."""
     _manager, _raw_key = _configured_gateway(tmp_path)
-    ProviderAuthStore(default_auth_path()).put("provider-main", "stored-loopback-key")
+    connection = ConnectionConfig(
+        provider="openai-compatible",
+        base_url="http://127.0.0.1:9/v1",
+        api_key_env="TEST_PROVIDER_KEY",
+    )
+    ProviderAuthStore(default_auth_path()).put(
+        "provider-main",
+        "stored-loopback-key",
+        binding=StoredCredentialBinding(
+            provider=connection.provider,
+            endpoint_sha256=connection.identity_sha256(),
+        ),
+    )
 
     runtime = load_local_gateway(tmp_path, graceful_timeout_seconds=1, environment={})
 

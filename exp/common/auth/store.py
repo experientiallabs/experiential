@@ -101,8 +101,8 @@ class ProviderAuthStore:
 
         Args:
             connection_id: Exact catalog or gateway connection name.
-            binding: Optional current endpoint identity. When the stored record is bound
-                to a different endpoint, the key is not returned.
+            binding: Optional current endpoint identity. When supplied, an unbound
+                record or a record bound to a different endpoint is refused.
 
         Returns:
             The non-empty stored key, or ``None`` when that connection has no record.
@@ -115,7 +115,7 @@ class ProviderAuthStore:
         record = records.get(connection_id)
         if record is None:
             return None
-        if binding is not None and record.binding is not None and record.binding != binding:
+        if binding is not None and record.binding != binding:
             raise StoredCredentialEndpointMismatch(
                 f"stored credential for connection {connection_id!r} does not match the "
                 f"configured {binding.provider} endpoint; run 'exp auth login {connection_id}'"

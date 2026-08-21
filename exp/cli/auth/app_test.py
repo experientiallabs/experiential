@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.common.auth import ProviderAuthStore, default_auth_path
+from exp.common.auth import ProviderAuthStore, StoredCredentialBinding, default_auth_path
 from exp.common.models import (
     BillingSource,
     ConnectionConfig,
@@ -21,6 +21,27 @@ from exp.common.models.catalog import ModelRoles, write_model_catalog
 
 _SECRET = "sk-auth-cli-secret"
 _OTHER = "sk-auth-cli-other"
+_OPENAI = ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")
+_ACME = ConnectionConfig(
+    provider="openai-compatible",
+    base_url="https://acme.example/v1",
+    api_key_env="ACME_API_KEY",
+)
+
+
+def _binding(connection: ConnectionConfig) -> StoredCredentialBinding:
+    """Return the endpoint binding for one catalog connection.
+
+    Args:
+        connection: Secret-free connection metadata.
+
+    Returns:
+        Provider name plus catalog endpoint digest.
+    """
+    return StoredCredentialBinding(
+        provider=connection.provider,
+        endpoint_sha256=connection.identity_sha256(),
+    )
 
 
 def _write_catalog(root: Path) -> None:
@@ -33,12 +54,8 @@ def _write_catalog(root: Path) -> None:
         root / "models.toml",
         ModelCatalog(
             connections={
-                "openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY"),
-                "acme": ConnectionConfig(
-                    provider="openai-compatible",
-                    base_url="https://acme.example/v1",
-                    api_key_env="ACME_API_KEY",
-                ),
+                "openai": _OPENAI,
+                "acme": _ACME,
             },
             models={
                 "luna": ModelRecord(
@@ -66,7 +83,7 @@ def test_list_shows_source_without_secret_values(
 ) -> None:
     """List reports environment and stored sources and never prints a key."""
     _write_catalog(tmp_path)
-    ProviderAuthStore(default_auth_path()).put("acme", _SECRET)
+    ProviderAuthStore(default_auth_path()).put("acme", _SECRET, binding=_binding(_ACME))
     monkeypatch.setenv("OPENAI_API_KEY", "from-env")
     monkeypatch.delenv("ACME_API_KEY", raising=False)
     runner = CliRunner()
@@ -103,8 +120,8 @@ def test_logout_removes_only_the_selected_stored_credential(tmp_path: Path) -> N
     """Logout deletes one stored key and leaves the other connection intact."""
     _write_catalog(tmp_path)
     store = ProviderAuthStore(default_auth_path())
-    store.put("openai", _SECRET)
-    store.put("acme", _OTHER)
+    store.put("openai", _SECRET, binding=_binding(_OPENAI))
+    store.put("acme", _OTHER, binding=_binding(_ACME))
     runner = CliRunner()
 
     result = runner.invoke(app, ["auth", "logout", "acme", "--root", str(tmp_path)])
