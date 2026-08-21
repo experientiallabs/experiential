@@ -23,6 +23,28 @@ _CONTROL = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])")
 _SETTLE_SECONDS = 0.3
 
 
+@pytest.fixture(autouse=True)
+def isolate_provider_auth_store(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    """Point the default credential file at a per-test user-data directory.
+
+    The directory is created beside the test ``tmp_path``, not inside it, so tests that
+    require an empty ``tmp_path`` stay valid.
+
+    Args:
+        tmp_path_factory: Factory for isolated temporary directories.
+        monkeypatch: Fixture that restores process environment after the test.
+
+    Returns:
+        Isolated ``XDG_DATA_HOME`` directory used by the default auth store.
+    """
+    xdg_data_home = tmp_path_factory.mktemp("xdg-data")
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg_data_home))
+    return xdg_data_home
+
+
 @pytest.fixture
 def interactive_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
     """Present a terminal stdin for a test that must reach an interactive prompt."""
