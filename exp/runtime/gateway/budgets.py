@@ -12,7 +12,11 @@ from pathlib import Path
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, canonical_json_bytes, stable_id
-from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.gateway_catalog import (
+    ExactModelDeployment,
+    ExactModelPool,
+    NormalizedGatewayCatalog,
+)
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.interfaces import GatewayClock
@@ -268,14 +272,14 @@ class SQLiteBudgetStore:
             raise RuntimeError("monthly budget disappeared inside its transaction")
         return _limit_from_row(row)
 
-    @staticmethod
     def _require_scope_authority(
+        self,
         connection: sqlite3.Connection,
         *,
         organization_id: str,
         scope: BudgetScope,
     ) -> None:
-        """Require referenced team authority before storing a limit."""
+        """Require every referenced allocation target before storing a limit."""
         organization = connection.execute(
             "SELECT 1 FROM organizations WHERE organization_id = ? AND active = 1",
             (organization_id,),
@@ -302,6 +306,60 @@ class SQLiteBudgetStore:
             ).fetchone()
             if alias is None:
                 raise ValueError("budget alias is not active")
+        if scope.pool_id is not None:
+            self._require_pool_scope(connection, organization_id=organization_id, scope=scope)
+
+    def _require_pool_scope(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        organization_id: str,
+        scope: BudgetScope,
+    ) -> None:
+        """Require the scoped pool, and any scoped deployment, to exist for the alias.
+
+        The pool must be the direct target of at least one revision of the scoped
+        alias. A deployment scope must additionally name a deployment inside that
+        pool in at least one of those revisions' pinned catalog snapshots, so a
+        stored limit always references attempts the ledger can actually charge.
+        """
+        rows = connection.execute(
+            """
+            SELECT snapshot_ref FROM alias_revisions
+            WHERE organization_id = ? AND alias_id = ? AND pool_id = ?
+            ORDER BY revision_number DESC
+            """,
+            (organization_id, scope.alias_id, scope.pool_id),
+        ).fetchall()
+        if not rows:
+            raise ValueError("budget pool is not a revision target of its alias")
+        if scope.deployment_id is None:
+            return
+        for row in rows:
+            pools = self._snapshot_pools(str(row["snapshot_ref"]))
+            for pool in pools:
+                if pool.pool_id != scope.pool_id:
+                    continue
+                if scope.deployment_id in pool.deployment_ids:
+                    return
+        raise ValueError("budget deployment is not in its pool's catalog snapshots")
+
+    def _snapshot_pools(self, snapshot_ref: str) -> tuple[ExactModelPool, ...]:
+        """Load the certified pools from one pinned catalog snapshot reference.
+
+        Raises:
+            ValueError: The reference escapes gateway state or is unreadable, so
+                configuration fails closed instead of storing an unverifiable scope.
+        """
+        state_dir = self.database_path.parent.resolve()
+        snapshot = (state_dir / snapshot_ref).resolve()
+        if not snapshot.is_relative_to(state_dir):
+            raise ValueError("budget catalog snapshot reference escapes gateway state")
+        try:
+            catalog = NormalizedGatewayCatalog.model_validate_json(snapshot.read_bytes())
+        except (OSError, ValueError) as exc:
+            raise ValueError("budget scope catalog snapshot is unreadable") from exc
+        return catalog.pools
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:

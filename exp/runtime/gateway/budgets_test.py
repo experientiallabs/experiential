@@ -11,8 +11,16 @@ import pytest
 
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models import ModelCapabilities
-from exp.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
-from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.catalog import (
+    GatewayDeploymentMetadata,
+    GatewayEquivalenceCertification,
+    GatewayTokenPrices,
+)
+from exp.common.models.gateway_catalog import (
+    ExactModelDeployment,
+    ExactModelPool,
+    NormalizedGatewayCatalog,
+)
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScope,
@@ -516,3 +524,89 @@ def test_migrated_attempts_receive_explicit_period_and_cost_state(tmp_path: Path
     finally:
         connection.close()
     assert row == ("2026-08-01T00:00:00+00:00", 123, None)
+
+
+def _write_snapshot(tmp_path: Path) -> None:
+    """Write the pinned normalized catalog snapshot referenced by the fixture alias."""
+    catalog = NormalizedGatewayCatalog(
+        deployments=(_deployment(), _deployment(deployment_id="secondary")),
+        pools=(
+            ExactModelPool(
+                pool_id="pool",
+                exact_model_id="exact-one",
+                deployment_ids=("primary", "secondary"),
+                equivalence=GatewayEquivalenceCertification(
+                    certification_id="cert-one",
+                    provenance="operator replayed both deployments",
+                    evidence_sha256="e" * 64,
+                    certified_at=datetime(2026, 8, 1, tzinfo=UTC),
+                ),
+            ),
+        ),
+    )
+    (tmp_path / "snapshot").write_bytes(canonical_json_bytes(catalog.model_dump(mode="json")))
+
+
+def test_pool_and_deployment_budget_scopes_require_real_targets(tmp_path: Path) -> None:
+    """Pool and deployment limits reject identifiers the ledger can never charge."""
+    clock = _Clock()
+    _store, _ledger, budgets, _key = _authority(tmp_path, clock)
+    _write_snapshot(tmp_path)
+
+    with pytest.raises(ValueError, match="pool is not a revision target"):
+        budgets.set_limit(
+            organization_id="org",
+            period="2026-08",
+            scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="ghost"),
+            limit_micro_usd=100,
+        )
+    with pytest.raises(ValueError, match="deployment is not in its pool"):
+        budgets.set_limit(
+            organization_id="org",
+            period="2026-08",
+            scope=BudgetScope(
+                kind=BudgetScopeKind.DEPLOYMENT,
+                alias_id="coding",
+                pool_id="pool",
+                deployment_id="ghost",
+            ),
+            limit_micro_usd=100,
+        )
+    changed, pool_limit = budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="pool"),
+        limit_micro_usd=100,
+    )
+    assert changed and pool_limit.scope.pool_id == "pool"
+    changed, deployment_limit = budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=BudgetScope(
+            kind=BudgetScopeKind.DEPLOYMENT,
+            alias_id="coding",
+            pool_id="pool",
+            deployment_id="secondary",
+        ),
+        limit_micro_usd=100,
+    )
+    assert changed and deployment_limit.scope.deployment_id == "secondary"
+
+
+def test_deployment_budget_scope_fails_closed_on_unreadable_snapshot(tmp_path: Path) -> None:
+    """A missing pinned snapshot rejects deployment scopes instead of trusting them."""
+    clock = _Clock()
+    _store, _ledger, budgets, _key = _authority(tmp_path, clock)
+
+    with pytest.raises(ValueError, match="snapshot is unreadable"):
+        budgets.set_limit(
+            organization_id="org",
+            period="2026-08",
+            scope=BudgetScope(
+                kind=BudgetScopeKind.DEPLOYMENT,
+                alias_id="coding",
+                pool_id="pool",
+                deployment_id="primary",
+            ),
+            limit_micro_usd=100,
+        )
