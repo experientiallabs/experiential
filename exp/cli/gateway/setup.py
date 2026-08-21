@@ -149,10 +149,10 @@ def interactive_gateway_setup(
                 detail=detail,
             )
 
-        manager.initialize()
-        advance("initialize")
         set_maximum_command_cost_usd(values.maximum_cost_usd, root)
         advance("save budget")
+        manager.initialize()
+        advance("initialize")
         for endpoint in session.endpoints:
             manager.upsert_provider_connection(
                 connection_id=endpoint.connection.name,

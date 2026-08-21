@@ -180,6 +180,37 @@ def test_gateway_setup_can_edit_the_displayed_defaults(
     assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
 
 
+def test_gateway_setup_writes_budget_before_gateway_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed budget write leaves first-run setup eligible for a retry."""
+    endpoints, models = _prepared_gateway_models()
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
+    )
+
+    def _fail_budget(_maximum_cost_usd: float, root: Path) -> None:
+        """Fail before gateway initialization, as a settings write can in production."""
+        assert root == tmp_path
+        assert not setup.GatewayManagement(root).initialized
+        raise OSError("settings unavailable")
+
+    monkeypatch.setattr(setup, "set_maximum_command_cost_usd", _fail_budget)
+
+    with pytest.raises(OSError, match="settings unavailable"):
+        setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    assert not setup.GatewayManagement(tmp_path).initialized
+
+
 def test_gateway_setup_aborts_when_connection_prompt_is_cancelled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
