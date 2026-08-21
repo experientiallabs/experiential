@@ -40,13 +40,14 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 Prefer a managed gateway to running one locally? The hosted platform at
 [platform.experientiallabs.ai](https://platform.experientiallabs.ai) serves the same
 OpenAI-compatible (and Anthropic Messages) API at `https://api.experientiallabs.ai/v1`.
-Each link below is a copy-paste prompt you hand to your coding agent (Claude Code, Cursor,
-Codex, and similar); the agent runs the setup for you.
+See [setup.md](./setup.md) for copy-paste prompts you hand to your coding agent
+(Claude Code, Cursor, Codex, and similar); the agent runs the setup for you. It
+collects four prompts:
 
-- [Upload your LLM traces as telemetry](https://github.com/experientiallabs/setup-prompts/blob/main/01-upload-traces-as-telemetry.md): create an account instantly from your email, then pull or upload your existing LLM traces onto the platform as telemetry.
-- [Connect your inference provider keys (BYOK)](https://github.com/experientiallabs/setup-prompts/blob/main/02-connect-provider-keys-byok.md): create an account, then connect your own OpenAI, Anthropic, Gemini, Azure, Bedrock, Fireworks, or OpenRouter keys for free pass-through.
-- [Start calling models on the gateway](https://github.com/experientiallabs/setup-prompts/blob/main/03-start-calling-models.md): make your first `/v1` call with the OpenAI and Anthropic SDKs using an `xpl_` key, and optionally repoint your existing coding agents.
-- [Full onboarding](https://github.com/experientiallabs/setup-prompts/blob/main/04-full-onboarding.md): create an account instantly from your email, connect your keys, import your spend, then repoint every coding agent (Claude Code, Cursor, Codex, Aider, and similar) or Conductor at the gateway.
+- Upload your LLM traces as telemetry: create an account instantly from your email, then pull or upload your existing LLM traces onto the platform as telemetry.
+- Connect your inference provider keys (BYOK): create an account, then connect your own OpenAI, Anthropic, Gemini, Azure, Bedrock, Fireworks, or OpenRouter keys for free pass-through.
+- Start calling models on the gateway: make your first `/v1` call with the OpenAI and Anthropic SDKs using an `xpl_` key, and optionally repoint your existing coding agents.
+- Full onboarding: create an account instantly from your email, connect your keys, import your spend, then repoint every coding agent (Claude Code, Cursor, Codex, Aider, and similar) or Conductor at the gateway.
 
 ## Using the API
 
