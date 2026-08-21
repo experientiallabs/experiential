@@ -46,7 +46,7 @@ Codex, and similar); the agent runs the setup for you.
 - [Upload your LLM traces as telemetry](https://github.com/experientiallabs/setup-prompts/blob/main/01-upload-traces-as-telemetry.md): create an account instantly from your email, then pull or upload your existing LLM traces onto the platform as telemetry.
 - [Connect your inference provider keys (BYOK)](https://github.com/experientiallabs/setup-prompts/blob/main/02-connect-provider-keys-byok.md): create an account, then connect your own OpenAI, Anthropic, Gemini, Azure, Bedrock, Fireworks, or OpenRouter keys for free pass-through.
 - [Start calling models on the gateway](https://github.com/experientiallabs/setup-prompts/blob/main/03-start-calling-models.md): make your first `/v1` call with the OpenAI and Anthropic SDKs using an `xpl_` key, and optionally repoint your existing coding agents.
-- [YC founder onboarding (full)](https://github.com/experientiallabs/setup-prompts/blob/main/04-yc-founder-onboarding-full.md): sign in through your agent, claim credits, connect your keys, then repoint every coding agent (Claude Code, Cursor, Codex, Aider, and similar) or Conductor at the gateway.
+- [Full onboarding](https://github.com/experientiallabs/setup-prompts/blob/main/04-yc-founder-onboarding-full.md): create an account instantly from your email, connect your keys, import your spend, then repoint every coding agent (Claude Code, Cursor, Codex, Aider, and similar) or Conductor at the gateway.
 
 ## Using the API
 
