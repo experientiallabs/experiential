@@ -764,6 +764,56 @@ def test_openai_compatible_reuses_a_configured_custom_env_name() -> None:
     assert models[0].connection == "acme"
 
 
+def test_openai_compatible_does_not_reuse_when_multiple_accounts_share_an_endpoint() -> None:
+    """Two compatible connections on one host stay distinct instead of reusing the first."""
+    console = ScriptedConsole("https://models.example.test/v1\n")
+    lister = _FakeLister(
+        {
+            "openai-compatible": [
+                (
+                    DiscoveredModel(
+                        provider="openai-compatible",
+                        model="internal-chat",
+                        supports_completions=True,
+                        supports_structured_output=True,
+                        input_cost_per_million_tokens_usd=1.0,
+                        output_cost_per_million_tokens_usd=2.0,
+                    ),
+                )
+            ]
+        }
+    )
+    existing = (
+        ProviderConnection(
+            name="acme",
+            provider="openai-compatible",
+            api_key_env="ACME_API_KEY",
+            base_url="https://models.example.test/v1",
+        ),
+        ProviderConnection(
+            name="acme-work",
+            provider="openai-compatible",
+            api_key_env="ACME_WORK_API_KEY",
+            base_url="https://models.example.test/v1",
+        ),
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai-compatible",),
+        lister=lister,
+        environment={"OPENAI_COMPATIBLE_API_KEY": "compat-secret"},
+        existing_connections=existing,
+    )
+
+    assert prepared is not None
+    endpoints, models = prepared
+    assert endpoints[0].connection.name == "openai-compatible"
+    assert not endpoints[0].configured
+    assert endpoints[0].connection.api_key_env == "OPENAI_COMPATIBLE_API_KEY"
+    assert models[0].connection == "openai-compatible"
+
+
 def test_azure_prepares_exact_connection_for_manual_deployment_declaration() -> None:
     """Azure preserves endpoint and API version without inventing deployment metadata."""
     console = ScriptedConsole("https://resource.openai.azure.com\n\n")

@@ -223,6 +223,37 @@ def test_bedrock_lookup_never_uses_the_store(tmp_path: Path) -> None:
     )
 
 
+def test_stored_key_is_rejected_when_the_endpoint_identity_changes(tmp_path: Path) -> None:
+    """Reusing a connection ID for another OpenAI-compatible endpoint does not leak the key."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    original = ConnectionConfig(
+        provider="openai-compatible",
+        base_url="https://acme.example/v1",
+    )
+    resolve_or_prompt_connection_api_key(
+        original,
+        connection_id="acme",
+        environment={},
+        store=store,
+        prompt=lambda: _SECRET,
+    )
+    replacement = ConnectionConfig(
+        provider="openai-compatible",
+        base_url="https://other.example/v1",
+    )
+
+    with pytest.raises(ModelCredentialError, match="does not match") as captured:
+        read_connection_api_key(
+            replacement,
+            connection_id="acme",
+            environment={},
+            store=store,
+        )
+
+    assert _SECRET not in str(captured.value)
+    assert store.get("acme") == _SECRET
+
+
 def test_resolution_repr_never_includes_the_secret() -> None:
     """Public representations of a resolved credential stay redacted."""
     resolved = CredentialResolution(_SECRET, "stored")

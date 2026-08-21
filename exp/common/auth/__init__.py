@@ -5,6 +5,8 @@ from exp.common.auth.paths import AUTH_FILE_NAME, default_auth_path, provider_da
 from exp.common.auth.store import (
     ProviderAuthStore,
     ProviderAuthStoreError,
+    StoredCredentialBinding,
+    StoredCredentialEndpointMismatch,
     StoredCredentialStatus,
 )
 
@@ -13,6 +15,8 @@ __all__ = [
     "CANONICAL_API_KEY_ENV",
     "ProviderAuthStore",
     "ProviderAuthStoreError",
+    "StoredCredentialBinding",
+    "StoredCredentialEndpointMismatch",
     "StoredCredentialStatus",
     "default_auth_path",
     "derived_api_key_env",

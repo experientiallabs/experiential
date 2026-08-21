@@ -522,8 +522,9 @@ def _reused_connection(
         region: Optional Bedrock region.
 
     Returns:
-        The matching configured connection, or ``None`` when a new one is needed.
+        The matching configured connection when exactly one exists, otherwise ``None``.
     """
+    matches: list[ProviderConnection] = []
     for connection in existing_connections:
         if (
             connection.provider != provider
@@ -532,8 +533,11 @@ def _reused_connection(
             or connection.region != region
         ):
             continue
-        if provider == "openai-compatible" or connection.api_key_env == api_key_env:
-            return connection
+        if provider != "openai-compatible" and connection.api_key_env != api_key_env:
+            continue
+        matches.append(connection)
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 

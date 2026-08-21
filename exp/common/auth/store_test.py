@@ -11,7 +11,15 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.auth.store import ProviderAuthStore, ProviderAuthStoreError
+from exp.common.auth.store import (
+    ProviderAuthStore,
+    ProviderAuthStoreError,
+    StoredCredentialBinding,
+    StoredCredentialEndpointMismatch,
+)
+
+_BINDING = StoredCredentialBinding(provider="openai-compatible", endpoint_sha256="a" * 64)
+_OTHER_BINDING = StoredCredentialBinding(provider="openai-compatible", endpoint_sha256="b" * 64)
 
 _SECRET = "sk-store-test-secret-value"
 _OTHER = "sk-other-connection-secret"
@@ -150,6 +158,56 @@ def test_logout_removes_only_the_selected_connection(tmp_path: Path) -> None:
     fresh = _store(path)
     assert fresh.get("openai") is None
     assert fresh.get("anthropic") == _OTHER
+
+
+def test_bound_key_is_rejected_for_a_different_endpoint(tmp_path: Path) -> None:
+    """A stored key is not returned when the connection now names another endpoint."""
+    path = tmp_path / "auth.json"
+    store = _store(path)
+    store.put("acme", _SECRET, binding=_BINDING)
+
+    assert store.get("acme", binding=_BINDING) == _SECRET
+    with pytest.raises(StoredCredentialEndpointMismatch, match="does not match") as captured:
+        store.get("acme", binding=_OTHER_BINDING)
+
+    assert _SECRET not in str(captured.value)
+    assert store.get("acme") == _SECRET
+
+
+def test_put_preserves_other_connection_bindings(tmp_path: Path) -> None:
+    """Writing one connection leaves another connection's endpoint binding intact."""
+    path = tmp_path / "auth.json"
+    store = _store(path)
+    store.put("acme", _SECRET, binding=_BINDING)
+    store.put("other", _OTHER)
+
+    fresh = _store(path)
+    assert fresh.get("acme", binding=_BINDING) == _SECRET
+    with pytest.raises(StoredCredentialEndpointMismatch):
+        fresh.get("acme", binding=_OTHER_BINDING)
+
+
+def test_replace_fsyncs_the_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful replace persists the parent directory entry after the rename."""
+    path = tmp_path / "exp" / "auth.json"
+    flushed: list[Path] = []
+
+    def _record(directory: Path) -> None:
+        """Record the directory durability call.
+
+        Args:
+            directory: Parent directory of the replaced credential file.
+        """
+        flushed.append(directory)
+
+    monkeypatch.setattr("exp.common.auth.store.fsync_directory_best_effort", _record)
+    _store(path).put("openai", _SECRET)
+
+    assert flushed == [path.parent]
+    assert _store(path).get("openai") == _SECRET
 
 
 def test_missing_file_is_an_empty_store(tmp_path: Path) -> None:

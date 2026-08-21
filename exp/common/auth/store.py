@@ -1,8 +1,9 @@
 """Atomic, user-only ``auth.json`` store keyed by provider connection ID.
 
 The document follows the OpenCode ``auth.json`` shape: one object whose keys are connection
-IDs and whose values are ``{"type": "api", "key": "..."}`` records. Secret values never
-appear in ``repr``, ``str``, or raised messages.
+IDs and whose values are ``{"type": "api", "key": "..."}`` records. Optional ``provider``
+and ``endpoint_sha256`` fields bind a key to one secret-free endpoint identity. Secret
+values never appear in ``repr``, ``str``, or raised messages.
 """
 
 from __future__ import annotations
@@ -12,11 +13,13 @@ import os
 import stat
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from exp.common.auth.paths import default_auth_path
-from exp.common.core.artifacts import SECRET_REDACTION_PLACEHOLDER, ContractModel
+from exp.common.core.artifacts import SECRET_REDACTION_PLACEHOLDER, ContractModel, Sha256
+from exp.common.core.files import fsync_directory_best_effort
 from exp.common.core.locks import file_write_lock
 
 _CONNECTION_ID_MAX = 128
@@ -36,13 +39,32 @@ class ProviderAuthStoreError(ValueError):
         super().__init__(message)
 
 
+class StoredCredentialBinding(ContractModel):
+    """Secret-free provider endpoint identity bound to one stored API key."""
+
+    provider: str
+    endpoint_sha256: Sha256
+
+
+class StoredCredentialEndpointMismatch(ProviderAuthStoreError):
+    """A stored key exists but was saved for a different provider endpoint."""
+
+
 class StoredCredentialStatus(ContractModel):
     """Public metadata for one stored or configured provider connection."""
 
     connection_id: str
     provider: str
-    source: Literal["environment", "stored", "missing", "aws_chain"]
+    source: Literal["environment", "stored", "missing", "aws_chain", "mismatch"]
     environment_variable: str | None = None
+
+
+@dataclass(frozen=True)
+class _StoredApiRecord:
+    """One connection's API key plus optional endpoint binding."""
+
+    key: str
+    binding: StoredCredentialBinding | None = None
 
 
 class ProviderAuthStore:
@@ -69,27 +91,51 @@ class ProviderAuthStore:
         """Describe the store by path only."""
         return self.__repr__()
 
-    def get(self, connection_id: str) -> str | None:
+    def get(
+        self,
+        connection_id: str,
+        *,
+        binding: StoredCredentialBinding | None = None,
+    ) -> str | None:
         """Return the stored API key for one connection, or ``None`` when absent.
 
         Args:
             connection_id: Exact catalog or gateway connection name.
+            binding: Optional current endpoint identity. When the stored record is bound
+                to a different endpoint, the key is not returned.
 
         Returns:
             The non-empty stored key, or ``None`` when that connection has no record.
 
         Raises:
+            StoredCredentialEndpointMismatch: The stored key belongs to another endpoint.
             ProviderAuthStoreError: The file exists but cannot be used.
         """
         records = self._load()
-        return records.get(connection_id)
+        record = records.get(connection_id)
+        if record is None:
+            return None
+        if binding is not None and record.binding is not None and record.binding != binding:
+            raise StoredCredentialEndpointMismatch(
+                f"stored credential for connection {connection_id!r} does not match the "
+                f"configured {binding.provider} endpoint; run 'exp auth login {connection_id}'"
+            )
+        return record.key
 
-    def put(self, connection_id: str, secret: str) -> None:
+    def put(
+        self,
+        connection_id: str,
+        secret: str,
+        *,
+        binding: StoredCredentialBinding | None = None,
+    ) -> None:
         """Create or replace the stored API key for one connection.
 
         Args:
             connection_id: Exact catalog or gateway connection name.
             secret: Non-empty API key to persist.
+            binding: Optional endpoint identity to store with the key. When omitted, an
+                existing binding on this connection is preserved.
 
         Raises:
             ProviderAuthStoreError: The identity or secret is invalid, or the write failed.
@@ -100,7 +146,12 @@ class ProviderAuthStore:
             raise ProviderAuthStoreError("stored credential values must be non-empty")
         with file_write_lock(self._path, what="provider credential file"):
             records = self._load()
-            records[connection_id] = key
+            existing = records.get(connection_id)
+            preserved = existing.binding if existing is not None else None
+            records[connection_id] = _StoredApiRecord(
+                key=key,
+                binding=binding if binding is not None else preserved,
+            )
             self._replace(records)
 
     def remove(self, connection_id: str) -> bool:
@@ -135,11 +186,11 @@ class ProviderAuthStore:
         """
         return tuple(sorted(self._load()))
 
-    def _load(self) -> dict[str, str]:
+    def _load(self) -> dict[str, _StoredApiRecord]:
         """Read and validate the credential document.
 
         Returns:
-            Connection ID to API key mapping.
+            Connection ID to stored API record mapping.
 
         Raises:
             ProviderAuthStoreError: The path is unsafe or the document is malformed.
@@ -158,11 +209,11 @@ class ProviderAuthStore:
             raise ProviderAuthStoreError(_malformed_message(self._path)) from exc
         return _parse_document(payload, path=self._path)
 
-    def _replace(self, records: Mapping[str, str]) -> None:
+    def _replace(self, records: Mapping[str, _StoredApiRecord]) -> None:
         """Atomically replace the credential file with user-only permissions.
 
         Args:
-            records: Complete connection ID to API key mapping to persist.
+            records: Complete connection ID to stored API record mapping to persist.
 
         Raises:
             ProviderAuthStoreError: The destination is unsafe or the write failed.
@@ -173,7 +224,7 @@ class ProviderAuthStore:
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
                 raise ProviderAuthStoreError(_malformed_message(self._path))
         payload = json.dumps(
-            {name: {"type": "api", "key": records[name]} for name in sorted(records)},
+            {name: _record_payload(records[name]) for name in sorted(records)},
             indent=2,
             sort_keys=True,
         ).encode("utf-8")
@@ -190,6 +241,7 @@ class ProviderAuthStore:
                 os.fsync(stream.fileno())
             os.replace(temporary, self._path)
             os.chmod(self._path, _FILE_MODE)
+            fsync_directory_best_effort(self._path.parent)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
@@ -226,7 +278,23 @@ def _validate_connection_id(connection_id: str) -> None:
         raise ProviderAuthStoreError("connection IDs must not contain path separators")
 
 
-def _parse_document(payload: object, *, path: Path) -> dict[str, str]:
+def _record_payload(record: _StoredApiRecord) -> dict[str, str]:
+    """Serialize one stored API record without extra identity when unbound.
+
+    Args:
+        record: Key and optional endpoint binding.
+
+    Returns:
+        OpenCode-shaped object, plus binding fields when present.
+    """
+    payload = {"type": "api", "key": record.key}
+    if record.binding is not None:
+        payload["provider"] = record.binding.provider
+        payload["endpoint_sha256"] = record.binding.endpoint_sha256
+    return payload
+
+
+def _parse_document(payload: object, *, path: Path) -> dict[str, _StoredApiRecord]:
     """Validate one OpenCode-shaped credential document.
 
     Args:
@@ -234,26 +302,65 @@ def _parse_document(payload: object, *, path: Path) -> dict[str, str]:
         path: File path used in recovery messages.
 
     Returns:
-        Connection ID to API key mapping.
+        Connection ID to stored API record mapping.
 
     Raises:
         ProviderAuthStoreError: The document is not a usable credential object.
     """
     if not isinstance(payload, dict):
         raise ProviderAuthStoreError(_malformed_message(path))
-    records: dict[str, str] = {}
+    records: dict[str, _StoredApiRecord] = {}
     for raw_name, raw_record in payload.items():
         if not isinstance(raw_name, str) or not raw_name:
             raise ProviderAuthStoreError(_malformed_message(path))
         if not isinstance(raw_record, dict):
             raise ProviderAuthStoreError(_malformed_message(path))
-        record_type = raw_record.get("type")
-        key = raw_record.get("key")
-        extra = set(raw_record) - {"type", "key"}
+        fields: dict[str, object] = {}
+        for field, value in raw_record.items():
+            if not isinstance(field, str):
+                raise ProviderAuthStoreError(_malformed_message(path))
+            fields[field] = value
+        record_type = fields.get("type")
+        key = fields.get("key")
+        extra = set(fields) - {"type", "key", "provider", "endpoint_sha256"}
         if extra or record_type != "api" or not isinstance(key, str) or not key.strip():
             raise ProviderAuthStoreError(_malformed_message(path))
-        records[raw_name] = key
+        records[raw_name] = _StoredApiRecord(
+            key=key,
+            binding=_parse_binding(fields, path=path),
+        )
     return records
+
+
+def _parse_binding(
+    raw_record: Mapping[str, object],
+    *,
+    path: Path,
+) -> StoredCredentialBinding | None:
+    """Read optional endpoint binding fields from one stored record.
+
+    Args:
+        raw_record: Decoded record object.
+        path: File path used in recovery messages.
+
+    Returns:
+        Binding when both identity fields are present, otherwise ``None``.
+
+    Raises:
+        ProviderAuthStoreError: Only one binding field is present or a field is invalid.
+    """
+    provider = raw_record.get("provider")
+    endpoint_sha256 = raw_record.get("endpoint_sha256")
+    if provider is None and endpoint_sha256 is None:
+        return None
+    if not isinstance(provider, str) or not provider:
+        raise ProviderAuthStoreError(_malformed_message(path))
+    if not isinstance(endpoint_sha256, str) or not endpoint_sha256:
+        raise ProviderAuthStoreError(_malformed_message(path))
+    try:
+        return StoredCredentialBinding(provider=provider, endpoint_sha256=endpoint_sha256)
+    except ValueError as exc:
+        raise ProviderAuthStoreError(_malformed_message(path)) from exc
 
 
 def _malformed_message(path: Path) -> str:

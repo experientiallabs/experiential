@@ -10,7 +10,13 @@ import os
 from collections.abc import Callable, Mapping
 from typing import Literal
 
-from exp.common.auth import ProviderAuthStore, ProviderAuthStoreError, StoredCredentialStatus
+from exp.common.auth import (
+    ProviderAuthStore,
+    ProviderAuthStoreError,
+    StoredCredentialBinding,
+    StoredCredentialEndpointMismatch,
+    StoredCredentialStatus,
+)
 from exp.common.models import ConnectionConfig
 
 CredentialSource = Literal["environment", "stored", "prompt"]
@@ -83,7 +89,7 @@ def lookup_connection_credential(
         if env_value:
             return CredentialResolution(env_value, "environment")
     auth_store = store if store is not None else ProviderAuthStore()
-    stored = auth_store.get(connection_id)
+    stored = auth_store.get(connection_id, binding=_credential_binding(connection))
     if stored:
         return CredentialResolution(stored, "stored")
     return None
@@ -113,12 +119,20 @@ def describe_connection_credential(
             provider=connection.provider,
             source="aws_chain",
         )
-    resolved = lookup_connection_credential(
-        connection,
-        connection_id=connection_id,
-        environment=environment,
-        store=store,
-    )
+    try:
+        resolved = lookup_connection_credential(
+            connection,
+            connection_id=connection_id,
+            environment=environment,
+            store=store,
+        )
+    except StoredCredentialEndpointMismatch:
+        return StoredCredentialStatus(
+            connection_id=connection_id,
+            provider=connection.provider,
+            source="mismatch",
+            environment_variable=connection.api_key_env,
+        )
     source: Literal["environment", "stored", "missing"]
     if resolved is None:
         source = "missing"
@@ -228,5 +242,20 @@ def resolve_or_prompt_connection_api_key(
     if not key:
         return None
     if persist:
-        auth_store.put(connection_id, key)
+        auth_store.put(connection_id, key, binding=_credential_binding(connection))
     return key
+
+
+def _credential_binding(connection: ConnectionConfig) -> StoredCredentialBinding:
+    """Return the secret-free endpoint identity stored with one API key.
+
+    Args:
+        connection: Secret-free connection metadata.
+
+    Returns:
+        Provider name plus the catalog endpoint digest.
+    """
+    return StoredCredentialBinding(
+        provider=connection.provider,
+        endpoint_sha256=connection.identity_sha256(),
+    )
