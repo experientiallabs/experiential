@@ -165,12 +165,31 @@ class HttpxAsyncJsonTransport:
     """Production async transport backed by ``httpx.AsyncClient``."""
 
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        """Use a caller-owned pooled client or short-lived clients per request.
+        """Use a caller-owned pooled client or one lazily created shared client.
 
         Args:
-            client: Optional async client whose lifecycle remains with the caller.
+            client: Optional async client whose lifecycle remains with the caller. When
+                omitted, the transport lazily creates one pooled client of its own and
+                reuses it for every request so provider connections and TLS sessions
+                are shared instead of re-established per call.
         """
         self._client = client
+        self._owned_client: httpx.AsyncClient | None = None
+
+    def _pooled_client(self) -> httpx.AsyncClient:
+        """Return the caller-owned client or this transport's lazily created one."""
+        if self._client is not None:
+            return self._client
+        if self._owned_client is None:
+            self._owned_client = httpx.AsyncClient()
+        return self._owned_client
+
+    async def aclose(self) -> None:
+        """Close the transport-owned pooled client when one was created."""
+        if self._owned_client is not None:
+            owned = self._owned_client
+            self._owned_client = None
+            await owned.aclose()
 
     async def get(
         self,
@@ -193,19 +212,11 @@ class HttpxAsyncJsonTransport:
             ProviderTransportError: The request or response body fails safely.
         """
         try:
-            if self._client is not None:
-                response = await self._client.get(
-                    url,
-                    headers=dict(headers),
-                    timeout=timeout_seconds,
-                )
-            else:
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(
-                        url,
-                        headers=dict(headers),
-                        timeout=timeout_seconds,
-                    )
+            response = await self._pooled_client().get(
+                url,
+                headers=dict(headers),
+                timeout=timeout_seconds,
+            )
         except httpx.TimeoutException as exc:
             raise ProviderTransportError("provider request timed out") from exc
         except httpx.TransportError as exc:
@@ -235,21 +246,12 @@ class HttpxAsyncJsonTransport:
             ProviderTransportError: The request or response body fails safely.
         """
         try:
-            if self._client is not None:
-                response = await self._client.post(
-                    url,
-                    headers=dict(headers),
-                    json=payload,
-                    timeout=timeout_seconds,
-                )
-            else:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(
-                        url,
-                        headers=dict(headers),
-                        json=payload,
-                        timeout=timeout_seconds,
-                    )
+            response = await self._pooled_client().post(
+                url,
+                headers=dict(headers),
+                json=payload,
+                timeout=timeout_seconds,
+            )
         except httpx.TimeoutException as exc:
             raise ProviderTransportError("provider request timed out") from exc
         except httpx.TransportError as exc:
@@ -278,8 +280,7 @@ class HttpxAsyncJsonTransport:
         Raises:
             ProviderTransportError: The request cannot establish a response stream.
         """
-        client = self._client or httpx.AsyncClient()
-        owns_client = self._client is None
+        client = self._pooled_client()
         try:
             request = client.build_request(
                 "POST",
@@ -290,18 +291,10 @@ class HttpxAsyncJsonTransport:
             )
             response = await client.send(request, stream=True)
         except httpx.TimeoutException as exc:
-            if owns_client:
-                await client.aclose()
             raise ProviderTransportError("provider request timed out") from exc
         except httpx.TransportError as exc:
-            if owns_client:
-                await client.aclose()
             raise ProviderTransportError("provider transport request failed") from exc
-        except BaseException:
-            if owns_client:
-                await client.aclose()
-            raise
-        return _HttpxByteStream(response, client if owns_client else None)
+        return _HttpxByteStream(response, None)
 
 
 class _HttpxByteStream:

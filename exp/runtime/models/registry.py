@@ -140,6 +140,17 @@ class RuntimeModelCatalog:
         self._transport_factory = transport_factory
         self._tinker_sampler_factory = tinker_sampler_factory
         self._bedrock_runtime_factory = bedrock_runtime_factory
+        self._shared_transport: ProviderTransport | None = None
+
+    def _transport(self) -> ProviderTransport:
+        """Return one lazily built transport shared by every HTTP-backed client.
+
+        Sharing one transport lets every resolved client reuse pooled provider
+        connections instead of re-establishing TLS sessions per request.
+        """
+        if self._shared_transport is None:
+            self._shared_transport = self._transport_factory()
+        return self._shared_transport
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
         """Resolve static identity and exact capability evidence without provider access.
@@ -240,7 +251,7 @@ class RuntimeModelCatalog:
                 model=snapshot,
                 api_key=api_key,
                 base_url=connection.base_url or OPENAI_BASE_URL,
-                transport=self._transport_factory(),
+                transport=self._transport(),
                 supports_temperature=capabilities.supports_temperature,
                 reasoning_effort=capabilities.reasoning_effort,
             )
@@ -270,7 +281,7 @@ class RuntimeModelCatalog:
                 endpoint=connection.base_url,
                 api_key=api_key,
                 api_version=connection.api_version,
-                transport=self._transport_factory(),
+                transport=self._transport(),
             )
             return ResolvedModel(
                 alias,
@@ -313,7 +324,7 @@ class RuntimeModelCatalog:
             model=snapshot,
             api_key=api_key,
             base_url=base_url,
-            transport=self._transport_factory(),
+            transport=self._transport(),
         )
         embedding_client = (
             http_client
