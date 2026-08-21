@@ -8,16 +8,43 @@ import pytest
 import typer
 
 from exp.cli.gateway import setup
-from exp.cli.providers import provider_picker
+from exp.cli.providers import model_picker, provider_picker
 from exp.cli.shared.picker import PickerKey
 from exp.cli.shared.picker_test import ScriptedConsole
-from exp.common.models import ConnectionConfig
+from exp.common.config import load_settings
+from exp.common.models import ConnectionConfig, ModelCapabilities, PricingSource, ProviderConnection
+
+
+def _prepared_gateway_models() -> tuple[
+    tuple[provider_picker.PreparedEndpoint, ...],
+    tuple[provider_picker.AvailableModel, ...],
+]:
+    """Build prepared endpoints and one discovered completion model for gateway tests."""
+    connections = (
+        ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),
+        ProviderConnection(name="anthropic", provider="anthropic", api_key_env="ANTHROPIC_API_KEY"),
+    )
+    endpoints = tuple(
+        provider_picker.PreparedEndpoint(connection=connection, api_key="secret", configured=False)
+        for connection in connections
+    )
+    model = provider_picker.AvailableModel(
+        alias="gpt-5-6-luna",
+        connection="openai",
+        provider="openai",
+        model="gpt-5.6-luna",
+        capabilities=ModelCapabilities(supports_completions=True, reasoning_effort="medium"),
+        pricing_source=PricingSource.EXP_CATALOG,
+        configured=False,
+    )
+    return endpoints, (model,)
 
 
 def test_gateway_setup_uses_the_shared_provider_setup_seams() -> None:
     """Gateway first-run setup does not maintain a second provider picker implementation."""
     assert setup.select_providers is provider_picker.select_providers
-    assert setup.collect_provider_connections is provider_picker.collect_provider_connections
+    assert setup.prepare_providers is provider_picker.prepare_providers
+    assert setup.select_gateway_model is model_picker.select_gateway_model
 
 
 @pytest.mark.parametrize(
@@ -88,25 +115,29 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """First-run setup accepts all displayed defaults with one empty line."""
-    connections = (
-        ("openai", ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")),
-        ("anthropic", ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")),
-    )
+    endpoints, models = _prepared_gateway_models()
     monkeypatch.setattr(
         setup,
         "select_providers",
         lambda *_args, **_kwargs: (("openai", "anthropic"), False),
     )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
     monkeypatch.setattr(
-        setup, "collect_provider_connections", lambda *_args, **_kwargs: connections
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
     )
     console = ScriptedConsole("\n")
 
     result = setup.interactive_gateway_setup(tmp_path, console=console)
 
     assert result.alias == "gpt-5-6-luna"
-    assert "gpt-5.6-luna" in console.output
     assert "Press Enter to accept all defaults" in console.output
+    assert "Alias" in console.output
+    assert "Identity ID" in console.output
+    assert "Budget" in console.output
+    assert "$50.00" in console.output
+    assert "Exact model ID" not in console.output
     assert "Planned local mutations" not in console.output
     assert "Create this gateway configuration?" not in console.output
     assert "Gateway configured" in console.output
@@ -116,6 +147,7 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
         "anthropic",
     }
     assert {item.alias_id for item in manager.aliases()} == {"gpt-5-6-luna"}
+    assert load_settings(tmp_path).commands.maximum_cost_usd == 50.0
 
 
 def test_gateway_setup_can_edit_the_displayed_defaults(
@@ -123,25 +155,29 @@ def test_gateway_setup_can_edit_the_displayed_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """First-run setup keeps the defaults visible while allowing every value to be edited."""
-    connections = (("openai", ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")),)
+    endpoints, models = _prepared_gateway_models()
     monkeypatch.setattr(
         setup,
         "select_providers",
         lambda *_args, **_kwargs: (("openai",), False),
     )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
     monkeypatch.setattr(
-        setup, "collect_provider_connections", lambda *_args, **_kwargs: connections
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
     )
-    console = ScriptedConsole("edit\ncustom-model\nlogical-model\ncustom-alias\noperator\n")
+    console = ScriptedConsole("edit\ncustom-alias\noperator\n75\n")
 
     result = setup.interactive_gateway_setup(tmp_path, console=console)
 
     assert result.alias == "custom-alias"
     assert result.identity_id == "operator"
-    assert "Provider model" in console.output
-    assert "Exact model ID" in console.output
     assert "Alias" in console.output
     assert "Identity ID" in console.output
+    assert "Budget" in console.output
+    assert "Exact model ID" not in console.output
+    assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
 
 
 def test_gateway_setup_aborts_when_connection_prompt_is_cancelled(
@@ -159,7 +195,7 @@ def test_gateway_setup_aborts_when_connection_prompt_is_cancelled(
         """Raise the shared picker cancellation sentinel."""
         raise provider_picker.SetupCancelled
 
-    monkeypatch.setattr(setup, "collect_provider_connections", _cancel)
+    monkeypatch.setattr(setup, "prepare_providers", _cancel)
 
     with pytest.raises(typer.Abort):
         setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole(""))

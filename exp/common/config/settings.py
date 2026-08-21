@@ -15,7 +15,7 @@ from exp.common.core.files import write_text_atomic
 from exp.common.core.locks import file_write_lock
 
 SETTINGS_FILENAME = "settings.toml"
-DEFAULT_COMMAND_BUDGET_USD = 10.0
+DEFAULT_COMMAND_BUDGET_USD = 50.0
 
 
 class TelemetrySettings(BaseModel):

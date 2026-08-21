@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import uuid
+from collections.abc import MutableMapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,21 +14,25 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from exp.cli.providers.model_picker import GatewayModelSelection, select_gateway_model
 from exp.cli.providers.provider_picker import (
+    AvailableModel,
     SetupCancelled,
     SetupSession,
+    ask_price,
     ask_text,
-    collect_provider_connections,
+    prepare_providers,
     select_providers,
 )
 from exp.cli.shared.progress import progress_display
 from exp.cli.shared.theme import EXP_THEME
+from exp.common.config import resolve_command_budget_usd, set_maximum_command_cost_usd
+from exp.common.core.artifacts import stable_id
 from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
     ModelCatalog,
-    derive_model_alias,
 )
 from exp.common.progress import report
 from exp.runtime.gateway.catalog_authority import (
@@ -34,6 +40,7 @@ from exp.runtime.gateway.catalog_authority import (
     upsert_singleton_deployment,
 )
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.models.providers import HttpProviderModelLister, ProviderModelLister
 
 
 @dataclass(frozen=True)
@@ -49,33 +56,25 @@ class InteractiveSetupResult:
 class _GatewaySetupValues:
     """Values shown on the first-run gateway defaults screen."""
 
-    provider_model: str
-    exact_model_id: str
     alias: str
     identity_id: str
-
-
-_DEFAULT_GATEWAY_MODELS = {
-    "openai": "gpt-5.6-luna",
-    "anthropic": "claude-sonnet-4-5",
-    "gemini": "gemini-3.6-flash",
-    "openrouter": "openai/gpt-5.4",
-    "openai-compatible": "gpt-5.4",
-    "azure": "gpt-5-deployment",
-    "bedrock": "anthropic.claude-sonnet-4-5",
-}
+    maximum_cost_usd: float
 
 
 def interactive_gateway_setup(
     root: Path,
     *,
     console: Console | None = None,
+    lister: ProviderModelLister | None = None,
+    environment: MutableMapping[str, str] | None = None,
 ) -> InteractiveSetupResult:
     """Collect and create one minimal provider-backed singleton gateway.
 
     Args:
         root: Empty EXP root selected by the operator.
         console: Optional terminal override used by tests and embedding callers.
+        lister: Optional authenticated model-listing seam used by tests.
+        environment: Environment consulted for provider credentials.
 
     Returns:
         Created identity, alias, and one-time key material.
@@ -88,27 +87,49 @@ def interactive_gateway_setup(
     if manager.initialized:
         raise ValueError("interactive first-run setup requires an uninitialized gateway")
     console = console or Console(theme=EXP_THEME)
+    environment = os.environ if environment is None else environment
+    lister = lister or HttpProviderModelLister()
+    session = SetupSession()
     try:
-        selection = select_providers(
-            SetupSession(),
-            console=console,
-            environment={},
-        )
+        while True:
+            selection = select_providers(
+                session,
+                console=console,
+                environment=environment,
+            )
+            if selection is None:
+                raise typer.Abort()
+            session.providers, session.advanced_models = selection
+            prepared = prepare_providers(
+                session,
+                existing_connections=(),
+                existing_aliases=(),
+                console=console,
+                lister=lister,
+                environment=environment,
+            )
+            if prepared is None:
+                continue
+            session.endpoints, session.available = prepared
+            model_selection = select_gateway_model(session, console=console)
+            if model_selection is None:
+                continue
+            values = _collect_gateway_values(
+                model_selection,
+                root=root,
+                console=console,
+            )
+            break
     except (EOFError, KeyboardInterrupt, SetupCancelled):
         raise typer.Abort from None
-    if selection is None:
-        raise typer.Abort()
-    providers, _manual_models = selection
-    try:
-        connections = collect_provider_connections(providers, console=console)
-    except SetupCancelled:
-        raise typer.Abort from None
-    if not connections:
-        raise typer.Abort()
-    provider_name, _provider_connection = connections[0]
-    values = _collect_gateway_values(provider_name, console=console)
 
-    total_steps = len(connections) + 6
+    selected = model_selection.model
+    capabilities = selected.capabilities or ModelCapabilities()
+    if model_selection.reasoning_effort is not None:
+        capabilities = capabilities.model_copy(
+            update={"reasoning_effort": model_selection.reasoning_effort}
+        )
+    total_steps = len(session.endpoints) + 7
     completed_steps = 0
 
     progress_context = (
@@ -130,20 +151,25 @@ def interactive_gateway_setup(
 
         manager.initialize()
         advance("initialize")
-        for connection_id, connection in connections:
-            manager.upsert_provider_connection(connection_id=connection_id, config=connection)
-            advance(f"connect {connection_id}")
+        set_maximum_command_cost_usd(values.maximum_cost_usd, root)
+        advance("save budget")
+        for endpoint in session.endpoints:
+            manager.upsert_provider_connection(
+                connection_id=endpoint.connection.name,
+                config=endpoint.connection.catalog_config(),
+            )
+            advance(f"connect {endpoint.connection.name}")
         serving_connections = {
             item.connection_id: item.config for item in manager.provider_connections()
         }
         normalized, snapshot, _changed = upsert_singleton_deployment(
             root,
             deployment_alias=values.alias,
-            connection_name=provider_name,
-            provider_model=values.provider_model,
-            exact_model_id=values.exact_model_id,
+            connection_name=selected.connection,
+            provider_model=selected.model,
+            exact_model_id=_gateway_exact_model_id(selected),
             revision=None,
-            capabilities=ModelCapabilities(),
+            capabilities=capabilities,
             gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             prices=GatewayTokenPrices(),
             pricing_source=None,
@@ -180,28 +206,33 @@ def interactive_gateway_setup(
     )
 
 
-def _collect_gateway_values(provider: str, *, console: Console) -> _GatewaySetupValues:
-    """Show gateway defaults and collect edits only when the operator requests them.
+def _collect_gateway_values(
+    model_selection: GatewayModelSelection,
+    *,
+    root: Path,
+    console: Console,
+) -> _GatewaySetupValues:
+    """Show and optionally edit only the user-owned gateway defaults.
 
     Args:
-        provider: First selected provider that receives the initial singleton alias.
+        model_selection: Provider/model and effort already selected by the shared picker.
+        root: EXP root owning the shared command budget setting.
         console: Terminal used for the defaults screen and optional field edits.
 
     Returns:
-        Gateway values accepted from the defaults screen or edited by the operator.
+        Alias, identity, and maximum command budget accepted by the operator.
 
     Raises:
         typer.Abort: The operator reaches end of input or interrupts the screen.
     """
-    defaults = _gateway_defaults(provider)
+    defaults = _gateway_defaults(model_selection, root=root)
     table = Table.grid(padding=(0, 2))
     table.add_column(style="dim")
     table.add_column(style="green")
     for label, value in (
-        ("Provider model", defaults.provider_model),
-        ("Exact model ID", defaults.exact_model_id),
         ("Alias", defaults.alias),
         ("Identity ID", defaults.identity_id),
+        ("Budget", f"${defaults.maximum_cost_usd:.2f}"),
     ):
         table.add_row(label, Text(value, style="green"))
     console.print(table)
@@ -216,32 +247,46 @@ def _collect_gateway_values(provider: str, *, console: Console) -> _GatewaySetup
 
     try:
         return _GatewaySetupValues(
-            provider_model=ask_text(
-                "Provider model", console=console, default=defaults.provider_model
-            ),
-            exact_model_id=ask_text(
-                "Exact model ID", console=console, default=defaults.exact_model_id
-            ),
             alias=ask_text("Alias", console=console, default=defaults.alias),
             identity_id=ask_text("Identity ID", console=console, default=defaults.identity_id),
+            maximum_cost_usd=ask_price(
+                "Budget (USD)",
+                console=console,
+                default=f"{defaults.maximum_cost_usd:g}",
+            ),
         )
     except SetupCancelled as exc:
         raise typer.Abort from exc
 
 
-def _gateway_defaults(provider: str) -> _GatewaySetupValues:
-    """Return the concise first-run defaults for one provider-backed singleton.
+def _gateway_defaults(
+    model_selection: GatewayModelSelection,
+    *,
+    root: Path,
+) -> _GatewaySetupValues:
+    """Return defaults after the shared provider/model/effort flow has completed.
 
     Args:
-        provider: Supported provider receiving the initial singleton alias.
+        model_selection: Selected provider model and optional effort pin.
+        root: EXP root owning the shared command budget setting.
 
     Returns:
-        Provider model, logical identity, alias, and caller identity defaults.
+        Alias, default identity, and current command-budget ceiling.
     """
-    provider_model = _DEFAULT_GATEWAY_MODELS[provider]
     return _GatewaySetupValues(
-        provider_model=provider_model,
-        exact_model_id=provider_model,
-        alias=derive_model_alias(provider, provider_model, frozenset()),
+        alias=model_selection.model.alias,
         identity_id="default",
+        maximum_cost_usd=resolve_command_budget_usd(root, None),
+    )
+
+
+def _gateway_exact_model_id(model: AvailableModel) -> str:
+    """Derive the hidden singleton identity from the selected provider model."""
+    return stable_id(
+        "gateway-model",
+        {
+            "connection": model.connection,
+            "provider": model.provider,
+            "model": model.model,
+        },
     )

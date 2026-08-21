@@ -65,6 +65,14 @@ class RoleAssignment:
     candidate_reasoning_efforts: dict[str, ReasoningEffort] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class GatewayModelSelection:
+    """One first-run gateway model and its optional reasoning-effort pin."""
+
+    model: AvailableModel
+    reasoning_effort: ReasoningEffort | None = None
+
+
 def available_models(session: SetupSession) -> tuple[AvailableModel, ...]:
     """List every configurable model, including models declared by hand."""
     return (*session.available, *session.manual)
@@ -190,6 +198,136 @@ def select_models(session: SetupSession, *, console: Console) -> tuple[str, ...]
                 session.selected = (*session.selected, declared.alias)
             continue
         return result.values
+
+
+def select_gateway_model(
+    session: SetupSession,
+    *,
+    console: Console,
+) -> GatewayModelSelection | None:
+    """Select one completion model and reuse the build effort picker for gateway setup.
+
+    The gateway has one initial public alias, so it selects one completion model from the same
+    provider/model rows used by provider setup. Azure and Bedrock keep their provider model entry
+    behind the same model screen because those providers do not expose a safe listing endpoint.
+
+    Args:
+        session: Prepared provider endpoints and discovered model rows.
+        console: Terminal used for the model and reasoning-effort screens.
+
+    Returns:
+        The selected model and effort, or ``None`` when the operator goes back to providers.
+
+    Raises:
+        SetupCancelled: The user cancelled setup.
+    """
+    while True:
+        available = tuple(
+            item
+            for item in available_models(session)
+            if item.capabilities is None or item.capabilities.supports_completions is not False
+        )
+        options = [_option(item) for item in available]
+        if session.advanced_models:
+            options.append(
+                PickerOption(
+                    value=_MANUAL_MODEL_ROW,
+                    label="Add a provider model",
+                    detail="Azure or Bedrock deployment",
+                )
+            )
+        if not options:
+            console.print(
+                "[yellow]No completion model is available for the selected providers. "
+                "Choose another provider.[/yellow]"
+            )
+            return None
+        default = next(
+            (alias for alias in session.selected if any(item.alias == alias for item in available)),
+            None,
+        )
+        result = choose_one(
+            console,
+            title="Model",
+            options=options,
+            default=default,
+        )
+        if result.action is PickerAction.CANCEL:
+            raise SetupCancelled
+        if result.action is PickerAction.BACK:
+            return None
+        selected = result.values[0]
+        if selected == _MANUAL_MODEL_ROW:
+            declared = _declare_gateway_model(session, console=console)
+            if declared is None:
+                continue
+            session.manual.append(declared)
+            item = declared
+        else:
+            item = next(item for item in available if item.alias == selected)
+        session.selected = (item.alias,)
+        effort = _ask_role_reasoning_effort(
+            (item,),
+            alias=item.alias,
+            role_name="model",
+            default=(item.capabilities.reasoning_effort if item.capabilities is not None else None),
+            console=console,
+        )
+        if isinstance(effort, _RoleEffortBack):
+            continue
+        return GatewayModelSelection(model=item, reasoning_effort=effort)
+
+
+def _declare_gateway_model(
+    session: SetupSession,
+    *,
+    console: Console,
+) -> AvailableModel | None:
+    """Add one minimally declared provider model for a gateway singleton.
+
+    Args:
+        session: Prepared provider endpoints and aliases already used in this session.
+        console: Terminal used for the connection and provider-model pickers.
+
+    Returns:
+        The declared model, or ``None`` when the operator goes back.
+
+    Raises:
+        SetupCancelled: The user cancelled setup.
+    """
+    connections = [
+        PickerOption(
+            value=endpoint.connection.name,
+            label=endpoint.connection.name,
+            detail=endpoint.connection.provider,
+        )
+        for endpoint in session.endpoints
+    ]
+    if not connections:
+        console.print("[yellow]Prepare a provider connection first.[/yellow]")
+        return None
+    chosen = choose_one(console, title="Provider connection", options=connections)
+    if chosen.action is PickerAction.CANCEL:
+        raise SetupCancelled
+    if chosen.action is PickerAction.BACK:
+        return None
+    connection_name = chosen.values[0]
+    endpoint = next(
+        endpoint for endpoint in session.endpoints if endpoint.connection.name == connection_name
+    )
+    model = ask_text("Provider model", console=console)
+    if not model:
+        return None
+    taken = frozenset(item.alias for item in available_models(session))
+    return AvailableModel(
+        alias=derive_model_alias(endpoint.connection.provider, model, taken),
+        connection=connection_name,
+        provider=endpoint.connection.provider,
+        model=model,
+        capabilities=ModelCapabilities(),
+        pricing_source=PricingSource.UNKNOWN,
+        configured=False,
+    )
 
 
 def declare_model(session: SetupSession, *, console: Console) -> AvailableModel | None:

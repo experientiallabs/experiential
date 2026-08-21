@@ -20,7 +20,7 @@ def test_budget_status_reports_the_default_without_writing(tmp_path: Path) -> No
     result = _RUNNER.invoke(app, ["config", "budget", "--root", str(root)])
 
     assert result.exit_code == 0, result.output
-    assert "maximum command cost: $10.00" in unstyle(result.output)
+    assert "maximum command cost: $50.00" in unstyle(result.output)
     assert not root.exists()
 
 

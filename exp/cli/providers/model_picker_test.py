@@ -5,11 +5,13 @@ from __future__ import annotations
 import pytest
 
 from exp.cli.providers.model_picker import (
+    GatewayModelSelection,
     assign_roles,
     build_result,
     configured_models,
     declare_model,
     render_summary,
+    select_gateway_model,
     select_models,
 )
 from exp.cli.providers.provider_picker import (
@@ -113,6 +115,41 @@ def test_model_screen_cancellation_ends_setup() -> None:
     """Cancelling the model screen cancels the whole session."""
     with pytest.raises(SetupCancelled):
         select_models(_session(_CHAT), console=ScriptedConsole("q\n"))
+
+
+def test_gateway_model_screen_reuses_model_and_effort_picker_defaults() -> None:
+    """Gateway model setup selects one shared model row and accepts its effort default."""
+    console = ScriptedConsole("1\n\n")
+
+    selected = select_gateway_model(_session(_CHAT), console=console)
+
+    assert selected == GatewayModelSelection(model=_CHAT, reasoning_effort="medium")
+    assert "Model effort (luna)" in console.output
+
+
+def test_gateway_model_screen_keeps_manual_provider_model_inside_model_flow() -> None:
+    """Azure and Bedrock deployment names stay inside the shared model-selection screen."""
+    azure = ProviderConnection(
+        name="azure",
+        provider="azure",
+        api_key_env="AZURE_OPENAI_API_KEY",
+        base_url="https://resource.openai.azure.com",
+        api_version="v1",
+    )
+    bedrock = ProviderConnection(name="bedrock", provider="bedrock", region="us-east-1")
+    session = SetupSession(
+        providers=("azure", "bedrock"),
+        advanced_models=True,
+        endpoints=(_endpoint(azure), _endpoint(bedrock)),
+    )
+    console = ScriptedConsole("1\n1\nmy-deployment\n")
+
+    selected = select_gateway_model(session, console=console)
+
+    assert selected is not None
+    assert selected.model.provider == "azure"
+    assert selected.model.model == "my-deployment"
+    assert "Exact model ID" not in console.output
 
 
 def test_roles_are_filtered_to_the_selected_models_that_can_serve_them() -> None:

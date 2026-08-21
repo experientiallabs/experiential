@@ -373,34 +373,6 @@ def collect_provider_connection(
     )
 
 
-def collect_provider_connections(
-    providers: Sequence[str],
-    *,
-    console: Console,
-) -> tuple[tuple[str, ConnectionConfig], ...]:
-    """Collect connection metadata for every provider selected in the shared screen.
-
-    Args:
-        providers: Supported providers returned by ``select_providers``.
-        console: Terminal used for provider-specific fields.
-
-    Returns:
-        Provider names paired with the metadata accepted for each provider. A provider whose
-        optional endpoint field is left empty is skipped using the same rule as normal setup.
-
-    Raises:
-        ValueError: A provider is unsupported or its collected metadata is invalid.
-    """
-    connections: list[tuple[str, ConnectionConfig]] = []
-    for provider in providers:
-        connection = collect_provider_connection(provider, console=console)
-        if connection is None:
-            console.print(f"[yellow]Skipping {SETUP_PROVIDER_LABELS[provider]}.[/yellow]")
-            continue
-        connections.append((provider, connection))
-    return tuple(connections)
-
-
 def prepare_providers(
     session: SetupSession,
     *,
@@ -819,12 +791,13 @@ def ask_positive_int(label: str, *, console: Console) -> int | None:
     return value if value > 0 else None
 
 
-def ask_price(label: str, *, console: Console) -> float:
+def ask_price(label: str, *, console: Console, default: str = "0") -> float:
     """Read one nonnegative price under the advanced path.
 
     Args:
         label: Prompt text.
         console: Terminal used for the prompt.
+        default: Value accepted with an empty line.
 
     Returns:
         The nonnegative price per million tokens in USD.
@@ -833,7 +806,7 @@ def ask_price(label: str, *, console: Console) -> float:
         SetupCancelled: The prompt reached end of input.
     """
     while True:
-        answer = ask_text(label, console=console, default="0")
+        answer = ask_text(label, console=console, default=default)
         try:
             value = float(answer)
         except ValueError:
