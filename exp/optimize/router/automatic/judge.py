@@ -168,7 +168,6 @@ class AutomaticRouterJudge:
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
-        self._plan: EvaluationPlan | None = None
 
     @property
     def provider_economics(self) -> tuple[OperationEconomics, ...]:
@@ -176,19 +175,6 @@ class AutomaticRouterJudge:
         if isinstance(self._client, ReservedJudgeClient):
             return self._client.economics
         return ()
-
-    def bind_plan(self, plan: EvaluationPlan) -> None:
-        """Bind the one frozen evaluation plan whose rollouts may be judged.
-
-        Args:
-            plan: Persisted current composition plan.
-
-        Raises:
-            ValueError: A different plan was already bound.
-        """
-        if self._plan is not None and self._plan != plan:
-            raise ValueError("automatic judge is already bound to a different evaluation plan")
-        self._plan = plan
 
     def judge_persisted(
         self,

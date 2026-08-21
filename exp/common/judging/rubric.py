@@ -86,10 +86,6 @@ class RubricDimension(ContractModel):
             "anchors": [anchor.model_dump(mode="json") for anchor in self.anchors],
         }
 
-    def identity_calibrated_scores(self) -> tuple[float, ...]:
-        """Return the identity map covering every permitted raw score."""
-        return tuple(float(score) for score in self.permitted_scores())
-
 
 def scored_axis(
     dimension_id: ArtifactId,

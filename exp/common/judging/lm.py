@@ -183,41 +183,6 @@ class LMJudge:
             probe=probe,
         )
 
-    def probe_persisted(
-        self,
-        store: ProjectStore,
-        *,
-        rollout_artifact_id: ArtifactId,
-        rubric_artifact_id: ArtifactId,
-        calibration_artifact_id: ArtifactId,
-    ) -> JudgeProbe:
-        """Score persisted scalar evidence without writing a judgment artifact.
-
-        Args:
-            store: Project store that owns completed immutable judging inputs.
-            rollout_artifact_id: Completed source rollout artifact to score.
-            rubric_artifact_id: Completed rubric artifact used for scoring.
-            calibration_artifact_id: Provisional or approved calibration binding the prompt.
-        Returns:
-            Structured provider response with observed economics and no persistence side effect.
-
-        Raises:
-            JudgmentError: A source, binding, response, or model identity is invalid.
-        """
-        rollout, _rollout_input, rubric, _rubric_input, calibration, _calibration_input = (
-            _load_authoritative_judging_inputs(
-                store,
-                rollout_artifact_id=rollout_artifact_id,
-                rubric_artifact_id=rubric_artifact_id,
-                calibration_artifact_id=calibration_artifact_id,
-            )
-        )
-        return self._probe(
-            rollout,
-            rubric,
-            calibration,
-        )
-
     def _probe(
         self,
         rollout: RolloutArtifact,
