@@ -131,6 +131,54 @@ def test_admit_and_settle_account_one_request(tmp_path: Path) -> None:
     assert repeat == "{}"
 
 
+def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
+    """A lost terminal write latches readiness but stays settleable on retry."""
+    control, raw_key = _control_plane(tmp_path)
+    admission = json.loads(
+        control.admit(
+            json.dumps(
+                {
+                    "raw_key": raw_key,
+                    "alias": "coding",
+                    "request": _chat_canonical(),
+                    "stream": False,
+                }
+            )
+        )
+    )
+    settlement = json.dumps(
+        {
+            "request_id": admission["request_id"],
+            "attempt_id": admission["attempt_id"],
+            "outcome": "completed",
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+            "tool_names": [],
+            "failure": None,
+        }
+    )
+    ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
+    real_finish = ledger.finish_attempt
+    calls = {"count": 0}
+
+    def failing_finish(**kwargs: object) -> None:
+        """Fail the first durable terminal write, then delegate."""
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("simulated terminal write loss")
+        real_finish(**kwargs)
+
+    ledger.finish_attempt = failing_finish  # type: ignore[method-assign]
+    try:
+        with pytest.raises(NativeBridgeError):
+            control.settle(settlement)
+        assert control.readiness("{}") == "false"
+        assert control.settle(settlement) == "{}"
+    finally:
+        ledger.finish_attempt = real_finish  # type: ignore[method-assign]
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
+
+
 def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:
     """An ungranted alias maps to the shared 403 public error."""
     control, raw_key = _control_plane(tmp_path)

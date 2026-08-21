@@ -41,6 +41,14 @@ pub struct WireHints {
     pub token_limit_key: String,
 }
 
+/// Aggregate per-request ceiling on retained provider output, mirroring the
+/// Python engine's 64 MiB bounded-aggregation limit.
+pub const MAXIMUM_RETAINED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The sanitized message that marks an aggregate output overflow; the HTTP
+/// layer maps it to the shared `provider_output_too_large` public error.
+pub const OUTPUT_OVERFLOW_MESSAGE: &str = "provider output exceeded the gateway response limit";
+
 fn capability_failure(capability: &str) -> Failure {
     Failure::new(
         FailureClass::UnsupportedCapability,
@@ -524,6 +532,7 @@ pub struct Normalizer {
     tools: BTreeMap<u32, ToolAccumulator>,
     refusal_seen: bool,
     terminal: bool,
+    accumulated_tool_bytes: usize,
     // Anthropic accumulation.
     input_tokens: u64,
     output_tokens: u64,
@@ -542,6 +551,7 @@ impl Normalizer {
             tools: BTreeMap::new(),
             refusal_seen: false,
             terminal: false,
+            accumulated_tool_bytes: 0,
             input_tokens: 0,
             output_tokens: 0,
             cache_read: 0,
@@ -554,6 +564,18 @@ impl Normalizer {
 
     pub fn saw_terminal(&self) -> bool {
         self.terminal
+    }
+
+    /// Reserve retained-output budget for accumulated tool-argument text.
+    fn reserve_tool_bytes(&mut self, additional: usize) -> Result<(), Failure> {
+        self.accumulated_tool_bytes = self.accumulated_tool_bytes.saturating_add(additional);
+        if self.accumulated_tool_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
+            return Err(Failure::new(
+                FailureClass::ProviderInternal,
+                OUTPUT_OVERFLOW_MESSAGE,
+            ));
+        }
+        Ok(())
     }
 
     /// Feed one decoded SSE frame; a terminal event ends the stream.
@@ -633,6 +655,7 @@ impl Normalizer {
                     events.push(Event::ToolCallStarted { index, call_id, name });
                     if let Some(Value::String(initial)) = item.get("arguments") {
                         if !initial.is_empty() {
+                            self.reserve_tool_bytes(initial.len())?;
                             tool.raw_arguments.push_str(initial);
                             events.push(Event::ToolArgumentsDelta {
                                 index,
@@ -649,6 +672,7 @@ impl Normalizer {
                 let index = require_u64(&payload, "output_index", "OpenAI output_index")
                     .map_err(|message| malformed(&message))? as u32;
                 let delta = optional_text(&payload, "delta", "OpenAI argument delta")?;
+                self.reserve_tool_bytes(delta.len())?;
                 let tool = self
                     .tools
                     .get_mut(&index)
@@ -659,41 +683,43 @@ impl Normalizer {
             "response.function_call_arguments.done" | "response.output_item.done" => {
                 let index = require_u64(&payload, "output_index", "OpenAI output_index")
                     .map_err(|message| malformed(&message))? as u32;
-                if let Some(tool) = self.tools.get_mut(&index) {
-                    if !tool.completed {
-                        let mut final_arguments = payload
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                        if event_type == "response.output_item.done" {
-                            if let Some(item) = payload.get("item").and_then(Value::as_object) {
-                                if let Some(from_item) =
-                                    item.get("arguments").and_then(Value::as_str)
-                                {
-                                    final_arguments = Some(from_item.to_string());
-                                }
+                let pending = self
+                    .tools
+                    .get(&index)
+                    .is_some_and(|tool| !tool.completed);
+                if pending {
+                    let mut final_arguments = payload
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if event_type == "response.output_item.done" {
+                        if let Some(item) = payload.get("item").and_then(Value::as_object) {
+                            if let Some(from_item) = item.get("arguments").and_then(Value::as_str) {
+                                final_arguments = Some(from_item.to_string());
                             }
                         }
-                        if let Some(final_arguments) = final_arguments {
-                            if !tool.raw_arguments.is_empty()
-                                && tool.raw_arguments != final_arguments
-                            {
-                                return Err(malformed(
-                                    "OpenAI tool argument fragments changed at done",
-                                ));
-                            }
-                            if tool.raw_arguments.is_empty() && !final_arguments.is_empty() {
-                                tool.raw_arguments = final_arguments.clone();
-                                events.push(Event::ToolArgumentsDelta {
-                                    index,
-                                    delta: final_arguments,
-                                });
-                            }
-                        }
-                        tool.completed = true;
-                        let call = tool.complete().map_err(|message| malformed(&message))?;
-                        events.push(Event::ToolCallCompleted { index, call });
                     }
+                    if let Some(final_arguments) = final_arguments {
+                        let streamed = &self.tools[&index].raw_arguments;
+                        if !streamed.is_empty() && *streamed != final_arguments {
+                            return Err(malformed(
+                                "OpenAI tool argument fragments changed at done",
+                            ));
+                        }
+                        if streamed.is_empty() && !final_arguments.is_empty() {
+                            self.reserve_tool_bytes(final_arguments.len())?;
+                            let tool = self.tools.get_mut(&index).expect("tool just checked");
+                            tool.raw_arguments = final_arguments.clone();
+                            events.push(Event::ToolArgumentsDelta {
+                                index,
+                                delta: final_arguments,
+                            });
+                        }
+                    }
+                    let tool = self.tools.get_mut(&index).expect("tool just checked");
+                    tool.completed = true;
+                    let call = tool.complete().map_err(|message| malformed(&message))?;
+                    events.push(Event::ToolCallCompleted { index, call });
                 }
             }
             "response.completed" | "response.incomplete" => {
@@ -832,6 +858,7 @@ impl Normalizer {
                     Some("input_json_delta") => {
                         let fragment =
                             optional_text(delta, "partial_json", "Anthropic argument delta")?;
+                        self.reserve_tool_bytes(fragment.len())?;
                         let tool = self.tools.get_mut(&index).ok_or_else(|| {
                             malformed("provider emitted arguments before a tool start")
                         })?;
@@ -1013,6 +1040,7 @@ impl Normalizer {
                                     ))
                                 }
                             };
+                            self.reserve_tool_bytes(raw_fragment.len())?;
                             let tool = self.tools.get_mut(&index).expect("tool just ensured");
                             tool.raw_arguments.push_str(&raw_fragment);
                             events.push(Event::ToolArgumentsDelta {

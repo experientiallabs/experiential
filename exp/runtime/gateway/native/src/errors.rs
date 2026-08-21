@@ -141,6 +141,16 @@ impl PublicError {
         .with_param("model")
     }
 
+    pub fn provider_output_too_large() -> Self {
+        Self::new(
+            502,
+            "provider_output_too_large",
+            "Provider output exceeded the gateway response limit. \
+             Request less output, for example with a lower max_tokens value.",
+            "api_error",
+        )
+    }
+
     pub fn responses_unsupported() -> Self {
         Self::new(
             404,

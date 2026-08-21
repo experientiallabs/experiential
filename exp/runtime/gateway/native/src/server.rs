@@ -19,7 +19,10 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::bridge::Bridge;
 use crate::decode::{decode_chat, DecodedChat};
-use crate::dialects::{build_payload, Dialect, Normalizer, WireHints};
+use crate::dialects::{
+    build_payload, Dialect, Normalizer, WireHints, MAXIMUM_RETAINED_OUTPUT_BYTES,
+    OUTPUT_OVERFLOW_MESSAGE,
+};
 use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
@@ -467,6 +470,25 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
+/// Approximate retained size of one aggregated event, in bytes.
+fn event_retained_bytes(event: &Event) -> usize {
+    match event {
+        Event::TextDelta(text) | Event::RefusalDelta(text) => text.len(),
+        Event::ToolArgumentsDelta { delta, .. } => delta.len(),
+        Event::ToolCallCompleted { call, .. } => call.raw_arguments.len(),
+        _ => 64,
+    }
+}
+
+/// Map one collection failure to its public error, honoring the shared
+/// aggregate-output overflow contract.
+fn collection_public_error(failure: &Failure) -> PublicError {
+    if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
+        return PublicError::provider_output_too_large();
+    }
+    failure.public_error()
+}
+
 /// Drain one upstream SSE response into normalized events.
 async fn collect_events(
     response: reqwest::Response,
@@ -477,6 +499,7 @@ async fn collect_events(
     let mut normalizer = Normalizer::new(dialect);
     let mut decoder = SseDecoder::new();
     let mut events = Vec::new();
+    let mut retained_bytes = 0usize;
     let mut byte_stream = response.bytes_stream();
     loop {
         let bound = remaining(deadline).min(phase_timeout);
@@ -500,7 +523,16 @@ async fn collect_events(
             .feed(&chunk)
             .map_err(|message| Failure::new(FailureClass::MalformedResponse, &message))?;
         for frame in frames {
-            events.extend(normalizer.feed(&frame)?);
+            for event in normalizer.feed(&frame)? {
+                retained_bytes = retained_bytes.saturating_add(event_retained_bytes(&event));
+                if retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
+                    return Err(Failure::new(
+                        FailureClass::ProviderInternal,
+                        OUTPUT_OVERFLOW_MESSAGE,
+                    ));
+                }
+                events.push(event);
+            }
             if normalizer.saw_terminal() {
                 return Ok(events);
             }
@@ -532,7 +564,7 @@ async fn completed_response(
     let events = match collect_events(response, dialect, deadline, phase_timeout).await {
         Ok(events) => events,
         Err(failure) => {
-            let error = failure.public_error();
+            let error = collection_public_error(&failure);
             settle(&state.bridge, &admission, "failed", None, &[], Some(&failure)).await;
             return error_response(&error);
         }

@@ -363,8 +363,9 @@ class NativeControlPlane:
                 latched unhealthy first, mirroring executor accounting.
         """
         data = json.loads(argument)
+        request_id = str(data["request_id"])
         with self._lock:
-            context = self._inflight.pop(str(data["request_id"]), None)
+            context = self._inflight.get(request_id)
         if context is None:
             return "{}"
         _authorization, attempt_id = context
@@ -391,8 +392,12 @@ class NativeControlPlane:
                 finalize_request=True,
             )
         except Exception as exc:  # noqa: BLE001 - latch any durable ledger failure.
+            # The in-flight entry is kept so a retried settlement can still
+            # reach the ledger; finish_attempt is idempotent on success.
             self._accounting_healthy = False
             raise _authority_error(exc) from exc
+        with self._lock:
+            self._inflight.pop(request_id, None)
         return "{}"
 
     def models(self, argument: str) -> str:
