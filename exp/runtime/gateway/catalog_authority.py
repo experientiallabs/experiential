@@ -203,8 +203,9 @@ def upsert_singleton_deployment(
         if changed:
             models = {**current.models, deployment_alias: record}
             current = current.model_copy(update={"models": models})
+        normalized = normalize_gateway_catalog(current)
+        if changed:
             write_model_catalog(path, current)
-    normalized = normalize_gateway_catalog(current)
     snapshot = _write_catalog_snapshot(root, current, normalized)
     return normalized, snapshot, changed
 
