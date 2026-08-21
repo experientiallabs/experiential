@@ -248,6 +248,32 @@ def test_concurrent_writes_share_batches_and_all_become_durable(tmp_path: Path) 
     assert int(count) == 64
 
 
+def test_cancelled_caller_keeps_writer_running_and_write_durable(tmp_path: Path) -> None:
+    """A cancelled awaiting task neither kills the writer nor loses its write."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+
+    async def cancel_then_continue() -> None:
+        """Cancel one submitting task mid-flight, then keep using the writer."""
+        cancelled = _authorize(store, clock, raw_key, "cancelled-prompt")
+        task = asyncio.ensure_future(grouped.accept_request(authorization=cancelled))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        survivor = _authorize(store, clock, raw_key, "survivor-prompt")
+        await grouped.accept_request(authorization=survivor)
+        await grouped.flush()
+
+    asyncio.run(cancel_then_continue())
+    grouped.close()
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    count = connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0]
+    connection.close()
+    assert int(count) == 2
+
+
 def test_closed_writer_rejects_new_operations(tmp_path: Path) -> None:
     """Submissions after close fail fast instead of queueing forever."""
     clock = FakeLedgerClock()

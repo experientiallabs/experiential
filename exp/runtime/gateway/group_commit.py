@@ -39,6 +39,28 @@ _DEFAULT_MAX_BATCH_SIZE = 128
 _T = TypeVar("_T")
 
 
+def _resolve_result(future: concurrent.futures.Future[object], value: object) -> None:
+    """Resolve one pending future, tolerating an already-cancelled caller.
+
+    Args:
+        future: Caller future for one committed operation.
+        value: Durably committed operation result.
+    """
+    if future.set_running_or_notify_cancel():
+        future.set_result(value)
+
+
+def _resolve_exception(future: concurrent.futures.Future[object], error: BaseException) -> None:
+    """Fail one pending future, tolerating an already-cancelled caller.
+
+    Args:
+        future: Caller future for one failed or rolled-back operation.
+        error: Original operation or commit failure.
+    """
+    if future.set_running_or_notify_cancel():
+        future.set_exception(error)
+
+
 @dataclass(frozen=True)
 class _PendingWrite:
     """One queued ledger operation and the future resolved after durable commit."""
@@ -235,7 +257,7 @@ class GroupCommitAttemptLedger:
             connection.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
             for pending in batch:
-                pending.future.set_exception(exc)
+                _resolve_exception(pending.future, exc)
             return
         outcomes: list[tuple[_PendingWrite, object, BaseException | None]] = []
         for index, pending in enumerate(batch):
@@ -258,16 +280,20 @@ class GroupCommitAttemptLedger:
             except sqlite3.Error:
                 _logger.exception("gateway ledger batch rollback failed after commit failure")
             for pending in batch:
-                pending.future.set_exception(exc)
+                _resolve_exception(pending.future, exc)
             return
         for pending, value, error in outcomes:
             if error is not None:
-                pending.future.set_exception(error)
+                _resolve_exception(pending.future, error)
             else:
-                pending.future.set_result(value)
+                _resolve_result(pending.future, value)
 
     async def _submit(self, apply: Callable[[sqlite3.Connection], _T]) -> _T:
         """Enqueue one operation and await its durable batch commit.
+
+        The queued write is shielded from caller cancellation: a cancelled
+        request task stops waiting, but the operation still commits durably
+        and the writer resolves its future without error.
 
         Args:
             apply: Operation run on the writer connection inside the batch transaction.
@@ -284,4 +310,4 @@ class GroupCommitAttemptLedger:
                 future=cast("concurrent.futures.Future[object]", future),
             )
         )
-        return await asyncio.wrap_future(future)
+        return await asyncio.shield(asyncio.wrap_future(future))
