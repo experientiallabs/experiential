@@ -2,7 +2,7 @@
 
 ## Supported surface
 
-No-argument `exp run` starts an authenticated multi-alias gateway on `127.0.0.1`.
+Bare `exp` and no-argument `exp run` start an authenticated multi-alias gateway on `127.0.0.1`.
 It serves:
 
 - `GET /v1/models`

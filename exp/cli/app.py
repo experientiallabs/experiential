@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 
 import typer
 
@@ -28,6 +29,30 @@ add_deferred_typer(
 app.command("build", help="Build a reusable grounded world model from local trace evidence.")(build)
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
 
+_ROOT_COMMANDS = frozenset(("build", "config", "optimize", "run"))
+
+
+def _dispatch_arguments(arguments: list[str]) -> list[str]:
+    """Resolve the root invocation into the existing command parser.
+
+    Bare invocations and gateway options use ``run`` as an implicit command. The explicit root
+    help forms and existing root subcommands remain unchanged, so the shortcut does not duplicate
+    or bypass the gateway command's option validation.
+
+    Args:
+        arguments: User-provided arguments after the ``exp`` executable name.
+
+    Returns:
+        Arguments suitable for the root Typer application.
+    """
+    if not arguments:
+        return ["run"]
+    if arguments[0] == "help":
+        return ["--help", *arguments[1:]]
+    if arguments[0] in {"--help", "-h"} or arguments[0] in _ROOT_COMMANDS:
+        return arguments
+    return ["run", *arguments]
+
 
 def _quiet_http_logs() -> None:
     """Cap noisy per-request loggers at WARNING."""
@@ -39,11 +64,12 @@ def main() -> None:
     """Load local environment settings, quiet HTTP logs, and dispatch the CLI.
 
     The explicit entrypoint keeps environment loading out of import time, so library imports
-    cannot mutate an operator's process environment.
+    cannot mutate an operator's process environment. A bare invocation is routed through the
+    existing gateway command while explicit root help remains available.
     """
     load_env_file()
     _quiet_http_logs()
-    app()
+    app(args=_dispatch_arguments(sys.argv[1:]))
 
 
 if __name__ == "__main__":

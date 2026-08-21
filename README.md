@@ -22,8 +22,11 @@ defaults for the public alias, identity, and `$50.00` command budget before prin
 
 ```bash
 pip install experiential
-exp run
+exp
 ```
+
+Bare `exp` is a shortcut for `exp run`; the explicit form remains available. Use `exp --help`
+or `exp help` for the root command help.
 
 Choose a public alias such as `support-agent`, capture the issued key, and send a request:
 
