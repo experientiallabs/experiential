@@ -8,9 +8,7 @@ import sys
 from pathlib import Path
 
 import typer
-from rich import box
 from rich.console import Console
-from rich.panel import Panel
 from rich.text import Text
 
 from exp.cli.shared.options import ROOT_OPTION, usage_error
@@ -18,6 +16,16 @@ from exp.cli.shared.theme import EXP_THEME
 
 _LOOPBACK_HOST = "127.0.0.1"
 _console = Console(theme=EXP_THEME)
+_EXP_WORDMARK = "\n".join(
+    (
+        "███████╗██╗  ██╗██████╗ ",
+        "██╔════╝╚██╗██╔╝██╔══██╗",
+        "█████╗   ╚███╔╝ ██████╔╝",
+        "██╔══╝   ██╔██╗ ██╔═══╝ ",
+        "███████╗██╔╝ ██╗██║     ",
+        "╚══════╝╚═╝  ╚═╝╚═╝     ",
+    )
+)
 _POLICY_OPTION = typer.Option(
     None,
     "--policy",
@@ -187,16 +195,8 @@ def _run_gateway(
 
 
 def _emit_exp_wordmark() -> None:
-    """Render the compact EXP wordmark for human-facing gateway startup output."""
-    _console.print(
-        Panel(
-            Text("EXP", style="bold"),
-            border_style="green",
-            box=box.SQUARE,
-            expand=False,
-            padding=(0, 1),
-        )
-    )
+    """Render the block-letter EXP wordmark for human-facing gateway startup output."""
+    _console.print(Text(_EXP_WORDMARK, style="bold green"))
 
 
 def _gateway_not_initialized(*, json_output: bool) -> None:
