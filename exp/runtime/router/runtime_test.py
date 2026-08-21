@@ -676,6 +676,57 @@ def test_prepared_selections_keep_physical_evidence_local_until_atomic_retain() 
     assert client.embed_calls == 2
 
 
+def test_project_resolver_selects_the_runtime_bound_to_the_target_catalog_digest() -> None:
+    """Selection resolves the runtime keyed by the target's own catalog digest."""
+    old_runtime, _old_client = _runtime()
+    new_runtime, _new_client = _runtime()
+    other_digest = "b" * 64
+    resolver = RouterProjectTargetResolver(
+        {
+            ("project-one", "activation-one", _DIGEST): old_runtime,
+            ("project-one", "activation-one", other_digest): new_runtime,
+        },
+        {
+            ("project-one", "activation-one", _DIGEST, "baseline"): "exact-old",
+            ("project-one", "activation-one", _DIGEST, "cheap"): "exact-old",
+            ("project-one", "activation-one", other_digest, "baseline"): "exact-new",
+            ("project-one", "activation-one", other_digest, "cheap"): "exact-new",
+        },
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+
+    old_selection = asyncio.run(
+        resolver.select(
+            target=ProjectTarget(
+                project_ref="project-one",
+                activation_ref="activation-one",
+                catalog_sha256=_DIGEST,
+            ),
+            request=request,
+            episode_namespace=("org", "identity", "revision", "episode-old"),
+            deadline_monotonic=__import__("time").monotonic() + 1,
+        )
+    )
+    new_selection = asyncio.run(
+        resolver.select(
+            target=ProjectTarget(
+                project_ref="project-one",
+                activation_ref="activation-one",
+                catalog_sha256=other_digest,
+            ),
+            request=request,
+            episode_namespace=("org", "identity", "revision", "episode-new"),
+            deadline_monotonic=__import__("time").monotonic() + 1,
+        )
+    )
+
+    assert old_selection.exact_model_id == "exact-old"
+    assert new_selection.exact_model_id == "exact-new"
+
+
 def test_project_resolver_retains_failed_embedding_evidence_without_reembedding() -> None:
     """A failed physical embed binds ambiguous accounting through gateway selection."""
     runtime, client = _runtime()
@@ -686,7 +737,7 @@ def test_project_resolver_retains_failed_embedding_evidence_without_reembedding(
         catalog_sha256=_DIGEST,
     )
     resolver = RouterProjectTargetResolver(
-        {("project-one", "activation-one"): runtime},
+        {("project-one", "activation-one", _DIGEST): runtime},
         {("project-one", "activation-one", _DIGEST, "baseline"): "exact-baseline"},
     )
     request = GatewayRequest(
@@ -757,7 +808,7 @@ def test_timed_out_project_selection_cannot_publish_late_sticky_state() -> None:
         catalog_sha256=_DIGEST,
     )
     resolver = RouterProjectTargetResolver(
-        {("project-one", "activation-one"): runtime},
+        {("project-one", "activation-one", _DIGEST): runtime},
         {("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap"},
     )
     request = GatewayRequest(

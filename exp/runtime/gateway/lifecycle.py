@@ -117,7 +117,7 @@ class _AliasAuthorityState:
     authorities: frozenset[tuple[str, str, str]]
     normalized_catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog]
     runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog]
-    activations: Mapping[tuple[str, str], RouterRuntime]
+    activations: Mapping[tuple[str, str, str], RouterRuntime]
     exact_models: Mapping[tuple[str, str, str, str], str]
     listing_pools: Mapping[tuple[str, str, str], str]
     proof: ExecutionSnapshot
@@ -224,7 +224,7 @@ class _AliasAuthorityReloader:
             for key, value in {**dict(previous.exact_models), **dict(loaded.exact_models)}.items()
             if key[2] in digests
         }
-        active_projects = {(key[0], key[1]) for key in exact_models}
+        active_projects = {(key[0], key[1], key[2]) for key in exact_models}
         activations = {
             key: value
             for key, value in {**dict(previous.activations), **dict(loaded.activations)}.items()
@@ -430,7 +430,7 @@ def load_local_gateway(
 
 
 def _project_resolver(
-    activations: Mapping[tuple[str, str], RouterRuntime],
+    activations: Mapping[tuple[str, str, str], RouterRuntime],
     exact_models: Mapping[tuple[str, str, str, str], str],
 ) -> ProjectTargetResolver | None:
     """Build one selection-only project bridge when any activation is loaded."""
@@ -475,7 +475,7 @@ def _load_alias_state(
 
     normalized_catalogs: dict[tuple[str, str], NormalizedGatewayCatalog] = {}
     runtime_catalogs: dict[tuple[str, str], RuntimeModelCatalog] = {}
-    activations: dict[tuple[str, str], RouterRuntime] = {}
+    activations: dict[tuple[str, str, str], RouterRuntime] = {}
     exact_models: dict[tuple[str, str, str, str], str] = {}
     readiness: list[ExecutionSnapshot] = []
     unavailable_aliases: list[tuple[str, str]] = []
@@ -547,7 +547,7 @@ def _load_alias_state(
         ) as exc:
             unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
-        activations[(project_ref, activation_ref)] = runtime
+        activations[(project_ref, activation_ref, catalog_sha256)] = runtime
         normalized_catalogs[key] = normalized
         runtime_catalogs[key] = runtime_catalog
         readiness.append(proof)

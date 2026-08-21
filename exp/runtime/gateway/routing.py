@@ -301,7 +301,7 @@ class RouterProjectTargetResolver:
 
     def __init__(
         self,
-        activations: Mapping[tuple[str, str], RouterRuntime],
+        activations: Mapping[tuple[str, str, str], RouterRuntime],
         exact_models_by_alias: Mapping[tuple[str, str, str, str], str],
         *,
         maximum_outstanding_selections: int = 4,
@@ -309,7 +309,8 @@ class RouterProjectTargetResolver:
         """Bind frozen activations and an exact-model projection.
 
         Args:
-            activations: Project and activation references mapped to verified runtimes.
+            activations: Project, activation, and catalog digest mapped to verified
+                runtimes, so each retained revision keeps its own selection policy.
             exact_models_by_alias: Project, activation, catalog, and candidate alias mappings.
             maximum_outstanding_selections: Running plus detached selection calls allowed.
         """
@@ -338,7 +339,9 @@ class RouterProjectTargetResolver:
         Returns:
             Exact logical model and content-free learned selection details.
         """
-        runtime = self._activations.get((target.project_ref, target.activation_ref))
+        runtime = self._activations.get(
+            (target.project_ref, target.activation_ref, target.catalog_sha256)
+        )
         if runtime is None:
             raise GatewayRoutingError("project activation is not loaded")
         deadline = RequestDeadline(deadline_monotonic)
