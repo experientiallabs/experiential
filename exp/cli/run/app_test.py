@@ -222,6 +222,7 @@ def test_first_run_delivers_credentials_before_readiness_failure(
         )
 
     transcript = output.getvalue()
+    assert transcript.startswith("┌─────┐\n│ EXP │\n└─────┘\n")
     assert "export EXP_GATEWAY_URL=http://127.0.0.1:8000/v1" in transcript
     assert f"export EXP_GATEWAY_KEY={raw_key}" in transcript
     assert "export OPENAI_API_KEY" not in transcript

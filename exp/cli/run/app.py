@@ -8,7 +8,10 @@ import sys
 from pathlib import Path
 
 import typer
+from rich import box
 from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
@@ -100,6 +103,9 @@ def _run_gateway(
     graceful_timeout: float,
 ) -> None:
     """Validate and optionally serve the normal gateway application."""
+    if not json_output:
+        _emit_exp_wordmark()
+
     import uvicorn
 
     from exp.cli.gateway.compatibility import prepare_project_gateway
@@ -178,6 +184,19 @@ def _run_gateway(
         if setup is not None:
             _emit_setup_recovery(setup=setup)
         raise
+
+
+def _emit_exp_wordmark() -> None:
+    """Render the compact EXP wordmark for human-facing gateway startup output."""
+    _console.print(
+        Panel(
+            Text("EXP", style="bold"),
+            border_style="green",
+            box=box.SQUARE,
+            expand=False,
+            padding=(0, 1),
+        )
+    )
 
 
 def _gateway_not_initialized(*, json_output: bool) -> None:
