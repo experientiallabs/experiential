@@ -123,53 +123,61 @@ def _run_gateway(
             _gateway_not_initialized(json_output=json_output)
         with usage_error(ValueError):
             setup = interactive_gateway_setup(root)
+        if setup is not None:
+            _emit_setup_credentials(port=port, setup=setup)
 
-    with usage_error(ValueError):
-        with gateway_instance_lock(root, port=port):
-            project_repository = LocalArtifactProjectActivationRepository(
-                root,
-                verifier=verify_automatic_router_policy,
-            )
-            runtime = load_local_gateway(
-                root,
-                graceful_timeout_seconds=graceful_timeout,
-                project_repository=project_repository,
-                only_aliases=(None if compatibility is None else frozenset({compatibility.alias})),
-            )
-            asyncio.run(runtime.service.preflight())
-            receipt = {
-                "schema_version": 1,
-                "operation": "gateway.check" if check else "gateway.run",
-                "status": "ready",
-                "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
-                "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage",
-                "reconciled_expired_requests": runtime.reconciled_expired_requests,
-                "reconciled_unknown_attempts": runtime.reconciled_unknown_attempts,
-                "launch_mode": "gateway" if compatibility is None else "project_alias",
-            }
-            if compatibility is not None:
-                receipt.update(
-                    {
-                        "project_alias": compatibility.alias,
-                        "alias_revision_id": compatibility.alias_revision_id,
-                        "policy_id": compatibility.policy_id,
-                        "key_file": str(compatibility.key_file),
-                        "project_journal": "disabled",
-                        "gateway_accounting": "enabled",
-                    }
+    try:
+        with usage_error(ValueError):
+            with gateway_instance_lock(root, port=port):
+                project_repository = LocalArtifactProjectActivationRepository(
+                    root,
+                    verifier=verify_automatic_router_policy,
                 )
-            if json_output:
-                typer.echo(json.dumps(receipt, separators=(",", ":")))
-            else:
-                _emit_gateway_ready(
-                    port=port,
-                    setup=setup,
-                    compatibility=compatibility,
-                    ghost=ghost,
+                runtime = load_local_gateway(
+                    root,
+                    graceful_timeout_seconds=graceful_timeout,
+                    project_repository=project_repository,
+                    only_aliases=(
+                        None if compatibility is None else frozenset({compatibility.alias})
+                    ),
                 )
-            if check:
-                return
-            uvicorn.run(runtime.app, host=_LOOPBACK_HOST, port=port)
+                asyncio.run(runtime.service.preflight())
+                receipt = {
+                    "schema_version": 1,
+                    "operation": "gateway.check" if check else "gateway.run",
+                    "status": "ready",
+                    "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
+                    "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage",
+                    "reconciled_expired_requests": runtime.reconciled_expired_requests,
+                    "reconciled_unknown_attempts": runtime.reconciled_unknown_attempts,
+                    "launch_mode": "gateway" if compatibility is None else "project_alias",
+                }
+                if compatibility is not None:
+                    receipt.update(
+                        {
+                            "project_alias": compatibility.alias,
+                            "alias_revision_id": compatibility.alias_revision_id,
+                            "policy_id": compatibility.policy_id,
+                            "key_file": str(compatibility.key_file),
+                            "project_journal": "disabled",
+                            "gateway_accounting": "enabled",
+                        }
+                    )
+                if json_output:
+                    typer.echo(json.dumps(receipt, separators=(",", ":")))
+                else:
+                    _emit_gateway_ready(
+                        port=port,
+                        compatibility=compatibility,
+                        ghost=ghost,
+                    )
+                if check:
+                    return
+                uvicorn.run(runtime.app, host=_LOOPBACK_HOST, port=port)
+    except typer.BadParameter:
+        if setup is not None:
+            _emit_setup_recovery(setup=setup)
+        raise
 
 
 def _gateway_not_initialized(*, json_output: bool) -> None:
@@ -205,14 +213,63 @@ def _gateway_not_initialized(*, json_output: bool) -> None:
     raise typer.Exit(2)
 
 
+def _emit_setup_credentials(*, port: int, setup: object) -> None:
+    """Deliver first-run gateway credentials before independent readiness checks run.
+
+    Args:
+        port: Loopback port that the gateway will serve when ready.
+        setup: First-run setup result containing the one-time raw gateway key.
+
+    Raises:
+        TypeError: The setup result is not the gateway setup contract.
+    """
+    from exp.cli.gateway.setup import InteractiveSetupResult
+
+    if not isinstance(setup, InteractiveSetupResult):
+        raise TypeError("interactive setup returned an invalid result")
+    _console.print(f"export EXP_GATEWAY_URL=http://{_LOOPBACK_HOST}:{port}/v1", markup=False)
+    _console.print(f"export EXP_GATEWAY_KEY={setup.raw_key}", markup=False)
+
+
+def _emit_setup_recovery(*, setup: object) -> None:
+    """Print recovery steps when first-run setup outlives a failed readiness check.
+
+    Args:
+        setup: First-run setup result identifying the identity that owns the key.
+
+    Raises:
+        TypeError: The setup result is not the gateway setup contract.
+    """
+    from exp.cli.gateway.setup import InteractiveSetupResult
+
+    if not isinstance(setup, InteractiveSetupResult):
+        raise TypeError("interactive setup returned an invalid result")
+    _console.print(
+        "[yellow]First-run gateway setup completed, but the gateway is not ready.[/yellow]",
+        markup=True,
+    )
+    _console.print(
+        "Keep the gateway credentials printed above, fix the listed provider configuration, "
+        "and rerun `exp run`.",
+        markup=False,
+    )
+    _console.print(
+        "If the key was not saved, issue a replacement with:",
+        markup=False,
+    )
+    _console.print(
+        f"  exp config gateway key issue {setup.identity_id} --key-id RECOVERY_KEY --json",
+        markup=False,
+    )
+
+
 def _emit_gateway_ready(
     *,
     port: int,
-    setup: object | None,
     compatibility: object | None,
     ghost: bool,
 ) -> None:
-    """Print the green startup result and only the exports needed to use the gateway."""
+    """Print the green startup result and project compatibility credentials."""
     _console.print(
         f"[green]✓ Gateway ready[/green] http://{_LOOPBACK_HOST}:{port}/v1",
         markup=True,
@@ -223,13 +280,10 @@ def _emit_gateway_ready(
         if not isinstance(compatibility, ProjectGatewayCompatibility):
             raise TypeError("project gateway compatibility returned an invalid result")
         _console.print(
-            f"export OPENAI_API_KEY=\"$(tr -d '\\n' < {compatibility.key_file})\"",
+            f"export EXP_GATEWAY_URL=http://{_LOOPBACK_HOST}:{port}/v1",
             markup=False,
         )
-    if setup is not None:
-        from exp.cli.gateway.setup import InteractiveSetupResult
-
-        if not isinstance(setup, InteractiveSetupResult):
-            raise TypeError("interactive setup returned an invalid result")
-        _console.print(f"export OPENAI_BASE_URL=http://{_LOOPBACK_HOST}:{port}/v1", markup=False)
-        _console.print(f"export OPENAI_API_KEY={setup.raw_key}", markup=False)
+        _console.print(
+            f"export EXP_GATEWAY_KEY=\"$(tr -d '\\n' < {compatibility.key_file})\"",
+            markup=False,
+        )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -9,10 +10,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import typer
+from rich.console import Console
 from typer.testing import CliRunner
 
+import exp.cli.run.app as run_app
 from exp.cli.app import app
 from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
+from exp.cli.gateway.setup import InteractiveSetupResult
 
 
 @pytest.mark.parametrize("ghost", [False, True])
@@ -151,3 +156,75 @@ def test_no_argument_noninteractive_run_returns_stable_empty_state_json(tmp_path
     assert payload["error"]["code"] == "gateway_not_initialized"
     assert payload["error"]["next_commands"][0].startswith("exp config gateway init")
     assert not (tmp_path / "gateway").exists()
+
+
+def test_first_run_delivers_credentials_before_readiness_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-run credentials remain recoverable when local readiness rejects the route."""
+    raw_key = "exp_vk_test-first-run-key"
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, highlight=False)
+    setup_result = InteractiveSetupResult(
+        identity_id="default",
+        alias="gpt-5-6-luna",
+        raw_key=raw_key,
+    )
+
+    def interactive_setup(root: Path) -> InteractiveSetupResult:
+        """Return the setup result that the launch path must deliver before preflight."""
+        assert root == tmp_path
+        return setup_result
+
+    def load_gateway(
+        root: Path,
+        *,
+        graceful_timeout_seconds: float,
+        project_repository: object,
+        only_aliases: frozenset[str] | None,
+    ) -> object:
+        """Fail readiness only after confirming that setup credentials were printed."""
+        del root, graceful_timeout_seconds, project_repository, only_aliases
+        transcript = output.getvalue()
+        assert transcript.index(f"export EXP_GATEWAY_KEY={raw_key}") < len(transcript)
+        raise ValueError(
+            "no granted active alias is locally available: "
+            "gpt-5-6-luna (connection credential environment variable "
+            "'OPENAI_API_KEY' is not set); fix the listed provider configuration and rerun "
+            "'exp run'"
+        )
+
+    @contextmanager
+    def instance_lock(root: Path, *, port: int) -> Iterator[None]:
+        """Provide the single-process seam without creating a real gateway lock."""
+        del root, port
+        yield
+
+    monkeypatch.setattr(run_app, "_console", console)
+    monkeypatch.setattr("exp.cli.gateway.setup.interactive_gateway_setup", interactive_setup)
+    monkeypatch.setattr("exp.runtime.gateway.lifecycle.load_local_gateway", load_gateway)
+    monkeypatch.setattr("exp.runtime.gateway.lifecycle.gateway_instance_lock", instance_lock)
+    monkeypatch.setattr(run_app.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(run_app.sys, "stdout", SimpleNamespace(isatty=lambda: True))
+
+    with pytest.raises(typer.BadParameter, match="OPENAI_API_KEY") as failure:
+        run_app._run_gateway(
+            project=None,
+            root=tmp_path,
+            policy=None,
+            port=8000,
+            ghost=False,
+            non_interactive=False,
+            json_output=False,
+            check=True,
+            graceful_timeout=10.0,
+        )
+
+    transcript = output.getvalue()
+    assert "export EXP_GATEWAY_URL=http://127.0.0.1:8000/v1" in transcript
+    assert f"export EXP_GATEWAY_KEY={raw_key}" in transcript
+    assert "export OPENAI_API_KEY" not in transcript
+    assert "First-run gateway setup completed, but the gateway is not ready." in transcript
+    assert "fix the listed provider configuration and rerun 'exp run'" in str(failure.value)
+    assert "exp config gateway key issue default --key-id RECOVERY_KEY --json" in transcript

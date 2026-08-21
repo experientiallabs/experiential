@@ -290,6 +290,17 @@ def test_readiness_requires_an_explicit_grant(tmp_path: Path) -> None:
         load_local_gateway(tmp_path, graceful_timeout_seconds=1, environment={})
 
 
+def test_unavailable_alias_reports_its_provider_readiness_reason(tmp_path: Path) -> None:
+    """A failed direct alias names the missing provider configuration and retry command."""
+    _manager, _raw_key = _configured_gateway(tmp_path)
+
+    with pytest.raises(
+        GatewayLifecycleError,
+        match=r"coding.*TEST_PROVIDER_KEY.*rerun 'exp run'",
+    ):
+        load_local_gateway(tmp_path, graceful_timeout_seconds=1, environment={})
+
+
 def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) -> None:
     """One absent provider secret does not block another complete granted alias."""
     manager, raw_key = _configured_gateway(tmp_path)

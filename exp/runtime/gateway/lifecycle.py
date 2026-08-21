@@ -233,7 +233,7 @@ def load_local_gateway(
     activations: dict[tuple[str, str], RouterRuntime] = {}
     exact_models: dict[tuple[str, str, str, str], str] = {}
     readiness: list[ExecutionSnapshot] = []
-    unavailable_aliases: list[str] = []
+    unavailable_aliases: list[tuple[str, str]] = []
 
     for alias in aliases:
         revision_id, catalog_sha256 = _required_revision(alias)
@@ -243,8 +243,8 @@ def load_local_gateway(
         if alias.target_kind == "direct":
             try:
                 proof = _direct_readiness(manager, alias, normalized, runtime_catalog)
-            except (ModelConnectionError, ModelCredentialError):
-                unavailable_aliases.append(alias.alias_name)
+            except (ModelConnectionError, ModelCredentialError) as exc:
+                unavailable_aliases.append((alias.alias_name, str(exc)))
                 continue
             normalized_catalogs[key] = normalized
             runtime_catalogs[key] = runtime_catalog
@@ -285,10 +285,10 @@ def load_local_gateway(
         except RouterApplicationError as exc:
             if not _caused_by_connection_error(exc):
                 raise
-            unavailable_aliases.append(alias.alias_name)
+            unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
-        except (ModelConnectionError, ModelCredentialError):
-            unavailable_aliases.append(alias.alias_name)
+        except (ModelConnectionError, ModelCredentialError) as exc:
+            unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
         activations[(project_ref, activation_ref)] = runtime
         normalized_catalogs[key] = normalized
@@ -296,9 +296,14 @@ def load_local_gateway(
         readiness.append(proof)
 
     if not readiness:
-        unavailable = ", ".join(sorted(unavailable_aliases))
+        unavailable = "; ".join(
+            f"{alias_name} ({reason})" for alias_name, reason in sorted(unavailable_aliases)
+        )
         detail = f": {unavailable}" if unavailable else ""
-        raise GatewayLifecycleError(f"no granted active alias is locally available{detail}")
+        raise GatewayLifecycleError(
+            "no granted active alias is locally available"
+            f"{detail}; fix the listed provider configuration and rerun 'exp run'"
+        )
 
     project_resolver = cast(
         ProjectTargetResolver | None,

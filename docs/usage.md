@@ -41,6 +41,12 @@ grant, and a virtual key. Interactive first-run setup can persist multiple provi
 creates one initial gateway alias; additional deployments and certified pools remain explicit
 gateway configuration. `exp run --non-interactive --json` returns `gateway_not_initialized` plus
 exact next commands on an empty root. `exp run --check` validates local readiness without binding.
+First-run setup prints `EXP_GATEWAY_URL` and the newly issued `EXP_GATEWAY_KEY` before readiness is
+checked, so the credentials remain available even when a provider route is not ready. The gateway-
+specific variables avoid overwriting an upstream provider's `OPENAI_API_KEY`. The error names the
+unavailable alias and provider configuration; fix that configuration and rerun `exp run`. If the
+one-time key was not saved, issue a replacement with
+`exp config gateway key issue IDENTITY --key-id KEY --json`.
 The gateway writes no prompts, responses, tool arguments, raw keys, or provider secrets to SQLite.
 `GET /usage` and `GET /usage.json` expose the same schema-v2 content-free overall and per-identity
 counts, token usage, latency, terminal states, and attributed estimated cost. Their attempt-only
