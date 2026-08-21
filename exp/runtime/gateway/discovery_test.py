@@ -10,9 +10,9 @@ from exp.common.models.model import ModelCapabilities
 from exp.runtime.gateway.discovery import (
     PublishedAliasMetadata,
     listing_metadata_by_alias,
-    published_alias_metadata,
     public_model_list,
     public_model_object,
+    published_alias_metadata,
     require_granted_authority,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
