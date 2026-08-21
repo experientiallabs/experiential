@@ -508,11 +508,11 @@ def test_empty_model_list_offers_recovery_and_can_skip_the_provider() -> None:
     assert prepared is not None
     _, models = prepared
     assert [model.alias for model in models] == ["claude-sonnet-5"]
-    assert "published no model with verified metadata" in console.output
+    assert "published no model identity" in console.output
 
 
 def test_models_without_verified_metadata_are_hidden_from_the_normal_path() -> None:
-    """An unverified model cannot serve a role, so setup never offers or claims it."""
+    """An official listing without maintained metadata stays off the verified path."""
     console = ScriptedConsole("")
     lister = _FakeLister({"openai": [(_LUNA, _UNVERIFIED, _EMBEDDING)]})
 
@@ -527,6 +527,75 @@ def test_models_without_verified_metadata_are_hidden_from_the_normal_path() -> N
     _, models = prepared
     assert [model.model for model in models] == ["gpt-5.6-luna", "text-embedding-3-small"]
     assert "internal-preview-model" not in console.output
+
+
+def test_openai_compatible_identity_only_models_stay_visible_as_unknown() -> None:
+    """A trusted compatible listing remains selectable when the host publishes only identities."""
+    console = ScriptedConsole("https://models.example.test/v1\n\n")
+    lister = _FakeLister(
+        {
+            "openai-compatible": [
+                (DiscoveredModel(provider="openai-compatible", model="hosted-chat"),)
+            ]
+        }
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai-compatible",),
+        lister=lister,
+        environment={"OPENAI_COMPATIBLE_API_KEY": "compat-secret"},
+    )
+
+    assert prepared is not None
+    _, models = prepared
+    assert [model.model for model in models] == ["hosted-chat"]
+    assert models[0].capabilities is None
+    assert models[0].pricing_source is PricingSource.UNKNOWN
+    assert models[0].published is not None
+    assert models[0].published.model == "hosted-chat"
+    assert f"1 models with {provider_picker.UNKNOWN_METADATA_LABEL}" in console.output
+    assert "published no model with verified metadata" not in console.output
+
+
+def test_openai_compatible_keeps_verified_and_unknown_identities() -> None:
+    """Published extension metadata stays verified beside identity-only siblings."""
+    console = ScriptedConsole("https://models.example.test/v1\n\n")
+    lister = _FakeLister(
+        {
+            "openai-compatible": [
+                (
+                    DiscoveredModel(
+                        provider="openai-compatible",
+                        model="hosted-chat",
+                        supports_completions=True,
+                        supports_structured_output=True,
+                        input_cost_per_million_tokens_usd=1.0,
+                        output_cost_per_million_tokens_usd=2.0,
+                    ),
+                    DiscoveredModel(provider="openai-compatible", model="hosted-preview"),
+                )
+            ]
+        }
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai-compatible",),
+        lister=lister,
+        environment={"OPENAI_COMPATIBLE_API_KEY": "compat-secret"},
+    )
+
+    assert prepared is not None
+    _, models = prepared
+    by_model = {item.model: item for item in models}
+    assert set(by_model) == {"hosted-chat", "hosted-preview"}
+    assert by_model["hosted-chat"].pricing_source is PricingSource.PROVIDER
+    assert by_model["hosted-chat"].capabilities is not None
+    assert serves_role(by_model["hosted-chat"].capabilities, SetupRole.WORLD_MODEL)
+    assert by_model["hosted-preview"].capabilities is None
+    assert by_model["hosted-preview"].pricing_source is PricingSource.UNKNOWN
+    assert f"1 models, 1 with {provider_picker.UNKNOWN_METADATA_LABEL}" in console.output
 
 
 def test_discovered_metadata_and_roles_come_from_the_maintained_table() -> None:

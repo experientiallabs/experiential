@@ -102,9 +102,17 @@ The same two connections work for evidence builds and router optimization throug
 `base_url` and credential environment variable; see `reference/providers.md` for that
 flow.
 
-A hosted WMO gateway is the same provider family. Point `base_url` at its `/v1` origin and
-present a granted virtual key. `GET /v1/models` keeps the OpenAI list shape and publishes
-per-alias completion capabilities, limits, and configured micro-USD prices from the active
-catalog. `exp config providers --provider openai-compatible` reads those optional fields,
-converts micro-USD prices to USD per million tokens, and leaves unknown any field the catalog
-did not declare. It does not treat official OpenAI listing metadata the same way.
+Any trusted OpenAI-compatible host is usable from that command, including an identity-only
+`GET /v1/models` response. Setup lists those identities and labels missing capabilities and
+prices as unknown. The operator then declares the minimum fields for the selected role in the
+interactive screens, or authors the same configured metadata with `--non-interactive`
+`--connection-json` / `--model-json` (or a hand-written `.exp/models.toml` record). Setup never
+infers tools, structured output, token limits, or prices.
+
+A hosted Experiential gateway is the same provider family and an optional richer listing. Point
+`base_url` at its `/v1` origin and present a granted virtual key. `GET /v1/models` keeps the
+OpenAI list shape and may publish per-alias completion capabilities, limits, and configured
+micro-USD prices from the active catalog. `exp config providers --provider openai-compatible`
+reads those optional fields, converts micro-USD prices to USD per million tokens, and leaves
+unknown any field the catalog did not declare. It does not treat official OpenAI listing
+metadata the same way.

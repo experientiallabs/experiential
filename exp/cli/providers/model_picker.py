@@ -3,10 +3,12 @@
 These screens run after every selected provider has been prepared. Setup asks for each model
 role in turn: world model, judge, embedder, then optional router candidates and their incumbent.
 Every screen uses the shared picker with concise shorthand aliases, sorted so the recommended
-model for each role comes first. The screens filter new build-role assignments to models whose
-verified metadata can serve them, preserve exact prior assignments as retain-only choices, ask
-for a role-specific reasoning effort directly after each completion role names a reasoning-capable
-model, and render the single compact summary shown before setup saves anything.
+model for each role comes first. Verified metadata can be assigned immediately. Identity-only
+OpenAI-compatible models stay visible as unknown; selecting one collects an explicit operator
+declaration of the minimum capabilities and prices that role needs. Exact prior assignments remain
+retain-only choices. Each completion role then asks for a role-specific reasoning effort when the
+selected model already carries a reasoning pin, and the compact summary is shown before setup
+saves anything.
 """
 
 from __future__ import annotations
@@ -17,8 +19,14 @@ from dataclasses import dataclass, field
 from typing import get_args
 
 from rich.console import Console
-from rich.prompt import Confirm
 
+from exp.cli.providers.declaration import (
+    can_declare_role,
+    declare_model,
+    declare_role_metadata,
+    eligible_for_role,
+    role_row_detail,
+)
 from exp.cli.providers.provider_picker import (
     AvailableModel,
     PreparedEndpoint,
@@ -26,8 +34,6 @@ from exp.cli.providers.provider_picker import (
     SetupCancelled,
     SetupRoleInputs,
     SetupSession,
-    ask_positive_int,
-    ask_price,
     ask_text,
 )
 from exp.cli.shared.picker import PickerAction, PickerOption, choose_many, choose_one
@@ -46,6 +52,12 @@ from exp.common.models import (
 )
 from exp.common.models.known_models import recommended_model_rank
 
+_CandidateAssignment = tuple[
+    tuple[str, ...],
+    str | None,
+    dict[str, ReasoningEffort],
+    tuple[AvailableModel, ...],
+]
 _MANUAL_MODEL_ROW = "declare-model-manually"
 _NO_REASONING_EFFORT = "none"
 _REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
@@ -63,6 +75,7 @@ class RoleAssignment:
     world_model_reasoning_effort: ReasoningEffort | None = None
     judge_reasoning_effort: ReasoningEffort | None = None
     candidate_reasoning_efforts: dict[str, ReasoningEffort] = field(default_factory=dict)
+    declared_models: tuple[AvailableModel, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -92,11 +105,8 @@ def _role_options(items: tuple[AvailableModel, ...]) -> list[PickerOption]:
 
 
 def _role_detail(item: AvailableModel) -> str:
-    """Annotate one role row, keeping only retain-only notes."""
-    if item.capabilities is None:
-        roles = ", ".join(sorted(role.value for role in item.retainable_roles))
-        return f"retain only: {roles}" if roles else "unverified"
-    return ""
+    """Annotate one role row, keeping unknown and retain-only notes."""
+    return role_row_detail(item)
 
 
 def recommendation_key(
@@ -149,8 +159,8 @@ def _role_ordered(
     """
 
     def key(item: AvailableModel) -> tuple[int, tuple[int, int, int, float, str, str]]:
-        """Sort verified models by recommendation and retain-only models after them."""
-        if item.capabilities is None:
+        """Sort verified models by recommendation and unknown or retain-only models after them."""
+        if item.capabilities is None or not serves_role(item.capabilities, role):
             return (1, (0, 0, 0, 0.0, item.provider, item.model))
         return (0, recommendation_key(item.provider, item.model, item.capabilities, role))
 
@@ -330,89 +340,6 @@ def _declare_gateway_model(
     )
 
 
-def declare_model(session: SetupSession, *, console: Console) -> AvailableModel | None:
-    """Declare one model and its capabilities by hand under the advanced path.
-
-    Args:
-        session: Prepared endpoints and aliases already used in this session.
-        console: Terminal used for prompts.
-
-    Returns:
-        The declared model, or ``None`` when no prepared connection can host it.
-
-    Raises:
-        SetupCancelled: The user cancelled setup at a prompt.
-    """
-    if not session.endpoints:
-        console.print("[yellow]Prepare a provider connection first.[/yellow]")
-        return None
-    connections = [
-        PickerOption(
-            value=endpoint.connection.name,
-            label=endpoint.connection.name,
-            detail=f"{endpoint.connection.provider}",
-        )
-        for endpoint in session.endpoints
-    ]
-    chosen = choose_one(console, title="Connection for the declared model", options=connections)
-    if chosen.action is PickerAction.CANCEL:
-        raise SetupCancelled
-    if chosen.action is PickerAction.BACK:
-        return None
-    connection_name = chosen.values[0]
-    provider = next(
-        endpoint.connection.provider
-        for endpoint in session.endpoints
-        if endpoint.connection.name == connection_name
-    )
-    model = ask_text("Provider model ID", console=console)
-    if not model:
-        return None
-    supports_completions = Confirm.ask("Supports chat completions?", default=True, console=console)
-    supports_embeddings = Confirm.ask("Supports embeddings?", default=False, console=console)
-    capabilities = ModelCapabilities(
-        supports_completions=supports_completions,
-        supports_embeddings=supports_embeddings,
-        supports_tools=Confirm.ask("Supports tools?", default=False, console=console),
-        supports_structured_output=Confirm.ask(
-            "Supports structured output?", default=False, console=console
-        ),
-        context_window_tokens=ask_positive_int("Context window tokens", console=console),
-        maximum_output_tokens=ask_positive_int("Maximum output tokens", console=console),
-        input_cost_per_million_tokens_usd=ask_price(
-            "Input cost per million tokens in USD", console=console
-        )
-        if supports_completions or supports_embeddings
-        else None,
-        output_cost_per_million_tokens_usd=ask_price(
-            "Output cost per million tokens in USD", console=console
-        )
-        if supports_completions
-        else None,
-        cached_input_cost_per_million_tokens_usd=ask_price(
-            "Cached input cost per million tokens in USD", console=console
-        )
-        if supports_completions
-        else None,
-        cache_write_cost_per_million_tokens_usd=ask_price(
-            "Cache write cost per million tokens in USD", console=console
-        )
-        if supports_completions
-        else None,
-        reasoning_effort=_ask_reasoning_effort(console=console) if supports_completions else None,
-    )
-    taken = frozenset(item.alias for item in available_models(session))
-    return AvailableModel(
-        alias=derive_model_alias(provider, model, taken),
-        connection=connection_name,
-        provider=provider,
-        model=model,
-        capabilities=capabilities,
-        pricing_source=PricingSource.CONFIGURED,
-        configured=False,
-    )
-
-
 def _parse_reasoning_effort(value: str) -> ReasoningEffort | None:
     """Return the reasoning effort named by a picker value, or ``None`` for no pin."""
     return next((effort for effort in _REASONING_EFFORTS if effort == value), None)
@@ -519,68 +446,88 @@ def assign_roles(
     Raises:
         SetupCancelled: The user cancelled setup.
     """
-    world_model = _assign_one_role(
-        chosen,
+    models = {item.alias: item for item in chosen}
+
+    def pool() -> tuple[AvailableModel, ...]:
+        """Return the current role-assignment pool, including declared metadata."""
+        return tuple(models.values())
+
+    world_item = _assign_one_role(
+        pool(),
         role=SetupRole.WORLD_MODEL,
         title="World model",
         role_name="world model",
         default=role_inputs.world_model,
         console=console,
     )
-    if world_model is None:
+    if world_item is None:
         return None
+    models[world_item.alias] = world_item
     world_effort = _ask_role_reasoning_effort(
-        chosen,
-        alias=world_model,
+        pool(),
+        alias=world_item.alias,
         role_name="world model",
         default=role_inputs.world_model_reasoning_effort
-        if world_model == role_inputs.world_model
+        if world_item.alias == role_inputs.world_model
         else None,
         console=console,
     )
     if isinstance(world_effort, _RoleEffortBack):
         return None
-    judge = _assign_one_role(
-        chosen,
+    judge_item = _assign_one_role(
+        pool(),
         role=SetupRole.JUDGE,
         title="Judge",
         role_name="judge",
         default=role_inputs.judge,
         console=console,
     )
-    if judge is None:
+    if judge_item is None:
         return None
+    models[judge_item.alias] = judge_item
     judge_effort = _ask_role_reasoning_effort(
-        chosen,
-        alias=judge,
+        pool(),
+        alias=judge_item.alias,
         role_name="judge",
-        default=role_inputs.judge_reasoning_effort if judge == role_inputs.judge else None,
+        default=(
+            role_inputs.judge_reasoning_effort if judge_item.alias == role_inputs.judge else None
+        ),
         console=console,
     )
     if isinstance(judge_effort, _RoleEffortBack):
         return None
-    embedder = _assign_one_role(
-        chosen,
+    embedder_item = _assign_one_role(
+        pool(),
         role=SetupRole.EMBEDDER,
         title="Embedder",
         role_name="embedder",
         default=role_inputs.embedder,
         console=console,
     )
-    if embedder is None:
+    if embedder_item is None:
         return None
-    candidates = _assign_candidates(chosen, role_inputs=role_inputs, console=console)
+    models[embedder_item.alias] = embedder_item
+    candidates = _assign_candidates(pool(), role_inputs=role_inputs, console=console)
     if candidates is None:
         return None
+    for item in candidates[3]:
+        models[item.alias] = item
+    used = {
+        world_item.alias,
+        judge_item.alias,
+        embedder_item.alias,
+        *candidates[0],
+    }
     return RoleAssignment(
-        world_model=world_model,
-        judge=judge,
-        embedder=embedder,
+        world_model=world_item.alias,
+        judge=judge_item.alias,
+        embedder=embedder_item.alias,
         candidates=candidates[0],
         incumbent=candidates[1],
         world_model_reasoning_effort=world_effort,
         judge_reasoning_effort=judge_effort,
         candidate_reasoning_efforts=candidates[2],
+        declared_models=tuple(models[alias] for alias in used if alias in models),
     )
 
 
@@ -592,7 +539,7 @@ def _assign_one_role(
     role_name: str,
     default: str | None,
     console: Console,
-) -> str | None:
+) -> AvailableModel | None:
     """Choose one model for a role from the compatible selected models.
 
     Args:
@@ -604,13 +551,14 @@ def _assign_one_role(
         console: Terminal used for the screen.
 
     Returns:
-        The chosen alias, or ``None`` when the model selection must change.
+        The chosen model, possibly with operator-declared metadata, or ``None`` when the
+        model selection must change.
 
     Raises:
         SetupCancelled: The user cancelled setup.
     """
     eligible = _role_ordered(
-        tuple(item for item in chosen if _serves_or_retains(item, role)),
+        tuple(item for item in chosen if eligible_for_role(item, role)),
         role,
     )
     if not eligible:
@@ -629,7 +577,14 @@ def _assign_one_role(
         raise SetupCancelled
     if result.action is PickerAction.BACK:
         return None
-    return result.values[0]
+    item = next(entry for entry in eligible if entry.alias == result.values[0])
+    if item.capabilities is not None and serves_role(item.capabilities, role):
+        return item
+    if role in item.retainable_roles and not can_declare_role(item, role):
+        return item
+    if can_declare_role(item, role):
+        return declare_role_metadata(item, role, console=console)
+    return item
 
 
 def _assign_candidates(
@@ -637,7 +592,7 @@ def _assign_candidates(
     *,
     role_inputs: SetupRoleInputs,
     console: Console,
-) -> tuple[tuple[str, ...], str | None, dict[str, ReasoningEffort]] | None:
+) -> _CandidateAssignment | None:
     """Choose optional router candidates, their efforts, and the incumbent.
 
     Args:
@@ -646,8 +601,8 @@ def _assign_candidates(
         console: Terminal used for the screens.
 
     Returns:
-        Candidate aliases, incumbent, and per-candidate reasoning efforts, or ``None`` when
-        the selection must change.
+        Candidate aliases, incumbent, per-candidate reasoning efforts, and any models whose
+        metadata the operator declared, or ``None`` when the selection must change.
 
     Raises:
         SetupCancelled: The user cancelled setup.
@@ -669,6 +624,7 @@ def select_router_candidates(
     incumbent: str | None = None,
     effort_defaults: Mapping[str, ReasoningEffort] | None = None,
     console: Console,
+    declared_models: list[AvailableModel] | None = None,
 ) -> RouterCandidateSelection | None:
     """Choose at least two eligible completion models, their efforts, and one incumbent.
 
@@ -678,6 +634,7 @@ def select_router_candidates(
         incumbent: Explicit incumbent that skips the incumbent screen.
         effort_defaults: Persisted per-candidate efforts accepted with an empty line.
         console: Terminal used for the screens.
+        declared_models: Optional list that receives operator-declared candidate metadata.
 
     Returns:
         A confirmed candidate selection, or ``None`` when the caller should return to its
@@ -697,6 +654,8 @@ def select_router_candidates(
     )
     if picked is None or picked[1] is None:
         return None
+    if declared_models is not None:
+        declared_models.extend(picked[3])
     return RouterCandidateSelection(
         candidates=picked[0],
         incumbent=picked[1],
@@ -712,7 +671,7 @@ def _assign_router_candidates(
     effort_defaults: Mapping[str, ReasoningEffort],
     console: Console,
     required: bool,
-) -> tuple[tuple[str, ...], str | None, dict[str, ReasoningEffort]] | None:
+) -> _CandidateAssignment | None:
     """Share router-candidate selection between optional setup and required router setup.
 
     Args:
@@ -724,8 +683,8 @@ def _assign_router_candidates(
         required: Whether fewer than two selected candidates is an error instead of a skip.
 
     Returns:
-        Candidate aliases, incumbent, and per-candidate reasoning efforts, or ``None`` when
-        the caller should go back.
+        Candidate aliases, incumbent, per-candidate reasoning efforts, and declared models,
+        or ``None`` when the caller should go back.
 
     Raises:
         SetupCancelled: The user cancelled interactive setup.
@@ -739,6 +698,7 @@ def _assign_router_candidates(
                 item.capabilities is not None
                 and serves_role(item.capabilities, SetupRole.ROUTER_CANDIDATE)
             )
+            or (required and can_declare_role(item, SetupRole.ROUTER_CANDIDATE))
             or (not required and SetupRole.ROUTER_CANDIDATE in item.retainable_roles)
         ),
         SetupRole.ROUTER_CANDIDATE,
@@ -754,7 +714,7 @@ def _assign_router_candidates(
             "[dim]Router candidates need two priced models with explicit token limits. "
             "Skipping that role for now.[/dim]"
         )
-        return (), None, {}
+        return (), None, {}, ()
     eligible_aliases = {item.alias for item in eligible}
     unknown = tuple(alias for alias in preselected if alias not in eligible_aliases)
     if unknown:
@@ -778,11 +738,31 @@ def _assign_router_candidates(
             console.print("[yellow]Router candidates need at least two models.[/yellow]")
             return None
         console.print("[dim]Router candidates need at least two models. Skipping that role.[/dim]")
-        return (), None, {}
+        return (), None, {}, ()
+    by_alias = {item.alias: item for item in chosen}
+    declared: list[AvailableModel] = []
+    for alias in result.values:
+        item = by_alias[alias]
+        if item.capabilities is not None and serves_role(
+            item.capabilities, SetupRole.ROUTER_CANDIDATE
+        ):
+            continue
+        if SetupRole.ROUTER_CANDIDATE in item.retainable_roles and not can_declare_role(
+            item, SetupRole.ROUTER_CANDIDATE
+        ):
+            continue
+        if not can_declare_role(item, SetupRole.ROUTER_CANDIDATE):
+            continue
+        declared_item = declare_role_metadata(item, SetupRole.ROUTER_CANDIDATE, console=console)
+        if declared_item is None:
+            return None
+        by_alias[alias] = declared_item
+        declared.append(declared_item)
+    updated = tuple(by_alias[alias] for alias in result.values)
     efforts: dict[str, ReasoningEffort] = {}
     for alias in result.values:
         effort = _ask_role_reasoning_effort(
-            chosen,
+            updated,
             alias=alias,
             role_name="router candidate",
             default=effort_defaults.get(alias),
@@ -795,7 +775,7 @@ def _assign_router_candidates(
     if incumbent is not None:
         if incumbent not in result.values:
             raise ValueError("router incumbent must also be a selected candidate")
-        return result.values, incumbent, efforts
+        return result.values, incumbent, efforts, tuple(declared)
     incumbent_result = choose_one(
         console,
         title="Router incumbent",
@@ -810,7 +790,7 @@ def _assign_router_candidates(
         raise SetupCancelled
     if incumbent_result.action is PickerAction.BACK:
         return None
-    return result.values, incumbent_result.values[0], efforts
+    return result.values, incumbent_result.values[0], efforts, tuple(declared)
 
 
 def build_result(

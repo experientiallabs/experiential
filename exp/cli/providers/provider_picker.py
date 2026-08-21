@@ -2,10 +2,10 @@
 
 Setup opens with one provider screen, resolves each selected provider's credential from its
 canonical environment variable or a masked paste, then asks that provider which models the
-authenticated account may call. Discovered metadata is merged with EXP's maintained capability and
-price table, so a model whose metadata cannot satisfy any build role is hidden rather than turned
-into a questionnaire. Providers without a safe listing API keep manual declaration on the model
-screen.
+authenticated account may call. Discovery lists identities. Verification is a separate step:
+maintained or provider-published metadata can prove a role, and identity-only OpenAI-compatible
+models stay visible as unknown until the operator declares the minimum fields for a selected role.
+Providers without a safe listing API keep manual declaration on the model screen.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from exp.cli.shared.picker import (
 )
 from exp.common.models import (
     ConnectionConfig,
+    DiscoveredModel,
     ModelCapabilities,
     PricingSource,
     ProviderConnection,
@@ -65,7 +66,9 @@ CANONICAL_CREDENTIAL_ENV = {
     "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
 }
 _MANUAL_MODEL_PROVIDERS = frozenset({"azure", "bedrock"})
+_OPERATOR_DECLARED_PROVIDERS = frozenset({"openai-compatible"})
 _CONFIGURED_ONLY = "configured-models-only"
+UNKNOWN_METADATA_LABEL = "unknown capabilities/prices"
 _RECOVERY_RETRY = "retry"
 _RECOVERY_SKIP = "skip"
 _RECOVERY_BACK = "back"
@@ -113,18 +116,19 @@ class AvailableModel:
     pricing_source: PricingSource
     configured: bool
     retainable_roles: frozenset[SetupRole] = frozenset()
+    published: DiscoveredModel | None = None
 
     def label(self) -> str:
         """Describe this model as one picker row by its shorthand alias."""
         return self.alias
 
     def detail(self) -> str:
-        """Annotate this model with its provider, marking retain-only prior roles."""
-        if self.capabilities is None:
+        """Annotate this model with its provider, marking unknown or retain-only rows."""
+        if self.capabilities is None or not served_roles(self.capabilities):
             roles = ", ".join(sorted(role.value for role in self.retainable_roles))
             if roles:
                 return f"{self.provider}, retain only: {roles}"
-            return f"{self.provider}, unverified"
+            return f"{self.provider}, {UNKNOWN_METADATA_LABEL}"
         return self.provider
 
 
@@ -592,7 +596,11 @@ def _discover_models(
     configured_identities: frozenset[tuple[str, str]] = frozenset(),
     environment: MutableMapping[str, str],
 ) -> _ProviderDiscoveryResult | None:
-    """List one provider account's models and keep the ones with usable metadata.
+    """List one provider account's models and keep selectable identities.
+
+    Verified metadata stays attached. Identity-only OpenAI-compatible models remain visible and
+    are labeled unknown rather than hidden. Official listings without maintained metadata stay
+    out of the normal path.
 
     Args:
         endpoint: Prepared connection and resolved credential.
@@ -650,39 +658,57 @@ def _discover_models(
                     )
                 continue
             return _ProviderDiscoveryResult(endpoint, ()) if recovery == _RECOVERY_SKIP else None
+        if not discovered:
+            console.print(f"[yellow]{label} published no model identity.[/yellow]")
+            recovery = _recover(f"{label} has no configurable model", console=console)
+            if recovery == _RECOVERY_RETRY:
+                continue
+            return _ProviderDiscoveryResult(endpoint, ()) if recovery == _RECOVERY_SKIP else None
+        published = {model.model: model for model in discovered}
         resolved = tuple(resolve_discovered_model(model) for model in discovered)
-        usable = _canonical_models(
+        verified = _canonical_models(
             tuple(model for model in resolved if served_roles(model.capabilities)),
             provider=provider,
         )
-        if not usable:
+        unknown = _canonical_models(
+            tuple(model for model in resolved if not served_roles(model.capabilities)),
+            provider=provider,
+        )
+        if provider not in _OPERATOR_DECLARED_PROVIDERS:
+            unknown = ()
+        if not verified and not unknown:
             console.print(f"[yellow]{label} published no model with verified metadata.[/yellow]")
             recovery = _recover(f"{label} has no configurable model", console=console)
             if recovery == _RECOVERY_RETRY:
                 continue
             return _ProviderDiscoveryResult(endpoint, ()) if recovery == _RECOVERY_SKIP else None
-        fresh = tuple(
-            model
-            for model in usable
-            if (provider, canonical_model_id(provider, model.model)) not in configured_identities
+        fresh_verified = _fresh_models(
+            verified, provider=provider, configured=configured_identities
         )
-        if not fresh:
+        fresh_unknown = _fresh_models(unknown, provider=provider, configured=configured_identities)
+        if not fresh_verified and not fresh_unknown:
             console.print(f"  [green]\u2713[/green] {label}: models already configured")
             return _ProviderDiscoveryResult(endpoint, ())
-        console.print(f"  [green]\u2713[/green] {label}: {len(fresh)} models")
+        console.print(
+            _discovery_status(label, verified=len(fresh_verified), unknown=len(fresh_unknown))
+        )
         models = []
-        for model in fresh:
+        for model in (*fresh_verified, *fresh_unknown):
             alias = derive_model_alias(provider, model.model, frozenset(aliases))
             aliases.add(alias)
+            verified_row = served_roles(model.capabilities)
             models.append(
                 AvailableModel(
                     alias=alias,
                     connection=endpoint.connection.name,
                     provider=provider,
                     model=model.model,
-                    capabilities=model.capabilities,
-                    pricing_source=model.pricing_source,
+                    capabilities=model.capabilities if verified_row else None,
+                    pricing_source=(
+                        model.pricing_source if verified_row else PricingSource.UNKNOWN
+                    ),
                     configured=False,
+                    published=published.get(model.model),
                 )
             )
         return _ProviderDiscoveryResult(endpoint, tuple(models))
@@ -691,6 +717,50 @@ def _discover_models(
 def _is_credential_rejection(error: ProviderListingError) -> bool:
     """Return whether a listing error asks the user to replace a rejected credential."""
     return str(error).endswith(" rejected the configured credential")
+
+
+def _fresh_models(
+    models: tuple[ResolvedDiscoveredModel, ...],
+    *,
+    provider: str,
+    configured: frozenset[tuple[str, str]],
+) -> tuple[ResolvedDiscoveredModel, ...]:
+    """Keep discovered identities that are not already present in the catalog.
+
+    Args:
+        models: Canonical discovered rows.
+        provider: Selected provider kind.
+        configured: Canonical (provider, model) identities already in the catalog.
+
+    Returns:
+        Models that still need a new alias in this session.
+    """
+    return tuple(
+        model
+        for model in models
+        if (provider, canonical_model_id(provider, model.model)) not in configured
+    )
+
+
+def _discovery_status(label: str, *, verified: int, unknown: int) -> str:
+    """Describe how many listed identities are verified versus still unknown.
+
+    Args:
+        label: Readable provider name.
+        verified: Newly listed models with role-proven metadata.
+        unknown: Newly listed identities that still need operator declaration.
+
+    Returns:
+        One compact status line for the discovery transcript.
+    """
+    if verified and unknown:
+        return (
+            f"  [green]\u2713[/green] {label}: {verified} models, "
+            f"{unknown} with {UNKNOWN_METADATA_LABEL}"
+        )
+    if unknown:
+        return f"  [green]\u2713[/green] {label}: {unknown} models with {UNKNOWN_METADATA_LABEL}"
+    return f"  [green]\u2713[/green] {label}: {verified} models"
 
 
 def _canonical_models(
