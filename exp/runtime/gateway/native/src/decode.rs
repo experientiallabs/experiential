@@ -354,8 +354,10 @@ fn decode_history_tool_calls(
                 return Err(PublicError::invalid_field(&format!("{prefix}.{key}")));
             }
         }
-        if !matches!(object.get("type"), None | Some(Value::String(kind)) if kind == "function") {
-            return Err(PublicError::invalid_field(&format!("{prefix}.type")));
+        match object.get("type") {
+            None => {}
+            Some(Value::String(kind)) if kind == "function" => {}
+            Some(_) => return Err(PublicError::invalid_field(&format!("{prefix}.type"))),
         }
         let call_id = match object.get("id").and_then(Value::as_str) {
             Some(id) if !id.is_empty() && id.len() <= 256 => id.to_string(),
