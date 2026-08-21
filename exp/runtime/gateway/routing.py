@@ -70,18 +70,29 @@ class CatalogRouteResolver:
             project_resolver: Optional resolver for project-backed targets.
         """
         self._project_resolver = project_resolver
-        self._catalogs: dict[tuple[str, str], _CatalogView] = {}
-        for key, catalog in catalogs.items():
-            revision_id, catalog_sha256 = key
-            if catalog.identity_sha256() != catalog_sha256:
-                raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
-            self._catalogs[key] = _CatalogView(
-                catalog=catalog,
-                pools={pool.pool_id: pool for pool in catalog.pools},
-                deployments={
-                    deployment.deployment_id: deployment for deployment in catalog.deployments
-                },
-            )
+        self._catalogs = _index_catalogs(catalogs)
+
+    def swap_catalogs(
+        self,
+        catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog],
+        *,
+        project_resolver: ProjectTargetResolver | None,
+    ) -> None:
+        """Atomically replace the served catalog index with one validated superset.
+
+        Callers must include every revision that an in-flight authorization may
+        still reference so requests never observe a partially loaded catalog.
+
+        Args:
+            catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
+            project_resolver: Replacement resolver covering all retained activations.
+
+        Raises:
+            ValueError: One catalog does not match its declared digest.
+        """
+        indexed = _index_catalogs(catalogs)
+        self._project_resolver = project_resolver
+        self._catalogs = indexed
 
     async def resolve(
         self,
@@ -212,6 +223,35 @@ class CatalogRouteResolver:
             route_reason=route_reason,
             fallback_reason=fallback_reason,
         )
+
+
+def _index_catalogs(
+    catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog],
+) -> dict[tuple[str, str], _CatalogView]:
+    """Index digest-verified catalogs by alias revision and catalog digest.
+
+    Args:
+        catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
+
+    Returns:
+        Fully built revision-scoped catalog views.
+
+    Raises:
+        ValueError: One catalog does not match its declared digest.
+    """
+    indexed: dict[tuple[str, str], _CatalogView] = {}
+    for key, catalog in catalogs.items():
+        revision_id, catalog_sha256 = key
+        if catalog.identity_sha256() != catalog_sha256:
+            raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
+        indexed[key] = _CatalogView(
+            catalog=catalog,
+            pools={pool.pool_id: pool for pool in catalog.pools},
+            deployments={
+                deployment.deployment_id: deployment for deployment in catalog.deployments
+            },
+        )
+    return indexed
 
 
 class RouterProjectTargetResolver:

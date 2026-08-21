@@ -746,6 +746,17 @@ class GatewayExecutor:
         self._health = health or DeploymentHealthRegistry()
         self._accounting_healthy = True
 
+    def swap_catalogs(self, catalogs: Mapping[tuple[str, str], RuntimeModelCatalog]) -> None:
+        """Atomically replace served runtime catalogs with one validated superset.
+
+        Callers must include every revision that an in-flight authorization may
+        still reference so running streams keep their original providers.
+
+        Args:
+            catalogs: Revision and catalog digests mapped to frozen runtime catalogs.
+        """
+        self._catalogs = dict(catalogs)
+
     def require_healthy(self) -> None:
         """Fail readiness after any durable terminal accounting write is lost."""
         if not self._accounting_healthy:

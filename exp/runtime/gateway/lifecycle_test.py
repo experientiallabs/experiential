@@ -369,10 +369,10 @@ def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) 
     assert runtime.reconciled_expired_requests == 0
 
 
-def test_live_alias_revision_drift_is_removed_from_discovery_and_dispatch(
+def test_live_alias_revision_update_hot_reloads_discovery_without_restart(
     tmp_path: Path,
 ) -> None:
-    """A running process advertises only the exact revision proven ready at startup."""
+    """A running process adopts a newly activated alias revision without restarting."""
     manager, raw_key = _configured_gateway(tmp_path)
     runtime = load_local_gateway(
         tmp_path,
@@ -383,7 +383,7 @@ def test_live_alias_revision_drift_is_removed_from_discovery_and_dispatch(
 
     with TestClient(runtime.app) as client:
         initial = client.get(
-            "/v1/models",
+            "/v1/models/coding",
             headers={"Authorization": f"Bearer {raw_key}"},
         )
         manager.activate_direct_alias(
@@ -394,40 +394,405 @@ def test_live_alias_revision_drift_is_removed_from_discovery_and_dispatch(
             snapshot_ref=str(alias.snapshot_ref),
             catalog_sha256=str(alias.catalog_sha256),
         )
-        drifted = client.get(
+        reloaded = client.get(
             "/v1/models",
             headers={"Authorization": f"Bearer {raw_key}"},
         )
-        unavailable = client.post(
-            "/v1/chat/completions",
+        detail = client.get(
+            "/v1/models/coding",
             headers={"Authorization": f"Bearer {raw_key}"},
-            json={
-                "model": "coding",
-                "messages": [{"role": "user", "content": "revision-drift-canary"}],
-            },
         )
 
-    assert [item["id"] for item in initial.json()["data"]] == ["coding"]
-    assert drifted.json()["data"] == []
-    assert unavailable.status_code == 503
-    assert unavailable.json()["error"]["code"] == "unavailable_route"
+    assert initial.json()["wmo"]["alias_revision_id"] == "revision-one"
+    assert [item["id"] for item in reloaded.json()["data"]] == ["coding"]
+    assert detail.status_code == 200
+    assert detail.json()["wmo"]["alias_revision_id"] == "revision-two"
     connection = sqlite3.connect(manager.database_path)
     try:
         assert connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone()[0] == 0
     finally:
         connection.close()
-    reloaded = load_local_gateway(
+
+
+def test_invalid_new_revision_fails_closed_and_recovers_after_fix(tmp_path: Path) -> None:
+    """An unloadable new revision keeps fail-closed behavior and recovers in place."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    runtime = load_local_gateway(
         tmp_path,
         graceful_timeout_seconds=1,
         environment={"TEST_PROVIDER_KEY": "available"},
     )
-    with TestClient(reloaded.app) as client:
-        refreshed = client.get(
+    alias = manager.aliases()[0]
+
+    with TestClient(runtime.app) as client:
+        manager.activate_direct_alias(
+            alias_id="coding",
+            alias_name="coding",
+            revision_id="revision-broken",
+            pool_id="coding",
+            snapshot_ref="catalog-snapshots/missing.json",
+            catalog_sha256="a" * 64,
+        )
+        unavailable = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": "broken-revision-canary"}],
+            },
+        )
+        hidden = client.get(
             "/v1/models",
             headers={"Authorization": f"Bearer {raw_key}"},
         )
-    assert [item["id"] for item in refreshed.json()["data"]] == ["coding"]
+        manager.activate_direct_alias(
+            alias_id="coding",
+            alias_name="coding",
+            revision_id="revision-repaired",
+            pool_id="coding",
+            snapshot_ref=str(alias.snapshot_ref),
+            catalog_sha256=str(alias.catalog_sha256),
+        )
+        recovered = client.get(
+            "/v1/models/coding",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+
+    assert unavailable.status_code == 503
+    assert unavailable.json()["error"]["code"] == "unavailable_route"
+    assert hidden.json()["data"] == []
+    assert recovered.status_code == 200
+    assert recovered.json()["wmo"]["alias_revision_id"] == "revision-repaired"
+    connection = sqlite3.connect(manager.database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_alias_update_serves_new_model_while_in_flight_requests_finish_on_old(
+    tmp_path: Path,
+) -> None:
+    """A mid-request alias repoint routes new traffic while old streams complete."""
+    release_old = threading.Event()
+    old_dispatched = threading.Event()
+    dispatched: list[str] = []
+
+    class SwitchProviderHandler(BaseHTTPRequestHandler):
+        """Serve a blocking old-model stream and an immediate new-model stream."""
+
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            """Suppress nondeterministic loopback server logs."""
+            del format, args
+
+        def do_POST(self) -> None:
+            """Stream one canary per exact provider model, blocking the old model."""
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length))
+            model = str(payload["model"])
+            dispatched.append(model)
+            canary = "old-model-canary" if model == "provider-model-exact" else "new-model-canary"
+            first = (
+                'data: {"choices":[{"index":0,"delta":{"content":"'
+                + canary
+                + '"},"finish_reason":"stop"}]}\n\n'
+            ).encode()
+            rest = (
+                b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
+                b"data: [DONE]\n\n"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(first) + len(rest)))
+            self.end_headers()
+            self.wfile.write(first)
+            self.wfile.flush()
+            if model == "provider-model-exact":
+                old_dispatched.set()
+                assert release_old.wait(timeout=10)
+            self.wfile.write(rest)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SwitchProviderHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        manager, raw_key = _configured_gateway(
+            tmp_path,
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+        )
+        runtime = load_local_gateway(
+            tmp_path,
+            graceful_timeout_seconds=1,
+            environment={"TEST_PROVIDER_KEY": "available"},
+        )
+        with TestClient(runtime.app) as client:
+            first_statuses: list[int] = []
+            first_contents: list[str] = []
+
+            def run_first_request() -> None:
+                """Hold one request open across the mid-flight alias repoint."""
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {raw_key}"},
+                    json={
+                        "model": "coding",
+                        "messages": [{"role": "user", "content": "old-revision-prompt"}],
+                    },
+                )
+                first_statuses.append(response.status_code)
+                first_contents.append(response.json()["choices"][0]["message"]["content"])
+
+            first_thread = threading.Thread(target=run_first_request)
+            first_thread.start()
+            assert old_dispatched.wait(timeout=10)
+            normalized, snapshot, _changed = upsert_singleton_deployment(
+                tmp_path,
+                deployment_alias="coding",
+                connection_name="provider-main",
+                provider_model="provider-model-next",
+                exact_model_id="model-revision-next",
+                revision=None,
+                capabilities=ModelCapabilities(),
+                gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                prices=GatewayTokenPrices(),
+                pricing_source=None,
+                replace=True,
+            )
+            manager.activate_direct_alias(
+                alias_id="coding",
+                alias_name="coding",
+                revision_id="revision-two",
+                pool_id="coding",
+                snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+                catalog_sha256=normalized.identity_sha256(),
+            )
+            second = client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {raw_key}"},
+                json={
+                    "model": "coding",
+                    "messages": [{"role": "user", "content": "new-revision-prompt"}],
+                },
+            )
+            detail = client.get(
+                "/v1/models/coding",
+                headers={"Authorization": f"Bearer {raw_key}"},
+            )
+            release_old.set()
+            first_thread.join(timeout=10)
+            assert not first_thread.is_alive()
+
+        assert first_statuses == [200]
+        assert first_contents == ["old-model-canary"]
+        assert second.status_code == 200
+        assert second.json()["choices"][0]["message"]["content"] == "new-model-canary"
+        assert detail.json()["wmo"]["alias_revision_id"] == "revision-two"
+        assert dispatched == ["provider-model-exact", "provider-model-next"]
+        with sqlite3.connect(manager.database_path) as connection:
+            attempts = connection.execute(
+                "SELECT exact_model_id, state FROM gateway_attempts ORDER BY started_at"
+            ).fetchall()
+        assert sorted(attempts) == [
+            ("model-revision-exact", "completed"),
+            ("model-revision-next", "completed"),
+        ]
+    finally:
+        release_old.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_concurrent_traffic_survives_pool_recertification_hot_swap(tmp_path: Path) -> None:
+    """Re-certifying one pool under load swaps it while untouched aliases keep serving."""
+    dispatched: list[str] = []
+
+    class PoolProviderHandler(BaseHTTPRequestHandler):
+        """Stream one canary naming the exact dispatched provider model."""
+
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            """Suppress nondeterministic loopback server logs."""
+            del format, args
+
+        def do_POST(self) -> None:
+            """Record the dispatched model and return one deterministic stream."""
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length))
+            model = str(payload["model"])
+            dispatched.append(model)
+            body = b"".join(
+                (
+                    b'data: {"choices":[{"index":0,"delta":{"content":"'
+                    + model.encode()
+                    + b'"},"finish_reason":"stop"}]}\n\n',
+                    b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n',
+                    b"data: [DONE]\n\n",
+                )
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), PoolProviderHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        root = tmp_path
+        manager = GatewayManagement(root)
+        manager.initialize()
+        upsert_connection(
+            root,
+            name="provider-main",
+            connection=ConnectionConfig(
+                provider="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key_env="TEST_PROVIDER_KEY",
+            ),
+            replace=False,
+        )
+        normalized = None
+        solo_snapshot = None
+        for deployment_alias, provider_model, exact_model in (
+            ("alpha", "alpha-model", "model-revision-exact"),
+            ("beta", "beta-model", "model-revision-exact"),
+            ("solo", "solo-model", "model-revision-solo"),
+        ):
+            normalized, solo_snapshot, _changed = upsert_singleton_deployment(
+                root,
+                deployment_alias=deployment_alias,
+                connection_name="provider-main",
+                provider_model=provider_model,
+                exact_model_id=exact_model,
+                revision=None,
+                capabilities=ModelCapabilities(),
+                gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                prices=GatewayTokenPrices(),
+                pricing_source=None,
+                replace=False,
+            )
+        assert normalized is not None
+        assert solo_snapshot is not None
+        manager.activate_direct_alias(
+            alias_id="solo",
+            alias_name="solo",
+            revision_id="rev-solo-1",
+            pool_id="solo",
+            snapshot_ref=f"catalog-snapshots/{solo_snapshot.name}",
+            catalog_sha256=normalized.identity_sha256(),
+        )
+        certification = GatewayEquivalenceCertification(
+            certification_id="certification-one",
+            provenance="operator-reviewed deployment manifests",
+            evidence_sha256="a" * 64,
+            certified_at=datetime(2026, 8, 18, tzinfo=UTC),
+        )
+        normalized, snapshot, _changed = upsert_certified_pool(
+            root,
+            pool_id="chat",
+            exact_model_id="model-revision-exact",
+            deployment_aliases=("alpha", "beta"),
+            certification=certification,
+            expected_catalog_sha256=normalized.identity_sha256(),
+            replace=False,
+        )
+        manager.activate_direct_alias(
+            alias_id="chat",
+            alias_name="chat",
+            revision_id="rev-chat-1",
+            pool_id="chat",
+            snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+            catalog_sha256=normalized.identity_sha256(),
+        )
+        manager.create_identity(identity_id="default", display_name="Default")
+        manager.add_grant(identity_id="default", alias_id="chat")
+        manager.add_grant(identity_id="default", alias_id="solo")
+        issued = manager.issue_key(identity_id="default", key_id="key-one")
+        runtime = load_local_gateway(
+            root,
+            graceful_timeout_seconds=1,
+            environment={"TEST_PROVIDER_KEY": "available"},
+        )
+        results: list[tuple[str, int, str]] = []
+        results_lock = threading.Lock()
+        warmed_up = threading.Event()
+        with TestClient(runtime.app) as client:
+
+            def worker(alias_name: str) -> None:
+                """Send a bounded burst of one-alias requests across the re-certification."""
+                for _index in range(12):
+                    response = client.post(
+                        "/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {issued.raw_key}"},
+                        json={
+                            "model": alias_name,
+                            "messages": [{"role": "user", "content": "pool-swap-canary"}],
+                        },
+                    )
+                    content = ""
+                    if response.status_code == 200:
+                        content = response.json()["choices"][0]["message"]["content"]
+                    with results_lock:
+                        results.append((alias_name, response.status_code, content))
+                        if len(results) >= 8:
+                            warmed_up.set()
+
+            workers = [
+                threading.Thread(target=worker, args=(alias_name,))
+                for alias_name in ("chat", "chat", "chat", "solo")
+            ]
+            for item in workers:
+                item.start()
+            assert warmed_up.wait(timeout=30)
+            recertified, recert_snapshot, _changed = upsert_certified_pool(
+                root,
+                pool_id="chat",
+                exact_model_id="model-revision-exact",
+                deployment_aliases=("beta", "alpha"),
+                certification=certification,
+                expected_catalog_sha256=normalized.identity_sha256(),
+                replace=True,
+            )
+            manager.activate_direct_alias(
+                alias_id="chat",
+                alias_name="chat",
+                revision_id="rev-chat-2",
+                pool_id="chat",
+                snapshot_ref=f"catalog-snapshots/{recert_snapshot.name}",
+                catalog_sha256=recertified.identity_sha256(),
+            )
+            for item in workers:
+                item.join(timeout=60)
+                assert not item.is_alive()
+            detail = client.get(
+                "/v1/models/chat",
+                headers={"Authorization": f"Bearer {issued.raw_key}"},
+            )
+            solo_detail = client.get(
+                "/v1/models/solo",
+                headers={"Authorization": f"Bearer {issued.raw_key}"},
+            )
+
+        assert len(results) == 48
+        assert all(status == 200 for _alias, status, _content in results)
+        chat_contents = {content for alias, _status, content in results if alias == "chat"}
+        solo_contents = {content for alias, _status, content in results if alias == "solo"}
+        assert chat_contents <= {"alpha-model", "beta-model"}
+        assert solo_contents == {"solo-model"}
+        assert dispatched[-1] in {"beta-model", "solo-model"}
+        assert "beta-model" in dispatched
+        assert detail.json()["wmo"]["alias_revision_id"] == "rev-chat-2"
+        assert solo_detail.json()["wmo"]["alias_revision_id"] == "rev-solo-1"
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
 
 
 def test_project_certified_pool_preflight_resolves_all_siblings_and_reloads(
@@ -695,7 +1060,11 @@ def test_project_certified_pool_is_unavailable_when_any_sibling_cannot_resolve(
         )
 
 
-def _configured_gateway(root: Path) -> tuple[GatewayManagement, str]:
+def _configured_gateway(
+    root: Path,
+    *,
+    base_url: str = "http://127.0.0.1:9/v1",
+) -> tuple[GatewayManagement, str]:
     """Create one explicit direct alias, identity, grant, and key in real SQLite."""
     manager = GatewayManagement(root)
     manager.initialize()
@@ -704,7 +1073,7 @@ def _configured_gateway(root: Path) -> tuple[GatewayManagement, str]:
         name="provider-main",
         connection=ConnectionConfig(
             provider="openai-compatible",
-            base_url="http://127.0.0.1:9/v1",
+            base_url=base_url,
             api_key_env="TEST_PROVIDER_KEY",
         ),
         replace=False,
