@@ -170,6 +170,7 @@ def test_bedrock_stream_normalizes_text_tools_usage_and_terminal_state() -> None
             GatewayEventKind.COMPLETED,
         ]
         assert events[2].raw_arguments_delta == '{"city":'
+        assert events[4].tool_call_index == 1
         assert events[4].tool_call is not None
         assert events[4].tool_call.raw_arguments == '{"city":"Zürich"}'
         assert events[5].usage is not None
@@ -242,6 +243,7 @@ def test_bedrock_empty_tool_input_delta_is_skipped() -> None:
             GatewayEventKind.COMPLETED,
         ]
         assert events[1].raw_arguments_delta == '{"path":"fib.py"}'
+        assert events[2].tool_call_index == 0
         assert events[2].tool_call is not None
         assert events[2].tool_call.raw_arguments == '{"path":"fib.py"}'
 

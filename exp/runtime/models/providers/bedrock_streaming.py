@@ -304,6 +304,7 @@ class BedrockProviderStream:
         return [
             self._event(
                 GatewayEventKind.TOOL_CALL_COMPLETED,
+                tool_call_index=index,
                 tool_call=tool.complete(),
             )
         ]
