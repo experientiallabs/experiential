@@ -17,6 +17,7 @@ ROOT_PYTHON_FILES = frozenset(
 )
 CLI_PACKAGES = frozenset(
     {
+        "auth",
         "build",
         "config",
         "gateway",

@@ -20,6 +20,14 @@ app = typer.Typer(
 app.add_typer(config_app, name="config")
 add_deferred_typer(
     app,
+    name="auth",
+    module="exp.cli.auth.app",
+    attr="auth_app",
+    help="Manage stored provider credentials.",
+    known_names=("list", "login", "logout"),
+)
+add_deferred_typer(
+    app,
     name="optimize",
     module="exp.cli.optimize.app",
     attr="optimize_app",
@@ -29,7 +37,7 @@ add_deferred_typer(
 app.command("build", help="Build a reusable grounded world model from local trace evidence.")(build)
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
 
-_ROOT_COMMANDS = frozenset(("build", "config", "optimize", "run"))
+_ROOT_COMMANDS = frozenset(("auth", "build", "config", "optimize", "run"))
 _ROOT_OPTIONS = frozenset(("--help", "-h", "--install-completion", "--show-completion"))
 
 

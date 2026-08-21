@@ -14,6 +14,7 @@ from exp.cli.app import app
 app_module = import_module("exp.cli.app")
 
 EXPECTED_SUBCOMMANDS = {
+    "auth": {"list", "login", "logout"},
     "config": {"budget", "gateway", "judge", "providers", "telemetry"},
     "optimize": {"model", "router"},
 }
@@ -29,6 +30,7 @@ EXPECTED_SUBCOMMANDS = {
         (["--show-completion"], ["--show-completion"]),
         (["build", "--help"], ["build", "--help"]),
         (["config", "gateway", "status"], ["config", "gateway", "status"]),
+        (["auth", "list"], ["auth", "list"]),
         (["run", "project-a"], ["run", "project-a"]),
         (["project-a", "--check"], ["run", "project-a", "--check"]),
         (["--check", "--json"], ["run", "--check", "--json"]),
@@ -67,7 +69,13 @@ def test_root_cli_and_subgroups_are_exact() -> None:
     """
     root = get_group(app)
     root_context = Context(root)
-    assert set(root.list_commands(root_context)) == {"build", "config", "optimize", "run"}
+    assert set(root.list_commands(root_context)) == {
+        "auth",
+        "build",
+        "config",
+        "optimize",
+        "run",
+    }
 
     for name, expected in EXPECTED_SUBCOMMANDS.items():
         command = root.get_command(root_context, name)

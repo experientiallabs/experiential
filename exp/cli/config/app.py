@@ -140,9 +140,10 @@ def config_providers(
 ) -> None:
     """Configure provider connections before selecting exact build-time role models.
 
-    Credential values are never requested or persisted. Only environment-variable names are
-    written. Repeatable ``--provider`` flags skip the opening list. Router candidates remain
-    untouched until ``exp optimize router``.
+    Catalog writes stay secret-free. Interactive setup pastes API keys into the user-data
+    credential store, while environment variables remain the override. Repeatable
+    ``--provider`` flags skip the opening list. Router candidates remain untouched until
+    ``exp optimize router``.
     """
     options = ProviderSetupOptions(
         providers=tuple(provider or ()),

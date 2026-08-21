@@ -22,6 +22,8 @@ from exp.cli.app import app
         ["optimize", "router", "--help"],
         ["optimize", "model", "--help"],
         ["run", "--help"],
+        ["auth", "--help"],
+        ["auth", "list", "--help"],
     ],
     ids=[
         "root",
@@ -34,6 +36,8 @@ from exp.cli.app import app
         "router",
         "model",
         "run",
+        "auth",
+        "auth-list",
     ],
 )
 def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
