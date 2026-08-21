@@ -34,6 +34,8 @@ dev = [
     "ruff>=0.5",
     "ty>=0.0.1a1",
     "experiential[sft]",
+    # Builds the optional Rust gateway data-plane extension (exp_gateway_native).
+    "maturin>=1.7,<2",
 ]
 
 [project.scripts]
@@ -46,7 +48,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["exp"]
 # Test-only code is named for pytest discovery, and `exp/conftest.py` is a pytest fixture module.
-exclude = ["**/*_test.py", "exp/conftest.py"]
+# The Rust crate's local build artifacts never enter the wheel; its sources do,
+# as ordinary tracked package files.
+exclude = ["**/*_test.py", "exp/conftest.py", "exp/runtime/gateway/native/target"]
 
 [tool.hatch.build.targets.sdist]
 # One flagship distribution: everything importable lives under /exp.
@@ -60,6 +64,7 @@ include = [
     "/pyproject.toml",
     "/conftest.py",
 ]
+exclude = ["exp/runtime/gateway/native/target"]
 
 [tool.pytest.ini_options]
 # Tests live inline next to the modules they cover (foo.py -> foo_test.py), or in a package's tests

@@ -13,6 +13,9 @@ dist/
 .ty_cache/
 .DS_Store
 
+# Rust extension build artifacts (PoC gateway data plane).
+exp/runtime/gateway/native/target/
+
 # Local-only design notes; not committed.
 DESIGN.md
 

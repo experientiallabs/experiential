@@ -50,6 +50,21 @@ _GRACEFUL_TIMEOUT_OPTION = typer.Option(
     min=0.1,
     help="Seconds to drain admitted gateway work during shutdown.",
 )
+_ENGINE_OPTION = typer.Option(
+    "auto",
+    "--engine",
+    help=(
+        "Data-plane engine: 'auto' (rust when available, otherwise python), "
+        "'rust' (exp_gateway_native, Chat Completions only), or 'python' "
+        "(uvicorn, full surface including /v1/responses)."
+    ),
+)
+_MAX_ACTIVE_REQUESTS_OPTION = typer.Option(
+    1024,
+    "--max-active-requests",
+    min=1,
+    help="Rust engine only: maximum concurrently admitted requests.",
+)
 
 
 def run(
@@ -65,6 +80,8 @@ def run(
     json_output: bool = _JSON_OPTION,
     check: bool = _CHECK_OPTION,
     graceful_timeout: float = _GRACEFUL_TIMEOUT_OPTION,
+    engine: str = _ENGINE_OPTION,
+    max_active_requests: int = _MAX_ACTIVE_REQUESTS_OPTION,
 ) -> None:
     """Start the local gateway, optionally materializing one project-backed alias.
 
@@ -78,13 +95,37 @@ def run(
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
+        engine: Data-plane engine: ``auto``, ``rust``, or ``python``.
+        max_active_requests: Rust engine concurrent-admission bound.
 
     Raises:
         typer.BadParameter: The selected form or activation is invalid.
     """
+    if engine not in {"auto", "rust", "python"}:
+        raise typer.BadParameter("--engine must be 'auto', 'rust', or 'python'")
     if policy is not None or ghost:
         if project is None:
             raise typer.BadParameter("--policy and --ghost require the 'exp run PROJECT' form")
+    if engine == "rust" and project is not None:
+        raise typer.BadParameter(
+            "--engine rust serves direct aliases only; project-backed serving "
+            "requires the python engine"
+        )
+    if project is None and engine != "python":
+        blocker = _rust_engine_blocker(root)
+        if blocker is None:
+            _run_rust_gateway(
+                root=root,
+                port=port,
+                json_output=json_output,
+                check=check,
+                max_active_requests=max_active_requests,
+            )
+            return
+        if engine == "rust":
+            raise typer.BadParameter(blocker)
+        if not json_output:
+            _console.print(f"[yellow]rust engine unavailable ({blocker}); using python[/yellow]")
     _run_gateway(
         project=project,
         root=root,
@@ -192,6 +233,114 @@ def _run_gateway(
         if setup is not None:
             _emit_setup_recovery(setup=setup)
         raise
+
+
+
+def _rust_engine_blocker(root: Path) -> str | None:
+    """Return why the rust data plane cannot serve this root, or ``None``.
+
+    Args:
+        root: Local artifact and model-catalog root.
+
+    Returns:
+        A display-safe reason to use the python engine, or ``None`` when the
+        rust engine can serve every granted active alias.
+    """
+    import importlib.util
+
+    from exp.runtime.gateway.management import GatewayManagement
+
+    if importlib.util.find_spec("exp_gateway_native") is None:
+        return (
+            "the exp_gateway_native extension is not built; run 'just native' "
+            "(uv run maturin develop --uv --release "
+            "--manifest-path exp/runtime/gateway/native/Cargo.toml)"
+        )
+    manager = GatewayManagement(root)
+    if not manager.initialized:
+        return "the gateway is not initialized yet"
+    if any(alias.target_kind != "direct" for alias in manager.aliases() if alias.active):
+        return "project-backed aliases require the python engine"
+    return None
+
+
+def _run_rust_gateway(
+    *,
+    root: Path,
+    port: int,
+    json_output: bool,
+    check: bool,
+    max_active_requests: int,
+) -> None:
+    """Serve the rust data plane over the same local authority.
+
+    The rust engine serves Chat Completions, model discovery, health, and
+    usage; callers that need /v1/responses select ``--engine python``.
+
+    Args:
+        root: Local artifact and model-catalog root.
+        port: Local loopback TCP port.
+        json_output: Whether startup output is one versioned JSON receipt.
+        check: Whether to validate gateway readiness without binding.
+        max_active_requests: Concurrent-admission bound for the data plane.
+
+    Raises:
+        typer.BadParameter: The extension module is missing or the gateway
+            configuration cannot form one ready direct route.
+    """
+    if not json_output:
+        _emit_exp_wordmark()
+
+    import importlib
+
+    from exp.runtime.gateway.lifecycle import gateway_instance_lock
+    from exp.runtime.gateway.management import GatewayManagement
+    from exp.runtime.gateway.native_bridge import load_native_control_plane
+
+    try:
+        exp_gateway_native = importlib.import_module("exp_gateway_native")
+    except ModuleNotFoundError as exc:
+        raise typer.BadParameter(
+            "the Rust gateway engine is not built; run 'just native' "
+            "(uv run maturin develop --uv --release "
+            "--manifest-path exp/runtime/gateway/native/Cargo.toml) and retry"
+        ) from exc
+
+    manager = GatewayManagement(root)
+    if not manager.initialized:
+        _gateway_not_initialized(json_output=json_output)
+    with usage_error(ValueError):
+        with gateway_instance_lock(root, port=port):
+            control_plane = load_native_control_plane(root)
+            receipt = {
+                "schema_version": 1,
+                "operation": "gateway.check" if check else "gateway.run",
+                "status": "ready",
+                "engine": "rust",
+                "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
+                "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage.json",
+                "reconciled_expired_requests": control_plane.reconciled_expired_requests,
+                "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
+                "launch_mode": "gateway",
+            }
+            if json_output:
+                typer.echo(json.dumps(receipt, separators=(",", ":")))
+            else:
+                _console.print(
+                    f"[green]Gateway ready (rust engine)[/green] "
+                    f"http://{_LOOPBACK_HOST}:{port}/v1",
+                    markup=True,
+                )
+            if check:
+                return
+            config = json.dumps(
+                {
+                    "host": _LOOPBACK_HOST,
+                    "port": port,
+                    "max_active_requests": max_active_requests,
+                }
+            )
+            exp_gateway_native.serve(control_plane, config)
 
 
 def _emit_exp_wordmark() -> None:

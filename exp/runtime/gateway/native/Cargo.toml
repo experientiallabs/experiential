@@ -1,0 +1,30 @@
+[package]
+name = "exp-gateway-native"
+version = "0.1.0"
+edition = "2021"
+description = "Rust data plane for the Experiential local gateway (PoC), embedded as a PyO3 extension."
+license = "MIT"
+publish = false
+
+[lib]
+name = "exp_gateway_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["abi3-py312"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+tokio-stream = "0.1"
+axum = "0.8"
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+thiserror = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

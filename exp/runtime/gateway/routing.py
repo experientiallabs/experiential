@@ -156,19 +156,12 @@ class CatalogRouteResolver:
         Raises:
             GatewayRoutingError: Catalog identity or target resolution is invalid.
         """
+        target = authorization.target
+        if isinstance(target, DirectTarget):
+            return self.resolve_direct(authorization)
         view = self._catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
         if view is None:
             raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
-        target = authorization.target
-        if isinstance(target, DirectTarget):
-            pool = self._pool(view, target.pool_id)
-            return self._route(
-                view=view,
-                authorization=authorization,
-                pool=pool,
-                route_reason="direct",
-                fallback_reason=None,
-            )
         if target.catalog_sha256 != authorization.catalog_sha256:
             raise GatewayRoutingError("project target catalog differs from authorized authority")
         selection = await self._select_project(
@@ -205,6 +198,38 @@ class CatalogRouteResolver:
             pool=pool,
             route_reason="learned_router",
             fallback_reason=selection.fallback_reason,
+        )
+
+    def resolve_direct(self, authorization: AuthorizationSnapshot) -> GatewayRoute:
+        """Resolve one direct-target authorization without event-loop work.
+
+        Direct pools resolve entirely inside frozen in-memory catalogs, so
+        callers without a running event loop (the Rust engine's control-plane
+        bridge) share this path with the async resolver.
+
+        Args:
+            authorization: Frozen authenticated alias revision and target.
+
+        Returns:
+            Frozen exact model, pool, and one launch deployment.
+
+        Raises:
+            GatewayRoutingError: The target is project-backed or the catalog
+                identity cannot resolve inside its frozen snapshot.
+        """
+        view = self._catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
+        if view is None:
+            raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
+        target = authorization.target
+        if not isinstance(target, DirectTarget):
+            raise GatewayRoutingError("project targets require asynchronous learned selection")
+        pool = self._pool(view, target.pool_id)
+        return self._route(
+            view=view,
+            authorization=authorization,
+            pool=pool,
+            route_reason="direct",
+            fallback_reason=None,
         )
 
     async def _select_project(

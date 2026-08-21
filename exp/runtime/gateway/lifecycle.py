@@ -37,7 +37,7 @@ from exp.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from exp.runtime.gateway.execution import GatewayExecutor
-from exp.runtime.gateway.interfaces import ProjectTargetResolver
+from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
 from exp.runtime.gateway.project_activation import (
@@ -342,6 +342,110 @@ def gateway_instance_lock(root: Path, *, port: int) -> Iterator[None]:
         lock.release()
 
 
+
+@dataclass(frozen=True)
+class LocalGatewayComponents:
+    """Loaded authority, accounting, and routing shared by both gateway engines.
+
+    The Python engine composes these into a ``GatewayRuntime``; the Rust
+    engine's control-plane bridge uses them directly for admission and
+    settlement over the same SQLite state and the same hot-reloadable
+    authority generations.
+    """
+
+    manager: GatewayManagement
+    store: GatewayControlStore
+    ledger: SQLiteAttemptLedger
+    routes: CatalogRouteResolver
+    executor: GatewayExecutor
+    reloader: _AliasAuthorityReloader
+    reconciled_expired_requests: int
+    reconciled_unknown_attempts: int
+
+    @property
+    def runtime_catalogs(self) -> Mapping[tuple[str, str], RuntimeModelCatalog]:
+        """Return the current generation's runtime catalogs."""
+        return self.reloader.state.runtime_catalogs
+
+    @property
+    def readiness(self) -> tuple[ExecutionSnapshot, ...]:
+        """Return the current generation's credential-free route proof."""
+        return (self.reloader.state.proof,)
+
+    @property
+    def organization_id(self) -> str:
+        """Return the single local organization identity."""
+        return self.manager.organization_id
+
+
+def load_gateway_components(
+    root: Path = Path(ARTIFACT_DIR),
+    *,
+    environment: Mapping[str, str] | None = None,
+    project_repository: ProjectActivationRepository | None = None,
+    decision_sink: DecisionSink | None = None,
+    only_aliases: frozenset[str] | None = None,
+    only_target_kinds: frozenset[str] | None = None,
+) -> LocalGatewayComponents:
+    """Load granted active aliases into engine-neutral gateway components.
+
+    Args:
+        root: Initialized EXP root. Defaults to the local ``.exp`` root.
+        environment: Optional provider credential mapping used by tests.
+        project_repository: Repository for verified immutable project activations.
+        decision_sink: Optional aggregate-safe recorder for served project selections.
+        only_aliases: Optional exact public aliases to expose.
+        only_target_kinds: Optional alias target kinds to expose, for engines
+            that serve a subset (the Rust engine serves only ``direct``).
+
+    Returns:
+        Hot-reloadable authority, ledger, routes, executor, and startup proof.
+
+    Raises:
+        GatewayLifecycleError: No granted alias can form a complete local route.
+    """
+    manager = GatewayManagement(root)
+    store = manager.require_initialized()
+    manager.migrate_legacy_provider_connections()
+    ledger = SQLiteAttemptLedger(manager.database_path)
+    expired, unknown = ledger.reconcile_crashed_requests(cleanup_grace=timedelta(seconds=5))
+
+    def loader() -> _AliasAuthorityState:
+        """Build one complete validated generation from current granted authority."""
+        return _load_alias_state(
+            manager,
+            environment=environment,
+            project_repository=project_repository,
+            decision_sink=decision_sink,
+            only_aliases=only_aliases,
+            only_target_kinds=only_target_kinds,
+        )
+
+    state = loader()
+    routes = CatalogRouteResolver(
+        state.normalized_catalogs,
+        project_resolver=_project_resolver(state.activations, state.exact_models),
+        listing_pools=state.listing_pools,
+    )
+    executor = GatewayExecutor(state.runtime_catalogs, ledger)
+    reloader = _AliasAuthorityReloader(
+        loader=loader,
+        state=state,
+        routes=routes,
+        executor=executor,
+    )
+    return LocalGatewayComponents(
+        manager=manager,
+        store=_ReadyControlStore(store=store, reloader=reloader),
+        ledger=ledger,
+        routes=routes,
+        executor=executor,
+        reloader=reloader,
+        reconciled_expired_requests=expired,
+        reconciled_unknown_attempts=unknown,
+    )
+
+
 def load_local_gateway(
     root: Path = Path(ARTIFACT_DIR),
     *,
@@ -373,59 +477,40 @@ def load_local_gateway(
     """
     if graceful_timeout_seconds <= 0:
         raise GatewayLifecycleError("graceful timeout must be positive")
-    manager = GatewayManagement(root)
-    store = manager.require_initialized()
-    manager.migrate_legacy_provider_connections()
-    ledger = SQLiteAttemptLedger(manager.database_path)
-    expired, unknown = ledger.reconcile_crashed_requests(cleanup_grace=timedelta(seconds=5))
-
-    def loader() -> _AliasAuthorityState:
-        """Build one complete validated generation from current granted authority."""
-        return _load_alias_state(
-            manager,
-            environment=environment,
-            project_repository=project_repository,
-            decision_sink=decision_sink,
-            only_aliases=only_aliases,
-        )
-
-    state = loader()
-    routes = CatalogRouteResolver(
-        state.normalized_catalogs,
-        project_resolver=_project_resolver(state.activations, state.exact_models),
-        listing_pools=state.listing_pools,
-    )
-    executor = GatewayExecutor(state.runtime_catalogs, ledger)
-    reloader = _AliasAuthorityReloader(
-        loader=loader,
-        state=state,
-        routes=routes,
-        executor=executor,
+    components = load_gateway_components(
+        root,
+        environment=environment,
+        project_repository=project_repository,
+        decision_sink=decision_sink,
+        only_aliases=only_aliases,
     )
 
     async def readiness_probe() -> ExecutionSnapshot:
         """Return the current generation's credential and route proof."""
-        return reloader.state.proof
+        return components.reloader.state.proof
 
     runtime = create_gateway_runtime(
         config=GatewayRuntimeConfig(
             graceful_timeout_seconds=graceful_timeout_seconds,
             title="EXP local gateway",
         ),
-        authority=_ReadyControlStore(store=store, reloader=reloader),
-        ledger=ledger,
-        routes=routes,
-        executor=executor,
+        authority=components.store,
+        ledger=components.ledger,
+        routes=components.routes,
+        executor=components.executor,
         clock=SystemGatewayClock(),
         readiness=readiness_probe,
-        usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
+        usage=lambda: read_usage_report(
+            components.ledger,
+            organization_id=components.organization_id,
+        ),
         replay=replay,
         continuations=continuations,
     )
     return LocalGatewayRuntime(
         runtime=runtime,
-        reconciled_expired_requests=expired,
-        reconciled_unknown_attempts=unknown,
+        reconciled_expired_requests=components.reconciled_expired_requests,
+        reconciled_unknown_attempts=components.reconciled_unknown_attempts,
     )
 
 
@@ -449,6 +534,7 @@ def _load_alias_state(
     project_repository: ProjectActivationRepository | None,
     decision_sink: DecisionSink | None,
     only_aliases: frozenset[str] | None,
+    only_target_kinds: frozenset[str] | None = None,
 ) -> _AliasAuthorityState:
     """Load and validate every granted active alias into one complete generation.
 
@@ -458,6 +544,8 @@ def _load_alias_state(
         project_repository: Repository for verified immutable project activations.
         decision_sink: Optional aggregate-safe recorder for served project selections.
         only_aliases: Optional exact public aliases to expose.
+        only_target_kinds: Optional alias target kinds to expose, for engines
+            that serve a subset (the Rust engine serves only ``direct``).
 
     Returns:
         Fully validated authority generation ready for atomic publication.
@@ -468,6 +556,8 @@ def _load_alias_state(
     aliases = _granted_active_aliases(manager)
     if only_aliases is not None:
         aliases = tuple(item for item in aliases if item.alias_name in only_aliases)
+    if only_target_kinds is not None:
+        aliases = tuple(item for item in aliases if item.target_kind in only_target_kinds)
     if not aliases:
         raise GatewayLifecycleError(
             "gateway has no granted active alias; create an identity, alias, and grant first"

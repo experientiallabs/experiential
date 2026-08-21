@@ -20,5 +20,10 @@ gate:
 test *ARGS:
     uv run pytest -q {{ARGS}}
 
+# Build the Rust gateway data-plane extension into the project venv (PoC).
+# Afterwards: uv run exp run --engine rust
+native:
+    uv run maturin develop --uv --release --manifest-path exp/runtime/gateway/native/Cargo.toml
+
 lint:
     uv run ruff check . && uv run ruff format --check .

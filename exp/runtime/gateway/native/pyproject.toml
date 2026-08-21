@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "exp-gateway-native"
+version = "0.1.0"
+description = "Rust data plane for the Experiential local gateway (PoC extension module)."
+requires-python = ">=3.12"
+
+[tool.maturin]
+module-name = "exp_gateway_native"
