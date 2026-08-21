@@ -88,11 +88,14 @@ def interactive_gateway_setup(
     if manager.initialized:
         raise ValueError("interactive first-run setup requires an uninitialized gateway")
     console = console or Console(theme=EXP_THEME)
-    selection = select_providers(
-        SetupSession(),
-        console=console,
-        environment={},
-    )
+    try:
+        selection = select_providers(
+            SetupSession(),
+            console=console,
+            environment={},
+        )
+    except (EOFError, KeyboardInterrupt, SetupCancelled):
+        raise typer.Abort from None
     if selection is None:
         raise typer.Abort()
     providers, _manual_models = selection

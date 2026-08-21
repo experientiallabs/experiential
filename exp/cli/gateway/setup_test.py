@@ -165,6 +165,22 @@ def test_gateway_setup_aborts_when_connection_prompt_is_cancelled(
         setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole(""))
 
 
+def test_gateway_setup_aborts_when_provider_selector_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-run setup converts selector EOF into the same clean CLI abort."""
+
+    def _cancel(*_args: object, **_kwargs: object) -> None:
+        """Raise the terminal EOF surfaced by the line-input fallback."""
+        raise EOFError
+
+    monkeypatch.setattr(setup, "select_providers", _cancel)
+
+    with pytest.raises(typer.Abort):
+        setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole(""))
+
+
 @pytest.mark.parametrize(
     ("provider", "credential_env"),
     (("openai", "OPENAI_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY")),
