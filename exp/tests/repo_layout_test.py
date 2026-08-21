@@ -36,6 +36,7 @@ ALLOWED_TOP_FILES = {
     "conftest.py",
     "justfile",
     "pyproject.toml",
+    "setup.md",
     "uv.lock",
 }
 
