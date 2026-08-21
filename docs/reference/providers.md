@@ -52,10 +52,11 @@ cache-write price is inferred from a neighboring value.
 | `pricing.cached_input_micro_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in micro-USD per million tokens |
 
 Micro-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000`. A
-hosted WMO gateway publishes these fields from its active catalog for each granted alias that
-resolves to one deployment. That is enough for world-model and judge setup when tools, structured
-output, and input/output prices are present. Router-candidate setup still requires a published
-context window and both cache prices; WMO does not invent those.
+hosted WMO gateway publishes these fields from the granted alias revision's direct singleton
+pool. Project aliases and multi-deployment pools stay identity-only. That is enough for
+world-model and judge setup when tools, structured output, and input/output prices are present.
+Router-candidate setup still requires a published context window and both cache prices; WMO does
+not invent those.
 
 The hosted WMO `/v1/models` response keeps the standard OpenAI list shape (`object`, `data`, and
 the four OpenAI model keys) and only adds these extension fields plus the existing `wmo`

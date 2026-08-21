@@ -154,8 +154,8 @@ idempotency, request, or provider values.
 
 `GET /v1/models` lists only the aliases granted to the presented key, as OpenAI model objects
 enriched with a `wmo` object carrying the alias revision and catalog digest of the granted
-authority. When that alias resolves to exactly one active catalog deployment, the same object
-also carries optional extension fields copied from that deployment: `supports_completions`,
+authority. When that alias revision targets exactly one direct singleton pool, the same object
+also carries optional extension fields copied from that pool's deployment: `supports_completions`,
 `supports_tools`, `supports_structured_output`, `maximum_output_tokens`, `context_window_tokens`
 when the catalog declares a window, and a `pricing` object of configured micro-USD-per-million-token
 rates. The gateway never invents a context window or a cache-write price, and it never hard-codes

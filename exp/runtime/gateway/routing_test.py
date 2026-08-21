@@ -25,6 +25,7 @@ def _deployment(
     deployment_id: str,
     source_alias: str,
     exact_model_id: str = "exact-one",
+    input_price: int = 900_000,
 ) -> ExactModelDeployment:
     """Build one priced completion deployment for lookup tests.
 
@@ -32,6 +33,7 @@ def _deployment(
         deployment_id: Catalog deployment identifier.
         source_alias: Source alias recorded on the deployment.
         exact_model_id: Exact logical model identity shared with its pool.
+        input_price: Configured input micro-USD per million tokens.
 
     Returns:
         A secret-free deployment with declared tools, output limit, and prices.
@@ -52,47 +54,71 @@ def _deployment(
         ),
         gateway=GatewayDeploymentMetadata(
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=900_000,
+                input_micro_usd_per_million_tokens=input_price,
                 output_micro_usd_per_million_tokens=900_000,
             )
         ),
     )
 
 
-def _resolver(
+def _catalog(
     deployments: tuple[ExactModelDeployment, ...],
     pools: tuple[ExactModelPool, ...],
-) -> tuple[CatalogRouteResolver, str]:
-    """Index one catalog snapshot and return the resolver plus its digest.
+) -> tuple[NormalizedGatewayCatalog, str]:
+    """Build one catalog snapshot and its digest.
 
     Args:
         deployments: Deployments stored in the snapshot.
         pools: Exact-model pools stored in the snapshot.
 
     Returns:
-        The resolver and the catalog digest used as the revision key.
+        The catalog and the digest used as the revision key.
     """
     catalog = NormalizedGatewayCatalog(deployments=deployments, pools=pools)
-    digest = catalog.identity_sha256()
-    return CatalogRouteResolver({(_REVISION, digest): catalog}), digest
+    return catalog, catalog.identity_sha256()
 
 
-def test_published_metadata_uses_the_deployment_named_by_the_public_alias() -> None:
-    """A direct alias copies fields from the deployment that shares its name."""
-    deployment = _deployment(deployment_id="coding", source_alias="coding")
-    resolver, digest = _resolver(
+def _resolver(
+    catalog: NormalizedGatewayCatalog,
+    digest: str,
+    listing_pools: dict[tuple[str, str, str], str] | None = None,
+) -> CatalogRouteResolver:
+    """Index one catalog with optional authoritative listing targets.
+
+    Args:
+        catalog: Snapshot served by the resolver.
+        digest: Frozen catalog digest.
+        listing_pools: Direct-target pool IDs keyed by granted alias authority.
+
+    Returns:
+        A resolver ready for metadata lookup.
+    """
+    return CatalogRouteResolver(
+        {(_REVISION, digest): catalog},
+        listing_pools=listing_pools,
+    )
+
+
+def test_published_metadata_uses_the_revision_direct_pool_not_the_public_name() -> None:
+    """A differently named public alias still publishes its frozen direct pool."""
+    deployment = _deployment(deployment_id="deployment-one", source_alias="source-one")
+    catalog, digest = _catalog(
         (deployment,),
         (
             ExactModelPool(
-                pool_id="coding",
+                pool_id="pool-one",
                 exact_model_id="exact-one",
-                deployment_ids=("coding",),
+                deployment_ids=("deployment-one",),
             ),
         ),
     )
 
-    metadata = resolver.published_metadata(
-        alias="coding",
+    metadata = _resolver(
+        catalog,
+        digest,
+        {("public-model", _REVISION, digest): "pool-one"},
+    ).published_metadata(
+        alias="public-model",
         revision_id=_REVISION,
         catalog_sha256=digest,
     )
@@ -106,35 +132,50 @@ def test_published_metadata_uses_the_deployment_named_by_the_public_alias() -> N
     assert metadata.cached_input_micro_usd_per_million_tokens is None
 
 
-def test_published_metadata_accepts_a_singleton_pool_named_by_the_public_alias() -> None:
-    """A public alias may name the singleton pool rather than the deployment ID."""
-    deployment = _deployment(deployment_id="deployment-one", source_alias="source-one")
-    resolver, digest = _resolver(
-        (deployment,),
+def test_published_metadata_ignores_a_deployment_that_only_shares_the_public_name() -> None:
+    """A name collision with another deployment does not override the frozen target."""
+    decoy = _deployment(
+        deployment_id="public-model",
+        source_alias="public-model",
+        exact_model_id="exact-decoy",
+        input_price=1,
+    )
+    target = _deployment(deployment_id="deployment-one", source_alias="source-one")
+    catalog, digest = _catalog(
+        (decoy, target),
         (
             ExactModelPool(
-                pool_id="coding",
+                pool_id="decoy-pool",
+                exact_model_id="exact-decoy",
+                deployment_ids=("public-model",),
+            ),
+            ExactModelPool(
+                pool_id="pool-one",
                 exact_model_id="exact-one",
                 deployment_ids=("deployment-one",),
             ),
         ),
     )
 
-    metadata = resolver.published_metadata(
-        alias="coding",
+    metadata = _resolver(
+        catalog,
+        digest,
+        {("public-model", _REVISION, digest): "pool-one"},
+    ).published_metadata(
+        alias="public-model",
         revision_id=_REVISION,
         catalog_sha256=digest,
     )
 
     assert metadata is not None
-    assert metadata.output_micro_usd_per_million_tokens == 900_000
+    assert metadata.input_micro_usd_per_million_tokens == 900_000
 
 
 def test_published_metadata_stays_closed_for_multi_deployment_pools() -> None:
     """A pool with more than one route does not pick a deployment to advertise."""
     first = _deployment(deployment_id="one", source_alias="one")
     second = _deployment(deployment_id="two", source_alias="two")
-    resolver, digest = _resolver(
+    catalog, digest = _catalog(
         (first, second),
         (
             ExactModelPool(
@@ -152,7 +193,11 @@ def test_published_metadata_stays_closed_for_multi_deployment_pools() -> None:
     )
 
     assert (
-        resolver.published_metadata(
+        _resolver(
+            catalog,
+            digest,
+            {("coding", _REVISION, digest): "coding"},
+        ).published_metadata(
             alias="coding",
             revision_id=_REVISION,
             catalog_sha256=digest,
@@ -161,22 +206,22 @@ def test_published_metadata_stays_closed_for_multi_deployment_pools() -> None:
     )
 
 
-def test_published_metadata_stays_closed_when_the_alias_is_not_in_the_catalog() -> None:
-    """Project aliases and other unmatched names publish no extra fields."""
-    deployment = _deployment(deployment_id="source-one", source_alias="source-one")
-    resolver, digest = _resolver(
+def test_published_metadata_stays_closed_when_the_revision_has_no_direct_pool() -> None:
+    """Project aliases and other unmapped names stay identity-only, even on name hits."""
+    deployment = _deployment(deployment_id="public-model", source_alias="public-model")
+    catalog, digest = _catalog(
         (deployment,),
         (
             ExactModelPool(
                 pool_id="pool-one",
                 exact_model_id="exact-one",
-                deployment_ids=("source-one",),
+                deployment_ids=("public-model",),
             ),
         ),
     )
 
     assert (
-        resolver.published_metadata(
+        _resolver(catalog, digest).published_metadata(
             alias="public-model",
             revision_id=_REVISION,
             catalog_sha256=digest,
