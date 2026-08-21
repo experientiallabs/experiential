@@ -86,7 +86,7 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """First-run setup persists selected connections without inventing public aliases."""
+    """First-run setup accepts all displayed defaults with one empty line."""
     connections = (
         ("openai", ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")),
         ("anthropic", ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")),
@@ -99,26 +99,48 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
     monkeypatch.setattr(
         setup, "collect_provider_connections", lambda *_args, **_kwargs: connections
     )
-    answers = iter(
-        (
-            "gpt-5",
-            "logical-openai",
-            "openai-alias",
-            "default",
-        )
-    )
-    monkeypatch.setattr(setup.typer, "prompt", lambda *_args, **_kwargs: next(answers))
-    monkeypatch.setattr(setup.typer, "confirm", lambda *_args, **_kwargs: True)
+    console = ScriptedConsole("\n")
 
-    result = setup.interactive_gateway_setup(tmp_path)
+    result = setup.interactive_gateway_setup(tmp_path, console=console)
 
-    assert result.alias == "openai-alias"
+    assert result.alias == "gpt-5-6-luna"
+    assert "gpt-5.6-luna" in console.output
+    assert "Press Enter to accept all defaults" in console.output
+    assert "Planned local mutations" not in console.output
+    assert "Create this gateway configuration?" not in console.output
+    assert "Gateway configured" in console.output
     manager = setup.GatewayManagement(tmp_path)
     assert {item.connection_id for item in manager.provider_connections()} == {
         "openai",
         "anthropic",
     }
-    assert {item.alias_id for item in manager.aliases()} == {"openai-alias"}
+    assert {item.alias_id for item in manager.aliases()} == {"gpt-5-6-luna"}
+
+
+def test_gateway_setup_can_edit_the_displayed_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-run setup keeps the defaults visible while allowing every value to be edited."""
+    connections = (("openai", ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")),)
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(
+        setup, "collect_provider_connections", lambda *_args, **_kwargs: connections
+    )
+    console = ScriptedConsole("edit\ncustom-model\nlogical-model\ncustom-alias\noperator\n")
+
+    result = setup.interactive_gateway_setup(tmp_path, console=console)
+
+    assert result.alias == "custom-alias"
+    assert result.identity_id == "operator"
+    assert "Provider model" in console.output
+    assert "Exact model ID" in console.output
+    assert "Alias" in console.output
+    assert "Identity ID" in console.output
 
 
 @pytest.mark.parametrize(

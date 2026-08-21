@@ -8,10 +8,13 @@ import sys
 from pathlib import Path
 
 import typer
+from rich.console import Console
 
 from exp.cli.shared.options import ROOT_OPTION, usage_error
+from exp.cli.shared.theme import EXP_THEME
 
 _LOOPBACK_HOST = "127.0.0.1"
+_console = Console(theme=EXP_THEME)
 _POLICY_OPTION = typer.Option(
     None,
     "--policy",
@@ -209,28 +212,24 @@ def _emit_gateway_ready(
     compatibility: object | None,
     ghost: bool,
 ) -> None:
-    """Print human startup instructions and an optional one-time setup key."""
-    typer.echo(f"Gateway ready at http://{_LOOPBACK_HOST}:{port}/v1")
-    typer.echo(f"Usage view: http://{_LOOPBACK_HOST}:{port}/usage")
+    """Print the green startup result and only the exports needed to use the gateway."""
+    _console.print(
+        f"[green]✓ Gateway ready[/green] http://{_LOOPBACK_HOST}:{port}/v1",
+        markup=True,
+    )
     if compatibility is not None:
         from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 
         if not isinstance(compatibility, ProjectGatewayCompatibility):
             raise TypeError("project gateway compatibility returned an invalid result")
-        typer.echo(f"Project alias: {compatibility.alias} (policy {compatibility.policy_id})")
-        typer.echo(f"Gateway key file: {compatibility.key_file}")
-        typer.echo(f"export OPENAI_API_KEY=\"$(tr -d '\\n' < {compatibility.key_file})\"")
-        if ghost:
-            typer.echo(
-                "ghost compatibility: project journals are disabled; gateway accounting is enabled"
-            )
+        _console.print(
+            f"export OPENAI_API_KEY=\"$(tr -d '\\n' < {compatibility.key_file})\"",
+            markup=False,
+        )
     if setup is not None:
         from exp.cli.gateway.setup import InteractiveSetupResult
 
         if not isinstance(setup, InteractiveSetupResult):
             raise TypeError("interactive setup returned an invalid result")
-        typer.echo(f"Default identity: {setup.identity_id}")
-        typer.echo(f"Granted alias: {setup.alias}")
-        typer.echo("")
-        typer.echo(f"export OPENAI_BASE_URL=http://{_LOOPBACK_HOST}:{port}/v1")
-        typer.echo(f"export OPENAI_API_KEY={setup.raw_key}")
+        _console.print(f"export OPENAI_BASE_URL=http://{_LOOPBACK_HOST}:{port}/v1", markup=False)
+        _console.print(f"export OPENAI_API_KEY={setup.raw_key}", markup=False)
