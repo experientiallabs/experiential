@@ -151,6 +151,62 @@ def test_default_transports_share_one_pooled_client_per_event_loop() -> None:
     assert third is not first
 
 
+def test_aclose_pooled_client_releases_the_loop_owned_client() -> None:
+    """Sync compatibility loops close their pooled client before the loop ends."""
+
+    async def scenario() -> httpx.AsyncClient:
+        """Create one pooled client, close it through the cleanup hook, and return it."""
+        client = async_transport._pooled_client()
+        await async_transport.aclose_pooled_client()
+        return client
+
+    client = asyncio.run(scenario())
+    assert client.is_closed
+
+
+def test_run_then_close_pooled_client_returns_result_and_closes() -> None:
+    """The sync-entry wrapper yields the operation result and releases the pool."""
+    observed: list[httpx.AsyncClient] = []
+
+    async def operation() -> str:
+        """Touch the pooled client and return a sentinel result."""
+        observed.append(async_transport._pooled_client())
+        return "done"
+
+    result = asyncio.run(async_transport.run_then_close_pooled_client(operation()))
+    assert result == "done"
+    assert observed[0].is_closed
+
+
+def test_pooled_client_never_stores_response_cookies() -> None:
+    """A provider-set cookie must not leak into a later shared-client request."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Set a cookie and echo back whether the request carried one."""
+        carried = "cookie" in request.headers
+        return httpx.Response(
+            200,
+            json={"carried_cookie": carried},
+            headers={"set-cookie": "session=leaked; Path=/"},
+        )
+
+    async def scenario() -> tuple[bool, int]:
+        """Send two requests through one pooled-style client and inspect cookie reuse."""
+        client = httpx.AsyncClient(
+            transport=async_transport._CookieFreeTransport(httpx.MockTransport(handler)),
+        )
+        try:
+            await client.get("https://provider.test/v1/models")
+            second = await client.get("https://provider.test/v1/models")
+            return bool(second.json()["carried_cookie"]), len(client.cookies)
+        finally:
+            await client.aclose()
+
+    carried, stored = asyncio.run(scenario())
+    assert not carried
+    assert stored == 0
+
+
 def test_httpx_decode_failure_does_not_expose_body_or_headers() -> None:
     """Malformed provider content must not appear in the surfaced transport error."""
     canary = "secret-response-canary"

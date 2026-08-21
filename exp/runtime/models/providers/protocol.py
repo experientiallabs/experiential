@@ -9,7 +9,10 @@ from exp.common.models import ModelClient, ModelRequest, ModelResponse
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.interfaces import ProviderStream
-from exp.runtime.models.providers.async_transport import RequestDeadline
+from exp.runtime.models.providers.async_transport import (
+    RequestDeadline,
+    run_then_close_pooled_client,
+)
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.transport import RetryPolicy
 
@@ -76,7 +79,7 @@ class SyncModelClientAdapter:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self._complete(request))
+            return asyncio.run(run_then_close_pooled_client(self._complete(request)))
         raise RuntimeError(
             "sync model compatibility cannot run on an event loop; await complete_async instead"
         )

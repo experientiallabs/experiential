@@ -16,6 +16,7 @@ from exp.runtime.models.providers.async_transport import (
     RequestDeadline,
     as_async_transport,
     post_json_async,
+    run_then_close_pooled_client,
     run_with_retry_async,
 )
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
@@ -281,7 +282,9 @@ def _run_sync[ResultT](
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(_wait_for(operation, timeout_seconds=timeout_seconds))
+        return asyncio.run(
+            run_then_close_pooled_client(_wait_for(operation, timeout_seconds=timeout_seconds))
+        )
     operation.close()
     raise RuntimeError("sync provider compatibility cannot run on an event loop; use async APIs")
 

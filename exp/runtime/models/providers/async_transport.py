@@ -51,6 +51,42 @@ def _default_ssl_context() -> ssl.SSLContext:
     return _shared_ssl_context
 
 
+class _CookieFreeTransport(httpx.AsyncBaseTransport):
+    """Transport wrapper that removes ``Set-Cookie`` headers from responses.
+
+    The pooled client is shared by every default transport on one event loop, so a
+    provider-set cookie must not be stored and replayed on a later request made
+    under a different credential context. Provider APIs authenticate per request
+    through explicit headers and need no cookie state.
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        """Wrap one connection-pooling transport.
+
+        Args:
+            inner: Transport that owns the actual connection pool.
+        """
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        """Forward one request and strip cookie-setting headers from its response.
+
+        Args:
+            request: Outbound provider request.
+
+        Returns:
+            The provider response without ``Set-Cookie`` headers.
+        """
+        response = await self._inner.handle_async_request(request)
+        if "set-cookie" in response.headers:
+            del response.headers["set-cookie"]
+        return response
+
+    async def aclose(self) -> None:
+        """Close the wrapped connection pool."""
+        await self._inner.aclose()
+
+
 def _pooled_client() -> httpx.AsyncClient:
     """Return the shared keep-alive client bound to the running event loop.
 
@@ -63,14 +99,47 @@ def _pooled_client() -> httpx.AsyncClient:
     client = _pooled_clients.get(loop)
     if client is None or client.is_closed:
         client = httpx.AsyncClient(
-            verify=_default_ssl_context(),
-            limits=httpx.Limits(
-                max_connections=_POOLED_MAX_CONNECTIONS,
-                max_keepalive_connections=_POOLED_MAX_KEEPALIVE_CONNECTIONS,
+            transport=_CookieFreeTransport(
+                httpx.AsyncHTTPTransport(
+                    verify=_default_ssl_context(),
+                    limits=httpx.Limits(
+                        max_connections=_POOLED_MAX_CONNECTIONS,
+                        max_keepalive_connections=_POOLED_MAX_KEEPALIVE_CONNECTIONS,
+                    ),
+                )
             ),
         )
         _pooled_clients[loop] = client
     return client
+
+
+async def aclose_pooled_client() -> None:
+    """Close and forget the pooled client owned by the running event loop.
+
+    Long-lived server loops keep their pooled client for connection reuse.
+    Sync compatibility entry points run each call on a temporary ``asyncio.run``
+    loop, so they invoke this before the loop ends to release pooled sockets
+    deterministically instead of leaving them to garbage collection.
+    """
+    loop = asyncio.get_running_loop()
+    client = _pooled_clients.pop(loop, None)
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
+async def run_then_close_pooled_client[ResultT](operation: Awaitable[ResultT]) -> ResultT:
+    """Await one operation, then release the temporary loop's pooled client.
+
+    Args:
+        operation: Provider operation executed on a short-lived event loop.
+
+    Returns:
+        The completed operation result.
+    """
+    try:
+        return await operation
+    finally:
+        await aclose_pooled_client()
 
 
 @dataclass(frozen=True)
