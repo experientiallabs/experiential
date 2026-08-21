@@ -181,6 +181,14 @@ def _transport_failure(status_code: int | None) -> GatewayFailure:
             failover_eligible=True,
             safe_details=details,
         )
+    if status_code in {409, 425}:
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+            safe_message="provider reported a transient conflict; retry the request",
+            retryable_same_deployment=True,
+            failover_eligible=True,
+            safe_details=details,
+        )
     if status_code is not None and 400 <= status_code < 500:
         return GatewayFailure(
             failure_class=GatewayFailureClass.INVALID_REQUEST,
