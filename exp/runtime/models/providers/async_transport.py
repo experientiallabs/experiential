@@ -540,46 +540,6 @@ async def run_with_retry_async[ResultT](
     raise RuntimeError("retry loop exhausted without running an attempt")
 
 
-async def get_json_async(
-    transport: AsyncJsonHttpTransport,
-    url: str,
-    *,
-    headers: Mapping[str, str],
-    deadline: RequestDeadline,
-    retry_policy: RetryPolicy,
-    attempt_timeout_seconds: float | None = None,
-) -> JsonObject:
-    """Read one JSON object through one deadline-aware async retry loop.
-
-    Args:
-        transport: Async transport used for every same-endpoint attempt.
-        url: Absolute provider endpoint URL.
-        headers: Provider request headers.
-        deadline: Absolute request-wide deadline.
-        retry_policy: Total same-endpoint attempt and delay bounds.
-        attempt_timeout_seconds: Optional smaller per-attempt bound.
-
-    Returns:
-        The first successful response body.
-    """
-
-    async def send(timeout_seconds: float) -> JsonObject:
-        """Send one GET attempt and validate its status."""
-        response = await transport.get(
-            url,
-            headers=headers,
-            timeout_seconds=timeout_seconds,
-        )
-        return _successful_body(response)
-
-    return await run_with_retry_async(
-        send,
-        policy=retry_policy,
-        deadline=deadline,
-        attempt_timeout_seconds=attempt_timeout_seconds,
-    )
-
-
 async def post_json_async(
     transport: AsyncJsonHttpTransport,
     url: str,

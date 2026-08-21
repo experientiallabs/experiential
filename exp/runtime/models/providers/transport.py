@@ -6,7 +6,6 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
-from uuid import uuid4
 
 import httpx
 
@@ -375,50 +374,6 @@ def get_json(
         """Run one GET attempt and return its successful body."""
         return _successful_body(
             transport.get(url, headers=headers, timeout_seconds=timeout_seconds)
-        )
-
-    return run_with_retry(send, policy=retry_policy)
-
-
-def post_json(
-    transport: JsonHttpTransport,
-    url: str,
-    *,
-    headers: Mapping[str, str],
-    payload: JsonObject,
-    timeout_seconds: float,
-    retry_policy: RetryPolicy,
-) -> JsonObject:
-    """Send one non-streaming JSON request with bounded same-endpoint retries.
-
-    Args:
-        transport: Explicit transport used for this request.
-        url: Absolute provider endpoint URL.
-        headers: Provider headers, including an already-resolved credential.
-        payload: Complete JSON request body.
-        timeout_seconds: Timeout for each attempt.
-        retry_policy: Retry policy that never changes provider or model.
-
-    Returns:
-        A successful response JSON object.
-
-    Raises:
-        ProviderTransportError: The endpoint failed or returned a non-success status.
-    """
-    request_headers = {
-        name: value for name, value in headers.items() if name.lower() != "idempotency-key"
-    }
-    request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
-
-    def send() -> JsonObject:
-        """Run one POST attempt, reusing the idempotency key, and return its successful body."""
-        return _successful_body(
-            transport.post(
-                url,
-                headers=request_headers,
-                payload=payload,
-                timeout_seconds=timeout_seconds,
-            )
         )
 
     return run_with_retry(send, policy=retry_policy)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Protocol
 
 from exp.common.core.artifacts import StructuredFailure
@@ -14,7 +13,7 @@ from exp.runtime.router.journal import (
     RuntimeInteractionInProgressError,
 )
 from exp.runtime.router.journal_service import JournaledRouterRuntime
-from exp.runtime.router.runtime import RoutedModelResponse, RouterRuntime
+from exp.runtime.router.runtime import RoutedModelResponse
 
 
 class RouterCompletionConflictError(ValueError):
@@ -109,41 +108,3 @@ class JournaledRouterCompletionService:
             raise RouterCompletionInProgressError(str(exc)) from exc
         except RuntimeInteractionFailedError as exc:
             raise RouterCompletionFailedError(exc.failure, exc.spend) from exc
-
-
-def complete_router_request(
-    runtime: RouterRuntime,
-    service: RouterCompletionService | None,
-    request: ModelRequest,
-    *,
-    idempotency_key: str | None,
-    conversation_id: str | None = None,
-) -> RoutedModelResponse:
-    """Dispatch through durable state when injected and preserve raw low-level composition.
-
-    Args:
-        runtime: Activated router used directly only when no durable service is injected.
-        service: Optional durable completion owner for every request on this endpoint.
-        request: Canonical provider-neutral request.
-        idempotency_key: Optional standard caller replay key.
-        conversation_id: Optional stable Responses conversation identity.
-
-    Returns:
-        The routed response after durable completion or direct low-level execution.
-
-    Raises:
-        RouterCompletionConflictError: A keyed call has no durable service or conflicts with state.
-        RouterCompletionInProgressError: Another process owns the durable interaction.
-        RouterCompletionFailedError: The durable interaction has a terminal failure.
-    """
-    if service is not None:
-        return service.complete(
-            request,
-            idempotency_key=idempotency_key or f"exp-request-{uuid.uuid4().hex}",
-            conversation_id=conversation_id,
-        )
-    if idempotency_key is not None:
-        raise RouterCompletionConflictError(
-            "this router has no durable idempotency service; retry without Idempotency-Key"
-        )
-    return runtime.complete(request, episode_id=conversation_id)
