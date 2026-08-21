@@ -43,7 +43,25 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
-_CATALOG = "a" * 64
+
+def _catalog() -> NormalizedGatewayCatalog:
+    """Build the normalized catalog pinned by the fixture alias revision."""
+    return NormalizedGatewayCatalog(
+        deployments=(_deployment(), _deployment(deployment_id="secondary")),
+        pools=(
+            ExactModelPool(
+                pool_id="pool",
+                exact_model_id="exact-one",
+                deployment_ids=("primary", "secondary"),
+                equivalence=GatewayEquivalenceCertification(
+                    certification_id="cert-one",
+                    provenance="operator replayed both deployments",
+                    evidence_sha256="e" * 64,
+                    certified_at=datetime(2026, 8, 1, tzinfo=UTC),
+                ),
+            ),
+        ),
+    )
 
 
 class _Clock:
@@ -115,10 +133,11 @@ def _authority(
     budgets = SQLiteBudgetStore(path, clock=clock)
     store.create_organization(organization_id="org", slug="org", display_name="Org")
     store.create_identity(organization_id="org", identity_id="identity", display_name="Identity")
+    digest = _catalog().identity_sha256()
     store.register_catalog_snapshot(
         organization_id="org",
         snapshot_ref="snapshot",
-        catalog_sha256=_CATALOG,
+        catalog_sha256=digest,
     )
     store.activate_alias_revision(
         organization_id="org",
@@ -127,7 +146,7 @@ def _authority(
         revision_id="revision",
         target=DirectTarget(pool_id="pool"),
         snapshot_ref="snapshot",
-        catalog_sha256=_CATALOG,
+        catalog_sha256=digest,
     )
     store.grant_alias(organization_id="org", identity_id="identity", alias_id="coding")
     key = store.issue_virtual_key(
@@ -528,23 +547,7 @@ def test_migrated_attempts_receive_explicit_period_and_cost_state(tmp_path: Path
 
 def _write_snapshot(tmp_path: Path) -> None:
     """Write the pinned normalized catalog snapshot referenced by the fixture alias."""
-    catalog = NormalizedGatewayCatalog(
-        deployments=(_deployment(), _deployment(deployment_id="secondary")),
-        pools=(
-            ExactModelPool(
-                pool_id="pool",
-                exact_model_id="exact-one",
-                deployment_ids=("primary", "secondary"),
-                equivalence=GatewayEquivalenceCertification(
-                    certification_id="cert-one",
-                    provenance="operator replayed both deployments",
-                    evidence_sha256="e" * 64,
-                    certified_at=datetime(2026, 8, 1, tzinfo=UTC),
-                ),
-            ),
-        ),
-    )
-    (tmp_path / "snapshot").write_bytes(canonical_json_bytes(catalog.model_dump(mode="json")))
+    (tmp_path / "snapshot").write_bytes(canonical_json_bytes(_catalog().model_dump(mode="json")))
 
 
 def test_pool_and_deployment_budget_scopes_require_real_targets(tmp_path: Path) -> None:
@@ -553,7 +556,7 @@ def test_pool_and_deployment_budget_scopes_require_real_targets(tmp_path: Path) 
     _store, _ledger, budgets, _key = _authority(tmp_path, clock)
     _write_snapshot(tmp_path)
 
-    with pytest.raises(ValueError, match="pool is not a revision target"):
+    with pytest.raises(ValueError, match="pool is not the active revision target"):
         budgets.set_limit(
             organization_id="org",
             period="2026-08",
@@ -591,6 +594,60 @@ def test_pool_and_deployment_budget_scopes_require_real_targets(tmp_path: Path) 
         limit_micro_usd=100,
     )
     assert changed and deployment_limit.scope.deployment_id == "secondary"
+
+
+def test_retargeted_alias_rejects_previous_pool_scope(tmp_path: Path) -> None:
+    """Only the active revision's pool authorizes new pool limits after a retarget."""
+    clock = _Clock()
+    store, _ledger, budgets, _key = _authority(tmp_path, clock)
+    _write_snapshot(tmp_path)
+    store.activate_alias_revision(
+        organization_id="org",
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-two",
+        target=DirectTarget(pool_id="pool-two"),
+        snapshot_ref="snapshot",
+        catalog_sha256=_catalog().identity_sha256(),
+    )
+
+    with pytest.raises(ValueError, match="pool is not the active revision target"):
+        budgets.set_limit(
+            organization_id="org",
+            period="2026-08",
+            scope=BudgetScope(kind=BudgetScopeKind.POOL, alias_id="coding", pool_id="pool"),
+            limit_micro_usd=100,
+        )
+
+
+def test_deployment_budget_scope_fails_closed_on_tampered_snapshot(tmp_path: Path) -> None:
+    """A snapshot whose content differs from the registered digest is rejected."""
+    clock = _Clock()
+    _store, _ledger, budgets, _key = _authority(tmp_path, clock)
+    tampered = NormalizedGatewayCatalog(
+        deployments=(_deployment(),),
+        pools=(
+            ExactModelPool(
+                pool_id="pool",
+                exact_model_id="exact-one",
+                deployment_ids=("primary",),
+            ),
+        ),
+    )
+    (tmp_path / "snapshot").write_bytes(canonical_json_bytes(tampered.model_dump(mode="json")))
+
+    with pytest.raises(ValueError, match="digest does not match"):
+        budgets.set_limit(
+            organization_id="org",
+            period="2026-08",
+            scope=BudgetScope(
+                kind=BudgetScopeKind.DEPLOYMENT,
+                alias_id="coding",
+                pool_id="pool",
+                deployment_id="primary",
+            ),
+            limit_micro_usd=100,
+        )
 
 
 def test_deployment_budget_scope_fails_closed_on_unreadable_snapshot(tmp_path: Path) -> None:

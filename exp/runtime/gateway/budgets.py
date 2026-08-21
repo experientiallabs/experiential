@@ -318,38 +318,51 @@ class SQLiteBudgetStore:
     ) -> None:
         """Require the scoped pool, and any scoped deployment, to exist for the alias.
 
-        The pool must be the direct target of at least one revision of the scoped
-        alias. A deployment scope must additionally name a deployment inside that
-        pool in at least one of those revisions' pinned catalog snapshots, so a
-        stored limit always references attempts the ledger can actually charge.
+        The pool must be the direct target of the alias's active revision, because
+        runtime routing and budget charging match on the active revision only. A
+        deployment scope must additionally name a deployment inside that pool in the
+        active revision's pinned catalog snapshot, verified against the registered
+        digest, so a stored limit always references attempts the ledger can charge.
         """
-        rows = connection.execute(
+        row = connection.execute(
             """
-            SELECT snapshot_ref FROM alias_revisions
-            WHERE organization_id = ? AND alias_id = ? AND pool_id = ?
-            ORDER BY revision_number DESC
+            SELECT r.pool_id, r.snapshot_ref, r.catalog_sha256
+            FROM gateway_aliases AS a
+            JOIN alias_revisions AS r
+              ON r.organization_id = a.organization_id
+             AND r.alias_id = a.alias_id
+             AND r.revision_id = a.active_revision_id
+            WHERE a.organization_id = ? AND a.alias_id = ?
             """,
-            (organization_id, scope.alias_id, scope.pool_id),
-        ).fetchall()
-        if not rows:
-            raise ValueError("budget pool is not a revision target of its alias")
+            (organization_id, scope.alias_id),
+        ).fetchone()
+        if row is None or row["pool_id"] != scope.pool_id:
+            raise ValueError("budget pool is not the active revision target of its alias")
         if scope.deployment_id is None:
             return
-        for row in rows:
-            pools = self._snapshot_pools(str(row["snapshot_ref"]))
-            for pool in pools:
-                if pool.pool_id != scope.pool_id:
-                    continue
-                if scope.deployment_id in pool.deployment_ids:
-                    return
-        raise ValueError("budget deployment is not in its pool's catalog snapshots")
+        pools = self._snapshot_pools(
+            str(row["snapshot_ref"]),
+            catalog_sha256=str(row["catalog_sha256"]),
+        )
+        for pool in pools:
+            if pool.pool_id != scope.pool_id:
+                continue
+            if scope.deployment_id in pool.deployment_ids:
+                return
+        raise ValueError("budget deployment is not in its pool's active catalog snapshot")
 
-    def _snapshot_pools(self, snapshot_ref: str) -> tuple[ExactModelPool, ...]:
+    def _snapshot_pools(
+        self,
+        snapshot_ref: str,
+        *,
+        catalog_sha256: str,
+    ) -> tuple[ExactModelPool, ...]:
         """Load the certified pools from one pinned catalog snapshot reference.
 
         Raises:
-            ValueError: The reference escapes gateway state or is unreadable, so
-                configuration fails closed instead of storing an unverifiable scope.
+            ValueError: The reference escapes gateway state, is unreadable, or does
+                not match its registered digest, so configuration fails closed
+                instead of storing an unverifiable scope.
         """
         state_dir = self.database_path.parent.resolve()
         snapshot = (state_dir / snapshot_ref).resolve()
@@ -359,6 +372,8 @@ class SQLiteBudgetStore:
             catalog = NormalizedGatewayCatalog.model_validate_json(snapshot.read_bytes())
         except (OSError, ValueError) as exc:
             raise ValueError("budget scope catalog snapshot is unreadable") from exc
+        if catalog.identity_sha256() != catalog_sha256:
+            raise ValueError("budget scope catalog snapshot digest does not match")
         return catalog.pools
 
     @contextmanager

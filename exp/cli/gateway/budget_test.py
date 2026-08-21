@@ -19,12 +19,10 @@ from exp.common.models.gateway_catalog import (
 from exp.runtime.gateway.contracts import DirectTarget
 from exp.runtime.gateway.management import GatewayManagement
 
-_DIGEST = "a" * 64
 
-
-def _snapshot_bytes() -> bytes:
-    """Return one pinned singleton-pool catalog snapshot for the fixture alias."""
-    catalog = NormalizedGatewayCatalog(
+def _snapshot_catalog() -> NormalizedGatewayCatalog:
+    """Build the pinned singleton-pool catalog snapshot for the fixture alias."""
+    return NormalizedGatewayCatalog(
         deployments=(
             ExactModelDeployment(
                 deployment_id="azure-primary",
@@ -46,7 +44,6 @@ def _snapshot_bytes() -> bytes:
             ),
         ),
     )
-    return canonical_json_bytes(catalog.model_dump(mode="json"))
 
 
 def _configured(root: Path) -> GatewayManagement:
@@ -55,11 +52,15 @@ def _configured(root: Path) -> GatewayManagement:
     manager.initialize()
     store = manager.require_initialized()
     manager.create_identity(identity_id="identity-one", display_name="Identity")
-    (manager.state_dir / "snapshot-one").write_bytes(_snapshot_bytes())
+    catalog = _snapshot_catalog()
+    (manager.state_dir / "snapshot-one").write_bytes(
+        canonical_json_bytes(catalog.model_dump(mode="json"))
+    )
+    digest = catalog.identity_sha256()
     store.register_catalog_snapshot(
         organization_id=manager.organization_id,
         snapshot_ref="snapshot-one",
-        catalog_sha256=_DIGEST,
+        catalog_sha256=digest,
     )
     store.activate_alias_revision(
         organization_id=manager.organization_id,
@@ -68,7 +69,7 @@ def _configured(root: Path) -> GatewayManagement:
         revision_id="revision-one",
         target=DirectTarget(pool_id="pool-one"),
         snapshot_ref="snapshot-one",
-        catalog_sha256=_DIGEST,
+        catalog_sha256=digest,
     )
     return manager
 
