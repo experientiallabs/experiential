@@ -71,20 +71,6 @@ def prepare_project_gateway(
     )
 
 
-def read_project_gateway_key(
-    compatibility: ProjectGatewayCompatibility,
-    *,
-    manager: GatewayManagement,
-) -> str:
-    """Read and authenticate the private compatibility key without logging it."""
-    try:
-        raw_key = compatibility.key_file.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise ValueError("project gateway key file is unavailable") from exc
-    manager.require_initialized().authenticate_key(raw_key=raw_key)
-    return raw_key
-
-
 def _ensure_compatibility_key(
     manager: GatewayManagement,
     *,

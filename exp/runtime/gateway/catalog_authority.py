@@ -48,14 +48,6 @@ class CertifiedPoolUpdate:
     changed: bool
 
 
-def list_connections(root: Path) -> tuple[tuple[str, ConnectionConfig], ...]:
-    """Return role-free connections without resolving their environment secrets."""
-    path = root / "models.toml"
-    if not path.exists():
-        return ()
-    return tuple(sorted(load_model_catalog(path).connections.items()))
-
-
 def upsert_connection(
     root: Path,
     *,
@@ -95,31 +87,6 @@ def upsert_connection(
                 roles=ModelRoles(),
             )
         write_model_catalog(path, updated)
-    return True
-
-
-def remove_connection(root: Path, *, name: str) -> bool:
-    """Remove an unreferenced provider connection without touching secret values."""
-    path = root / "models.toml"
-    if not path.exists():
-        return False
-    with file_write_lock(path, what="the gateway provider catalog"):
-        current = load_model_catalog(path)
-        if name not in current.connections:
-            return False
-        references = sorted(
-            alias for alias, record in current.models.items() if record.connection == name
-        )
-        if references:
-            raise GatewayCatalogAuthoringError(
-                f"provider connection {name!r} is used by deployments: {', '.join(references)}"
-            )
-        connections = dict(current.connections)
-        del connections[name]
-        if not connections:
-            path.unlink()
-            return True
-        write_model_catalog(path, current.model_copy(update={"connections": connections}))
     return True
 
 

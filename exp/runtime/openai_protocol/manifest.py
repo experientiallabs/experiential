@@ -123,18 +123,6 @@ RESPONSES_MANIFEST = CompatibilityManifest(
 )
 
 
-def manifest_for(surface: GatewayApiSurface) -> CompatibilityManifest:
-    """Return the frozen manifest for one public API surface.
-
-    Args:
-        surface: Chat Completions or Responses.
-
-    Returns:
-        Closed executable compatibility declaration.
-    """
-    return CHAT_MANIFEST if surface == GatewayApiSurface.CHAT_COMPLETIONS else RESPONSES_MANIFEST
-
-
 def disposition_map(manifest: CompatibilityManifest) -> dict[str, CompatibilityDisposition]:
     """Index one manifest by exact top-level request field.
 

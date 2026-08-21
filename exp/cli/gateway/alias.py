@@ -38,7 +38,6 @@ _POLICY_OPTION = typer.Option(None, "--policy")
 _REVISION_OPTION = typer.Option(None, "--revision")
 _PRICING_SOURCE_OPTION = typer.Option(None, "--pricing-source")
 _MAXIMUM_OUTPUT_OPTION = typer.Option(None, "--maximum-output-tokens", min=1)
-_PRICE_OPTION = typer.Option(None, min=0)
 _REFUSAL_FAILOVER_OPTION = typer.Option(False, "--refusal-failover")
 _BILLING_SOURCE_OPTION = typer.Option(None, "--billing-source")
 
