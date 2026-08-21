@@ -63,7 +63,7 @@ def test_put_survives_a_fresh_python_process(tmp_path: Path) -> None:
         check=False,
         capture_output=True,
         text=True,
-        cwd="/workspace",
+        cwd=Path(__file__).resolve().parents[3],
     )
 
     assert completed.returncode == 0, completed.stderr
