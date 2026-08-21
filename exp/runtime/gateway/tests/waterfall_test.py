@@ -241,6 +241,132 @@ def test_throttle_window_recovers_without_opening_the_failure_circuit() -> None:
     assert health.claim(key)
 
 
+def test_last_resort_probe_admits_one_bounded_request_through_open_circuits() -> None:
+    """One bounded probe passes an open circuit and success restores admission."""
+    now = [100.0]
+    health = DeploymentHealthRegistry(
+        failure_threshold=1,
+        open_seconds=30,
+        throttle_seconds=5,
+        clock=lambda: now[0],
+    )
+    key = ("catalog", "deployment", "connection")
+
+    assert health.claim(key)
+    health.failed(
+        key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider transport failed",
+            failover_eligible=True,
+        ),
+    )
+    assert not health.claim(key)
+    assert health.claim_last_resort(key)
+    assert not health.claim_last_resort(key)
+    health.dispatch_opened(key)
+    assert health.claim(key)
+
+    throttled = ("catalog", "deployment", "connection-throttled")
+    health.failed(
+        throttled,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request",
+            failover_eligible=True,
+        ),
+    )
+    assert not health.claim_last_resort(throttled)
+
+
+def test_recovered_provider_serves_through_open_circuits_without_waiting_out_cooldown() -> None:
+    """A request during full suppression probes the recovered primary immediately."""
+    now = [100.0]
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    first_provider = _ScriptedProvider([_completed_stream("primary recovered")])
+    second_provider = _ScriptedProvider([_completed_stream("must not run")])
+    health = DeploymentHealthRegistry(
+        failure_threshold=1,
+        open_seconds=30,
+        throttle_seconds=5,
+        clock=lambda: now[0],
+    )
+    outage = GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT,
+        safe_message="provider transport failed",
+        failover_eligible=True,
+    )
+    first_key = (_DIGEST, first.deployment_id, first.connection_sha256)
+    second_key = (_DIGEST, second.deployment_id, second.connection_sha256)
+    health.failed(first_key, outage)
+    health.failed(second_key, outage)
+    executor = _executor(
+        (first, second),
+        {
+            first.source_alias: first_provider,
+            second.source_alias: second_provider,
+        },
+        _WaterfallLedger(),
+        maximum_same_deployment_attempts=1,
+        health=health,
+    )
+
+    async def consume() -> str:
+        """Run one logical request and return its sole text delta."""
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+        return "".join(event.text_delta or "" for event in events)
+
+    assert asyncio.run(consume()) == "primary recovered"
+    assert second_provider.idempotency_keys == []
+    assert health.claim(first_key)
+
+
+def test_budget_skip_still_probes_a_suppressed_fallback_route() -> None:
+    """A budget-skipped primary probes the open fallback circuit instead of failing."""
+    now = [100.0]
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    first_provider = _ScriptedProvider([_completed_stream("must not dispatch")])
+    second_provider = _ScriptedProvider([_completed_stream("fallback recovered")])
+    health = DeploymentHealthRegistry(
+        failure_threshold=1,
+        open_seconds=30,
+        throttle_seconds=5,
+        clock=lambda: now[0],
+    )
+    second_key = (_DIGEST, second.deployment_id, second.connection_sha256)
+    health.failed(
+        second_key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider transport failed",
+            failover_eligible=True,
+        ),
+    )
+    executor = _executor(
+        (first, second),
+        {
+            first.source_alias: first_provider,
+            second.source_alias: second_provider,
+        },
+        _WaterfallLedger(rejected_deployments={"route-a"}),
+        maximum_same_deployment_attempts=1,
+        health=health,
+    )
+
+    async def consume() -> str:
+        """Run one logical request and return its sole text delta."""
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+        return "".join(event.text_delta or "" for event in events)
+
+    assert asyncio.run(consume()) == "fallback recovered"
+    assert first_provider.idempotency_keys == []
+    assert health.claim(second_key)
+
+
 def test_exhausted_provider_allocation_skips_only_that_certified_route() -> None:
     """A deployment allocation rejection advances without dispatching or opening health."""
     first = _deployment("route-a", connection_sha256="b" * 64)

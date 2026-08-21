@@ -567,13 +567,7 @@ class GatewayExecutionStream:
         deployment may still dispatch so recovery is observed by real traffic
         instead of waiting out the full circuit cooldown.
         """
-        for route_index in range(len(self._resolved)):
-            if self._health.claim(self._health_key(route_index)):
-                return route_index
-        for route_index in range(len(self._resolved)):
-            if self._health.claim_last_resort(self._health_key(route_index)):
-                return route_index
-        return None
+        return self._claim_from(0)
 
     def _next_candidate(
         self,
@@ -596,15 +590,24 @@ class GatewayExecutionStream:
         )
         if not failure.failover_eligible and not refusal_eligible:
             return None
-        for route_index in range(current + 1, len(self._resolved)):
-            if self._health.claim(self._health_key(route_index)):
-                return route_index
-        return None
+        return self._claim_from(current + 1)
 
     def _next_budget_candidate(self, current: int) -> int | None:
         """Advance past a route whose hard monthly allocation cannot admit this call."""
-        for route_index in range(current + 1, len(self._resolved)):
+        return self._claim_from(current + 1)
+
+    def _claim_from(self, start: int) -> int | None:
+        """Claim the first healthy later route, or one bounded last-resort probe.
+
+        Mirrors initial selection so a request skipping an exhausted or failed
+        route can still probe a suppressed fallback instead of failing for the
+        whole circuit cooldown after the provider has recovered.
+        """
+        for route_index in range(start, len(self._resolved)):
             if self._health.claim(self._health_key(route_index)):
+                return route_index
+        for route_index in range(start, len(self._resolved)):
+            if self._health.claim_last_resort(self._health_key(route_index)):
                 return route_index
         return None
 
