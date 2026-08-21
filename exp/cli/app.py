@@ -30,6 +30,7 @@ app.command("build", help="Build a reusable grounded world model from local trac
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
 
 _ROOT_COMMANDS = frozenset(("build", "config", "optimize", "run"))
+_ROOT_OPTIONS = frozenset(("--help", "-h", "--install-completion", "--show-completion"))
 
 
 def _dispatch_arguments(arguments: list[str]) -> list[str]:
@@ -49,7 +50,7 @@ def _dispatch_arguments(arguments: list[str]) -> list[str]:
         return ["run"]
     if arguments[0] == "help":
         return ["--help", *arguments[1:]]
-    if arguments[0] in {"--help", "-h"} or arguments[0] in _ROOT_COMMANDS:
+    if arguments[0] in _ROOT_OPTIONS or arguments[0] in _ROOT_COMMANDS:
         return arguments
     return ["run", *arguments]
 

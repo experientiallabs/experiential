@@ -25,6 +25,8 @@ EXPECTED_SUBCOMMANDS = {
         ([], ["run"]),
         (["--help"], ["--help"]),
         (["help"], ["--help"]),
+        (["--install-completion"], ["--install-completion"]),
+        (["--show-completion"], ["--show-completion"]),
         (["build", "--help"], ["build", "--help"]),
         (["config", "gateway", "status"], ["config", "gateway", "status"]),
         (["run", "project-a"], ["run", "project-a"]),
