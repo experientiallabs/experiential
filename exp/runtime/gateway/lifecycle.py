@@ -58,7 +58,7 @@ from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.openai_protocol.state import ResponseContinuationStore, ResponseReplayStore
 from exp.runtime.router.errors import RouterApplicationError
-from exp.runtime.router.runtime import DecisionSink, RouterRuntime
+from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntimeIntegrityError
 
 _DEFAULT_GRACEFUL_TIMEOUT_SECONDS = 10.0
 _RETIRED_REVISION_RETENTION_SECONDS = 600.0
@@ -538,7 +538,13 @@ def _load_alias_state(
                 raise
             unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
-        except (GatewayLifecycleError, ModelConnectionError, ModelCredentialError) as exc:
+        except (
+            GatewayLifecycleError,
+            ModelConnectionError,
+            ModelCredentialError,
+            ProjectActivationError,
+            RouterRuntimeIntegrityError,
+        ) as exc:
             unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
         activations[(project_ref, activation_ref)] = runtime

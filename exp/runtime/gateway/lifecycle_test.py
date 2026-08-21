@@ -42,7 +42,7 @@ from exp.runtime.gateway.lifecycle import (
     load_local_gateway,
 )
 from exp.runtime.gateway.management import GatewayManagement
-from exp.runtime.gateway.project_activation import ProjectActivation
+from exp.runtime.gateway.project_activation import ProjectActivation, ProjectActivationError
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -477,6 +477,77 @@ def test_unrelated_invalid_snapshot_does_not_block_a_valid_alias_reload(tmp_path
             json={
                 "model": "sibling",
                 "messages": [{"role": "user", "content": "broken-sibling-canary"}],
+            },
+        )
+
+    assert [item["id"] for item in models.json()["data"]] == ["coding"]
+    assert detail.status_code == 200
+    assert detail.json()["wmo"]["alias_revision_id"] == "revision-two"
+    assert broken.status_code == 503
+    assert broken.json()["error"]["code"] == "unavailable_route"
+
+
+class _FailingProjectRepository:
+    """Raise a project activation failure for every load request."""
+
+    def load(
+        self,
+        project_ref: str,
+        activation_ref: str | None,
+        *,
+        runtime_catalog: RuntimeModelCatalog,
+    ) -> ProjectActivation:
+        """Fail closed for the requested activation reference."""
+        del runtime_catalog
+        raise ProjectActivationError(
+            f"activation {activation_ref!r} for {project_ref!r} is unverifiable"
+        )
+
+
+def test_broken_project_sibling_does_not_block_a_valid_alias_reload(tmp_path: Path) -> None:
+    """A failing sibling project activation never blocks a direct alias reload."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    alias = manager.aliases()[0]
+    manager.activate_project_alias(
+        alias_id="router",
+        alias_name="router",
+        revision_id="revision-router",
+        project_ref="project-broken",
+        activation_ref="activation-broken",
+        snapshot_ref=str(alias.snapshot_ref),
+        catalog_sha256=str(alias.catalog_sha256),
+    )
+    manager.add_grant(identity_id="default", alias_id="router")
+    runtime = load_local_gateway(
+        tmp_path,
+        graceful_timeout_seconds=1,
+        environment={"TEST_PROVIDER_KEY": "available"},
+        project_repository=_FailingProjectRepository(),
+    )
+
+    with TestClient(runtime.app) as client:
+        manager.activate_direct_alias(
+            alias_id="coding",
+            alias_name="coding",
+            revision_id="revision-two",
+            pool_id="coding",
+            snapshot_ref=str(alias.snapshot_ref),
+            catalog_sha256=str(alias.catalog_sha256),
+        )
+        models = client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+        detail = client.get(
+            "/v1/models/coding",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+        broken = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "router",
+                "messages": [{"role": "user", "content": "broken-project-canary"}],
             },
         )
 
