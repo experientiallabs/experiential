@@ -76,23 +76,39 @@ class _AssistantToolCall(_WireModel):
 
 
 class _Message(_WireModel):
-    """Text-only OpenAI message with complete assistant tool history."""
+    """Text-only OpenAI message with complete assistant tool history.
+
+    Assistant messages returned by this gateway (and by official OpenAI SDK
+    clients) carry `refusal`, `annotations`, `audio`, and `function_call`
+    keys even when they are empty. Callers echo those messages back verbatim
+    on tool-call continuations, so the empty forms are accepted here; only a
+    populated value is rejected as unsupported.
+    """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | tuple[_TextPart, ...] | None = None
-    tool_calls: tuple[_AssistantToolCall, ...] = ()
+    tool_calls: tuple[_AssistantToolCall, ...] | None = None
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    refusal: None = None
+    annotations: tuple[()] | None = None
+    audio: None = None
+    function_call: None = None
+
+    @property
+    def history_tool_calls(self) -> tuple[_AssistantToolCall, ...]:
+        """Return retained assistant tool calls, treating a null list as empty."""
+        return self.tool_calls or ()
 
     @model_validator(mode="after")
     def _require_role_fields(self) -> _Message:
         """Require tool linkage and assistant calls on their legal roles."""
-        if self.role == "assistant" and self.content is None and not self.tool_calls:
+        if self.role == "assistant" and self.content is None and not self.history_tool_calls:
             raise ValueError("assistant messages need content or tool calls")
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only for tool messages")
-        if self.role != "assistant" and self.tool_calls:
+        if self.role != "assistant" and self.history_tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
         return self
 
@@ -412,7 +428,7 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
     for message_index, message in enumerate(messages):
         calls = tuple(
             _tool_call(call, f"{prefix}.{message_index}.tool_calls.{call_index}.function.arguments")
-            for call_index, call in enumerate(message.tool_calls)
+            for call_index, call in enumerate(message.history_tool_calls)
         )
         converted.append(
             GatewayMessage(

@@ -213,6 +213,63 @@ def test_unknown_and_excluded_fields_fail_with_exact_param(
     assert captured.value.detail.param == param
 
 
+def test_chat_decoder_accepts_echoed_assistant_message_with_empty_sdk_fields() -> None:
+    """Assistant messages echoed verbatim from a prior gateway response must decode.
+
+    The gateway's own Chat responses and official SDK message dumps carry
+    refusal, annotations, audio, function_call, and a possibly null tool_calls
+    key; a tool-call continuation sends that message back unchanged.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "Weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "refusal": None,
+                    "annotations": [],
+                    "audio": None,
+                    "function_call": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "sunny"},
+                {
+                    "role": "assistant",
+                    "content": "It is sunny.",
+                    "refusal": None,
+                    "tool_calls": None,
+                },
+                {"role": "user", "content": "Thanks."},
+            ],
+        }
+    )
+    assert decoded.request.messages[1].tool_calls[0].name == "weather"
+    assert decoded.request.messages[3].content == "It is sunny."
+    assert decoded.request.messages[3].tool_calls == ()
+
+
+def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> None:
+    """A populated refusal or annotation in request history stays rejected."""
+    for extra in ({"refusal": "no"}, {"annotations": [{"type": "url_citation"}]}):
+        with pytest.raises(OpenAIProtocolError) as captured:
+            decode_chat(
+                {
+                    "model": "coding",
+                    "messages": [{"role": "assistant", "content": "x", **extra}],
+                }
+            )
+        param = captured.value.detail.param
+        assert param is not None and param.startswith("messages.0.")
+
+
 def test_invalid_tool_arguments_and_conflicting_operation_headers_are_specific() -> None:
     """Malformed history and mismatched dedup headers identify the exact public field."""
     with pytest.raises(OpenAIProtocolError) as arguments:
