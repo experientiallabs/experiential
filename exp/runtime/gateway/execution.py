@@ -456,18 +456,25 @@ class GatewayExecutionStream:
         attempt_id: str | None = None
         try:
             self._deadline.attempt_timeout()
-            attempt_id = await self._ledger.start_attempt(
-                snapshot=self._route.snapshot,
-                deployment=binding.deployment,
-                attempt_ordinal=self._total_attempts,
-                route_depth=route_index,
-                maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(
-                    self._request,
-                    binding.deployment,
-                ),
-                route_reason=self._route.route_reason,
-                fallback_reason=self._route.fallback_reason,
+            reservation = asyncio.ensure_future(
+                self._ledger.start_attempt(
+                    snapshot=self._route.snapshot,
+                    deployment=binding.deployment,
+                    attempt_ordinal=self._total_attempts,
+                    route_depth=route_index,
+                    maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(
+                        self._request,
+                        binding.deployment,
+                    ),
+                    route_reason=self._route.route_reason,
+                    fallback_reason=self._route.fallback_reason,
+                )
             )
+            try:
+                attempt_id = await asyncio.shield(reservation)
+            except asyncio.CancelledError:
+                attempt_id = await _abandoned_reservation_outcome(reservation)
+                raise
             self._attempt_counts[route_index] += 1
             self._total_attempts += 1
             current = _PhysicalAttempt(
@@ -914,6 +921,32 @@ def _stamp_tool_names(event: GatewayEvent, tool_names: list[str]) -> GatewayEven
         else event.usage.model_copy(update={"tool_names": tuple(tool_names)})
     )
     return event.model_copy(update={"usage": usage})
+
+
+async def _abandoned_reservation_outcome(reservation: asyncio.Task[str]) -> str | None:
+    """Wait out a cancellation-abandoned reservation and return its attempt ID.
+
+    The durable reservation write keeps running on the ledger writer after the
+    dispatching task is cancelled, so this waits for its real outcome (absorbing
+    repeated cancellation of the waiter) to learn whether a dispatched attempt
+    now exists and must be settled instead of silently orphaned.
+
+    Args:
+        reservation: The in-flight attempt reservation, never itself cancelled.
+
+    Returns:
+        The durably committed attempt ID, or None when the write failed.
+    """
+    while not reservation.done():
+        try:
+            await asyncio.shield(reservation)
+        except asyncio.CancelledError:
+            continue
+        except Exception:  # noqa: BLE001 - the reservation failure is read below.
+            break
+    if reservation.cancelled() or reservation.exception() is not None:
+        return None
+    return reservation.result()
 
 
 def _all_routes_unavailable() -> GatewayFailure:
