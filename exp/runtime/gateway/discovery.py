@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Protocol
+
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.model import ModelCapabilities
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 AliasAuthority = tuple[str, str, str]
@@ -12,41 +18,174 @@ MODEL_AUTHORITY_SCHEMA_VERSION = 1
 """Version of the gateway-specific model-list authority envelope."""
 
 
-def public_model_object(authority: AliasAuthority) -> JsonObject:
-    """Build one OpenAI model object enriched with the granted alias authority.
+class AliasMetadataLookup(Protocol):
+    """Look up catalog-backed listing fields for one granted alias."""
 
-    The four OpenAI keys keep their exact meaning for official clients; the ``wmo``
+    def __call__(
+        self,
+        *,
+        alias: str,
+        revision_id: str,
+        catalog_sha256: str,
+    ) -> PublishedAliasMetadata | None:
+        """Return declared listing fields, or ``None`` when the alias is not unique."""
+        ...
+
+
+@dataclass(frozen=True)
+class PublishedAliasMetadata:
+    """Catalog-backed listing fields published beside one OpenAI model object.
+
+    Every optional field is omitted from the wire object when the active catalog does not
+    declare it. The gateway never invents a context window or a cache-write price.
+    """
+
+    supports_completions: bool | None = None
+    supports_tools: bool | None = None
+    supports_structured_output: bool | None = None
+    maximum_output_tokens: int | None = None
+    context_window_tokens: int | None = None
+    input_micro_usd_per_million_tokens: int | None = None
+    output_micro_usd_per_million_tokens: int | None = None
+    cached_input_micro_usd_per_million_tokens: int | None = None
+
+    def extension_fields(self) -> JsonObject:
+        """Return only the declared extension fields for one public model object."""
+        fields: JsonObject = {}
+        _put_optional(fields, "supports_completions", self.supports_completions)
+        _put_optional(fields, "supports_tools", self.supports_tools)
+        _put_optional(fields, "supports_structured_output", self.supports_structured_output)
+        _put_optional(fields, "maximum_output_tokens", self.maximum_output_tokens)
+        _put_optional(fields, "context_window_tokens", self.context_window_tokens)
+        pricing: JsonObject = {}
+        _put_optional(
+            pricing, "input_micro_usd_per_million_tokens", self.input_micro_usd_per_million_tokens
+        )
+        _put_optional(
+            pricing, "output_micro_usd_per_million_tokens", self.output_micro_usd_per_million_tokens
+        )
+        _put_optional(
+            pricing,
+            "cached_input_micro_usd_per_million_tokens",
+            self.cached_input_micro_usd_per_million_tokens,
+        )
+        if pricing:
+            fields["pricing"] = pricing
+        return fields
+
+
+def published_alias_metadata(
+    deployment: ExactModelDeployment | None,
+) -> PublishedAliasMetadata | None:
+    """Project one active catalog deployment onto public listing extension fields.
+
+    A granted alias that does not resolve to exactly one catalog deployment publishes no
+    extra fields. Completion support is published for a resolved deployment unless the
+    catalog explicitly denies it. Tools, structured output, limits, and prices are copied
+    only when the catalog declares them.
+
+    Args:
+        deployment: The unique active catalog deployment for the granted alias, if any.
+
+    Returns:
+        Catalog-backed metadata, or ``None`` when the alias has no unique deployment.
+    """
+    if deployment is None:
+        return None
+    capabilities = deployment.capabilities
+    prices = deployment.gateway.prices
+    return PublishedAliasMetadata(
+        supports_completions=_completion_support(capabilities),
+        supports_tools=None if capabilities is None else capabilities.supports_tools,
+        supports_structured_output=(
+            None if capabilities is None else capabilities.supports_structured_output
+        ),
+        maximum_output_tokens=(
+            None if capabilities is None else capabilities.maximum_output_tokens
+        ),
+        context_window_tokens=(
+            None if capabilities is None else capabilities.context_window_tokens
+        ),
+        input_micro_usd_per_million_tokens=prices.input_micro_usd_per_million_tokens,
+        output_micro_usd_per_million_tokens=prices.output_micro_usd_per_million_tokens,
+        cached_input_micro_usd_per_million_tokens=(
+            prices.cached_input_micro_usd_per_million_tokens
+        ),
+    )
+
+
+def listing_metadata_by_alias(
+    authorities: tuple[AliasAuthority, ...],
+    lookup: AliasMetadataLookup,
+) -> dict[str, PublishedAliasMetadata]:
+    """Collect catalog-backed listing fields for granted aliases that have them.
+
+    Args:
+        authorities: Granted alias, revision, and catalog digest triples.
+        lookup: Keyword lookup of ``alias``, ``revision_id``, and ``catalog_sha256``.
+
+    Returns:
+        Metadata keyed by alias for every unique active catalog deployment.
+    """
+    published: dict[str, PublishedAliasMetadata] = {}
+    for alias, revision, digest in authorities:
+        metadata = lookup(alias=alias, revision_id=revision, catalog_sha256=digest)
+        if metadata is not None:
+            published[alias] = metadata
+    return published
+
+
+def public_model_object(
+    authority: AliasAuthority,
+    metadata: PublishedAliasMetadata | None = None,
+) -> JsonObject:
+    """Build one OpenAI model object enriched with granted authority and catalog fields.
+
+    The four OpenAI keys keep their exact meaning for official clients. The ``wmo``
     object carries only authority metadata the gateway already exposes to callers
     through response headers and grants, never provider or credential detail.
+    Optional capability, limit, and price fields are catalog copies, never guesses.
 
     Args:
         authority: Granted alias, active revision, and catalog digest triple.
+        metadata: Catalog-backed extension fields for the granted alias, when unique.
 
     Returns:
         JSON-compatible public model object.
     """
     alias, revision, digest = authority
-    return {
+    payload: JsonObject = {
         "id": alias,
         "object": "model",
         "created": 0,
         "owned_by": "wmo",
         "wmo": {"alias_revision_id": revision, "catalog_sha256": digest},
     }
+    if metadata is not None:
+        payload.update(metadata.extension_fields())
+    return payload
 
 
-def public_model_list(authorities: tuple[AliasAuthority, ...]) -> JsonObject:
+def public_model_list(
+    authorities: tuple[AliasAuthority, ...],
+    metadata_by_alias: Mapping[str, PublishedAliasMetadata] | None = None,
+) -> JsonObject:
     """Build a caller model list with an authority marker even when it is empty.
 
     Args:
         authorities: Granted alias, revision, and catalog digest triples.
+        metadata_by_alias: Catalog-backed extension fields keyed by granted alias.
 
     Returns:
         OpenAI-compatible model-list envelope with the gateway authority marker.
     """
+    published = {} if metadata_by_alias is None else metadata_by_alias
     return {
         "object": "list",
-        "data": [public_model_object(authority) for authority in authorities],
+        "data": [
+            public_model_object(authority, metadata=published.get(authority[0]))
+            for authority in authorities
+        ],
         "wmo": {"authority_schema_version": MODEL_AUTHORITY_SCHEMA_VERSION},
     }
 
@@ -80,3 +219,27 @@ def require_granted_authority(
         ),
         param="model",
     )
+
+
+def _completion_support(capabilities: ModelCapabilities | None) -> bool:
+    """Publish completion support unless the catalog explicitly denies it.
+
+    Args:
+        capabilities: Authored capability snapshot, or ``None`` when undeclared.
+
+    Returns:
+        ``False`` only when the catalog records an explicit completion denial.
+    """
+    return not (capabilities is not None and capabilities.supports_completions is False)
+
+
+def _put_optional(target: JsonObject, key: str, value: bool | int | None) -> None:
+    """Copy one declared field onto a public JSON object.
+
+    Args:
+        target: Object receiving the field.
+        key: Public extension field name.
+        value: Catalog value, or ``None`` when the catalog omitted it.
+    """
+    if value is not None:
+        target[key] = value

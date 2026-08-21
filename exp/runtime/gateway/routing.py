@@ -20,6 +20,7 @@ from exp.runtime.gateway.contracts import (
     ProjectSelection,
     ProjectTarget,
 )
+from exp.runtime.gateway.discovery import PublishedAliasMetadata, published_alias_metadata
 from exp.runtime.gateway.interfaces import ProjectTargetResolver
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -82,6 +83,44 @@ class CatalogRouteResolver:
                     deployment.deployment_id: deployment for deployment in catalog.deployments
                 },
             )
+
+    def published_metadata(
+        self,
+        *,
+        alias: str,
+        revision_id: str,
+        catalog_sha256: str,
+    ) -> PublishedAliasMetadata | None:
+        """Return catalog-backed listing fields for one granted public alias.
+
+        The alias must resolve to exactly one active deployment: a deployment whose
+        ID or source alias matches, or a singleton pool named by the public alias.
+        Multi-deployment pools and unmatched project aliases publish nothing extra.
+
+        Args:
+            alias: Granted public alias name.
+            revision_id: Active alias revision loaded in this process.
+            catalog_sha256: Frozen catalog digest bound to that revision.
+
+        Returns:
+            Declared capability, limit, and price fields, or ``None`` when the alias
+            has no unique catalog deployment in the active snapshot.
+        """
+        view = self._catalogs.get((revision_id, catalog_sha256))
+        if view is None:
+            return None
+        deployment = view.deployments.get(alias)
+        if deployment is None:
+            for candidate in view.deployments.values():
+                if candidate.source_alias == alias:
+                    deployment = candidate
+                    break
+        if deployment is None:
+            pool = view.pools.get(alias)
+            if pool is None or len(pool.deployment_ids) != 1:
+                return None
+            deployment = view.deployments.get(pool.deployment_ids[0])
+        return published_alias_metadata(deployment)
 
     async def resolve(
         self,

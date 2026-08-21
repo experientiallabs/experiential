@@ -101,3 +101,10 @@ The same two connections work for evidence builds and router optimization throug
 `exp config providers` by choosing the `openai-compatible` provider with the identical
 `base_url` and credential environment variable; see `reference/providers.md` for that
 flow.
+
+A hosted WMO gateway is the same provider family. Point `base_url` at its `/v1` origin and
+present a granted virtual key. `GET /v1/models` keeps the OpenAI list shape and publishes
+per-alias completion capabilities, limits, and configured micro-USD prices from the active
+catalog. `exp config providers --provider openai-compatible` reads those optional fields,
+converts micro-USD prices to USD per million tokens, and leaves unknown any field the catalog
+did not declare. It does not treat official OpenAI listing metadata the same way.

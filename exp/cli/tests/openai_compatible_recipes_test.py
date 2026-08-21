@@ -207,5 +207,7 @@ def test_recipes_doc_pins_the_verified_constants_and_is_indexed() -> None:
     assert ".modal.run" in doc
     assert "exp config gateway provider add" in doc
     assert "--provider openai-compatible" in doc.replace(" \\\n  ", " ")
+    assert "hosted WMO gateway" in doc
+    assert "micro-USD prices" in doc
     assert "exp/cli/tests/openai_compatible_recipes_test.py" in doc
     assert "`reference/openai-compatible-recipes.md`" in index
