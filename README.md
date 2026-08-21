@@ -35,6 +35,19 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
 ```
 
+## Setup / get started with the hosted gateway
+
+Prefer a managed gateway to running one locally? The hosted platform at
+[platform.experientiallabs.ai](https://platform.experientiallabs.ai) serves the same
+OpenAI-compatible (and Anthropic Messages) API at `https://api.experientiallabs.ai/v1`.
+Each link below is a copy-paste prompt you hand to your coding agent (Claude Code, Cursor,
+Codex, and similar); the agent runs the setup for you.
+
+- [Upload your LLM traces as telemetry](https://gist.github.com/SilenNaihin/dedc96cf00f60a2ecba9ae21a72266d2): create an account instantly from your email, then pull or upload your existing LLM traces onto the platform as telemetry.
+- [Connect your inference provider keys (BYOK)](https://gist.github.com/SilenNaihin/a1d13eded274dc32db10d7dbed5aeaa0): create an account, then connect your own OpenAI, Anthropic, Gemini, Azure, Bedrock, Fireworks, or OpenRouter keys for free pass-through.
+- [Start calling models on the gateway](https://gist.github.com/SilenNaihin/d9d37a0b93947e9b7063976d5ca4cbe5): make your first `/v1` call with the OpenAI and Anthropic SDKs using an `xpl_` key, and optionally repoint your existing coding agents.
+- [YC founder onboarding (full)](https://gist.github.com/SilenNaihin/7f78ae96d6726a2b45c64d1e686eee55): sign in through your agent, claim credits, connect your keys, then repoint every coding agent (Claude Code, Cursor, Codex, Aider, and similar) or Conductor at the gateway.
+
 ## Using the API
 
 Create a local gateway programmatically:
