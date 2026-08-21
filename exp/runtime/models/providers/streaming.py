@@ -434,6 +434,7 @@ async def start_openai_compatible_stream(
     idempotency_key: str,
     retry_policy: RetryPolicy,
     timeout_seconds: float,
+    token_limit_key: str = "max_tokens",
 ) -> NormalizedProviderStream:
     """Open and normalize one generic OpenAI-compatible Chat stream.
 
@@ -447,11 +448,12 @@ async def start_openai_compatible_stream(
         idempotency_key: Stable identity reused by safe opening retries.
         retry_policy: Same-endpoint retry bounds before response commitment.
         timeout_seconds: Per-phase timeout ceiling.
+        token_limit_key: Wire field carrying the output-token ceiling.
 
     Returns:
         A true upstream normalized stream.
     """
-    payload = openai_compatible_stream_payload(model_id, request)
+    payload = openai_compatible_stream_payload(model_id, request, token_limit_key=token_limit_key)
     return await _start_stream(
         transport,
         url,

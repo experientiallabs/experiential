@@ -60,6 +60,21 @@ def test_openai_compatible_stream_payload_omits_absent_top_p() -> None:
     assert "temperature" not in payload
 
 
+def test_openai_compatible_stream_payload_honors_token_limit_key() -> None:
+    """The output-token ceiling lands on the configured wire field only."""
+    request = _chat_request().model_copy(update={"maximum_output_tokens": 64})
+
+    default_payload = openai_compatible_stream_payload("exact-model", request)
+    azure_payload = openai_compatible_stream_payload(
+        "exact-model", request, token_limit_key="max_completion_tokens"
+    )
+
+    assert default_payload["max_tokens"] == 64
+    assert "max_completion_tokens" not in default_payload
+    assert azure_payload["max_completion_tokens"] == 64
+    assert "max_tokens" not in azure_payload
+
+
 def test_openai_responses_stream_payload_forwards_top_p_when_sampling_is_open() -> None:
     """Native Responses streaming preserves nucleus sampling on models that accept it."""
     payload = openai_responses_stream_payload(

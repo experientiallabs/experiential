@@ -65,6 +65,26 @@ def test_v1_route_sends_deployment_and_api_key_header() -> None:
     assert payload["model"] == "gpt-deployment"
 
 
+def test_azure_payloads_carry_max_completion_tokens() -> None:
+    """Azure sends the output-token ceiling as max_completion_tokens, never max_tokens."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "gpt-deployment"),
+        endpoint=_ENDPOINT,
+        api_key=_SECRET,
+        api_version="v1",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    _url, _headers, payload = transport.requests[0]
+    assert payload["max_completion_tokens"] == 128
+    assert "max_tokens" not in payload
+
+
 def test_classic_route_puts_the_exact_deployment_in_the_path() -> None:
     """Dated Azure OpenAI versions keep the deployment in the URL and the body."""
     transport = ScriptedJsonTransport(

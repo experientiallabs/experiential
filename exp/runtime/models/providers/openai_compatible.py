@@ -47,12 +47,20 @@ class OpenAICompatibleResponseError(ProviderResponseError):
     """An OpenAI-compatible endpoint returned a response outside the typed contract."""
 
 
-def openai_compatible_request(model_id: str, request: ModelRequest) -> JsonObject:
+def openai_compatible_request(
+    model_id: str,
+    request: ModelRequest,
+    *,
+    token_limit_key: str = "max_tokens",
+) -> JsonObject:
     """Convert a EXP request into one non-streaming Chat Completions payload.
 
     Args:
         model_id: Provider model identifier to place on the wire.
         request: Typed EXP request.
+        token_limit_key: Wire field carrying the output-token ceiling. Azure OpenAI
+            reasoning deployments reject ``max_tokens`` and require
+            ``max_completion_tokens``.
 
     Returns:
         A JSON object for ``/chat/completions``.
@@ -91,7 +99,7 @@ def openai_compatible_request(model_id: str, request: ModelRequest) -> JsonObjec
     if request.top_p is not None:
         payload["top_p"] = request.top_p
     if request.maximum_output_tokens is not None:
-        payload["max_tokens"] = request.maximum_output_tokens
+        payload[token_limit_key] = request.maximum_output_tokens
     return payload
 
 
@@ -209,6 +217,8 @@ class OpenAIEmbeddingMixin(ProviderHttpClient):
 class OpenAICompatibleClient(OpenAIEmbeddingMixin):
     """Calls one explicit OpenAI-compatible connection without cross-provider failover."""
 
+    token_limit_key: ClassVar[str] = "max_tokens"
+
     async def stream(
         self,
         request: GatewayRequest,
@@ -243,6 +253,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             idempotency_key=idempotency_key,
             retry_policy=retry_policy or self._retry_policy,
             timeout_seconds=self._timeout_seconds,
+            token_limit_key=self.token_limit_key,
         )
 
     def _completion_path(self) -> str:
@@ -251,7 +262,9 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a Chat Completions payload."""
-        return openai_compatible_request(self._model.model_id, request)
+        return openai_compatible_request(
+            self._model.model_id, request, token_limit_key=self.token_limit_key
+        )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one Chat Completions payload into the shared response contract."""

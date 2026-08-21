@@ -143,12 +143,20 @@ def anthropic_messages_stream_payload(model_id: str, request: GatewayRequest) ->
     return payload
 
 
-def openai_compatible_stream_payload(model_id: str, request: GatewayRequest) -> JsonObject:
+def openai_compatible_stream_payload(
+    model_id: str,
+    request: GatewayRequest,
+    *,
+    token_limit_key: str = "max_tokens",
+) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
     Args:
         model_id: Exact provider model identifier.
         request: Canonical gateway request.
+        token_limit_key: Wire field carrying the output-token ceiling. Azure OpenAI
+            reasoning deployments reject ``max_tokens`` and require
+            ``max_completion_tokens``.
 
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
@@ -172,7 +180,7 @@ def openai_compatible_stream_payload(model_id: str, request: GatewayRequest) -> 
             schema["description"] = request.structured_text.description
         payload["response_format"] = {"type": "json_schema", "json_schema": schema}
     if request.maximum_output_tokens is not None:
-        payload["max_tokens"] = request.maximum_output_tokens
+        payload[token_limit_key] = request.maximum_output_tokens
     if request.temperature is not None:
         payload["temperature"] = request.temperature
     if request.top_p is not None:

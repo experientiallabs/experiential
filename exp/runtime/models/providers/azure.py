@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import ClassVar
 from urllib.parse import urlsplit
 
 from exp.common.models import ModelSnapshot
@@ -98,7 +99,13 @@ def _azure_base_url(endpoint: str, *, deployment: str, api_version: str) -> str:
 
 
 class AzureClient(OpenAICompatibleClient):
-    """Calls one explicit Azure connection without streaming, failover, or guessed deployments."""
+    """Calls one explicit Azure connection without streaming, failover, or guessed deployments.
+
+    Azure OpenAI reasoning deployments reject the legacy ``max_tokens`` field, so every
+    Azure payload carries the output-token ceiling as ``max_completion_tokens``.
+    """
+
+    token_limit_key: ClassVar[str] = "max_completion_tokens"
 
     def __init__(
         self,
