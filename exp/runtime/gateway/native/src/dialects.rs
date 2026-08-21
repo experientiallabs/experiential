@@ -629,7 +629,7 @@ impl Normalizer {
                         .to_string();
                     let name = require_string(item, "name", "OpenAI function call name")
                         .map_err(|message| malformed(&message))?;
-                    let mut tool = ToolAccumulator::new(index, call_id.clone(), name.clone());
+                    let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
                     events.push(Event::ToolCallStarted { index, call_id, name });
                     if let Some(Value::String(initial)) = item.get("arguments") {
                         if !initial.is_empty() {
@@ -793,7 +793,7 @@ impl Normalizer {
                             return Err(malformed("Anthropic stream repeated a tool-call start"));
                         }
                         self.tools
-                            .insert(index, ToolAccumulator::new(index, call_id.clone(), name.clone()));
+                            .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
                         events.push(Event::ToolCallStarted { index, call_id, name });
                     }
                     Some("text") => {
@@ -1000,7 +1000,7 @@ impl Normalizer {
                         let name = require_string(function, "name", "OpenAI-compatible tool name")
                             .map_err(|message| malformed(&message))?;
                         self.tools
-                            .insert(index, ToolAccumulator::new(index, call_id.clone(), name.clone()));
+                            .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
                         events.push(Event::ToolCallStarted { index, call_id, name });
                     }
                     if let Some(fragment) = function.get("arguments") {

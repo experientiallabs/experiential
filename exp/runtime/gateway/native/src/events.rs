@@ -71,7 +71,6 @@ pub fn require_json_object_text(raw: &str) -> Result<(), String> {
 /// Accumulated per-stream state for one incrementally emitted function call.
 #[derive(Debug, Clone)]
 pub struct ToolAccumulator {
-    pub index: u32,
     pub call_id: String,
     pub name: String,
     pub raw_arguments: String,
@@ -79,9 +78,8 @@ pub struct ToolAccumulator {
 }
 
 impl ToolAccumulator {
-    pub fn new(index: u32, call_id: String, name: String) -> Self {
+    pub fn new(call_id: String, name: String) -> Self {
         Self {
-            index,
             call_id,
             name,
             raw_arguments: String::new(),

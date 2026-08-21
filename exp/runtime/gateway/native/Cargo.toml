@@ -11,7 +11,7 @@ name = "exp_gateway_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["abi3-py312"] }
+pyo3 = { version = "0.23", features = ["abi3-py312", "extension-module"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 tokio-stream = "0.1"
 axum = "0.8"
