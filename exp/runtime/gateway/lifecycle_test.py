@@ -415,6 +415,78 @@ def test_live_alias_revision_update_hot_reloads_discovery_without_restart(
         connection.close()
 
 
+def test_unrelated_invalid_snapshot_does_not_block_a_valid_alias_reload(tmp_path: Path) -> None:
+    """One broken sibling alias never blocks another alias from hot reloading."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="sibling",
+        connection_name="provider-main",
+        provider_model="sibling-model",
+        exact_model_id="sibling-exact-model",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="sibling",
+        alias_name="sibling",
+        revision_id="revision-sibling",
+        pool_id="sibling",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="sibling")
+    runtime = load_local_gateway(
+        tmp_path,
+        graceful_timeout_seconds=1,
+        environment={"TEST_PROVIDER_KEY": "available"},
+    )
+
+    with TestClient(runtime.app) as client:
+        manager.activate_direct_alias(
+            alias_id="sibling",
+            alias_name="sibling",
+            revision_id="revision-sibling-broken",
+            pool_id="sibling",
+            snapshot_ref="catalog-snapshots/missing.json",
+            catalog_sha256="a" * 64,
+        )
+        manager.activate_direct_alias(
+            alias_id="coding",
+            alias_name="coding",
+            revision_id="revision-two",
+            pool_id="coding",
+            snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+            catalog_sha256=normalized.identity_sha256(),
+        )
+        models = client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+        detail = client.get(
+            "/v1/models/coding",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+        broken = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "sibling",
+                "messages": [{"role": "user", "content": "broken-sibling-canary"}],
+            },
+        )
+
+    assert [item["id"] for item in models.json()["data"]] == ["coding"]
+    assert detail.status_code == 200
+    assert detail.json()["wmo"]["alias_revision_id"] == "revision-two"
+    assert broken.status_code == 503
+    assert broken.json()["error"]["code"] == "unavailable_route"
+
+
 def test_invalid_new_revision_fails_closed_and_recovers_after_fix(tmp_path: Path) -> None:
     """An unloadable new revision keeps fail-closed behavior and recovers in place."""
     manager, raw_key = _configured_gateway(tmp_path)

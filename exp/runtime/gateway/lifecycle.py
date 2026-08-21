@@ -217,8 +217,18 @@ class _AliasAuthorityReloader:
             **{key: previous.runtime_catalogs[key] for key in retained},
             **dict(loaded.runtime_catalogs),
         }
-        activations = {**dict(previous.activations), **dict(loaded.activations)}
-        exact_models = {**dict(previous.exact_models), **dict(loaded.exact_models)}
+        digests = {digest for _revision, digest in normalized}
+        exact_models = {
+            key: value
+            for key, value in {**dict(previous.exact_models), **dict(loaded.exact_models)}.items()
+            if key[2] in digests
+        }
+        active_projects = {(key[0], key[1]) for key in exact_models}
+        activations = {
+            key: value
+            for key, value in {**dict(previous.activations), **dict(loaded.activations)}.items()
+            if key in active_projects
+        }
         merged = _AliasAuthorityState(
             authorities=loaded.authorities,
             normalized_catalogs=normalized,
@@ -459,14 +469,18 @@ def _load_alias_state(
     unavailable_aliases: list[tuple[str, str]] = []
 
     for alias in aliases:
-        revision_id, catalog_sha256 = _required_revision(alias)
-        catalog, normalized = _load_snapshot(manager, alias)
+        try:
+            revision_id, catalog_sha256 = _required_revision(alias)
+            catalog, normalized = _load_snapshot(manager, alias)
+        except GatewayLifecycleError as exc:
+            unavailable_aliases.append((alias.alias_name, str(exc)))
+            continue
         key = (revision_id, catalog_sha256)
         runtime_catalog = RuntimeModelCatalog(catalog, environment=environment)
         if alias.target_kind == "direct":
             try:
                 proof = _direct_readiness(manager, alias, normalized, runtime_catalog)
-            except (ModelConnectionError, ModelCredentialError) as exc:
+            except (GatewayLifecycleError, ModelConnectionError, ModelCredentialError) as exc:
                 unavailable_aliases.append((alias.alias_name, str(exc)))
                 continue
             normalized_catalogs[key] = normalized
@@ -474,14 +488,16 @@ def _load_alias_state(
             readiness.append(proof)
             continue
         if alias.target_kind != "project":
-            raise GatewayLifecycleError(f"alias {alias.alias_name!r} has an unknown target kind")
+            unavailable_aliases.append((alias.alias_name, "unknown target kind"))
+            continue
         if project_repository is None:
-            raise GatewayLifecycleError(
-                f"project alias {alias.alias_name!r} requires a project activation repository"
+            unavailable_aliases.append(
+                (alias.alias_name, "project alias requires a project activation repository")
             )
-        project_ref = _required(alias.project_ref, "project reference", alias)
-        activation_ref = _required(alias.activation_ref, "activation reference", alias)
+            continue
         try:
+            project_ref = _required(alias.project_ref, "project reference", alias)
+            activation_ref = _required(alias.activation_ref, "activation reference", alias)
             activation = project_repository.load(
                 project_ref,
                 activation_ref,
@@ -510,7 +526,7 @@ def _load_alias_state(
                 raise
             unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
-        except (ModelConnectionError, ModelCredentialError) as exc:
+        except (GatewayLifecycleError, ModelConnectionError, ModelCredentialError) as exc:
             unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
         activations[(project_ref, activation_ref)] = runtime
