@@ -16,7 +16,7 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.interfaces import GatewayClock
-from exp.runtime.gateway.sqlite.migrations import connect_database, initialize_database
+from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
 MAXIMUM_MICRO_USD = 9_223_372_036_854_775_807
@@ -305,12 +305,11 @@ class SQLiteBudgetStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        """Open and close one configured connection."""
-        connection = connect_database(self.database_path, busy_timeout_ms=self._busy_timeout_ms)
-        try:
+        """Check out one reusable configured connection."""
+        with persistent_connection(
+            self.database_path, busy_timeout_ms=self._busy_timeout_ms
+        ) as connection:
             yield connection
-        finally:
-            connection.close()
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:

@@ -23,7 +23,61 @@ from exp.runtime.gateway.sqlite.migrations import (
     GatewaySchemaError,
     connect_database,
     initialize_database,
+    persistent_connection,
 )
+
+
+def test_persistent_connection_reuses_one_idle_connection_per_thread(tmp_path: Path) -> None:
+    """Sequential checkouts on one thread reuse the same cached connection."""
+    database = tmp_path / "reuse.db"
+    initialize_database(database)
+    with persistent_connection(database) as first:
+        first_id = id(first)
+    with persistent_connection(database) as second:
+        assert id(second) == first_id
+
+
+def test_persistent_connection_overlapping_checkouts_get_distinct_connections(
+    tmp_path: Path,
+) -> None:
+    """Nested checkouts must not share one connection mid-transaction."""
+    database = tmp_path / "nested.db"
+    initialize_database(database)
+    with persistent_connection(database) as outer:
+        outer.execute("BEGIN IMMEDIATE")
+        try:
+            with persistent_connection(database) as inner:
+                assert inner is not outer
+        finally:
+            outer.execute("ROLLBACK")
+
+
+def test_persistent_connection_discards_a_connection_left_in_transaction(
+    tmp_path: Path,
+) -> None:
+    """A connection exiting mid-transaction is closed instead of cached."""
+    database = tmp_path / "dirty.db"
+    initialize_database(database)
+    with persistent_connection(database) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+    with persistent_connection(database) as replacement:
+        assert replacement.in_transaction is False
+        assert replacement.execute("SELECT 1").fetchone()[0] == 1
+
+
+def test_persistent_connection_closes_and_discards_on_error(tmp_path: Path) -> None:
+    """An exception inside the checkout closes the connection and clears the cache."""
+    database = tmp_path / "error.db"
+    initialize_database(database)
+    with pytest.raises(RuntimeError, match="boom"):
+        with persistent_connection(database) as connection:
+            raise RuntimeError("boom")
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
+    with persistent_connection(database) as replacement:
+        assert replacement.execute("SELECT 1").fetchone()[0] == 1
 
 
 def test_initial_database_is_private_wal_with_foreign_keys(tmp_path: Path) -> None:

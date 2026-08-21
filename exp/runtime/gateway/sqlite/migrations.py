@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -543,6 +546,55 @@ def connect_database(
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
     return connection
+
+
+class _ThreadConnectionCache(threading.local):
+    """Per-thread idle SQLite connections keyed by path and busy timeout."""
+
+    def __init__(self) -> None:
+        """Start each thread with an empty idle-connection map."""
+        self.idle: dict[tuple[str, int], sqlite3.Connection] = {}
+
+
+_connection_cache = _ThreadConnectionCache()
+
+
+@contextmanager
+def persistent_connection(
+    path: Path, *, busy_timeout_ms: int = 5_000
+) -> Iterator[sqlite3.Connection]:
+    """Yield one reusable per-thread connection for repeated gateway operations.
+
+    Opening a SQLite connection pays file open, pragma, and WAL setup costs on
+    every call, which dominates hot request paths. This checkout keeps one idle
+    connection per thread, path, and timeout so sequential operations reuse it,
+    while overlapping checkouts on the same thread fall back to a fresh
+    connection instead of sharing an in-flight transaction.
+
+    Args:
+        path: Gateway database path.
+        busy_timeout_ms: Bounded lock wait in milliseconds.
+
+    Yields:
+        A configured connection; it returns to the idle cache on clean exit.
+    """
+    key = (str(path), busy_timeout_ms)
+    connection = _connection_cache.idle.pop(key, None)
+    if connection is None:
+        connection = connect_database(path, busy_timeout_ms=busy_timeout_ms)
+    try:
+        yield connection
+    except BaseException:
+        connection.close()
+        raise
+    if connection.in_transaction:
+        connection.close()
+        return
+    previous = _connection_cache.idle.get(key)
+    if previous is not None:
+        connection.close()
+        return
+    _connection_cache.idle[key] = connection
 
 
 def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | None:
