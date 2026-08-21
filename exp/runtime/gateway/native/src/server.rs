@@ -9,6 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use axum::Router;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -116,7 +117,11 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         .with_state(state);
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
-        .map_err(|error| format!("failed to bind {}:{}: {error}", config.host, config.port))?;
+        .map_err(|error| format!("failed to bind {}:{}: {error}", config.host, config.port))?
+        // Small SSE frames must not sit behind Nagle's algorithm.
+        .tap_io(|stream| {
+            let _ = stream.set_nodelay(true);
+        });
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
