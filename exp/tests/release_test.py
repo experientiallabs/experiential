@@ -1837,8 +1837,8 @@ def _installed_release_driver() -> None:
             state.count_containing(sdk_retry_input_canary) - provider_before_retry
         )
         assert usage_after_retry["requests"] - usage_before_retry["requests"] == 3
-        assert usage_after_retry["attempts"] - usage_before_retry["attempts"] == 4
-        assert provider_retry_calls == 4
+        assert usage_after_retry["attempts"] - usage_before_retry["attempts"] == 8
+        assert provider_retry_calls == 8
 
         retry_stdout, retry_stderr = stop_gateway(gateway_process)
         gateway_stdout_parts.append(retry_stdout)
