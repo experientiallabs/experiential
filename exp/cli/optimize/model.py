@@ -598,7 +598,7 @@ def _compose_tinker_backend(
         raise SFTModelOptimizationPreflightError(
             "selected Tinker connection metadata drifted before credential resolution"
         )
-    api_key = read_connection_api_key(connection)
+    api_key = read_connection_api_key(connection, connection_id=connection_name)
     try:
         import tinker
     except ImportError as exc:

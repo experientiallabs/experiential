@@ -234,7 +234,11 @@ class RuntimeModelCatalog:
                 bedrock_client if capabilities.supports_embeddings is not False else None,
                 served_model_id=record.served_model_id,
             )
-        api_key = read_connection_api_key(connection, environment=self._environment)
+        api_key = read_connection_api_key(
+            connection,
+            connection_id=record.connection,
+            environment=self._environment,
+        )
         if provider == "openai":
             openai_client = OpenAIClient(
                 model=snapshot,

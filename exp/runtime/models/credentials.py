@@ -1,42 +1,232 @@
-"""Credential lookup that reads only a named environment variable at construction time."""
+"""Resolve one provider API key from environment, then the user-local credential store.
+
+Runtime and CI callers never prompt. Interactive setup and ``exp auth login`` supply a
+masked prompt that persists the pasted key for the exact connection ID.
+"""
 
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from typing import Literal
 
+from exp.common.auth import ProviderAuthStore, ProviderAuthStoreError, StoredCredentialStatus
 from exp.common.models import ConnectionConfig
+
+CredentialSource = Literal["environment", "stored", "prompt"]
+CredentialPrompt = Callable[[], str | None]
 
 
 class ModelCredentialError(ValueError):
-    """A configured model connection could not resolve its named credential."""
+    """A configured model connection could not resolve its credential."""
+
+
+class CredentialResolution:
+    """One resolved API key plus the source that supplied it.
+
+    The secret is omitted from ``repr`` and ``str``.
+    """
+
+    def __init__(self, value: str, source: CredentialSource) -> None:
+        """Bind one non-empty secret and its source.
+
+        Args:
+            value: Resolved API key.
+            source: Whether the key came from the environment, store, or a prompt.
+        """
+        self._value = value
+        self.source = source
+
+    @property
+    def value(self) -> str:
+        """Return the resolved API key."""
+        return self._value
+
+    def __repr__(self) -> str:
+        """Describe the source without the secret."""
+        return f"CredentialResolution(source={self.source!r}, value='[REDACTED]')"
+
+    def __str__(self) -> str:
+        """Describe the source without the secret."""
+        return self.__repr__()
+
+
+def lookup_connection_credential(
+    connection: ConnectionConfig,
+    *,
+    connection_id: str,
+    environment: Mapping[str, str] | None = None,
+    store: ProviderAuthStore | None = None,
+) -> CredentialResolution | None:
+    """Resolve one credential from the environment, then the stored connection record.
+
+    A non-empty environment value wins and does not rewrite the store. Bedrock connections
+    do not participate; they authenticate through the AWS credential chain.
+
+    Args:
+        connection: Secret-free connection metadata.
+        connection_id: Exact catalog or gateway connection name used as the store key.
+        environment: Optional mapping used by deterministic tests instead of process environment.
+        store: Optional credential store. When omitted, the platform user-data file is used.
+
+    Returns:
+        The resolved secret and source, or ``None`` when neither source has a value.
+
+    Raises:
+        ProviderAuthStoreError: The local credential file exists but cannot be used.
+    """
+    if connection.provider == "bedrock":
+        return None
+    values = os.environ if environment is None else environment
+    if connection.api_key_env is not None:
+        env_value = (values.get(connection.api_key_env) or "").strip()
+        if env_value:
+            return CredentialResolution(env_value, "environment")
+    auth_store = store if store is not None else ProviderAuthStore()
+    stored = auth_store.get(connection_id)
+    if stored:
+        return CredentialResolution(stored, "stored")
+    return None
+
+
+def describe_connection_credential(
+    connection: ConnectionConfig,
+    *,
+    connection_id: str,
+    environment: Mapping[str, str] | None = None,
+    store: ProviderAuthStore | None = None,
+) -> StoredCredentialStatus:
+    """Return public credential metadata for one connection without the secret.
+
+    Args:
+        connection: Secret-free connection metadata.
+        connection_id: Exact catalog or gateway connection name.
+        environment: Optional mapping used instead of the process environment.
+        store: Optional credential store. When omitted, the platform user-data file is used.
+
+    Returns:
+        Connection identity, provider, source, and environment-variable name.
+    """
+    if connection.provider == "bedrock":
+        return StoredCredentialStatus(
+            connection_id=connection_id,
+            provider=connection.provider,
+            source="aws_chain",
+        )
+    resolved = lookup_connection_credential(
+        connection,
+        connection_id=connection_id,
+        environment=environment,
+        store=store,
+    )
+    source: Literal["environment", "stored", "missing"]
+    if resolved is None:
+        source = "missing"
+    elif resolved.source == "environment":
+        source = "environment"
+    else:
+        source = "stored"
+    return StoredCredentialStatus(
+        connection_id=connection_id,
+        provider=connection.provider,
+        source=source,
+        environment_variable=connection.api_key_env,
+    )
 
 
 def read_connection_api_key(
     connection: ConnectionConfig,
     *,
+    connection_id: str,
     environment: Mapping[str, str] | None = None,
+    store: ProviderAuthStore | None = None,
 ) -> str:
     """Read one configured key without exposing its value in an exception.
 
     Args:
-        connection: Local connection metadata containing only an environment variable name.
+        connection: Secret-free connection metadata, including an optional environment name.
+        connection_id: Exact catalog or gateway connection name used as the store key.
         environment: Optional mapping used by deterministic tests instead of process environment.
+        store: Optional credential store. When omitted, the platform user-data file is used.
 
     Returns:
         The non-empty credential value.
 
     Raises:
-        ModelCredentialError: The connection does not name a key variable or it is unset.
+        ModelCredentialError: The connection does not name a key variable, or both the
+            environment variable and stored credential are absent.
+        ProviderAuthStoreError: The local credential file exists but cannot be used.
     """
-    if connection.api_key_env is None:
+    if connection.provider == "bedrock":
         raise ModelCredentialError(
-            f"connection provider {connection.provider!r} needs api_key_env in .exp/models.toml"
+            "bedrock authenticates through the AWS credential chain and has no stored API key"
         )
-    values = os.environ if environment is None else environment
-    api_key = values.get(connection.api_key_env)
-    if not api_key:
+    try:
+        resolved = lookup_connection_credential(
+            connection,
+            connection_id=connection_id,
+            environment=environment,
+            store=store,
+        )
+    except ProviderAuthStoreError as exc:
+        raise ModelCredentialError(str(exc)) from exc
+    if resolved is None:
+        if connection.api_key_env is None:
+            raise ModelCredentialError(
+                f"no stored credential exists for connection {connection_id!r}; "
+                f"run 'exp auth login {connection_id}'"
+            )
         raise ModelCredentialError(
-            f"connection credential environment variable {connection.api_key_env!r} is not set"
+            f"connection credential environment variable {connection.api_key_env!r} is not set "
+            f"and no stored credential exists for connection {connection_id!r}; "
+            f"run 'exp auth login {connection_id}' or export the variable"
         )
-    return api_key
+    return resolved.value
+
+
+def resolve_or_prompt_connection_api_key(
+    connection: ConnectionConfig,
+    *,
+    connection_id: str,
+    environment: Mapping[str, str] | None = None,
+    store: ProviderAuthStore | None = None,
+    prompt: CredentialPrompt,
+    persist: bool = True,
+    force_prompt: bool = False,
+) -> str | None:
+    """Resolve from environment or store, or accept a masked prompt and persist it.
+
+    Args:
+        connection: Secret-free connection metadata.
+        connection_id: Exact catalog or gateway connection name used as the store key.
+        environment: Optional mapping used by deterministic tests instead of process environment.
+        store: Optional credential store. When omitted, the platform user-data file is used.
+        prompt: Interactive callback that returns a pasted key or ``None`` to skip.
+        persist: Whether a newly pasted key is written to the store.
+        force_prompt: Whether to ignore current environment and stored values and ask again.
+
+    Returns:
+        The resolved or pasted key, or ``None`` when the operator skips the provider.
+
+    Raises:
+        ProviderAuthStoreError: The local credential file exists but cannot be used.
+    """
+    auth_store = store if store is not None else ProviderAuthStore()
+    if not force_prompt:
+        resolved = lookup_connection_credential(
+            connection,
+            connection_id=connection_id,
+            environment=environment,
+            store=auth_store,
+        )
+        if resolved is not None:
+            return resolved.value
+    pasted = prompt()
+    if pasted is None:
+        return None
+    key = pasted.strip()
+    if not key:
+        return None
+    if persist:
+        auth_store.put(connection_id, key)
+    return key

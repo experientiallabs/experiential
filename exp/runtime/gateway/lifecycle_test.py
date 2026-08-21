@@ -16,6 +16,7 @@ from typing import cast
 import pytest
 from fastapi.testclient import TestClient
 
+from exp.common.auth import ProviderAuthStore, default_auth_path
 from exp.common.models import (
     BillingSource,
     CandidateTokenPrice,
@@ -288,6 +289,16 @@ def test_readiness_requires_an_explicit_grant(tmp_path: Path) -> None:
 
     with pytest.raises(GatewayLifecycleError, match="no granted active alias"):
         load_local_gateway(tmp_path, graceful_timeout_seconds=1, environment={})
+
+
+def test_launch_uses_stored_openai_compatible_credential(tmp_path: Path) -> None:
+    """A stored connection key makes gateway readiness succeed without the env var."""
+    _manager, _raw_key = _configured_gateway(tmp_path)
+    ProviderAuthStore(default_auth_path()).put("provider-main", "stored-loopback-key")
+
+    runtime = load_local_gateway(tmp_path, graceful_timeout_seconds=1, environment={})
+
+    assert runtime.app is not None
 
 
 def test_unavailable_alias_reports_its_provider_readiness_reason(tmp_path: Path) -> None:
