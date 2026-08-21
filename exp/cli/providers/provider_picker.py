@@ -10,6 +10,7 @@ screen.
 
 from __future__ import annotations
 
+import re
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from getpass import getpass
@@ -69,6 +70,7 @@ _RECOVERY_RETRY = "retry"
 _RECOVERY_SKIP = "skip"
 _RECOVERY_BACK = "back"
 _PROVIDER_VISIBLE_ROWS = 3
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class SetupCancelled(Exception):
@@ -345,14 +347,23 @@ def collect_provider_connection(
         )
     api_key_env = CANONICAL_CREDENTIAL_ENV.get(provider)
     if provider == "openai-compatible":
-        api_key_env = (
-            ask_text(
-                "Credential environment variable name",
-                console=console,
-                default=CANONICAL_CREDENTIAL_ENV[provider],
-            ).strip()
-            or CANONICAL_CREDENTIAL_ENV[provider]
-        )
+        while True:
+            candidate = (
+                ask_text(
+                    "Credential environment variable name",
+                    console=console,
+                    default=CANONICAL_CREDENTIAL_ENV[provider],
+                ).strip()
+                or CANONICAL_CREDENTIAL_ENV[provider]
+            )
+            if _ENVIRONMENT_NAME.fullmatch(candidate):
+                api_key_env = candidate
+                break
+            console.print(
+                "Credential environment variable names must match [A-Za-z_][A-Za-z0-9_]*.",
+                style="yellow",
+                markup=False,
+            )
     return ConnectionConfig(
         provider=provider,
         base_url=base_url,

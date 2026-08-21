@@ -96,7 +96,10 @@ def interactive_gateway_setup(
     if selection is None:
         raise typer.Abort()
     providers, _manual_models = selection
-    connections = collect_provider_connections(providers, console=console)
+    try:
+        connections = collect_provider_connections(providers, console=console)
+    except SetupCancelled:
+        raise typer.Abort from None
     if not connections:
         raise typer.Abort()
     provider_name, _provider_connection = connections[0]

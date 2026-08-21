@@ -604,9 +604,9 @@ def test_an_identical_configured_connection_is_reused_instead_of_duplicated() ->
     assert models[0].connection == "primary"
 
 
-def test_openai_compatible_endpoint_asks_only_for_its_base_url() -> None:
-    """A compatible endpoint defaults its credential variable after its explicit base URL."""
-    console = ScriptedConsole("https://models.example.test/v1\n\n")
+def test_openai_compatible_endpoint_retries_invalid_credential_env_names() -> None:
+    """A compatible endpoint retries invalid names before resolving its custom variable."""
+    console = ScriptedConsole("https://models.example.test/v1\nnot-a-variable\nINTERNAL_API_KEY\n")
     lister = _FakeLister(
         {
             "openai-compatible": [
@@ -628,13 +628,16 @@ def test_openai_compatible_endpoint_asks_only_for_its_base_url() -> None:
         console,
         providers=("openai-compatible",),
         lister=lister,
-        environment={"OPENAI_COMPATIBLE_API_KEY": "compat-secret"},
+        environment={"INTERNAL_API_KEY": "compat-secret"},
     )
 
     assert prepared is not None
     endpoints, models = prepared
     assert endpoints[0].connection.base_url == "https://models.example.test/v1"
+    assert endpoints[0].connection.api_key_env == "INTERNAL_API_KEY"
     assert lister.requests[0].base_url == "https://models.example.test/v1"
+    assert lister.requests[0].api_key == "compat-secret"
+    assert "must match" in console.output
     assert models[0].pricing_source is PricingSource.PROVIDER
 
 

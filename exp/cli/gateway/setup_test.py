@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import typer
 
 from exp.cli.gateway import setup
 from exp.cli.providers import provider_picker
@@ -141,6 +142,27 @@ def test_gateway_setup_can_edit_the_displayed_defaults(
     assert "Exact model ID" in console.output
     assert "Alias" in console.output
     assert "Identity ID" in console.output
+
+
+def test_gateway_setup_aborts_when_connection_prompt_is_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-run setup converts shared provider prompt cancellation into a clean abort."""
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+
+    def _cancel(*_args: object, **_kwargs: object) -> None:
+        """Raise the shared picker cancellation sentinel."""
+        raise provider_picker.SetupCancelled
+
+    monkeypatch.setattr(setup, "collect_provider_connections", _cancel)
+
+    with pytest.raises(typer.Abort):
+        setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole(""))
 
 
 @pytest.mark.parametrize(
