@@ -160,6 +160,21 @@ def _transport_failure(status_code: int | None) -> GatewayFailure:
             failover_eligible=True,
             safe_details=details,
         )
+    if status_code is not None and 400 <= status_code < 500:
+        # A client-side 4xx (an unsupported or out-of-range parameter, an
+        # oversized prompt, an otherwise malformed request) is deterministic:
+        # every rung rejects it identically, so this is not a transient outage.
+        # Classify it as an invalid request the caller can correct rather than
+        # letting it collapse into the generic all-routes-failed 502, which
+        # tells an agent to retry with backoff. It stays failover eligible so a
+        # sibling deployment that DOES accept the request can still serve it;
+        # only when every rung rejects it the same way does the caller see 400.
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.INVALID_REQUEST,
+            safe_message="provider rejected the request as invalid",
+            failover_eligible=True,
+            safe_details=details,
+        )
     if status_code is not None:
         return GatewayFailure(
             failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
