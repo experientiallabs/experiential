@@ -22,8 +22,11 @@ defaults for the public alias, identity, and `$50.00` command budget before prin
 
 ```bash
 pip install experiential
-exp run
+exp
 ```
+
+Bare `exp` is a shortcut for `exp run`; the explicit form remains available. Use `exp --help`
+or `exp help` for the root command help.
 
 Choose a public alias such as `support-agent`, capture the issued key, and send a request:
 
@@ -34,6 +37,20 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
 ```
+
+## Setup / get started with the hosted gateway
+
+Prefer a managed gateway to running one locally? The hosted platform at
+[platform.experientiallabs.ai](https://platform.experientiallabs.ai) serves the same
+OpenAI-compatible (and Anthropic Messages) API at `https://api.experientiallabs.ai/v1`.
+See [setup.md](./setup.md) for copy-paste prompts you hand to your coding agent
+(Claude Code, Cursor, Codex, and similar); the agent runs the setup for you. It
+collects four prompts:
+
+- Upload your LLM traces as telemetry: create an account instantly from your email, then pull or upload your existing LLM traces onto the platform as telemetry.
+- Connect your inference provider keys (BYOK): create an account, then connect your own OpenAI, Anthropic, Gemini, Azure, Bedrock, Fireworks, or OpenRouter keys for free pass-through.
+- Start calling models on the gateway: make your first `/v1` call with the OpenAI and Anthropic SDKs using an `xpl_` key, and optionally repoint your existing coding agents.
+- Full onboarding: create an account instantly from your email, connect your keys, import your spend, then repoint every coding agent (Claude Code, Cursor, Codex, Aider, and similar) or Conductor at the gateway.
 
 ## Using the API
 

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -57,9 +59,12 @@ from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.openai_protocol.state import ResponseContinuationStore, ResponseReplayStore
 from exp.runtime.router.errors import RouterApplicationError
-from exp.runtime.router.runtime import DecisionSink, RouterRuntime
+from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntimeIntegrityError
 
 _DEFAULT_GRACEFUL_TIMEOUT_SECONDS = 10.0
+_RETIRED_REVISION_RETENTION_SECONDS = 600.0
+
+_logger = logging.getLogger(__name__)
 
 
 class GatewayLifecycleError(ValueError):
@@ -111,29 +116,179 @@ class LocalGatewayRuntime:
 
 
 @dataclass(frozen=True)
+class _AliasAuthorityState:
+    """One fully validated generation of granted alias serving authority."""
+
+    authorities: frozenset[tuple[str, str, str]]
+    normalized_catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog]
+    runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog]
+    activations: Mapping[tuple[str, str, str], RouterRuntime]
+    exact_models: Mapping[tuple[str, str, str, str], str]
+    listing_pools: Mapping[tuple[str, str, str], str]
+    proof: ExecutionSnapshot
+
+
+class _AliasAuthorityReloader:
+    """Swap fully validated authority generations while retaining in-flight revisions.
+
+    A candidate generation is loaded and digest-verified completely before it is
+    published, so requests never observe a half-loaded catalog. Revisions retired
+    by a swap stay resolvable for a bounded retention window so requests that
+    authorized against them finish on the revision they started with.
+    """
+
+    def __init__(
+        self,
+        *,
+        loader: Callable[[], _AliasAuthorityState],
+        state: _AliasAuthorityState,
+        routes: CatalogRouteResolver,
+        executor: GatewayExecutor,
+        retention_seconds: float = _RETIRED_REVISION_RETENTION_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Bind the validated startup generation and its reload seam.
+
+        Args:
+            loader: Builds one complete candidate generation from current authority.
+            state: Fully validated startup generation.
+            routes: Shared route resolver whose catalog index this reloader swaps.
+            executor: Shared executor whose runtime catalogs this reloader swaps.
+            retention_seconds: How long retired revisions stay resolvable.
+            monotonic: Monotonic clock used for retirement bookkeeping.
+        """
+        self._loader = loader
+        self._routes = routes
+        self._executor = executor
+        self._retention_seconds = retention_seconds
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._retired: dict[tuple[str, str], float] = {}
+        self._state = state
+
+    @property
+    def state(self) -> _AliasAuthorityState:
+        """Return the current immutable authority generation."""
+        return self._state
+
+    def refresh_if_drifted(self, authority: tuple[str, str, str]) -> _AliasAuthorityState:
+        """Reload authority once when one authorized revision is not currently served.
+
+        Args:
+            authority: Alias, revision, and catalog digest triple from SQLite authority.
+
+        Returns:
+            The current generation after at most one reload attempt.
+
+        Raises:
+            GatewayRoutingError: The changed authority cannot form a valid generation;
+                the previous generation keeps serving unchanged.
+        """
+        with self._lock:
+            state = self._state
+            if authority in state.authorities:
+                return state
+            try:
+                loaded = self._loader()
+            except GatewayLifecycleError as exc:
+                _logger.warning("gateway alias authority reload failed: %s", exc)
+                raise GatewayRoutingError(
+                    "alias authority changed but the new revision failed to load; "
+                    "previously ready revisions keep serving; "
+                    f"fix the alias configuration and retry: {exc}"
+                ) from exc
+            self._swap(state, loaded)
+            return self._state
+
+    def _swap(self, previous: _AliasAuthorityState, loaded: _AliasAuthorityState) -> None:
+        """Publish one validated generation while retaining recent retired revisions."""
+        now = self._monotonic()
+        for key in previous.normalized_catalogs:
+            if key not in loaded.normalized_catalogs:
+                self._retired.setdefault(key, now)
+        for key in tuple(self._retired):
+            if key in loaded.normalized_catalogs:
+                del self._retired[key]
+        self._retired = {
+            key: retired_at
+            for key, retired_at in self._retired.items()
+            if now - retired_at <= self._retention_seconds
+        }
+        retained = tuple(key for key in self._retired if key in previous.normalized_catalogs)
+        normalized = {
+            **{key: previous.normalized_catalogs[key] for key in retained},
+            **dict(loaded.normalized_catalogs),
+        }
+        runtime = {
+            **{key: previous.runtime_catalogs[key] for key in retained},
+            **dict(loaded.runtime_catalogs),
+        }
+        digests = {digest for _revision, digest in normalized}
+        exact_models = {
+            key: value
+            for key, value in {**dict(previous.exact_models), **dict(loaded.exact_models)}.items()
+            if key[2] in digests
+        }
+        active_projects = {(key[0], key[1], key[2]) for key in exact_models}
+        activations = {
+            key: value
+            for key, value in {**dict(previous.activations), **dict(loaded.activations)}.items()
+            if key in active_projects
+        }
+        listing_pools = {
+            key: value
+            for key, value in {
+                **dict(previous.listing_pools),
+                **dict(loaded.listing_pools),
+            }.items()
+            if (key[1], key[2]) in normalized
+        }
+        merged = _AliasAuthorityState(
+            authorities=loaded.authorities,
+            normalized_catalogs=normalized,
+            runtime_catalogs=runtime,
+            activations=activations,
+            exact_models=exact_models,
+            listing_pools=listing_pools,
+            proof=loaded.proof,
+        )
+        self._executor.swap_catalogs(runtime)
+        self._routes.swap_catalogs(
+            normalized,
+            project_resolver=_project_resolver(activations, exact_models),
+            listing_pools=listing_pools,
+        )
+        self._state = merged
+
+
+@dataclass(frozen=True)
 class _ReadyControlStore:
-    """Filter public authority through one frozen startup readiness snapshot."""
+    """Filter public authority through the current hot-reloadable ready generation."""
 
     store: SQLiteGatewayStore
-    authorities: frozenset[tuple[str, str, str]]
+    reloader: _AliasAuthorityReloader
 
     def authenticate_key(self, *, raw_key: str) -> None:
         """Delegate authentication without consulting alias readiness."""
         self.store.authenticate_key(raw_key=raw_key)
 
     def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
-        """Return granted aliases that were ready in this process snapshot."""
+        """Return granted aliases whose active revision is currently served."""
         return tuple(
             alias for alias, _revision, _digest in self.granted_alias_authorities(raw_key=raw_key)
         )
 
     def granted_alias_authorities(self, *, raw_key: str) -> tuple[tuple[str, str, str], ...]:
-        """Return granted authority triples that were ready in this process snapshot."""
-        return tuple(
-            (alias, revision, digest)
-            for alias, revision, digest in self.store.granted_alias_authorities(raw_key=raw_key)
-            if (alias, revision, digest) in self.authorities
-        )
+        """Return granted authority triples whose active revision is currently served."""
+        granted = tuple(self.store.granted_alias_authorities(raw_key=raw_key))
+        state = self.reloader.state
+        drifted = next((item for item in granted if item not in state.authorities), None)
+        if drifted is not None:
+            try:
+                state = self.reloader.refresh_if_drifted(drifted)
+            except GatewayRoutingError:
+                state = self.reloader.state
+        return tuple(item for item in granted if item in state.authorities)
 
     def authorize_request(
         self,
@@ -143,7 +298,7 @@ class _ReadyControlStore:
         request: GatewayRequest,
         deadline_monotonic: float,
     ) -> AuthorizationSnapshot:
-        """Authorize only the exact alias revision proven ready at startup."""
+        """Authorize only an alias revision proven ready, reloading once on drift."""
         authorization = self.store.authorize_request(
             raw_key=raw_key,
             alias=alias,
@@ -155,7 +310,10 @@ class _ReadyControlStore:
             authorization.alias_revision_id,
             authorization.catalog_sha256,
         )
-        if authority not in self.authorities:
+        state = self.reloader.state
+        if authority not in state.authorities:
+            state = self.reloader.refresh_if_drifted(authority)
+        if authority not in state.authorities:
             raise GatewayRoutingError("authorized alias revision is unavailable in this process")
         return authorization
 
@@ -225,6 +383,96 @@ def load_local_gateway(
     manager.migrate_legacy_provider_connections()
     ledger = SQLiteAttemptLedger(manager.database_path)
     expired, unknown = ledger.reconcile_crashed_requests(cleanup_grace=timedelta(seconds=5))
+
+    def loader() -> _AliasAuthorityState:
+        """Build one complete validated generation from current granted authority."""
+        return _load_alias_state(
+            manager,
+            environment=environment,
+            project_repository=project_repository,
+            decision_sink=decision_sink,
+            only_aliases=only_aliases,
+        )
+
+    state = loader()
+    routes = CatalogRouteResolver(
+        state.normalized_catalogs,
+        project_resolver=_project_resolver(state.activations, state.exact_models),
+        listing_pools=state.listing_pools,
+    )
+    write_ledger = GroupCommitAttemptLedger(ledger)
+    executor = GatewayExecutor(state.runtime_catalogs, write_ledger)
+    reloader = _AliasAuthorityReloader(
+        loader=loader,
+        state=state,
+        routes=routes,
+        executor=executor,
+    )
+
+    async def readiness_probe() -> ExecutionSnapshot:
+        """Return the current generation's credential and route proof."""
+        return reloader.state.proof
+
+    runtime = create_gateway_runtime(
+        config=GatewayRuntimeConfig(
+            graceful_timeout_seconds=graceful_timeout_seconds,
+            title="EXP local gateway",
+        ),
+        authority=_ReadyControlStore(store=store, reloader=reloader),
+        ledger=write_ledger,
+        routes=routes,
+        executor=executor,
+        clock=SystemGatewayClock(),
+        readiness=readiness_probe,
+        usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
+        replay=replay,
+        continuations=continuations,
+        terminal_flusher=write_ledger.flush,
+    )
+    return LocalGatewayRuntime(
+        runtime=runtime,
+        write_ledger=write_ledger,
+        reconciled_expired_requests=expired,
+        reconciled_unknown_attempts=unknown,
+    )
+
+
+def _project_resolver(
+    activations: Mapping[tuple[str, str, str], RouterRuntime],
+    exact_models: Mapping[tuple[str, str, str, str], str],
+) -> ProjectTargetResolver | None:
+    """Build one selection-only project bridge when any activation is loaded."""
+    if not activations:
+        return None
+    return cast(
+        ProjectTargetResolver,
+        RouterProjectTargetResolver(activations, exact_models),
+    )
+
+
+def _load_alias_state(
+    manager: GatewayManagement,
+    *,
+    environment: Mapping[str, str] | None,
+    project_repository: ProjectActivationRepository | None,
+    decision_sink: DecisionSink | None,
+    only_aliases: frozenset[str] | None,
+) -> _AliasAuthorityState:
+    """Load and validate every granted active alias into one complete generation.
+
+    Args:
+        manager: Initialized gateway management over SQLite authority.
+        environment: Optional provider credential mapping used by tests.
+        project_repository: Repository for verified immutable project activations.
+        decision_sink: Optional aggregate-safe recorder for served project selections.
+        only_aliases: Optional exact public aliases to expose.
+
+    Returns:
+        Fully validated authority generation ready for atomic publication.
+
+    Raises:
+        GatewayLifecycleError: No granted alias can form a complete local route.
+    """
     aliases = _granted_active_aliases(manager)
     if only_aliases is not None:
         aliases = tuple(item for item in aliases if item.alias_name in only_aliases)
@@ -235,20 +483,24 @@ def load_local_gateway(
 
     normalized_catalogs: dict[tuple[str, str], NormalizedGatewayCatalog] = {}
     runtime_catalogs: dict[tuple[str, str], RuntimeModelCatalog] = {}
-    activations: dict[tuple[str, str], RouterRuntime] = {}
+    activations: dict[tuple[str, str, str], RouterRuntime] = {}
     exact_models: dict[tuple[str, str, str, str], str] = {}
     readiness: list[ExecutionSnapshot] = []
     unavailable_aliases: list[tuple[str, str]] = []
 
     for alias in aliases:
-        revision_id, catalog_sha256 = _required_revision(alias)
-        catalog, normalized = _load_snapshot(manager, alias)
+        try:
+            revision_id, catalog_sha256 = _required_revision(alias)
+            catalog, normalized = _load_snapshot(manager, alias)
+        except GatewayLifecycleError as exc:
+            unavailable_aliases.append((alias.alias_name, str(exc)))
+            continue
         key = (revision_id, catalog_sha256)
         runtime_catalog = RuntimeModelCatalog(catalog, environment=environment)
         if alias.target_kind == "direct":
             try:
                 proof = _direct_readiness(manager, alias, normalized, runtime_catalog)
-            except (ModelConnectionError, ModelCredentialError) as exc:
+            except (GatewayLifecycleError, ModelConnectionError, ModelCredentialError) as exc:
                 unavailable_aliases.append((alias.alias_name, str(exc)))
                 continue
             normalized_catalogs[key] = normalized
@@ -256,14 +508,16 @@ def load_local_gateway(
             readiness.append(proof)
             continue
         if alias.target_kind != "project":
-            raise GatewayLifecycleError(f"alias {alias.alias_name!r} has an unknown target kind")
+            unavailable_aliases.append((alias.alias_name, "unknown target kind"))
+            continue
         if project_repository is None:
-            raise GatewayLifecycleError(
-                f"project alias {alias.alias_name!r} requires a project activation repository"
+            unavailable_aliases.append(
+                (alias.alias_name, "project alias requires a project activation repository")
             )
-        project_ref = _required(alias.project_ref, "project reference", alias)
-        activation_ref = _required(alias.activation_ref, "activation reference", alias)
+            continue
         try:
+            project_ref = _required(alias.project_ref, "project reference", alias)
+            activation_ref = _required(alias.activation_ref, "activation reference", alias)
             activation = project_repository.load(
                 project_ref,
                 activation_ref,
@@ -292,10 +546,16 @@ def load_local_gateway(
                 raise
             unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
-        except (ModelConnectionError, ModelCredentialError) as exc:
+        except (
+            GatewayLifecycleError,
+            ModelConnectionError,
+            ModelCredentialError,
+            ProjectActivationError,
+            RouterRuntimeIntegrityError,
+        ) as exc:
             unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
-        activations[(project_ref, activation_ref)] = runtime
+        activations[(project_ref, activation_ref, catalog_sha256)] = runtime
         normalized_catalogs[key] = normalized
         runtime_catalogs[key] = runtime_catalog
         readiness.append(proof)
@@ -310,61 +570,29 @@ def load_local_gateway(
             f"{detail}; fix the listed provider configuration and rerun 'exp run'"
         )
 
-    project_resolver = cast(
-        ProjectTargetResolver | None,
-        RouterProjectTargetResolver(activations, exact_models) if activations else None,
-    )
-    listing_pools = {
-        (
-            item.authorization.alias,
-            item.authorization.alias_revision_id,
-            item.authorization.catalog_sha256,
-        ): item.authorization.target.pool_id
-        for item in readiness
-        if isinstance(item.authorization.target, DirectTarget)
-    }
-    routes = CatalogRouteResolver(
-        normalized_catalogs,
-        project_resolver=project_resolver,
-        listing_pools=listing_pools,
-    )
-    write_ledger = GroupCommitAttemptLedger(ledger)
-    executor = GatewayExecutor(runtime_catalogs, write_ledger)
-    proof = readiness[0]
-
-    async def readiness_probe() -> ExecutionSnapshot:
-        """Return precomputed credential and route proof without provider work."""
-        return proof
-
-    ready_authorities = frozenset(
-        (
-            item.authorization.alias,
-            item.authorization.alias_revision_id,
-            item.authorization.catalog_sha256,
-        )
-        for item in readiness
-    )
-    runtime = create_gateway_runtime(
-        config=GatewayRuntimeConfig(
-            graceful_timeout_seconds=graceful_timeout_seconds,
-            title="EXP local gateway",
+    return _AliasAuthorityState(
+        authorities=frozenset(
+            (
+                item.authorization.alias,
+                item.authorization.alias_revision_id,
+                item.authorization.catalog_sha256,
+            )
+            for item in readiness
         ),
-        authority=_ReadyControlStore(store=store, authorities=ready_authorities),
-        ledger=write_ledger,
-        routes=routes,
-        executor=executor,
-        clock=SystemGatewayClock(),
-        readiness=readiness_probe,
-        usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
-        replay=replay,
-        continuations=continuations,
-        terminal_flusher=write_ledger.flush,
-    )
-    return LocalGatewayRuntime(
-        runtime=runtime,
-        write_ledger=write_ledger,
-        reconciled_expired_requests=expired,
-        reconciled_unknown_attempts=unknown,
+        normalized_catalogs=normalized_catalogs,
+        runtime_catalogs=runtime_catalogs,
+        activations=activations,
+        exact_models=exact_models,
+        listing_pools={
+            (
+                item.authorization.alias,
+                item.authorization.alias_revision_id,
+                item.authorization.catalog_sha256,
+            ): item.authorization.target.pool_id
+            for item in readiness
+            if isinstance(item.authorization.target, DirectTarget)
+        },
+        proof=readiness[0],
     )
 
 

@@ -75,18 +75,33 @@ class CatalogRouteResolver:
         """
         self._project_resolver = project_resolver
         self._listing_pools = dict(listing_pools or {})
-        self._catalogs: dict[tuple[str, str], _CatalogView] = {}
-        for key, catalog in catalogs.items():
-            revision_id, catalog_sha256 = key
-            if catalog.identity_sha256() != catalog_sha256:
-                raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
-            self._catalogs[key] = _CatalogView(
-                catalog=catalog,
-                pools={pool.pool_id: pool for pool in catalog.pools},
-                deployments={
-                    deployment.deployment_id: deployment for deployment in catalog.deployments
-                },
-            )
+        self._catalogs = _index_catalogs(catalogs)
+
+    def swap_catalogs(
+        self,
+        catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog],
+        *,
+        project_resolver: ProjectTargetResolver | None,
+        listing_pools: Mapping[tuple[str, str, str], str],
+    ) -> None:
+        """Atomically replace the served catalog index with one validated superset.
+
+        Callers must include every revision that an in-flight authorization may
+        still reference so requests never observe a partially loaded catalog.
+
+        Args:
+            catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
+            project_resolver: Replacement resolver covering all retained activations.
+            listing_pools: Direct-target pool IDs keyed by granted alias, revision,
+                and catalog digest, covering the replacement generation.
+
+        Raises:
+            ValueError: One catalog does not match its declared digest.
+        """
+        indexed = _index_catalogs(catalogs)
+        self._project_resolver = project_resolver
+        self._listing_pools = dict(listing_pools)
+        self._catalogs = indexed
 
     def published_metadata(
         self,
@@ -252,12 +267,41 @@ class CatalogRouteResolver:
         )
 
 
+def _index_catalogs(
+    catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog],
+) -> dict[tuple[str, str], _CatalogView]:
+    """Index digest-verified catalogs by alias revision and catalog digest.
+
+    Args:
+        catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
+
+    Returns:
+        Fully built revision-scoped catalog views.
+
+    Raises:
+        ValueError: One catalog does not match its declared digest.
+    """
+    indexed: dict[tuple[str, str], _CatalogView] = {}
+    for key, catalog in catalogs.items():
+        revision_id, catalog_sha256 = key
+        if catalog.identity_sha256() != catalog_sha256:
+            raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
+        indexed[key] = _CatalogView(
+            catalog=catalog,
+            pools={pool.pool_id: pool for pool in catalog.pools},
+            deployments={
+                deployment.deployment_id: deployment for deployment in catalog.deployments
+            },
+        )
+    return indexed
+
+
 class RouterProjectTargetResolver:
     """Run synchronous ``RouterRuntime.select`` in a bounded selection worker lane."""
 
     def __init__(
         self,
-        activations: Mapping[tuple[str, str], RouterRuntime],
+        activations: Mapping[tuple[str, str, str], RouterRuntime],
         exact_models_by_alias: Mapping[tuple[str, str, str, str], str],
         *,
         maximum_outstanding_selections: int = 4,
@@ -265,7 +309,8 @@ class RouterProjectTargetResolver:
         """Bind frozen activations and an exact-model projection.
 
         Args:
-            activations: Project and activation references mapped to verified runtimes.
+            activations: Project, activation, and catalog digest mapped to verified
+                runtimes, so each retained revision keeps its own selection policy.
             exact_models_by_alias: Project, activation, catalog, and candidate alias mappings.
             maximum_outstanding_selections: Running plus detached selection calls allowed.
         """
@@ -294,7 +339,9 @@ class RouterProjectTargetResolver:
         Returns:
             Exact logical model and content-free learned selection details.
         """
-        runtime = self._activations.get((target.project_ref, target.activation_ref))
+        runtime = self._activations.get(
+            (target.project_ref, target.activation_ref, target.catalog_sha256)
+        )
         if runtime is None:
             raise GatewayRoutingError("project activation is not loaded")
         deadline = RequestDeadline(deadline_monotonic)

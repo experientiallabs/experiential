@@ -4,6 +4,7 @@ The root surface is deliberately small:
 
 | Command | Purpose | Local result |
 |---|---|---|
+| `exp` | Shortcut for `exp run`; use `exp --help` or `exp help` for root CLI help. | Start the authenticated gateway on loopback. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
@@ -35,7 +36,7 @@ remain frozen for the process lifetime and return only an exact model pool. `--g
 compatibility flag for project-journal behavior; gateway authentication, replay, attempts, and
 usage accounting stay enabled.
 
-Both `exp run` forms use one gateway lifecycle. It binds only `127.0.0.1`, starts with no
+Bare `exp` and both `exp run` forms use one gateway lifecycle. It binds only `127.0.0.1`, starts with no
 provider call, and requires an explicit provider environment reference, exact model alias, identity,
 grant, and a virtual key. Interactive first-run setup can persist multiple provider connections and
 creates one initial gateway alias; additional deployments and certified pools remain explicit

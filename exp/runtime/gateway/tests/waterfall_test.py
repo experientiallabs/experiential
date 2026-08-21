@@ -323,6 +323,46 @@ def test_recovered_provider_serves_through_open_circuits_without_waiting_out_coo
     assert health.claim(first_key)
 
 
+def test_caller_invalid_request_burst_never_suppresses_valid_traffic() -> None:
+    """A storm of caller-fault provider 4xx rejections leaves the route admissible."""
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    provider = _ScriptedProvider(
+        [
+            *(
+                ProviderTransportError("provider returned HTTP 400", status_code=400)
+                for _ in range(8)
+            ),
+            _completed_stream("valid traffic"),
+        ]
+    )
+    health = DeploymentHealthRegistry(
+        failure_threshold=2,
+        open_seconds=60,
+        throttle_seconds=60,
+    )
+    ledger = _WaterfallLedger()
+    executor = _executor(
+        (first,),
+        {first.source_alias: provider},
+        ledger,
+        maximum_same_deployment_attempts=1,
+        health=health,
+    )
+
+    async def scenario() -> str:
+        """Send one malformed-param burst and then one valid request."""
+        for _ in range(8):
+            with pytest.raises(GatewayExecutionError) as error:
+                await executor.start(route=_route((first,)), request=_request())
+            assert error.value.failure.failure_class is GatewayFailureClass.INVALID_REQUEST
+        stream = await executor.start(route=_route((first,)), request=_request())
+        events = [event async for event in stream]
+        return "".join(event.text_delta or "" for event in events)
+
+    assert asyncio.run(scenario()) == "valid traffic"
+    assert health.claim((_DIGEST, first.deployment_id, first.connection_sha256))
+
+
 def test_budget_skip_still_probes_a_suppressed_fallback_route() -> None:
     """A budget-skipped primary probes the open fallback circuit instead of failing."""
     now = [100.0]

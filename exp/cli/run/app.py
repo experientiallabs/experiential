@@ -9,12 +9,23 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.text import Text
 
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
 
 _LOOPBACK_HOST = "127.0.0.1"
 _console = Console(theme=EXP_THEME)
+_EXP_WORDMARK = "\n".join(
+    (
+        "███████╗██╗  ██╗██████╗ ",
+        "██╔════╝╚██╗██╔╝██╔══██╗",
+        "█████╗   ╚███╔╝ ██████╔╝",
+        "██╔══╝   ██╔██╗ ██╔═══╝ ",
+        "███████╗██╔╝ ██╗██║     ",
+        "╚══════╝╚═╝  ╚═╝╚═╝     ",
+    )
+)
 _POLICY_OPTION = typer.Option(
     None,
     "--policy",
@@ -100,6 +111,9 @@ def _run_gateway(
     graceful_timeout: float,
 ) -> None:
     """Validate and optionally serve the normal gateway application."""
+    if not json_output:
+        _emit_exp_wordmark()
+
     import uvicorn
 
     from exp.cli.gateway.compatibility import prepare_project_gateway
@@ -178,6 +192,11 @@ def _run_gateway(
         if setup is not None:
             _emit_setup_recovery(setup=setup)
         raise
+
+
+def _emit_exp_wordmark() -> None:
+    """Render the block-letter EXP wordmark for human-facing gateway startup output."""
+    _console.print(Text(_EXP_WORDMARK, style="bold green"))
 
 
 def _gateway_not_initialized(*, json_output: bool) -> None:

@@ -13,8 +13,9 @@ on the exact release checkout.
   provider fallback, Chat Completions, Responses, bounded in-memory continuation and replay,
   content-free SQLite accounting, monthly integer micro-USD enforcement, and loopback-only health
   and usage views.
-- Both no-argument gateway launch and the retained `exp run PROJECT [--ghost]` compatibility form
-  are installed-wheel surfaces. Gateway startup is provider-idle and requires explicit authority.
+- Bare `exp` and the explicit no-argument `exp run` gateway launch, plus the retained
+  `exp run PROJECT [--ghost]` compatibility form, are installed-wheel surfaces. Gateway startup
+  is provider-idle and requires explicit authority.
 - The installed-wheel gateway lane uses real SQLite, a real subprocess listener, a real loopback
   upstream, and OpenAI `3.0.0`. It covers `OpenAI` and `AsyncOpenAI` across Chat Completions and
   Responses, with both stream and non-stream requests. HTML and JSON usage are checked for the same

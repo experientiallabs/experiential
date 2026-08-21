@@ -457,7 +457,7 @@ def _provider_error(event: Mapping[str, object]) -> GatewayFailure | None:
         )
     if "validationException" in event:
         return GatewayFailure(
-            failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+            failure_class=GatewayFailureClass.INVALID_REQUEST,
             safe_message="provider rejected the request",
         )
     return None
