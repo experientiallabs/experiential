@@ -276,10 +276,11 @@ class BedrockProviderStream:
         if raw_tool is not None:
             tool = self._require_tool(index)
             tool_delta = _mapping(raw_tool, "Bedrock toolUse delta")
-            fragment = require_string(
-                cast("JsonValue | None", tool_delta.get("input")),
-                "Bedrock tool input delta",
-            )
+            fragment = tool_delta.get("input")
+            if not isinstance(fragment, str):
+                raise ProviderResponseError("Bedrock tool input delta must be text")
+            if not fragment:
+                return []
             tool.raw_arguments += fragment
             return [
                 self._event(
