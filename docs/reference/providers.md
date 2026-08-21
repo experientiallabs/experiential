@@ -12,7 +12,24 @@ repeatable `--provider` flags (`openai`, `anthropic`, `gemini`, `openrouter`,
 write. Azure and Bedrock still require manual model IDs. Other selected providers use account
 model discovery when credentials are available.
 
-Setup writes only secret-free catalog fields and never prints a credential value.
+Setup writes only secret-free catalog fields and never prints a credential value. Interactive
+setup and `exp auth login` persist pasted API keys outside the repository in the platform
+user-data file (`$XDG_DATA_HOME/exp/auth.json` or `~/.local/share/exp/auth.json` on Linux).
+Known providers keep their canonical environment override names internally. Custom
+OpenAI-compatible connections keep a generated or already-configured override name, but the
+operator pastes the key rather than typing a variable name.
+
+Credential resolution order for one connection ID:
+
+1. The configured environment variable, when it is non-empty
+2. The stored local credential for that exact connection
+3. An interactive secure prompt that persists the pasted key
+
+A non-empty environment value wins and does not overwrite the store. Runtime, `--non-interactive`,
+and CI paths never reach the prompt; they fail with the environment name and
+`exp auth login CONNECTION`. Amazon Bedrock is unchanged: it uses the AWS credential chain and
+rejects a stored API key. `exp auth list` shows connection, provider, and source metadata without
+secret values. `exp auth logout CONNECTION` removes only that stored record.
 
 ## Supported providers
 
@@ -164,6 +181,8 @@ input_cost_per_million_tokens_usd = 0
 
 ## Errors
 
-Missing credentials name the environment variable, never its value. A missing Bedrock region lists
-the resolution order. Azure endpoint and key mismatches name `AZURE_OPENAI_ENDPOINT`, not the key.
-Malformed provider responses fail closed and do not write partial catalog or evidence artifacts.
+Missing credentials name the environment variable and the `exp auth login` recovery, never a
+secret value. A missing Bedrock region lists the AWS resolution order. Azure endpoint and key
+mismatches name `AZURE_OPENAI_ENDPOINT`, not the key. A malformed user-data credential file
+fails closed and tells the operator to move or delete it, then run `exp auth login`. Malformed
+provider responses fail closed and do not write partial catalog or evidence artifacts.

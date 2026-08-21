@@ -65,7 +65,9 @@ mode, versioned forward
 migrations, private backups before migration, newer-schema refusal, and serialized initialization.
 Virtual keys are stored only as peppered fingerprints. Key material is delivered once in a JSON
 receipt or to a new mode-`0600` file, and commit ambiguity preserves recoverability. Provider
-configuration stores an environment variable name, never its value. The local pepper is mode
+configuration stores an environment variable name, never its value. Pasted provider keys live in
+the user-data credential file and are resolved after a non-empty environment override. The local
+pepper is mode
 `0600` and is not exported.
 
 Every data-plane request is authenticated and authorized before request decoding, routing,

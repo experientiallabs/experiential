@@ -3145,6 +3145,9 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     usage = (docs / "usage.md").read_text(encoding="utf-8")
     assert "exp optimize router" in usage
     assert "exp optimize model" in usage
+    assert "exp auth list" in usage
+    assert "exp auth login" in usage
+    assert "exp auth logout" in usage
     assert "exp config gateway" in usage
     assert "exp config gateway pool certify" in usage
     assert "exp run --root ROOT" in usage
