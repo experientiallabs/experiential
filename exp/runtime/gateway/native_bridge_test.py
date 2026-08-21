@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 import pytest
 
@@ -157,24 +158,15 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
         }
     )
     ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
-    real_finish = ledger.finish_attempt
-    calls = {"count": 0}
-
-    def failing_finish(**kwargs: object) -> None:
-        """Fail the first durable terminal write, then delegate."""
-        calls["count"] += 1
-        if calls["count"] == 1:
-            raise RuntimeError("simulated terminal write loss")
-        real_finish(**kwargs)
-
-    ledger.finish_attempt = failing_finish  # type: ignore[method-assign]
-    try:
+    with mock.patch.object(
+        ledger,
+        "finish_attempt",
+        side_effect=RuntimeError("simulated terminal write loss"),
+    ):
         with pytest.raises(NativeBridgeError):
             control.settle(settlement)
-        assert control.readiness("{}") == "false"
-        assert control.settle(settlement) == "{}"
-    finally:
-        ledger.finish_attempt = real_finish  # type: ignore[method-assign]
+    assert control.readiness("{}") == "false"
+    assert control.settle(settlement) == "{}"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
 
