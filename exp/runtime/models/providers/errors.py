@@ -123,6 +123,10 @@ def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
 def _transport_failure(status_code: int | None) -> GatewayFailure:
     """Classify one sanitized HTTP or connection failure by status only.
 
+    Remaining 4xx statuses are the caller's request being rejected, so they map to
+    ``INVALID_REQUEST``: the caller gets a corrective 400 and the deployment health
+    circuit never counts the attempt against the deployment.
+
     Args:
         status_code: Provider HTTP status, or ``None`` for a connection failure.
 
@@ -177,13 +181,20 @@ def _transport_failure(status_code: int | None) -> GatewayFailure:
             failover_eligible=True,
             safe_details=details,
         )
-    if status_code is not None:
+    if status_code is not None and 400 <= status_code < 500:
         return GatewayFailure(
-            failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+            failure_class=GatewayFailureClass.INVALID_REQUEST,
             safe_message=(
                 "provider rejected the request; verify the request fields against "
                 "the model alias capabilities"
             ),
+            safe_details=details,
+        )
+    if status_code is not None:
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+            safe_message="provider returned an unexpected status; retry the request",
+            failover_eligible=True,
             safe_details=details,
         )
     return GatewayFailure(

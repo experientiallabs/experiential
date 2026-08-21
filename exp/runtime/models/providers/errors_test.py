@@ -40,6 +40,24 @@ from exp.runtime.models.providers.transport import ProviderTransportError
             True,
         ),
         (
+            ProviderTransportError("raw invalid canary", status_code=400),
+            GatewayFailureClass.INVALID_REQUEST,
+            False,
+            False,
+        ),
+        (
+            ProviderTransportError("raw reject canary", status_code=422),
+            GatewayFailureClass.INVALID_REQUEST,
+            False,
+            False,
+        ),
+        (
+            ProviderTransportError("raw redirect canary", status_code=302),
+            GatewayFailureClass.PROVIDER_INTERNAL,
+            False,
+            True,
+        ),
+        (
             ProviderTransportError("raw body canary"),
             GatewayFailureClass.TRANSPORT,
             True,
@@ -119,6 +137,10 @@ def test_refusal_and_capability_failures_keep_only_safe_signals() -> None:
             ProviderTransportError("raw reject canary", status_code=422),
             "provider rejected the request; verify the request fields against "
             "the model alias capabilities",
+        ),
+        (
+            ProviderTransportError("raw redirect canary", status_code=302),
+            "provider returned an unexpected status; retry the request",
         ),
         (
             ProviderTransportError("raw body canary"),
