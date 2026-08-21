@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
+from exp.cli.providers.declaration import can_declare_role, merge_declared_models
 from exp.cli.providers.model_picker import (
     available_models,
     configured_models,
@@ -121,8 +122,11 @@ def run_router_candidate_picker(
         eligible = tuple(
             item
             for item in available
-            if item.capabilities is not None
-            and serves_role(item.capabilities, SetupRole.ROUTER_CANDIDATE)
+            if (
+                item.capabilities is not None
+                and serves_role(item.capabilities, SetupRole.ROUTER_CANDIDATE)
+            )
+            or can_declare_role(item, SetupRole.ROUTER_CANDIDATE)
         )
         if len(eligible) < 2:
             console.print(
@@ -131,16 +135,22 @@ def run_router_candidate_picker(
                 "path.[/yellow]"
             )
             continue
+        declared: list[AvailableModel] = []
         selection = select_router_candidates(
             available,
             preselected=preselected,
             incumbent=incumbent,
             effort_defaults=catalog.roles.candidate_reasoning_efforts,
             console=console,
+            declared_models=declared,
         )
         if selection is None:
             continue
-        selected_models = tuple(item for item in available if item.alias in selection.candidates)
+        selected_models = tuple(
+            item
+            for item in merge_declared_models(available, tuple(declared))
+            if item.alias in selection.candidates
+        )
         used_connections = {item.connection for item in selected_models}
         candidate_models = tuple(
             model_selection(item) for item in selected_models if not item.configured

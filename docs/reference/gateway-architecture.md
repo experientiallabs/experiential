@@ -154,7 +154,12 @@ idempotency, request, or provider values.
 
 `GET /v1/models` lists only the aliases granted to the presented key, as OpenAI model objects
 enriched with a `wmo` object carrying the alias revision and catalog digest of the granted
-authority. Its list envelope carries `wmo.authority_schema_version`, including when `data` is
+authority. When that alias revision targets exactly one direct singleton pool, the same object
+also carries optional extension fields copied from that pool's deployment: `supports_completions`,
+`supports_tools`, `supports_structured_output`, `maximum_output_tokens`, `context_window_tokens`
+when the catalog declares a window, and a `pricing` object of configured micro-USD-per-million-token
+rates. The gateway never invents a context window or a cache-write price, and it never hard-codes
+hosted alias names. Its list envelope carries `wmo.authority_schema_version`, including when `data` is
 empty, so caller-side key validation can distinguish this gateway from a generic OpenAI proxy.
 `GET /v1/models/{model_id}` describes one granted alias with the same object and
 returns the identical `model_not_found` 404 for every other model ID, so the route never confirms

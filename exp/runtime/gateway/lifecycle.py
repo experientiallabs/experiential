@@ -119,6 +119,7 @@ class _AliasAuthorityState:
     runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog]
     activations: Mapping[tuple[str, str], RouterRuntime]
     exact_models: Mapping[tuple[str, str, str, str], str]
+    listing_pools: Mapping[tuple[str, str, str], str]
     proof: ExecutionSnapshot
 
 
@@ -229,18 +230,28 @@ class _AliasAuthorityReloader:
             for key, value in {**dict(previous.activations), **dict(loaded.activations)}.items()
             if key in active_projects
         }
+        listing_pools = {
+            key: value
+            for key, value in {
+                **dict(previous.listing_pools),
+                **dict(loaded.listing_pools),
+            }.items()
+            if (key[1], key[2]) in normalized
+        }
         merged = _AliasAuthorityState(
             authorities=loaded.authorities,
             normalized_catalogs=normalized,
             runtime_catalogs=runtime,
             activations=activations,
             exact_models=exact_models,
+            listing_pools=listing_pools,
             proof=loaded.proof,
         )
         self._executor.swap_catalogs(runtime)
         self._routes.swap_catalogs(
             normalized,
             project_resolver=_project_resolver(activations, exact_models),
+            listing_pools=listing_pools,
         )
         self._state = merged
 
@@ -382,6 +393,7 @@ def load_local_gateway(
     routes = CatalogRouteResolver(
         state.normalized_catalogs,
         project_resolver=_project_resolver(state.activations, state.exact_models),
+        listing_pools=state.listing_pools,
     )
     executor = GatewayExecutor(state.runtime_catalogs, ledger)
     reloader = _AliasAuthorityReloader(
@@ -557,6 +569,15 @@ def _load_alias_state(
         runtime_catalogs=runtime_catalogs,
         activations=activations,
         exact_models=exact_models,
+        listing_pools={
+            (
+                item.authorization.alias,
+                item.authorization.alias_revision_id,
+                item.authorization.catalog_sha256,
+            ): item.authorization.target.pool_id
+            for item in readiness
+            if isinstance(item.authorization.target, DirectTarget)
+        },
         proof=readiness[0],
     )
 

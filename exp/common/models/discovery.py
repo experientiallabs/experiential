@@ -5,7 +5,8 @@ providers also publish capabilities, token limits, and prices there. This module
 response with EXP's maintained metadata into one resolved record per model, decides which build
 roles the record can serve, and derives the stable connection names and readable aliases that setup
 writes to ``.exp/models.toml``. Every value stays unknown unless a provider or the maintained table
-proves it, so an unverified model is hidden instead of being claimed as capable.
+proves it. Setup may still list an identity with unknown metadata; it never claims that identity is
+capable until the operator or a proven source declares the required fields.
 """
 
 from __future__ import annotations

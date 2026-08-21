@@ -22,7 +22,11 @@ from exp.common.models import (
     ModelSnapshot,
     ToolCall,
 )
-from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
+from exp.common.models.catalog import (
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
+    GatewayTokenPrices,
+)
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     ExactModelPool,
@@ -495,12 +499,17 @@ def _service(
     replay_store: ResponseReplayStore | None = None,
     continuation_store: ResponseContinuationStore | None = None,
     request_digest: Callable[[GatewayRequest], str] | None = None,
+    listing_pools: dict[tuple[str, str, str], str] | None = None,
+    catalog_bundle: tuple[NormalizedGatewayCatalog, ExactModelDeployment] | None = None,
 ) -> tuple[GatewayService, _ControlStore, _Ledger, ExecutionSnapshot]:
     """Compose the full launch data plane with deterministic injected dependencies."""
-    catalog, deployment = _catalog()
+    catalog, deployment = _catalog() if catalog_bundle is None else catalog_bundle
     control = _ControlStore(catalog.identity_sha256(), request_digest)
     ledger = _Ledger()
-    routes = CatalogRouteResolver({("revision-one", catalog.identity_sha256()): catalog})
+    routes = CatalogRouteResolver(
+        {("revision-one", catalog.identity_sha256()): catalog},
+        listing_pools=listing_pools,
+    )
     authorization = control.authorize_request(
         raw_key="preflight-not-a-caller-secret",
         alias="public-model",
@@ -1646,6 +1655,89 @@ def test_model_discovery_is_enriched_and_detail_is_not_an_existence_oracle() -> 
         assert "GET /v1/models lists the model aliases available to this key." in error["message"]
         assert "other-model" not in error["message"]
         assert unauthenticated.status_code == 401
+        assert len(provider.streams) == 0
+
+    asyncio.run(scenario())
+
+
+def test_model_discovery_publishes_the_revision_direct_pool_not_a_name_match() -> None:
+    """GET /v1/models copies fields from the frozen direct pool, not a public-name hit."""
+
+    async def scenario() -> None:
+        """Serve one granted alias whose public name differs from its deployment."""
+        deployment = ExactModelDeployment(
+            deployment_id="deployment-one",
+            source_alias="source-one",
+            exact_model_id="exact-one",
+            connection="connection-one",
+            provider="openai",
+            provider_model="provider-model",
+            connection_sha256="b" * 64,
+            capabilities_sha256="c" * 64,
+            capabilities=ModelCapabilities(
+                supports_tools=True,
+                supports_structured_output=True,
+                maximum_output_tokens=16_000,
+            ),
+            gateway=GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                prices=GatewayTokenPrices(
+                    input_micro_usd_per_million_tokens=1_250_000,
+                    output_micro_usd_per_million_tokens=10_000_000,
+                    cached_input_micro_usd_per_million_tokens=125_000,
+                ),
+            ),
+        )
+        catalog = NormalizedGatewayCatalog(
+            deployments=(deployment,),
+            pools=(
+                ExactModelPool(
+                    pool_id="pool-one",
+                    exact_model_id="exact-one",
+                    deployment_ids=("deployment-one",),
+                ),
+            ),
+        )
+        digest = catalog.identity_sha256()
+        provider = _Provider(lambda: _EventStream(()))
+        service, _control, _ledger, _proof = _service(
+            provider,
+            catalog_bundle=(catalog, deployment),
+            listing_pools={("public-model", "revision-one", digest): "pool-one"},
+        )
+        transport = httpx.ASGITransport(app=create_gateway_app(service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+            listed = await client.get(
+                "/v1/models", headers={"authorization": "Bearer caller-secret"}
+            )
+            granted = await client.get(
+                "/v1/models/public-model", headers={"authorization": "Bearer caller-secret"}
+            )
+
+        expected = {
+            "id": "public-model",
+            "object": "model",
+            "created": 0,
+            "owned_by": "wmo",
+            "wmo": {"alias_revision_id": "revision-one", "catalog_sha256": digest},
+            "supports_completions": True,
+            "supports_tools": True,
+            "supports_structured_output": True,
+            "maximum_output_tokens": 16_000,
+            "pricing": {
+                "input_micro_usd_per_million_tokens": 1_250_000,
+                "output_micro_usd_per_million_tokens": 10_000_000,
+                "cached_input_micro_usd_per_million_tokens": 125_000,
+            },
+        }
+        assert listed.status_code == 200
+        assert listed.json() == {
+            "object": "list",
+            "data": [expected],
+            "wmo": {"authority_schema_version": 1},
+        }
+        assert granted.status_code == 200
+        assert granted.json() == expected
         assert len(provider.streams) == 0
 
     asyncio.run(scenario())

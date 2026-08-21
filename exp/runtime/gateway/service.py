@@ -27,6 +27,8 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.discovery import (
+    PublishedAliasMetadata,
+    listing_metadata_by_alias,
     public_model_list,
     public_model_object,
     require_granted_authority,
@@ -252,6 +254,14 @@ class GatewayService:
         return require_granted_authority(
             self._control.granted_alias_authorities(raw_key=raw_key),
             model_id,
+        )
+
+    def published_alias_metadata(
+        self, *, alias: str, revision_id: str, catalog_sha256: str
+    ) -> PublishedAliasMetadata | None:
+        """Return catalog-backed listing fields for one granted public alias."""
+        return self._routes.published_metadata(
+            alias=alias, revision_id=revision_id, catalog_sha256=catalog_sha256
         )
 
     def authenticate(self, *, raw_key: str) -> None:
@@ -656,7 +666,14 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
         try:
             raw_key = _bearer_key(authorization)
             authorities = service.model_authorities(raw_key=raw_key)
-            return JSONResponse(public_model_list(authorities))
+            return JSONResponse(
+                public_model_list(
+                    authorities,
+                    metadata_by_alias=listing_metadata_by_alias(
+                        authorities, service.published_alias_metadata
+                    ),
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
             return _exception_response(exc)
 
@@ -669,7 +686,14 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
         try:
             raw_key = _bearer_key(authorization)
             authority = service.model_authority(raw_key=raw_key, model_id=model_id)
-            return JSONResponse(public_model_object(authority))
+            return JSONResponse(
+                public_model_object(
+                    authority,
+                    metadata=listing_metadata_by_alias(
+                        (authority,), service.published_alias_metadata
+                    ).get(authority[0]),
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
             return _exception_response(exc)
 

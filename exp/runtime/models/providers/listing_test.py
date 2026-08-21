@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.discovery import SetupRole, resolve_discovered_model, served_roles
 from exp.runtime.models.providers.listing import (
     HttpProviderModelLister,
     ProviderEndpoint,
@@ -86,7 +87,133 @@ def test_openai_compatible_listing_uses_the_configured_base_url() -> None:
     )
 
     assert [model.model for model in models] == ["local-model"]
+    assert models[0].supports_completions is None
+    assert models[0].input_cost_per_million_tokens_usd is None
     assert transport.requests[0].url == "https://gateway.internal/v1/models"
+
+
+def test_openai_listing_discards_optional_entry_metadata() -> None:
+    """Official OpenAI listing stays identity-only even when extra keys are present."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [
+                    {
+                        "id": "gpt-5.1",
+                        "supports_completions": True,
+                        "supports_tools": True,
+                        "maximum_output_tokens": 16_000,
+                        "pricing": {"input_micro_usd_per_million_tokens": 1_250_000},
+                    }
+                ]
+            }
+        )
+    )
+
+    models = _lister(transport).list_models(
+        ProviderEndpoint(provider="openai", api_key="secret-key")
+    )
+
+    assert len(models) == 1
+    model = models[0]
+    assert model.model == "gpt-5.1"
+    assert model.supports_completions is None
+    assert model.supports_tools is None
+    assert model.maximum_output_tokens is None
+    assert model.input_cost_per_million_tokens_usd is None
+
+
+def test_openai_compatible_listing_reads_validated_wmo_gateway_metadata() -> None:
+    """The hosted gateway contract supplies capabilities, limits, and micro-USD prices."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [
+                    {
+                        "id": "coding",
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "wmo",
+                        "wmo": {
+                            "alias_revision_id": "revision-one",
+                            "catalog_sha256": "a" * 64,
+                        },
+                        "supports_completions": True,
+                        "supports_tools": True,
+                        "supports_structured_output": True,
+                        "maximum_output_tokens": 16_000,
+                        "pricing": {
+                            "input_micro_usd_per_million_tokens": 1_250_000,
+                            "output_micro_usd_per_million_tokens": 10_000_000,
+                            "cached_input_micro_usd_per_million_tokens": 125_000,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    models = _lister(transport).list_models(
+        ProviderEndpoint(
+            provider="openai-compatible",
+            api_key="secret-key",
+            base_url="https://gateway.internal/v1",
+        )
+    )
+
+    assert len(models) == 1
+    model = models[0]
+    assert model.model == "coding"
+    assert model.supports_completions is True
+    assert model.supports_tools is True
+    assert model.supports_structured_output is True
+    assert model.maximum_output_tokens == 16_000
+    assert model.context_window_tokens is None
+    assert model.input_cost_per_million_tokens_usd == pytest.approx(1.25)
+    assert model.output_cost_per_million_tokens_usd == pytest.approx(10.0)
+    assert model.cached_input_cost_per_million_tokens_usd == pytest.approx(0.125)
+    assert model.cache_write_cost_per_million_tokens_usd is None
+    resolved = resolve_discovered_model(model)
+    assert served_roles(resolved.capabilities) == (SetupRole.WORLD_MODEL, SetupRole.JUDGE)
+
+
+def test_openai_compatible_listing_preserves_unknowns_for_absent_or_invalid_fields() -> None:
+    """Wrong types and omitted keys stay unknown instead of being coerced or guessed."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [
+                    {
+                        "id": "local-model",
+                        "supports_tools": 1,
+                        "supports_structured_output": "true",
+                        "maximum_output_tokens": 16_000.0,
+                        "pricing": {
+                            "input_micro_usd_per_million_tokens": "1250000",
+                            "output_micro_usd_per_million_tokens": -1,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    models = _lister(transport).list_models(
+        ProviderEndpoint(
+            provider="openai-compatible",
+            api_key="secret-key",
+            base_url="https://gateway.internal/v1",
+        )
+    )
+
+    model = models[0]
+    assert model.supports_completions is None
+    assert model.supports_tools is None
+    assert model.supports_structured_output is None
+    assert model.maximum_output_tokens is None
+    assert model.input_cost_per_million_tokens_usd is None
+    assert model.output_cost_per_million_tokens_usd is None
+    assert model.cache_write_cost_per_million_tokens_usd is None
 
 
 def test_anthropic_listing_reads_identities_and_sends_version_header() -> None:

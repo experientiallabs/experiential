@@ -20,6 +20,7 @@ from exp.runtime.gateway.contracts import (
     ProjectSelection,
     ProjectTarget,
 )
+from exp.runtime.gateway.discovery import PublishedAliasMetadata, published_alias_metadata
 from exp.runtime.gateway.interfaces import ProjectTargetResolver
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -62,14 +63,18 @@ class CatalogRouteResolver:
         catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog],
         *,
         project_resolver: ProjectTargetResolver | None = None,
+        listing_pools: Mapping[tuple[str, str, str], str] | None = None,
     ) -> None:
         """Index one immutable catalog and optional learned-selection seam.
 
         Args:
             catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
             project_resolver: Optional resolver for project-backed targets.
+            listing_pools: Direct-target pool IDs keyed by granted alias, revision,
+                and catalog digest. Project aliases are omitted and stay identity-only.
         """
         self._project_resolver = project_resolver
+        self._listing_pools = dict(listing_pools or {})
         self._catalogs = _index_catalogs(catalogs)
 
     def swap_catalogs(
@@ -77,6 +82,7 @@ class CatalogRouteResolver:
         catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog],
         *,
         project_resolver: ProjectTargetResolver | None,
+        listing_pools: Mapping[tuple[str, str, str], str],
     ) -> None:
         """Atomically replace the served catalog index with one validated superset.
 
@@ -86,13 +92,49 @@ class CatalogRouteResolver:
         Args:
             catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
             project_resolver: Replacement resolver covering all retained activations.
+            listing_pools: Direct-target pool IDs keyed by granted alias, revision,
+                and catalog digest, covering the replacement generation.
 
         Raises:
             ValueError: One catalog does not match its declared digest.
         """
         indexed = _index_catalogs(catalogs)
         self._project_resolver = project_resolver
+        self._listing_pools = dict(listing_pools)
         self._catalogs = indexed
+
+    def published_metadata(
+        self,
+        *,
+        alias: str,
+        revision_id: str,
+        catalog_sha256: str,
+    ) -> PublishedAliasMetadata | None:
+        """Return catalog-backed listing fields for one granted public alias.
+
+        Lookup uses the alias revision's authoritative direct pool, never a public
+        name that happens to match a deployment or source alias. Multi-deployment
+        pools and project aliases publish nothing extra.
+
+        Args:
+            alias: Granted public alias name.
+            revision_id: Active alias revision loaded in this process.
+            catalog_sha256: Frozen catalog digest bound to that revision.
+
+        Returns:
+            Declared capability, limit, and price fields, or ``None`` when the alias
+            has no unique catalog deployment on its frozen direct target.
+        """
+        pool_id = self._listing_pools.get((alias, revision_id, catalog_sha256))
+        if pool_id is None:
+            return None
+        view = self._catalogs.get((revision_id, catalog_sha256))
+        if view is None:
+            return None
+        pool = view.pools.get(pool_id)
+        if pool is None or len(pool.deployment_ids) != 1:
+            return None
+        return published_alias_metadata(view.deployments.get(pool.deployment_ids[0]))
 
     async def resolve(
         self,
