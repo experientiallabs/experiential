@@ -112,7 +112,7 @@ def test_browser_login_accepts_matching_loopback_callback(running_login: Browser
 
 
 def test_browser_login_rejects_invalid_callbacks(running_login: BrowserLogin) -> None:
-    """Wrong state, missing key, and wrong paths cannot complete the login attempt."""
+    """Wrong state, malformed keys, missing keys, and wrong paths cannot complete the login."""
     wrong_state, _ = _request(
         f"http://127.0.0.1:{running_login.port}/callback",
         {"state": "wrong", "token": "xpl_wrong_state"},
@@ -121,12 +121,16 @@ def test_browser_login_rejects_invalid_callbacks(running_login: BrowserLogin) ->
         f"http://127.0.0.1:{running_login.port}/callback",
         {"state": running_login.state},
     )
+    malformed_token, _ = _request(
+        f"http://127.0.0.1:{running_login.port}/callback",
+        {"state": running_login.state, "token": "not-an-experiential-key"},
+    )
     wrong_path, _ = _request(
         f"http://127.0.0.1:{running_login.port}/not-callback",
         {"state": running_login.state, "token": "xpl_wrong_path"},
     )
 
-    assert (wrong_state, missing_token, wrong_path) == (400, 400, 404)
+    assert (wrong_state, missing_token, malformed_token, wrong_path) == (400, 400, 400, 404)
     assert running_login.wait(timeout=0.01) is None
 
 
@@ -163,3 +167,31 @@ def test_hosted_platform_login_receives_key_without_printing_it() -> None:
     assert token == "xpl_browser_key"
     assert token not in transcript.getvalue()
     assert "Platform login received." in transcript.getvalue()
+
+
+def test_hosted_platform_login_falls_back_when_browser_cannot_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A browserless terminal returns to masked paste instead of waiting for a callback."""
+    transcript = io.StringIO()
+    console = Console(file=transcript, force_terminal=True, no_color=True)
+    connection = ProviderConnection(
+        name="experiential-cloud",
+        provider="openai-compatible",
+        api_key_env=HOSTED_GATEWAY_API_KEY_ENV,
+        base_url=HOSTED_GATEWAY_DEFAULT_BASE_URL,
+    )
+
+    def unexpected_wait(*_args: object, **_kwargs: object) -> str | None:
+        """Fail if browser-unavailable setup waits for a callback."""
+        raise AssertionError("browser-unavailable login should not wait for a callback")
+
+    monkeypatch.setattr(BrowserLogin, "wait", unexpected_wait)
+    token = hosted_platform_login(
+        connection,
+        console=console,
+        open_browser=lambda _url: False,
+    )
+
+    assert token is None
+    assert "Open this URL to connect Experiential Cloud:" in transcript.getvalue()

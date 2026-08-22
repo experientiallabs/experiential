@@ -103,7 +103,9 @@ class BrowserLogin:
                 params = parse_qs(parsed.query)
                 token = (params.get("token") or [""])[0]
                 state = (params.get("state") or [""])[0]
-                if not token or not secrets.compare_digest(state, expected_state):
+                if not token.startswith("xpl_") or not secrets.compare_digest(
+                    state, expected_state
+                ):
                     self._respond(400, _FAILURE_PAGE)
                     return
                 try:
@@ -242,6 +244,7 @@ def hosted_platform_login(
             opened = False
         if not opened:
             console.print(f"[yellow]Open this URL to connect Experiential Cloud:[/yellow] {url}")
+            return None
         console.print("[dim]Approve the connection in your browser to continue.[/dim]")
         token = attempt.wait(timeout)
         if token is None:
