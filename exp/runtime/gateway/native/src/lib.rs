@@ -12,6 +12,7 @@ mod encode_responses;
 mod errors;
 mod events;
 mod memory;
+mod metrics;
 mod replay;
 mod server;
 mod sse;
@@ -29,8 +30,9 @@ use crate::server::ServeConfig;
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
 /// `settle`, `remember`, `models`, `model_detail`, `usage_json`,
-/// `usage_page`, and `readiness`, each taking and returning one JSON string.
-/// `config_json` carries host, port, and concurrency bounds.
+/// `usage_page`, `metrics_json`, and `readiness`, each taking and returning
+/// one JSON string. `config_json` carries host, port, and concurrency
+/// bounds.
 #[pyfunction]
 fn serve(py: Python<'_>, control_plane: Py<PyAny>, config_json: &str) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
@@ -69,6 +71,14 @@ fn encode_chat_fixture(
         );
     }
     Ok(frames)
+}
+
+/// Snapshot the process-global data-plane metrics registry as one JSON
+/// object. Python hosts compose this content-free snapshot with the control
+/// plane's own counters (see `NativeControlPlane.metrics_snapshot`).
+#[pyfunction]
+fn metrics_snapshot_json() -> String {
+    metrics::METRICS.snapshot().to_string()
 }
 
 /// Encode one normalized event fixture through the Rust Responses SSE
@@ -228,6 +238,7 @@ fn error_payload(error: &errors::PublicError) -> String {
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(serve, module)?)?;
+    module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;
     module.add_function(wrap_pyfunction!(encode_chat_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(encode_responses_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(completed_responses_fixture, module)?)?;

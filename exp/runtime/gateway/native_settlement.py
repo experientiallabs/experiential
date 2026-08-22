@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, stable_id
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -10,6 +10,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayUsage,
 )
+from exp.runtime.gateway.routing import GatewayRoute
 
 _TERMINAL_KINDS = {
     "completed": GatewayEventKind.COMPLETED,
@@ -74,3 +75,32 @@ def _optional_count(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def deployment_operation_key(route: GatewayRoute) -> str:
+    """Derive the stable per-deployment idempotency key used by dispatch.
+
+    Mirrors the executor's provider-operation identity so retried physical
+    dispatches of the same deployment reuse one caller operation.
+
+    Args:
+        route: Resolved single-deployment route.
+
+    Returns:
+        Stable content-addressed operation identity.
+    """
+    authorization = route.snapshot.authorization
+    return stable_id(
+        "gateway-provider-operation",
+        {
+            "request_id": authorization.request_id,
+            "catalog_sha256": authorization.catalog_sha256,
+            "deployment_id": route.deployment.deployment_id,
+            "connection_sha256": route.deployment.connection_sha256,
+        },
+    )
+
+
+def optional_text(value: object) -> str | None:
+    """Return one optional boundary string value or ``None``."""
+    return value if isinstance(value, str) else None

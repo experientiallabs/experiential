@@ -36,6 +36,9 @@ impl Bridge {
             .acquire()
             .await
             .map_err(|_| PublicError::internal())?;
+        // Latency is measured from permit grant so it reflects the python
+        // callback itself, not queueing behind other bridge calls.
+        let call_started = std::time::Instant::now();
         let object = Python::attach(|py| self.object.clone_ref(py));
         let outcome = tokio::task::spawn_blocking(move || {
             Python::attach(|py| -> Result<String, PublicError> {
@@ -49,6 +52,9 @@ impl Bridge {
             })
         })
         .await;
+        crate::metrics::METRICS
+            .bridge_call_ms
+            .record(call_started.elapsed());
         match outcome {
             Ok(result) => result,
             Err(_) => Err(PublicError::internal()),

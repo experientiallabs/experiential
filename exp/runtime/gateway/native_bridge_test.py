@@ -605,6 +605,92 @@ def test_readiness_reflects_startup_proof_and_executor_health(tmp_path: Path) ->
     assert control.readiness("{}") == "false"
 
 
+def test_metrics_snapshot_reports_control_plane_state_without_a_data_plane(
+    tmp_path: Path,
+) -> None:
+    """Without an injected provider the snapshot still carries bridge counters."""
+    control, raw_key = _control_plane(tmp_path)
+    _admit(control, raw_key, _chat_body())
+
+    snapshot = json.loads(control.metrics_json("{}"))
+
+    assert snapshot["data_plane"] is None
+    control_plane = snapshot["control_plane"]
+    assert control_plane["sweep_retained_settlements_replayed"] == 0
+    assert control_plane["sweep_abandoned_attempts_cancelled"] == 0
+    assert control_plane["inflight_attempts"] == 1
+    assert control_plane["reconciled_expired_requests"] == 0
+    assert control_plane["reconciled_unknown_attempts"] == 0
+    assert control_plane["accounting_healthy"] is True
+
+
+def test_metrics_snapshot_merges_the_injected_data_plane_registry(tmp_path: Path) -> None:
+    """The injected native snapshot appears verbatim under ``data_plane``."""
+    _manager, _raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(
+        components,
+        data_plane_metrics=lambda: '{"served_requests": 3}',
+    )
+
+    snapshot = control.metrics_snapshot()
+
+    assert snapshot["data_plane"] == {"served_requests": 3}
+
+
+def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) -> None:
+    """A sweep that lands a retained settlement moves the recovery counter."""
+    control, raw_key = _control_plane(tmp_path)
+    admission = _admit(control, raw_key, _chat_body())
+    settlement = json.dumps(
+        {
+            "request_id": admission["request_id"],
+            "attempt_id": admission["attempt_id"],
+            "outcome": "completed",
+            "usage": {"input_tokens": 9, "output_tokens": 4},
+            "tool_names": [],
+            "failure": None,
+        }
+    )
+    ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
+    with mock.patch.object(
+        ledger,
+        "apply_finish_attempt",
+        side_effect=RuntimeError("simulated terminal write loss"),
+    ):
+        with pytest.raises(NativeBridgeError):
+            control.settle(settlement)
+    control._sweep_expired()  # noqa: SLF001 - the timer normally drives this.
+
+    snapshot = control.metrics_snapshot()
+
+    control_plane = snapshot["control_plane"]
+    assert isinstance(control_plane, dict)
+    assert control_plane["sweep_retained_settlements_replayed"] == 1
+    assert control_plane["sweep_abandoned_attempts_cancelled"] == 0
+    assert control_plane["inflight_attempts"] == 0
+
+
+def test_metrics_snapshot_counts_a_swept_abandoned_attempt(tmp_path: Path) -> None:
+    """An abandoned admission closed by the sweep moves the cancellation counter."""
+    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
+    _admit(control, raw_key, _chat_body())
+    time.sleep(0.05)
+    with mock.patch("exp.runtime.gateway.native_bridge._SWEEP_GRACE_SECONDS", 0.0):
+        control._sweep_expired()  # noqa: SLF001 - the timer normally drives this.
+
+    snapshot = control.metrics_snapshot()
+
+    control_plane = snapshot["control_plane"]
+    assert isinstance(control_plane, dict)
+    assert control_plane["sweep_abandoned_attempts_cancelled"] == 1
+    assert control_plane["sweep_retained_settlements_replayed"] == 0
+    assert control_plane["inflight_attempts"] == 0
+
+
 def test_readiness_uses_host_lifecycle_probe_and_fails_closed(tmp_path: Path) -> None:
     """A hosted composition can add database, catalog, and drain readiness."""
     _manager, _raw_key = _configured_gateway(tmp_path)

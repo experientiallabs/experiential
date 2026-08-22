@@ -27,6 +27,7 @@ use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder
 use crate::encode_responses::{completed_responses_body, ResponsesEnvelope, ResponsesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{CompletedToolCall, Event, Usage};
+use crate::metrics::{classify_escalation, METRICS};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey, ReplayStore};
 use crate::sse::SseDecoder;
 use crate::upstream::open_stream;
@@ -109,6 +110,8 @@ impl ProxyGuard {
     /// Count one proxied request as in flight.
     fn new(counter: Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::SeqCst);
+        METRICS.record_proxied();
+        METRICS.enter_proxy();
         Self(counter)
     }
 }
@@ -116,6 +119,7 @@ impl ProxyGuard {
 impl Drop for ProxyGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+        METRICS.exit_proxy();
     }
 }
 
@@ -177,7 +181,8 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses))
         .route("/health/live", get(health_live))
-        .route("/health/ready", get(health_ready));
+        .route("/health/ready", get(health_ready))
+        .route("/metrics.json", get(metrics_json));
     let app = if config.native_usage_enabled {
         app.route("/usage.json", get(usage_json).fallback(proxy_fallback))
             .route("/usage", get(usage_page).fallback(proxy_fallback))
@@ -345,6 +350,19 @@ async fn usage_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
     }
 }
 
+/// Serve the content-free metrics snapshot. The control plane composes the
+/// data-plane registry with its own sweep counters so this body and the
+/// programmatic python snapshot are one and the same.
+async fn metrics_json(State(state): State<AppState>) -> Response {
+    match state.bridge.call("metrics_json", "{}".to_string()).await {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
+            Err(_) => error_response(&PublicError::internal()),
+        },
+        Err(error) => error_response(&error),
+    }
+}
+
 /// Replay one HTTP request against the embedded python engine and stream the
 /// response back unchanged. Serves every surface the native plane does not
 /// implement (replay-keyed requests, escalated aliases, unknown routes).
@@ -391,6 +409,7 @@ async fn proxy_to_python(
                     tokio::time::sleep(Duration::from_millis(25 << attempt)).await;
                     continue;
                 }
+                METRICS.record_fallback_unavailable();
                 return error_response(&PublicError::new(
                     502,
                     "fallback_engine_unavailable",
@@ -611,14 +630,24 @@ async fn deliver_settlement(bridge: &Bridge, argument: String) -> bool {
     for backoff_ms in [0u64, 100, 500, 2_000] {
         if backoff_ms > 0 {
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            METRICS.record_settlement_retry();
         }
         if bridge.call("settle", argument.clone()).await.is_ok() {
             return true;
         }
     }
     // The control plane keeps the in-flight entry; its sweep keeps retrying
-    // and latches readiness if the loss is durable. Leave an operator signal.
-    eprintln!("exp-gateway-native: settlement not yet durable after retries: {argument}");
+    // and latches readiness if the loss is durable. Leave an operator signal
+    // as one structured, content-free stderr line beside the counter.
+    METRICS.record_settlement_give_up();
+    let parsed: Value = serde_json::from_str(&argument).unwrap_or(Value::Null);
+    let line = json!({
+        "event": "settlement_give_up",
+        "request_id": parsed.get("request_id").cloned().unwrap_or(Value::Null),
+        "attempt_id": parsed.get("attempt_id").cloned().unwrap_or(Value::Null),
+        "outcome": parsed.get("outcome").cloned().unwrap_or(Value::Null),
+    });
+    eprintln!("exp-gateway-native: {line}");
     false
 }
 
@@ -626,25 +655,52 @@ async fn deliver_settlement(bridge: &Bridge, argument: String) -> bool {
 ///
 /// Every admitted request settles through this guard. If the owning future is
 /// dropped before an explicit settlement lands (client disconnect cancels the
-/// handler, a panic unwinds the stream task), `Drop` spawns a cancellation
-/// settlement so the ledger row and its budget reservation are always closed.
+/// handler, a panic unwinds the stream task), `Drop` spawns a settlement so
+/// the ledger row and its budget reservation are always closed: the decided
+/// settlement verbatim when delivery was cut short, a cancellation otherwise.
 struct AttemptGuard {
     bridge: Arc<Bridge>,
     request_id: String,
     attempt_id: String,
     pending: Arc<AtomicUsize>,
     armed: bool,
+    outcome_recorded: bool,
+    /// The exact settlement whose delivery is in flight. The drop backstop
+    /// re-delivers this decided settlement instead of a cancellation, so a
+    /// task cancelled mid-write can neither downgrade the ledger outcome nor
+    /// diverge from the recorded metric.
+    decided_settlement: Option<String>,
+    started: Instant,
 }
 
 impl AttemptGuard {
-    fn new(state: &AppState, request_id: String, attempt_id: String) -> Self {
+    fn new(state: &AppState, request_id: String, attempt_id: String, started: Instant) -> Self {
+        METRICS.record_served();
+        METRICS.enter_request();
         Self {
             bridge: state.bridge.clone(),
             request_id,
             attempt_id,
             pending: state.pending_settlements.clone(),
             armed: true,
+            outcome_recorded: false,
+            decided_settlement: None,
+            started,
         }
+    }
+
+    /// Record this attempt's terminal outcome and duration exactly once, at
+    /// the moment the outcome is decided. Recording happens before delivery
+    /// is awaited, so a task cancelled mid-write cannot re-report a decided
+    /// outcome as a cancellation.
+    fn record_terminal(&mut self, outcome: &str, cancelled: bool) {
+        if self.outcome_recorded {
+            return;
+        }
+        self.outcome_recorded = true;
+        METRICS.record_outcome(outcome, cancelled);
+        METRICS.request_duration_ms.record(self.started.elapsed());
+        METRICS.exit_request();
     }
 
     /// Durably settle this attempt; disarms the drop backstop afterwards.
@@ -664,8 +720,13 @@ impl AttemptGuard {
             tool_names,
             failure,
         );
+        let cancelled =
+            failure.map(|failure| failure.failure_class == FailureClass::Cancelled) == Some(true);
+        self.record_terminal(outcome, cancelled);
+        self.decided_settlement = Some(argument.clone());
         let delivered = deliver_settlement(&self.bridge, argument).await;
         self.armed = false;
+        self.decided_settlement = None;
         delivered
     }
 
@@ -688,6 +749,27 @@ impl Drop for AttemptGuard {
         if !self.armed {
             return;
         }
+        // A settlement already decided (its delivery was cut short by the
+        // cancellation) is re-delivered verbatim, matching the control
+        // plane's own never-downgrade sweep semantics; only an attempt with
+        // no decided outcome settles as cancelled.
+        let argument = match self.decided_settlement.take() {
+            Some(argument) => argument,
+            None => {
+                self.record_terminal("failed", true);
+                settle_argument(
+                    &self.request_id,
+                    &self.attempt_id,
+                    "failed",
+                    None,
+                    &[],
+                    Some(&Failure::new(
+                        FailureClass::Cancelled,
+                        "gateway request was cancelled",
+                    )),
+                )
+            }
+        };
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // Runtime teardown; startup reconciliation closes the row.
             return;
@@ -695,17 +777,6 @@ impl Drop for AttemptGuard {
         let bridge = self.bridge.clone();
         let pending = self.pending.clone();
         pending.fetch_add(1, Ordering::SeqCst);
-        let argument = settle_argument(
-            &self.request_id,
-            &self.attempt_id,
-            "failed",
-            None,
-            &[],
-            Some(&Failure::new(
-                FailureClass::Cancelled,
-                "gateway request was cancelled",
-            )),
-        );
         handle.spawn(async move {
             deliver_settlement(&bridge, argument).await;
             pending.fetch_sub(1, Ordering::SeqCst);
@@ -762,7 +833,8 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
             Ok(value) => value,
             Err(_) => return error_response(&PublicError::internal()),
         };
-        if scope_value.get("escalate").is_some() {
+        if let Some(reason) = scope_value.get("escalate") {
+            METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
             // No replay claim exists; the python engine owns this request
             // end to end, including its own replay store.
             return proxy_to_python(
@@ -814,7 +886,8 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
         Ok(value) => value,
         Err(_) => return error_response(&PublicError::internal()),
     };
-    if admission_value.get("escalate").is_some() {
+    if let Some(reason) = admission_value.get("escalate") {
+        METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
         // No ledger row exists; the python engine owns this request end to end.
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
@@ -844,7 +917,7 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
                 .unwrap_or_default()
                 .to_string();
             if !request_id.is_empty() && !attempt_id.is_empty() {
-                let mut guard = AttemptGuard::new(&state, request_id, attempt_id);
+                let mut guard = AttemptGuard::new(&state, request_id, attempt_id, started);
                 guard
                     .settle(
                         "failed",
@@ -864,6 +937,7 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
         &state,
         admission.request_id.clone(),
         admission.attempt_id.clone(),
+        started,
     );
     // The replay key was authorized independently of admission. If an alias
     // activation landed between the two, the admitted work belongs to a newer
@@ -923,10 +997,14 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
     // The bounded active-dispatch permit is awaited after admission, like the
     // python executor: protocol and authority errors answer immediately even
     // at capacity, and a queue-deadline expiry settles the started attempt.
+    let permit_wait_started = Instant::now();
     let permit =
         match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await
         {
-            Ok(Ok(permit)) => permit,
+            Ok(Ok(permit)) => {
+                METRICS.permit_wait_ms.record(permit_wait_started.elapsed());
+                permit
+            }
             Ok(Err(_)) => {
                 guard
                     .settle(
@@ -976,6 +1054,7 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
                     && transport.retryable_same_deployment
                     && !remaining(deadline).is_zero()
                 {
+                    METRICS.record_open_retry();
                     continue;
                 }
                 let failure = transport.failure;
@@ -1088,12 +1167,14 @@ fn collection_public_error(failure: &Failure) -> PublicError {
     failure.public_error()
 }
 
-/// Drain one upstream SSE response into normalized events.
+/// Drain one upstream SSE response into normalized events. `request_started`
+/// anchors the time-to-first-byte observation at the first upstream chunk.
 async fn collect_events(
     response: reqwest::Response,
     dialect: Dialect,
     deadline: Instant,
     phase_timeout: Duration,
+    request_started: Instant,
 ) -> Result<Vec<Event>, Failure> {
     let mut normalizer = Normalizer::new(dialect);
     let mut decoder = SseDecoder::new();
@@ -1111,6 +1192,7 @@ async fn collect_events(
         Ok(())
     };
     let mut byte_stream = response.bytes_stream();
+    let mut first_byte_recorded = false;
     loop {
         let bound = remaining(deadline).min(phase_timeout);
         let chunk = match tokio::time::timeout(bound, byte_stream.next()).await {
@@ -1124,6 +1206,12 @@ async fn collect_events(
             Ok(None) => break,
             Err(_) => return Err(stream_timeout_failure(deadline)),
         };
+        if !first_byte_recorded {
+            METRICS
+                .time_to_first_byte_ms
+                .record(request_started.elapsed());
+            first_byte_recorded = true;
+        }
         let frames = decoder
             .feed(&chunk)
             .map_err(|message| Failure::new(FailureClass::MalformedResponse, &message))?;
@@ -1168,18 +1256,19 @@ async fn completed_response(
     client_request_id: Option<String>,
 ) -> Response {
     let _permit = permit;
-    let events = match collect_events(response, dialect, deadline, phase_timeout).await {
-        Ok(events) => events,
-        Err(failure) => {
-            let failure = failure.boundary();
-            let error = collection_public_error(&failure);
-            guard.settle("failed", None, &[], Some(&failure)).await;
-            if let Some(mut owner) = lease.take() {
-                owner.abandon().await;
+    let events =
+        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
+            Ok(events) => events,
+            Err(failure) => {
+                let failure = failure.boundary();
+                let error = collection_public_error(&failure);
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
+                return error_response(&error);
             }
-            return error_response(&error);
-        }
-    };
+        };
     let aggregated =
         match completed_chat_body(&admission.request_id, &admission.alias, created_at, &events) {
             Ok(aggregated) => aggregated,
@@ -1344,6 +1433,7 @@ async fn stream_response(
         }
 
         let mut byte_stream = response.bytes_stream();
+        let mut first_byte_recorded = false;
         'outer: loop {
             let bound = remaining(deadline).min(phase_timeout);
             let chunk = match tokio::time::timeout(bound, byte_stream.next()).await {
@@ -1357,6 +1447,12 @@ async fn stream_response(
                 Ok(None) => break 'outer,
                 Err(_) => fail_stream!(stream_timeout_failure(deadline)),
             };
+            if !first_byte_recorded {
+                METRICS
+                    .time_to_first_byte_ms
+                    .record(guard.started.elapsed());
+                first_byte_recorded = true;
+            }
             let frames = match decoder.feed(&chunk) {
                 Ok(frames) => frames,
                 Err(message) => {
@@ -1658,7 +1754,7 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
                 .unwrap_or_default()
                 .to_string();
             if !request_id.is_empty() && !attempt_id.is_empty() {
-                let mut guard = AttemptGuard::new(&state, request_id, attempt_id);
+                let mut guard = AttemptGuard::new(&state, request_id, attempt_id, started);
                 guard
                     .settle(
                         "failed",
@@ -1678,6 +1774,7 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
         &state,
         admission.request_id.clone(),
         admission.attempt_id.clone(),
+        started,
     );
 
     let dialect = match Dialect::from_str(&admission.dialect) {
@@ -1899,15 +1996,16 @@ async fn completed_responses(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let _permit = permit;
-    let events = match collect_events(response, dialect, deadline, phase_timeout).await {
-        Ok(events) => events,
-        Err(failure) => {
-            let failure = failure.boundary();
-            let error = collection_public_error(&failure);
-            guard.settle("failed", None, &[], Some(&failure)).await;
-            return error_response(&error);
-        }
-    };
+    let events =
+        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
+            Ok(events) => events,
+            Err(failure) => {
+                let failure = failure.boundary();
+                let error = collection_public_error(&failure);
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                return error_response(&error);
+            }
+        };
     let envelope = admission.envelope.clone().unwrap_or_default();
     let aggregated = match completed_responses_body(
         &admission.request_id,
