@@ -1,0 +1,38 @@
+name: gateway latency
+
+# Mock-isolated gateway overhead report. No paid providers and no secrets.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: exp/runtime/gateway/native
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
+      - name: Measure gateway-added latency against a local mock
+        env:
+          EXP_TELEMETRY: "0"
+        run: >-
+          uv run python -m exp.runtime.gateway.latency_report
+          --output-json gateway-latency.json
+          --github-summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload the versioned latency report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-latency-report
+          path: gateway-latency.json
+          if-no-files-found: warn
