@@ -1616,3 +1616,47 @@ def test_first_token_time_is_absent_when_no_token_is_streamed() -> None:
     asyncio.run(consume())
 
     assert ledger.first_token_ats == [None]
+
+
+def test_buffered_refusal_stamps_first_token_at_receipt_not_commit() -> None:
+    """A buffered refusal that fails over records first-token at receipt, never null."""
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    first_events = (
+        GatewayEvent(kind=GatewayEventKind.REFUSAL_DELTA, sequence_number=0, text_delta="no"),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+    )
+    ledger = _WaterfallLedger()
+    catalog = cast(
+        RuntimeModelCatalog,
+        _WaterfallRuntimeCatalog(
+            (first, second),
+            {
+                first.source_alias: _ScriptedProvider([_WaterfallStream(first_events)]),
+                second.source_alias: _ScriptedProvider([_completed_stream("fallback")]),
+            },
+        ),
+    )
+    stamped = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    executor = GatewayExecutor(
+        {("revision-one", _DIGEST): catalog},
+        ledger,
+        maximum_same_deployment_attempts=1,
+        clock=_FixedClock(stamped),
+    )
+
+    async def consume() -> list[GatewayEvent]:
+        """Run one refusal-failover request and collect its outward events."""
+        stream = await executor.start(
+            route=_route((first, second), refusal_failover=True),
+            request=_request(),
+        )
+        return [event async for event in stream]
+
+    events = asyncio.run(consume())
+
+    assert any(event.text_delta == "fallback" for event in events)
+    # The refused first attempt stamps first-token when the withheld refusal delta is
+    # received (not when the buffer later commits or fails over), so it is never null.
+    assert ledger.first_token_ats[0] == stamped
+    assert ledger.first_token_ats[-1] == stamped

@@ -239,6 +239,8 @@ class GatewayExecutionStream:
                 and self._refusal_failover
                 and not self._committed
             ):
+                if current.first_token_at is None:
+                    current.first_token_at = self._clock.now()
                 event_bytes = len((event.text_delta or "").encode("utf-8"))
                 if (
                     current.withheld_refusal_bytes + event_bytes > _MAX_WITHHELD_REFUSAL_BYTES
@@ -666,8 +668,6 @@ class GatewayExecutionStream:
             current: Physical attempt holding in-memory refusal deltas.
             *following: Semantic or terminal events that arrived after the refusal.
         """
-        if current.first_token_at is None:
-            current.first_token_at = self._clock.now()
         self._committed = True
         current.visible_refusal = True
         self._pending_outward.extend(current.withheld_refusals)
