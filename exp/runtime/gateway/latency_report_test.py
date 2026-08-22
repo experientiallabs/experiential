@@ -302,6 +302,6 @@ def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
     assert report.representative_run.experiential_ttft is not None
     assert report.representative_run.experiential_ttft.failures == 0
     assert report.representative_run.litellm is None
-    assert report.runner.gateway_engine in {"rust", "python"}
+    assert report.runner.gateway_engine in {"rust", "python", "unknown"}
     assert "raw_key" not in payload
     assert "EXP_LATENCY_MOCK_KEY" not in json.dumps(payload)

@@ -39,3 +39,8 @@ def test_wait_for_engine_receipt_covers_pump_race() -> None:
 
     threading.Thread(target=_append_receipt, daemon=True).start()
     assert _wait_for_engine_receipt(lines, timeout_s=1.0) == "rust"
+
+
+def test_wait_for_engine_receipt_keeps_unknown_without_a_receipt() -> None:
+    """A timeout with no receipt does not guess python."""
+    assert _wait_for_engine_receipt([], timeout_s=0.05) == "unknown"

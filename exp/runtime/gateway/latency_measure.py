@@ -627,7 +627,8 @@ def _wait_for_engine_receipt(lines: list[str], *, timeout_s: float = 2.0) -> str
         timeout_s: Bound for waiting on the receipt after readiness.
 
     Returns:
-        ``rust`` or ``python``. Defaults to ``python`` only after the timeout.
+        ``rust`` or ``python`` when a ready receipt is pumped, otherwise
+        ``unknown``. An unobserved receipt is never guessed as python.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -635,7 +636,7 @@ def _wait_for_engine_receipt(lines: list[str], *, timeout_s: float = 2.0) -> str
         if engine is not None:
             return engine
         time.sleep(0.02)
-    return _engine_from_output(lines) or "python"
+    return _engine_from_output(lines) or "unknown"
 
 
 def _engine_from_output(lines: list[str]) -> str | None:
