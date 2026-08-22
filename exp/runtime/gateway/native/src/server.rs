@@ -309,9 +309,18 @@ async fn settle(
     failure: Option<&Failure>,
 ) {
     let argument = settle_argument(admission, outcome, usage, tool_names, failure);
-    // A settlement failure latches accounting-unhealthy inside the control
-    // plane itself; the data plane has nothing further to do with the error.
-    let _ = bridge.call("settle", argument).await;
+    // The control plane keeps the in-flight entry on a failed terminal write,
+    // so a transient ledger failure is retried here with bounded backoff; a
+    // persistent failure stays latched as accounting-unhealthy control-plane
+    // side and is left for restart reconciliation.
+    for backoff_ms in [0u64, 100, 500, 2_000] {
+        if backoff_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+        if bridge.call("settle", argument.clone()).await.is_ok() {
+            return;
+        }
+    }
 }
 
 async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -480,7 +489,8 @@ fn event_retained_bytes(event: &Event) -> usize {
     match event {
         Event::TextDelta(text) | Event::RefusalDelta(text) => text.len(),
         Event::ToolArgumentsDelta { delta, .. } => delta.len(),
-        Event::ToolCallCompleted { call, .. } => call.raw_arguments.len(),
+        // Completed-call bytes were already charged as argument deltas.
+        Event::ToolCallCompleted { .. } => 64,
         _ => 64,
     }
 }
