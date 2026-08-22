@@ -730,9 +730,7 @@ def test_editing_a_stored_credential_can_keep_it(
     """Keeping a stored key reuses it without asking the operator to paste again."""
     monkeypatch.setattr(provider_picker, "getpass", _forbid_getpass)
     store = _persist_openai_key("stored-secret")
-    existing = (
-        ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),
-    )
+    existing = (ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),)
     console = ScriptedConsole("1\n")
     lister = _FakeLister({"openai": [(_LUNA,)]})
 
@@ -772,9 +770,7 @@ def test_editing_a_stored_credential_can_replace_it(
 
     monkeypatch.setattr(provider_picker, "getpass", _fake_getpass)
     store = _persist_openai_key("stored-secret")
-    existing = (
-        ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),
-    )
+    existing = (ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),)
     console = ScriptedConsole("2\n")
     lister = _FakeLister({"openai": [(_LUNA,)]})
 
@@ -801,9 +797,7 @@ def test_editing_a_stored_credential_can_remove_it_and_use_env(
     """Removing a stored key deletes only that record and then uses a non-empty env override."""
     monkeypatch.setattr(provider_picker, "getpass", _forbid_getpass)
     store = _persist_openai_key("stored-secret")
-    existing = (
-        ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),
-    )
+    existing = (ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),)
     console = ScriptedConsole("3\n")
     lister = _FakeLister({"openai": [(_LUNA,)]})
 
@@ -842,9 +836,7 @@ def test_editing_a_stored_credential_can_remove_it_and_paste_again(
 
     monkeypatch.setattr(provider_picker, "getpass", _fake_getpass)
     store = _persist_openai_key("stored-secret")
-    existing = (
-        ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),
-    )
+    existing = (ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),)
     console = ScriptedConsole("3\n")
     lister = _FakeLister({"openai": [(_LUNA,)]})
 
