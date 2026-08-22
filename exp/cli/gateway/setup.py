@@ -46,7 +46,7 @@ from exp.runtime.models.providers import HttpProviderModelLister, ProviderModelL
 
 @dataclass(frozen=True)
 class InteractiveSetupResult:
-    """Explicit resources created by one accepted first-run summary."""
+    """Explicit resources created or reconfigured by one accepted setup summary."""
 
     identity_id: str
     alias: str
@@ -68,14 +68,17 @@ def interactive_gateway_setup(
     console: Console | None = None,
     lister: ProviderModelLister | None = None,
     environment: MutableMapping[str, str] | None = None,
+    allow_reconfigure: bool = False,
 ) -> InteractiveSetupResult:
-    """Collect and create one minimal provider-backed singleton gateway.
+    """Collect and create or reconfigure one minimal provider-backed gateway.
 
     Args:
-        root: Empty EXP root selected by the operator.
+        root: EXP root selected by the operator.
         console: Optional terminal override used by tests and embedding callers.
         lister: Optional authenticated model-listing seam used by tests.
         environment: Environment consulted for provider credentials.
+        allow_reconfigure: Whether the caller has explicitly confirmed replacing the selected
+            provider and alias revisions in an existing gateway.
 
     Returns:
         Created identity, alias, and one-time key material.
@@ -85,7 +88,8 @@ def interactive_gateway_setup(
         ValueError: Existing state or incomplete metadata prevents safe setup.
     """
     manager = GatewayManagement(root)
-    if manager.initialized:
+    reconfigure = manager.initialized
+    if reconfigure and not allow_reconfigure:
         raise ValueError("interactive first-run setup requires an uninitialized gateway")
     console = console or Console(theme=EXP_THEME)
     environment = os.environ if environment is None else environment
@@ -125,6 +129,8 @@ def interactive_gateway_setup(
     except (EOFError, KeyboardInterrupt, SetupCancelled):
         raise typer.Abort from None
 
+    _validate_setup_identity(manager, identity_id=values.identity_id)
+
     selected = model_selection.model
     capabilities = selected.capabilities or ModelCapabilities()
     if model_selection.reasoning_effort is not None:
@@ -159,6 +165,7 @@ def interactive_gateway_setup(
             manager.upsert_provider_connection(
                 connection_id=endpoint.connection.name,
                 config=endpoint.connection.catalog_config(),
+                replace=reconfigure,
             )
             advance(f"connect {endpoint.connection.name}")
         serving_connections = {
@@ -175,7 +182,7 @@ def interactive_gateway_setup(
             gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             prices=GatewayTokenPrices(),
             pricing_source=None,
-            replace=False,
+            replace=reconfigure,
             serving_connections=serving_connections,
         )
         advance("write catalog")
@@ -191,8 +198,10 @@ def interactive_gateway_setup(
             provider_connections=manager.provider_bindings(authored),
         )
         advance("activate alias")
-        manager.create_identity(identity_id=values.identity_id, display_name=values.identity_id)
-        advance("create identity")
+        if _ensure_setup_identity(manager, identity_id=values.identity_id):
+            advance("create identity")
+        else:
+            advance("reuse identity")
         manager.add_grant(identity_id=values.identity_id, alias_id=values.alias)
         advance("grant alias")
         issued = manager.issue_key(
@@ -206,6 +215,39 @@ def interactive_gateway_setup(
         alias=values.alias,
         raw_key=issued.raw_key,
     )
+
+
+def _validate_setup_identity(manager: GatewayManagement, *, identity_id: str) -> None:
+    """Reject a reconfiguration that would target a disabled existing identity.
+
+    Args:
+        manager: Initialized gateway authority being configured.
+        identity_id: Identity selected by the operator.
+
+    Raises:
+        ValueError: The selected identity exists but is disabled.
+    """
+    for identity in manager.identities():
+        if identity.identity_id == identity_id and not identity.active:
+            raise ValueError(
+                f"identity {identity_id!r} is disabled; choose an active identity for setup"
+            )
+
+
+def _ensure_setup_identity(manager: GatewayManagement, *, identity_id: str) -> bool:
+    """Create a new setup identity or reuse an active one already in the gateway.
+
+    Args:
+        manager: Initialized gateway authority being configured.
+        identity_id: Identity selected by the operator.
+
+    Returns:
+        True when a new identity was created, or False when an existing identity was reused.
+    """
+    if any(identity.identity_id == identity_id for identity in manager.identities()):
+        return False
+    manager.create_identity(identity_id=identity_id, display_name=identity_id)
+    return True
 
 
 def _collect_gateway_values(

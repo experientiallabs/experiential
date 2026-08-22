@@ -40,7 +40,9 @@ The default and project gateway forms use one gateway lifecycle. It binds only `
 provider call, and requires an explicit provider environment reference, exact model alias, identity,
 grant, and a virtual key. Interactive first-run setup can persist multiple provider connections and
 creates one initial gateway alias; additional deployments and certified pools remain explicit
-gateway configuration. `exp --non-interactive --json` returns `gateway_not_initialized` plus exact
+gateway configuration. From the interactive home screen, `Setup Gateway` also offers a confirmation-gated
+reconfiguration path for an initialized gateway: it replaces the selected provider and alias revisions
+while preserving existing identities, keys, grants, usage, and history. `exp --non-interactive --json` returns `gateway_not_initialized` plus exact
 next commands on an empty root. `exp --check` validates local readiness without binding.
 First-run setup prints `EXP_GATEWAY_URL` and the newly issued `EXP_GATEWAY_KEY` before readiness is
 checked, so the credentials remain available even when a provider route is not ready. The gateway-
