@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import typer
@@ -162,9 +163,15 @@ def test_engine_rust_without_the_extension_is_an_actionable_error(tmp_path: Path
     """An explicit rust engine without the built extension names the build step."""
     import importlib.util
 
-    if importlib.util.find_spec("exp_gateway_native") is not None:
-        pytest.skip("extension is built in this environment")
-    result = CliRunner().invoke(app, ["run", "--root", str(tmp_path), "--engine", "rust"])
+    real_find_spec = importlib.util.find_spec
+
+    def missing_extension(name: str, package: str | None = None) -> object | None:
+        if name == "exp_gateway_native":
+            return None
+        return real_find_spec(name, package)
+
+    with mock.patch.object(importlib.util, "find_spec", side_effect=missing_extension):
+        result = CliRunner().invoke(app, ["run", "--root", str(tmp_path), "--engine", "rust"])
     assert result.exit_code == 2
     assert "exp_gateway_native" in result.output
 

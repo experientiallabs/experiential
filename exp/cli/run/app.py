@@ -59,8 +59,9 @@ _ENGINE_OPTION = typer.Option(
         "replay, and project aliases), or 'python' (uvicorn only)."
     ),
 )
+_MAX_ACTIVE_REQUESTS_DEFAULT = 1024
 _MAX_ACTIVE_REQUESTS_OPTION = typer.Option(
-    1024,
+    _MAX_ACTIVE_REQUESTS_DEFAULT,
     "--max-active-requests",
     min=1,
     help="Rust engine only: maximum concurrently admitted requests.",
@@ -129,6 +130,12 @@ def run(
             raise typer.BadParameter(blocker)
         if not json_output:
             _console.print(f"[yellow]rust engine unavailable ({blocker}); using python[/yellow]")
+    if max_active_requests != _MAX_ACTIVE_REQUESTS_DEFAULT:
+        typer.echo(
+            "--max-active-requests applies only to the rust engine; the python "
+            "engine keeps its own executor bound",
+            err=True,
+        )
     _run_gateway(
         project=project,
         root=root,
@@ -408,7 +415,10 @@ def _run_rust_gateway(
                         "graceful_timeout_seconds": graceful_timeout,
                     }
                 )
-                exp_gateway_native.serve(control_plane, config)
+                try:
+                    exp_gateway_native.serve(control_plane, config)
+                except RuntimeError as exc:
+                    raise typer.BadParameter(f"the gateway engine failed: {exc}") from exc
             finally:
                 fallback.should_exit = True
                 fallback_thread.join(timeout=graceful_timeout + 5)

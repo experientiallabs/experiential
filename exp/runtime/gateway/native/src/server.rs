@@ -27,7 +27,7 @@ use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::sse::SseDecoder;
-use crate::upstream::{completion_timeout_seconds, open_stream};
+use crate::upstream::open_stream;
 
 /// Largest accepted request body on every native-served or proxied route.
 /// Bounded so one client cannot hold unbounded gateway memory; far above any
@@ -90,8 +90,6 @@ struct Admission {
     alias_revision_id: String,
     stream: bool,
     include_usage: bool,
-    #[serde(default)]
-    maximum_output_tokens: Option<u64>,
     dialect: String,
     url: String,
     headers: HashMap<String, String>,
@@ -566,23 +564,6 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
         Err(_) => return error_response(&PublicError::invalid_json()),
     };
 
-    // Logical admission mirrors the executor's bounded active-request permit.
-    let permit =
-        match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return error_response(&PublicError::draining()),
-            Err(_) => {
-                return error_response(
-                    &Failure::new(
-                        FailureClass::Timeout,
-                        "gateway execution queue deadline exceeded",
-                    )
-                    .public_error(),
-                )
-            }
-        };
-
     let admit_argument = compact_json(&json!({"raw_key": raw_key, "body": body_text}));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
@@ -594,7 +575,6 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
     };
     if admission_value.get("escalate").is_some() {
         // No ledger row exists; the python engine owns this request end to end.
-        drop(permit);
         return proxy_to_python(
             &state,
             reqwest::Method::POST,
@@ -660,10 +640,42 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
         }
     };
 
-    let phase_timeout = Duration::from_secs_f64(completion_timeout_seconds(
-        admission.timeout_seconds,
-        admission.maximum_output_tokens,
-    ));
+    // The connection's raw timeout bounds each transport phase (open, then
+    // every chunk read), exactly like the python streaming path.
+    let phase_timeout = Duration::from_secs_f64(admission.timeout_seconds.max(0.001));
+
+    // The bounded active-dispatch permit is awaited after admission, like the
+    // python executor: protocol and authority errors answer immediately even
+    // at capacity, and a queue-deadline expiry settles the started attempt.
+    let permit =
+        match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                guard
+                    .settle(
+                        "failed",
+                        None,
+                        &[],
+                        Some(&Failure::new(
+                            FailureClass::Cancelled,
+                            "gateway is draining and is not accepting new requests",
+                        )),
+                    )
+                    .await;
+                return error_response(&PublicError::draining());
+            }
+            Err(_) => {
+                let failure = Failure::new(
+                    FailureClass::Timeout,
+                    "gateway execution queue deadline exceeded",
+                );
+                let error = failure.public_error();
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                return error_response(&error);
+            }
+        };
+
     // One bounded same-deployment retry at the open phase, mirroring the
     // python executor's retry policy before any byte reaches the client.
     let mut response = None;

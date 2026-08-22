@@ -391,7 +391,6 @@ class NativeControlPlane:
             "alias_revision_id": authorization.alias_revision_id,
             "stream": request.stream,
             "include_usage": request.include_usage,
-            "maximum_output_tokens": request.maximum_output_tokens,
             "exact_model_id": route.snapshot.exact_model_id,
             "provider": route.deployment.provider,
             "deployment_id": route.deployment.deployment_id,

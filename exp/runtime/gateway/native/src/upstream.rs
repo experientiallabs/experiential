@@ -7,26 +7,6 @@ use serde_json::Value;
 
 use crate::errors::{Failure, FailureClass};
 
-/// Per-token completion allowance mirroring
-/// `providers.base.COMPLETION_SECONDS_PER_OUTPUT_TOKEN`.
-const COMPLETION_SECONDS_PER_OUTPUT_TOKEN: f64 = 0.03;
-const MAXIMUM_COMPLETION_TIMEOUT_SECONDS: f64 = 600.0;
-
-/// Derive one bounded completion timeout, mirroring
-/// `providers.base.completion_timeout_seconds`.
-pub fn completion_timeout_seconds(
-    configured_timeout_seconds: f64,
-    maximum_output_tokens: Option<u64>,
-) -> f64 {
-    match maximum_output_tokens {
-        None => configured_timeout_seconds,
-        Some(tokens) => {
-            let scaled = tokens as f64 * COMPLETION_SECONDS_PER_OUTPUT_TOKEN;
-            configured_timeout_seconds.max(scaled.min(MAXIMUM_COMPLETION_TIMEOUT_SECONDS))
-        }
-    }
-}
-
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a
 /// provider 3xx can never re-send credentials to an attacker-chosen location.

@@ -92,6 +92,17 @@ impl ToolAccumulator {
 
     pub fn complete(&self) -> Result<CompletedToolCall, String> {
         require_json_object_text(&self.raw_arguments)?;
+        // Mirror the python ToolCall model constraints so both engines accept
+        // exactly the same provider tool-call streams (a call the python
+        // engine rejects must not become client-visible history here).
+        if self.call_id.is_empty()
+            || self.call_id.chars().count() > 256
+            || self.name.is_empty()
+            || self.name.chars().count() > 256
+            || self.raw_arguments.chars().count() > 4_000_000
+        {
+            return Err("streamed tool call is incomplete".to_string());
+        }
         Ok(CompletedToolCall {
             call_id: self.call_id.clone(),
             name: self.name.clone(),
