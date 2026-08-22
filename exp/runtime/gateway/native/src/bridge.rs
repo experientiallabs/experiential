@@ -36,9 +36,9 @@ impl Bridge {
             .acquire()
             .await
             .map_err(|_| PublicError::internal())?;
-        let object = Python::with_gil(|py| self.object.clone_ref(py));
+        let object = Python::attach(|py| self.object.clone_ref(py));
         let outcome = tokio::task::spawn_blocking(move || {
-            Python::with_gil(|py| -> Result<String, PublicError> {
+            Python::attach(|py| -> Result<String, PublicError> {
                 let bound = object.bind(py);
                 match bound.call_method1(method, (argument,)) {
                     Ok(result) => result

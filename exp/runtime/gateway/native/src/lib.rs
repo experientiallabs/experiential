@@ -33,7 +33,7 @@ fn serve(py: Python<'_>, control_plane: Py<PyAny>, config_json: &str) -> PyResul
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
     let bridge = Arc::new(Bridge::new(control_plane, config.callback_permits));
-    let outcome = py.allow_threads(move || {
+    let outcome = py.detach(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
