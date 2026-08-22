@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -61,9 +62,44 @@ def _chat_body(*, model: str = "coding", stream: bool = False) -> str:
     return json.dumps(payload)
 
 
-def _admit(control: NativeControlPlane, raw_key: str, body: str) -> JsonObject:
+def _admit(
+    control: NativeControlPlane,
+    raw_key: str,
+    body: str,
+    *,
+    idempotency_key: str | None = None,
+    client_request_id: str | None = None,
+) -> JsonObject:
     """Run one admission call and decode its JSON response."""
-    return json.loads(control.admit(json.dumps({"raw_key": raw_key, "body": body})))
+    argument = json.dumps(
+        {
+            "raw_key": raw_key,
+            "body": body,
+            "idempotency_key": idempotency_key,
+            "client_request_id": client_request_id,
+        }
+    )
+    return json.loads(control.admit(argument))
+
+
+def _claim_scope(
+    control: NativeControlPlane,
+    raw_key: str,
+    body: str,
+    *,
+    idempotency_key: str | None = None,
+    client_request_id: str | None = None,
+) -> JsonObject:
+    """Run one replay-scope call and decode its JSON response."""
+    argument = json.dumps(
+        {
+            "raw_key": raw_key,
+            "body": body,
+            "idempotency_key": idempotency_key,
+            "client_request_id": client_request_id,
+        }
+    )
+    return json.loads(control.claim_scope(argument))
 
 
 def test_bridge_error_payload_is_openai_shaped() -> None:
@@ -309,8 +345,102 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
     admission = _admit(control, raw_key, _chat_body(model="gem"))
     assert "escalate" in admission
     assert "request_id" not in admission
+    scope = _claim_scope(control, raw_key, _chat_body(model="gem"), idempotency_key="op-1")
+    assert "escalate" in scope
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 0
+
+
+def test_claim_scope_matches_the_python_replay_key(tmp_path: Path) -> None:
+    """The scope carries the same hashed caller operation and canonical digest
+    the python engine computes for its replay key."""
+    control, raw_key = _control_plane(tmp_path)
+    scope = _claim_scope(control, raw_key, _chat_body(), idempotency_key="operation-one")
+    assert scope["surface"] == "chat_completions"
+    assert scope["caller_operation_sha256"] == hashlib.sha256(b"operation-one").hexdigest()
+    repeat = _claim_scope(control, raw_key, _chat_body(), idempotency_key="operation-one")
+    assert repeat == scope
+    # The caller operation hashes identically through either header; the
+    # canonical request digest covers the decoded request, which records
+    # which header carried it, exactly as the python engine canonicalizes.
+    via_client_id = _claim_scope(
+        control,
+        raw_key,
+        _chat_body(),
+        client_request_id="operation-one",
+    )
+    assert via_client_id["caller_operation_sha256"] == scope["caller_operation_sha256"]
+    different_body = _claim_scope(
+        control,
+        raw_key,
+        _chat_body(stream=True),
+        idempotency_key="operation-two",
+    )
+    assert different_body["canonical_request_sha256"] != scope["canonical_request_sha256"]
+    decoded = decode_chat(json.loads(_chat_body()), idempotency_key="operation-one")
+    assert decoded.request.idempotency_key == "operation-one"
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 0
+
+
+def test_claim_scope_validates_headers_with_python_parity(tmp_path: Path) -> None:
+    """Header validation failures map to the exact shared protocol errors."""
+    control, raw_key = _control_plane(tmp_path)
+    for bad_value in ("", "x" * 513, "line\nbreak"):
+        with pytest.raises(NativeBridgeError) as invalid:
+            _claim_scope(control, raw_key, _chat_body(), idempotency_key=bad_value)
+        payload = json.loads(invalid.value.public_error_json)
+        assert payload["status_code"] == 400
+        with pytest.raises(OpenAIProtocolError) as expected:
+            decode_chat(json.loads(_chat_body()), idempotency_key=bad_value)
+        assert payload["code"] == expected.value.detail.code
+        assert payload["message"] == expected.value.detail.message
+    with pytest.raises(NativeBridgeError) as mismatch:
+        _claim_scope(
+            control,
+            raw_key,
+            _chat_body(),
+            idempotency_key="one",
+            client_request_id="two",
+        )
+    payload = json.loads(mismatch.value.public_error_json)
+    assert payload["status_code"] == 400
+    assert payload["code"] == "idempotency_conflict"
+
+
+def test_keyed_admissions_enforce_the_durable_ledger_idempotency_rows(
+    tmp_path: Path,
+) -> None:
+    """With the process-local replay store empty (as after a restart), the
+    durable ledger fails a repeated caller operation closed exactly as the
+    python engine does: a different body conflicts and an identical body
+    reports the replay unavailable, never a second provider dispatch."""
+    control, raw_key = _control_plane(tmp_path)
+    admission = _admit(control, raw_key, _chat_body(), idempotency_key="durable-op")
+    control.settle(
+        json.dumps(
+            {
+                "request_id": admission["request_id"],
+                "attempt_id": admission["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+    with pytest.raises(NativeBridgeError) as conflict:
+        _admit(control, raw_key, _chat_body(stream=True), idempotency_key="durable-op")
+    conflict_payload = json.loads(conflict.value.public_error_json)
+    assert conflict_payload["status_code"] == 409
+    assert conflict_payload["code"] == "idempotency_conflict"
+    with pytest.raises(NativeBridgeError) as unavailable:
+        _admit(control, raw_key, _chat_body(), idempotency_key="durable-op")
+    unavailable_payload = json.loads(unavailable.value.public_error_json)
+    assert unavailable_payload["status_code"] == 409
+    assert unavailable_payload["code"] == "idempotency_replay_unavailable"
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
 
 
 def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:

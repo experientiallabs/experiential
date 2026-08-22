@@ -68,6 +68,7 @@ from exp.runtime.models.providers.streaming_requests import (
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest, decode_chat
+from exp.runtime.openai_protocol.state import ProtocolNamespace, replay_key
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
 _SWEEP_GRACE_SECONDS = 5.0
@@ -252,7 +253,11 @@ class NativeControlPlane:
         """
         self._sweep_expired()
         data = json.loads(argument)
-        decoded = self._decode_body(data["body"])
+        decoded = self._decode_body(
+            data["body"],
+            idempotency_key=_optional_text(data.get("idempotency_key")),
+            client_request_id=_optional_text(data.get("client_request_id")),
+        )
         request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
         try:
@@ -363,6 +368,96 @@ class NativeControlPlane:
         }
         return json.dumps(response, separators=(",", ":"))
 
+    def claim_scope(self, argument: str) -> str:
+        """Resolve the replay-store scope for one keyed Chat Completions request.
+
+        The data plane owns the bounded in-process replay store; this call
+        performs the same decode and authorization the python engine runs so
+        the store key (tenant namespace, hashed caller operation, canonical
+        request digest) is computed by exactly one implementation. Requests
+        the native path cannot serve are escalated before any replay claim,
+        so one caller operation never spans both engines' replay stores.
+
+        Args:
+            argument: JSON object with ``raw_key``, ``body``, and optional
+                ``idempotency_key`` and ``client_request_id`` header values.
+
+        Returns:
+            JSON replay scope with ``organization_id``, ``identity_id``,
+            ``alias_revision_id``, ``surface``, ``caller_operation_sha256``,
+            and ``canonical_request_sha256``, or an ``{"escalate": reason}``
+            disposition handing the request to the python engine.
+
+        Raises:
+            NativeBridgeError: Decoding or authorization failed.
+        """
+        data = json.loads(argument)
+        decoded = self._decode_body(
+            data["body"],
+            idempotency_key=_optional_text(data.get("idempotency_key")),
+            client_request_id=_optional_text(data.get("client_request_id")),
+        )
+        request = decoded.request
+        caller_operation = request.idempotency_key or request.client_request_id
+        if caller_operation is None:
+            raise NativeBridgeError(
+                OpenAIProtocolError(
+                    status_code=400,
+                    code="invalid_request",
+                    message="A replay scope requires an Idempotency-Key header.",
+                    param="Idempotency-Key",
+                )
+            )
+        deadline = time.monotonic() + self._request_timeout_seconds
+        try:
+            authorization = self._components.store.authorize_request(
+                raw_key=data["raw_key"],
+                alias=decoded.alias,
+                request=request,
+                deadline_monotonic=deadline,
+            )
+        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            raise _authority_error(exc) from exc
+        if not isinstance(authorization.target, DirectTarget):
+            return _escalation("project-backed aliases use learned selection on the python engine")
+        try:
+            route = self._components.routes.resolve_direct(authorization)
+            self._wire_profile(route)
+        except _NativeDialectUnavailableError as exc:
+            return _escalation(str(exc))
+        except Exception:  # noqa: BLE001 - the owner's admission records this failure.
+            route = None
+        if route is not None and route.fallback_deployments:
+            return _escalation("multi-deployment pools use the python engine's certified waterfall")
+        key = replay_key(
+            namespace=ProtocolNamespace(
+                organization_id=authorization.organization_id,
+                identity_id=authorization.identity_id,
+                alias_revision_id=authorization.alias_revision_id,
+            ),
+            surface=request.surface,
+            caller_operation=caller_operation,
+            canonical_request_sha256=authorization.canonical_request_sha256,
+        )
+        if key is None:  # pragma: no cover - caller_operation is checked above.
+            raise NativeBridgeError(
+                OpenAIProtocolError(
+                    status_code=500,
+                    code="internal_error",
+                    message="The gateway request failed.",
+                    error_type="api_error",
+                )
+            )
+        scope: JsonObject = {
+            "organization_id": key.namespace.organization_id,
+            "identity_id": key.namespace.identity_id,
+            "alias_revision_id": key.namespace.alias_revision_id,
+            "surface": key.surface.value,
+            "caller_operation_sha256": key.caller_operation_sha256,
+            "canonical_request_sha256": key.canonical_request_sha256,
+        }
+        return json.dumps(scope, separators=(",", ":"))
+
     def settle(self, argument: str) -> str:
         """Durably settle one previously admitted attempt exactly once.
 
@@ -454,11 +549,19 @@ class NativeControlPlane:
             return "false"
         return "true"
 
-    def _decode_body(self, body: str) -> DecodedGatewayRequest:
+    def _decode_body(
+        self,
+        body: str,
+        *,
+        idempotency_key: str | None = None,
+        client_request_id: str | None = None,
+    ) -> DecodedGatewayRequest:
         """Decode one raw Chat Completions body with the shared decoder.
 
         Args:
             body: Raw request body text.
+            idempotency_key: Optional raw ``Idempotency-Key`` header value.
+            client_request_id: Optional raw ``X-Client-Request-Id`` header value.
 
         Returns:
             The public alias and canonical request.
@@ -488,7 +591,11 @@ class NativeControlPlane:
                 )
             )
         try:
-            return decode_chat(payload)
+            return decode_chat(
+                payload,
+                idempotency_key=idempotency_key,
+                client_request_id=client_request_id,
+            )
         except OpenAIProtocolError as exc:
             raise NativeBridgeError(exc) from exc
 
@@ -690,6 +797,11 @@ def _deployment_operation_key(route: GatewayRoute) -> str:
             "connection_sha256": route.deployment.connection_sha256,
         },
     )
+
+
+def _optional_text(value: object) -> str | None:
+    """Return one optional boundary string value or ``None``."""
+    return value if isinstance(value, str) else None
 
 
 def _terminal_from_settlement(

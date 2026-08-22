@@ -26,6 +26,7 @@ use crate::dialects::{
 use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
+use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey, ReplayStore};
 use crate::sse::SseDecoder;
 use crate::upstream::open_stream;
 
@@ -33,6 +34,10 @@ use crate::upstream::open_stream;
 /// Bounded so one client cannot hold unbounded gateway memory; far above any
 /// real chat history (the python engine imposes no explicit cap).
 const MAXIMUM_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Largest SSE capture retained for keyed-stream replay, matching the python
+/// engine's `_STREAM_REPLAY_CAPTURE_BYTES`.
+const STREAM_REPLAY_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Serve-time configuration passed from `exp --engine rust`.
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +89,9 @@ struct AppState {
     /// traffic holds no active-request permit, so the reclaim loop needs
     /// this separate in-flight signal to avoid trimming under proxy load.
     active_proxies: Arc<AtomicUsize>,
+    /// Bounded in-process keyed-response replay, the native mirror of the
+    /// python engine's `BoundedReplayStore`.
+    replays: Arc<ReplayStore>,
 }
 
 /// Holds one in-flight proxy count from admission until the relayed
@@ -143,6 +151,7 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         active_proxies: active_proxies.clone(),
+        replays: Arc::new(ReplayStore::new()),
     };
     tokio::spawn(crate::memory::reclaim_when_idle(
         state.permits.clone(),
@@ -422,18 +431,79 @@ async fn model_detail(
     }
 }
 
-/// Commit-independent headers, mirroring `commit_independent_headers`.
-/// Replay-keyed requests are proxied, so no client request identity exists
-/// on the native path.
-fn commit_independent(admission: &Admission) -> Vec<(String, String)> {
-    vec![
+/// Commit-independent headers, mirroring `commit_independent_headers`,
+/// including the caller's echoed request identity when one was supplied.
+fn commit_independent(
+    admission: &Admission,
+    client_request_id: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut headers = vec![
         ("x-request-id".to_string(), admission.request_id.clone()),
         ("x-gateway-alias".to_string(), admission.alias.clone()),
         (
             "x-gateway-alias-revision".to_string(),
             admission.alias_revision_id.clone(),
         ),
-    ]
+    ];
+    if let Some(value) = client_request_id {
+        headers.push(("x-client-request-id".to_string(), value.to_string()));
+    }
+    headers
+}
+
+/// Read one header value as latin-1 text, the same byte-transparent decoding
+/// the python engine's ASGI server applies, so any HTTP-legal value produces
+/// the identical caller-operation string on both engines.
+fn latin1_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .map(|value| value.as_bytes().iter().map(|&byte| byte as char).collect())
+}
+
+/// Re-encode one latin-1 decoded header value to its original bytes.
+fn latin1_bytes(value: &str) -> Vec<u8> {
+    value
+        .chars()
+        .map(|character| {
+            let code = character as u32;
+            if code < 256 {
+                code as u8
+            } else {
+                b'?'
+            }
+        })
+        .collect()
+}
+
+/// Build one exact HTTP response from a stored keyed result, mirroring the
+/// python engine's `_cached_response`.
+fn cached_response(cached: &CachedResponse) -> Response {
+    let mut builder = Response::builder()
+        .status(
+            StatusCode::from_u16(cached.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        )
+        .header(header::CONTENT_TYPE, cached.media_type.as_str());
+    for (name, value) in &cached.headers {
+        if let (Ok(name), Ok(value)) = (
+            header::HeaderName::try_from(name.as_str()),
+            HeaderValue::from_bytes(&latin1_bytes(value)),
+        ) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(Body::from(Bytes::copy_from_slice(&cached.body)))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Append one frame while it remains within the replay capture ceiling,
+/// mirroring the python engine's `capture_frame`.
+fn capture_frame(buffer: &mut Vec<u8>, data: &[u8], replayable: bool) -> bool {
+    if !replayable || buffer.len() + data.len() > STREAM_REPLAY_CAPTURE_BYTES {
+        return false;
+    }
+    buffer.extend_from_slice(data);
+    true
 }
 
 /// Commit-dependent headers, mirroring `commit_dependent_headers`.
@@ -612,28 +682,82 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
         return error_response(&error);
     }
 
-    // Replay-keyed chat keeps the python engine's idempotency semantics.
-    // Presence is checked on the raw header map so a non-UTF8 value still
-    // escalates instead of silently dropping replay behavior.
-    if headers.contains_key("idempotency-key") || headers.contains_key("x-client-request-id") {
-        return proxy_to_python(
-            &state,
-            reqwest::Method::POST,
-            "/v1/chat/completions",
-            &headers,
-            body,
-        )
-        .await;
-    }
     let body_text = match String::from_utf8(body.to_vec()) {
         Ok(text) => text,
         Err(_) => return error_response(&PublicError::invalid_json()),
     };
 
-    let admit_argument = compact_json(&json!({"raw_key": raw_key, "body": body_text}));
+    // Replay-keyed chat runs the python engine's exact idempotency protocol
+    // natively: the shared control plane computes the tenant-scoped replay
+    // key (or escalates a request the native path cannot serve), then the
+    // bounded replay store dedupes concurrent duplicates and replays the
+    // owner's exact stored response. Headers are decoded latin-1 so any
+    // HTTP-legal value matches the python engine's view byte for byte.
+    let idempotency_key = latin1_header(&headers, "idempotency-key");
+    let client_request_id = latin1_header(&headers, "x-client-request-id");
+    let mut lease: Option<OwnerLease> = None;
+    if idempotency_key.is_some() || client_request_id.is_some() {
+        let scope_argument = compact_json(&json!({
+            "raw_key": raw_key,
+            "body": body_text,
+            "idempotency_key": idempotency_key,
+            "client_request_id": client_request_id,
+        }));
+        let scope_text = match state.bridge.call("claim_scope", scope_argument).await {
+            Ok(text) => text,
+            Err(error) => return error_response(&error),
+        };
+        let scope_value: Value = match serde_json::from_str(&scope_text) {
+            Ok(value) => value,
+            Err(_) => return error_response(&PublicError::internal()),
+        };
+        if scope_value.get("escalate").is_some() {
+            // No replay claim exists; the python engine owns this request
+            // end to end, including its own replay store.
+            return proxy_to_python(
+                &state,
+                reqwest::Method::POST,
+                "/v1/chat/completions",
+                &headers,
+                body,
+            )
+            .await;
+        }
+        let key: ReplayKey = match serde_json::from_value(scope_value) {
+            Ok(key) => key,
+            Err(_) => return error_response(&PublicError::internal()),
+        };
+        match state.replays.claim(key).await {
+            Err(error) => return error_response(&error),
+            Ok(Claim::Replay(cached)) => return cached_response(&cached),
+            Ok(Claim::Join(joiner)) => {
+                // Joining never touches the ledger or budget: only the owner
+                // accounts for the single provider call.
+                return match joiner.result().await {
+                    Ok(cached) => cached_response(&cached),
+                    Err(error) => error_response(&error),
+                };
+            }
+            Ok(Claim::Owner(owner)) => lease = Some(owner),
+        }
+    }
+
+    let admit_argument = compact_json(&json!({
+        "raw_key": raw_key,
+        "body": body_text,
+        "idempotency_key": idempotency_key,
+        "client_request_id": client_request_id,
+    }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
-        Err(error) => return error_response(&error),
+        Err(error) => {
+            // A failed keyed admission abandons ownership so waiting
+            // duplicates fail closed instead of hanging.
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return error_response(&error);
+        }
     };
     let admission_value: Value = match serde_json::from_str(&admission_text) {
         Ok(value) => value,
@@ -641,6 +765,9 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
     };
     if admission_value.get("escalate").is_some() {
         // No ledger row exists; the python engine owns this request end to end.
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
         return proxy_to_python(
             &state,
             reqwest::Method::POST,
@@ -799,6 +926,8 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
             deadline,
             phase_timeout,
             permit,
+            lease,
+            client_request_id,
         )
         .await
     } else {
@@ -811,6 +940,8 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
             deadline,
             phase_timeout,
             permit,
+            lease,
+            client_request_id,
         )
         .await
     }
@@ -950,6 +1081,8 @@ async fn completed_response(
     deadline: Instant,
     phase_timeout: Duration,
     permit: tokio::sync::OwnedSemaphorePermit,
+    mut lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
 ) -> Response {
     let _permit = permit;
     let events = match collect_events(response, dialect, deadline, phase_timeout).await {
@@ -958,6 +1091,9 @@ async fn completed_response(
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
             guard.settle("failed", None, &[], Some(&failure)).await;
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
             return error_response(&error);
         }
     };
@@ -979,6 +1115,9 @@ async fn completed_response(
                         ),
                     )
                     .await;
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
                 return error_response(&error);
             }
         };
@@ -993,6 +1132,9 @@ async fn completed_response(
                 Some(&failure),
             )
             .await;
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
         return error_response(&error);
     }
     let outcome = if aggregated.incomplete {
@@ -1010,10 +1152,29 @@ async fn completed_response(
         .await;
     if !settled {
         // Success is only reported once the terminal accounting write landed.
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
         return error_response(&PublicError::internal());
     }
-    let mut headers = commit_independent(&admission);
+    let mut headers = commit_independent(&admission, client_request_id.as_deref());
     headers.extend(commit_dependent(&admission));
+    if let Some(mut owner) = lease.take() {
+        // Publish the exact response body and headers, then answer from the
+        // stored copy, matching the python engine's `_cached_response`.
+        let mut sorted = headers.clone();
+        sorted.sort();
+        let cached = CachedResponse {
+            status_code: 200,
+            media_type: "application/json".to_string(),
+            headers: sorted,
+            body: compact_json(&aggregated.body).into_bytes(),
+        };
+        return match owner.complete(cached.clone()).await {
+            Ok(()) => cached_response(&cached),
+            Err(error) => error_response(&error),
+        };
+    }
     json_response(StatusCode::OK, &aggregated.body, &headers)
 }
 
@@ -1027,30 +1188,54 @@ async fn stream_response(
     deadline: Instant,
     phase_timeout: Duration,
     permit: tokio::sync::OwnedSemaphorePermit,
+    lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let mut header_pairs = commit_independent(&admission);
+    let mut header_pairs = commit_independent(&admission, client_request_id.as_deref());
     header_pairs.extend(commit_dependent(&admission));
     let include_usage = admission.include_usage;
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();
+    let cached_headers = {
+        let mut sorted = header_pairs.clone();
+        sorted.sort();
+        sorted
+    };
     tokio::spawn(async move {
         let _permit = permit;
         let mut guard = guard;
+        let mut lease = lease;
         let mut encoder = ChatSseEncoder::new(&request_id, &alias, created_at, include_usage);
         let mut normalizer = Normalizer::new(dialect);
         let mut decoder = SseDecoder::new();
         let mut usage: Option<Usage> = None;
         let mut tool_names: Vec<String> = Vec::new();
         let mut terminal: Option<Event> = None;
+        // Keyed streams capture every public frame so the owner can publish
+        // the exact byte stream; terminal frames are withheld until that
+        // publication succeeds, matching the python engine's `_stream_body`.
+        let mut capture: Vec<u8> = Vec::new();
+        let mut replayable = lease.is_some();
+        let mut withheld: Vec<Bytes> = Vec::new();
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
                 let failure = $failure.boundary();
-                emit_failure(&sender, deadline, &mut encoder, &failure).await;
+                let frames = failure_frames(&mut encoder, &failure);
                 guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure))
                     .await;
+                finish_stream_terminal(
+                    &sender,
+                    deadline,
+                    &mut lease,
+                    replayable,
+                    &mut capture,
+                    &cached_headers,
+                    frames,
+                )
+                .await;
                 return;
             }};
         }
@@ -1065,7 +1250,11 @@ async fn stream_response(
             }
         };
         for frame in start_frames {
-            if !send_bounded(&sender, deadline, Bytes::from(frame)).await {
+            let data = Bytes::from(frame);
+            if lease.is_some() {
+                replayable = capture_frame(&mut capture, &data, replayable);
+            }
+            if !send_bounded(&sender, deadline, data).await {
                 guard.settle_cancelled(usage.as_ref(), &tool_names).await;
                 return;
             }
@@ -1113,8 +1302,15 @@ async fn stream_response(
                             ))
                         }
                     };
+                    let withhold = lease.is_some() && terminal.is_some();
                     for data in encoded {
-                        if !send_bounded(&sender, deadline, Bytes::from(data)).await {
+                        let data = Bytes::from(data);
+                        if lease.is_some() {
+                            replayable = capture_frame(&mut capture, &data, replayable);
+                        }
+                        if withhold {
+                            withheld.push(data);
+                        } else if !send_bounded(&sender, deadline, data).await {
                             settle_stream_end(
                                 &mut guard,
                                 terminal.as_ref(),
@@ -1161,8 +1357,15 @@ async fn stream_response(
                             ))
                         }
                     };
+                    let withhold = lease.is_some() && terminal.is_some();
                     for data in encoded {
-                        if !send_bounded(&sender, deadline, Bytes::from(data)).await {
+                        let data = Bytes::from(data);
+                        if lease.is_some() {
+                            replayable = capture_frame(&mut capture, &data, replayable);
+                        }
+                        if withhold {
+                            withheld.push(data);
+                        } else if !send_bounded(&sender, deadline, data).await {
                             settle_stream_end(
                                 &mut guard,
                                 terminal.as_ref(),
@@ -1179,16 +1382,10 @@ async fn stream_response(
         }
 
         if terminal.is_none() {
-            let failure = Failure::new(
+            fail_stream!(Failure::new(
                 FailureClass::MalformedResponse,
                 "provider stream ended without a terminal event",
-            )
-            .boundary();
-            emit_failure(&sender, deadline, &mut encoder, &failure).await;
-            guard
-                .settle("failed", usage.as_ref(), &tool_names, Some(&failure))
-                .await;
-            return;
+            ));
         }
         settle_stream_end(
             &mut guard,
@@ -1196,6 +1393,16 @@ async fn stream_response(
             usage.as_ref(),
             &tool_names,
             false,
+        )
+        .await;
+        finish_stream_terminal(
+            &sender,
+            deadline,
+            &mut lease,
+            replayable,
+            &mut capture,
+            &cached_headers,
+            withheld,
         )
         .await;
     });
@@ -1260,27 +1467,65 @@ fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Vec<St
     }
 }
 
-/// Emit the encoder's sanitized failure frame and done sentinel when the
+/// Build the encoder's sanitized failure frame and done sentinel when the
 /// stream has not already reached a terminal.
-async fn emit_failure(
-    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
-    deadline: Instant,
-    encoder: &mut ChatSseEncoder,
-    failure: &Failure,
-) {
+fn failure_frames(encoder: &mut ChatSseEncoder, failure: &Failure) -> Vec<Bytes> {
     if encoder.saw_terminal() {
-        return;
+        return Vec::new();
     }
-    let frames = encoder
+    encoder
         .feed(&Event::Failed(failure.clone()))
         .unwrap_or_else(|_| {
             vec![
                 chat_data(&failure.public_error().json_body()),
                 "data: [DONE]\n\n".to_string(),
             ]
-        });
-    for frame in frames {
-        if !send_bounded(sender, deadline, Bytes::from(frame)).await {
+        })
+        .into_iter()
+        .map(Bytes::from)
+        .collect()
+}
+
+/// Close one stream that reached a terminal outcome: publish the keyed
+/// capture (or abandon it), then flush the withheld terminal frames.
+///
+/// Mirrors the python engine's `_stream_body` tail: a keyed stream that
+/// cannot be retained (capture overflow or a rejected publication) ends
+/// without its terminal frames, so the caller observes a truncated stream
+/// rather than an unreplayable success, and every waiting duplicate fails
+/// closed instead of hanging.
+async fn finish_stream_terminal(
+    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    deadline: Instant,
+    lease: &mut Option<OwnerLease>,
+    mut replayable: bool,
+    capture: &mut Vec<u8>,
+    cached_headers: &[(String, String)],
+    frames: Vec<Bytes>,
+) {
+    if lease.is_some() {
+        for data in &frames {
+            replayable = capture_frame(capture, data, replayable);
+        }
+    }
+    if let Some(mut owner) = lease.take() {
+        if replayable {
+            let cached = CachedResponse {
+                status_code: 200,
+                media_type: "text/event-stream".to_string(),
+                headers: cached_headers.to_vec(),
+                body: std::mem::take(capture),
+            };
+            if owner.complete(cached).await.is_err() {
+                return;
+            }
+        } else {
+            owner.abandon().await;
+            return;
+        }
+    }
+    for data in frames {
+        if !send_bounded(sender, deadline, data).await {
             return;
         }
     }

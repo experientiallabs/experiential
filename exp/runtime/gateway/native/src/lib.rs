@@ -11,6 +11,7 @@ mod encode;
 mod errors;
 mod events;
 mod memory;
+mod replay;
 mod server;
 mod sse;
 mod upstream;
