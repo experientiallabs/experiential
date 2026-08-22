@@ -29,6 +29,8 @@ jobs:
         run: >-
           cargo clippy --manifest-path exp/runtime/gateway/native/Cargo.toml
           --no-default-features -- -D warnings
+      - name: Install libpython for the crate's unit-test binary
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-dev
       - name: cargo test
         run: >-
           cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml

@@ -24,22 +24,26 @@ extension is built, and otherwise prints the reason and serves through the
 python engine. `--engine rust` and `--engine python` force one engine.
 
 The native engine is a Rust HTTP server compiled as a PyO3 extension. It owns
-the public socket and the anonymous Chat Completions fast path: request decode,
-upstream dispatch, provider stream normalization, and public SSE encoding run
-off the GIL, with three JSON-string callbacks into python per request
-(authenticate, admit, settle) that execute the same authority checks and the
-same durable SQLite transactions as the python engine, over the same
-hot-reloadable authority generations. Provider wire facts come from the public
-`gateway_wire_profile()` on each resolved provider client; native dialects are
-`openai_responses`, `anthropic_messages`, and `openai_compatible` (which also
-covers Azure and OpenRouter connections).
+the public socket and the anonymous Chat Completions fast path: upstream
+dispatch, provider stream normalization, and public SSE encoding run off the
+GIL, with three JSON-string callbacks into python per request (authenticate,
+admit, settle). Everything protocol- and authority-shaped stays in the shared
+python code: admission decodes the raw body with the same `decode_chat`,
+enforces the same deployment-identity invariant, builds the upstream payload
+with the same `streaming_requests` builders, and writes the same durable
+SQLite transactions, over the same hot-reloadable authority generations.
+Provider wire facts come from the public `gateway_wire_profile()` on each
+resolved provider client; native dialects are `openai_responses`,
+`anthropic_messages`, and `openai_compatible` (which also covers Azure and
+OpenRouter connections).
 
 The public surface is identical under either engine. An embedded python engine
 over the same authority, ledger, and routes listens on an internal loopback
 port, and the native engine forwards to it everything outside its fast path:
 `POST /v1/responses`, chat requests carrying `Idempotency-Key` or
-`X-Client-Request-Id` (replay semantics), project-backed aliases, providers
-without a native dialect, `GET /usage`, and unknown routes. Escalation happens
+`X-Client-Request-Id` (replay semantics), project-backed aliases,
+multi-deployment pools (the certified waterfall), providers without a native
+dialect, `GET /usage`, and unknown routes. Escalation happens
 before any ledger write, so each request is accounted exactly once by the
 engine that serves it. Shutdown drains admitted work on both engines within
 `--graceful-timeout`.
