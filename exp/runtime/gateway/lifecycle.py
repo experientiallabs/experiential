@@ -80,6 +80,7 @@ class LocalGatewayRuntime:
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
     write_ledger: GroupCommitAttemptLedger | None = None
+    selection_workers: SelectionWorkerPool | None = None
 
     @property
     def app(self) -> FastAPI:
@@ -109,8 +110,10 @@ class LocalGatewayRuntime:
         return await self.runtime.drain(timeout_seconds=timeout_seconds)
 
     async def shutdown(self) -> bool:
-        """Shut down the shared runtime, then stop the drained ledger writer."""
+        """Shut down the runtime, the selection lane, and the drained ledger writer."""
         stopped = await self.runtime.shutdown()
+        if self.selection_workers is not None:
+            self.selection_workers.shutdown()
         if self.write_ledger is not None:
             self.write_ledger.close()
         return stopped
@@ -404,6 +407,7 @@ class LocalGatewayComponents:
     routes: CatalogRouteResolver
     executor: GatewayExecutor
     reloader: _AliasAuthorityReloader
+    selection_workers: SelectionWorkerPool
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
 
@@ -490,6 +494,7 @@ def load_gateway_components(
         routes=routes,
         executor=executor,
         reloader=reloader,
+        selection_workers=selection_workers,
         reconciled_expired_requests=expired,
         reconciled_unknown_attempts=unknown,
     )
@@ -550,6 +555,7 @@ def compose_local_gateway(
     return LocalGatewayRuntime(
         runtime=runtime,
         write_ledger=components.write_ledger,
+        selection_workers=components.selection_workers,
         reconciled_expired_requests=components.reconciled_expired_requests,
         reconciled_unknown_attempts=components.reconciled_unknown_attempts,
     )
