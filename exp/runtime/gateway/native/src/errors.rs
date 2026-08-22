@@ -36,7 +36,6 @@ impl PublicError {
         }
     }
 
-
     /// The OpenAI error envelope body, matching `OpenAIProtocolError.json_body()`.
     pub fn json_body(&self) -> serde_json::Value {
         json!({
@@ -48,9 +47,6 @@ impl PublicError {
             }
         })
     }
-
-
-
 
     pub fn invalid_key() -> Self {
         Self::new(
@@ -70,7 +66,6 @@ impl PublicError {
             "invalid_request_error",
         )
     }
-
 
     pub fn internal() -> Self {
         Self::new(
@@ -94,7 +89,6 @@ impl PublicError {
         error
     }
 
-
     pub fn request_too_large() -> Self {
         Self::new(
             413,
@@ -113,7 +107,6 @@ impl PublicError {
             "api_error",
         )
     }
-
 }
 
 /// Stable failure classes shared with `GatewayFailureClass`.
@@ -180,7 +173,8 @@ impl Failure {
     pub fn boundary(self) -> Self {
         match self.failure_class {
             FailureClass::MalformedResponse
-                if self.safe_message != "provider returned a malformed response; retry the request" =>
+                if self.safe_message
+                    != "provider returned a malformed response; retry the request" =>
             {
                 Failure::new(
                     FailureClass::MalformedResponse,

@@ -55,7 +55,10 @@ pub enum Event {
 
 impl Event {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Event::Completed | Event::Incomplete | Event::Failed(_))
+        matches!(
+            self,
+            Event::Completed | Event::Incomplete | Event::Failed(_)
+        )
     }
 }
 
@@ -144,8 +147,16 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
         .as_object()
         .ok_or_else(|| "OpenAI usage must be an object".to_string())?;
     Ok(Some(Usage {
-        input_tokens: Some(count_or_zero(object, "input_tokens", "OpenAI input_tokens")?),
-        output_tokens: Some(count_or_zero(object, "output_tokens", "OpenAI output_tokens")?),
+        input_tokens: Some(count_or_zero(
+            object,
+            "input_tokens",
+            "OpenAI input_tokens",
+        )?),
+        output_tokens: Some(count_or_zero(
+            object,
+            "output_tokens",
+            "OpenAI output_tokens",
+        )?),
         cached_input_tokens: optional_usage_detail(
             object,
             "input_tokens_details",
@@ -170,7 +181,11 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
         .ok_or_else(|| "OpenAI-compatible usage must be an object".to_string())?;
     Ok(Usage {
         input_tokens: Some(count_or_zero(object, "prompt_tokens", "prompt_tokens")?),
-        output_tokens: Some(count_or_zero(object, "completion_tokens", "completion_tokens")?),
+        output_tokens: Some(count_or_zero(
+            object,
+            "completion_tokens",
+            "completion_tokens",
+        )?),
         cached_input_tokens: optional_usage_detail(
             object,
             "prompt_tokens_details",
@@ -187,7 +202,11 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
 }
 
 /// Fetch a required string field from a provider JSON object.
-pub fn require_string(object: &Map<String, Value>, key: &str, label: &str) -> Result<String, String> {
+pub fn require_string(
+    object: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<String, String> {
     object
         .get(key)
         .and_then(Value::as_str)

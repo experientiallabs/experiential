@@ -52,7 +52,9 @@ impl ChatSseEncoder {
     /// Emit the single initial assistant-role chunk.
     pub fn start(&mut self) -> Result<Vec<String>, PublicError> {
         if self.started {
-            return Err(invalid_provider_stream("Chat stream was started more than once."));
+            return Err(invalid_provider_stream(
+                "Chat stream was started more than once.",
+            ));
         }
         self.started = true;
         Ok(vec![self.chunk(json!({"role": "assistant"}), None)])
@@ -73,9 +75,15 @@ impl ChatSseEncoder {
         match event {
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
-            Event::ToolCallStarted { index, call_id, name } => {
+            Event::ToolCallStarted {
+                index,
+                call_id,
+                name,
+            } => {
                 if self.tool_indices.contains_key(index) {
-                    return Err(invalid_provider_stream("A Chat tool-call index was started twice."));
+                    return Err(invalid_provider_stream(
+                        "A Chat tool-call index was started twice.",
+                    ));
                 }
                 self.tool_indices
                     .insert(*index, (call_id.clone(), name.clone()));

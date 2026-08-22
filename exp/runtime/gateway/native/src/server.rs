@@ -20,7 +20,9 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::bridge::Bridge;
-use crate::dialects::{Dialect, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE};
+use crate::dialects::{
+    Dialect, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
+};
 use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
@@ -175,7 +177,9 @@ async fn shutdown_signal() {
 
 fn error_response(error: &PublicError) -> Response {
     let mut builder = Response::builder()
-        .status(StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+        .status(
+            StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        )
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(wait) = error.retry_after_seconds {
         builder = builder.header(header::RETRY_AFTER, wait.to_string());
@@ -202,7 +206,9 @@ fn bearer_key(headers: &HeaderMap) -> Result<String, PublicError> {
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(PublicError::invalid_key)?;
-    let key = value.strip_prefix("Bearer ").ok_or_else(PublicError::invalid_key)?;
+    let key = value
+        .strip_prefix("Bearer ")
+        .ok_or_else(PublicError::invalid_key)?;
     let trimmed = key.trim();
     if trimmed.is_empty() {
         return Err(PublicError::invalid_key());
@@ -260,8 +266,14 @@ async fn proxy_to_python(
         let lowered = name.as_str().to_ascii_lowercase();
         if matches!(
             lowered.as_str(),
-            "host" | "connection" | "content-length" | "transfer-encoding" | "keep-alive"
-                | "te" | "trailer" | "upgrade"
+            "host"
+                | "connection"
+                | "content-length"
+                | "transfer-encoding"
+                | "keep-alive"
+                | "te"
+                | "trailer"
+                | "upgrade"
         ) {
             continue;
         }
@@ -555,24 +567,21 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
     };
 
     // Logical admission mirrors the executor's bounded active-request permit.
-    let permit = match tokio::time::timeout_at(
-        deadline.into(),
-        state.permits.clone().acquire_owned(),
-    )
-    .await
-    {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return error_response(&PublicError::draining()),
-        Err(_) => {
-            return error_response(
-                &Failure::new(
-                    FailureClass::Timeout,
-                    "gateway execution queue deadline exceeded",
+    let permit =
+        match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return error_response(&PublicError::draining()),
+            Err(_) => {
+                return error_response(
+                    &Failure::new(
+                        FailureClass::Timeout,
+                        "gateway execution queue deadline exceeded",
+                    )
+                    .public_error(),
                 )
-                .public_error(),
-            )
-        }
-    };
+            }
+        };
 
     let admit_argument = compact_json(&json!({"raw_key": raw_key, "body": body_text}));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
@@ -704,12 +713,26 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
 
     if admission.stream {
         stream_response(
-            admission, guard, dialect, response, created_at, deadline, phase_timeout, permit,
+            admission,
+            guard,
+            dialect,
+            response,
+            created_at,
+            deadline,
+            phase_timeout,
+            permit,
         )
         .await
     } else {
         completed_response(
-            admission, guard, dialect, response, created_at, deadline, phase_timeout, permit,
+            admission,
+            guard,
+            dialect,
+            response,
+            created_at,
+            deadline,
+            phase_timeout,
+            permit,
         )
         .await
     }
@@ -724,10 +747,7 @@ fn remaining(deadline: Instant) -> Duration {
 /// deadline is exhausted.
 fn stream_timeout_failure(deadline: Instant) -> Failure {
     if remaining(deadline).is_zero() {
-        Failure::new(
-            FailureClass::Timeout,
-            "gateway execution deadline exceeded",
-        )
+        Failure::new(FailureClass::Timeout, "gateway execution deadline exceeded")
     } else {
         Failure::new(
             FailureClass::Transport,
@@ -879,9 +899,18 @@ async fn completed_response(
             .await;
         return error_response(&error);
     }
-    let outcome = if aggregated.incomplete { "incomplete" } else { "completed" };
+    let outcome = if aggregated.incomplete {
+        "incomplete"
+    } else {
+        "completed"
+    };
     let settled = guard
-        .settle(outcome, aggregated.usage.as_ref(), &aggregated.tool_names, None)
+        .settle(
+            outcome,
+            aggregated.usage.as_ref(),
+            &aggregated.tool_names,
+            None,
+        )
         .await;
     if !settled {
         // Success is only reported once the terminal accounting write landed.
@@ -990,8 +1019,14 @@ async fn stream_response(
                     };
                     for data in encoded {
                         if sender.send(Ok(Bytes::from(data))).await.is_err() {
-                            settle_stream_end(&mut guard, terminal.as_ref(), usage.as_ref(), &tool_names, true)
-                                .await;
+                            settle_stream_end(
+                                &mut guard,
+                                terminal.as_ref(),
+                                usage.as_ref(),
+                                &tool_names,
+                                true,
+                            )
+                            .await;
                             return;
                         }
                     }
@@ -1032,8 +1067,14 @@ async fn stream_response(
                     };
                     for data in encoded {
                         if sender.send(Ok(Bytes::from(data))).await.is_err() {
-                            settle_stream_end(&mut guard, terminal.as_ref(), usage.as_ref(), &tool_names, true)
-                                .await;
+                            settle_stream_end(
+                                &mut guard,
+                                terminal.as_ref(),
+                                usage.as_ref(),
+                                &tool_names,
+                                true,
+                            )
+                            .await;
                             return;
                         }
                     }
@@ -1053,7 +1094,14 @@ async fn stream_response(
                 .await;
             return;
         }
-        settle_stream_end(&mut guard, terminal.as_ref(), usage.as_ref(), &tool_names, false).await;
+        settle_stream_end(
+            &mut guard,
+            terminal.as_ref(),
+            usage.as_ref(),
+            &tool_names,
+            false,
+        )
+        .await;
     });
 
     let body = Body::from_stream(ReceiverStream::new(receiver));
@@ -1068,7 +1116,9 @@ async fn stream_response(
             builder = builder.header(name, value);
         }
     }
-    builder.body(body).unwrap_or_else(|_| Response::new(Body::empty()))
+    builder
+        .body(body)
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 /// Settle a stream that reached its end (or lost its client). With a terminal
@@ -1084,7 +1134,9 @@ async fn settle_stream_end(
     match terminal {
         Some(Event::Failed(failure)) => {
             let failure = failure.clone().boundary();
-            guard.settle("failed", usage, tool_names, Some(&failure)).await;
+            guard
+                .settle("failed", usage, tool_names, Some(&failure))
+                .await;
         }
         Some(Event::Incomplete) => {
             guard.settle("incomplete", usage, tool_names, None).await;
@@ -1105,10 +1157,8 @@ fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Vec<St
         Event::Usage(candidate) if candidate.has_token_counts() => {
             *usage = Some(candidate.clone());
         }
-        Event::ToolCallCompleted { call, .. } => {
-            if !tool_names.contains(&call.name) {
-                tool_names.push(call.name.clone());
-            }
+        Event::ToolCallCompleted { call, .. } if !tool_names.contains(&call.name) => {
+            tool_names.push(call.name.clone());
         }
         _ => {}
     }

@@ -53,8 +53,7 @@ fn encode_chat_fixture(
     include_usage: bool,
     events_json: &str,
 ) -> PyResult<Vec<String>> {
-    let events = parse_fixture_events(events_json)
-        .map_err(|message| PyValueError::new_err(message))?;
+    let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
     let mut encoder = encode::ChatSseEncoder::new(request_id, model, created_at, include_usage);
     let mut frames = encoder
         .start()
@@ -73,9 +72,10 @@ fn encode_chat_fixture(
 /// taxonomy parity tests against `public_failure_error`.
 #[pyfunction]
 fn failure_public_error_fixture(failure_class: &str, safe_message: &str) -> PyResult<String> {
-    let parsed: errors::FailureClass =
-        serde_json::from_value(serde_json::Value::String(failure_class.to_string()))
-            .map_err(|_| PyValueError::new_err(format!("unknown failure class: {failure_class}")))?;
+    let parsed: errors::FailureClass = serde_json::from_value(serde_json::Value::String(
+        failure_class.to_string(),
+    ))
+    .map_err(|_| PyValueError::new_err(format!("unknown failure class: {failure_class}")))?;
     let failure = errors::Failure::new(parsed, safe_message);
     Ok(error_payload(&failure.public_error()))
 }
@@ -137,8 +137,12 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 },
             },
             "usage" => events::Event::Usage(events::Usage {
-                input_tokens: object.get("input_tokens").and_then(serde_json::Value::as_u64),
-                output_tokens: object.get("output_tokens").and_then(serde_json::Value::as_u64),
+                input_tokens: object
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                output_tokens: object
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64),
                 cached_input_tokens: object
                     .get("cached_input_tokens")
                     .and_then(serde_json::Value::as_u64),
@@ -150,7 +154,11 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
             "incomplete" => events::Event::Incomplete,
             "failed" => events::Event::Failed(errors::Failure::new(
                 errors::FailureClass::ProviderInternal,
-                if text.is_empty() { "provider stream failed" } else { &text },
+                if text.is_empty() {
+                    "provider stream failed"
+                } else {
+                    &text
+                },
             )),
             other => return Err(format!("unknown event kind: {other}")),
         };

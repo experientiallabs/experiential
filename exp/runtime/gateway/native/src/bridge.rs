@@ -26,7 +26,11 @@ impl Bridge {
     }
 
     /// Call one control-plane method with a JSON-string argument.
-    pub async fn call(&self, method: &'static str, argument: String) -> Result<String, PublicError> {
+    pub async fn call(
+        &self,
+        method: &'static str,
+        argument: String,
+    ) -> Result<String, PublicError> {
         let _permit = self
             .permits
             .acquire()

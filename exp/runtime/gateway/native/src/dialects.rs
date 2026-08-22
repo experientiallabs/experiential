@@ -75,7 +75,10 @@ fn finish_open_tools(tools: &mut BTreeMap<u32, ToolAccumulator>) -> Result<Vec<E
         if !tool.completed {
             tool.completed = true;
             let call = tool.complete().map_err(|message| malformed(&message))?;
-            events.push(Event::ToolCallCompleted { index: *index, call });
+            events.push(Event::ToolCallCompleted {
+                index: *index,
+                call,
+            });
         }
     }
     Ok(events)
@@ -194,7 +197,8 @@ impl Normalizer {
                 let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
                 if item_type == "function_call" {
                     let index = require_u64(&payload, "output_index", "OpenAI output_index")
-                        .map_err(|message| malformed(&message))? as u32;
+                        .map_err(|message| malformed(&message))?
+                        as u32;
                     if self.tools.contains_key(&index) {
                         return Err(malformed("OpenAI stream repeated a tool-call start"));
                     }
@@ -207,7 +211,11 @@ impl Normalizer {
                     let name = require_string(item, "name", "OpenAI function call name")
                         .map_err(|message| malformed(&message))?;
                     let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
-                    events.push(Event::ToolCallStarted { index, call_id, name });
+                    events.push(Event::ToolCallStarted {
+                        index,
+                        call_id,
+                        name,
+                    });
                     if let Some(Value::String(initial)) = item.get("arguments") {
                         if !initial.is_empty() {
                             self.reserve_tool_bytes(initial.len())?;
@@ -220,7 +228,9 @@ impl Normalizer {
                     }
                     self.tools.insert(index, tool);
                 } else if item_type != "message" && item_type != "reasoning" {
-                    return Err(malformed("OpenAI stream emitted an unsupported output item"));
+                    return Err(malformed(
+                        "OpenAI stream emitted an unsupported output item",
+                    ));
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -238,10 +248,7 @@ impl Normalizer {
             "response.function_call_arguments.done" | "response.output_item.done" => {
                 let index = require_u64(&payload, "output_index", "OpenAI output_index")
                     .map_err(|message| malformed(&message))? as u32;
-                let pending = self
-                    .tools
-                    .get(&index)
-                    .is_some_and(|tool| !tool.completed);
+                let pending = self.tools.get(&index).is_some_and(|tool| !tool.completed);
                 if pending {
                     let mut final_arguments = payload
                         .get("arguments")
@@ -339,7 +346,9 @@ impl Normalizer {
                 let message = payload
                     .get("message")
                     .and_then(Value::as_object)
-                    .ok_or_else(|| malformed("Anthropic message_start.message must be an object"))?;
+                    .ok_or_else(|| {
+                        malformed("Anthropic message_start.message must be an object")
+                    })?;
                 let usage = message
                     .get("usage")
                     .and_then(Value::as_object)
@@ -377,7 +386,11 @@ impl Normalizer {
                         }
                         self.tools
                             .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
-                        events.push(Event::ToolCallStarted { index, call_id, name });
+                        events.push(Event::ToolCallStarted {
+                            index,
+                            call_id,
+                            name,
+                        });
                     }
                     Some("text") => {
                         let text = optional_text(block, "text", "Anthropic initial text")?;
@@ -517,8 +530,9 @@ impl Normalizer {
         let mut events = Vec::new();
         if let Some(raw_usage) = payload.get("usage") {
             if !raw_usage.is_null() {
-                self.usage =
-                    Some(openai_compatible_usage(raw_usage).map_err(|message| malformed(&message))?);
+                self.usage = Some(
+                    openai_compatible_usage(raw_usage).map_err(|message| malformed(&message))?,
+                );
             }
         }
         let choices = payload
@@ -529,7 +543,9 @@ impl Normalizer {
             return Ok(events);
         }
         if choices.len() != 1 {
-            return Err(malformed("OpenAI-compatible stream must contain one choice"));
+            return Err(malformed(
+                "OpenAI-compatible stream must contain one choice",
+            ));
         }
         let choice = choices[0]
             .as_object()
@@ -553,17 +569,18 @@ impl Normalizer {
                     .as_array()
                     .ok_or_else(|| malformed("OpenAI-compatible tool_calls must be an array"))?;
                 for value in items {
-                    let item = value
-                        .as_object()
-                        .ok_or_else(|| malformed("OpenAI-compatible tool call must be an object"))?;
+                    let item = value.as_object().ok_or_else(|| {
+                        malformed("OpenAI-compatible tool call must be an object")
+                    })?;
                     let index = require_u64(item, "index", "OpenAI-compatible tool index")
-                        .map_err(|message| malformed(&message))? as u32;
-                    let function = item
-                        .get("function")
-                        .and_then(Value::as_object)
-                        .ok_or_else(|| {
-                            malformed("OpenAI-compatible tool function must be an object")
-                        })?;
+                        .map_err(|message| malformed(&message))?
+                        as u32;
+                    let function =
+                        item.get("function")
+                            .and_then(Value::as_object)
+                            .ok_or_else(|| {
+                                malformed("OpenAI-compatible tool function must be an object")
+                            })?;
                     if let Some(tool) = self.tools.get(&index) {
                         if let Some(Value::String(repeated_id)) = item.get("id") {
                             if repeated_id != &tool.call_id {
@@ -586,7 +603,11 @@ impl Normalizer {
                             .map_err(|message| malformed(&message))?;
                         self.tools
                             .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
-                        events.push(Event::ToolCallStarted { index, call_id, name });
+                        events.push(Event::ToolCallStarted {
+                            index,
+                            call_id,
+                            name,
+                        });
                     }
                     if let Some(fragment) = function.get("arguments") {
                         if !fragment.is_null() {
