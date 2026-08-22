@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class GatewaySchemaError(RuntimeError):
@@ -514,6 +514,15 @@ _MIGRATION_7 = (
     """,
 )
 
+_MIGRATION_8 = (
+    """
+    ALTER TABLE gateway_monthly_budgets
+    ADD COLUMN strict_unknown_cost INTEGER NOT NULL DEFAULT 0 CHECK (
+        strict_unknown_cost IN (0, 1)
+    )
+    """,
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -522,6 +531,7 @@ _MIGRATIONS = {
     5: _MIGRATION_5,
     6: _MIGRATION_6,
     7: _MIGRATION_7,
+    8: _MIGRATION_8,
 }
 
 

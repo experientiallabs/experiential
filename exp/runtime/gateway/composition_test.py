@@ -23,7 +23,7 @@ from exp.runtime.gateway.composition import (
     create_gateway_runtime,
 )
 from exp.runtime.gateway.contracts import ExecutionSnapshot
-from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.lifecycle import LocalGatewayRuntime, load_local_gateway
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.tests.launch_test import _configure_gateway, _LoopbackProvider
@@ -174,7 +174,7 @@ def test_injected_runtime_matches_local_http_surface_end_to_end(tmp_path: Path) 
         environment={"LOOPBACK_PROVIDER_KEY": "provider-secret-canary"},
     )
     service = local.service
-    ledger = cast(SQLiteAttemptLedger, service._ledger)  # noqa: SLF001 - parity seam evidence
+    ledger = cast(GroupCommitAttemptLedger, service._ledger)  # noqa: SLF001 - parity seam evidence
     injected = create_gateway_runtime(
         config=GatewayRuntimeConfig(
             graceful_timeout_seconds=1,
@@ -186,7 +186,7 @@ def test_injected_runtime_matches_local_http_surface_end_to_end(tmp_path: Path) 
         executor=service._executor,  # noqa: SLF001 - parity seam evidence
         clock=service._clock,  # noqa: SLF001 - parity seam evidence
         readiness=service._readiness_probe,  # noqa: SLF001 - parity seam evidence
-        usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
+        usage=lambda: read_usage_report(ledger.core, organization_id=manager.organization_id),
     )
 
     try:
@@ -214,7 +214,7 @@ def _compose_from_local(
 ) -> GatewayRuntime:
     """Recompose local dependencies through the fully injected hosted seam."""
     service = local.service
-    ledger = cast(SQLiteAttemptLedger, service._ledger)  # noqa: SLF001 - parity seam evidence
+    ledger = cast(GroupCommitAttemptLedger, service._ledger)  # noqa: SLF001 - parity seam evidence
     return create_gateway_runtime(
         config=GatewayRuntimeConfig(graceful_timeout_seconds=1),
         authority=service._control,  # noqa: SLF001 - parity seam evidence
@@ -223,7 +223,7 @@ def _compose_from_local(
         executor=service._executor,  # noqa: SLF001 - parity seam evidence
         clock=service._clock,  # noqa: SLF001 - parity seam evidence
         readiness=readiness or service._readiness_probe,  # noqa: SLF001
-        usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
+        usage=lambda: read_usage_report(ledger.core, organization_id=manager.organization_id),
         terminal_flusher=terminal_flusher,
     )
 

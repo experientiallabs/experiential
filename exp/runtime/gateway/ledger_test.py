@@ -165,9 +165,6 @@ def test_attempt_usage_and_integer_cost_are_content_free(tmp_path: Path) -> None
         deployment=_deployment(),
         attempt_ordinal=0,
         route_depth=0,
-    )
-    ledger.record_route_context(
-        attempt_id=attempt_id,
         route_reason="direct_alias",
         fallback_reason=None,
     )

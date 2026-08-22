@@ -89,6 +89,7 @@ class MonthlyBudgetLimit(ContractModel):
     period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     scope: BudgetScope
     limit_micro_usd: int = Field(ge=0, le=MAXIMUM_MICRO_USD)
+    strict_unknown_cost: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -102,6 +103,8 @@ class MonthlyBudgetRemaining(ContractModel):
     settled_micro_usd: int = Field(ge=0)
     remaining_micro_usd: int = Field(ge=0)
     unknown_cost_attempts: int = Field(ge=0)
+    unknown_cost_input_tokens: int = Field(ge=0)
+    unknown_cost_output_tokens: int = Field(ge=0)
     exhausted: bool
 
 
@@ -138,6 +141,7 @@ class SQLiteBudgetStore:
         scope: BudgetScope,
         limit_micro_usd: int,
         replace: bool = False,
+        strict_unknown_cost: bool = False,
     ) -> tuple[bool, MonthlyBudgetLimit]:
         """Create or explicitly replace one monthly hard limit.
 
@@ -147,6 +151,8 @@ class SQLiteBudgetStore:
             scope: Exact allocation target.
             limit_micro_usd: Nonnegative integer hard limit.
             replace: Whether a different existing limit may be replaced.
+            strict_unknown_cost: Whether unpriced attempts fail closed instead of
+                being admitted and tracked as unknown cost with token volume.
 
         Returns:
             Change flag and current typed allocation.
@@ -171,22 +177,27 @@ class SQLiteBudgetStore:
             )
             row = connection.execute(
                 """
-                SELECT limit_micro_usd FROM gateway_monthly_budgets
+                SELECT limit_micro_usd, strict_unknown_cost FROM gateway_monthly_budgets
                 WHERE organization_id = ? AND period_start = ? AND scope_key = ?
                 """,
                 (organization_id, period_start, scope.storage_key()),
             ).fetchone()
             if row is not None:
-                if int(row["limit_micro_usd"]) == limit_micro_usd:
+                unchanged = (
+                    int(row["limit_micro_usd"]) == limit_micro_usd
+                    and bool(row["strict_unknown_cost"]) == strict_unknown_cost
+                )
+                if unchanged:
                     return False, self._read_limit(connection, budget_id)
                 if not replace:
                     raise ValueError("monthly budget exists with another limit; pass --replace")
                 connection.execute(
                     """
                     UPDATE gateway_monthly_budgets
-                    SET limit_micro_usd = ?, updated_at = ? WHERE budget_id = ?
+                    SET limit_micro_usd = ?, strict_unknown_cost = ?, updated_at = ?
+                    WHERE budget_id = ?
                     """,
-                    (limit_micro_usd, now, budget_id),
+                    (limit_micro_usd, int(strict_unknown_cost), now, budget_id),
                 )
                 return True, self._read_limit(connection, budget_id)
             connection.execute(
@@ -194,8 +205,8 @@ class SQLiteBudgetStore:
                 INSERT INTO gateway_monthly_budgets (
                     budget_id, organization_id, period_start, scope_kind, scope_key,
                     identity_id, alias_id, pool_id, deployment_id, limit_micro_usd,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    strict_unknown_cost, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     budget_id,
@@ -208,6 +219,7 @@ class SQLiteBudgetStore:
                     scope.pool_id,
                     scope.deployment_id,
                     limit_micro_usd,
+                    int(strict_unknown_cost),
                     now,
                     now,
                 ),
@@ -253,10 +265,100 @@ class SQLiteBudgetStore:
                     """,
                     (organization_id, period_start),
                 ).fetchall()
-                results = tuple(_remaining_from_row(row) for row in rows)
+                results = tuple(_remaining_from_row(connection, row) for row in rows)
             finally:
                 connection.rollback()
         return results
+
+    def reconcile_unknown_costs(
+        self,
+        *,
+        organization_id: str,
+        period: str,
+        scope: BudgetScope,
+        assigned_cost_micro_usd: int,
+    ) -> tuple[int, MonthlyBudgetRemaining]:
+        """Settle every unknown-cost attempt on one limit at an explicit assigned cost.
+
+        Unknown-cost attempts stay visible on the allocation until an operator
+        deliberately assigns an exact integer micro-USD cost to each of them here,
+        and under a strict limit they block every new reservation until then. Each
+        reconciled attempt keeps its own charge row settled at the assigned cost, so
+        per-attempt attribution stays exact, and a later natural settlement of a
+        reconciled attempt is skipped rather than double-counted.
+
+        Args:
+            organization_id: Tenant whose allocation is reconciled.
+            period: Immutable UTC month in ``YYYY-MM`` form.
+            scope: Exact allocation target holding the unknown-cost attempts.
+            assigned_cost_micro_usd: Nonnegative integer micro-USD charged per attempt.
+
+        Returns:
+            Count of reconciled attempts and the resulting allocation balance.
+
+        Raises:
+            ValueError: The assigned cost is unrepresentable, the limit does not
+                exist, or settling would exceed SQLite integer capacity.
+        """
+        if not 0 <= assigned_cost_micro_usd <= MAXIMUM_MICRO_USD:
+            raise ValueError("assigned cost must fit a nonnegative SQLite integer")
+        period_start = budget_period_start(period)
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM gateway_monthly_budgets
+                WHERE organization_id = ? AND period_start = ? AND scope_key = ?
+                """,
+                (organization_id, period_start, scope.storage_key()),
+            ).fetchone()
+            if row is None:
+                raise ValueError("monthly budget does not exist for this scope and period")
+            budget_id = str(row["budget_id"])
+            charges = connection.execute(
+                """
+                SELECT attempt_id FROM gateway_attempt_budget_charges
+                WHERE budget_id = ?
+                  AND reserved_micro_usd IS NULL AND settled_micro_usd IS NULL
+                ORDER BY attempt_id
+                """,
+                (budget_id,),
+            ).fetchall()
+            if len(charges) != int(row["unknown_cost_attempts"]):
+                raise RuntimeError("monthly budget counters are inconsistent")
+            if not charges:
+                return 0, _remaining_from_row(connection, row)
+            added = assigned_cost_micro_usd * len(charges)
+            if int(row["settled_micro_usd"]) + added > MAXIMUM_MICRO_USD:
+                raise ValueError("settled monthly gateway cost exceeds SQLite integer capacity")
+            for charge in charges:
+                updated = connection.execute(
+                    """
+                    UPDATE gateway_attempt_budget_charges SET settled_micro_usd = ?
+                    WHERE budget_id = ? AND attempt_id = ?
+                      AND reserved_micro_usd IS NULL AND settled_micro_usd IS NULL
+                    """,
+                    (assigned_cost_micro_usd, budget_id, str(charge["attempt_id"])),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("monthly budget counters are inconsistent")
+            updated = connection.execute(
+                """
+                UPDATE gateway_monthly_budgets
+                SET unknown_cost_attempts = unknown_cost_attempts - ?,
+                    settled_micro_usd = settled_micro_usd + ?
+                WHERE budget_id = ? AND unknown_cost_attempts >= ?
+                """,
+                (len(charges), added, budget_id, len(charges)),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("monthly budget counters are inconsistent")
+            fresh = connection.execute(
+                "SELECT * FROM gateway_monthly_budgets WHERE budget_id = ?",
+                (budget_id,),
+            ).fetchone()
+            if fresh is None:
+                raise RuntimeError("monthly budget disappeared inside its transaction")
+            return len(charges), _remaining_from_row(connection, fresh)
 
     def _read_limit(
         self,
@@ -472,7 +574,14 @@ def require_attempt_budget(
     period_start: str,
     maximum_cost_micro_usd: int | None,
 ) -> None:
-    """Atomically require room beneath every limit applicable to one attempt."""
+    """Atomically require room beneath every limit applicable to one attempt.
+
+    A limit with ``strict_unknown_cost`` fails closed: it rejects an unpriced
+    attempt outright and rejects every attempt while unknown-cost attempts remain
+    unresolved. A default limit admits an unpriced attempt, records it as one
+    unknown-cost charge for later reconciliation, and keeps enforcing the hard
+    cap over every known-cost reservation and settlement.
+    """
     rows = connection.execute(
         """
         SELECT * FROM gateway_monthly_budgets
@@ -500,26 +609,46 @@ def require_attempt_budget(
         return
     for row in rows:
         scope_kind = BudgetScopeKind(str(row["scope_kind"]))
+        strict = bool(row["strict_unknown_cost"])
         unknown = int(row["unknown_cost_attempts"])
         charged = int(row["reserved_micro_usd"]) + int(row["settled_micro_usd"])
         limit = int(row["limit_micro_usd"])
-        if unknown:
+        if strict and unknown:
             raise BudgetReservationRejected(
                 scope_kind=scope_kind,
                 reason="monthly hard limit has prior attempts with unknown cost",
             )
         if maximum_cost_micro_usd is None:
-            raise BudgetReservationRejected(
-                scope_kind=scope_kind,
-                reason="monthly hard limit requires a known maximum attempt cost",
-            )
+            if strict:
+                raise BudgetReservationRejected(
+                    scope_kind=scope_kind,
+                    reason="monthly hard limit requires a known maximum attempt cost",
+                )
+            continue
         if maximum_cost_micro_usd > max(0, limit - charged):
             raise BudgetReservationRejected(
                 scope_kind=scope_kind,
                 reason=f"monthly {scope_kind.value} allocation is exhausted",
             )
-    assert maximum_cost_micro_usd is not None
     for row in rows:
+        if maximum_cost_micro_usd is None:
+            connection.execute(
+                """
+                UPDATE gateway_monthly_budgets
+                SET unknown_cost_attempts = unknown_cost_attempts + 1
+                WHERE budget_id = ?
+                """,
+                (str(row["budget_id"]),),
+            )
+            connection.execute(
+                """
+                INSERT INTO gateway_attempt_budget_charges (
+                    budget_id, attempt_id
+                ) VALUES (?, ?)
+                """,
+                (str(row["budget_id"]), attempt_id),
+            )
+            continue
         connection.execute(
             """
             UPDATE gateway_monthly_budgets
@@ -600,14 +729,19 @@ def settle_attempt_budgets(
             raise RuntimeError("attempt budget charge is already settled")
 
 
-def _remaining_from_row(row: sqlite3.Row) -> MonthlyBudgetRemaining:
-    """Decode one materialized allocation balance without scanning attempt history."""
+def _remaining_from_row(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> MonthlyBudgetRemaining:
+    """Decode one materialized allocation balance and its unknown-cost token volume."""
     budget = _limit_from_row(row)
     reserved = int(row["reserved_micro_usd"])
     settled = int(row["settled_micro_usd"])
     charged = reserved + settled
     unknown = int(row["unknown_cost_attempts"])
-    remaining = 0 if unknown else max(0, budget.limit_micro_usd - charged)
+    strict = budget.strict_unknown_cost
+    remaining = 0 if strict and unknown else max(0, budget.limit_micro_usd - charged)
+    input_tokens, output_tokens = _unknown_token_volume(connection, str(row["budget_id"]))
     return MonthlyBudgetRemaining(
         budget=budget,
         charged_micro_usd=charged,
@@ -615,8 +749,39 @@ def _remaining_from_row(row: sqlite3.Row) -> MonthlyBudgetRemaining:
         settled_micro_usd=settled,
         remaining_micro_usd=remaining,
         unknown_cost_attempts=unknown,
-        exhausted=unknown > 0 or charged >= budget.limit_micro_usd,
+        unknown_cost_input_tokens=input_tokens,
+        unknown_cost_output_tokens=output_tokens,
+        exhausted=(strict and unknown > 0) or charged >= budget.limit_micro_usd,
     )
+
+
+def _unknown_token_volume(
+    connection: sqlite3.Connection,
+    budget_id: str,
+) -> tuple[int, int]:
+    """Sum observed token volume across one limit's unresolved unknown-cost attempts.
+
+    Input volume includes cached input tokens and output volume includes reasoning
+    tokens, so operators can gauge the real traffic behind attempts whose price is
+    still unknown.
+    """
+    row = connection.execute(
+        """
+        SELECT
+            COALESCE(SUM(
+                COALESCE(a.input_tokens, 0) + COALESCE(a.cached_input_tokens, 0)
+            ), 0) AS input_volume,
+            COALESCE(SUM(
+                COALESCE(a.output_tokens, 0) + COALESCE(a.reasoning_tokens, 0)
+            ), 0) AS output_volume
+        FROM gateway_attempt_budget_charges AS c
+        JOIN gateway_attempts AS a ON a.attempt_id = c.attempt_id
+        WHERE c.budget_id = ?
+          AND c.reserved_micro_usd IS NULL AND c.settled_micro_usd IS NULL
+        """,
+        (budget_id,),
+    ).fetchone()
+    return int(row["input_volume"]), int(row["output_volume"])
 
 
 def _backfill_budget(connection: sqlite3.Connection, *, budget_id: str) -> None:
@@ -731,6 +896,7 @@ def _limit_from_row(row: sqlite3.Row) -> MonthlyBudgetLimit:
             deployment_id=(None if row["deployment_id"] is None else str(row["deployment_id"])),
         ),
         limit_micro_usd=int(row["limit_micro_usd"]),
+        strict_unknown_cost=bool(row["strict_unknown_cost"]),
         created_at=datetime.fromisoformat(str(row["created_at"])),
         updated_at=datetime.fromisoformat(str(row["updated_at"])),
     )

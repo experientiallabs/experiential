@@ -37,6 +37,7 @@ from exp.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from exp.runtime.gateway.execution import GatewayExecutor
+from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
@@ -77,6 +78,7 @@ class LocalGatewayRuntime:
     runtime: GatewayRuntime
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
+    write_ledger: GroupCommitAttemptLedger | None = None
 
     @property
     def app(self) -> FastAPI:
@@ -106,8 +108,11 @@ class LocalGatewayRuntime:
         return await self.runtime.drain(timeout_seconds=timeout_seconds)
 
     async def shutdown(self) -> bool:
-        """Shut down the shared runtime within its local bound."""
-        return await self.runtime.shutdown()
+        """Shut down the shared runtime, then stop the drained ledger writer."""
+        stopped = await self.runtime.shutdown()
+        if self.write_ledger is not None:
+            self.write_ledger.close()
+        return stopped
 
 
 @dataclass(frozen=True)
@@ -355,6 +360,7 @@ class LocalGatewayComponents:
     manager: GatewayManagement
     store: GatewayControlStore
     ledger: SQLiteAttemptLedger
+    write_ledger: GroupCommitAttemptLedger
     routes: CatalogRouteResolver
     executor: GatewayExecutor
     reloader: _AliasAuthorityReloader
@@ -404,6 +410,7 @@ def load_gateway_components(
     store = manager.require_initialized()
     manager.migrate_legacy_provider_connections()
     ledger = SQLiteAttemptLedger(manager.database_path)
+    write_ledger = GroupCommitAttemptLedger(ledger)
     expired, unknown = ledger.reconcile_crashed_requests(cleanup_grace=timedelta(seconds=5))
 
     def loader() -> _AliasAuthorityState:
@@ -422,7 +429,7 @@ def load_gateway_components(
         project_resolver=_project_resolver(state.activations, state.exact_models),
         listing_pools=state.listing_pools,
     )
-    executor = GatewayExecutor(state.runtime_catalogs, ledger)
+    executor = GatewayExecutor(state.runtime_catalogs, write_ledger)
     reloader = _AliasAuthorityReloader(
         loader=loader,
         state=state,
@@ -433,6 +440,7 @@ def load_gateway_components(
         manager=manager,
         store=_ReadyControlStore(store=store, reloader=reloader),
         ledger=ledger,
+        write_ledger=write_ledger,
         routes=routes,
         executor=executor,
         reloader=reloader,
@@ -475,7 +483,7 @@ def compose_local_gateway(
             title="EXP local gateway",
         ),
         authority=components.store,
-        ledger=components.ledger,
+        ledger=components.write_ledger,
         routes=components.routes,
         executor=components.executor,
         clock=SystemGatewayClock(),
@@ -486,9 +494,11 @@ def compose_local_gateway(
         ),
         replay=replay,
         continuations=continuations,
+        terminal_flusher=components.write_ledger.flush,
     )
     return LocalGatewayRuntime(
         runtime=runtime,
+        write_ledger=components.write_ledger,
         reconciled_expired_requests=components.reconciled_expired_requests,
         reconciled_unknown_attempts=components.reconciled_unknown_attempts,
     )

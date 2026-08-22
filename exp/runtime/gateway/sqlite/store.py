@@ -39,6 +39,8 @@ from exp.runtime.gateway.sqlite.provider_authority import (
 )
 from exp.runtime.gateway.sqlite.provider_store import ProviderConnectionStoreMixin
 
+_LAST_USED_REFRESH_SECONDS = 60.0
+
 
 class GatewayStoreError(ValueError):
     """A control-store mutation or lookup violates gateway authority invariants."""
@@ -805,6 +807,10 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
     ) -> tuple[str, str, str]:
         """Authenticate one key inside the caller's authority transaction.
 
+        The key's last-used timestamp is operator telemetry with deliberate
+        coarse granularity: it is rewritten at most once per refresh interval
+        so hot keys do not dirty a page and pay a durable write per request.
+
         Args:
             connection: Immediate transaction retained through the authority read.
             raw_key: Caller key that must never enter SQLite or logs.
@@ -823,7 +829,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             """
             SELECT k.organization_id, k.identity_id, k.key_id,
                    k.fingerprint_version, k.fingerprint_sha256,
-                   k.expires_at, k.revoked_at, i.active AS identity_active,
+                   k.expires_at, k.revoked_at, k.last_used_at,
+                   i.active AS identity_active,
                    o.active AS organization_active
             FROM virtual_keys AS k
             JOIN identities AS i
@@ -857,13 +864,20 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         organization_id = str(selected["organization_id"])
         identity_id = str(selected["identity_id"])
         key_id = str(selected["key_id"])
-        connection.execute(
-            """
-            UPDATE virtual_keys SET last_used_at = ?
-            WHERE organization_id = ? AND key_id = ?
-            """,
-            (utc_text(now), organization_id, key_id),
+        last_used = selected["last_used_at"]
+        stale = (
+            last_used is None
+            or (now - datetime.fromisoformat(str(last_used))).total_seconds()
+            >= _LAST_USED_REFRESH_SECONDS
         )
+        if stale:
+            connection.execute(
+                """
+                UPDATE virtual_keys SET last_used_at = ?
+                WHERE organization_id = ? AND key_id = ?
+                """,
+                (utc_text(now), organization_id, key_id),
+            )
         return organization_id, identity_id, key_id
 
     @contextmanager

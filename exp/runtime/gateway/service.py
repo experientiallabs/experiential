@@ -38,6 +38,7 @@ from exp.runtime.gateway.execution import (
     GatewayExecutionStream,
     GatewayExecutor,
 )
+from exp.runtime.gateway.group_commit import abandoned_write_outcome
 from exp.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayControlStore
 from exp.runtime.gateway.ledger import IdempotencyConflictError, IdempotencyReplayUnavailableError
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute, GatewayRoutingError
@@ -330,10 +331,9 @@ class GatewayService:
         lease = None if key is None else await self._replays.claim(key)
         if lease is not None and lease.kind != ReplayClaimKind.OWNER:
             return _cached_response(await lease.result())
-        accepted = False
+        accept = asyncio.ensure_future(self._ledger.accept_request(authorization=authorization))
         try:
-            self._ledger.accept_request(authorization=authorization)
-            accepted = True
+            await asyncio.shield(accept)
             route = await self._routes.resolve(
                 authorization=authorization,
                 request=execution_request,
@@ -341,9 +341,12 @@ class GatewayService:
             )
             stream = await self._executor.start(route=route, request=execution_request)
         except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                await abandoned_write_outcome(accept)
+            accepted = accept.done() and not accept.cancelled() and accept.exception() is None
             request_finalized = isinstance(exc, GatewayExecutionError) and exc.request_finalized
             if accepted and not request_finalized:
-                _finish_request_quietly(
+                await _finish_request_quietly(
                     self._ledger,
                     authorization=authorization,
                     failure=_failure_for_exception(exc),
@@ -980,7 +983,7 @@ def _failure_for_exception(exception: BaseException) -> GatewayFailure:
     return normalized_provider_failure(exception)
 
 
-def _finish_request_quietly(
+async def _finish_request_quietly(
     ledger: AttemptLedger,
     *,
     authorization: AuthorizationSnapshot,
@@ -989,7 +992,7 @@ def _finish_request_quietly(
 ) -> None:
     """Attempt durable pre-dispatch finalization without masking the primary failure."""
     try:
-        ledger.finish_request(authorization=authorization, failure=failure)
+        await ledger.finish_request(authorization=authorization, failure=failure)
     except BaseException:  # noqa: BLE001 - primary request failure remains authoritative
         accounting_failure()
         return

@@ -23,6 +23,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.group_commit import abandoned_write_outcome
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.interfaces import AttemptLedger, ProviderStream
 from exp.runtime.gateway.ledger import GatewayLedgerError
@@ -388,7 +389,7 @@ class GatewayExecutionStream:
                 current.tool_names,
             )
             try:
-                self._ledger.finish_attempt(
+                await self._ledger.finish_attempt(
                     attempt_id=current.attempt_id,
                     terminal_event=terminal,
                     failure=failure,
@@ -456,23 +457,27 @@ class GatewayExecutionStream:
         attempt_id: str | None = None
         try:
             self._deadline.attempt_timeout()
-            attempt_id = self._ledger.start_attempt(
-                snapshot=self._route.snapshot,
-                deployment=binding.deployment,
-                attempt_ordinal=self._total_attempts,
-                route_depth=route_index,
-                maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(
-                    self._request,
-                    binding.deployment,
-                ),
+            reservation = asyncio.ensure_future(
+                self._ledger.start_attempt(
+                    snapshot=self._route.snapshot,
+                    deployment=binding.deployment,
+                    attempt_ordinal=self._total_attempts,
+                    route_depth=route_index,
+                    maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(
+                        self._request,
+                        binding.deployment,
+                    ),
+                    route_reason=self._route.route_reason,
+                    fallback_reason=self._route.fallback_reason,
+                )
             )
+            try:
+                attempt_id = await asyncio.shield(reservation)
+            except asyncio.CancelledError:
+                attempt_id = await abandoned_write_outcome(reservation)
+                raise
             self._attempt_counts[route_index] += 1
             self._total_attempts += 1
-            self._ledger.record_route_context(
-                attempt_id=attempt_id,
-                route_reason=self._route.route_reason,
-                fallback_reason=self._route.fallback_reason,
-            )
             current = _PhysicalAttempt(
                 route_index=route_index,
                 attempt_id=attempt_id,
@@ -519,7 +524,7 @@ class GatewayExecutionStream:
     ) -> None:
         """Settle one provider opening failure before another physical dispatch."""
         try:
-            self._ledger.finish_attempt(
+            await self._ledger.finish_attempt(
                 attempt_id=dispatch_failure.attempt_id,
                 terminal_event=None,
                 failure=dispatch_failure.failure,
@@ -547,7 +552,7 @@ class GatewayExecutionStream:
             if current.settled:
                 return
             try:
-                self._ledger.finish_attempt(
+                await self._ledger.finish_attempt(
                     attempt_id=current.attempt_id,
                     terminal_event=terminal,
                     failure=failure,
@@ -666,7 +671,7 @@ class GatewayExecutionStream:
         if self._parent_finalized:
             return
         try:
-            self._ledger.finish_request(
+            await self._ledger.finish_request(
                 authorization=self._route.snapshot.authorization,
                 failure=failure,
             )

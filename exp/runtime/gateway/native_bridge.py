@@ -350,9 +350,6 @@ class NativeControlPlane:
                 attempt_ordinal=0,
                 route_depth=0,
                 maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(request, deployment),
-            )
-            self._components.ledger.record_route_context(
-                attempt_id=attempt_id,
                 route_reason=route.route_reason,
                 fallback_reason=route.fallback_reason,
             )

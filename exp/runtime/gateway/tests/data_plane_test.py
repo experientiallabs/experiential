@@ -158,11 +158,11 @@ class _Ledger:
         self.fail_finishes = False
         self.fail_starts = False
 
-    def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
+    async def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Capture accepted authority only."""
         self.accepted.append(authorization)
 
-    def start_attempt(
+    async def start_attempt(
         self,
         *,
         snapshot: ExecutionSnapshot,
@@ -170,26 +170,18 @@ class _Ledger:
         attempt_ordinal: int,
         route_depth: int,
         maximum_cost_micro_usd: int | None = None,
+        route_reason: str | None = None,
+        fallback_reason: str | None = None,
     ) -> str:
         """Capture dispatch identity and return a deterministic attempt ID."""
         del deployment, attempt_ordinal, route_depth, maximum_cost_micro_usd
         if self.fail_starts:
             raise GatewayLedgerError("attempt reservation unavailable")
         self.started.append(snapshot)
+        self.routes.append((route_reason, fallback_reason))
         return f"attempt-{len(self.started)}"
 
-    def record_route_context(
-        self,
-        *,
-        attempt_id: str,
-        route_reason: str | None,
-        fallback_reason: str | None,
-    ) -> None:
-        """Capture sanitized route context."""
-        del attempt_id
-        self.routes.append((route_reason, fallback_reason))
-
-    def finish_attempt(
+    async def finish_attempt(
         self,
         *,
         attempt_id: str,
@@ -203,7 +195,7 @@ class _Ledger:
             raise RuntimeError("terminal ledger unavailable")
         self.finished.append((terminal_event, failure))
 
-    def finish_request(
+    async def finish_request(
         self,
         *,
         authorization: AuthorizationSnapshot,
