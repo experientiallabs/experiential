@@ -26,7 +26,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.group_commit import abandoned_write_outcome
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.interfaces import AttemptLedger, ProviderStream
-from exp.runtime.gateway.ledger import GatewayLedgerError
+from exp.runtime.gateway.ledger import AttemptRejectedError, GatewayLedgerError
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers import (
@@ -505,7 +505,9 @@ class GatewayExecutionStream:
                 # The settlement path terminalizes the accepted request and latches only if
                 # that write is itself lost.
                 self._health.release_probe(binding.health_key)
-                if isinstance(exc, asyncio.CancelledError):
+                if isinstance(exc, (asyncio.CancelledError, AttemptRejectedError)):
+                    # A typed rejection owns its public shape: it propagates
+                    # unchanged, with no fallback and no reshaping.
                     raise
                 raise GatewayExecutionError(_pre_dispatch_failure(exc)) from exc
             failure = normalized_provider_failure(exc)

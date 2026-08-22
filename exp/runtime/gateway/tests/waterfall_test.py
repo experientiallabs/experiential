@@ -40,7 +40,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.execution import GatewayExecutionError, GatewayExecutor
 from exp.runtime.gateway.health import DeploymentHealthRegistry
-from exp.runtime.gateway.ledger import GatewayLedgerError
+from exp.runtime.gateway.ledger import AttemptRejectedError, GatewayLedgerError
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
 from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers import ProviderDeadlineExceeded, RequestDeadline
@@ -740,6 +740,51 @@ def test_pre_dispatch_start_failure_does_not_latch_and_still_serves() -> None:
     asyncio.run(scenario())
 
 
+def test_typed_start_rejection_keeps_shape_without_latch_or_fallback() -> None:
+    """A typed pre-dispatch rejection propagates unchanged, skipping fallback and the latch."""
+
+    async def scenario() -> None:
+        """Reject one reservation with a typed shape, then reserve and serve a later request."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        ledger = _WaterfallLedger()
+        rejection = AttemptRejectedError(
+            "virtual key was revoked between accept and dispatch",
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.AUTHENTICATION,
+                safe_message="the gateway key is invalid, expired, or revoked",
+            ),
+        )
+        ledger.reject_starts = rejection
+        provider = _ScriptedProvider([_completed_stream("served")])
+        fallback = _ScriptedProvider([_completed_stream("fallback")])
+        executor = _executor(
+            (first, second),
+            {first.source_alias: provider, second.source_alias: fallback},
+            ledger,
+        )
+
+        with pytest.raises(AttemptRejectedError) as raised:
+            await executor.start(route=_route((first, second)), request=_request())
+        assert raised.value is rejection
+        assert ledger.budget_checks == [first.deployment_id]
+        assert ledger.started == []
+        assert ledger.finished == []
+        assert ledger.parent_finishes == []
+        assert fallback.idempotency_keys == []
+
+        executor.require_healthy()
+
+        ledger.reject_starts = None
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+        assert events[-1].kind == GatewayEventKind.COMPLETED
+        assert [entry[0] for entry in ledger.started] == [first.deployment_id]
+        executor.require_healthy()
+
+    asyncio.run(scenario())
+
+
 def test_first_semantic_event_freezes_route_even_when_provider_later_fails() -> None:
     """Outward semantic output prevents a later provider failure from advancing routes."""
 
@@ -1325,6 +1370,7 @@ class _WaterfallLedger:
         self.rejected_scope = rejected_scope
         self.budget_checks: list[str] = []
         self.fail_starts = False
+        self.reject_starts: AttemptRejectedError | None = None
 
     async def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Accept a parent request when a service-level test requires it."""
@@ -1347,6 +1393,8 @@ class _WaterfallLedger:
         self.budget_checks.append(deployment.deployment_id)
         if self.fail_starts:
             raise GatewayLedgerError("attempt reservation unavailable")
+        if self.reject_starts is not None:
+            raise self.reject_starts
         if deployment.deployment_id in self.rejected_deployments:
             raise BudgetReservationRejected(
                 scope_kind=self.rejected_scope,

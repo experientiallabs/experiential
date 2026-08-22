@@ -53,7 +53,11 @@ from exp.runtime.gateway.execution import (
     GatewayExecutor,
     _require_deployment_identity,
 )
-from exp.runtime.gateway.ledger import GatewayLedgerError
+from exp.runtime.gateway.ledger import (
+    AttemptRejectedError,
+    GatewayLedgerError,
+    IdempotencyConflictError,
+)
 from exp.runtime.gateway.routing import (
     CatalogRouteResolver,
     GatewayRoute,
@@ -162,6 +166,7 @@ class _Ledger:
         self.finished: list[tuple[GatewayEvent | None, GatewayFailure | None]] = []
         self.fail_finishes = False
         self.fail_starts = False
+        self.reject_starts: AttemptRejectedError | None = None
 
     async def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Capture accepted authority only."""
@@ -182,6 +187,8 @@ class _Ledger:
         del deployment, attempt_ordinal, route_depth, maximum_cost_micro_usd
         if self.fail_starts:
             raise GatewayLedgerError("attempt reservation unavailable")
+        if self.reject_starts is not None:
+            raise self.reject_starts
         self.started.append(snapshot)
         self.routes.append((route_reason, fallback_reason))
         return f"attempt-{len(self.started)}"
@@ -1139,6 +1146,45 @@ def test_pre_dispatch_start_failure_keeps_readiness_and_serves_other_requests() 
         await service.preflight()
 
         ledger.fail_starts = False
+        response = await asyncio.wait_for(
+            service.complete(raw_key="caller-secret", decoded=decoded),
+            timeout=0.5,
+        )
+        assert response.status_code == 200
+
+    asyncio.run(scenario())
+
+
+def test_typed_start_rejection_settles_request_with_its_own_shape() -> None:
+    """A typed reservation rejection keeps its exception type and settles the request."""
+
+    async def scenario() -> None:
+        """Reject one reservation with a 409-shaped conflict, then prove readiness and serving."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0),)
+            )
+        )
+        service, _control, ledger, _proof = _service(provider)
+        ledger.reject_starts = IdempotencyConflictError(
+            "caller operation key was reused with different request content"
+        )
+        decoded = decode_chat(
+            {
+                "model": "public-model",
+                "messages": [{"role": "user", "content": "account"}],
+            }
+        )
+
+        with pytest.raises(IdempotencyConflictError) as raised:
+            await service.complete(raw_key="caller-secret", decoded=decoded)
+        assert raised.value.failure.failure_class == GatewayFailureClass.INVALID_REQUEST
+        assert ledger.started == []
+        assert ledger.finished == [(None, raised.value.failure)]
+
+        await service.preflight()
+
+        ledger.reject_starts = None
         response = await asyncio.wait_for(
             service.complete(raw_key="caller-secret", decoded=decoded),
             timeout=0.5,

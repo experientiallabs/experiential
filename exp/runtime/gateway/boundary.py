@@ -15,6 +15,7 @@ from exp.runtime.gateway.aggregation import GatewayAggregationOverflowError
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.execution import GatewayExecutionError
 from exp.runtime.gateway.ledger import (
+    AttemptRejectedError,
     IdempotencyConflictError,
     IdempotencyReplayUnavailableError,
 )
@@ -92,6 +93,11 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
             error_type="api_error",
             param="Idempotency-Key",
         )
+    elif isinstance(exception, AttemptRejectedError):
+        # A typed pre-dispatch rejection without a more specific branch above
+        # keeps the shape its ledger assigned (for example an injected ledger's
+        # dispatch-time key revocation surfacing as authentication).
+        error = public_failure_error(exception.failure)
     elif isinstance(exception, GatewayExecutionError):
         error = public_failure_error(exception.failure)
     elif isinstance(exception, ProviderDeadlineExceeded):
