@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +13,7 @@ from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest import mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -39,12 +41,16 @@ from exp.runtime.gateway.catalog_authority import (
 )
 from exp.runtime.gateway.lifecycle import (
     GatewayLifecycleError,
+    _ReadyControlStore,
     gateway_instance_lock,
+    load_gateway_components,
     load_local_gateway,
 )
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.project_activation import ProjectActivation, ProjectActivationError
+from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.openai_protocol.requests import decode_chat
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
     BoundedReplayStore,
@@ -1346,3 +1352,94 @@ def _configured_project_pool(
     manager.add_grant(identity_id="default", alias_id="coding")
     issued = manager.issue_key(identity_id="default", key_id="key-one")
     return manager, issued.raw_key
+
+
+def _activate_coding_revision_two(root: Path, manager: GatewayManagement) -> str:
+    """Repoint the coding alias at a second revision and return its catalog digest."""
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        root,
+        deployment_alias="coding",
+        connection_name="provider-main",
+        provider_model="provider-model-next",
+        exact_model_id="model-revision-next",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=True,
+    )
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-two",
+        pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    return normalized.identity_sha256()
+
+
+def test_authority_minted_at_the_swap_instant_stays_authorized_on_the_retired_revision(
+    tmp_path: Path,
+) -> None:
+    """An authorization minted just before a hot activation swap keeps serving.
+
+    The retired revision's retained catalogs make the freshly minted authority
+    servable, so the ready gate must not reject it with a client-visible error.
+    """
+    manager, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    ready = components.store
+    assert isinstance(ready, _ReadyControlStore)
+    request = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "hi"}]}
+    ).request
+    old = ready.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=time.monotonic() + 30.0,
+    )
+    assert old.alias_revision_id == "revision-one"
+    new_digest = _activate_coding_revision_two(tmp_path, manager)
+    components.reloader.refresh_if_drifted(("coding", "revision-two", new_digest))
+    with mock.patch.object(ready.store, "authorize_request", return_value=old):
+        pinned = ready.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=request,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+    assert pinned.alias_revision_id == "revision-one"
+    fresh = ready.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=time.monotonic() + 30.0,
+    )
+    assert fresh.alias_revision_id == "revision-two"
+
+
+def test_reload_failure_keeps_the_previous_generation_and_maps_to_routing_error(
+    tmp_path: Path,
+) -> None:
+    """Any loader failure during drift refresh raises the sanitized routing error."""
+    _manager, _raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    reloader = components.reloader
+    with mock.patch.object(
+        reloader,
+        "_loader",
+        side_effect=OSError("catalog snapshot mid-write"),
+    ):
+        with pytest.raises(GatewayRoutingError, match="failed to load"):
+            reloader.refresh_if_drifted(("coding", "revision-ghost", "digest-ghost"))
+    state = reloader.state
+    assert any(alias == "coding" for alias, _revision, _digest in state.authorities)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from unittest import mock
@@ -10,10 +11,22 @@ from unittest import mock
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.common.models import (
+    GatewayDeploymentCapabilities,
+    GatewayTokenPrices,
+    ModelCapabilities,
+)
+from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayRequest,
+)
 from exp.runtime.gateway.discovery import listing_metadata_by_alias
-from exp.runtime.gateway.lifecycle import load_gateway_components
+from exp.runtime.gateway.lifecycle import _ReadyControlStore, load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
@@ -330,7 +343,7 @@ def test_models_and_detail_mirror_the_python_discovery_bodies(tmp_path: Path) ->
 
     models = json.loads(control.models(json.dumps({"raw_key": raw_key})))
     assert [item["id"] for item in models["data"]] == ["coding"]
-    assert models["wmo"]["authority_schema_version"] == 1
+    assert models["exp"]["authority_schema_version"] == 1
     listed = models["data"][0]
     for key, value in metadata["coding"].extension_fields().items():
         assert listed[key] == value
@@ -454,3 +467,113 @@ def test_rust_chat_sse_frames_match_python_encoder() -> None:
         json.dumps(fixture),
     )
     assert list(actual) == expected
+
+
+def _activate_revision_two(root: Path, manager: GatewayManagement) -> str:
+    """Repoint the coding alias at a new revision and return its catalog digest."""
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        root,
+        deployment_alias="coding",
+        connection_name="provider-main",
+        provider_model="provider-model-next",
+        exact_model_id="model-revision-next",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=True,
+    )
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-two",
+        pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    return normalized.identity_sha256()
+
+
+def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
+    tmp_path: Path,
+) -> None:
+    """An admission whose authority was minted just before a hot activation
+    lands, serves on the retired revision instead of failing at the boundary."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components)
+    ready = components.store
+    assert isinstance(ready, _ReadyControlStore)
+    inner = ready.store
+    minted = threading.Event()
+    swapped = threading.Event()
+    original = inner.authorize_request
+
+    def stalled_authorize(
+        *,
+        raw_key: str,
+        alias: str,
+        request: GatewayRequest,
+        deadline_monotonic: float,
+    ) -> AuthorizationSnapshot:
+        """Mint the authorization, then stall until the activation swap lands."""
+        authorization = original(
+            raw_key=raw_key,
+            alias=alias,
+            request=request,
+            deadline_monotonic=deadline_monotonic,
+        )
+        minted.set()
+        assert swapped.wait(timeout=10)
+        return authorization
+
+    outcomes: list[JsonObject] = []
+    errors: list[BaseException] = []
+
+    def admit_old() -> None:
+        """Admit one request racing the activation swap."""
+        try:
+            outcomes.append(_admit(control, raw_key, _chat_body()))
+        except BaseException as exc:  # noqa: BLE001 - the test asserts no error.
+            errors.append(exc)
+
+    racer = threading.Thread(target=admit_old)
+    with mock.patch.object(inner, "authorize_request", side_effect=stalled_authorize):
+        racer.start()
+        assert minted.wait(timeout=10)
+        new_digest = _activate_revision_two(tmp_path, manager)
+    components.reloader.refresh_if_drifted(("coding", "revision-two", new_digest))
+    swapped.set()
+    racer.join(timeout=15)
+    assert not racer.is_alive()
+
+    assert errors == []
+    assert len(outcomes) == 1
+    pinned = outcomes[0]
+    assert pinned["alias_revision_id"] == "revision-one"
+    assert pinned["model_id"] == "provider-model-exact"
+    fresh = _admit(control, raw_key, _chat_body())
+    assert fresh["alias_revision_id"] == "revision-two"
+    assert fresh["model_id"] == "provider-model-next"
+    for admission in (pinned, fresh):
+        assert (
+            control.settle(
+                json.dumps(
+                    {
+                        "request_id": admission["request_id"],
+                        "attempt_id": admission["attempt_id"],
+                        "outcome": "completed",
+                        "usage": {"input_tokens": 3, "output_tokens": 2},
+                        "tool_names": [],
+                        "failure": None,
+                    }
+                )
+            )
+            == "{}"
+        )
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 2

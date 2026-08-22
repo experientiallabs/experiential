@@ -190,7 +190,7 @@ class _AliasAuthorityReloader:
                 return state
             try:
                 loaded = self._loader()
-            except GatewayLifecycleError as exc:
+            except Exception as exc:  # noqa: BLE001 - any load failure keeps the previous generation.
                 _logger.warning("gateway alias authority reload failed: %s", exc)
                 raise GatewayRoutingError(
                     "alias authority changed but the new revision failed to load; "
@@ -261,6 +261,27 @@ class _AliasAuthorityReloader:
         self._state = merged
 
 
+def _revision_served(
+    state: _AliasAuthorityState,
+    authorization: AuthorizationSnapshot,
+) -> bool:
+    """Return whether the authorized revision's catalogs are loaded in this generation.
+
+    A freshly minted SQLite authorization can name a revision retired by a
+    concurrent activation; its retained normalized and runtime catalogs keep it
+    servable for the retention window, exactly like admitted in-flight work.
+
+    Args:
+        state: Current immutable authority generation.
+        authorization: Frozen authority snapshot minted by SQLite.
+
+    Returns:
+        True when both catalogs for the authorized revision are resolvable.
+    """
+    key = (authorization.alias_revision_id, authorization.catalog_sha256)
+    return key in state.normalized_catalogs and key in state.runtime_catalogs
+
+
 @dataclass(frozen=True)
 class _ReadyControlStore:
     """Filter public authority through the current hot-reloadable ready generation."""
@@ -298,7 +319,13 @@ class _ReadyControlStore:
         request: GatewayRequest,
         deadline_monotonic: float,
     ) -> AuthorizationSnapshot:
-        """Authorize only an alias revision proven ready, reloading once on drift."""
+        """Authorize only an alias revision this process can serve, reloading once on drift.
+
+        A revision retired by a concurrent activation stays authorized while its
+        retained catalogs can still serve it, so a request whose SQLite authority
+        was minted an instant before the swap is pinned to its revision instead
+        of being rejected at the swap boundary.
+        """
         authorization = self.store.authorize_request(
             raw_key=raw_key,
             alias=alias,
@@ -311,9 +338,9 @@ class _ReadyControlStore:
             authorization.catalog_sha256,
         )
         state = self.reloader.state
-        if authority not in state.authorities:
+        if authority not in state.authorities and not _revision_served(state, authorization):
             state = self.reloader.refresh_if_drifted(authority)
-        if authority not in state.authorities:
+        if authority not in state.authorities and not _revision_served(state, authorization):
             raise GatewayRoutingError("authorized alias revision is unavailable in this process")
         return authorization
 
