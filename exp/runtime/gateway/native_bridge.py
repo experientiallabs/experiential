@@ -38,6 +38,7 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayRequest,
     GatewayUsage,
 )
 from exp.runtime.gateway.discovery import (
@@ -735,17 +736,6 @@ class NativeControlPlane:
         one policy execution path. Request-time embedding failure falls back
         to the frozen conservative baseline inside the shared runtime, and
         neither path mutates policy or evidence.
-
-        Args:
-            authorization: Frozen authenticated alias revision and target.
-            request: Canonical decoded gateway request.
-
-        Returns:
-            Frozen exact model, pool, and one launch deployment.
-
-        Raises:
-            GatewayRoutingError: Catalog identity or target resolution failed.
-            ProviderDeadlineExceeded: No request-wide time remains.
         """
         if isinstance(authorization.target, DirectTarget):
             return self._components.routes.resolve_direct(authorization)

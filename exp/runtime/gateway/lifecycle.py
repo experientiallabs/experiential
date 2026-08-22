@@ -159,8 +159,7 @@ class _AliasAuthorityReloader:
             state: Fully validated startup generation.
             routes: Shared route resolver whose catalog index this reloader swaps.
             executor: Shared executor whose runtime catalogs this reloader swaps.
-            selection_workers: Process-wide bounded selection lane every replacement
-                project resolver keeps using, so a reload cannot widen the bound.
+            selection_workers: Process-wide selection lane reused by every generation.
             retention_seconds: How long retired revisions stay resolvable.
             monotonic: Monotonic clock used for retirement bookkeeping.
         """
@@ -264,9 +263,7 @@ class _AliasAuthorityReloader:
         self._routes.swap_catalogs(
             normalized,
             project_resolver=_project_resolver(
-                activations,
-                exact_models,
-                selection_workers=self._selection_workers,
+                activations, exact_models, selection_workers=self._selection_workers
             ),
             listing_pools=listing_pools,
         )
@@ -472,9 +469,7 @@ def load_gateway_components(
     routes = CatalogRouteResolver(
         state.normalized_catalogs,
         project_resolver=_project_resolver(
-            state.activations,
-            state.exact_models,
-            selection_workers=selection_workers,
+            state.activations, state.exact_models, selection_workers=selection_workers
         ),
         listing_pools=state.listing_pools,
     )
