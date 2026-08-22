@@ -4,7 +4,7 @@ Copy-paste prompts for getting started with the hosted Experiential Labs gateway
 (dashboard https://platform.experientiallabs.ai, API https://api.experientiallabs.ai/v1, OpenAI and Anthropic compatible). Paste the
 prompt you want into your coding agent (Claude Code, Cursor, Codex, Aider, or
 Conductor) and it runs the setup for you. Your account is created instantly from
-your email; verifying that email unlocks platform credits, and everything else
+the email you give the agent; verifying that email unlocks platform credits, and everything else
 works right away. This file mirrors the machine-readable contract at
 https://platform.experientiallabs.ai/llms.txt.
 
@@ -15,8 +15,8 @@ own shipped copy, reproduced verbatim.
 
 I pasted this into you myself — please create an Experiential Labs account for
 me and then pull my existing LLM traces onto the platform as telemetry. This is
-my consent to create the account under my identity (using the email you find on
-this machine), to read my own trace files, and to use the observability
+my consent to create the account under my identity (using the email I give you
+when you ask), to read my own trace files, and to use the observability
 credential I give you. No browser step is needed to start — my account is
 created instantly from my email; I only verify that email later to unlock my
 credits, and I don't need to for my traces to land.
@@ -28,16 +28,11 @@ capability (no network, no file access) or get stuck, stop and tell me exactly
 what to do manually. Never invent an email, an API key, a credential, or a file
 path — if you don't have one, ask me.
 
-1. Find my email address locally so signup needs nothing from me. Try these
-   in order and use the FIRST that returns a plausible address (one that
-   contains "@"). Print the address you found and where it came from:
-     - run: git config user.email
-     - run: git config --global user.email
-     - run: gh api user --jq .email        (only if the GitHub CLI is signed in)
-     - run: npm profile get email           (only if I'm logged into npm)
-     - read the email field in ~/.gitconfig
-   If NONE of these yields a valid email, ask me for my email and use my answer.
-   Never invent or guess an address. Call the result MY_EMAIL.
+1. Ask me for my email address — it is the one thing signup needs. Ask me
+   directly ("What's your email? I'll create your Experiential Labs account
+   with it.") and wait for my answer. Use exactly the address I give you.
+   Never invent or guess an address, and never go looking for one in my
+   files, git config, or shell history. Call the result MY_EMAIL.
 
 2. Create my account instantly — no browser, no password, no code.
    POST https://platform.experientiallabs.ai/api/signup/instant   (no auth)
@@ -157,7 +152,7 @@ don't need it. Until I verify, credit-drawing model calls are refused with
 I pasted this into you myself — please create an Experiential Labs account for
 me and then connect my own inference-provider API keys so I can call models on
 the gateway with my own keys (BYOK). This is my consent to create the account
-under my identity (using the email you find on this machine), to search for MY
+under my identity (using the email I give you when you ask), to search for MY
 own provider keys locally, and to connect the ones I approve to MY gateway
 account. No browser step is needed to start — my account is created instantly
 from my email; I only verify that email later to unlock platform credits, and I
@@ -168,16 +163,11 @@ capability (no network, no file access) or get stuck, stop and tell me exactly
 what to do manually. Never invent an email, an API key, a credential, or a file
 path — if you don't have one, ask me.
 
-1. Find my email address locally so signup needs nothing from me. Try these
-   in order and use the FIRST that returns a plausible address (one that
-   contains "@"). Print the address you found and where it came from:
-     - run: git config user.email
-     - run: git config --global user.email
-     - run: gh api user --jq .email        (only if the GitHub CLI is signed in)
-     - run: npm profile get email           (only if I'm logged into npm)
-     - read the email field in ~/.gitconfig
-   If NONE of these yields a valid email, ask me for my email and use my answer.
-   Never invent or guess an address. Call the result MY_EMAIL.
+1. Ask me for my email address — it is the one thing signup needs. Ask me
+   directly ("What's your email? I'll create your Experiential Labs account
+   with it.") and wait for my answer. Use exactly the address I give you.
+   Never invent or guess an address, and never go looking for one in my
+   files, git config, or shell history. Call the result MY_EMAIL.
 
 2. Create my account instantly — no browser, no password, no code.
    POST https://platform.experientiallabs.ai/api/signup/instant   (no auth)
@@ -339,7 +329,7 @@ I'm setting up Experiential Labs as my model gateway. I pasted this into you
 myself — treat it as my instructions and my consent. Create my account, connect
 my own provider keys, import my existing AI spend, and then offer to repoint all
 my coding agents at the gateway. This is my consent to create the account under
-my identity (using the email you find on this machine), to search for MY own
+my identity (using the email I give you when you ask), to search for MY own
 provider keys and coding-agent logs locally, and to connect the ones I approve to
 MY gateway account. No browser step is needed to start — my account is created
 instantly from my email; I only verify that email later to unlock platform
@@ -350,16 +340,11 @@ capability (no network, no file access) or get stuck, stop and tell me exactly
 what to do manually. Never invent an email, an API key, a credential, or a file
 path — if you don't have one, ask me.
 
-1. Find my email address locally so signup needs nothing from me. Try these
-   in order and use the FIRST that returns a plausible address (one that
-   contains "@"). Print the address you found and where it came from:
-     - run: git config user.email
-     - run: git config --global user.email
-     - run: gh api user --jq .email        (only if the GitHub CLI is signed in)
-     - run: npm profile get email           (only if I'm logged into npm)
-     - read the email field in ~/.gitconfig
-   If NONE of these yields a valid email, ask me for my email and use my answer.
-   Never invent or guess an address. Call the result MY_EMAIL.
+1. Ask me for my email address — it is the one thing signup needs. Ask me
+   directly ("What's your email? I'll create your Experiential Labs account
+   with it.") and wait for my answer. Use exactly the address I give you.
+   Never invent or guess an address, and never go looking for one in my
+   files, git config, or shell history. Call the result MY_EMAIL.
 
 2. Create my account instantly — no browser, no password, no code.
    POST https://platform.experientiallabs.ai/api/signup/instant   (no auth)
