@@ -329,7 +329,7 @@ def test_gateway_setup_rolls_back_catalog_and_provider_when_alias_activation_fai
 
     monkeypatch.setattr(
         gateway_store,
-        "_activate_alias_revision_in_transaction",
+        "activate_alias_revision_in_transaction",
         fail_alias_activation,
     )
 
