@@ -8,6 +8,7 @@
 mod bridge;
 mod dialects;
 mod encode;
+mod encode_responses;
 mod errors;
 mod events;
 mod memory;
@@ -28,10 +29,10 @@ use crate::server::ServeConfig;
 /// Serve the gateway data plane until shutdown (SIGINT or SIGTERM).
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
-/// `settle`, `models`, `model_detail`, `usage_json`, `usage_page`,
-/// `metrics_json`, and
-/// `readiness`, each taking and returning one JSON string. `config_json`
-/// carries host, port, and concurrency bounds.
+/// `settle`, `remember`, `models`, `model_detail`, `usage_json`,
+/// `usage_page`, `metrics_json`, and `readiness`, each taking and returning
+/// one JSON string. `config_json` carries host, port, and concurrency
+/// bounds.
 #[pyfunction]
 fn serve(py: Python<'_>, control_plane: Py<PyAny>, config_json: &str) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
@@ -78,6 +79,56 @@ fn encode_chat_fixture(
 #[pyfunction]
 fn metrics_snapshot_json() -> String {
     metrics::METRICS.snapshot().to_string()
+}
+
+/// Encode one normalized event fixture through the Rust Responses SSE
+/// encoder for byte parity tests. `envelope_json` carries the
+/// request-reflecting envelope fields; `events_json` is a list of simplified
+/// event objects.
+#[pyfunction]
+fn encode_responses_fixture(
+    request_id: &str,
+    model: &str,
+    created_at: f64,
+    envelope_json: &str,
+    events_json: &str,
+) -> PyResult<Vec<String>> {
+    let envelope: encode_responses::ResponsesEnvelope = serde_json::from_str(envelope_json)
+        .map_err(|error| PyValueError::new_err(format!("invalid envelope: {error}")))?;
+    let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
+    let mut encoder =
+        encode_responses::ResponsesSseEncoder::new(request_id, model, created_at, envelope);
+    let mut frames = encoder
+        .start()
+        .map_err(|error| PyValueError::new_err(error_payload(&error)))?;
+    for event in &events {
+        frames.extend(
+            encoder
+                .feed(event)
+                .map_err(|error| PyValueError::new_err(error_payload(&error)))?,
+        );
+    }
+    Ok(frames)
+}
+
+/// Build one non-streaming Responses body fixture through the Rust
+/// aggregation for byte parity tests against the python `completed_body`.
+#[pyfunction]
+fn completed_responses_fixture(
+    request_id: &str,
+    model: &str,
+    created_at: f64,
+    envelope_json: &str,
+    events_json: &str,
+) -> PyResult<String> {
+    let envelope: encode_responses::ResponsesEnvelope = serde_json::from_str(envelope_json)
+        .map_err(|error| PyValueError::new_err(format!("invalid envelope: {error}")))?;
+    let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
+    let aggregated = encode_responses::completed_responses_body(
+        request_id, model, created_at, envelope, &events,
+    )
+    .map_err(|error| PyValueError::new_err(error_payload(&error)))?;
+    Ok(serde_json::to_string(&aggregated.body).unwrap_or_else(|_| "null".to_string()))
 }
 
 /// Map one failure class and safe message to the Rust public-error JSON for
@@ -189,6 +240,8 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;
     module.add_function(wrap_pyfunction!(encode_chat_fixture, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_responses_fixture, module)?)?;
+    module.add_function(wrap_pyfunction!(completed_responses_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

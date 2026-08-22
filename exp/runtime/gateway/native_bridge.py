@@ -3,11 +3,12 @@
 The native engine (`exp_gateway_native`) owns the HTTP socket, upstream
 streaming, provider-event normalization, and public SSE encoding. Everything
 protocol- and authority-shaped happens here, in the same code the python
-engine runs: request decoding through ``decode_chat``, authorization through
-the shared control store, upstream payload construction through the shared
-``streaming_requests`` builders, and the same durable SQLite ledger
-transactions. Every boundary call takes and returns one JSON string so the
-boundary stays narrow and typed on both sides.
+engine runs: request decoding through ``decode_chat`` and
+``decode_responses``, authorization through the shared control store,
+upstream payload construction through the shared ``streaming_requests``
+builders, Responses continuation state through the shared bounded store, and
+the same durable SQLite ledger transactions. Every boundary call takes and
+returns one JSON string so the boundary stays narrow and typed on both sides.
 
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
@@ -33,11 +34,11 @@ from exp.runtime.gateway.budgets import BudgetReservationRejected, maximum_attem
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
+    GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
-    GatewayRequest,
     GatewayUsage,
 )
 from exp.runtime.gateway.discovery import (
@@ -54,6 +55,12 @@ from exp.runtime.gateway.execution import (
     _require_deployment_identity,  # noqa: PLC2701
 )
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+from exp.runtime.gateway.native_responses import (
+    ContinuationContext,
+    continued_request,
+    remember_turn,
+    responses_envelope,
+)
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 from exp.runtime.models.providers import (
@@ -62,14 +69,18 @@ from exp.runtime.models.providers import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
 from exp.runtime.models.providers.errors import ProviderCapabilityError
-from exp.runtime.models.providers.streaming_requests import (
-    anthropic_messages_stream_payload,
-    openai_compatible_stream_payload,
-    openai_responses_stream_payload,
-)
+from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
-from exp.runtime.openai_protocol.requests import DecodedGatewayRequest, decode_chat
-from exp.runtime.openai_protocol.state import ProtocolNamespace, replay_key
+from exp.runtime.openai_protocol.requests import (
+    DecodedGatewayRequest,
+    decode_chat,
+    decode_responses,
+)
+from exp.runtime.openai_protocol.state import (
+    BoundedContinuationStore,
+    ProtocolNamespace,
+    replay_key,
+)
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
 _SWEEP_GRACE_SECONDS = 5.0
@@ -97,6 +108,9 @@ class _InflightAttempt:
     # The exact settlement the data plane could not land; the sweep replays it
     # verbatim so a completed outcome and its usage are never downgraded.
     pending_settlement: JsonObject | None = field(default=None)
+    # Responses-only retention facts consumed by ``remember`` after a
+    # successful terminal; chat attempts carry ``None``.
+    continuation: ContinuationContext | None = field(default=None)
 
 
 class NativeBridgeError(Exception):
@@ -174,6 +188,7 @@ class NativeControlPlane:
         *,
         request_timeout_seconds: float = _REQUEST_TIMEOUT_SECONDS,
         data_plane_metrics: Callable[[], str] | None = None,
+        continuation_store: BoundedContinuationStore | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -184,12 +199,18 @@ class NativeControlPlane:
                 content-free metrics snapshot as one JSON string; the local
                 launch injects ``exp_gateway_native.metrics_snapshot_json``.
                 Without it the snapshot reports ``data_plane`` as ``None``.
+            continuation_store: Optional Responses continuation state, shared
+                with the embedded python engine so both engines resolve and
+                retain the same bounded namespaced history.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
         self._request_timeout_seconds = request_timeout_seconds
         self._data_plane_metrics = data_plane_metrics
+        self._continuations = (
+            continuation_store if continuation_store is not None else BoundedContinuationStore()
+        )
         self._inflight: dict[str, _InflightAttempt] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
@@ -247,8 +268,9 @@ class NativeControlPlane:
         provider boundary.
 
         Args:
-            argument: JSON object with ``raw_key`` and ``body`` (raw request
-                body text).
+            argument: JSON object with ``raw_key``, ``body`` (raw request
+                body text), and optional ``surface`` (``"chat"`` or
+                ``"responses"``, defaulting to chat).
 
         Returns:
             JSON wire configuration for the single resolved deployment,
@@ -262,8 +284,10 @@ class NativeControlPlane:
         """
         self._sweep_expired()
         data = json.loads(argument)
+        surface = str(data.get("surface", "chat"))
         decoded = self._decode_body(
             data["body"],
+            surface=surface,
             idempotency_key=_optional_text(data.get("idempotency_key")),
             client_request_id=_optional_text(data.get("client_request_id")),
         )
@@ -278,6 +302,20 @@ class NativeControlPlane:
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
+
+        # Responses continuation resolves after authorization and before any
+        # ledger write, the same order the python engine uses; unavailable,
+        # expired, evicted, or cross-namespace state fails closed here.
+        continuation_context: ContinuationContext | None = None
+        if request.surface == GatewayApiSurface.RESPONSES:
+            try:
+                request, continuation_context = continued_request(
+                    self._continuations,
+                    authorization=authorization,
+                    request=request,
+                )
+            except OpenAIProtocolError as exc:
+                raise NativeBridgeError(exc) from exc
 
         # Escalation runs before any ledger write: the python engine performs
         # full accounting for every request it serves. Routing failures found
@@ -311,7 +349,7 @@ class NativeControlPlane:
             deployment = route.deployment
             require_gateway_provider(deployment.provider)
             preflight_gateway_request(provider_request, deployment.gateway.capabilities)
-            upstream_payload = _build_upstream_payload(profile, provider_request)
+            upstream_payload = dialect_stream_payload(profile, provider_request)
             attempt_id = self._components.ledger.start_attempt(
                 snapshot=route.snapshot,
                 deployment=deployment,
@@ -355,6 +393,7 @@ class NativeControlPlane:
                 authorization=authorization,
                 attempt_id=attempt_id,
                 deadline_monotonic=deadline,
+                continuation=continuation_context,
             )
         response: JsonObject = {
             "request_id": authorization.request_id,
@@ -375,6 +414,9 @@ class NativeControlPlane:
             "upstream_payload": upstream_payload,
             "idempotency_key": _deployment_operation_key(route),
         }
+        if request.surface == GatewayApiSurface.RESPONSES:
+            response["surface"] = "responses"
+            response["envelope"] = responses_envelope(request)
         return json.dumps(response, separators=(",", ":"))
 
     def claim_scope(self, argument: str) -> str:
@@ -466,6 +508,35 @@ class NativeControlPlane:
             "canonical_request_sha256": key.canonical_request_sha256,
         }
         return json.dumps(scope, separators=(",", ":"))
+
+    def remember(self, argument: str) -> str:
+        """Retain one completed Responses continuation within strict bounds.
+
+        Args:
+            argument: JSON object with ``request_id``, aggregated ``text``,
+                ``refusal`` presence, and completed ``tool_calls``.
+
+        Returns:
+            An empty JSON object; retention that does not apply is a no-op.
+
+        Raises:
+            NativeBridgeError: The continuation exceeds the bounded store or
+                a completed tool call carried malformed fields.
+        """
+        data = json.loads(argument)
+        request_id = str(data["request_id"])
+        with self._lock:
+            entry = self._inflight.get(request_id)
+        context = entry.continuation if entry is not None else None
+        if context is None:
+            return "{}"
+        try:
+            remember_turn(self._continuations, context=context, data=data)
+        except OpenAIProtocolError as exc:
+            raise NativeBridgeError(exc) from exc
+        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            raise _authority_error(exc) from exc
+        return "{}"
 
     def settle(self, argument: str) -> str:
         """Durably settle one previously admitted attempt exactly once.
@@ -646,13 +717,15 @@ class NativeControlPlane:
         self,
         body: str,
         *,
+        surface: str = "chat",
         idempotency_key: str | None = None,
         client_request_id: str | None = None,
     ) -> DecodedGatewayRequest:
-        """Decode one raw Chat Completions body with the shared decoder.
+        """Decode one raw request body with the shared surface decoder.
 
         Args:
             body: Raw request body text.
+            surface: Public surface, ``"chat"`` or ``"responses"``.
             idempotency_key: Optional raw ``Idempotency-Key`` header value.
             client_request_id: Optional raw ``X-Client-Request-Id`` header value.
 
@@ -683,8 +756,9 @@ class NativeControlPlane:
                     message="Request body must be a JSON object. Re-encode the payload and resend.",
                 )
             )
+        decoder = decode_responses if surface == "responses" else decode_chat
         try:
-            return decode_chat(
+            return decoder(
                 payload,
                 idempotency_key=idempotency_key,
                 client_request_id=client_request_id,
@@ -842,39 +916,6 @@ class NativeControlPlane:
             )
         except Exception:  # noqa: BLE001 - primary admission failure stays authoritative.
             self._accounting_healthy = False
-
-
-def _build_upstream_payload(
-    profile: GatewayWireProfile,
-    provider_request: GatewayRequest,
-) -> JsonObject:
-    """Build the provider wire payload with the shared dialect builders.
-
-    Args:
-        profile: The resolved connection's wire profile.
-        provider_request: Canonical request forced into streaming mode.
-
-    Returns:
-        The exact JSON payload the python engine would send upstream.
-
-    Raises:
-        ProviderCapabilityError: The request uses a capability this dialect
-            cannot preserve, mirroring the python engine's dispatch behavior.
-    """
-    if profile.dialect == "openai_responses":
-        return openai_responses_stream_payload(
-            profile.model_id,
-            provider_request,
-            supports_temperature=profile.supports_temperature,
-            reasoning_effort=profile.reasoning_effort,
-        )
-    if profile.dialect == "anthropic_messages":
-        return anthropic_messages_stream_payload(profile.model_id, provider_request)
-    return openai_compatible_stream_payload(
-        profile.model_id,
-        provider_request,
-        token_limit_key=profile.token_limit_key,
-    )
 
 
 def _deployment_operation_key(route: GatewayRoute) -> str:

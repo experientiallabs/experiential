@@ -20,9 +20,12 @@ from exp.common.models import (
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
+    GatewayEvent,
+    GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
     GatewayRequest,
+    GatewayUsage,
 )
 from exp.runtime.gateway.discovery import listing_metadata_by_alias
 from exp.runtime.gateway.lifecycle import _ReadyControlStore, load_gateway_components
@@ -35,7 +38,9 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
-from exp.runtime.openai_protocol.requests import decode_chat
+from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
+from exp.runtime.openai_protocol.state import ProtocolNamespace
+from exp.runtime.openai_protocol.streaming import stable_public_id
 
 
 def _control_plane(
@@ -855,3 +860,414 @@ def test_usage_callbacks_reject_an_invalid_key(tmp_path: Path) -> None:
         payload = json.loads(excinfo.value.public_error_json)
         assert payload["status_code"] == 401
         assert payload["code"] == "invalid_key"
+
+
+def _responses_body(
+    *,
+    model: str = "coding",
+    stream: bool = False,
+    previous_response_id: str | None = None,
+    with_tools: bool = False,
+) -> str:
+    """Return one raw Responses API request body."""
+    payload: JsonObject = {"model": model, "input": [{"role": "user", "content": "hi"}]}
+    if stream:
+        payload["stream"] = True
+    if previous_response_id is not None:
+        payload["previous_response_id"] = previous_response_id
+    if with_tools:
+        payload["tools"] = [
+            {
+                "type": "function",
+                "name": "search",
+                "description": "Find things.",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            }
+        ]
+        payload["tool_choice"] = "auto"
+        payload["metadata"] = {"team": "core"}
+        payload["max_output_tokens"] = 128
+        payload["temperature"] = 0.5
+    return json.dumps(payload)
+
+
+def _admit_responses(control: NativeControlPlane, raw_key: str, body: str) -> JsonObject:
+    """Run one Responses-surface admission call and decode its JSON response."""
+    return json.loads(
+        control.admit(json.dumps({"raw_key": raw_key, "body": body, "surface": "responses"}))
+    )
+
+
+def _admitted_request_id(admission: JsonObject) -> str:
+    """Narrow one admission's request identity to a string."""
+    request_id = admission["request_id"]
+    assert isinstance(request_id, str)
+    return request_id
+
+
+def _payload_messages(admission: JsonObject) -> list[JsonObject]:
+    """Narrow one admission's upstream payload to its message list."""
+    payload = admission["upstream_payload"]
+    assert isinstance(payload, dict)
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    return [message for message in messages if isinstance(message, dict)]
+
+
+def _responses_parity_case() -> tuple[list[GatewayEvent], str]:
+    """Return matching python events and the Rust fixture JSON for one stream."""
+    from exp.common.models.model import ToolCall
+
+    events = [
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=0, text_delta="Hel"),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=1, text_delta="lo é"),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=2,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=3,
+            tool_call_index=0,
+            raw_arguments_delta='{"q": "x"}',
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=4,
+            tool_call_index=0,
+            tool_call=ToolCall(
+                call_id="call-1",
+                name="search",
+                arguments={"q": "x"},
+                raw_arguments='{"q": "x"}',
+            ),
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.USAGE,
+            sequence_number=5,
+            usage=GatewayUsage(input_tokens=10, output_tokens=4, cached_input_tokens=1),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=6),
+    ]
+    fixture = [
+        {"kind": "text_delta", "text": "Hel"},
+        {"kind": "text_delta", "text": "lo é"},
+        {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
+        {"kind": "tool_arguments_delta", "index": 0, "text": '{"q": "x"}'},
+        {
+            "kind": "tool_call_completed",
+            "index": 0,
+            "call_id": "call-1",
+            "name": "search",
+            "raw_arguments": '{"q": "x"}',
+        },
+        {"kind": "usage", "input_tokens": 10, "output_tokens": 4, "cached_input_tokens": 1},
+        {"kind": "completed"},
+    ]
+    return events, json.dumps(fixture)
+
+
+def _python_responses_frames(
+    body: str,
+    events: list[GatewayEvent],
+    *,
+    created_at: float,
+) -> list[str]:
+    """Encode one Responses stream through the python encoder."""
+    from exp.runtime.openai_protocol.streaming import ResponsesSseEncoder
+
+    decoded = decode_responses(json.loads(body))
+    encoder = ResponsesSseEncoder(
+        request_id="request-abc",
+        model=decoded.alias,
+        created_at=created_at,
+        request=decoded.request,
+    )
+    expected = list(encoder.start())
+    for event in events:
+        expected.extend(encoder.feed(event))
+    return expected
+
+
+def _native_envelope(body: str) -> str:
+    """Render the control plane's Responses envelope JSON for one raw body."""
+    from exp.runtime.gateway.native_responses import responses_envelope
+
+    return json.dumps(responses_envelope(decode_responses(json.loads(body)).request))
+
+
+def test_rust_responses_sse_frames_match_python_encoder() -> None:
+    """Rust Responses SSE frames are byte-identical to the python encoder."""
+    native = pytest.importorskip("exp_gateway_native")
+    body = _responses_body(stream=True, with_tools=True)
+    events, fixture = _responses_parity_case()
+    expected = _python_responses_frames(body, events, created_at=1_700_000_000.25)
+    actual = native.encode_responses_fixture(
+        "request-abc",
+        "coding",
+        1_700_000_000.25,
+        _native_envelope(body),
+        fixture,
+    )
+    assert list(actual) == expected
+
+
+def test_rust_responses_refusal_and_incomplete_match_python_encoder() -> None:
+    """Refusal deltas and the incomplete terminal render byte-identically."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    body = _responses_body(stream=True)
+    events = [
+        GatewayEvent(kind=GatewayEventKind.REFUSAL_DELTA, sequence_number=0, text_delta="I ca"),
+        GatewayEvent(kind=GatewayEventKind.REFUSAL_DELTA, sequence_number=1, text_delta="nnot"),
+        GatewayEvent(kind=GatewayEventKind.INCOMPLETE, sequence_number=2),
+    ]
+    fixture = json.dumps(
+        [
+            {"kind": "refusal_delta", "text": "I ca"},
+            {"kind": "refusal_delta", "text": "nnot"},
+            {"kind": "incomplete"},
+        ]
+    )
+    expected = _python_responses_frames(body, events, created_at=1_700_000_000.0)
+    actual = native.encode_responses_fixture(
+        "request-abc", "coding", 1_700_000_000.0, _native_envelope(body), fixture
+    )
+    assert list(actual) == expected
+
+
+def test_rust_responses_failed_terminal_matches_python_encoder() -> None:
+    """The failed terminal envelope and error body render byte-identically."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    body = _responses_body(stream=True)
+    events = [
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=0, text_delta="part"),
+        GatewayEvent(
+            kind=GatewayEventKind.FAILED,
+            sequence_number=1,
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+                safe_message="provider exploded",
+            ),
+        ),
+    ]
+    fixture = json.dumps(
+        [
+            {"kind": "text_delta", "text": "part"},
+            {"kind": "failed", "text": "provider exploded"},
+        ]
+    )
+    expected = _python_responses_frames(body, events, created_at=1_700_000_000.5)
+    actual = native.encode_responses_fixture(
+        "request-abc", "coding", 1_700_000_000.5, _native_envelope(body), fixture
+    )
+    assert list(actual) == expected
+
+
+def test_rust_responses_completed_body_matches_python() -> None:
+    """The Rust non-streaming Responses body equals the python completed_body."""
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.openai_protocol.response import completed_body
+
+    body = _responses_body(with_tools=True)
+    events, fixture = _responses_parity_case()
+    decoded = decode_responses(json.loads(body))
+    expected = completed_body(
+        request=decoded.request,
+        request_id="request-abc",
+        model=decoded.alias,
+        created_at=1_700_000_000.25,
+        events=tuple(events),
+    )
+    actual = native.completed_responses_fixture(
+        "request-abc",
+        "coding",
+        1_700_000_000.25,
+        _native_envelope(body),
+        fixture,
+    )
+    assert json.loads(actual) == expected
+    assert actual == json.dumps(expected, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_rust_responses_rejects_streams_without_terminals() -> None:
+    """A provider stream without a terminal fails closed like the python path."""
+    native = pytest.importorskip("exp_gateway_native")
+    body = _responses_body()
+    fixture = json.dumps([{"kind": "text_delta", "text": "no terminal"}])
+    with pytest.raises(ValueError, match="all_routes_failed"):
+        native.completed_responses_fixture(
+            "request-abc", "coding", 1_700_000_000.0, _native_envelope(body), fixture
+        )
+    malformed = json.dumps(
+        [
+            {"kind": "tool_arguments_delta", "index": 3, "text": "{"},
+            {"kind": "completed"},
+        ]
+    )
+    with pytest.raises(ValueError, match="invalid_provider_stream"):
+        native.encode_responses_fixture(
+            "request-abc", "coding", 1_700_000_000.0, _native_envelope(body), malformed
+        )
+
+
+def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path) -> None:
+    """A Responses request admits natively (no escalation) with the exact
+    request-reflecting envelope and the shared dialect payload."""
+    from exp.runtime.gateway.native_responses import responses_envelope
+
+    control, raw_key = _control_plane(tmp_path)
+    body = _responses_body(with_tools=True)
+    admission = _admit_responses(control, raw_key, body)
+    assert "escalate" not in admission
+    assert admission["surface"] == "responses"
+    assert admission["dialect"] == "openai_compatible"
+    decoded = decode_responses(json.loads(body))
+    assert admission["envelope"] == responses_envelope(decoded.request)
+    provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
+    assert admission["upstream_payload"] == openai_compatible_stream_payload(
+        "provider-model-exact", provider_request
+    )
+    settled = control.settle(
+        json.dumps(
+            {
+                "request_id": admission["request_id"],
+                "attempt_id": admission["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 7, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+    assert settled == "{}"
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
+
+
+def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> None:
+    """Retained history is prepended on continuation; unknown, refused, and
+    cross-namespace continuations fail closed with the shared public error."""
+    control, raw_key = _control_plane(tmp_path)
+    first = _admit_responses(control, raw_key, _responses_body())
+    remembered = control.remember(
+        json.dumps(
+            {
+                "request_id": first["request_id"],
+                "text": "The answer is 42.",
+                "refusal": False,
+                "tool_calls": [],
+            }
+        )
+    )
+    assert remembered == "{}"
+    response_id = stable_public_id("resp", _admitted_request_id(first))
+    second = _admit_responses(control, raw_key, _responses_body(previous_response_id=response_id))
+    messages = _payload_messages(second)
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    assert messages[1]["content"] == "The answer is 42."
+
+    with pytest.raises(NativeBridgeError) as unknown:
+        _admit_responses(control, raw_key, _responses_body(previous_response_id="resp_missing"))
+    payload = json.loads(unknown.value.public_error_json)
+    assert payload["status_code"] == 400
+    assert payload["code"] == "continuation_unavailable"
+    assert payload["param"] == "previous_response_id"
+
+    refused = _admit_responses(control, raw_key, _responses_body())
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": refused["request_id"],
+                    "text": "partial",
+                    "refusal": True,
+                    "tool_calls": [],
+                }
+            )
+        )
+        == "{}"
+    )
+    with pytest.raises(NativeBridgeError) as after_refusal:
+        _admit_responses(
+            control,
+            raw_key,
+            _responses_body(
+                previous_response_id=stable_public_id("resp", _admitted_request_id(refused))
+            ),
+        )
+    assert json.loads(after_refusal.value.public_error_json)["code"] == "continuation_unavailable"
+
+    foreign = ProtocolNamespace(
+        organization_id="other-org",
+        identity_id="other-identity",
+        alias_revision_id="other-revision",
+    )
+    with pytest.raises(OpenAIProtocolError) as crossed:
+        control._continuations.resolve_now(  # noqa: SLF001 - namespace isolation assertion.
+            namespace=foreign,
+            previous_response_id=response_id,
+        )
+    assert crossed.value.detail.code == "continuation_unavailable"
+
+
+def test_responses_tool_call_retention_survives_continuation(tmp_path: Path) -> None:
+    """Completed tool calls are retained and replayed into continued history."""
+    control, raw_key = _control_plane(tmp_path)
+    first = _admit_responses(control, raw_key, _responses_body(with_tools=True))
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": first["request_id"],
+                    "text": "",
+                    "refusal": False,
+                    "tool_calls": [
+                        {"call_id": "call-9", "name": "search", "arguments": '{"q":"x"}'}
+                    ],
+                }
+            )
+        )
+        == "{}"
+    )
+    second = _admit_responses(
+        control,
+        raw_key,
+        _responses_body(previous_response_id=stable_public_id("resp", _admitted_request_id(first))),
+    )
+    assistant = _payload_messages(second)[1]
+    assert assistant["role"] == "assistant"
+    tool_calls = assistant["tool_calls"]
+    assert isinstance(tool_calls, list)
+    first_call = tool_calls[0]
+    assert isinstance(first_call, dict)
+    assert first_call["function"] == {"name": "search", "arguments": '{"q":"x"}'}
+
+
+def test_responses_admission_rejects_invalid_bodies_and_bad_keys(tmp_path: Path) -> None:
+    """Responses-surface admission fails closed on protocol and key errors."""
+    control, raw_key = _control_plane(tmp_path)
+    with pytest.raises(NativeBridgeError) as invalid:
+        control.admit(json.dumps({"raw_key": raw_key, "body": "{not json", "surface": "responses"}))
+    assert json.loads(invalid.value.public_error_json)["code"] == "invalid_json"
+    rejected = json.dumps({"model": "coding", "input": "hi", "modalities": ["audio"]})
+    with pytest.raises(NativeBridgeError) as protocol:
+        control.admit(json.dumps({"raw_key": raw_key, "body": rejected, "surface": "responses"}))
+    assert json.loads(protocol.value.public_error_json)["status_code"] == 400
+    with pytest.raises(NativeBridgeError) as bad_key:
+        control.admit(
+            json.dumps(
+                {
+                    "raw_key": "exp_vk_invalid",
+                    "body": _responses_body(),
+                    "surface": "responses",
+                }
+            )
+        )
+    assert json.loads(bad_key.value.public_error_json)["status_code"] == 401
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 0

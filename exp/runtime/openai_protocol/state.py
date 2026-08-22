@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -374,7 +375,12 @@ class _ContinuationEntry:
 
 
 class BoundedContinuationStore:
-    """Tenant-isolated Responses continuation with count, byte, and TTL limits."""
+    """Tenant-isolated Responses continuation with count, byte, and TTL limits.
+
+    Guarded by one non-async lock held only for in-memory bookkeeping, so the
+    same instance is shared safely between the async python engine and the
+    native data plane's control-plane worker threads.
+    """
 
     def __init__(
         self,
@@ -391,13 +397,49 @@ class BoundedContinuationStore:
         self._byte_cap = byte_cap
         self._ttl_seconds = ttl_seconds
         self._clock = clock
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
         self._entries: OrderedDict[tuple[ProtocolNamespace, str], _ContinuationEntry] = (
             OrderedDict()
         )
         self._content_bytes = 0
 
     async def remember(
+        self,
+        *,
+        namespace: ProtocolNamespace,
+        response_id: str,
+        state: ContinuationState,
+    ) -> None:
+        """Retain one completed Responses continuation within strict bounds.
+
+        Args:
+            namespace: Tenant, identity, and alias-revision boundary.
+            response_id: Public completed response identity.
+            state: Canonical history and hashed episode identity.
+
+        Raises:
+            OpenAIProtocolError: One continuation exceeds the total byte ceiling.
+        """
+        self.remember_now(namespace=namespace, response_id=response_id, state=state)
+
+    async def resolve(
+        self, *, namespace: ProtocolNamespace, previous_response_id: str
+    ) -> ContinuationState:
+        """Resolve an exact namespaced continuation or fail closed.
+
+        Args:
+            namespace: Current caller and immutable alias-revision boundary.
+            previous_response_id: Public response identity to continue.
+
+        Returns:
+            Retained canonical history.
+
+        Raises:
+            OpenAIProtocolError: State expired, was evicted, crossed namespace, or restarted.
+        """
+        return self.resolve_now(namespace=namespace, previous_response_id=previous_response_id)
+
+    def remember_now(
         self,
         *,
         namespace: ProtocolNamespace,
@@ -426,7 +468,7 @@ class BoundedContinuationStore:
                 param="previous_response_id",
             )
         key = (namespace, response_id)
-        async with self._lock:
+        with self._lock:
             self._expire(self._clock())
             previous = self._entries.pop(key, None)
             if previous is not None:
@@ -438,7 +480,7 @@ class BoundedContinuationStore:
             self._content_bytes += state.size_bytes
             self._evict()
 
-    async def resolve(
+    def resolve_now(
         self, *, namespace: ProtocolNamespace, previous_response_id: str
     ) -> ContinuationState:
         """Resolve an exact namespaced continuation or fail closed.
@@ -454,7 +496,7 @@ class BoundedContinuationStore:
             OpenAIProtocolError: State expired, was evicted, crossed namespace, or restarted.
         """
         key = (namespace, previous_response_id)
-        async with self._lock:
+        with self._lock:
             self._expire(self._clock())
             entry = self._entries.get(key)
             if entry is None:

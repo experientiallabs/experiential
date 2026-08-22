@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayMessage,
@@ -9,6 +11,42 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderResponseError
+
+if TYPE_CHECKING:
+    from exp.runtime.models.providers.base import GatewayWireProfile
+
+
+def dialect_stream_payload(
+    profile: GatewayWireProfile,
+    provider_request: GatewayRequest,
+) -> JsonObject:
+    """Build the provider wire payload for one resolved wire profile.
+
+    Args:
+        profile: The resolved connection's wire profile.
+        provider_request: Canonical request forced into streaming mode.
+
+    Returns:
+        The exact JSON payload the gateway sends upstream for this dialect.
+
+    Raises:
+        ProviderCapabilityError: The request uses a capability this dialect
+            cannot preserve.
+    """
+    if profile.dialect == "openai_responses":
+        return openai_responses_stream_payload(
+            profile.model_id,
+            provider_request,
+            supports_temperature=profile.supports_temperature,
+            reasoning_effort=profile.reasoning_effort,
+        )
+    if profile.dialect == "anthropic_messages":
+        return anthropic_messages_stream_payload(profile.model_id, provider_request)
+    return openai_compatible_stream_payload(
+        profile.model_id,
+        provider_request,
+        token_limit_key=profile.token_limit_key,
+    )
 
 
 def openai_responses_stream_payload(
