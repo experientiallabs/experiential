@@ -17,6 +17,7 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -519,6 +520,28 @@ def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:
     assert payload["code"] == "model_not_granted"
 
 
+def test_budget_rejection_uses_host_error_factory(tmp_path: Path) -> None:
+    """Hosted policy can refine a quota rejection without moving accounting."""
+    control, raw_key = _control_plane(tmp_path)
+    customized = NativeBridgeError(
+        OpenAIProtocolError(
+            status_code=429,
+            code="email_unverified",
+            message="verify your email",
+            error_type="insufficient_quota",
+        )
+    )
+    control._budget_error_factory = lambda key: customized  # noqa: SLF001
+    with mock.patch.object(
+        control._components.ledger,  # noqa: SLF001
+        "start_attempt",
+        side_effect=BudgetReservationRejected(scope_kind=BudgetScopeKind.TEAM, reason="blocked"),
+    ):
+        with pytest.raises(NativeBridgeError) as excinfo:
+            _admit(control, raw_key, _chat_body())
+    assert excinfo.value is customized
+
+
 def test_authenticate_rejects_an_invalid_key(tmp_path: Path) -> None:
     """A bad virtual key maps to the shared 401 public error."""
     control, _raw_key = _control_plane(tmp_path)
@@ -558,6 +581,25 @@ def test_readiness_reflects_startup_proof_and_executor_health(tmp_path: Path) ->
     assert control.readiness("{}") == "true"
     control._components.executor.mark_accounting_unhealthy()  # noqa: SLF001 - fault injection.
     assert control.readiness("{}") == "false"
+
+
+def test_readiness_uses_host_lifecycle_probe_and_fails_closed(tmp_path: Path) -> None:
+    """A hosted composition can add database, catalog, and drain readiness."""
+    _manager, _raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    ready = True
+    control = NativeControlPlane(components, readiness_probe=lambda: ready)
+    assert control.readiness("{}") == "true"
+    ready = False
+    assert control.readiness("{}") == "false"
+    failed = NativeControlPlane(
+        components,
+        readiness_probe=mock.Mock(side_effect=RuntimeError("database unavailable")),
+    )
+    assert failed.readiness("{}") == "false"
 
 
 def test_rust_failure_taxonomy_matches_public_failure_error() -> None:

@@ -28,14 +28,19 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from typing import Protocol, cast
 
 from exp.common.core.artifacts import JsonObject, stable_id
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budgets import BudgetReservationRejected, maximum_attempt_cost_micro_usd
 from exp.runtime.gateway.contracts import (
+    AttemptId,
     AuthorizationSnapshot,
     DirectTarget,
+    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
@@ -55,18 +60,21 @@ from exp.runtime.gateway.discovery import (
 # the native path must enforce the same one, so the private helper is shared.
 from exp.runtime.gateway.execution import (
     GatewayExecutionError,
+    GatewayExecutor,
     _require_deployment_identity,  # noqa: PLC2701
 )
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
-from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+from exp.runtime.gateway.interfaces import GatewayControlStore
+from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continued_request,
     remember_turn,
     responses_envelope,
 )
-from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
+from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers import (
     preflight_gateway_request,
     require_gateway_provider,
@@ -97,6 +105,90 @@ _TERMINAL_KINDS = {
     "incomplete": GatewayEventKind.INCOMPLETE,
     "failed": GatewayEventKind.FAILED,
 }
+
+
+class NativeAttemptLedger(Protocol):
+    """Synchronous durable ledger used from native callback threads."""
+
+    def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
+        """Persist one accepted request."""
+        ...
+
+    def start_attempt(
+        self,
+        *,
+        snapshot: ExecutionSnapshot,
+        deployment: ExactModelDeployment,
+        attempt_ordinal: int,
+        route_depth: int,
+        maximum_cost_micro_usd: int | None = None,
+    ) -> AttemptId:
+        """Reserve and persist one provider attempt."""
+        ...
+
+    def finish_attempt(
+        self,
+        *,
+        attempt_id: AttemptId,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+    ) -> None:
+        """Settle one provider attempt."""
+        ...
+
+    def finish_request(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+    ) -> None:
+        """Finalize accepted work that failed before dispatch."""
+        ...
+
+
+class NativeGatewayComponents(Protocol):
+    """Engine-neutral components required by the native control plane."""
+
+    @property
+    def store(self) -> GatewayControlStore:
+        """Return the authority store."""
+        ...
+
+    @property
+    def ledger(self) -> NativeAttemptLedger:
+        """Return the synchronous durable accounting ledger."""
+        ...
+
+    @property
+    def routes(self) -> CatalogRouteResolver:
+        """Return the direct-route resolver."""
+        ...
+
+    @property
+    def executor(self) -> GatewayExecutor:
+        """Return the shared accounting-health latch."""
+        ...
+
+    @property
+    def reconciled_expired_requests(self) -> int:
+        """Return startup-reconciled request count."""
+        ...
+
+    @property
+    def reconciled_unknown_attempts(self) -> int:
+        """Return startup-reconciled attempt count."""
+        ...
+
+    @property
+    def runtime_catalogs(self) -> Mapping[tuple[str, str], RuntimeModelCatalog]:
+        """Return runtime catalogs keyed by alias revision and digest."""
+        ...
+
+    @property
+    def organization_id(self) -> str:
+        """Return the organization used by the local usage endpoint."""
+        ...
 
 
 class _NativeDialectUnavailableError(RuntimeError):
@@ -192,10 +284,13 @@ class NativeControlPlane:
 
     def __init__(
         self,
-        components: LocalGatewayComponents,
+        components: NativeGatewayComponents,
         *,
         request_timeout_seconds: float = _REQUEST_TIMEOUT_SECONDS,
         continuation_store: BoundedContinuationStore | None = None,
+        readiness_probe: Callable[[], bool] | None = None,
+        usage_reporter: Callable[[], JsonObject] | None = None,
+        budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -205,6 +300,12 @@ class NativeControlPlane:
             continuation_store: Optional Responses continuation state, shared
                 with the embedded python engine so both engines resolve and
                 retain the same bounded namespaced history.
+            readiness_probe: Optional hosted lifecycle readiness callback. The
+                local engine defaults to the shared executor health latch.
+            usage_reporter: Optional hosted usage report callback. The local
+                engine defaults to its single-organization SQLite report.
+            budget_error_factory: Optional hosted mapping for a rejected
+                reservation, keyed by the presented virtual key.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -214,6 +315,9 @@ class NativeControlPlane:
         self._continuations = (
             continuation_store if continuation_store is not None else BoundedContinuationStore()
         )
+        self._readiness_probe = readiness_probe
+        self._usage_reporter = usage_reporter
+        self._budget_error_factory = budget_error_factory
         self._inflight: dict[str, _InflightAttempt] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
@@ -353,11 +457,13 @@ class NativeControlPlane:
                 attempt_ordinal=0,
                 route_depth=0,
                 maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(request, deployment),
-                route_reason=route.route_reason,
-                fallback_reason=route.fallback_reason,
             )
         except BudgetReservationRejected as exc:
-            error = _budget_quota_error()
+            error = (
+                _budget_quota_error()
+                if self._budget_error_factory is None
+                else self._budget_error_factory(data["raw_key"])
+            )
             self._finish_request_quietly(
                 authorization,
                 GatewayFailure(
@@ -620,6 +726,8 @@ class NativeControlPlane:
         Raises:
             NativeBridgeError: The presented key is invalid, expired, or revoked.
         """
+        if self._usage_reporter is not None:
+            return json.dumps(self._usage_reporter(), separators=(",", ":"))
         report = self._usage_report(argument)
         return json.dumps(report.model_dump(mode="json"), separators=(",", ":"))
 
@@ -661,7 +769,7 @@ class NativeControlPlane:
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
                 raise _authority_error(exc) from exc
         return read_usage_report(
-            self._components.ledger,
+            cast("SQLiteAttemptLedger", self._components.ledger),
             organization_id=self._components.organization_id,
             identity_id=identity_id,
         )
@@ -671,6 +779,11 @@ class NativeControlPlane:
         del argument
         if not self._accounting_healthy:
             return "false"
+        if self._readiness_probe is not None:
+            try:
+                return "true" if self._readiness_probe() else "false"
+            except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
+                return "false"
         try:
             self._components.executor.require_healthy()
         except GatewayExecutionError:

@@ -53,6 +53,8 @@ pub struct ServeConfig {
     pub callback_permits: usize,
     /// Loopback port of the embedded python engine serving escalated requests.
     pub fallback_port: u16,
+    #[serde(default = "default_native_usage_enabled")]
+    pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
     pub graceful_timeout_seconds: f64,
 }
@@ -71,6 +73,10 @@ fn default_request_timeout_seconds() -> f64 {
 
 fn default_callback_permits() -> usize {
     4
+}
+
+fn default_native_usage_enabled() -> bool {
+    true
 }
 
 /// Shared server state.
@@ -171,9 +177,17 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses))
         .route("/health/live", get(health_live))
-        .route("/health/ready", get(health_ready))
-        .route("/usage.json", get(usage_json).fallback(proxy_fallback))
+        .route("/health/ready", get(health_ready));
+    let app = if config.native_usage_enabled {
+        app.route(
+            "/usage.json",
+            get(usage_json).fallback(proxy_fallback),
+        )
         .route("/usage", get(usage_page).fallback(proxy_fallback))
+    } else {
+        app
+    };
+    let app = app
         .fallback(proxy_fallback)
         .with_state(state);
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
