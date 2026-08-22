@@ -1,7 +1,7 @@
 """Resolve one provider API key from environment, then the user-local credential store.
 
-Runtime and CI callers never prompt. Interactive setup and ``exp auth login`` supply a
-masked prompt that persists the pasted key for the exact connection ID.
+Runtime and CI callers never prompt. Interactive ``exp config providers`` setup can
+persist a pasted key for the exact connection ID.
 """
 
 from __future__ import annotations
@@ -188,12 +188,12 @@ def read_connection_api_key(
         if connection.api_key_env is None:
             raise ModelCredentialError(
                 f"no stored credential exists for connection {connection_id!r}; "
-                f"run 'exp auth login {connection_id}'"
+                "run 'exp config providers' to supply one"
             )
         raise ModelCredentialError(
             f"connection credential environment variable {connection.api_key_env!r} is not set "
             f"and no stored credential exists for connection {connection_id!r}; "
-            f"run 'exp auth login {connection_id}' or export the variable"
+            "run 'exp config providers' or export the variable"
         )
     return resolved.value
 

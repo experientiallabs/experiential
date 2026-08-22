@@ -118,7 +118,7 @@ class ProviderAuthStore:
         if binding is not None and record.binding != binding:
             raise StoredCredentialEndpointMismatch(
                 f"stored credential for connection {connection_id!r} does not match the "
-                f"configured {binding.provider} endpoint; run 'exp auth login {connection_id}'"
+                f"configured {binding.provider} endpoint; run 'exp config providers'"
             )
         return record.key
 
@@ -374,7 +374,7 @@ def _malformed_message(path: Path) -> str:
     """
     return (
         f"provider credential file {path} is malformed; move or delete it, then run "
-        "'exp auth login'"
+        "'exp config providers'"
     )
 
 

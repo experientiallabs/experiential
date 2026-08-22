@@ -140,7 +140,7 @@ def test_malformed_file_fails_with_a_recoverable_error(tmp_path: Path) -> None:
         _store(path).get("openai")
 
     message = str(captured.value)
-    assert "exp auth login" in message
+    assert "exp config providers" in message
     assert str(path) in message
     assert _SECRET not in message
     assert _SECRET not in repr(captured.value)

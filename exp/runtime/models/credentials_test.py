@@ -141,7 +141,7 @@ def test_missing_environment_and_store_fails_without_prompting() -> None:
         read_connection_api_key(_openai(), connection_id="openai", environment={})
 
     message = str(captured.value)
-    assert "exp auth login openai" in message
+    assert "exp config providers" in message
     assert _SECRET not in message
 
 

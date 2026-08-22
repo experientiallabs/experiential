@@ -10,14 +10,11 @@ The root surface is deliberately small:
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
 | `exp run --root ROOT [--check]` | Validate or start the initialized authenticated gateway on loopback. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp run PROJECT --root ROOT [--ghost]` | Activate a frozen policy as one project-backed alias and launch the normal gateway. | The same authenticated OpenAI endpoint and SQLite accounting as no-argument `exp run`. |
-| `exp auth list [--json]` | Show configured connections and where each credential comes from. | Connection, provider, source, and environment-override metadata. No secret values. |
-| `exp auth login CONNECTION` | Prompt for one API key and persist it for that exact connection. | One record in the user-data credential file. |
-| `exp auth logout CONNECTION` | Remove only the stored credential for that connection. | That connection ID is deleted from the user-data credential file. |
 | `exp config gateway ...` | Author provider references, identities, virtual keys, grants, aliases, certified exact-model pools, monthly limits, status, and usage without optimizer roles. | Private SQLite authority, immutable catalog snapshots, and versioned receipts. |
 | `exp config gateway call ALIAS PROMPT [--json]` | Send one chat completion to a live gateway as a caller, streaming text to stdout. | One HTTP request against the running gateway; no local state. |
 | `exp config gateway models [--json]` | List the aliases a live gateway grants to the presented key (caller view of `GET /v1/models`). | One HTTP request against the running gateway; no local state. |
 | `exp config gateway key check [--json]` | Validate one raw virtual key against a live gateway and print its granted aliases without storing the key. | One HTTP request against the running gateway; no local state. |
-| `exp config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. | Local `.exp/models.toml`. |
+| `exp config providers [--provider NAME ...]` | Collect secret-free provider connections, model aliases, and build roles. Interactive setup also persists, replaces, or removes user-local provider keys. | Local `.exp/models.toml` plus optional records in the user-data credential file. |
 | `exp config budget [USD] --root ROOT` | Read or set the maximum conservative estimate allowed for one paid command (default `$50.00`). | Local `.exp/settings.toml`. |
 | `exp config telemetry status\|enable\|disable` | Read or update aggregate product telemetry preference. | Local `.exp/settings.toml`. |
 
@@ -61,13 +58,15 @@ partitioned. Estimated cost is not provider invoice cost.
 One-time virtual-key material appears only in the successful key-issue receipt or a newly created
 mode-`0600` output file. Human key issuance on a non-terminal requires `--json` or `--output`.
 Provider catalogs and gateway SQLite store an environment-variable name, never a raw credential
-value. Interactive setup and `exp auth login` persist the pasted key in the platform user-data
-file (`~/.local/share/exp/auth.json` on Linux). Resolution uses a non-empty environment variable
-first, then the stored key for that connection ID. Environment values override the store without
-rewriting it. Noninteractive and CI invocations never prompt; they fail with the missing
-environment name and `exp auth login` recovery. Bedrock stays on the AWS credential chain.
-Current provider revisions live in SQLite; immutable serving snapshots bind exact revisions while
-build and evaluation artifacts remain in the project artifact store.
+value. Interactive `exp config providers` persists a pasted key in the platform user-data file
+(`~/.local/share/exp/auth.json` on Linux) and can replace or remove that stored key when the
+same provider is edited again. Runtime commands never prompt. They resolve an explicit
+caller-supplied environment mapping first, then a non-empty process environment value, then
+the stored key for that connection ID. Environment values override the store without rewriting
+it. Missing credentials fail with the environment name and a recovery that points at
+`exp config providers`. Bedrock stays on the AWS credential chain. Current provider revisions
+live in SQLite; immutable serving snapshots bind exact revisions while build and evaluation
+artifacts remain in the project artifact store.
 
 To add ordered failover, first author each deployment as a direct alias with the same
 `--exact-model`. Then certify their equivalence and order with:

@@ -6,8 +6,8 @@ on the exact release checkout.
 
 ## Supported and verified
 
-- Root CLI commands are exactly `auth`, `build`, `config`, `optimize`, and `run`; optimizer commands are
-  exactly `router` and `model`. The `auth` group is exactly `list`, `login`, and `logout`.
+- Root CLI commands are exactly `build`, `config`, `optimize`, and `run`; optimizer commands are
+  exactly `router` and `model`.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses, bounded in-memory continuation and replay,
