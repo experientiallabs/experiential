@@ -16,3 +16,4 @@ results, and plans do not live here.
 | `reference/router_optimization_config.md` | Exact completed-evidence configuration recipe for router optimization. |
 | `release-scope.md` | Supported and explicitly excluded release claims. |
 | `research/w16-router-sandbox-evidence.md` | Deterministic W16 router and local sandbox evidence, limits, and replay commands. |
+| `research/rust-gateway-engine.md` | Native (Rust) gateway data-plane benchmarks: streaming concurrency, the shared SQLite durability ceiling, and horizontal-scaling guidance. |
