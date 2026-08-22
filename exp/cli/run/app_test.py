@@ -158,6 +158,33 @@ def test_no_argument_noninteractive_run_returns_stable_empty_state_json(tmp_path
     assert not (tmp_path / "gateway").exists()
 
 
+def test_engine_rust_without_the_extension_is_an_actionable_error(tmp_path: Path) -> None:
+    """An explicit rust engine without the built extension names the build step."""
+    import importlib.util
+
+    if importlib.util.find_spec("exp_gateway_native") is not None:
+        pytest.skip("extension is built in this environment")
+    result = CliRunner().invoke(app, ["run", "--root", str(tmp_path), "--engine", "rust"])
+    assert result.exit_code == 2
+    assert "exp_gateway_native" in result.output
+
+
+def test_engine_auto_falls_back_to_python_on_an_uninitialized_root(tmp_path: Path) -> None:
+    """The default auto engine keeps the python empty-state contract."""
+    result = CliRunner().invoke(
+        app,
+        ["run", "--root", str(tmp_path), "--non-interactive", "--json"],
+    )
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["error"]["code"] == "gateway_not_initialized"
+
+
+def test_engine_rejects_unknown_values(tmp_path: Path) -> None:
+    """An unknown engine name is a usage error."""
+    result = CliRunner().invoke(app, ["run", "--root", str(tmp_path), "--engine", "zig"])
+    assert result.exit_code == 2
+
+
 def test_first_run_delivers_credentials_before_readiness_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -235,7 +235,6 @@ def _run_gateway(
         raise
 
 
-
 def _rust_engine_blocker(root: Path) -> str | None:
     """Return why the rust data plane cannot serve this root, or ``None``.
 
@@ -327,8 +326,7 @@ def _run_rust_gateway(
                 typer.echo(json.dumps(receipt, separators=(",", ":")))
             else:
                 _console.print(
-                    f"[green]Gateway ready (rust engine)[/green] "
-                    f"http://{_LOOPBACK_HOST}:{port}/v1",
+                    f"[green]Gateway ready (rust engine)[/green] http://{_LOOPBACK_HOST}:{port}/v1",
                     markup=True,
                 )
             if check:

@@ -342,7 +342,6 @@ def gateway_instance_lock(root: Path, *, port: int) -> Iterator[None]:
         lock.release()
 
 
-
 @dataclass(frozen=True)
 class LocalGatewayComponents:
     """Loaded authority, accounting, and routing shared by both gateway engines.
