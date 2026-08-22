@@ -36,11 +36,17 @@ def budget_set(
     pool_id: str | None = typer.Option(None, "--pool"),
     deployment_id: str | None = typer.Option(None, "--deployment"),
     replace: bool = typer.Option(False, "--replace"),
+    strict_unknown_cost: bool = typer.Option(False, "--strict-unknown-cost"),
     root: Path = ROOT_OPTION,
     non_interactive: bool = _NON_INTERACTIVE_OPTION,
     json_output: bool = _JSON_OPTION,
 ) -> None:
-    """Create or explicitly replace one hard monthly allocation."""
+    """Create or explicitly replace one hard monthly allocation.
+
+    By default unpriced attempts are admitted and tracked as unknown cost with
+    their token volume; ``--strict-unknown-cost`` makes the limit fail closed on
+    unpriced attempts until an operator reconciles them.
+    """
     selected_period = _required_value(
         period,
         name="--period",
@@ -74,6 +80,7 @@ def budget_set(
             scope=scope,
             limit_micro_usd=selected_limit,
             replace=replace,
+            strict_unknown_cost=strict_unknown_cost,
         )
     emit_receipt(
         GatewayReceipt(

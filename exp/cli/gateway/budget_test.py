@@ -172,6 +172,59 @@ def test_noninteractive_budget_management_reports_integer_remaining(tmp_path: Pa
     assert "dashboard" not in remaining.stdout.lower()
 
 
+def test_set_records_opt_in_strict_unknown_cost(tmp_path: Path) -> None:
+    """The strict fail-closed mode is off by default and explicit in the receipt."""
+    _configured(tmp_path)
+    runner = CliRunner()
+    default = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "budget",
+            "set",
+            "--period",
+            "2026-08",
+            "--scope",
+            "team",
+            "--limit-micro-usd",
+            "1000",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert default.exit_code == 0, default.output
+    assert json.loads(default.stdout)["data"]["strict_unknown_cost"] is False
+
+    strict = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "budget",
+            "set",
+            "--period",
+            "2026-08",
+            "--scope",
+            "team",
+            "--limit-micro-usd",
+            "1000",
+            "--strict-unknown-cost",
+            "--replace",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert strict.exit_code == 0, strict.output
+    receipt = json.loads(strict.stdout)
+    assert receipt["changed"] is True
+    assert receipt["data"]["strict_unknown_cost"] is True
+
+
 def test_interactive_set_prompts_while_noninteractive_missing_values_fail(tmp_path: Path) -> None:
     """Human prompts remain available and automation never waits for missing values."""
     _configured(tmp_path)

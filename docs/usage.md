@@ -105,9 +105,11 @@ exp config gateway budget remaining --period 2026-08 --root ROOT --json
 Omit required values in an interactive terminal to receive prompts. Pass `--non-interactive` to
 fail immediately instead. `--replace` changes a configured limit without deleting the month or its
 spend. Exhausting one deployment continues to the next certified exact-model route. Exhausting all
-applicable shared capacity returns OpenAI `insufficient_quota`. Unknown required pricing fails
-closed under a hard limit. Attempts already recorded with unknown cost keep the limit fail-closed
-even after `--replace` raises it; `exp config gateway budget reconcile --period 2026-08 --scope
+applicable shared capacity returns OpenAI `insufficient_quota`. By default an unpriced attempt is
+admitted and recorded as unknown cost; `budget remaining` reports the unknown-cost attempts and
+their observed token volume. `--strict-unknown-cost` on `budget set` opts one limit into failing
+closed instead: unpriced attempts are rejected, recorded unknown-cost attempts block the limit even
+after `--replace` raises it, and `exp config gateway budget reconcile --period 2026-08 --scope
 team --assigned-cost-micro-usd COST --root ROOT --non-interactive` settles each unknown-cost
 attempt at an explicit assigned cost and restores service with exact per-attempt attribution.
 There is no budget reset job and no budgets dashboard.

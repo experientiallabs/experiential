@@ -19,6 +19,7 @@ from exp.runtime.gateway.sqlite.migrations import (
     _MIGRATION_4,
     _MIGRATION_5,
     _MIGRATION_6,
+    _MIGRATION_7,
     SCHEMA_VERSION,
     GatewaySchemaError,
     connect_database,
@@ -530,7 +531,7 @@ def test_v7_migration_assigns_immutable_period_and_preserves_prior_cost(tmp_path
             """
         ).fetchone()
         assert row == ("2026-08-01T00:00:00+00:00", None, 17)
-        assert current.execute("PRAGMA user_version").fetchone() == (7,)
+        assert current.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
     finally:
         current.close()
     prior = sqlite3.connect(backup)
@@ -538,6 +539,69 @@ def test_v7_migration_assigns_immutable_period_and_preserves_prior_cost(tmp_path
         columns = {str(row[1]) for row in prior.execute("PRAGMA table_info(gateway_attempts)")}
         assert "budget_period_start" not in columns
         assert prior.execute("PRAGMA user_version").fetchone() == (6,)
+    finally:
+        prior.close()
+
+
+def test_v8_migration_adds_default_off_strict_unknown_cost(tmp_path: Path) -> None:
+    """A v7 budget migrates with the strict fail-closed mode disabled by default."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for migration in (
+            _MIGRATION_1,
+            _MIGRATION_2,
+            _MIGRATION_3,
+            _MIGRATION_4,
+            _MIGRATION_5,
+            _MIGRATION_6,
+            _MIGRATION_7,
+        ):
+            for statement in migration:
+                connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO gateway_monthly_budgets (
+                budget_id, organization_id, period_start, scope_kind, scope_key,
+                limit_micro_usd, created_at, updated_at
+            ) VALUES (?, ?, ?, 'team', ?, 1000, ?, ?)
+            """,
+            (
+                "budget-one",
+                "org-one",
+                "2026-08-01T00:00:00+00:00",
+                "scope-one",
+                "2026-08-18T00:00:00+00:00",
+                "2026-08-18T00:00:00+00:00",
+            ),
+        )
+        connection.execute("PRAGMA user_version = 7")
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    backup = initialize_database(path)
+
+    assert backup is not None
+    current = sqlite3.connect(path)
+    try:
+        row = current.execute(
+            "SELECT strict_unknown_cost FROM gateway_monthly_budgets WHERE budget_id = 'budget-one'"
+        ).fetchone()
+        assert row == (0,)
+        assert current.execute("PRAGMA user_version").fetchone() == (8,)
+    finally:
+        current.close()
+    prior = sqlite3.connect(backup)
+    try:
+        columns = {
+            str(row[1]) for row in prior.execute("PRAGMA table_info(gateway_monthly_budgets)")
+        }
+        assert "strict_unknown_cost" not in columns
+        assert prior.execute("PRAGMA user_version").fetchone() == (7,)
     finally:
         prior.close()
 
