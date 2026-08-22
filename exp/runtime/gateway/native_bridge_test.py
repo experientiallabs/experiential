@@ -467,17 +467,25 @@ def test_claim_scope_matches_the_python_replay_key(tmp_path: Path) -> None:
 
 
 def test_admit_escalates_host_ineligible_route_before_accounting(tmp_path: Path) -> None:
-    """Hosted execution policy can retain routes whose native semantics are incomplete."""
+    """Hosted policy can retain requests whose native semantics are incomplete."""
     _manager, raw_key = _configured_gateway(tmp_path)
     components = load_gateway_components(
         tmp_path,
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
     )
-    control = NativeControlPlane(components, native_route_eligible=lambda _route: False)
+    seen_requests: list[GatewayRequest] = []
 
-    admission = _admit(control, raw_key, _chat_body())
+    def native_route_eligible(_route: object, request: GatewayRequest) -> bool:
+        """Reject keyed requests after retaining the decoded request for assertion."""
+        seen_requests.append(request)
+        return request.idempotency_key is None
+
+    control = NativeControlPlane(components, native_route_eligible=native_route_eligible)
+
+    admission = _admit(control, raw_key, _chat_body(), idempotency_key="shared-replay")
 
     assert admission == {"escalate": "host policy requires the python execution engine"}
+    assert [request.idempotency_key for request in seen_requests] == ["shared-replay"]
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 0
 

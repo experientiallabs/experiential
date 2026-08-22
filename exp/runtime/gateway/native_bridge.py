@@ -202,7 +202,7 @@ class NativeControlPlane:
         readiness_probe: Callable[[], bool] | None = None,
         usage_reporter: Callable[[], JsonObject] | None = None,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
-        native_route_eligible: Callable[[GatewayRoute], bool] | None = None,
+        native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -219,7 +219,8 @@ class NativeControlPlane:
             budget_error_factory: Optional hosted mapping for a rejected
                 reservation, keyed by the presented virtual key.
             native_route_eligible: Optional hosted policy deciding whether a
-                resolved direct route has complete native execution semantics.
+                resolved direct route and canonical request have complete
+                native execution semantics.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -355,7 +356,7 @@ class NativeControlPlane:
             return _escalation("multi-deployment pools use the python engine's certified waterfall")
         if route is not None and self._native_route_eligible is not None:
             try:
-                native_route_eligible = self._native_route_eligible(route)
+                native_route_eligible = self._native_route_eligible(route, request)
             except Exception:  # noqa: BLE001 - hosted policy fails closed to Python.
                 native_route_eligible = False
             if not native_route_eligible:
