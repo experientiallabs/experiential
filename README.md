@@ -51,23 +51,6 @@ collects four prompts:
 
 ## Using the API
 
-The local gateway serves the same OpenAI-compatible API through the native Rust
-data plane by default when the `exp_gateway_native` extension is available. Rust
-owns the public socket and Chat Completions fast path. An embedded Python engine
-handles Responses, replay-keyed chat, project-backed aliases, and other routes
-that need it, using the same authorization and usage ledger.
-
-Choose the data-plane engine explicitly when needed:
-
-```bash
-exp --engine rust    # require the native Rust data plane
-exp --engine python  # force the Python server
-```
-
-Both engines expose the same `/v1` API. See the [native gateway data-plane
-report](./docs/research/rust-gateway-engine.md) for benchmark and scaling
-details.
-
 Create a local gateway programmatically:
 
 ```python
@@ -81,6 +64,8 @@ uvicorn.run(gateway.app, lifespan="on")
 
 For hosted workers with their own storage and provider services, use the lower-level
 `exp.create_gateway_runtime(...)` composition API.
+
+The API is unchanged: the default data plane is `Rust`, with faster streaming than `Python`.
 
 ## Optimize from Traffic
 
