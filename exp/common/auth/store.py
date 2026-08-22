@@ -9,6 +9,7 @@ values never appear in ``repr``, ``str``, or raised messages.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import tempfile
@@ -22,6 +23,7 @@ from exp.common.core.artifacts import SECRET_REDACTION_PLACEHOLDER, ContractMode
 from exp.common.core.files import fsync_directory_best_effort
 from exp.common.core.locks import file_write_lock
 
+logger = logging.getLogger(__name__)
 _CONNECTION_ID_MAX = 128
 _DIRECTORY_MODE = 0o700
 _FILE_MODE = 0o600
@@ -212,11 +214,15 @@ class ProviderAuthStore:
     def _replace(self, records: Mapping[str, _StoredApiRecord]) -> None:
         """Atomically replace the credential file with user-only permissions.
 
+        The staging file is restricted before the rename. After ``os.replace`` succeeds the
+        requested document is installed, so a later destination ``chmod`` or directory fsync
+        failure cannot report the write as lost.
+
         Args:
             records: Complete connection ID to stored API record mapping to persist.
 
         Raises:
-            ProviderAuthStoreError: The destination is unsafe or the write failed.
+            ProviderAuthStoreError: The destination is unsafe or the write failed before replace.
         """
         self._prepare_directory()
         if self._path.exists() or self._path.is_symlink():
@@ -240,11 +246,18 @@ class ProviderAuthStore:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self._path)
-            os.chmod(self._path, _FILE_MODE)
-            fsync_directory_best_effort(self._path.parent)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
+        try:
+            os.chmod(self._path, _FILE_MODE)
+        except OSError as exc:
+            logger.warning(
+                "could not restrict provider credential file mode at %s: %s",
+                self._path,
+                exc,
+            )
+        fsync_directory_best_effort(self._path.parent)
 
     def _prepare_directory(self) -> None:
         """Create the credential directory and restrict it to the current user."""
@@ -370,7 +383,7 @@ def _malformed_message(path: Path) -> str:
         path: Credential file the operator can move or replace.
 
     Returns:
-        Error text naming the path and the login recovery command.
+        Error text naming the path and the providers recovery command.
     """
     return (
         f"provider credential file {path} is malformed; move or delete it, then run "

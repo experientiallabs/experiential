@@ -146,7 +146,7 @@ def test_malformed_file_fails_with_a_recoverable_error(tmp_path: Path) -> None:
     assert _SECRET not in repr(captured.value)
 
 
-def test_logout_removes_only_the_selected_connection(tmp_path: Path) -> None:
+def test_remove_deletes_only_the_selected_connection(tmp_path: Path) -> None:
     """Removing one stored credential leaves every other connection intact."""
     path = tmp_path / "auth.json"
     store = _store(path)
@@ -221,6 +221,32 @@ def test_replace_fsyncs_the_parent_directory(
 
     assert flushed == [path.parent]
     assert _store(path).get("openai") == _SECRET
+
+
+def test_post_rename_chmod_failure_does_not_hide_a_successful_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once replace succeeds, a later chmod failure still leaves the new credential readable."""
+    path = tmp_path / "auth.json"
+    real_chmod = os.chmod
+
+    def _fail_destination_chmod(target: str | os.PathLike[str], mode: int) -> None:
+        """Fail only the destination file chmod after the rename.
+
+        Args:
+            target: Path being chmod'd.
+            mode: Requested mode.
+        """
+        if Path(target) == path:
+            raise OSError("chmod failed")
+        real_chmod(target, mode)
+
+    monkeypatch.setattr(os, "chmod", _fail_destination_chmod)
+    _store(path).put("openai", _SECRET)
+
+    assert _store(path).get("openai") == _SECRET
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_missing_file_is_an_empty_store(tmp_path: Path) -> None:
