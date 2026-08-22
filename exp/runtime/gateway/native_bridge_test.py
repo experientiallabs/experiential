@@ -464,6 +464,20 @@ def test_claim_scope_matches_the_python_replay_key(tmp_path: Path) -> None:
     assert different_body["canonical_request_sha256"] != scope["canonical_request_sha256"]
     decoded = decode_chat(json.loads(_chat_body()), idempotency_key="operation-one")
     assert decoded.request.idempotency_key == "operation-one"
+
+
+def test_admit_escalates_host_ineligible_route_before_accounting(tmp_path: Path) -> None:
+    """Hosted execution policy can retain routes whose native semantics are incomplete."""
+    _manager, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, native_route_eligible=lambda _route: False)
+
+    admission = _admit(control, raw_key, _chat_body())
+
+    assert admission == {"escalate": "host policy requires the python execution engine"}
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 0
 
@@ -526,8 +540,6 @@ def test_keyed_admissions_enforce_the_durable_ledger_idempotency_rows(
     assert unavailable_payload["code"] == "idempotency_replay_unavailable"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
-
-
 def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:
     """An ungranted alias maps to the shared 403 public error."""
     control, raw_key = _control_plane(tmp_path)

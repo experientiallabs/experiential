@@ -293,6 +293,7 @@ class NativeControlPlane:
         readiness_probe: Callable[[], bool] | None = None,
         usage_reporter: Callable[[], JsonObject] | None = None,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
+        native_route_eligible: Callable[[GatewayRoute], bool] | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -308,6 +309,8 @@ class NativeControlPlane:
                 engine defaults to its single-organization SQLite report.
             budget_error_factory: Optional hosted mapping for a rejected
                 reservation, keyed by the presented virtual key.
+            native_route_eligible: Optional hosted policy deciding whether a
+                resolved direct route has complete native execution semantics.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -320,6 +323,7 @@ class NativeControlPlane:
         self._readiness_probe = readiness_probe
         self._usage_reporter = usage_reporter
         self._budget_error_factory = budget_error_factory
+        self._native_route_eligible = native_route_eligible
         self._inflight: dict[str, _InflightAttempt] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
@@ -440,6 +444,13 @@ class NativeControlPlane:
             probe_failure = exc
         if route is not None and route.fallback_deployments:
             return _escalation("multi-deployment pools use the python engine's certified waterfall")
+        if route is not None and self._native_route_eligible is not None:
+            try:
+                native_route_eligible = self._native_route_eligible(route)
+            except Exception:  # noqa: BLE001 - hosted policy fails closed to Python.
+                native_route_eligible = False
+            if not native_route_eligible:
+                return _escalation("host policy requires the python execution engine")
 
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         accepted = False
