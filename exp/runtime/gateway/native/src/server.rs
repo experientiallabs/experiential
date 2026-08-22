@@ -1951,7 +1951,7 @@ async fn completed_responses(
         // Success is only reported once the terminal accounting write landed.
         return error_response(&PublicError::internal());
     }
-    let mut headers = commit_independent(&admission);
+    let mut headers = commit_independent(&admission, None);
     headers.extend(commit_dependent(&admission));
     json_response(StatusCode::OK, &aggregated.body, &headers)
 }
@@ -1969,7 +1969,7 @@ async fn stream_responses(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let mut header_pairs = commit_independent(&admission);
+    let mut header_pairs = commit_independent(&admission, None);
     header_pairs.extend(commit_dependent(&admission));
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();
