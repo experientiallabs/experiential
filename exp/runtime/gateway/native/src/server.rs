@@ -80,6 +80,28 @@ struct AppState {
     /// Requests handled since start; the idle reclaim loop trims the
     /// allocator once per burst when this advances and the plane is idle.
     handled_requests: Arc<AtomicUsize>,
+    /// Proxied requests still relaying to or from the python engine. Proxy
+    /// traffic holds no active-request permit, so the reclaim loop needs
+    /// this separate in-flight signal to avoid trimming under proxy load.
+    active_proxies: Arc<AtomicUsize>,
+}
+
+/// Holds one in-flight proxy count from admission until the relayed
+/// response body is fully forwarded or dropped.
+struct ProxyGuard(Arc<AtomicUsize>);
+
+impl ProxyGuard {
+    /// Count one proxied request as in flight.
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The wire configuration returned by one successful admission. The upstream
@@ -111,6 +133,7 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
     let pending_settlements = Arc::new(AtomicUsize::new(0));
     let max_active_requests = config.max_active_requests.max(1);
     let handled_requests = Arc::new(AtomicUsize::new(0));
+    let active_proxies = Arc::new(AtomicUsize::new(0));
     let state = AppState {
         bridge,
         http,
@@ -119,12 +142,14 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         fallback_base: format!("http://127.0.0.1:{}", config.fallback_port),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
+        active_proxies: active_proxies.clone(),
     };
     tokio::spawn(crate::memory::reclaim_when_idle(
         state.permits.clone(),
         max_active_requests,
         handled_requests,
         pending_settlements.clone(),
+        active_proxies,
     ));
     let app = Router::new()
         .route("/v1/models", get(models))
@@ -270,6 +295,7 @@ async fn proxy_to_python(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
+    let guard = ProxyGuard::new(state.active_proxies.clone());
     let url = format!("{}{}", state.fallback_base, path_and_query);
     let mut request = state.http.request(method, url);
     for (name, value) in headers {
@@ -313,8 +339,14 @@ async fn proxy_to_python(
         }
         builder = builder.header(name, value);
     }
+    // The guard rides the relayed stream so the proxied request stays
+    // counted until its body finishes or the client disconnects.
+    let relayed = upstream.bytes_stream().map(move |chunk| {
+        let _held = &guard;
+        chunk
+    });
     builder
-        .body(Body::from_stream(upstream.bytes_stream()))
+        .body(Body::from_stream(relayed))
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
