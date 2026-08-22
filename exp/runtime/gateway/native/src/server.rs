@@ -648,6 +648,7 @@ struct AttemptGuard {
     attempt_id: String,
     pending: Arc<AtomicUsize>,
     armed: bool,
+    outcome_recorded: bool,
     started: Instant,
 }
 
@@ -661,13 +662,20 @@ impl AttemptGuard {
             attempt_id,
             pending: state.pending_settlements.clone(),
             armed: true,
+            outcome_recorded: false,
             started,
         }
     }
 
-    /// Record this attempt's terminal outcome and duration exactly once, when
-    /// the settlement is decided (whether or not its write landed durably).
-    fn record_terminal(&self, outcome: &str, cancelled: bool) {
+    /// Record this attempt's terminal outcome and duration exactly once, at
+    /// the moment the outcome is decided. Recording happens before delivery
+    /// is awaited, so a task cancelled mid-write cannot re-report a decided
+    /// outcome as a cancellation.
+    fn record_terminal(&mut self, outcome: &str, cancelled: bool) {
+        if self.outcome_recorded {
+            return;
+        }
+        self.outcome_recorded = true;
         METRICS.record_outcome(outcome, cancelled);
         METRICS.request_duration_ms.record(self.started.elapsed());
         METRICS.exit_request();
@@ -692,8 +700,8 @@ impl AttemptGuard {
         );
         let cancelled =
             failure.map(|failure| failure.failure_class == FailureClass::Cancelled) == Some(true);
-        let delivered = deliver_settlement(&self.bridge, argument).await;
         self.record_terminal(outcome, cancelled);
+        let delivered = deliver_settlement(&self.bridge, argument).await;
         self.armed = false;
         delivered
     }

@@ -43,7 +43,10 @@ impl Histogram {
     /// Record one observed duration.
     pub fn record(&self, elapsed: Duration) {
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        let ms = micros / 1_000;
+        // Round the observation up to whole milliseconds so a fractional
+        // value lands in the bucket whose inclusive bound actually covers it
+        // (1.5 ms belongs to `le_ms: 2`, not `le_ms: 1`).
+        let ms = micros.div_ceil(1_000);
         let index = LATENCY_BUCKET_UPPER_MS
             .iter()
             .position(|upper| ms <= *upper)
@@ -332,21 +335,26 @@ mod tests {
         let histogram = Histogram::new();
         histogram.record(Duration::from_micros(500));
         histogram.record(Duration::from_millis(1));
+        histogram.record(Duration::from_micros(1_500));
         histogram.record(Duration::from_millis(3));
         histogram.record(Duration::from_secs(120));
         let snapshot = histogram.snapshot();
-        assert_eq!(snapshot["count"], 4);
+        assert_eq!(snapshot["count"], 5);
         let buckets = snapshot["buckets"].as_array().expect("bucket array");
         assert_eq!(buckets.len(), LATENCY_BUCKET_UPPER_MS.len() + 1);
         assert_eq!(buckets[0]["le_ms"], 1);
         assert_eq!(buckets[0]["count"], 2);
+        // A fractional observation just past a boundary rounds up into the
+        // bucket whose inclusive bound covers it.
+        assert_eq!(buckets[1]["le_ms"], 2);
+        assert_eq!(buckets[1]["count"], 1);
         assert_eq!(buckets[2]["le_ms"], 5);
         assert_eq!(buckets[2]["count"], 1);
         let overflow = buckets.last().expect("overflow bucket");
         assert!(overflow["le_ms"].is_null());
         assert_eq!(overflow["count"], 1);
         let sum_ms = snapshot["sum_ms"].as_f64().expect("sum");
-        assert!((sum_ms - 120_004.5).abs() < 0.001);
+        assert!((sum_ms - 120_006.0).abs() < 0.001);
     }
 
     #[test]
