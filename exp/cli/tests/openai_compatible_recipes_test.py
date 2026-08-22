@@ -9,6 +9,11 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.providers.experiential_cloud import (
+    HOSTED_GATEWAY_API_KEY_ENV,
+    HOSTED_GATEWAY_DEFAULT_BASE_URL,
+    SETUP_PICKER_NAME,
+)
 
 FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1"
 _RECIPES_DOC = Path(__file__).parents[3] / "docs" / "reference" / "openai-compatible-recipes.md"
@@ -208,6 +213,10 @@ def test_recipes_doc_pins_the_verified_constants_and_is_indexed() -> None:
     assert "exp config gateway provider add" in doc
     assert "--provider openai-compatible" in doc.replace(" \\\n  ", " ")
     assert "hosted Experiential gateway" in doc
+    assert HOSTED_GATEWAY_DEFAULT_BASE_URL in doc
+    assert HOSTED_GATEWAY_API_KEY_ENV in doc
+    assert f"--provider {SETUP_PICKER_NAME}" in doc
+    assert "does not write a local `gateway.db`" in doc
     assert "identity-only" in doc
     assert "unknown" in doc
     assert "micro-USD prices" in doc

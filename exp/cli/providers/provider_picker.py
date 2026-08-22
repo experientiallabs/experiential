@@ -12,13 +12,20 @@ Providers without a safe listing API keep manual declaration on the model screen
 
 from __future__ import annotations
 
-from collections.abc import MutableMapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from getpass import getpass
 
 from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
+from exp.cli.providers.experiential_cloud import (
+    CATALOG_PROVIDER as HOSTED_CATALOG_PROVIDER,
+    HOSTED_GATEWAY_API_KEY_ENV,
+    SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
+    SETUP_PICKER_NAME as HOSTED_SETUP_PICKER,
+    hosted_gateway_base_url,
+)
 from exp.cli.shared.picker import (
     PickerAction,
     PickerKeyReader,
@@ -59,6 +66,7 @@ SETUP_PROVIDER_LABELS = {
     "openai-compatible": "openai-compatible",
     "azure": "azure",
     "bedrock": "bedrock",
+    HOSTED_SETUP_PICKER: HOSTED_SETUP_LABEL,
 }
 CANONICAL_CREDENTIAL_ENV = CANONICAL_API_KEY_ENV
 _MANUAL_MODEL_PROVIDERS = frozenset({"azure", "bedrock"})
@@ -231,6 +239,7 @@ def select_providers(
     environment: MutableMapping[str, str],
     configured: bool = False,
     read_key: PickerKeyReader | None = None,
+    exclude: frozenset[str] = frozenset(),
 ) -> tuple[tuple[str, ...], bool] | None:
     """Show the one provider screen that opens setup.
 
@@ -241,6 +250,8 @@ def select_providers(
         configured: Whether the catalog already holds usable models, which makes provider
             selection optional so roles can be edited offline.
         read_key: Optional keyboard source used by tests instead of the controlling terminal.
+        exclude: Provider keys omitted from this screen. Local gateway first-run
+            hides Experiential Cloud so it cannot wrap the hosted Platform path.
 
     Returns:
         Selected providers plus whether manual model declaration is needed, or ``None`` when the
@@ -250,6 +261,7 @@ def select_providers(
     options = [
         PickerOption(value=provider, label=label)
         for provider, label in SETUP_PROVIDER_LABELS.items()
+        if provider not in exclude
     ]
     if configured:
         options.insert(
@@ -313,12 +325,15 @@ def collect_provider_connection(
     provider: str,
     *,
     console: Console,
+    environment: Mapping[str, str] | None = None,
 ) -> ConnectionConfig | None:
     """Collect the provider-specific connection metadata shared by setup entry points.
 
     Args:
         provider: Supported provider selected on the shared provider screen.
         console: Terminal used for provider-specific fields.
+        environment: Optional process environment. Experiential Cloud reads
+            ``EXP_GATEWAY_URL`` from it; other providers ignore it.
 
     Returns:
         Secret-free connection metadata, or ``None`` when an optional endpoint field is skipped.
@@ -328,6 +343,12 @@ def collect_provider_connection(
     """
     if provider not in SETUP_PROVIDER_LABELS:
         raise ValueError(f"unsupported provider {provider!r}")
+    if provider == HOSTED_SETUP_PICKER:
+        return ConnectionConfig(
+            provider=HOSTED_CATALOG_PROVIDER,
+            api_key_env=HOSTED_GATEWAY_API_KEY_ENV,
+            base_url=hosted_gateway_base_url(environment),
+        )
     base_url = None
     api_version = None
     region = None
@@ -431,6 +452,7 @@ def prepare_providers(
             not discovered
             and provider not in _MANUAL_MODEL_PROVIDERS
             and provider not in configured_providers
+            and endpoint.connection.provider not in configured_providers
             and not session.advanced_models
         ):
             console.print(f"[yellow]Skipping {label}.[/yellow]")
@@ -470,12 +492,12 @@ def _resolve_endpoint(
         SetupCancelled: The user cancelled setup at a prompt.
     """
     label = SETUP_PROVIDER_LABELS[provider]
-    config = collect_provider_connection(provider, console=console)
+    config = collect_provider_connection(provider, console=console, environment=environment)
     if config is None:
         return None
     connection = _reused_connection(
         existing_connections,
-        provider=provider,
+        provider=config.provider,
         api_key_env=config.api_key_env,
         base_url=config.base_url,
         api_version=config.api_version,
@@ -486,8 +508,8 @@ def _resolve_endpoint(
         name = derive_connection_name(provider, taken_names)
         connection = ProviderConnection(
             name=name,
-            provider=provider,
-            api_key_env=config.api_key_env or derived_api_key_env(provider, name),
+            provider=config.provider,
+            api_key_env=config.api_key_env or derived_api_key_env(config.provider, name),
             base_url=config.base_url,
             api_version=config.api_version,
             region=config.region,
@@ -693,8 +715,9 @@ def _discover_models(
         SetupCancelled: The user cancelled setup during recovery.
     """
     label = SETUP_PROVIDER_LABELS[provider]
+    runtime_provider = endpoint.connection.provider
     request = ProviderEndpoint(
-        provider=provider,
+        provider=runtime_provider,
         api_key=endpoint.api_key,
         base_url=endpoint.connection.base_url,
     )
@@ -723,7 +746,7 @@ def _discover_models(
                         configured=endpoint.configured,
                     )
                     request = ProviderEndpoint(
-                        provider=provider,
+                        provider=runtime_provider,
                         api_key=api_key,
                         base_url=endpoint.connection.base_url,
                     )
@@ -739,13 +762,13 @@ def _discover_models(
         resolved = tuple(resolve_discovered_model(model) for model in discovered)
         verified = _canonical_models(
             tuple(model for model in resolved if served_roles(model.capabilities)),
-            provider=provider,
+            provider=runtime_provider,
         )
         unknown = _canonical_models(
             tuple(model for model in resolved if not served_roles(model.capabilities)),
-            provider=provider,
+            provider=runtime_provider,
         )
-        if provider not in _OPERATOR_DECLARED_PROVIDERS:
+        if runtime_provider not in _OPERATOR_DECLARED_PROVIDERS:
             unknown = ()
         if not verified and not unknown:
             console.print(f"[yellow]{label} published no model with verified metadata.[/yellow]")
@@ -754,9 +777,11 @@ def _discover_models(
                 continue
             return _ProviderDiscoveryResult(endpoint, ()) if recovery == _RECOVERY_SKIP else None
         fresh_verified = _fresh_models(
-            verified, provider=provider, configured=configured_identities
+            verified, provider=runtime_provider, configured=configured_identities
         )
-        fresh_unknown = _fresh_models(unknown, provider=provider, configured=configured_identities)
+        fresh_unknown = _fresh_models(
+            unknown, provider=runtime_provider, configured=configured_identities
+        )
         if not fresh_verified and not fresh_unknown:
             console.print(f"  [green]\u2713[/green] {label}: models already configured")
             return _ProviderDiscoveryResult(endpoint, ())
@@ -765,14 +790,14 @@ def _discover_models(
         )
         models = []
         for model in (*fresh_verified, *fresh_unknown):
-            alias = derive_model_alias(provider, model.model, frozenset(aliases))
+            alias = derive_model_alias(runtime_provider, model.model, frozenset(aliases))
             aliases.add(alias)
             verified_row = served_roles(model.capabilities)
             models.append(
                 AvailableModel(
                     alias=alias,
                     connection=endpoint.connection.name,
-                    provider=provider,
+                    provider=runtime_provider,
                     model=model.model,
                     capabilities=model.capabilities if verified_row else None,
                     pricing_source=(

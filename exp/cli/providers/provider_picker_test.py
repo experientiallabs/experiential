@@ -7,6 +7,11 @@ from pathlib import Path
 import pytest
 
 from exp.cli.providers import provider_picker
+from exp.cli.providers.experiential_cloud import (
+    HOSTED_GATEWAY_API_KEY_ENV,
+    HOSTED_GATEWAY_DEFAULT_BASE_URL,
+    HOSTED_GATEWAY_URL_ENV,
+)
 from exp.cli.providers.provider_picker import (
     SetupCancelled,
     SetupSession,
@@ -181,7 +186,7 @@ def test_keyboard_provider_list_selects_without_typed_numbers() -> None:
             PickerKey.ENTER,
             PickerKey.DOWN,
             PickerKey.ENTER,
-            *(PickerKey.DOWN for _ in range(6)),
+            *(PickerKey.DOWN for _ in range(7)),
             PickerKey.ENTER,
         )
     )
@@ -1066,3 +1071,104 @@ def test_no_prepared_provider_returns_to_the_provider_screen(
 
     assert prepared is None
     assert "No provider was prepared" in console.output
+
+
+def test_experiential_cloud_persists_the_hosted_platform_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Experiential Cloud writes openai-compatible plus the Platform origin."""
+
+    def _fail_prompt(_label: str, **_kwargs: object) -> str:
+        """Fail if setup asks for a local endpoint or credential variable."""
+        raise AssertionError(f"unexpected prompt: {_label}")
+
+    monkeypatch.setattr(provider_picker, "ask_text", _fail_prompt)
+    connection = provider_picker.collect_provider_connection(
+        "experiential-cloud",
+        console=ScriptedConsole(""),
+        environment={},
+    )
+
+    assert connection is not None
+    assert connection.provider == "openai-compatible"
+    assert connection.base_url == HOSTED_GATEWAY_DEFAULT_BASE_URL
+    assert connection.api_key_env == HOSTED_GATEWAY_API_KEY_ENV
+
+
+def test_experiential_cloud_honors_the_hosted_gateway_url_override() -> None:
+    """Preview or staging may replace the production Platform origin."""
+    connection = provider_picker.collect_provider_connection(
+        "experiential-cloud",
+        console=ScriptedConsole(""),
+        environment={HOSTED_GATEWAY_URL_ENV: "https://api-pr-12.preview.experientiallabs.ai/v1"},
+    )
+
+    assert connection is not None
+    assert connection.base_url == "https://api-pr-12.preview.experientiallabs.ai/v1"
+
+
+def test_experiential_cloud_lists_through_the_openai_compatible_family() -> None:
+    """Discovery uses the persisted provider so Platform listing metadata applies."""
+    console = ScriptedConsole("")
+    lister = _FakeLister(
+        {
+            "openai-compatible": [
+                (
+                    DiscoveredModel(
+                        provider="openai-compatible",
+                        model="deepseek-v4-flash",
+                        supports_completions=True,
+                        supports_structured_output=True,
+                        input_cost_per_million_tokens_usd=0.072,
+                        output_cost_per_million_tokens_usd=0.162,
+                    ),
+                )
+            ]
+        }
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("experiential-cloud",),
+        lister=lister,
+        environment={HOSTED_GATEWAY_API_KEY_ENV: "xpl_test_key"},
+    )
+
+    assert prepared is not None
+    endpoints, models = prepared
+    assert len(endpoints) == 1
+    assert endpoints[0].connection.name == "experiential-cloud"
+    assert endpoints[0].connection.provider == "openai-compatible"
+    assert endpoints[0].connection.base_url == HOSTED_GATEWAY_DEFAULT_BASE_URL
+    assert endpoints[0].connection.api_key_env == HOSTED_GATEWAY_API_KEY_ENV
+    assert lister.requests == [
+        ProviderEndpoint(
+            provider="openai-compatible",
+            api_key="xpl_test_key",
+            base_url=HOSTED_GATEWAY_DEFAULT_BASE_URL,
+        )
+    ]
+    assert [model.model for model in models] == ["deepseek-v4-flash"]
+    assert models[0].provider == "openai-compatible"
+    assert models[0].capabilities is not None
+    assert serves_role(models[0].capabilities, SetupRole.WORLD_MODEL)
+    assert "xpl_test_key" not in console.output
+    assert "https://gateway.example.test" not in console.output
+
+
+def test_resolve_setup_providers_accepts_experiential_cloud() -> None:
+    """The hosted picker is a first-class --provider value."""
+    assert resolve_setup_providers(("experiential-cloud", "openai")) == (
+        "openai",
+        "experiential-cloud",
+    )
+
+
+def test_provider_screen_lists_experiential_cloud() -> None:
+    """Builder setup shows the hosted Platform picker as its own row."""
+    console = ScriptedConsole("8\n\n")
+
+    selection = select_providers(SetupSession(), console=console, environment={})
+
+    assert selection == (("experiential-cloud",), False)
+    assert "Experiential Cloud" in console.output

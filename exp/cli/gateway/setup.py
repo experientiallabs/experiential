@@ -14,6 +14,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from exp.cli.providers.experiential_cloud import SETUP_PICKER_NAME as HOSTED_SETUP_PICKER
 from exp.cli.providers.model_picker import GatewayModelSelection, select_gateway_model
 from exp.cli.providers.provider_picker import (
     AvailableModel,
@@ -96,6 +97,7 @@ def interactive_gateway_setup(
                 session,
                 console=console,
                 environment=environment,
+                exclude=frozenset({HOSTED_SETUP_PICKER}),
             )
             if selection is None:
                 raise typer.Abort()

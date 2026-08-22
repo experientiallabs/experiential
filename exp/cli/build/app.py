@@ -88,7 +88,7 @@ _PROVIDER_OPTION = typer.Option(
     help=(
         "Repeatable provider to configure during first-build setup. "
         "Supported values: openai, anthropic, gemini, openrouter, openai-compatible, "
-        "azure, bedrock."
+        "azure, bedrock, experiential-cloud."
     ),
 )
 

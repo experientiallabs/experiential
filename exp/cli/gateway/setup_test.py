@@ -9,6 +9,9 @@ import typer
 
 from exp.cli.gateway import setup
 from exp.cli.providers import model_picker, provider_picker
+from exp.cli.providers.experiential_cloud import SETUP_PICKER_LABEL, SETUP_PICKER_NAME
+
+_LOCAL_GATEWAY_EXCLUDE = frozenset({SETUP_PICKER_NAME})
 from exp.cli.shared.picker import PickerKey
 from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.config import load_settings
@@ -65,12 +68,16 @@ def test_gateway_provider_selector_exposes_primary_and_legacy_providers(
     console = ScriptedConsole(f"{answer}\n\n")
 
     selected = provider_picker.select_providers(
-        provider_picker.SetupSession(), console=console, environment={}
+        provider_picker.SetupSession(),
+        console=console,
+        environment={},
+        exclude=_LOCAL_GATEWAY_EXCLUDE,
     )
 
     assert selected == ((provider,), provider in {"azure", "bedrock"})
     for expected in ("openai", "anthropic", "azure", "bedrock", "openai-compatible"):
         assert expected in console.output
+    assert SETUP_PICKER_LABEL not in console.output
 
 
 def test_gateway_provider_selector_accepts_multiple_providers() -> None:
@@ -78,7 +85,10 @@ def test_gateway_provider_selector_accepts_multiple_providers() -> None:
     console = ScriptedConsole("1,2,6,7\n\n")
 
     selected = provider_picker.select_providers(
-        provider_picker.SetupSession(), console=console, environment={}
+        provider_picker.SetupSession(),
+        console=console,
+        environment={},
+        exclude=_LOCAL_GATEWAY_EXCLUDE,
     )
 
     assert selected == (("openai", "anthropic", "azure", "bedrock"), True)
@@ -102,6 +112,7 @@ def test_gateway_provider_selector_uses_the_builder_keyboard_picker() -> None:
         console=console,
         environment={},
         read_key=lambda: next(keys),
+        exclude=_LOCAL_GATEWAY_EXCLUDE,
     )
 
     assert selected == (("azure",), True)
@@ -302,6 +313,21 @@ def test_openai_compatible_provider_connection_collects_endpoint(
         base_url="https://gateway.example.test/v1",
     )
     assert connection.api_key_env is None
+
+
+def test_experiential_cloud_connection_uses_the_hosted_platform_gateway() -> None:
+    """Experiential Cloud does not collect a local base URL or credential name."""
+    connection = provider_picker.collect_provider_connection(
+        "experiential-cloud",
+        console=ScriptedConsole(""),
+        environment={},
+    )
+
+    assert connection == ConnectionConfig(
+        provider="openai-compatible",
+        base_url="https://api.experientiallabs.ai/v1",
+        api_key_env="EXPLABS_API_KEY",
+    )
 
 
 def test_bedrock_provider_connection_uses_the_aws_credential_chain(
