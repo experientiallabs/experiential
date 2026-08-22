@@ -1639,3 +1639,34 @@ def test_project_alias_native_selection_matches_the_python_resolver(tmp_path: Pa
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_admit_persists_caller_app_identity_for_attribution(tmp_path: Path) -> None:
+    """The native admit path forwards caller HTTP-Referer/X-Title to durable attribution."""
+    control, raw_key = _control_plane(tmp_path)
+
+    admission = json.loads(
+        control.admit(
+            json.dumps(
+                {
+                    "raw_key": raw_key,
+                    "body": _chat_body(),
+                    "app_referer": "https://app.example.com",
+                    "app_title": "Example App",
+                }
+            )
+        )
+    )
+
+    ledger = control._components.ledger  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT r.app_referer, r.app_title
+            FROM gateway_requests AS r
+            JOIN gateway_attempts AS a ON a.request_id = r.request_id
+            WHERE a.attempt_id = ?
+            """,
+            (admission["attempt_id"],),
+        ).fetchone()
+    assert row == ("https://app.example.com", "Example App")
