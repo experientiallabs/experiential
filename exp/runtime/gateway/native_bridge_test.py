@@ -540,6 +540,8 @@ def test_keyed_admissions_enforce_the_durable_ledger_idempotency_rows(
     assert unavailable_payload["code"] == "idempotency_replay_unavailable"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
+
+
 def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:
     """An ungranted alias maps to the shared 403 public error."""
     control, raw_key = _control_plane(tmp_path)

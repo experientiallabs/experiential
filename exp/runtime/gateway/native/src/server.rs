@@ -179,11 +179,8 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready));
     let app = if config.native_usage_enabled {
-        app.route(
-            "/usage.json",
-            get(usage_json).fallback(proxy_fallback),
-        )
-        .route("/usage", get(usage_page).fallback(proxy_fallback))
+        app.route("/usage.json", get(usage_json).fallback(proxy_fallback))
+            .route("/usage", get(usage_page).fallback(proxy_fallback))
     } else {
         app
     };
