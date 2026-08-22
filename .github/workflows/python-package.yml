@@ -39,8 +39,11 @@ jobs:
             target: linux-x86_64
           - runner: ubuntu-24.04-arm
             target: linux-aarch64
-          - runner: macos-13
+          # Cross-compiled from the arm runner; macos-13 (the last intel
+          # runner) is being retired and queues for hours.
+          - runner: macos-14
             target: macos-x86_64
+            cargo-target: x86_64-apple-darwin
           - runner: macos-14
             target: macos-arm64
           - runner: windows-latest
@@ -70,6 +73,7 @@ jobs:
           command: build
           args: --release --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
           manylinux: auto
+          target: ${{ matrix.cargo-target || '' }}
       - name: Build the extension sdist
         if: matrix.target == 'linux-x86_64'
         uses: PyO3/maturin-action@v1
