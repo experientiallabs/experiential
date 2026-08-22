@@ -544,7 +544,7 @@ class RouterProjectTargetResolver:
         )
 
 
-def _consume_abandoned_selection(wrapped: asyncio.Future[object]) -> None:
+def _consume_abandoned_selection[SelectionT](wrapped: asyncio.Future[SelectionT]) -> None:
     """Retrieve a detached selection outcome so late failures are not logged as leaks."""
     if not wrapped.cancelled():
         wrapped.exception()
