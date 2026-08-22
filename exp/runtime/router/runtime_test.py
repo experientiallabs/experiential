@@ -955,6 +955,60 @@ def test_blocking_selection_deadline_expiring_mid_embed_fails_without_late_stick
     assert recorded == []
 
 
+def test_timed_out_queued_selection_is_cancelled_and_never_embeds() -> None:
+    """A queued selection abandoned at its deadline is cancelled before it runs."""
+    runtime, client = _runtime()
+    release = threading.Event()
+    embed_calls: list[int] = []
+
+    def blocking_embed(texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Count each embed and hold the single worker until released."""
+        del texts
+        embed_calls.append(1)
+        release.wait(timeout=1)
+        return (Embedding(values=(1.0, 0.0)),)
+
+    client.__dict__["embed"] = blocking_embed
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): runtime},
+        {("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap"},
+        maximum_outstanding_selections=1,
+    )
+    target = ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256=_DIGEST,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+    occupant = threading.Thread(
+        target=resolver.select_blocking,
+        kwargs={
+            "target": target,
+            "request": request,
+            "episode_namespace": ("org", "identity", "revision", "episode-one"),
+            "deadline_monotonic": __import__("time").monotonic() + 5,
+        },
+    )
+    occupant.start()
+    while not embed_calls:
+        __import__("time").sleep(0.005)
+
+    with pytest.raises(ProviderDeadlineExceeded):
+        resolver.select_blocking(
+            target=target,
+            request=request,
+            episode_namespace=("org", "identity", "revision", "episode-two"),
+            deadline_monotonic=__import__("time").monotonic() + 0.05,
+        )
+    release.set()
+    occupant.join(timeout=1)
+
+    assert embed_calls == [1]
+
+
 def test_blocking_selection_expired_deadline_raises_before_any_selection_work() -> None:
     """An already-expired request deadline fails closed without touching the client."""
     runtime, client = _runtime()

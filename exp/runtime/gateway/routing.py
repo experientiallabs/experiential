@@ -407,6 +407,8 @@ class RouterProjectTargetResolver:
         self._exact_models_by_alias = dict(exact_models_by_alias)
         # One worker pool is the single aggregate bound on concurrent
         # selections, shared by the event-loop path and the blocking path.
+        # Timed-out submissions are cancelled so abandoned work never
+        # occupies a worker ahead of live requests.
         self._selection_workers = ThreadPoolExecutor(
             max_workers=maximum_outstanding_selections,
             thread_name_prefix="exp-router-selection",
@@ -441,18 +443,18 @@ class RouterProjectTargetResolver:
             episode_id=episode_id,
         )
         if decision is None:
-            wrapped = asyncio.wrap_future(
-                self._selection_workers.submit(
-                    runtime._select_unretained,  # noqa: SLF001 - selection-only bridge.
-                    model_request,
-                    episode_id=episode_id,
-                )
+            submitted = self._selection_workers.submit(
+                runtime._select_unretained,  # noqa: SLF001 - selection-only bridge.
+                model_request,
+                episode_id=episode_id,
             )
+            wrapped = asyncio.wrap_future(submitted)
             wrapped.add_done_callback(_consume_abandoned_selection)
             try:
                 async with asyncio.timeout(deadline.attempt_timeout()):
                     prepared = await asyncio.shield(wrapped)
             except TimeoutError as exc:
+                submitted.cancel()
                 raise ProviderDeadlineExceeded("router selection deadline exceeded") from exc
             deadline.attempt_timeout()
             decision = runtime._retain_prepared_selection(
@@ -476,8 +478,9 @@ class RouterProjectTargetResolver:
         this runs the same sticky reuse, unretained selection, and retention
         sequence as :meth:`select` without an event loop. The selection runs
         on the shared bounded worker pool, so a request whose deadline
-        expires mid-selection fails immediately while the detached worker
-        finishes without publishing sticky state.
+        expires mid-selection fails immediately: still-queued work is
+        cancelled and a running detached worker finishes without publishing
+        sticky state.
 
         Args:
             target: Frozen project activation target.
@@ -506,6 +509,7 @@ class RouterProjectTargetResolver:
             try:
                 prepared = future.result(timeout=deadline.attempt_timeout())
             except FutureTimeoutError as exc:
+                future.cancel()
                 raise ProviderDeadlineExceeded("router selection deadline exceeded") from exc
             deadline.attempt_timeout()
             decision = runtime._retain_prepared_selection(  # noqa: SLF001 - selection-only.
