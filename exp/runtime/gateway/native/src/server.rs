@@ -809,6 +809,19 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
             return error_response(&PublicError::internal());
         }
     };
+    // The replay key was authorized independently of admission. If an alias
+    // activation landed between the two, the admitted response belongs to a
+    // newer revision than the claimed replay scope, so the claim is abandoned
+    // rather than caching a response under the wrong revision's namespace;
+    // waiting duplicates fail closed and retry against the new revision.
+    if lease
+        .as_ref()
+        .is_some_and(|owner| owner.alias_revision_id() != admission.alias_revision_id)
+    {
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
+    }
     let mut guard = AttemptGuard::new(
         &state,
         admission.request_id.clone(),

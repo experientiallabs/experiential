@@ -349,18 +349,28 @@ impl ReplayStore {
 }
 
 impl OwnerLease {
+    /// The alias revision this replay claim was scoped to.
+    pub fn alias_revision_id(&self) -> &str {
+        &self.key.alias_revision_id
+    }
+
     /// Publish one exact successful response from the unique owner.
     pub async fn complete(&mut self, response: CachedResponse) -> Result<(), PublicError> {
-        self.settled = true;
-        self.store
+        let result = self
+            .store
             .complete_entry(&self.key, self.epoch, response)
-            .await
+            .await;
+        // Settled only after the store call finishes: a task cancelled while
+        // waiting on the store mutex still abandons through `Drop`, so no
+        // pending entry is stranded with joiners waiting forever.
+        self.settled = true;
+        result
     }
 
     /// Remove failed owner work so no joiner receives invented content.
     pub async fn abandon(&mut self) {
-        self.settled = true;
         self.store.abandon_entry(&self.key, self.epoch).await;
+        self.settled = true;
     }
 }
 
