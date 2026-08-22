@@ -291,6 +291,7 @@ class NativeControlPlane:
         readiness_probe: Callable[[], bool] | None = None,
         usage_reporter: Callable[[], JsonObject] | None = None,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
+        route_context_recorder: Callable[[AttemptId, str | None, str | None], None] | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -306,6 +307,8 @@ class NativeControlPlane:
                 engine defaults to its single-organization SQLite report.
             budget_error_factory: Optional hosted mapping for a rejected
                 reservation, keyed by the presented virtual key.
+            route_context_recorder: Optional hosted sink for display-safe
+                route and fallback reason codes after durable reservation.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -318,6 +321,7 @@ class NativeControlPlane:
         self._readiness_probe = readiness_probe
         self._usage_reporter = usage_reporter
         self._budget_error_factory = budget_error_factory
+        self._route_context_recorder = route_context_recorder
         self._inflight: dict[str, _InflightAttempt] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
@@ -458,6 +462,12 @@ class NativeControlPlane:
                 route_depth=0,
                 maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(request, deployment),
             )
+            if self._route_context_recorder is not None:
+                self._route_context_recorder(
+                    attempt_id,
+                    route.route_reason,
+                    route.fallback_reason,
+                )
         except BudgetReservationRejected as exc:
             error = (
                 _budget_quota_error()

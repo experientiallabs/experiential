@@ -201,6 +201,26 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     assert repeat == "{}"
 
 
+def test_admit_records_host_route_context_after_reservation(tmp_path: Path) -> None:
+    """A hosted display sink receives route context without changing the ledger seam."""
+    _manager, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    contexts: list[tuple[str, str | None, str | None]] = []
+    control = NativeControlPlane(
+        components,
+        route_context_recorder=lambda attempt_id, route_reason, fallback_reason: contexts.append(
+            (attempt_id, route_reason, fallback_reason)
+        ),
+    )
+
+    admission = _admit(control, raw_key, _chat_body())
+
+    assert contexts == [(admission["attempt_id"], "direct", None)]
+
+
 def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None:
     """Invalid JSON, non-objects, and protocol violations use the shared codes."""
     control, raw_key = _control_plane(tmp_path)
