@@ -640,8 +640,9 @@ async fn deliver_settlement(bridge: &Bridge, argument: String) -> bool {
 ///
 /// Every admitted request settles through this guard. If the owning future is
 /// dropped before an explicit settlement lands (client disconnect cancels the
-/// handler, a panic unwinds the stream task), `Drop` spawns a cancellation
-/// settlement so the ledger row and its budget reservation are always closed.
+/// handler, a panic unwinds the stream task), `Drop` spawns a settlement so
+/// the ledger row and its budget reservation are always closed: the decided
+/// settlement verbatim when delivery was cut short, a cancellation otherwise.
 struct AttemptGuard {
     bridge: Arc<Bridge>,
     request_id: String,
@@ -649,6 +650,11 @@ struct AttemptGuard {
     pending: Arc<AtomicUsize>,
     armed: bool,
     outcome_recorded: bool,
+    /// The exact settlement whose delivery is in flight. The drop backstop
+    /// re-delivers this decided settlement instead of a cancellation, so a
+    /// task cancelled mid-write can neither downgrade the ledger outcome nor
+    /// diverge from the recorded metric.
+    decided_settlement: Option<String>,
     started: Instant,
 }
 
@@ -663,6 +669,7 @@ impl AttemptGuard {
             pending: state.pending_settlements.clone(),
             armed: true,
             outcome_recorded: false,
+            decided_settlement: None,
             started,
         }
     }
@@ -701,8 +708,10 @@ impl AttemptGuard {
         let cancelled =
             failure.map(|failure| failure.failure_class == FailureClass::Cancelled) == Some(true);
         self.record_terminal(outcome, cancelled);
+        self.decided_settlement = Some(argument.clone());
         let delivered = deliver_settlement(&self.bridge, argument).await;
         self.armed = false;
+        self.decided_settlement = None;
         delivered
     }
 
@@ -725,7 +734,27 @@ impl Drop for AttemptGuard {
         if !self.armed {
             return;
         }
-        self.record_terminal("failed", true);
+        // A settlement already decided (its delivery was cut short by the
+        // cancellation) is re-delivered verbatim, matching the control
+        // plane's own never-downgrade sweep semantics; only an attempt with
+        // no decided outcome settles as cancelled.
+        let argument = match self.decided_settlement.take() {
+            Some(argument) => argument,
+            None => {
+                self.record_terminal("failed", true);
+                settle_argument(
+                    &self.request_id,
+                    &self.attempt_id,
+                    "failed",
+                    None,
+                    &[],
+                    Some(&Failure::new(
+                        FailureClass::Cancelled,
+                        "gateway request was cancelled",
+                    )),
+                )
+            }
+        };
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // Runtime teardown; startup reconciliation closes the row.
             return;
@@ -733,17 +762,6 @@ impl Drop for AttemptGuard {
         let bridge = self.bridge.clone();
         let pending = self.pending.clone();
         pending.fetch_add(1, Ordering::SeqCst);
-        let argument = settle_argument(
-            &self.request_id,
-            &self.attempt_id,
-            "failed",
-            None,
-            &[],
-            Some(&Failure::new(
-                FailureClass::Cancelled,
-                "gateway request was cancelled",
-            )),
-        );
         handle.spawn(async move {
             deliver_settlement(&bridge, argument).await;
             pending.fetch_sub(1, Ordering::SeqCst);
