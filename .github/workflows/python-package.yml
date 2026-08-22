@@ -68,7 +68,7 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
       - name: Build the abi3 extension wheel
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8  # v1.51.0
         with:
           command: build
           args: --release --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
@@ -76,10 +76,22 @@ jobs:
           target: ${{ matrix.cargo-target || '' }}
       - name: Build the extension sdist
         if: matrix.target == 'linux-x86_64'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8  # v1.51.0
         with:
           command: sdist
           args: --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
+      - uses: astral-sh/setup-uv@v6
+      - name: Smoke test the wheel on its own platform
+        # The cross-compiled intel-mac wheel cannot import on the arm runner.
+        if: matrix.cargo-target == null
+        shell: bash
+        run: |
+          uv venv --python 3.12 /tmp/native-smoke || uv venv --python 3.12 native-smoke
+          venv_python="/tmp/native-smoke/bin/python"
+          [ -x "$venv_python" ] || venv_python="native-smoke/Scripts/python.exe"
+          [ -x "$venv_python" ] || venv_python="native-smoke/bin/python"
+          uv pip install --python "$venv_python" native-dist/*.whl
+          "$venv_python" -c "import exp_gateway_native as n; assert n.__version__; assert callable(n.serve)"
       - uses: actions/upload-artifact@v4
         with:
           name: native-dist-${{ matrix.target }}
