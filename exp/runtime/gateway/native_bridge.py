@@ -209,18 +209,11 @@ class NativeControlPlane:
         Args:
             components: Authority, ledger, routes, and runtime catalogs.
             request_timeout_seconds: Total per-request budget from admission.
-            continuation_store: Optional Responses continuation state, shared
-                with the embedded python engine so both engines resolve and
-                retain the same bounded namespaced history.
-            readiness_probe: Optional hosted lifecycle readiness callback. The
-                local engine defaults to the shared executor health latch.
-            usage_reporter: Optional hosted usage report callback. The local
-                engine defaults to its single-organization SQLite report.
-            budget_error_factory: Optional hosted mapping for a rejected
-                reservation, keyed by the presented virtual key.
-            native_route_eligible: Optional hosted policy deciding whether a
-                resolved direct route and canonical request have complete
-                native execution semantics.
+            continuation_store: Optional state shared by native and Python engines.
+            readiness_probe: Optional hosted lifecycle readiness callback.
+            usage_reporter: Optional hosted usage report callback.
+            budget_error_factory: Optional hosted mapping for a rejected reservation.
+            native_route_eligible: Optional hosted policy for complete native semantics.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
