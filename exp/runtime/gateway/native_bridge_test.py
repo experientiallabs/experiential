@@ -34,7 +34,6 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
-    _usage_from_payload,
 )
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
@@ -127,21 +126,6 @@ def test_bridge_error_payload_is_openai_shaped() -> None:
         "param": None,
         "retry_after_seconds": 60,
     }
-
-
-def test_usage_from_payload_handles_tokens_and_tool_names() -> None:
-    """Settlement usage covers token totals, tool-only, and absent cases."""
-    assert _usage_from_payload(None, []) is None
-    tools_only = _usage_from_payload(None, ["search"])
-    assert tools_only is not None and tools_only.tool_names == ("search",)
-    complete = _usage_from_payload(
-        {"input_tokens": 10, "output_tokens": 3, "cached_input_tokens": 2},
-        [],
-    )
-    assert complete is not None
-    assert complete.input_tokens == 10
-    assert complete.output_tokens == 3
-    assert complete.cached_input_tokens == 2
 
 
 def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:

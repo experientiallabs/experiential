@@ -28,7 +28,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
-from exp.common.core.artifacts import JsonObject, stable_id
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budgets import BudgetReservationRejected, maximum_attempt_cost_micro_usd
 from exp.runtime.gateway.contracts import (
@@ -39,7 +39,6 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
-    GatewayUsage,
 )
 from exp.runtime.gateway.discovery import (
     listing_metadata_by_alias,
@@ -60,6 +59,11 @@ from exp.runtime.gateway.native_responses import (
     continued_request,
     remember_turn,
     responses_envelope,
+)
+from exp.runtime.gateway.native_settlement import (
+    deployment_operation_key,
+    optional_text,
+    terminal_from_settlement,
 )
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
@@ -86,12 +90,6 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 _SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
 _SWEEP_BATCH = 16
-
-_TERMINAL_KINDS = {
-    "completed": GatewayEventKind.COMPLETED,
-    "incomplete": GatewayEventKind.INCOMPLETE,
-    "failed": GatewayEventKind.FAILED,
-}
 
 
 class _NativeDialectUnavailableError(RuntimeError):
@@ -288,8 +286,8 @@ class NativeControlPlane:
         decoded = self._decode_body(
             data["body"],
             surface=surface,
-            idempotency_key=_optional_text(data.get("idempotency_key")),
-            client_request_id=_optional_text(data.get("client_request_id")),
+            idempotency_key=optional_text(data.get("idempotency_key")),
+            client_request_id=optional_text(data.get("client_request_id")),
         )
         request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
@@ -412,7 +410,7 @@ class NativeControlPlane:
             "model_id": profile.model_id,
             "timeout_seconds": profile.timeout_seconds,
             "upstream_payload": upstream_payload,
-            "idempotency_key": _deployment_operation_key(route),
+            "idempotency_key": deployment_operation_key(route),
         }
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
@@ -445,8 +443,8 @@ class NativeControlPlane:
         data = json.loads(argument)
         decoded = self._decode_body(
             data["body"],
-            idempotency_key=_optional_text(data.get("idempotency_key")),
-            client_request_id=_optional_text(data.get("client_request_id")),
+            idempotency_key=optional_text(data.get("idempotency_key")),
+            client_request_id=optional_text(data.get("client_request_id")),
         )
         request = decoded.request
         caller_operation = request.idempotency_key or request.client_request_id
@@ -559,7 +557,7 @@ class NativeControlPlane:
             entry = self._inflight.get(request_id)
         if entry is None:
             return "{}"
-        terminal, failure = _terminal_from_settlement(data)
+        terminal, failure = terminal_from_settlement(data)
         try:
             self._components.ledger.finish_attempt(
                 attempt_id=entry.attempt_id,
@@ -845,7 +843,7 @@ class NativeControlPlane:
             settlement = entry.pending_settlement
             if settlement is None:
                 continue
-            terminal, failure = _terminal_from_settlement(settlement)
+            terminal, failure = terminal_from_settlement(settlement)
             if self._settle_swept(request_id, entry, terminal, failure, latch_on_failure=True):
                 with self._lock:
                     self._sweep_retained_replayed += 1
@@ -916,101 +914,3 @@ class NativeControlPlane:
             )
         except Exception:  # noqa: BLE001 - primary admission failure stays authoritative.
             self._accounting_healthy = False
-
-
-def _deployment_operation_key(route: GatewayRoute) -> str:
-    """Derive the stable per-deployment idempotency key used by dispatch.
-
-    Mirrors the executor's provider-operation identity so retried physical
-    dispatches of the same deployment reuse one caller operation.
-
-    Args:
-        route: Resolved single-deployment route.
-
-    Returns:
-        Stable content-addressed operation identity.
-    """
-    authorization = route.snapshot.authorization
-    return stable_id(
-        "gateway-provider-operation",
-        {
-            "request_id": authorization.request_id,
-            "catalog_sha256": authorization.catalog_sha256,
-            "deployment_id": route.deployment.deployment_id,
-            "connection_sha256": route.deployment.connection_sha256,
-        },
-    )
-
-
-def _optional_text(value: object) -> str | None:
-    """Return one optional boundary string value or ``None``."""
-    return value if isinstance(value, str) else None
-
-
-def _terminal_from_settlement(
-    data: JsonObject,
-) -> tuple[GatewayEvent, GatewayFailure | None]:
-    """Build the durable terminal event from one settlement payload.
-
-    Args:
-        data: Parsed settlement with ``outcome``, optional ``usage``,
-            ``tool_names``, and ``failure``.
-
-    Returns:
-        The terminal event and the optional normalized failure.
-    """
-    raw_usage = data.get("usage")
-    raw_tool_names = data.get("tool_names")
-    usage = _usage_from_payload(
-        raw_usage if isinstance(raw_usage, dict) else None,
-        [str(name) for name in raw_tool_names] if isinstance(raw_tool_names, list) else [],
-    )
-    failure_payload = data.get("failure")
-    failure = None
-    if isinstance(failure_payload, dict):
-        failure = GatewayFailure(
-            failure_class=GatewayFailureClass(str(failure_payload["failure_class"])),
-            safe_message=str(failure_payload["safe_message"]),
-        )
-    kind = _TERMINAL_KINDS[str(data["outcome"])]
-    terminal = GatewayEvent(
-        kind=kind,
-        sequence_number=0,
-        usage=usage,
-        failure=failure if kind == GatewayEventKind.FAILED else None,
-    )
-    return terminal, failure
-
-
-def _usage_from_payload(
-    payload: JsonObject | None,
-    tool_names: list[str],
-) -> GatewayUsage | None:
-    """Build normalized usage from settlement scalars.
-
-    Args:
-        payload: Optional token totals observed by the data plane.
-        tool_names: Invoked tool names in first-use order.
-
-    Returns:
-        Normalized usage, or ``None`` when nothing was observed.
-    """
-    names = tuple(str(name) for name in tool_names)
-    if payload is None or payload.get("input_tokens") is None:
-        if not names:
-            return None
-        return GatewayUsage(tool_names=names)
-    return GatewayUsage(
-        input_tokens=_optional_count(payload.get("input_tokens")),
-        output_tokens=_optional_count(payload.get("output_tokens")),
-        cached_input_tokens=_optional_count(payload.get("cached_input_tokens")),
-        reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
-        tool_names=names,
-    )
-
-
-def _optional_count(value: object) -> int | None:
-    """Return one non-negative settlement token count or ``None``."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value

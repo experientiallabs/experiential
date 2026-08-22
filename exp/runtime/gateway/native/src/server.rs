@@ -1725,7 +1725,7 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
                 .unwrap_or_default()
                 .to_string();
             if !request_id.is_empty() && !attempt_id.is_empty() {
-                let mut guard = AttemptGuard::new(&state, request_id, attempt_id);
+                let mut guard = AttemptGuard::new(&state, request_id, attempt_id, started);
                 guard
                     .settle(
                         "failed",
@@ -1745,6 +1745,7 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
         &state,
         admission.request_id.clone(),
         admission.attempt_id.clone(),
+        started,
     );
 
     let dialect = match Dialect::from_str(&admission.dialect) {
@@ -1966,15 +1967,16 @@ async fn completed_responses(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let _permit = permit;
-    let events = match collect_events(response, dialect, deadline, phase_timeout).await {
-        Ok(events) => events,
-        Err(failure) => {
-            let failure = failure.boundary();
-            let error = collection_public_error(&failure);
-            guard.settle("failed", None, &[], Some(&failure)).await;
-            return error_response(&error);
-        }
-    };
+    let events =
+        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
+            Ok(events) => events,
+            Err(failure) => {
+                let failure = failure.boundary();
+                let error = collection_public_error(&failure);
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                return error_response(&error);
+            }
+        };
     let envelope = admission.envelope.clone().unwrap_or_default();
     let aggregated = match completed_responses_body(
         &admission.request_id,
