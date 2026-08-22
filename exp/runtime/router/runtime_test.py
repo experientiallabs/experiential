@@ -56,11 +56,15 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.routing import (
     RouterProjectTargetResolver,
+    _select_within_deadline,  # noqa: PLC2701
     gateway_model_request,
     project_episode_identity,
 )
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
-from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
+from exp.runtime.models.providers.async_transport import (
+    ProviderDeadlineExceeded,
+    RequestDeadline,
+)
 from exp.runtime.router import RouterRuntime, RouterRuntimeIntegrityError
 from exp.runtime.router.economics import (
     RoutedProviderComponent,
@@ -1007,6 +1011,25 @@ def test_timed_out_queued_selection_is_cancelled_and_never_embeds() -> None:
     occupant.join(timeout=1)
 
     assert embed_calls == [1]
+
+
+def test_expired_submission_that_escapes_cancellation_fails_before_embedding() -> None:
+    """A worker re-checks the deadline first, so an expired pickup never embeds."""
+    runtime, client = _runtime()
+    model_request = gateway_model_request(
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="route"),),
+        )
+    )
+    with pytest.raises(ProviderDeadlineExceeded):
+        _select_within_deadline(
+            runtime,
+            model_request,
+            episode_id="episode",
+            deadline=RequestDeadline(__import__("time").monotonic() - 1),
+        )
+    assert client.embed_calls == 0
 
 
 def test_blocking_selection_expired_deadline_raises_before_any_selection_work() -> None:

@@ -9,6 +9,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, stable_id
+from exp.common.models import ModelRequest
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     ExactModelPool,
@@ -28,6 +29,7 @@ from exp.runtime.gateway.interfaces import ProjectTargetResolver
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 from exp.runtime.router.runtime import RouterRuntime
+from exp.runtime.router.runtime import _PreparedSelection as PreparedSelection  # noqa: PLC2701
 
 
 class GatewayRoutingError(ValueError):
@@ -407,8 +409,9 @@ class RouterProjectTargetResolver:
         self._exact_models_by_alias = dict(exact_models_by_alias)
         # One worker pool is the single aggregate bound on concurrent
         # selections, shared by the event-loop path and the blocking path.
-        # Timed-out submissions are cancelled so abandoned work never
-        # occupies a worker ahead of live requests.
+        # Timed-out submissions are cancelled while queued, and a worker
+        # re-checks the request deadline before embedding, so abandoned
+        # work never runs ahead of live requests.
         self._selection_workers = ThreadPoolExecutor(
             max_workers=maximum_outstanding_selections,
             thread_name_prefix="exp-router-selection",
@@ -444,9 +447,11 @@ class RouterProjectTargetResolver:
         )
         if decision is None:
             submitted = self._selection_workers.submit(
-                runtime._select_unretained,  # noqa: SLF001 - selection-only bridge.
+                _select_within_deadline,
+                runtime,
                 model_request,
                 episode_id=episode_id,
+                deadline=deadline,
             )
             wrapped = asyncio.wrap_future(submitted)
             wrapped.add_done_callback(_consume_abandoned_selection)
@@ -502,9 +507,11 @@ class RouterProjectTargetResolver:
         )
         if decision is None:
             future = self._selection_workers.submit(
-                runtime._select_unretained,  # noqa: SLF001 - selection-only bridge.
+                _select_within_deadline,
+                runtime,
                 model_request,
                 episode_id=episode_id,
+                deadline=deadline,
             )
             try:
                 prepared = future.result(timeout=deadline.attempt_timeout())
@@ -546,6 +553,27 @@ class RouterProjectTargetResolver:
             activation_ref=target.activation_ref,
             fallback_reason=decision.fallback_reason,
         )
+
+
+def _select_within_deadline(
+    runtime: RouterRuntime,
+    model_request: ModelRequest,
+    *,
+    episode_id: str,
+    deadline: RequestDeadline,
+) -> PreparedSelection:
+    """Run one unretained selection only while its request deadline is live.
+
+    The deadline check runs on the worker thread immediately before any
+    embedding work, so a submission that expired while queued (racing its
+    caller's cancellation) fails fast instead of occupying the bounded
+    worker with a discarded selection.
+    """
+    deadline.attempt_timeout()
+    return runtime._select_unretained(  # noqa: SLF001 - selection-only bridge.
+        model_request,
+        episode_id=episode_id,
+    )
 
 
 def _consume_abandoned_selection[SelectionT](wrapped: asyncio.Future[SelectionT]) -> None:
