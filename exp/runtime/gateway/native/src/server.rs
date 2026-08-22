@@ -187,9 +187,7 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
     } else {
         app
     };
-    let app = app
-        .fallback(proxy_fallback)
-        .with_state(state);
+    let app = app.fallback(proxy_fallback).with_state(state);
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
         .map_err(|error| format!("failed to bind {}:{}: {error}", config.host, config.port))?
