@@ -38,7 +38,6 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
-    GatewayRequest,
     GatewayUsage,
 )
 from exp.runtime.gateway.discovery import (
@@ -69,11 +68,7 @@ from exp.runtime.models.providers import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
 from exp.runtime.models.providers.errors import ProviderCapabilityError
-from exp.runtime.models.providers.streaming_requests import (
-    anthropic_messages_stream_payload,
-    openai_compatible_stream_payload,
-    openai_responses_stream_payload,
-)
+from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
@@ -345,7 +340,7 @@ class NativeControlPlane:
             deployment = route.deployment
             require_gateway_provider(deployment.provider)
             preflight_gateway_request(provider_request, deployment.gateway.capabilities)
-            upstream_payload = _build_upstream_payload(profile, provider_request)
+            upstream_payload = dialect_stream_payload(profile, provider_request)
             attempt_id = self._components.ledger.start_attempt(
                 snapshot=route.snapshot,
                 deployment=deployment,
@@ -510,8 +505,7 @@ class NativeControlPlane:
 
         Args:
             argument: JSON object with ``request_id``, aggregated ``text``,
-                ``refusal`` presence, and completed ``tool_calls`` (each with
-                ``call_id``, ``name``, and raw JSON ``arguments``).
+                ``refusal`` presence, and completed ``tool_calls``.
 
         Returns:
             An empty JSON object; retention that does not apply is a no-op.
@@ -871,39 +865,6 @@ class NativeControlPlane:
             )
         except Exception:  # noqa: BLE001 - primary admission failure stays authoritative.
             self._accounting_healthy = False
-
-
-def _build_upstream_payload(
-    profile: GatewayWireProfile,
-    provider_request: GatewayRequest,
-) -> JsonObject:
-    """Build the provider wire payload with the shared dialect builders.
-
-    Args:
-        profile: The resolved connection's wire profile.
-        provider_request: Canonical request forced into streaming mode.
-
-    Returns:
-        The exact JSON payload the python engine would send upstream.
-
-    Raises:
-        ProviderCapabilityError: The request uses a capability this dialect
-            cannot preserve, mirroring the python engine's dispatch behavior.
-    """
-    if profile.dialect == "openai_responses":
-        return openai_responses_stream_payload(
-            profile.model_id,
-            provider_request,
-            supports_temperature=profile.supports_temperature,
-            reasoning_effort=profile.reasoning_effort,
-        )
-    if profile.dialect == "anthropic_messages":
-        return anthropic_messages_stream_payload(profile.model_id, provider_request)
-    return openai_compatible_stream_payload(
-        profile.model_id,
-        provider_request,
-        token_limit_key=profile.token_limit_key,
-    )
 
 
 def _deployment_operation_key(route: GatewayRoute) -> str:
