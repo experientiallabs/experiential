@@ -911,6 +911,50 @@ def test_blocking_selection_falls_back_to_frozen_baseline_on_embedding_failure()
     assert client.embed_calls == 1
 
 
+def test_blocking_selection_deadline_expiring_mid_embed_fails_without_late_sticky_state() -> None:
+    """A blocked embed frees the caller at the deadline and never publishes sticky state."""
+    runtime, client = _runtime()
+    recorded: list[object] = []
+    runtime._decision_sink = recorded.append  # noqa: SLF001 - deadline publication regression
+    release = threading.Event()
+    completed = threading.Event()
+
+    def blocking_embed(texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Hold selection beyond the gateway deadline, then report completion."""
+        del texts
+        release.wait(timeout=1)
+        completed.set()
+        return (Embedding(values=(1.0, 0.0)),)
+
+    client.__dict__["embed"] = blocking_embed
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): runtime},
+        {("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap"},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+
+    with pytest.raises(ProviderDeadlineExceeded):
+        resolver.select_blocking(
+            target=ProjectTarget(
+                project_ref="project-one",
+                activation_ref="activation-one",
+                catalog_sha256=_DIGEST,
+            ),
+            request=request,
+            episode_namespace=("org", "identity", "revision", "episode"),
+            deadline_monotonic=__import__("time").monotonic() + 0.01,
+        )
+    release.set()
+    assert completed.wait(timeout=1)
+
+    assert runtime._episode_decisions == {}  # noqa: SLF001 - deadline isolation regression
+    assert runtime._request_decisions == {}  # noqa: SLF001 - deadline isolation regression
+    assert recorded == []
+
+
 def test_blocking_selection_expired_deadline_raises_before_any_selection_work() -> None:
     """An already-expired request deadline fails closed without touching the client."""
     runtime, client = _runtime()

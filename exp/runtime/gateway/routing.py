@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, stable_id
@@ -404,10 +405,12 @@ class RouterProjectTargetResolver:
             raise ValueError("maximum_outstanding_selections must be at least one")
         self._activations = dict(activations)
         self._exact_models_by_alias = dict(exact_models_by_alias)
-        self._permits = asyncio.Semaphore(maximum_outstanding_selections)
-        # The blocking path runs on data-plane worker threads with no event
-        # loop, so it keeps its own bounded lane of the same width.
-        self._thread_permits = threading.Semaphore(maximum_outstanding_selections)
+        # One worker pool is the single aggregate bound on concurrent
+        # selections, shared by the event-loop path and the blocking path.
+        self._selection_workers = ThreadPoolExecutor(
+            max_workers=maximum_outstanding_selections,
+            thread_name_prefix="exp-router-selection",
+        )
 
     async def select(
         self,
@@ -438,18 +441,17 @@ class RouterProjectTargetResolver:
             episode_id=episode_id,
         )
         if decision is None:
-            await self._acquire(deadline)
-            task = asyncio.create_task(
-                asyncio.to_thread(
-                    runtime._select_unretained,
+            wrapped = asyncio.wrap_future(
+                self._selection_workers.submit(
+                    runtime._select_unretained,  # noqa: SLF001 - selection-only bridge.
                     model_request,
                     episode_id=episode_id,
                 )
             )
-            task.add_done_callback(self._release_permit)
+            wrapped.add_done_callback(_consume_abandoned_selection)
             try:
                 async with asyncio.timeout(deadline.attempt_timeout()):
-                    prepared = await asyncio.shield(task)
+                    prepared = await asyncio.shield(wrapped)
             except TimeoutError as exc:
                 raise ProviderDeadlineExceeded("router selection deadline exceeded") from exc
             deadline.attempt_timeout()
@@ -472,9 +474,10 @@ class RouterProjectTargetResolver:
 
         The frozen ``RouterRuntime`` selection primitives are thread-safe, so
         this runs the same sticky reuse, unretained selection, and retention
-        sequence as :meth:`select` without an event loop. A selection that
-        overruns the request-wide deadline is detected after it returns, at
-        the post-selection deadline check.
+        sequence as :meth:`select` without an event loop. The selection runs
+        on the shared bounded worker pool, so a request whose deadline
+        expires mid-selection fails immediately while the detached worker
+        finishes without publishing sticky state.
 
         Args:
             target: Frozen project activation target.
@@ -495,15 +498,15 @@ class RouterProjectTargetResolver:
             episode_id=episode_id,
         )
         if decision is None:
-            if not self._thread_permits.acquire(timeout=deadline.attempt_timeout()):
-                raise ProviderDeadlineExceeded("router selection queue deadline exceeded")
+            future = self._selection_workers.submit(
+                runtime._select_unretained,  # noqa: SLF001 - selection-only bridge.
+                model_request,
+                episode_id=episode_id,
+            )
             try:
-                prepared = runtime._select_unretained(  # noqa: SLF001 - selection-only bridge.
-                    model_request,
-                    episode_id=episode_id,
-                )
-            finally:
-                self._thread_permits.release()
+                prepared = future.result(timeout=deadline.attempt_timeout())
+            except FutureTimeoutError as exc:
+                raise ProviderDeadlineExceeded("router selection deadline exceeded") from exc
             deadline.attempt_timeout()
             decision = runtime._retain_prepared_selection(  # noqa: SLF001 - selection-only.
                 model_request,
@@ -540,18 +543,11 @@ class RouterProjectTargetResolver:
             fallback_reason=decision.fallback_reason,
         )
 
-    async def _acquire(self, deadline: RequestDeadline) -> None:
-        """Wait for one selection permit inside the request-wide deadline."""
-        try:
-            async with asyncio.timeout(deadline.attempt_timeout()):
-                await self._permits.acquire()
-        except TimeoutError as exc:
-            raise ProviderDeadlineExceeded("router selection queue deadline exceeded") from exc
 
-    def _release_permit(self, task: asyncio.Task[object]) -> None:
-        """Release bounded capacity only after the synchronous selection stops."""
-        del task
-        self._permits.release()
+def _consume_abandoned_selection(wrapped: asyncio.Future[object]) -> None:
+    """Retrieve a detached selection outcome so late failures are not logged as leaks."""
+    if not wrapped.cancelled():
+        wrapped.exception()
 
 
 def project_episode_identity(
