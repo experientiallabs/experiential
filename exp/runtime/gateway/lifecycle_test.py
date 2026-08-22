@@ -252,8 +252,8 @@ def test_local_gateway_preflights_real_state_and_serves_health_and_usage(
         assert detail.status_code == 200
         assert detail.json() == models.json()["data"][0]
         assert detail.json()["object"] == "model"
-        assert detail.json()["wmo"]["alias_revision_id"]
-        assert detail.json()["wmo"]["catalog_sha256"]
+        assert detail.json()["exp"]["alias_revision_id"]
+        assert detail.json()["exp"]["catalog_sha256"]
         missing = client.get(
             "/v1/models/ungranted",
             headers={"Authorization": f"Bearer {raw_key}"},
@@ -426,10 +426,10 @@ def test_live_alias_revision_update_hot_reloads_discovery_without_restart(
             headers={"Authorization": f"Bearer {raw_key}"},
         )
 
-    assert initial.json()["wmo"]["alias_revision_id"] == "revision-one"
+    assert initial.json()["exp"]["alias_revision_id"] == "revision-one"
     assert [item["id"] for item in reloaded.json()["data"]] == ["coding"]
     assert detail.status_code == 200
-    assert detail.json()["wmo"]["alias_revision_id"] == "revision-two"
+    assert detail.json()["exp"]["alias_revision_id"] == "revision-two"
     connection = sqlite3.connect(manager.database_path)
     try:
         assert connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0] == 0
@@ -505,7 +505,7 @@ def test_unrelated_invalid_snapshot_does_not_block_a_valid_alias_reload(tmp_path
 
     assert [item["id"] for item in models.json()["data"]] == ["coding"]
     assert detail.status_code == 200
-    assert detail.json()["wmo"]["alias_revision_id"] == "revision-two"
+    assert detail.json()["exp"]["alias_revision_id"] == "revision-two"
     assert broken.status_code == 503
     assert broken.json()["error"]["code"] == "unavailable_route"
 
@@ -576,7 +576,7 @@ def test_broken_project_sibling_does_not_block_a_valid_alias_reload(tmp_path: Pa
 
     assert [item["id"] for item in models.json()["data"]] == ["coding"]
     assert detail.status_code == 200
-    assert detail.json()["wmo"]["alias_revision_id"] == "revision-two"
+    assert detail.json()["exp"]["alias_revision_id"] == "revision-two"
     assert broken.status_code == 503
     assert broken.json()["error"]["code"] == "unavailable_route"
 
@@ -629,7 +629,7 @@ def test_invalid_new_revision_fails_closed_and_recovers_after_fix(tmp_path: Path
     assert unavailable.json()["error"]["code"] == "unavailable_route"
     assert hidden.json()["data"] == []
     assert recovered.status_code == 200
-    assert recovered.json()["wmo"]["alias_revision_id"] == "revision-repaired"
+    assert recovered.json()["exp"]["alias_revision_id"] == "revision-repaired"
     connection = sqlite3.connect(manager.database_path)
     try:
         assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone()[0] == 0
@@ -755,7 +755,7 @@ def test_alias_update_serves_new_model_while_in_flight_requests_finish_on_old(
         assert first_contents == ["old-model-canary"]
         assert second.status_code == 200
         assert second.json()["choices"][0]["message"]["content"] == "new-model-canary"
-        assert detail.json()["wmo"]["alias_revision_id"] == "revision-two"
+        assert detail.json()["exp"]["alias_revision_id"] == "revision-two"
         assert dispatched == ["provider-model-exact", "provider-model-next"]
         with sqlite3.connect(manager.database_path) as connection:
             attempts = connection.execute(
@@ -953,8 +953,8 @@ def test_concurrent_traffic_survives_pool_recertification_hot_swap(tmp_path: Pat
         assert solo_contents == {"solo-model"}
         assert dispatched[-1] in {"beta-model", "solo-model"}
         assert "beta-model" in dispatched
-        assert detail.json()["wmo"]["alias_revision_id"] == "rev-chat-2"
-        assert solo_detail.json()["wmo"]["alias_revision_id"] == "rev-solo-1"
+        assert detail.json()["exp"]["alias_revision_id"] == "rev-chat-2"
+        assert solo_detail.json()["exp"]["alias_revision_id"] == "rev-solo-1"
     finally:
         server.shutdown()
         server.server_close()

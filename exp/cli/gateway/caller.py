@@ -101,7 +101,7 @@ def caller_models(
         return
     for model in _listed_models(response):
         identity = str(model.get("id", ""))
-        authority = model.get("wmo")
+        authority = model.get("exp")
         if isinstance(authority, dict) and "alias_revision_id" in authority:
             typer.echo(f"{identity} (revision {authority['alias_revision_id']})")
         else:
@@ -416,7 +416,7 @@ def _listed_authority_models(response: httpx.Response) -> list[JsonObject] | Non
         return None
     if not isinstance(payload, dict) or payload.get("object") != "list":
         return None
-    authority_marker = payload.get("wmo")
+    authority_marker = payload.get("exp")
     if (
         not isinstance(authority_marker, dict)
         or authority_marker.get("authority_schema_version") != 1
@@ -448,11 +448,11 @@ def _is_authority_model(model: JsonObject) -> bool:
     if (
         model.get("object") != "model"
         or model.get("created") != 0
-        or model.get("owned_by") != "wmo"
+        or model.get("owned_by") != "exp"
     ):
         return False
     model_id = model.get("id")
-    authority = model.get("wmo")
+    authority = model.get("exp")
     if not isinstance(model_id, str) or not model_id or not isinstance(authority, dict):
         return False
     revision = authority.get("alias_revision_id")

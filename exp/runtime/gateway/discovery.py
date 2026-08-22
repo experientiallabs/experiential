@@ -141,7 +141,7 @@ def public_model_object(
 ) -> JsonObject:
     """Build one OpenAI model object enriched with granted authority and catalog fields.
 
-    The four OpenAI keys keep their exact meaning for official clients. The ``wmo``
+    The four OpenAI keys keep their exact meaning for official clients. The ``exp``
     object carries only authority metadata the gateway already exposes to callers
     through response headers and grants, never provider or credential detail.
     Optional capability, limit, and price fields are catalog copies, never guesses.
@@ -158,8 +158,8 @@ def public_model_object(
         "id": alias,
         "object": "model",
         "created": 0,
-        "owned_by": "wmo",
-        "wmo": {"alias_revision_id": revision, "catalog_sha256": digest},
+        "owned_by": "exp",
+        "exp": {"alias_revision_id": revision, "catalog_sha256": digest},
     }
     if metadata is not None:
         payload.update(metadata.extension_fields())
@@ -186,7 +186,7 @@ def public_model_list(
             public_model_object(authority, metadata=published.get(authority[0]))
             for authority in authorities
         ],
-        "wmo": {"authority_schema_version": MODEL_AUTHORITY_SCHEMA_VERSION},
+        "exp": {"authority_schema_version": MODEL_AUTHORITY_SCHEMA_VERSION},
     }
 
 

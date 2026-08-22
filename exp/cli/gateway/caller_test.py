@@ -251,11 +251,11 @@ def test_models_prints_the_caller_view_with_granted_revisions(
                 "id": "coding",
                 "object": "model",
                 "created": 0,
-                "owned_by": "wmo",
-                "wmo": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
+                "owned_by": "exp",
+                "exp": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
             }
         ],
-        "wmo": {"authority_schema_version": 1},
+        "exp": {"authority_schema_version": 1},
     }
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -292,14 +292,14 @@ def test_key_check_reports_granted_aliases_without_echoing_the_key(
                         "id": "coding",
                         "object": "model",
                         "created": 0,
-                        "owned_by": "wmo",
-                        "wmo": {
+                        "owned_by": "exp",
+                        "exp": {
                             "alias_revision_id": "revision-one",
                             "catalog_sha256": "a" * 64,
                         },
                     }
                 ],
-                "wmo": {"authority_schema_version": 1},
+                "exp": {"authority_schema_version": 1},
             },
         )
 
@@ -372,7 +372,7 @@ def test_key_check_accepts_a_gateway_authority_envelope_with_no_grants(
             json={
                 "object": "list",
                 "data": [],
-                "wmo": {"authority_schema_version": 1},
+                "exp": {"authority_schema_version": 1},
             },
         )
 
