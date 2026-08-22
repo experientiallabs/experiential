@@ -284,6 +284,7 @@ def _run_rust_gateway(
     from exp.runtime.gateway.management import GatewayManagement
     from exp.runtime.gateway.native_bridge import NativeControlPlane
     from exp.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
+    from exp.runtime.openai_protocol.state import BoundedContinuationStore
 
     try:
         exp_gateway_native = importlib.import_module("exp_gateway_native")
@@ -304,10 +305,15 @@ def _run_rust_gateway(
                 verifier=verify_automatic_router_policy,
             )
             components = load_gateway_components(root, project_repository=project_repository)
-            control_plane = NativeControlPlane(components)
+            # One bounded continuation store shared by the native Responses
+            # path and the embedded python engine, so keyed replays and
+            # native requests resolve identical namespaced history.
+            continuations = BoundedContinuationStore()
+            control_plane = NativeControlPlane(components, continuation_store=continuations)
             runtime = compose_local_gateway(
                 components,
                 graceful_timeout_seconds=graceful_timeout,
+                continuations=continuations,
             )
             asyncio.run(runtime.service.preflight())
             receipt = {
