@@ -132,6 +132,7 @@ def test_multi_select_marks_selection_and_names_the_submit_row() -> None:
     assert "[ ] anthropic" in text
     assert "\u276f Complete" in text
     assert "Enter on Complete" in text
+    assert "/ search" in text
 
 
 def test_single_select_shows_metadata_without_selection_marks() -> None:
@@ -145,6 +146,7 @@ def test_single_select_shows_metadata_without_selection_marks() -> None:
     text = _plain(console)
     assert "\u276f sonnet (anthropic)" in text
     assert "[ ]" not in text
+    assert "/ search" in text
     assert "up/down + Enter" in text
 
 

@@ -25,8 +25,8 @@ _MAXIMUM_VISIBLE_ROWS = 5
 _RESERVED_LINES = 6
 _ROW_INDENT = " "
 
-_MULTI_HINT = "up/down + space, Enter on Complete"
-_SINGLE_HINT = "up/down + Enter"
+_MULTI_HINT = "up/down + space, Enter on Complete, / search"
+_SINGLE_HINT = "up/down + Enter, / search"
 _MULTI_SEARCH_HINT = "type to search; Enter keeps matches, Esc clears"
 _SINGLE_SEARCH_HINT = "type to search; Enter confirms, Esc clears"
 

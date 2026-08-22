@@ -124,6 +124,35 @@ def test_typed_text_filters_a_long_list_and_all_selects_only_matches() -> None:
     assert "filter: model-12" in console.output
 
 
+def test_line_picker_accepts_a_slash_prefixed_search_query() -> None:
+    """The non-terminal fallback accepts the same slash-prefixed search affordance."""
+    console = _console("/model-12\n1\n\n")
+
+    result = select_many(console, title="Models", options=_options(20))
+
+    assert result.values == ("model-12",)
+    assert "filter: model-12" in console.output
+
+
+def test_line_picker_can_open_a_search_prompt_with_slash() -> None:
+    """A standalone slash opens a second line for search text before selection continues."""
+    console = _console("/\nmodel-12\n1\n\n")
+
+    result = select_many(console, title="Models", options=_options(20))
+
+    assert result.values == ("model-12",)
+    assert "search>" in console.output
+
+
+def test_single_select_accepts_a_slash_prefixed_search_query() -> None:
+    """Single-select screens use the same explicit slash query in the line fallback."""
+    console = _console("/model-12\n1\n")
+
+    result = select_one(console, title="Model", options=_options(20))
+
+    assert result.values == ("model-12",)
+
+
 def test_preselected_values_survive_reentering_a_screen() -> None:
     """Answers already given stay selected when a screen is shown again."""
     console = _console("\n")

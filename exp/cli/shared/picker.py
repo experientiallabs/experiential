@@ -6,7 +6,8 @@ toggles a row on a multi-select screen whose Complete row submits, and Enter con
 row on a single-select screen. Slash opens a search line that narrows long lists as the user
 types: Backspace edits the query, Enter keeps the matches, and Esc clears the search. A console
 without a terminal cannot be driven by raw keys, so the same screens fall back to the line-based
-path, which reads whole lines and accepts numbers, ranges, filter text, and back or cancel words.
+path, which reads whole lines and accepts numbers, ranges, slash-prefixed searches, filter text,
+and back or cancel words.
 """
 
 from __future__ import annotations
@@ -120,16 +121,25 @@ def select_many(
     values = {option.value for option in options}
     selected = [value for value in preselected if value in values]
     query = ""
+    searching = False
     expanded = False
     console.print(f"[bold]{title}[/bold]")
     while True:
         visible = _filtered(options, query)
         _render(console, visible, selected=selected, expanded=expanded, query=query)
         console.print(
-            "[dim]Numbers or ranges toggle rows, 'all' selects, 'none' clears, text filters, "
-            "empty line accepts, 'b' goes back, 'q' cancels.[/dim]"
+            "[dim]Numbers/ranges toggle, 'all' selects, 'none' clears, '/text' filters, "
+            "empty accepts, 'b' back, 'q' cancels.[/dim]"
         )
-        answer = console.input("> ").strip()
+        answer = console.input("search> " if searching else "> ").strip()
+        if searching:
+            query = answer
+            searching = False
+            expanded = False
+            if query and not _filtered(options, query):
+                console.print(f"[yellow]No row matches {query!r}.[/yellow]")
+                query = ""
+            continue
         word = answer.casefold()
         if word in _BACK_WORDS:
             return PickerResult(action=PickerAction.BACK)
@@ -149,6 +159,14 @@ def select_many(
         if word in _ALL_WORDS:
             selected = _merged(selected, tuple(option.value for option in visible))
             continue
+        if answer == "/":
+            searching = True
+            continue
+        if answer.startswith("/"):
+            answer = answer[1:]
+            if not answer:
+                searching = True
+                continue
         positions = _positions(answer, count=len(visible))
         if positions is None:
             query = answer
@@ -191,16 +209,23 @@ def select_one(
     values = {option.value for option in options}
     fallback = default if default in values else None
     query = ""
+    searching = False
     expanded = False
     console.print(f"[bold]{title}[/bold]")
     while True:
         visible = _filtered(options, query)
         _render(console, visible, selected=[], expanded=expanded, query=query)
         suffix = f" [dim](empty line keeps {fallback})[/dim]" if fallback is not None else ""
-        console.print(
-            f"[dim]Enter one number, text filters, 'b' goes back, 'q' cancels.[/dim]{suffix}"
-        )
-        answer = console.input("> ").strip()
+        console.print(f"[dim]Number selects, '/text' filters, 'b' back, 'q' cancels.[/dim]{suffix}")
+        answer = console.input("search> " if searching else "> ").strip()
+        if searching:
+            query = answer
+            searching = False
+            expanded = False
+            if query and not _filtered(options, query):
+                console.print(f"[yellow]No row matches {query!r}.[/yellow]")
+                query = ""
+            continue
         word = answer.casefold()
         if word in _BACK_WORDS:
             return PickerResult(action=PickerAction.BACK)
@@ -211,6 +236,14 @@ def select_one(
         if word in _MORE_WORDS:
             expanded = True
             continue
+        if answer == "/":
+            searching = True
+            continue
+        if answer.startswith("/"):
+            answer = answer[1:]
+            if not answer:
+                searching = True
+                continue
         positions = _positions(answer, count=len(visible))
         if positions is not None and len(positions) == 1:
             return PickerResult(values=(visible[positions[0] - 1].value,))
