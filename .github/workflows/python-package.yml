@@ -30,7 +30,59 @@ permissions:
   contents: read
 
 jobs:
+  native-wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: linux-aarch64
+          - runner: macos-13
+            target: macos-x86_64
+          - runner: macos-14
+            target: macos-arm64
+          - runner: windows-latest
+            target: windows-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Resolve the latest published release
+        id: release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          published_tag="$(
+            gh release view --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,publishedAt,tagName \
+              --jq 'select(.isDraft == false and .publishedAt != null) | .tagName'
+          )"
+          test -n "$published_tag"
+          echo "tag=$published_tag" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
+      - name: Build the abi3 extension wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
+          manylinux: auto
+      - name: Build the extension sdist
+        if: matrix.target == 'linux-x86_64'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-dist-${{ matrix.target }}
+          path: native-dist/
+
   build:
+    needs: native-wheels
     runs-on: ubuntu-latest
     steps:
       - name: Resolve the latest published release
@@ -55,10 +107,14 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Build the EXP distribution
         run: uv build --package experiential --no-sources
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-dist-linux-x86_64
+          path: native-dist
       - name: Smoke test the wheel
         run: |
           uv venv /tmp/exp-wheel-smoke
-          uv pip install --python /tmp/exp-wheel-smoke/bin/python dist/*.whl "openai==3.0.0"
+          uv pip install --python /tmp/exp-wheel-smoke/bin/python dist/*.whl native-dist/*.whl "openai==3.0.0"
           cd /tmp
           /tmp/exp-wheel-smoke/bin/python - <<'PY'
           import exp
@@ -84,6 +140,11 @@ jobs:
           assert SimulationSpec.__module__ == "exp.simulation.specs.simulation"
           assert SandboxSimulator.__module__ == "exp.simulation.engines.sandbox"
           assert LocalProcessEnvironmentRuntime.__module__ == "exp.runtime.environments.local"
+
+          import exp_gateway_native
+
+          assert exp_gateway_native.__version__
+          assert callable(exp_gateway_native.serve)
           PY
           /tmp/exp-wheel-smoke/bin/exp --help
       - name: Installed-wheel no-spend release evidence
@@ -120,5 +181,10 @@ jobs:
         with:
           name: python-dist
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-dist-*
+          path: dist
+          merge-multiple: true
       - name: Publish to PyPI with trusted publishing
         run: uv publish --trusted-publishing always dist/*

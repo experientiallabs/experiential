@@ -417,6 +417,10 @@ def _run_rust_gateway(
                 )
                 try:
                     exp_gateway_native.serve(control_plane, config)
+                except KeyboardInterrupt:
+                    # SIGINT already drained the data plane gracefully inside
+                    # serve; the launch exits cleanly like the uvicorn path.
+                    pass
                 except RuntimeError as exc:
                     raise typer.BadParameter(f"the gateway engine failed: {exc}") from exc
             finally:

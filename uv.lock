@@ -474,6 +474,11 @@ wheels = [
 ]
 
 [[package]]
+name = "exp-gateway-native"
+version = "0.1.0"
+source = { directory = "exp/runtime/gateway/native" }
+
+[[package]]
 name = "experiential"
 version = "0.4.0"
 source = { editable = "." }
@@ -481,6 +486,7 @@ dependencies = [
     { name = "boto3" },
     { name = "botocore" },
     { name = "click" },
+    { name = "exp-gateway-native" },
     { name = "fastapi" },
     { name = "filelock" },
     { name = "httpx" },
@@ -514,6 +520,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.35,<2" },
     { name = "botocore", specifier = ">=1.35,<2" },
     { name = "click", specifier = ">=8.2" },
+    { name = "exp-gateway-native", directory = "exp/runtime/gateway/native" },
     { name = "experiential", extras = ["sft"], marker = "extra == 'dev'" },
     { name = "fastapi", specifier = ">=0.128" },
     { name = "filelock", specifier = ">=3.12" },

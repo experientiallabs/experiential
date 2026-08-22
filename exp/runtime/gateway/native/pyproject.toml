@@ -5,8 +5,18 @@ build-backend = "maturin"
 [project]
 name = "exp-gateway-native"
 version = "0.1.0"
-description = "Rust data plane for the Experiential local gateway (PoC extension module)."
+description = "Rust data plane for the Experiential local gateway (compiled extension module)."
 requires-python = ">=3.12"
 
 [tool.maturin]
 module-name = "exp_gateway_native"
+
+[tool.uv]
+# Rebuild the extension whenever the crate changes, so `uv run` in a checkout
+# always serves the current data plane.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "src/**/*.rs" },
+]

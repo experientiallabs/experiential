@@ -315,13 +315,20 @@ uv run pytest -q
 
 ## One package
 
-This repo publishes **one distribution**: `experiential`, whose importable code is all of
-`exp/` and nothing else. Rules of the road:
+This repo publishes **one flagship distribution**: `experiential`, whose importable python code
+is all of `exp/` and nothing else, plus exactly one companion distribution: `exp-gateway-native`,
+the compiled gateway data-plane extension built from the crate at `exp/runtime/gateway/native/`.
+Rules of the road:
 
 - **One package, no workspace**: a dependency is either a normal PyPI requirement in
-  `[project.dependencies]` or it is code under `exp/`. `pyproject.toml` declares no uv workspace
-  and no path sources, and a member directory would need a new top-level directory that rule 5
-  forbids.
+  `[project.dependencies]` or it is code under `exp/`. `pyproject.toml` declares no uv workspace,
+  and a member directory would need a new top-level directory that rule 5 forbids.
+- **The native-extension carve-out**: `exp-gateway-native` is the single permitted
+  `[tool.uv.sources]` path source, so a repo checkout rebuilds the extension from source on
+  `.rs` changes while released installs resolve it as a normal PyPI requirement (the release
+  workflow publishes prebuilt abi3 wheels). The crate ships no importable python beyond the
+  compiled `exp_gateway_native` module; python code still belongs under `exp/`. No further path
+  sources or distributions may be added.
 - **Keep dependency ownership explicit**: published shared building blocks are normal PyPI
   requirements. Provider-neutral catalog metadata and immutable snapshots live under
   `exp/common/models/`; explicit runtime clients use the shared HTTP transport. A release resolves
@@ -330,8 +337,8 @@ This repo publishes **one distribution**: `experiential`, whose importable code 
   all over the single `testpaths = ["exp"]`. Tests are inline `*_test.py` beside the module they
   cover. There is exactly one ruff config and one ty config, at the root.
 - **Publishing**: `.github/workflows/python-package.yml` builds and publishes the flagship
-  `experiential` distribution; the publish job runs only for a GitHub release and uses
-  the `pypi` trusted-publisher environment.
+  `experiential` distribution and the `exp-gateway-native` abi3 wheel matrix; the publish job
+  runs only for a GitHub release and uses the `pypi` trusted-publisher environment.
 
 ## Docs
 

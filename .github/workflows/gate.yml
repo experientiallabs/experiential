@@ -35,10 +35,6 @@ jobs:
         run: >-
           cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml
           --no-default-features
-      - name: Build the native gateway extension so parity tests cannot skip
-        run: >-
-          uv run maturin develop --uv --release
-          --manifest-path exp/runtime/gateway/native/Cargo.toml
       - name: Native parity tests are present, not skipped
         run: >-
           uv run pytest -q exp/runtime/gateway/native_bridge_test.py
@@ -67,6 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install the project and its dev extras
         run: uv sync --extra dev
       - name: W16 router and bounded local-process evidence

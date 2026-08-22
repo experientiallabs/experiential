@@ -3029,8 +3029,22 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
         cwd=repository,
         environment=environment,
     )
-    wheel = tuple(distribution.glob("*.whl"))
-    assert len(wheel) == 1
+    # The clean-room install needs the companion native wheel built locally,
+    # because the flagship wheel requires it and both publish together.
+    _run_checked(
+        [
+            uv,
+            "build",
+            "--wheel",
+            "--out-dir",
+            str(distribution),
+            "exp/runtime/gateway/native",
+        ],
+        cwd=repository,
+        environment=environment,
+    )
+    wheels = tuple(sorted(distribution.glob("*.whl")))
+    assert len(wheels) == 2
     _run_checked(
         [uv, "venv", "--python", sys.executable, str(virtual_environment)],
         cwd=execution,
@@ -3044,7 +3058,7 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
             "install",
             "--python",
             str(installed_python),
-            str(wheel[0]),
+            *(str(wheel) for wheel in wheels),
             "openai==3.0.0",
         ],
         cwd=execution,
