@@ -36,10 +36,6 @@ impl PublicError {
         }
     }
 
-    pub fn with_param(mut self, param: &str) -> Self {
-        self.param = Some(param.to_string());
-        self
-    }
 
     /// The OpenAI error envelope body, matching `OpenAIProtocolError.json_body()`.
     pub fn json_body(&self) -> serde_json::Value {
@@ -53,32 +49,8 @@ impl PublicError {
         })
     }
 
-    pub fn invalid_field(param: &str) -> Self {
-        Self::new(
-            400,
-            "invalid_parameter",
-            &format!("Invalid value for '{param}'."),
-            "invalid_request_error",
-        )
-        .with_param(param)
-    }
 
-    pub fn invalid_field_message(param: &str, message: &str) -> Self {
-        Self::new(400, "invalid_parameter", message, "invalid_request_error").with_param(param)
-    }
 
-    pub fn unsupported_field(param: &str) -> Self {
-        Self::new(
-            400,
-            "unsupported_parameter",
-            &format!(
-                "The parameter '{param}' is not supported by this gateway profile. \
-                 Remove the field and resend the request."
-            ),
-            "invalid_request_error",
-        )
-        .with_param(param)
-    }
 
     pub fn invalid_key() -> Self {
         Self::new(
@@ -99,14 +71,6 @@ impl PublicError {
         )
     }
 
-    pub fn not_json_object() -> Self {
-        Self::new(
-            400,
-            "invalid_request",
-            "Request body must be a JSON object. Re-encode the payload and resend.",
-            "invalid_request_error",
-        )
-    }
 
     pub fn internal() -> Self {
         Self::new(
@@ -130,16 +94,6 @@ impl PublicError {
         error
     }
 
-    pub fn model_not_found() -> Self {
-        Self::new(
-            404,
-            "model_not_found",
-            "The requested model does not exist or is not granted to this key. \
-             GET /v1/models lists the model aliases available to this key.",
-            "invalid_request_error",
-        )
-        .with_param("model")
-    }
 
     pub fn request_too_large() -> Self {
         Self::new(
