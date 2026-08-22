@@ -29,18 +29,17 @@ from exp.cli.shared.progress import progress_display
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.config import resolve_command_budget_usd, set_maximum_command_cost_usd
 from exp.common.core.artifacts import stable_id
-from exp.common.models import (
-    GatewayDeploymentCapabilities,
-    GatewayTokenPrices,
-    ModelCapabilities,
-    ModelCatalog,
-)
+from exp.common.core.locks import file_write_lock
+from exp.common.models import GatewayDeploymentCapabilities, GatewayTokenPrices, ModelCapabilities
 from exp.common.progress import report
 from exp.runtime.gateway.catalog_authority import (
-    authored_snapshot_path,
-    upsert_singleton_deployment,
+    GatewayCatalogCompensationError,
+    apply_singleton_deployment_update,
+    plan_singleton_deployment_update,
+    rollback_singleton_deployment_update,
 )
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 from exp.runtime.models.providers import HttpProviderModelLister, ProviderModelLister
 
 
@@ -161,43 +160,54 @@ def interactive_gateway_setup(
         advance("save budget")
         manager.initialize()
         advance("initialize")
-        for endpoint in session.endpoints:
-            manager.upsert_provider_connection(
-                connection_id=endpoint.connection.name,
-                config=endpoint.connection.catalog_config(),
-                replace=reconfigure,
-            )
-            advance(f"connect {endpoint.connection.name}")
         serving_connections = {
             item.connection_id: item.config for item in manager.provider_connections()
         }
-        normalized, snapshot, _changed = upsert_singleton_deployment(
-            root,
-            deployment_alias=values.alias,
-            connection_name=selected.connection,
-            provider_model=selected.model,
-            exact_model_id=_gateway_exact_model_id(selected),
-            revision=None,
-            capabilities=capabilities,
-            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
-            prices=GatewayTokenPrices(),
-            pricing_source=None,
-            replace=reconfigure,
-            serving_connections=serving_connections,
-        )
-        advance("write catalog")
-        authored = ModelCatalog.model_validate_json(authored_snapshot_path(snapshot).read_bytes())
-        revision_id = f"revision-{uuid.uuid4().hex}"
-        manager.activate_direct_alias(
-            alias_id=values.alias,
-            alias_name=values.alias,
-            revision_id=revision_id,
-            pool_id=values.alias,
-            snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-            catalog_sha256=normalized.identity_sha256(),
-            provider_connections=manager.provider_bindings(authored),
-        )
-        advance("activate alias")
+        for endpoint in session.endpoints:
+            serving_connections[endpoint.connection.name] = endpoint.connection.catalog_config()
+            advance(f"prepare {endpoint.connection.name}")
+        catalog_path = root / "models.toml"
+        with file_write_lock(catalog_path, what="the interactive gateway setup"):
+            update = plan_singleton_deployment_update(
+                root,
+                deployment_alias=values.alias,
+                connection_name=selected.connection,
+                provider_model=selected.model,
+                exact_model_id=_gateway_exact_model_id(selected),
+                revision=None,
+                capabilities=capabilities,
+                gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                prices=GatewayTokenPrices(),
+                pricing_source=None,
+                replace=reconfigure,
+                serving_connections=serving_connections,
+            )
+            revision_id = f"revision-{uuid.uuid4().hex}"
+            try:
+                apply_singleton_deployment_update(root, update)
+                manager.configure_direct_alias(
+                    alias_id=values.alias,
+                    alias_name=values.alias,
+                    revision_id=revision_id,
+                    pool_id=values.alias,
+                    snapshot_ref=f"catalog-snapshots/{update.snapshot.name}",
+                    catalog_sha256=update.normalized.identity_sha256(),
+                    provider_connections=update.updated.connections,
+                    replace=reconfigure,
+                )
+            except AliasActivationOutcomeUnknownError:
+                raise
+            except BaseException:
+                try:
+                    rollback_singleton_deployment_update(root, update)
+                except GatewayCatalogCompensationError as compensation_error:
+                    raise RuntimeError(
+                        "gateway setup catalog compensation outcome is unknown; inspect "
+                        "catalog and gateway status before retrying"
+                    ) from compensation_error
+                raise
+            advance("write catalog")
+            advance("activate alias")
         if _ensure_setup_identity(manager, identity_id=values.identity_id):
             advance("create identity")
         else:

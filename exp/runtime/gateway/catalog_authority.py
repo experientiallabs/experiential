@@ -48,6 +48,17 @@ class CertifiedPoolUpdate:
     changed: bool
 
 
+@dataclass(frozen=True)
+class SingletonDeploymentUpdate:
+    """One lock-scoped singleton deployment update and its durable preimage."""
+
+    original: ModelCatalog | None
+    updated: ModelCatalog
+    normalized: NormalizedGatewayCatalog
+    snapshot: Path
+    changed: bool
+
+
 def upsert_connection(
     root: Path,
     *,
@@ -126,55 +137,219 @@ def upsert_singleton_deployment(
     Returns:
         Normalized catalog, immutable snapshot path, and whether authored metadata changed.
     """
+    path = root / "models.toml"
+    with file_write_lock(path, what="the gateway deployment catalog"):
+        update = plan_singleton_deployment_update(
+            root,
+            deployment_alias=deployment_alias,
+            connection_name=connection_name,
+            provider_model=provider_model,
+            exact_model_id=exact_model_id,
+            revision=revision,
+            capabilities=capabilities,
+            gateway_capabilities=gateway_capabilities,
+            prices=prices,
+            pricing_source=pricing_source,
+            billing_source=billing_source,
+            replace=replace,
+            serving_connections=serving_connections,
+        )
+        apply_singleton_deployment_update(root, update)
+    return update.normalized, update.snapshot, update.changed
+
+
+def plan_singleton_deployment_update(
+    root: Path,
+    *,
+    deployment_alias: str,
+    connection_name: str,
+    provider_model: str,
+    exact_model_id: str,
+    revision: str | None,
+    capabilities: ModelCapabilities,
+    gateway_capabilities: GatewayDeploymentCapabilities,
+    prices: GatewayTokenPrices,
+    pricing_source: str | None,
+    billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
+    replace: bool,
+    serving_connections: dict[str, ConnectionConfig] | None = None,
+) -> SingletonDeploymentUpdate:
+    """Plan a singleton deployment mutation while the caller holds the catalog lock.
+
+    Args:
+        root: EXP root containing ``models.toml`` and gateway snapshots.
+        deployment_alias: Stable source alias used by the deployment record.
+        connection_name: Provider connection selected by the deployment.
+        provider_model: Exact provider-side model spelling.
+        exact_model_id: Operator-asserted exact logical model identity.
+        revision: Optional exact provider revision.
+        capabilities: Existing runtime capability declaration.
+        gateway_capabilities: Gateway protocol capability declaration.
+        prices: Integer attribution rates, with unknown represented by ``None``.
+        pricing_source: Optional provenance label for the rates.
+        billing_source: Credential ownership frozen for every dispatched attempt.
+        replace: Whether an existing deployment alias may change.
+        serving_connections: SQLite-authoritative connection metadata for serving snapshots.
+
+    Returns:
+        Immutable update plan containing the catalog preimage and desired snapshot.
+
+    Raises:
+        GatewayCatalogAuthoringError: Required metadata is missing or the deployment already
+            differs without explicit replacement.
+    """
     validate_artifact_id(deployment_alias)
     validate_artifact_id(exact_model_id)
     path = root / "models.toml"
-    with file_write_lock(path, what="the gateway deployment catalog"):
-        if path.exists():
-            current = load_model_catalog(path)
-            if serving_connections is not None:
-                current = current.model_copy(update={"connections": serving_connections})
-        elif serving_connections:
-            current = ModelCatalog(
-                connections=serving_connections,
-                models={},
-                roles=ModelRoles(),
-            )
-        else:
-            raise GatewayCatalogAuthoringError(
-                "gateway deployment authoring requires SQLite provider connections"
-            )
-        if connection_name not in current.connections:
-            raise GatewayCatalogAuthoringError(
-                f"unknown provider connection {connection_name!r}; add it first"
-            )
-        record = ModelRecord(
-            connection=connection_name,
-            model=provider_model,
-            revision=revision,
-            billing_source=billing_source,
-            capabilities=capabilities,
-            gateway=GatewayDeploymentMetadata(
-                exact_model_id=exact_model_id,
-                capabilities=gateway_capabilities,
-                prices=prices,
-                pricing_source=pricing_source,
-            ),
+    original = load_model_catalog(path) if path.exists() else None
+    if original is not None:
+        current = original
+        if serving_connections is not None:
+            current = current.model_copy(update={"connections": serving_connections})
+    elif serving_connections:
+        current = ModelCatalog(
+            connections=serving_connections,
+            models={},
+            roles=ModelRoles(),
         )
-        existing = current.models.get(deployment_alias)
-        if existing is not None and existing != record and not replace:
-            raise GatewayCatalogAuthoringError(
-                f"deployment {deployment_alias!r} exists; use alias update to replace it"
+    else:
+        raise GatewayCatalogAuthoringError(
+            "gateway deployment authoring requires SQLite provider connections"
+        )
+    if connection_name not in current.connections:
+        raise GatewayCatalogAuthoringError(
+            f"unknown provider connection {connection_name!r}; add it first"
+        )
+    record = ModelRecord(
+        connection=connection_name,
+        model=provider_model,
+        revision=revision,
+        billing_source=billing_source,
+        capabilities=capabilities,
+        gateway=GatewayDeploymentMetadata(
+            exact_model_id=exact_model_id,
+            capabilities=gateway_capabilities,
+            prices=prices,
+            pricing_source=pricing_source,
+        ),
+    )
+    existing = current.models.get(deployment_alias)
+    if existing is not None and existing != record and not replace:
+        raise GatewayCatalogAuthoringError(
+            f"deployment {deployment_alias!r} exists; use alias update to replace it"
+        )
+    updated = current
+    if existing != record:
+        updated = current.model_copy(
+            update={"models": {**current.models, deployment_alias: record}}
+        )
+    normalized = normalize_gateway_catalog(updated)
+    snapshot = root / "gateway" / "catalog-snapshots" / f"{normalized.identity_sha256()}.json"
+    return SingletonDeploymentUpdate(
+        original=original,
+        updated=updated,
+        normalized=normalized,
+        snapshot=snapshot,
+        changed=original != updated,
+    )
+
+
+def apply_singleton_deployment_update(root: Path, update: SingletonDeploymentUpdate) -> None:
+    """Persist a planned singleton deployment while its catalog lock remains held.
+
+    Args:
+        root: EXP root containing the locked catalog.
+        update: Previously validated singleton deployment mutation.
+    """
+    if update.changed:
+        write_model_catalog(root / "models.toml", update.updated)
+    _write_catalog_snapshot(root, update.updated, update.normalized)
+
+
+def rollback_singleton_deployment_update(
+    root: Path,
+    update: SingletonDeploymentUpdate,
+) -> None:
+    """Restore a failed setup's exact singleton catalog preimage.
+
+    Args:
+        root: EXP root containing the locked catalog.
+        update: Applied mutation plan whose SQLite authority mutation failed.
+
+    Raises:
+        GatewayCatalogCompensationError: The exact catalog preimage could not be proven restored.
+    """
+    if not update.changed:
+        return
+    path = root / "models.toml"
+    if update.original is None:
+        if not path.exists():
+            return
+        try:
+            current = load_model_catalog(path)
+        except BaseException as exc:
+            raise GatewayCatalogCompensationError(
+                "gateway catalog rollback outcome is unknown; inspect catalog authority before "
+                "retrying"
+            ) from exc
+        if current != update.updated:
+            raise GatewayCatalogCompensationError(
+                "gateway catalog changed during setup; inspect authority before retrying"
             )
-        changed = existing != record
-        if changed:
-            models = {**current.models, deployment_alias: record}
-            current = current.model_copy(update={"models": models})
-        normalized = normalize_gateway_catalog(current)
-        if changed:
-            write_model_catalog(path, current)
-    snapshot = _write_catalog_snapshot(root, current, normalized)
-    return normalized, snapshot, changed
+        try:
+            path.unlink()
+        except BaseException as exc:
+            if not path.exists():
+                return
+            raise GatewayCatalogCompensationError(
+                "gateway catalog rollback did not remove its newly created preimage; inspect "
+                "authority before retrying"
+            ) from exc
+        if path.exists():
+            raise GatewayCatalogCompensationError(
+                "gateway catalog rollback did not remove its newly created preimage; inspect "
+                "authority before retrying"
+            )
+        return
+    try:
+        current = load_model_catalog(path)
+    except BaseException as exc:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback outcome is unknown; inspect catalog authority before retrying"
+        ) from exc
+    if current == update.original:
+        return
+    if current != update.updated:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog changed during setup; inspect authority before retrying"
+        )
+    try:
+        write_model_catalog(path, update.original)
+    except BaseException as exc:
+        try:
+            restored = load_model_catalog(path)
+        except BaseException as reconciliation_error:
+            raise GatewayCatalogCompensationError(
+                "gateway catalog rollback outcome is unknown; inspect catalog authority before "
+                "retrying"
+            ) from reconciliation_error
+        if restored == update.original:
+            return
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback did not restore its exact preimage; inspect authority "
+            "before retrying"
+        ) from exc
+    try:
+        restored = load_model_catalog(path)
+    except BaseException as exc:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback could not be verified; inspect authority before retrying"
+        ) from exc
+    if restored != update.original:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback did not restore its exact preimage; inspect authority "
+            "before retrying"
+        )
 
 
 def upsert_certified_pool(

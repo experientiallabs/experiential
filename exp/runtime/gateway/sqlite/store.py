@@ -35,7 +35,9 @@ from exp.runtime.gateway.sqlite.alias_activation import alias_activation_transac
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
+    ProviderConnectionMutation,
     bind_alias_provider_connections,
+    upsert_provider_connection,
 )
 from exp.runtime.gateway.sqlite.provider_store import ProviderConnectionStoreMixin
 
@@ -480,114 +482,105 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             catalog_sha256=catalog_sha256,
             refusal_failover=refusal_failover,
         ) as connection:
-            snapshot = connection.execute(
-                """
-                SELECT 1 FROM catalog_snapshot_refs
-                WHERE organization_id = ? AND snapshot_ref = ? AND catalog_sha256 = ?
-                """,
-                (organization_id, snapshot_ref, catalog_sha256),
-            ).fetchone()
-            if snapshot is None:
-                raise GatewayStoreError("catalog snapshot reference is not registered")
-            alias_row = connection.execute(
-                """
-                SELECT alias_name FROM gateway_aliases
-                WHERE organization_id = ? AND alias_id = ?
-                """,
-                (organization_id, alias_id),
-            ).fetchone()
-            if alias_row is None:
-                connection.execute(
-                    """
-                    INSERT INTO gateway_aliases (
-                        alias_id, organization_id, alias_name, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (alias_id, organization_id, alias_name, now, now),
-                )
-                revision_number = 1
-            else:
-                if str(alias_row["alias_name"]) != alias_name:
-                    raise GatewayStoreError("alias ID cannot be renamed")
-                revision_number = int(
-                    connection.execute(
-                        """
-                        SELECT COALESCE(MAX(revision_number), 0) + 1
-                        FROM alias_revisions WHERE organization_id = ? AND alias_id = ?
-                        """,
-                        (organization_id, alias_id),
-                    ).fetchone()[0]
-                )
-            pool_id: str | None = None
-            project_ref: str | None = None
-            activation_ref: str | None = None
-            if isinstance(target, DirectTarget):
-                pool_id = target.pool_id
-            else:
-                project_ref = target.project_ref
-                activation_ref = target.activation_ref
-            connection.execute(
-                """
-                INSERT INTO alias_revisions (
-                    revision_id, organization_id, alias_id, revision_number, target_kind,
-                    pool_id, project_ref, activation_ref, catalog_sha256, snapshot_ref,
-                    refusal_failover, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    revision_id,
-                    organization_id,
-                    alias_id,
-                    revision_number,
-                    target.kind,
-                    pool_id,
-                    project_ref,
-                    activation_ref,
-                    catalog_sha256,
-                    snapshot_ref,
-                    int(refusal_failover),
-                    now,
-                ),
-            )
-            bind_alias_provider_connections(
+            _activate_alias_revision_in_transaction(
                 connection,
                 organization_id=organization_id,
                 alias_id=alias_id,
-                alias_revision_id=revision_id,
-                bindings=provider_connections,
+                alias_name=alias_name,
+                revision_id=revision_id,
+                target=target,
+                snapshot_ref=snapshot_ref,
+                catalog_sha256=catalog_sha256,
+                provider_connections=provider_connections,
+                refusal_failover=refusal_failover,
                 now=now,
             )
-            connection.execute(
-                """
-                DELETE FROM project_activation_bindings
-                WHERE organization_id = ? AND alias_id = ?
-                """,
-                (organization_id, alias_id),
-            )
-            if isinstance(target, ProjectTarget):
-                connection.execute(
-                    """
-                    INSERT INTO project_activation_bindings (
-                        organization_id, project_ref, activation_ref,
-                        alias_id, revision_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        organization_id,
-                        target.project_ref,
-                        target.activation_ref,
-                        alias_id,
-                        revision_id,
-                        now,
-                    ),
+
+    def upsert_provider_connections_and_activate_direct_alias(
+        self,
+        *,
+        organization_id: str,
+        alias_id: str,
+        alias_name: str,
+        revision_id: str,
+        pool_id: str,
+        snapshot_ref: str,
+        catalog_sha256: Sha256,
+        provider_connections: tuple[ProviderConnectionMutation, ...],
+        replace: bool,
+        refusal_failover: bool = False,
+    ) -> None:
+        """Atomically revise providers, register a snapshot, and activate one direct alias.
+
+        Args:
+            organization_id: Owning tenant.
+            alias_id: Stable alias resource ID.
+            alias_name: Public model string.
+            revision_id: Immutable alias revision ID.
+            pool_id: Direct target pool identifier.
+            snapshot_ref: Content-addressed catalog snapshot reference.
+            catalog_sha256: Exact normalized catalog digest.
+            provider_connections: Desired provider connection revisions for the snapshot.
+            replace: Whether differing active provider metadata may be revised.
+            refusal_failover: Whether typed precommit refusals may advance.
+
+        Raises:
+            GatewayStoreError: The snapshot or alias invariants conflict.
+            ProviderAuthorityError: A provider replacement violates SQLite authority.
+            AliasActivationOutcomeUnknownError: SQLite COMMIT outcome is ambiguous.
+        """
+        target = DirectTarget(pool_id=pool_id)
+        now = utc_text(self._clock.now())
+        with alias_activation_transaction(
+            connect=self._connect,
+            organization_id=organization_id,
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            target=target,
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            refusal_failover=refusal_failover,
+        ) as connection:
+            authorities = []
+            for mutation in provider_connections:
+                _changed, authority = upsert_provider_connection(
+                    connection,
+                    organization_id=organization_id,
+                    connection_id=mutation.connection_id,
+                    revision_id=mutation.revision_id,
+                    config=mutation.config,
+                    replace=replace,
+                    now=now,
                 )
-            connection.execute(
-                """
-                UPDATE gateway_aliases
-                SET active_revision_id = ?, active = 1, updated_at = ?
-                WHERE organization_id = ? AND alias_id = ?
-                """,
-                (revision_id, now, organization_id, alias_id),
+                authorities.append(authority)
+            bindings = tuple(
+                ProviderConnectionBinding(
+                    connection_id=authority.connection_id,
+                    connection_revision_id=authority.revision_id,
+                    connection_sha256=authority.connection_sha256,
+                )
+                for authority in authorities
+            )
+            _register_catalog_snapshot_in_transaction(
+                connection,
+                organization_id=organization_id,
+                snapshot_ref=snapshot_ref,
+                catalog_sha256=catalog_sha256,
+                now=now,
+            )
+            _activate_alias_revision_in_transaction(
+                connection,
+                organization_id=organization_id,
+                alias_id=alias_id,
+                alias_name=alias_name,
+                revision_id=revision_id,
+                target=target,
+                snapshot_ref=snapshot_ref,
+                catalog_sha256=catalog_sha256,
+                provider_connections=bindings,
+                refusal_failover=refusal_failover,
+                now=now,
             )
 
     def disable_alias(self, *, organization_id: str, alias_id: str) -> bool:
@@ -968,6 +961,202 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 created_at,
             ),
         )
+
+
+def _register_catalog_snapshot_in_transaction(
+    connection: sqlite3.Connection,
+    *,
+    organization_id: str,
+    snapshot_ref: str,
+    catalog_sha256: Sha256,
+    now: str,
+) -> None:
+    """Register one catalog snapshot idempotently inside a caller-owned transaction.
+
+    Args:
+        connection: Open SQLite transaction.
+        organization_id: Owning tenant.
+        snapshot_ref: Content-addressed external snapshot reference.
+        catalog_sha256: Normalized secret-free catalog digest.
+        now: Canonical transaction timestamp.
+
+    Raises:
+        GatewayStoreError: The snapshot reference or digest was previously assigned differently.
+    """
+    by_ref = connection.execute(
+        """
+        SELECT organization_id, catalog_sha256 FROM catalog_snapshot_refs
+        WHERE snapshot_ref = ?
+        """,
+        (snapshot_ref,),
+    ).fetchone()
+    if by_ref is not None:
+        if (
+            str(by_ref["organization_id"]) != organization_id
+            or str(by_ref["catalog_sha256"]) != catalog_sha256
+        ):
+            raise GatewayStoreError("catalog snapshot reference was reused with another digest")
+        return
+    by_digest = connection.execute(
+        """
+        SELECT snapshot_ref FROM catalog_snapshot_refs
+        WHERE organization_id = ? AND catalog_sha256 = ?
+        """,
+        (organization_id, catalog_sha256),
+    ).fetchone()
+    if by_digest is not None:
+        raise GatewayStoreError("catalog digest is already registered under another snapshot")
+    connection.execute(
+        """
+        INSERT INTO catalog_snapshot_refs (
+            snapshot_ref, organization_id, catalog_sha256, created_at
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (snapshot_ref, organization_id, catalog_sha256, now),
+    )
+
+
+def _activate_alias_revision_in_transaction(
+    connection: sqlite3.Connection,
+    *,
+    organization_id: str,
+    alias_id: str,
+    alias_name: str,
+    revision_id: str,
+    target: GatewayTarget,
+    snapshot_ref: str,
+    catalog_sha256: Sha256,
+    provider_connections: tuple[ProviderConnectionBinding, ...],
+    refusal_failover: bool,
+    now: str,
+) -> None:
+    """Create and activate one immutable alias revision in an open transaction.
+
+    Args:
+        connection: Open SQLite transaction.
+        organization_id: Owning tenant.
+        alias_id: Stable alias resource ID.
+        alias_name: Public model string.
+        revision_id: Immutable alias revision ID.
+        target: Direct pool or frozen project target.
+        snapshot_ref: Registered catalog snapshot reference.
+        catalog_sha256: Exact normalized catalog digest.
+        provider_connections: Exact active connection revisions for the snapshot.
+        refusal_failover: Whether typed precommit refusals may advance.
+        now: Canonical transaction timestamp.
+
+    Raises:
+        GatewayStoreError: The snapshot or alias invariants conflict.
+    """
+    snapshot = connection.execute(
+        """
+        SELECT 1 FROM catalog_snapshot_refs
+        WHERE organization_id = ? AND snapshot_ref = ? AND catalog_sha256 = ?
+        """,
+        (organization_id, snapshot_ref, catalog_sha256),
+    ).fetchone()
+    if snapshot is None:
+        raise GatewayStoreError("catalog snapshot reference is not registered")
+    alias_row = connection.execute(
+        """
+        SELECT alias_name FROM gateway_aliases
+        WHERE organization_id = ? AND alias_id = ?
+        """,
+        (organization_id, alias_id),
+    ).fetchone()
+    if alias_row is None:
+        connection.execute(
+            """
+            INSERT INTO gateway_aliases (
+                alias_id, organization_id, alias_name, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (alias_id, organization_id, alias_name, now, now),
+        )
+        revision_number = 1
+    else:
+        if str(alias_row["alias_name"]) != alias_name:
+            raise GatewayStoreError("alias ID cannot be renamed")
+        revision_number = int(
+            connection.execute(
+                """
+                SELECT COALESCE(MAX(revision_number), 0) + 1
+                FROM alias_revisions WHERE organization_id = ? AND alias_id = ?
+                """,
+                (organization_id, alias_id),
+            ).fetchone()[0]
+        )
+    pool_id: str | None = None
+    project_ref: str | None = None
+    activation_ref: str | None = None
+    if isinstance(target, DirectTarget):
+        pool_id = target.pool_id
+    else:
+        project_ref = target.project_ref
+        activation_ref = target.activation_ref
+    connection.execute(
+        """
+        INSERT INTO alias_revisions (
+            revision_id, organization_id, alias_id, revision_number, target_kind,
+            pool_id, project_ref, activation_ref, catalog_sha256, snapshot_ref,
+            refusal_failover, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            revision_id,
+            organization_id,
+            alias_id,
+            revision_number,
+            target.kind,
+            pool_id,
+            project_ref,
+            activation_ref,
+            catalog_sha256,
+            snapshot_ref,
+            int(refusal_failover),
+            now,
+        ),
+    )
+    bind_alias_provider_connections(
+        connection,
+        organization_id=organization_id,
+        alias_id=alias_id,
+        alias_revision_id=revision_id,
+        bindings=provider_connections,
+        now=now,
+    )
+    connection.execute(
+        """
+        DELETE FROM project_activation_bindings
+        WHERE organization_id = ? AND alias_id = ?
+        """,
+        (organization_id, alias_id),
+    )
+    if isinstance(target, ProjectTarget):
+        connection.execute(
+            """
+            INSERT INTO project_activation_bindings (
+                organization_id, project_ref, activation_ref,
+                alias_id, revision_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                organization_id,
+                target.project_ref,
+                target.activation_ref,
+                alias_id,
+                revision_id,
+                now,
+            ),
+        )
+    connection.execute(
+        """
+        UPDATE gateway_aliases
+        SET active_revision_id = ?, active = 1, updated_at = ?
+        WHERE organization_id = ? AND alias_id = ?
+        """,
+        (revision_id, now, organization_id, alias_id),
+    )
 
 
 def _caller_operation_sha256(request: GatewayRequest) -> Sha256 | None:

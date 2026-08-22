@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import typer
 
+import exp.runtime.gateway.sqlite.store as gateway_store
 from exp.cli.gateway import setup
 from exp.cli.providers import model_picker, provider_picker
 from exp.cli.providers.experiential_cloud import SETUP_PICKER_LABEL, SETUP_PICKER_NAME
@@ -267,6 +268,81 @@ def test_gateway_setup_reconfigures_provider_alias_and_existing_identity(
     assert manager.status().active_keys == 2
     assert manager.status().grants == 1
     assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
+
+
+def test_gateway_setup_rolls_back_catalog_and_provider_when_alias_activation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed reconfiguration leaves the prior catalog and SQLite authority active."""
+    endpoints, models = _prepared_gateway_models()
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
+    )
+    first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    manager = setup.GatewayManagement(tmp_path)
+    catalog_before = (tmp_path / "models.toml").read_bytes()
+    providers_before = manager.provider_connections()
+    aliases_before = manager.aliases()
+
+    updated_connection = ProviderConnection(
+        name="openai",
+        provider="openai",
+        api_key_env="UPDATED_OPENAI_API_KEY",
+    )
+    updated_endpoint = provider_picker.PreparedEndpoint(
+        connection=updated_connection,
+        api_key="secret",
+        configured=False,
+    )
+    updated_model = provider_picker.AvailableModel(
+        alias=models[0].alias,
+        connection="openai",
+        provider="openai",
+        model="gpt-5-6-luna-v2",
+        capabilities=models[0].capabilities,
+        pricing_source=models[0].pricing_source,
+        configured=False,
+    )
+    monkeypatch.setattr(
+        setup,
+        "prepare_providers",
+        lambda *_args, **_kwargs: ((updated_endpoint,), (updated_model,)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(updated_model, "medium"),
+    )
+
+    def fail_alias_activation(*_args: object, **_kwargs: object) -> None:
+        """Fail after provider revisions have been staged in the shared transaction."""
+        raise RuntimeError("alias activation failed")
+
+    monkeypatch.setattr(
+        gateway_store,
+        "_activate_alias_revision_in_transaction",
+        fail_alias_activation,
+    )
+
+    with pytest.raises(RuntimeError, match="alias activation failed"):
+        setup.interactive_gateway_setup(
+            tmp_path,
+            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n50\n"),
+            allow_reconfigure=True,
+        )
+
+    assert (tmp_path / "models.toml").read_bytes() == catalog_before
+    assert manager.provider_connections() == providers_before
+    assert manager.aliases() == aliases_before
 
 
 def test_gateway_setup_writes_budget_before_gateway_initialization(

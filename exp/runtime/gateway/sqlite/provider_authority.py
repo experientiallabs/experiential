@@ -20,6 +20,14 @@ class ProviderConnectionBinding(ContractModel):
     connection_sha256: Sha256
 
 
+class ProviderConnectionMutation(ContractModel):
+    """One provider connection revision staged inside an alias activation transaction."""
+
+    connection_id: str
+    revision_id: str
+    config: ConnectionConfig
+
+
 class ProviderConnectionAuthority(ContractModel):
     """One active or revision-pinned secret-free provider connection."""
 
