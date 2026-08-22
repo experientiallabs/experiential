@@ -908,9 +908,9 @@ def _python_responses_frames(
 
 def _native_envelope(body: str) -> str:
     """Render the control plane's Responses envelope JSON for one raw body."""
-    from exp.runtime.gateway.native_bridge import _responses_envelope
+    from exp.runtime.gateway.native_responses import responses_envelope
 
-    return json.dumps(_responses_envelope(decode_responses(json.loads(body)).request))
+    return json.dumps(responses_envelope(decode_responses(json.loads(body)).request))
 
 
 def test_rust_responses_sse_frames_match_python_encoder() -> None:
@@ -1032,7 +1032,7 @@ def test_rust_responses_rejects_streams_without_terminals() -> None:
 def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path) -> None:
     """A Responses request admits natively (no escalation) with the exact
     request-reflecting envelope and the shared dialect payload."""
-    from exp.runtime.gateway.native_bridge import _responses_envelope
+    from exp.runtime.gateway.native_responses import responses_envelope
 
     control, raw_key = _control_plane(tmp_path)
     body = _responses_body(with_tools=True)
@@ -1041,7 +1041,7 @@ def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path)
     assert admission["surface"] == "responses"
     assert admission["dialect"] == "openai_compatible"
     decoded = decode_responses(json.loads(body))
-    assert admission["envelope"] == _responses_envelope(decoded.request)
+    assert admission["envelope"] == responses_envelope(decoded.request)
     provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
     assert admission["upstream_payload"] == openai_compatible_stream_payload(
         "provider-model-exact", provider_request
