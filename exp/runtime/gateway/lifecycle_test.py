@@ -279,6 +279,57 @@ def test_local_gateway_preflights_real_state_and_serves_health_and_usage(
     assert manager.status().active_aliases == 1
 
 
+def test_local_gateway_usage_routes_scope_to_the_presented_key(tmp_path: Path) -> None:
+    """A Bearer key sees only its own identity; a bad key is rejected with 401."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    manager.create_identity(identity_id="neighbor", display_name="Neighbor")
+    manager.add_grant(identity_id="neighbor", alias_id="coding")
+    neighbor_key = manager.issue_key(identity_id="neighbor", key_id="key-neighbor").raw_key
+
+    runtime = load_local_gateway(
+        tmp_path,
+        graceful_timeout_seconds=1,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+
+    with TestClient(runtime.app) as client:
+        organization_wide = client.get("/usage.json")
+        scoped = client.get(
+            "/usage.json",
+            headers={"Authorization": f"Bearer {raw_key}"},
+        )
+        isolated = client.get(
+            "/usage.json",
+            headers={"Authorization": f"Bearer {neighbor_key}"},
+        )
+        isolated_page = client.get(
+            "/usage",
+            headers={"Authorization": f"Bearer {neighbor_key}"},
+        )
+        invalid = client.get(
+            "/usage.json",
+            headers={"Authorization": "Bearer exp_vk_invalid"},
+        )
+        malformed = client.get("/usage", headers={"Authorization": "Basic nope"})
+
+    assert organization_wide.status_code == 200
+    assert {item["identity_id"] for item in organization_wide.json()["identities"]} == {
+        "default",
+        "neighbor",
+    }
+    assert scoped.status_code == 200
+    assert [item["identity_id"] for item in scoped.json()["identities"]] == ["default"]
+    assert isolated.status_code == 200
+    assert [item["identity_id"] for item in isolated.json()["identities"]] == ["neighbor"]
+    assert isolated_page.status_code == 200
+    assert "neighbor" in isolated_page.text
+    assert ">default<" not in isolated_page.text
+    assert invalid.status_code == 401
+    assert invalid.json()["error"]["code"] == "invalid_key"
+    assert malformed.status_code == 401
+    assert malformed.json()["error"]["code"] == "invalid_key"
+
+
 def test_instance_lock_rejects_a_second_owner_for_the_same_root(tmp_path: Path) -> None:
     """A second local process cannot concurrently own one gateway database."""
     with gateway_instance_lock(tmp_path, port=8000):

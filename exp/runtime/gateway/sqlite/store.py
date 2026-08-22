@@ -749,6 +749,12 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         with self._transaction() as connection:
             self._authenticate_in_transaction(connection, raw_key)
 
+    def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
+        """Return the organization and identity IDs owning one valid key."""
+        with self._transaction() as connection:
+            organization_id, identity_id, _ = self._authenticate_in_transaction(connection, raw_key)
+        return organization_id, identity_id
+
     def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
         """List only active aliases granted to the key-derived identity.
 

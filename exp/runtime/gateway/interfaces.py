@@ -27,6 +27,10 @@ class GatewayControlStore(Protocol):
         """Validate a virtual key before parsing a full content-bearing request."""
         ...
 
+    def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
+        """Return the organization and identity IDs owning one valid key."""
+        ...
+
     def authorize_request(
         self,
         *,

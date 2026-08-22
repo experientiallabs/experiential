@@ -10,19 +10,24 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from exp.runtime.gateway.contracts import ExecutionSnapshot
 from exp.runtime.gateway.execution import GatewayExecutor
 from exp.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayControlStore
 from exp.runtime.gateway.routing import CatalogRouteResolver
-from exp.runtime.gateway.service import GatewayService, create_gateway_app
+from exp.runtime.gateway.service import (
+    GatewayService,
+    _bearer_key,
+    _exception_response,
+    create_gateway_app,
+)
 from exp.runtime.gateway.usage import GatewayUsageReport, usage_html
 from exp.runtime.openai_protocol.state import ResponseContinuationStore, ResponseReplayStore
 
 GatewayReadinessProbe = Callable[[], Awaitable[ExecutionSnapshot]]
-GatewayUsageSupplier = Callable[[], GatewayUsageReport]
+GatewayUsageSupplier = Callable[[str | None], GatewayUsageReport]
 GatewayTerminalFlusher = Callable[[], Awaitable[None]]
 
 
@@ -159,6 +164,9 @@ def create_gateway_runtime(
         clock: Injected authority and deadline clock.
         readiness: Credential-free proof for one granted executable route.
         usage: Content-free usage report supplier for the public usage routes.
+            It receives the caller's optional Bearer key: ``None`` returns the
+            organization-wide report, and a virtual key returns the report
+            scoped to that key's identity.
         replay: Optional bounded Chat and Responses replay state.
         continuations: Optional bounded Responses continuation state.
         wall_clock: Optional epoch clock for public OpenAI object timestamps.
@@ -221,15 +229,40 @@ def _create_managed_app(
         return JSONResponse({"status": "ready" if ready else "not_ready"}, status_code=status)
 
     @application.get("/usage.json")
-    async def usage_json() -> JSONResponse:
-        """Return versioned content-free usage from the injected supplier."""
-        report = usage()
+    async def usage_json(authorization: str | None = Header(default=None)) -> Response:
+        """Return versioned content-free usage, scoped when a key is presented."""
+        try:
+            report = usage(_usage_scope_key(authorization))
+        except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
+            return _exception_response(exc)
         return JSONResponse(report.model_dump(mode="json"))
 
     @application.get("/usage")
-    async def usage_page() -> HTMLResponse:
-        """Return the minimal content-free usage page."""
-        return HTMLResponse(usage_html(usage()))
+    async def usage_page(authorization: str | None = Header(default=None)) -> Response:
+        """Return the minimal content-free usage page, scoped when a key is presented."""
+        try:
+            report = usage(_usage_scope_key(authorization))
+        except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
+            return _exception_response(exc)
+        return HTMLResponse(usage_html(report))
 
     application.mount("/", create_gateway_app(runtime.service))
     return application
+
+
+def _usage_scope_key(authorization: str | None) -> str | None:
+    """Return the optional Bearer credential scoping one usage request.
+
+    Args:
+        authorization: Raw Authorization header value, if any.
+
+    Returns:
+        The presented virtual key, or ``None`` for the anonymous
+        organization-wide report.
+
+    Raises:
+        OpenAIProtocolError: A present header does not carry a Bearer key.
+    """
+    if authorization is None:
+        return None
+    return _bearer_key(authorization)
