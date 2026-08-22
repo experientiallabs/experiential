@@ -126,9 +126,12 @@ class _MockChatHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Content-Length", str(sum(len(frame) for frame in frames)))
         self.end_headers()
-        for frame in frames:
-            self.wfile.write(frame)
-            self.wfile.flush()
+        try:
+            for frame in frames:
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except BrokenPipeError:
+            return
 
 
 def _completion_payload(*, model: str, created: int) -> JsonObject:
@@ -507,11 +510,10 @@ def start_gateway_process(
             "no_proxy": "127.0.0.1,localhost",
         }
     )
+    executable = Path(sys.executable).with_name("exp")
     process = subprocess.Popen(
         [
-            sys.executable,
-            "-m",
-            "exp.cli",
+            str(executable),
             "--root",
             str(root),
             "--port",
@@ -536,7 +538,7 @@ def start_gateway_process(
     )
     pump.start()
     try:
-        _wait_for_ready(port, process)
+        _wait_for_ready(port, process, lines)
     except Exception:
         stop_gateway_process(process)
         raise
@@ -571,12 +573,17 @@ def _pump_process_output(process: subprocess.Popen[str], lines: list[str]) -> No
         lines.append(line)
 
 
-def _wait_for_ready(port: int, process: subprocess.Popen[str]) -> None:
+def _wait_for_ready(
+    port: int,
+    process: subprocess.Popen[str],
+    lines: list[str],
+) -> None:
     """Wait until ``/health/ready`` answers or fail boundedly.
 
     Args:
         port: Expected loopback TCP port.
         process: Server process that must remain live.
+        lines: Captured gateway stdout lines from the pump thread.
 
     Raises:
         RuntimeError: The process exits or does not become ready in time.
@@ -585,7 +592,7 @@ def _wait_for_ready(port: int, process: subprocess.Popen[str]) -> None:
     url = f"http://127.0.0.1:{port}/health/ready"
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            output = process.stdout.read() if process.stdout is not None else ""
+            output = "".join(lines)
             raise RuntimeError(f"gateway exited before readiness: {output}")
         try:
             response = httpx.get(url, timeout=0.2)
