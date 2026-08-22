@@ -790,7 +790,7 @@ def main(argv: list[str] | None = None) -> int:
         Process exit status. Functional request failures return 1.
     """
     args = parse_args(argv)
-    console = Console()
+    console = Console(width=200, soft_wrap=True)
     config = LatencyRunConfig(
         warmup_requests=args.warmup,
         measured_requests=args.requests,
