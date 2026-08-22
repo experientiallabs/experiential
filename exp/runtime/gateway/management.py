@@ -19,6 +19,7 @@ from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
 )
 from exp.runtime.gateway.sqlite.store import GatewayStoreError, SQLiteGatewayStore
+from exp.runtime.models import SUPPORTED_PROVIDERS
 
 
 class GatewayIdentityView(ContractModel):
@@ -146,7 +147,18 @@ class GatewayManagement:
         config: ConnectionConfig,
         replace: bool = False,
     ) -> tuple[bool, ProviderConnectionAuthority]:
-        """Create or revise one SQLite-authoritative serving connection."""
+        """Create or revise one SQLite-authoritative serving connection.
+
+        Raises:
+            GatewayStoreError: The connection names a provider the runtime
+                registry cannot construct a client for.
+        """
+        if config.provider not in SUPPORTED_PROVIDERS:
+            supported = ", ".join(sorted(SUPPORTED_PROVIDERS))
+            raise GatewayStoreError(
+                f"provider connection {connection_id!r} uses unsupported provider "
+                f"{config.provider!r}; choose one of: {supported}"
+            )
         revision_id = stable_id(
             "provider-connection-revision",
             {

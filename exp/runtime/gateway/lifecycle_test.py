@@ -453,6 +453,53 @@ def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) 
     assert runtime.reconciled_expired_requests == 0
 
 
+def test_partial_startup_exposes_each_unavailable_alias_with_its_reason(tmp_path: Path) -> None:
+    """A partially ready gateway names every failed alias and its exact load reason."""
+    manager, _raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="missing-provider",
+        connection=ConnectionConfig(
+            provider="openai-compatible",
+            base_url="http://127.0.0.1:9/v1",
+            api_key_env="MISSING_PROVIDER_KEY",
+        ),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="broken",
+        connection_name="missing-provider",
+        provider_model="missing-model",
+        exact_model_id="missing-exact-model",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="broken",
+        alias_name="broken",
+        revision_id="revision-broken",
+        pool_id="broken",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="broken")
+
+    runtime = load_local_gateway(
+        tmp_path,
+        graceful_timeout_seconds=1,
+        environment={"TEST_PROVIDER_KEY": "available"},
+    )
+
+    ((alias_name, reason),) = runtime.unavailable_aliases
+    assert alias_name == "broken"
+    assert "MISSING_PROVIDER_KEY" in reason
+
+
 def test_live_alias_revision_update_hot_reloads_discovery_without_restart(
     tmp_path: Path,
 ) -> None:

@@ -179,6 +179,7 @@ def _run_gateway(
                     "reconciled_expired_requests": runtime.reconciled_expired_requests,
                     "reconciled_unknown_attempts": runtime.reconciled_unknown_attempts,
                     "launch_mode": "gateway" if compatibility is None else "project_alias",
+                    "unavailable_aliases": _unavailable_alias_entries(runtime.unavailable_aliases),
                 }
                 if compatibility is not None:
                     receipt.update(
@@ -199,6 +200,7 @@ def _run_gateway(
                         compatibility=compatibility,
                         ghost=ghost,
                     )
+                    _emit_unavailable_aliases(runtime.unavailable_aliases)
                 if check:
                     return
                 uvicorn.run(runtime.app, host=_LOOPBACK_HOST, port=port)
@@ -325,6 +327,7 @@ def _run_rust_gateway(
                 "reconciled_expired_requests": control_plane.reconciled_expired_requests,
                 "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
                 "launch_mode": "gateway",
+                "unavailable_aliases": _unavailable_alias_entries(components.unavailable_aliases),
             }
             if json_output:
                 typer.echo(json.dumps(receipt, separators=(",", ":")))
@@ -333,6 +336,7 @@ def _run_rust_gateway(
                     f"[green]Gateway ready (rust engine)[/green] http://{_LOOPBACK_HOST}:{port}/v1",
                     markup=True,
                 )
+                _emit_unavailable_aliases(components.unavailable_aliases)
             if check:
                 return
 
@@ -356,6 +360,34 @@ def _run_rust_gateway(
                 )
             except NativeGatewayServerError as exc:
                 raise typer.BadParameter(str(exc)) from exc
+
+
+def _unavailable_alias_entries(
+    unavailable_aliases: tuple[tuple[str, str], ...],
+) -> list[dict[str, str]]:
+    """Shape failed aliases and their reasons for the versioned startup receipt.
+
+    Args:
+        unavailable_aliases: Alias names paired with their exact load-failure reasons.
+
+    Returns:
+        JSON-ready entries naming each alias that will answer 503 unavailable_route.
+    """
+    return [{"alias": alias_name, "reason": reason} for alias_name, reason in unavailable_aliases]
+
+
+def _emit_unavailable_aliases(unavailable_aliases: tuple[tuple[str, str], ...]) -> None:
+    """Warn about granted aliases that failed to load and will answer 503.
+
+    Args:
+        unavailable_aliases: Alias names paired with their exact load-failure reasons.
+    """
+    for alias_name, reason in unavailable_aliases:
+        _console.print(
+            f"[yellow]! alias {alias_name!r} is unavailable and will answer "
+            f"503 unavailable_route: {reason}[/yellow]",
+            markup=True,
+        )
 
 
 def _emit_exp_wordmark() -> None:

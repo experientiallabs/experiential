@@ -158,8 +158,8 @@ class RuntimeModelCatalog:
         if record is None:
             raise ModelConnectionError(f"unknown model alias {alias!r}")
         connection = self._catalog.connections[record.connection]
-        if connection.provider not in _SUPPORTED_PROVIDERS:
-            supported = ", ".join(sorted(_SUPPORTED_PROVIDERS))
+        if connection.provider not in SUPPORTED_PROVIDERS:
+            supported = ", ".join(sorted(SUPPORTED_PROVIDERS))
             raise ModelConnectionError(
                 f"model alias {alias!r} uses unsupported provider {connection.provider!r}; "
                 f"choose one of: {supported}"
@@ -407,7 +407,8 @@ _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
     "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
 }
 
-_SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {"azure", "bedrock", "openai", "tinker"}
+SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {"azure", "bedrock", "openai", "tinker"}
+"""Every provider identifier the runtime registry can construct a client for."""
 
 
 def _runtime_tinker_sampler(

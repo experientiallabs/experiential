@@ -2,6 +2,7 @@
 
 from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
 from exp.runtime.models.registry import (
+    SUPPORTED_PROVIDERS,
     CatalogRoleName,
     ModelConnectionError,
     ResolvedModel,
@@ -9,6 +10,7 @@ from exp.runtime.models.registry import (
 )
 
 __all__ = [
+    "SUPPORTED_PROVIDERS",
     "CapabilityRequirement",
     "CatalogRoleName",
     "ModelCapabilityError",

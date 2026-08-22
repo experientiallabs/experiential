@@ -86,6 +86,7 @@ def test_project_option_launches_the_normal_gateway_on_loopback(
             service=SimpleNamespace(preflight=preflight),
             reconciled_expired_requests=0,
             reconciled_unknown_attempts=0,
+            unavailable_aliases=(),
         )
 
     @contextmanager
@@ -157,6 +158,28 @@ def test_noninteractive_default_gateway_returns_stable_empty_state_json(tmp_path
     assert payload["error"]["code"] == "gateway_not_initialized"
     assert payload["error"]["next_commands"][0].startswith("exp config gateway init")
     assert not (tmp_path / "gateway").exists()
+
+
+def test_unavailable_alias_entries_shape_the_startup_receipt() -> None:
+    """Failed aliases become JSON-ready receipt entries naming alias and reason."""
+    entries = run_app._unavailable_alias_entries((("broken", "missing MISSING_PROVIDER_KEY"),))
+    assert entries == [{"alias": "broken", "reason": "missing MISSING_PROVIDER_KEY"}]
+    assert run_app._unavailable_alias_entries(()) == []
+
+
+def test_emit_unavailable_aliases_warns_with_alias_and_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Human startup output names each failed alias, its 503 behavior, and reason."""
+    buffer = io.StringIO()
+    monkeypatch.setattr(run_app, "_console", Console(file=buffer, width=200))
+
+    run_app._emit_unavailable_aliases((("broken", "missing MISSING_PROVIDER_KEY"),))
+
+    output = buffer.getvalue()
+    assert "'broken'" in output
+    assert "503 unavailable_route" in output
+    assert "missing MISSING_PROVIDER_KEY" in output
 
 
 def test_engine_rust_without_the_extension_is_an_actionable_error(tmp_path: Path) -> None:

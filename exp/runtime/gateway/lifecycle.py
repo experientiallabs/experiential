@@ -81,6 +81,7 @@ class LocalGatewayRuntime:
     reconciled_unknown_attempts: int
     write_ledger: GroupCommitAttemptLedger | None = None
     selection_workers: SelectionWorkerPool | None = None
+    unavailable_aliases: tuple[tuple[str, str], ...] = ()
 
     @property
     def app(self) -> FastAPI:
@@ -130,6 +131,7 @@ class _AliasAuthorityState:
     exact_models: Mapping[tuple[str, str, str, str], str]
     listing_pools: Mapping[tuple[str, str, str], str]
     proof: ExecutionSnapshot
+    unavailable_aliases: tuple[tuple[str, str], ...] = ()
 
 
 class _AliasAuthorityReloader:
@@ -258,6 +260,7 @@ class _AliasAuthorityReloader:
             exact_models=exact_models,
             listing_pools=listing_pools,
             proof=loaded.proof,
+            unavailable_aliases=loaded.unavailable_aliases,
         )
         self._executor.swap_catalogs(runtime)
         self._routes.swap_catalogs(
@@ -422,6 +425,11 @@ class LocalGatewayComponents:
         return (self.reloader.state.proof,)
 
     @property
+    def unavailable_aliases(self) -> tuple[tuple[str, str], ...]:
+        """Return the current generation's failed aliases with their exact reasons."""
+        return self.reloader.state.unavailable_aliases
+
+    @property
     def organization_id(self) -> str:
         """Return the single local organization identity."""
         return self.manager.organization_id
@@ -556,6 +564,7 @@ def compose_local_gateway(
         selection_workers=components.selection_workers,
         reconciled_expired_requests=components.reconciled_expired_requests,
         reconciled_unknown_attempts=components.reconciled_unknown_attempts,
+        unavailable_aliases=components.unavailable_aliases,
     )
 
 
@@ -740,45 +749,39 @@ def _load_alias_state(
         readiness.append(proof)
 
     if not readiness:
-        unavailable = "; ".join(
-            f"{alias_name} ({reason})" for alias_name, reason in sorted(unavailable_aliases)
-        )
+        unavailable = "; ".join(f"{name} ({why})" for name, why in sorted(unavailable_aliases))
         detail = f": {unavailable}" if unavailable else ""
         if missing_credential_variables:
-            assignments = " ".join(
-                f"{variable}=YOUR_API_KEY" for variable in sorted(missing_credential_variables)
-            )
-            remediation = f"; run '{assignments} exp'"
+            keys = " ".join(f"{name}=YOUR_API_KEY" for name in sorted(missing_credential_variables))
+            remediation = f"; run '{keys} exp'"
         else:
             remediation = "; fix the listed provider configuration and rerun 'exp'"
         raise GatewayLifecycleError(
             f"no granted active alias is locally available{detail}{remediation}"
         )
 
+    for alias_name, reason in sorted(unavailable_aliases):
+        _logger.warning("gateway alias %r is unavailable: %s", alias_name, reason)
     return _AliasAuthorityState(
-        authorities=frozenset(
-            (
-                item.authorization.alias,
-                item.authorization.alias_revision_id,
-                item.authorization.catalog_sha256,
-            )
-            for item in readiness
-        ),
+        authorities=frozenset(_authority_key(item) for item in readiness),
         normalized_catalogs=normalized_catalogs,
         runtime_catalogs=runtime_catalogs,
         activations=activations,
         exact_models=exact_models,
         listing_pools={
-            (
-                item.authorization.alias,
-                item.authorization.alias_revision_id,
-                item.authorization.catalog_sha256,
-            ): item.authorization.target.pool_id
+            _authority_key(item): item.authorization.target.pool_id
             for item in readiness
             if isinstance(item.authorization.target, DirectTarget)
         },
         proof=readiness[0],
+        unavailable_aliases=tuple(sorted(unavailable_aliases)),
     )
+
+
+def _authority_key(item: ExecutionSnapshot) -> tuple[str, str, str]:
+    """Return the alias, revision, and catalog digest key of one readiness proof."""
+    proof = item.authorization
+    return (proof.alias, proof.alias_revision_id, proof.catalog_sha256)
 
 
 def _granted_active_aliases(manager: GatewayManagement) -> tuple[GatewayAliasView, ...]:
