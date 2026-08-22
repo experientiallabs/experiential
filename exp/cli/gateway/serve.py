@@ -268,6 +268,7 @@ def _run_rust_gateway(
     if not json_output:
         _emit_exp_wordmark()
 
+    import importlib
     import socket
 
     from exp.optimize.router.activation import verify_automatic_router_policy
@@ -299,6 +300,10 @@ def _run_rust_gateway(
             # path and the embedded python engine, so keyed replays and
             # native requests resolve identical namespaced history.
             continuations = BoundedContinuationStore()
+            # Loaded directly (rather than through native_server's own import)
+            # so this composition can wire the content-free metrics snapshot
+            # into the control plane before the process host ever starts.
+            exp_gateway_native = importlib.import_module("exp_gateway_native")
             control_plane = NativeControlPlane(
                 components,
                 data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
