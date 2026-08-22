@@ -330,7 +330,7 @@ def test_models_and_detail_mirror_the_python_discovery_bodies(tmp_path: Path) ->
 
     models = json.loads(control.models(json.dumps({"raw_key": raw_key})))
     assert [item["id"] for item in models["data"]] == ["coding"]
-    assert models["wmo"]["authority_schema_version"] == 1
+    assert models["exp"]["authority_schema_version"] == 1
     listed = models["data"][0]
     for key, value in metadata["coding"].extension_fields().items():
         assert listed[key] == value
