@@ -538,7 +538,13 @@ def start_gateway_process(
     )
     pump.start()
     try:
-        _wait_for_ready(port, process, lines)
+        wait_for_http_ok(
+            f"http://127.0.0.1:{port}/health/ready",
+            process=process,
+            lines=lines,
+            timeout_s=GATEWAY_START_TIMEOUT_S,
+            label="gateway",
+        )
         engine = _wait_for_engine_receipt(lines)
     except Exception:
         stop_gateway_process(process)
@@ -574,27 +580,31 @@ def _pump_process_output(process: subprocess.Popen[str], lines: list[str]) -> No
         lines.append(line)
 
 
-def _wait_for_ready(
-    port: int,
+def wait_for_http_ok(
+    url: str,
+    *,
     process: subprocess.Popen[str],
     lines: list[str],
+    timeout_s: float,
+    label: str,
 ) -> None:
-    """Wait until ``/health/ready`` answers or fail boundedly.
+    """Wait until ``url`` returns HTTP 200 or fail boundedly.
 
     Args:
-        port: Expected loopback TCP port.
+        url: Absolute health URL.
         process: Server process that must remain live.
-        lines: Captured gateway stdout lines from the pump thread.
+        lines: Captured stdout lines from the pump thread.
+        timeout_s: Bound for the readiness wait.
+        label: Process name used in error messages.
 
     Raises:
         RuntimeError: The process exits or does not become ready in time.
     """
-    deadline = time.monotonic() + GATEWAY_START_TIMEOUT_S
-    url = f"http://127.0.0.1:{port}/health/ready"
+    deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if process.poll() is not None:
             output = "".join(lines)
-            raise RuntimeError(f"gateway exited before readiness: {output}")
+            raise RuntimeError(f"{label} exited before readiness: {output}")
         try:
             response = httpx.get(url, timeout=0.2)
             if response.status_code == 200:
@@ -602,7 +612,7 @@ def _wait_for_ready(
         except httpx.HTTPError:
             pass
         time.sleep(0.05)
-    raise RuntimeError(f"gateway did not become ready on port {port}")
+    raise RuntimeError(f"{label} did not become ready: {url}")
 
 
 def _wait_for_engine_receipt(lines: list[str], *, timeout_s: float = 2.0) -> str:

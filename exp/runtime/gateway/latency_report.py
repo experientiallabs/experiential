@@ -1,13 +1,19 @@
-"""Measure Experiential gateway overhead against a local OpenAI-compatible mock.
+"""Measure Experiential and LiteLLM overhead against one local mock.
 
-The runner starts one loopback mock upstream, benchmarks that mock directly, then
-benchmarks the same payload through the native local gateway. Reported
-gateway-added latency is the client-observed difference between those two arms.
-It is not end-to-end model latency and is not a comparison with LiteLLM.
+The runner starts one loopback OpenAI-compatible mock, then measures that mock
+directly, the Experiential native gateway, and (when requested) a pinned
+LiteLLM config-file proxy. All three arms use the same payload, schedule,
+warmup, concurrency, and sampler. Gateway measurement order rotates across
+repeats so neither proxy systematically benefits from first position.
 
-Methodology follows the official LiteLLM mock-isolated scripts: warmup requests
-are discarded, measured runs use fixed request and concurrency counts, arms run
-sequentially, and the representative result is the median run by gateway p50.
+Reported added latency is the client-observed difference versus the mock
+direct baseline. This is a same-host mock-upstream comparison, not end-to-end
+model latency and not LiteLLM's public 1K-RPS topology.
+
+Methodology follows the official LiteLLM mock-isolated scripts: warmup
+requests are discarded, measured runs use fixed request and concurrency
+counts, arms run sequentially, and the representative result is the median
+run by Experiential p50.
 """
 
 from __future__ import annotations
@@ -25,6 +31,15 @@ from pydantic import Field
 from rich.console import Console
 
 from exp.common.core.artifacts import ContractModel, JsonObject
+from exp.runtime.gateway.latency_litellm import (
+    LITELLM_MASTER_KEY,
+    LITELLM_PIN,
+    LITELLM_STARTUP,
+    installed_litellm_version,
+    start_litellm_process,
+    stop_litellm_process,
+    write_litellm_config,
+)
 from exp.runtime.gateway.latency_measure import (
     ALIAS_ID,
     CHAT_PATH,
@@ -41,11 +56,11 @@ from exp.runtime.gateway.latency_measure import (
 )
 
 SCHEMA_NAME = "exp.gateway.latency_report"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CAVEAT = (
-    "This report measures gateway overhead against a local OpenAI-compatible "
-    "mock upstream. It is not end-to-end model latency and is not a comparison "
-    "with LiteLLM."
+    "This report is a same-host mock-upstream comparison of Experiential and "
+    "LiteLLM against one local OpenAI-compatible mock. It is not end-to-end "
+    "model latency and is not LiteLLM's public 1K-RPS multi-worker topology."
 )
 _DEFAULT_WARMUP = 10
 _DEFAULT_REQUESTS = 40
@@ -59,6 +74,8 @@ _ARM_TABLE_HEADER = (
     "| Arm | Requests | Failures | Failure rate | RPS | p50 (ms) | p95 (ms) | p99 (ms) |"
 )
 _ARM_TABLE_DIVIDER = "|---|---:|---:|---:|---:|---:|---:|---:|"
+_EXPERIENTIAL = "experiential"
+_LITELLM = "litellm"
 
 
 class LatencyArmStats(ContractModel):
@@ -94,6 +111,7 @@ class LatencyRunConfig(ContractModel):
     stream_concurrency: int = Field(ge=1)
     timeout_s: float = Field(gt=0.0)
     measure_streaming_ttft: bool
+    compare_litellm: bool = False
 
 
 class RunnerContext(ContractModel):
@@ -104,25 +122,35 @@ class RunnerContext(ContractModel):
     platform_name: str = Field(min_length=1)
     runner_name: str = Field(min_length=1)
     gateway_engine: str = Field(min_length=1)
+    runner_os: str = Field(min_length=1, default="unknown")
+    cpu_count: int = Field(ge=0, default=0)
+    cpu_model: str = Field(min_length=1, default="unknown")
+    litellm_version: str | None = None
+    litellm_startup: str | None = None
 
 
 class LatencyMeasuredRun(ContractModel):
-    """One complete sequential pass of mock-direct and gateway arms."""
+    """One sequential pass of mock-direct and rotated gateway arms."""
 
     run_index: int = Field(ge=1)
+    gateway_order: tuple[str, ...]
     mock_direct: LatencyArmStats
-    gateway: LatencyArmStats
-    gateway_added: GatewayAddedLatency
+    experiential: LatencyArmStats
+    experiential_added: GatewayAddedLatency
+    litellm: LatencyArmStats | None = None
+    litellm_added: GatewayAddedLatency | None = None
     mock_direct_ttft: LatencyArmStats | None = None
-    gateway_ttft: LatencyArmStats | None = None
-    gateway_added_ttft: GatewayAddedLatency | None = None
+    experiential_ttft: LatencyArmStats | None = None
+    experiential_added_ttft: GatewayAddedLatency | None = None
+    litellm_ttft: LatencyArmStats | None = None
+    litellm_added_ttft: GatewayAddedLatency | None = None
 
 
 class LatencyReport(ContractModel):
-    """Versioned machine-readable gateway overhead report."""
+    """Versioned machine-readable same-run gateway comparison report."""
 
     schema_name: Literal["exp.gateway.latency_report"] = SCHEMA_NAME
-    schema_version: Literal[1] = SCHEMA_VERSION
+    schema_version: Literal[2] = SCHEMA_VERSION
     measured_at: datetime
     caveat: str = CAVEAT
     config: LatencyRunConfig
@@ -172,6 +200,27 @@ def gateway_added(gateway: LatencyArmStats, mock_direct: LatencyArmStats) -> Gat
     )
 
 
+def comparison_order(run_index: int, *, compare_litellm: bool) -> tuple[str, ...]:
+    """Return the gateway measurement order for one 1-based repeat.
+
+    Odd runs measure Experiential first. Even runs measure LiteLLM first when
+    the comparison is enabled, so position does not systematically favor one
+    proxy.
+
+    Args:
+        run_index: 1-based repeat number.
+        compare_litellm: Whether LiteLLM is part of this report.
+
+    Returns:
+        Ordered gateway arm names.
+    """
+    if not compare_litellm:
+        return (_EXPERIENTIAL,)
+    if run_index % 2 == 1:
+        return (_EXPERIENTIAL, _LITELLM)
+    return (_LITELLM, _EXPERIENTIAL)
+
+
 def resolve_commit_sha() -> str:
     """Return ``GITHUB_SHA`` or the current checkout SHA.
 
@@ -192,6 +241,22 @@ def resolve_commit_sha() -> str:
         return "unknown"
     sha = result.stdout.strip()
     return sha if result.returncode == 0 and sha else "unknown"
+
+
+def runner_cpu_model() -> str:
+    """Return the host CPU model from ``/proc/cpuinfo`` when present.
+
+    Returns:
+        CPU model string, or a platform fallback.
+    """
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.is_file():
+        for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.lower().startswith("model name"):
+                model = line.split(":", 1)[1].strip()
+                if model:
+                    return model
+    return platform.processor() or "unknown"
 
 
 def render_markdown(report: LatencyReport) -> str:
@@ -215,36 +280,41 @@ def render_markdown(report: LatencyReport) -> str:
         "|---|---|",
         f"| Commit | `{runner.commit_sha}` |",
         f"| Runner | {runner.runner_name} |",
+        f"| OS | {runner.runner_os} |",
         f"| Platform | {runner.platform_name} |",
+        f"| CPU | {runner.cpu_count} x {runner.cpu_model} |",
         f"| Python | {runner.python_version} |",
-        f"| Gateway engine | {runner.gateway_engine} |",
+        f"| Experiential engine | {runner.gateway_engine} |",
+        f"| Schema | `{report.schema_name}` v{report.schema_version} |",
         (
             f"| Non-stream schedule | warmup {config.warmup_requests}, "
             f"{config.measured_requests} requests, concurrency "
             f"{config.concurrency}, {config.repeats} runs |"
         ),
-        f"| Representative run | {run.run_index} of {len(report.runs)} (median gateway p50) |",
+        f"| Gateway order | {' then '.join(run.gateway_order)} |",
+        f"| Representative run | {run.run_index} of {len(report.runs)} (median experiential p50) |",
         f"| Measured at | {report.measured_at.isoformat()} |",
-        "",
-        "## Non-streaming chat completions",
-        "",
-        _ARM_TABLE_HEADER,
-        _ARM_TABLE_DIVIDER,
-        _arm_row("mock direct", run.mock_direct),
-        _arm_row("gateway", run.gateway),
-        (
-            f"| gateway-added |  |  |  |  | {run.gateway_added.p50_ms:.2f} | "
-            f"{run.gateway_added.p95_ms:.2f} | {run.gateway_added.p99_ms:.2f} |"
-        ),
     ]
-    if run.mock_direct_ttft is not None and run.gateway_ttft is not None:
-        added = run.gateway_added_ttft
-        added_row = (
-            "| gateway-added TTFT |  |  |  |  | "
-            f"{added.p50_ms:.2f} | {added.p95_ms:.2f} | {added.p99_ms:.2f} |"
-            if added is not None
-            else ""
-        )
+    if runner.litellm_version:
+        lines.append(f"| LiteLLM | {runner.litellm_version} |")
+    if runner.litellm_startup:
+        lines.append(f"| LiteLLM startup | {runner.litellm_startup} |")
+    lines.extend(
+        [
+            "",
+            "## Non-streaming chat completions",
+            "",
+            _ARM_TABLE_HEADER,
+            _ARM_TABLE_DIVIDER,
+            _arm_row("mock direct", run.mock_direct),
+            _arm_row("experiential", run.experiential),
+            _added_row("experiential-added", run.experiential_added),
+        ]
+    )
+    if run.litellm is not None and run.litellm_added is not None:
+        lines.append(_arm_row("litellm", run.litellm))
+        lines.append(_added_row("litellm-added", run.litellm_added))
+    if run.mock_direct_ttft is not None and run.experiential_ttft is not None:
         lines.extend(
             [
                 "",
@@ -259,11 +329,15 @@ def render_markdown(report: LatencyReport) -> str:
                 _ARM_TABLE_HEADER,
                 _ARM_TABLE_DIVIDER,
                 _arm_row("mock direct TTFT", run.mock_direct_ttft),
-                _arm_row("gateway TTFT", run.gateway_ttft),
+                _arm_row("experiential TTFT", run.experiential_ttft),
             ]
         )
-        if added_row:
-            lines.append(added_row)
+        if run.experiential_added_ttft is not None:
+            lines.append(_added_row("experiential-added TTFT", run.experiential_added_ttft))
+        if run.litellm_ttft is not None:
+            lines.append(_arm_row("litellm TTFT", run.litellm_ttft))
+        if run.litellm_added_ttft is not None:
+            lines.append(_added_row("litellm-added TTFT", run.litellm_added_ttft))
     return "\n".join(lines) + "\n"
 
 
@@ -282,6 +356,19 @@ def _arm_row(name: str, stats: LatencyArmStats) -> str:
         f"{stats.failure_rate:.1%} | {stats.rps:.2f} | {stats.p50_ms:.2f} | "
         f"{stats.p95_ms:.2f} | {stats.p99_ms:.2f} |"
     )
+
+
+def _added_row(name: str, added: GatewayAddedLatency) -> str:
+    """Format one Markdown row for gateway-added percentiles.
+
+    Args:
+        name: Row label.
+        added: Signed overhead versus the mock-direct baseline.
+
+    Returns:
+        One Markdown table row.
+    """
+    return f"| {name} |  |  |  |  | {added.p50_ms:.2f} | {added.p95_ms:.2f} | {added.p99_ms:.2f} |"
 
 
 def measure_arm(
@@ -323,28 +410,58 @@ def measure_arm(
     return summarize_samples(samples, wall_time_s)
 
 
+def _measure_named_arm(
+    *,
+    name: str,
+    targets: dict[str, tuple[str, dict[str, str]]],
+    config: LatencyRunConfig,
+    stream: bool,
+) -> LatencyArmStats:
+    """Measure one named gateway or skip-safe target.
+
+    Args:
+        name: Arm name from :func:`comparison_order`.
+        targets: Mapping of arm name to URL and headers.
+        config: Fixed request schedule.
+        stream: Whether to stop at the first content token.
+
+    Returns:
+        Aggregated arm statistics.
+    """
+    url, headers = targets[name]
+    return measure_arm(
+        url=url,
+        headers=headers,
+        payload=chat_payload(ALIAS_ID if name != "mock" else MOCK_MODEL, stream=stream),
+        warmup=(config.stream_warmup_requests if stream else config.warmup_requests),
+        requests=(config.stream_measured_requests if stream else config.measured_requests),
+        concurrency=(config.stream_concurrency if stream else config.concurrency),
+        timeout_s=config.timeout_s,
+        stream=stream,
+    )
+
+
 def _measure_run(
     *,
     run_index: int,
     config: LatencyRunConfig,
     mock_url: str,
-    gateway_url: str,
     mock_headers: dict[str, str],
-    gateway_headers: dict[str, str],
+    targets: dict[str, tuple[str, dict[str, str]]],
 ) -> LatencyMeasuredRun:
-    """Run mock-direct then gateway arms for one repeat.
+    """Run mock-direct, then the rotated gateway arms, for one repeat.
 
     Args:
         run_index: 1-based repeat number.
         config: Fixed request schedule.
         mock_url: Direct mock chat-completions URL.
-        gateway_url: Gateway chat-completions URL.
         mock_headers: Headers for the mock.
-        gateway_headers: Headers for the gateway.
+        targets: Experiential and optional LiteLLM URL/header pairs.
 
     Returns:
         One complete measured run.
     """
+    order = comparison_order(run_index, compare_litellm=config.compare_litellm)
     mock_direct = measure_arm(
         url=mock_url,
         headers=mock_headers,
@@ -355,19 +472,18 @@ def _measure_run(
         timeout_s=config.timeout_s,
         stream=False,
     )
-    gateway = measure_arm(
-        url=gateway_url,
-        headers=gateway_headers,
-        payload=chat_payload(ALIAS_ID, stream=False),
-        warmup=config.warmup_requests,
-        requests=config.measured_requests,
-        concurrency=config.concurrency,
-        timeout_s=config.timeout_s,
-        stream=False,
-    )
+    measured: dict[str, LatencyArmStats] = {}
+    for name in order:
+        measured[name] = _measure_named_arm(
+            name=name,
+            targets=targets,
+            config=config,
+            stream=False,
+        )
+    experiential = measured[_EXPERIENTIAL]
+    litellm_stats = measured.get(_LITELLM)
     mock_ttft: LatencyArmStats | None = None
-    gateway_ttft: LatencyArmStats | None = None
-    added_ttft: GatewayAddedLatency | None = None
+    ttft: dict[str, LatencyArmStats] = {}
     if config.measure_streaming_ttft:
         mock_ttft = measure_arm(
             url=mock_url,
@@ -379,30 +495,43 @@ def _measure_run(
             timeout_s=config.timeout_s,
             stream=True,
         )
-        gateway_ttft = measure_arm(
-            url=gateway_url,
-            headers=gateway_headers,
-            payload=chat_payload(ALIAS_ID, stream=True),
-            warmup=config.stream_warmup_requests,
-            requests=config.stream_measured_requests,
-            concurrency=config.stream_concurrency,
-            timeout_s=config.timeout_s,
-            stream=True,
-        )
-        added_ttft = gateway_added(gateway_ttft, mock_ttft)
+        for name in order:
+            ttft[name] = _measure_named_arm(
+                name=name,
+                targets=targets,
+                config=config,
+                stream=True,
+            )
+    experiential_ttft = ttft.get(_EXPERIENTIAL)
+    litellm_ttft = ttft.get(_LITELLM)
     return LatencyMeasuredRun(
         run_index=run_index,
+        gateway_order=order,
         mock_direct=mock_direct,
-        gateway=gateway,
-        gateway_added=gateway_added(gateway, mock_direct),
+        experiential=experiential,
+        experiential_added=gateway_added(experiential, mock_direct),
+        litellm=litellm_stats,
+        litellm_added=(
+            gateway_added(litellm_stats, mock_direct) if litellm_stats is not None else None
+        ),
         mock_direct_ttft=mock_ttft,
-        gateway_ttft=gateway_ttft,
-        gateway_added_ttft=added_ttft,
+        experiential_ttft=experiential_ttft,
+        experiential_added_ttft=(
+            gateway_added(experiential_ttft, mock_ttft)
+            if experiential_ttft is not None and mock_ttft is not None
+            else None
+        ),
+        litellm_ttft=litellm_ttft,
+        litellm_added_ttft=(
+            gateway_added(litellm_ttft, mock_ttft)
+            if litellm_ttft is not None and mock_ttft is not None
+            else None
+        ),
     )
 
 
 def select_representative_run(runs: tuple[LatencyMeasuredRun, ...]) -> LatencyMeasuredRun:
-    """Return the run whose gateway non-stream p50 is the median.
+    """Return the run whose Experiential non-stream p50 is the median.
 
     Choosing one whole run keeps related arms in the same execution context.
 
@@ -410,14 +539,14 @@ def select_representative_run(runs: tuple[LatencyMeasuredRun, ...]) -> LatencyMe
         runs: Completed repeats. Must not be empty.
 
     Returns:
-        Median run by gateway p50.
+        Median run by Experiential p50.
 
     Raises:
         ValueError: ``runs`` is empty.
     """
     if not runs:
         raise ValueError("at least one measured run is required")
-    ordered = sorted(runs, key=lambda item: item.gateway.p50_ms)
+    ordered = sorted(runs, key=lambda item: item.experiential.p50_ms)
     return ordered[len(ordered) // 2]
 
 
@@ -438,11 +567,12 @@ def run_latency_report(
         Completed report for the representative (median) run plus every repeat.
 
     Raises:
-        RuntimeError: The gateway fails to start or a measured arm has failures.
+        RuntimeError: A gateway fails to start or a measured arm has failures.
     """
     mock = MockOpenAIServer()
     mock.start()
     process: subprocess.Popen[str] | None = None
+    litellm_process: subprocess.Popen[str] | None = None
     try:
         raw_key = configure_gateway(work_root, provider_base_url=mock.base_url)
         port = unused_loopback_port()
@@ -452,23 +582,45 @@ def run_latency_report(
             credential=mock_credential,
         )
         mock_url = f"{mock.base_url}/chat/completions"
-        gateway_url = f"http://127.0.0.1:{port}{CHAT_PATH}"
         mock_headers = {
             "Authorization": f"Bearer {mock_credential}",
             "Content-Type": "application/json",
         }
-        gateway_headers = {
-            "Authorization": f"Bearer {raw_key}",
-            "Content-Type": "application/json",
+        targets: dict[str, tuple[str, dict[str, str]]] = {
+            _EXPERIENTIAL: (
+                f"http://127.0.0.1:{port}{CHAT_PATH}",
+                {
+                    "Authorization": f"Bearer {raw_key}",
+                    "Content-Type": "application/json",
+                },
+            )
         }
+        litellm_version: str | None = None
+        litellm_startup: str | None = None
+        if config.compare_litellm:
+            config_path = work_root / "litellm.yaml"
+            write_litellm_config(
+                config_path,
+                api_base=mock.base_url,
+                api_key=mock_credential,
+            )
+            litellm_process, litellm_port = start_litellm_process(config_path=config_path)
+            targets[_LITELLM] = (
+                f"http://127.0.0.1:{litellm_port}{CHAT_PATH}",
+                {
+                    "Authorization": f"Bearer {LITELLM_MASTER_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+            litellm_version = installed_litellm_version()
+            litellm_startup = LITELLM_STARTUP
         runs = tuple(
             _measure_run(
                 run_index=index,
                 config=config,
                 mock_url=mock_url,
-                gateway_url=gateway_url,
                 mock_headers=mock_headers,
-                gateway_headers=gateway_headers,
+                targets=targets,
             )
             for index in range(1, config.repeats + 1)
         )
@@ -482,12 +634,19 @@ def run_latency_report(
                 python_version=platform.python_version(),
                 platform_name=platform.platform(),
                 runner_name=os.environ.get("RUNNER_NAME") or platform.node() or "unknown",
+                runner_os=os.environ.get("RUNNER_OS") or platform.system() or "unknown",
+                cpu_count=os.cpu_count() or 0,
+                cpu_model=runner_cpu_model(),
                 gateway_engine=engine,
+                litellm_version=litellm_version,
+                litellm_startup=litellm_startup,
             ),
             representative_run=representative,
             runs=runs,
         )
     finally:
+        if litellm_process is not None:
+            stop_litellm_process(litellm_process)
         if process is not None:
             stop_gateway_process(process)
         mock.stop()
@@ -495,6 +654,8 @@ def run_latency_report(
 
 def _assert_functional_success(runs: tuple[LatencyMeasuredRun, ...]) -> None:
     """Fail closed when any measured request failed.
+
+    Latency differences never fail the report. Only HTTP or parse failures do.
 
     Args:
         runs: Completed repeats.
@@ -506,9 +667,11 @@ def _assert_functional_success(runs: tuple[LatencyMeasuredRun, ...]) -> None:
     for run in runs:
         arms = (
             ("mock_direct", run.mock_direct),
-            ("gateway", run.gateway),
+            ("experiential", run.experiential),
+            ("litellm", run.litellm),
             ("mock_direct_ttft", run.mock_direct_ttft),
-            ("gateway_ttft", run.gateway_ttft),
+            ("experiential_ttft", run.experiential_ttft),
+            ("litellm_ttft", run.litellm_ttft),
         )
         for name, stats in arms:
             if stats is not None and stats.failures:
@@ -517,11 +680,16 @@ def _assert_functional_success(runs: tuple[LatencyMeasuredRun, ...]) -> None:
         raise RuntimeError("latency report functional failures: " + "; ".join(failures))
 
 
-def default_config(*, measure_streaming_ttft: bool = True) -> LatencyRunConfig:
+def default_config(
+    *,
+    measure_streaming_ttft: bool = True,
+    compare_litellm: bool = False,
+) -> LatencyRunConfig:
     """Return the CI schedule used by the GitHub Actions workflow.
 
     Args:
         measure_streaming_ttft: Whether to include the streaming TTFT arms.
+        compare_litellm: Whether to start and measure the pinned LiteLLM proxy.
 
     Returns:
         Fixed small request schedule.
@@ -536,6 +704,7 @@ def default_config(*, measure_streaming_ttft: bool = True) -> LatencyRunConfig:
         stream_concurrency=_DEFAULT_STREAM_CONCURRENCY,
         timeout_s=_DEFAULT_TIMEOUT_S,
         measure_streaming_ttft=measure_streaming_ttft,
+        compare_litellm=compare_litellm,
     )
 
 
@@ -599,6 +768,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip the streaming time-to-first-token arms.",
     )
     parser.add_argument(
+        "--compare-litellm",
+        action="store_true",
+        help=f"Measure pinned LiteLLM[proxy] {LITELLM_PIN} in the same job.",
+    )
+    parser.add_argument(
         "--work-root",
         type=Path,
         help="EXP root used for the temporary gateway. Defaults to a temp dir.",
@@ -627,6 +801,7 @@ def main(argv: list[str] | None = None) -> int:
         stream_concurrency=args.stream_concurrency,
         timeout_s=args.timeout,
         measure_streaming_ttft=not args.no_stream_ttft,
+        compare_litellm=args.compare_litellm,
     )
     summary = args.github_summary
     if summary is None:
