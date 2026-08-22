@@ -75,3 +75,28 @@ def test_throttle_storms_still_suppress_the_deployment() -> None:
     registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
 
     assert not registry.claim(_KEY)
+
+
+def test_forced_claim_admits_every_request_through_an_open_circuit() -> None:
+    """Forced claims stay available for concurrent traffic once probes are taken."""
+    registry = DeploymentHealthRegistry(failure_threshold=1, clock=lambda: 100.0)
+
+    registry.failed(_KEY, _failure(GatewayFailureClass.TRANSPORT))
+    assert not registry.claim(_KEY)
+    assert registry.claim_last_resort(_KEY)
+    assert not registry.claim_last_resort(_KEY)
+
+    assert registry.claim_forced(_KEY)
+    assert registry.claim_forced(_KEY)
+
+
+def test_forced_claim_still_respects_the_throttle_window() -> None:
+    """A provider-requested backoff window refuses even forced dispatch."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+
+    assert not registry.claim_forced(_KEY)
+    now[0] += 31
+    assert registry.claim_forced(_KEY)

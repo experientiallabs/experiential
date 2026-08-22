@@ -116,6 +116,28 @@ class DeploymentHealthRegistry:
             state.last_resort_probe = True
             return True
 
+    def claim_forced(self, key: DeploymentHealthKey) -> bool:
+        """Admit one dispatch through an open circuit when a request would otherwise fail.
+
+        Circuit suppression is load shedding, not correctness: refusing the last
+        eligible route turns a possibly-down deployment into a certain caller
+        failure. When every healthy claim and bounded probe is unavailable, each
+        request whose alternatives are exhausted may still dispatch through an
+        open circuit, so concurrent failures never strand eligible traffic behind
+        the single half-open or last-resort probe. Throttle windows stay
+        authoritative because the provider explicitly asked for backoff.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+
+        Returns:
+            Whether the caller may dispatch this suppressed deployment now.
+        """
+        now = self._clock()
+        with self._lock:
+            state = self._states.setdefault(key, _DeploymentHealth())
+            return state.throttle_until <= now
+
     def dispatch_opened(self, key: DeploymentHealthKey) -> None:
         """Restore admission once one provider dispatch opens successfully.
 

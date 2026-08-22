@@ -568,9 +568,9 @@ class GatewayExecutionStream:
     def _initial_candidate(self) -> int | None:
         """Claim the first currently healthy deployment in authored order.
 
-        When every deployment is suppressed, one bounded last-resort probe per
-        deployment may still dispatch so recovery is observed by real traffic
-        instead of waiting out the full circuit cooldown.
+        When every deployment is suppressed, a bounded last-resort probe or a
+        forced dispatch through an open circuit still runs so the request is
+        attempted instead of waiting out the full circuit cooldown.
         """
         return self._claim_from(0)
 
@@ -602,17 +602,25 @@ class GatewayExecutionStream:
         return self._claim_from(current + 1)
 
     def _claim_from(self, start: int) -> int | None:
-        """Claim the first healthy later route, or one bounded last-resort probe.
+        """Claim the first healthy later route, a bounded probe, or a forced dispatch.
 
         Mirrors initial selection so a request skipping an exhausted or failed
         route can still probe a suppressed fallback instead of failing for the
-        whole circuit cooldown after the provider has recovered.
+        whole circuit cooldown after the provider has recovered. When every
+        healthy claim and bounded probe is unavailable, the first non-throttled
+        route is dispatched anyway: a request whose alternatives are exhausted
+        must attempt its ordered fallback rather than fail on circuit state that
+        concurrent traffic opened, subject only to the request deadline and to
+        throttle windows the provider explicitly requested.
         """
         for route_index in range(start, len(self._resolved)):
             if self._health.claim(self._health_key(route_index)):
                 return route_index
         for route_index in range(start, len(self._resolved)):
             if self._health.claim_last_resort(self._health_key(route_index)):
+                return route_index
+        for route_index in range(start, len(self._resolved)):
+            if self._health.claim_forced(self._health_key(route_index)):
                 return route_index
         return None
 

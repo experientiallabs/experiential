@@ -363,6 +363,145 @@ def test_caller_invalid_request_burst_never_suppresses_valid_traffic() -> None:
     assert health.claim((_DIGEST, first.deployment_id, first.connection_sha256))
 
 
+def test_precommit_primary_failure_forces_the_fallback_through_taken_probes() -> None:
+    """A primary opening failure still attempts the fallback when its probes are held.
+
+    Under concurrent load another request may hold both the half-open and the
+    last-resort probe of a suppressed fallback. The remaining requests must
+    still dispatch the ordered fallback instead of failing with no fallback
+    attempt in the ledger.
+    """
+    now = [100.0]
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    first_provider = _ScriptedProvider([ProviderTransportError("connection failed")])
+    second_provider = _ScriptedProvider([_completed_stream("forced fallback")])
+    health = DeploymentHealthRegistry(
+        failure_threshold=1,
+        open_seconds=30,
+        throttle_seconds=5,
+        clock=lambda: now[0],
+    )
+    second_key = (_DIGEST, second.deployment_id, second.connection_sha256)
+    health.failed(
+        second_key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider transport failed",
+            failover_eligible=True,
+        ),
+    )
+    assert health.claim_last_resort(second_key)
+    assert not health.claim(second_key)
+    assert not health.claim_last_resort(second_key)
+    ledger = _WaterfallLedger()
+    executor = _executor(
+        (first, second),
+        {
+            first.source_alias: first_provider,
+            second.source_alias: second_provider,
+        },
+        ledger,
+        maximum_same_deployment_attempts=1,
+        health=health,
+    )
+
+    async def consume() -> str:
+        """Run one logical request and return its sole text delta."""
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+        return "".join(event.text_delta or "" for event in events)
+
+    assert asyncio.run(consume()) == "forced fallback"
+    assert ledger.started == [("route-a", 0, 0), ("route-b", 1, 1)]
+    assert len(second_provider.idempotency_keys) == 1
+
+
+def test_concurrent_primary_outage_attempts_the_fallback_for_every_request() -> None:
+    """Every pre-commitment primary failure under load records one fallback attempt."""
+    requests = 24
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    first_provider = _ScriptedProvider(
+        [ProviderTransportError("connection failed") for _ in range(requests)]
+    )
+    second_provider = _ScriptedProvider(
+        [_completed_stream(f"fallback-{index}") for index in range(requests)]
+    )
+    health = DeploymentHealthRegistry(
+        failure_threshold=1,
+        open_seconds=30,
+        throttle_seconds=5,
+    )
+    ledger = _WaterfallLedger()
+    executor = _executor(
+        (first, second),
+        {
+            first.source_alias: first_provider,
+            second.source_alias: second_provider,
+        },
+        ledger,
+        maximum_same_deployment_attempts=1,
+        health=health,
+    )
+
+    async def consume() -> str:
+        """Run one logical request and return its concatenated text output."""
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+        return "".join(event.text_delta or "" for event in events)
+
+    async def scenario() -> list[str]:
+        """Drive every request concurrently against the shared health registry."""
+        return list(await asyncio.gather(*(consume() for _ in range(requests))))
+
+    results = asyncio.run(scenario())
+    assert all(result.startswith("fallback-") for result in results)
+    fallback_attempts = [entry for entry in ledger.started if entry[0] == "route-b"]
+    assert len(fallback_attempts) == requests
+
+
+def test_forced_fallback_still_skips_a_throttled_deployment() -> None:
+    """A provider-requested backoff window keeps refusing even the forced dispatch."""
+    now = [100.0]
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    first_provider = _ScriptedProvider([ProviderTransportError("connection failed")])
+    second_provider = _ScriptedProvider([_completed_stream("must not run")])
+    health = DeploymentHealthRegistry(
+        failure_threshold=1,
+        open_seconds=30,
+        throttle_seconds=5,
+        clock=lambda: now[0],
+    )
+    second_key = (_DIGEST, second.deployment_id, second.connection_sha256)
+    health.failed(
+        second_key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request",
+            failover_eligible=True,
+        ),
+    )
+    ledger = _WaterfallLedger()
+    executor = _executor(
+        (first, second),
+        {
+            first.source_alias: first_provider,
+            second.source_alias: second_provider,
+        },
+        ledger,
+        maximum_same_deployment_attempts=1,
+        health=health,
+    )
+
+    with pytest.raises(GatewayExecutionError):
+        asyncio.run(executor.start(route=_route((first, second)), request=_request()))
+
+    assert second_provider.idempotency_keys == []
+    assert ledger.started == [("route-a", 0, 0)]
+
+
 def test_budget_skip_still_probes_a_suppressed_fallback_route() -> None:
     """A budget-skipped primary probes the open fallback circuit instead of failing."""
     now = [100.0]

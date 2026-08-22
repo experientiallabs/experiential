@@ -259,34 +259,51 @@ async fn proxy_to_python(
     body: Bytes,
 ) -> Response {
     let url = format!("{}{}", state.fallback_base, path_and_query);
-    let mut request = state.http.request(method, url);
-    for (name, value) in headers {
-        let lowered = name.as_str().to_ascii_lowercase();
-        if matches!(
-            lowered.as_str(),
-            "host"
-                | "connection"
-                | "content-length"
-                | "transfer-encoding"
-                | "keep-alive"
-                | "te"
-                | "trailer"
-                | "upgrade"
-        ) {
-            continue;
+    // Connect failures are retried a bounded number of times: nothing has been
+    // written to the python engine yet, so a replay cannot double-execute, and
+    // a transient accept-queue overflow under concurrent load must not surface
+    // as a caller-visible 502.
+    let mut upstream = None;
+    for attempt in 0..3u8 {
+        let mut request = state.http.request(method.clone(), url.clone());
+        for (name, value) in headers {
+            let lowered = name.as_str().to_ascii_lowercase();
+            if matches!(
+                lowered.as_str(),
+                "host"
+                    | "connection"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "keep-alive"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+            ) {
+                continue;
+            }
+            request = request.header(name, value);
         }
-        request = request.header(name, value);
+        match request.body(body.clone()).send().await {
+            Ok(response) => {
+                upstream = Some(response);
+                break;
+            }
+            Err(error) => {
+                if attempt < 2 && error.is_connect() {
+                    tokio::time::sleep(Duration::from_millis(25 << attempt)).await;
+                    continue;
+                }
+                return error_response(&PublicError::new(
+                    502,
+                    "fallback_engine_unavailable",
+                    "The python fallback engine did not answer. Retry shortly; if this persists, restart the gateway.",
+                    "api_error",
+                ));
+            }
+        }
     }
-    let upstream = match request.body(body).send().await {
-        Ok(upstream) => upstream,
-        Err(_) => {
-            return error_response(&PublicError::new(
-                502,
-                "fallback_engine_unavailable",
-                "The python fallback engine did not answer. Retry shortly; if this persists, restart the gateway.",
-                "api_error",
-            ))
-        }
+    let Some(upstream) = upstream else {
+        return error_response(&PublicError::internal());
     };
     let status = StatusCode::from_u16(upstream.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
