@@ -1044,6 +1044,29 @@ def test_bedrock_prepares_credential_chain_without_listing_or_identity_invention
     assert "declare deployment model IDs" in console.output
 
 
+def test_release_tty_walk_selects_azure_then_completes() -> None:
+    """The installed-wheel provider walk still lands on Azure, then Complete."""
+    keys = iter(
+        (
+            *(PickerKey.DOWN for _ in range(5)),
+            PickerKey.ENTER,
+            *(PickerKey.DOWN for _ in range(3)),
+            PickerKey.ENTER,
+        )
+    )
+    console = ScriptedConsole("")
+
+    selection = select_providers(
+        SetupSession(),
+        console=console,
+        environment={},
+        read_key=lambda: next(keys),
+    )
+
+    assert selection == (("azure",), True)
+    assert "Experiential Cloud" in console.output
+
+
 def test_azure_and_bedrock_force_explicit_manual_model_declaration() -> None:
     """Providers without a safe listing API make the manual model row available explicitly."""
     console = ScriptedConsole("6,7\n\n")

@@ -2463,7 +2463,9 @@ def _installed_release_driver() -> None:
     setup_answers = [
         (
             "Providers",
-            (down * 5) + enter + (down * 2) + enter,
+            # openai through openai-compatible, then Azure; Complete is after
+            # Bedrock and Experiential Cloud.
+            (down * 5) + enter + (down * 3) + enter,
         ),
         ("azure base URL", azure_endpoint),
         ("Azure OpenAI API version", ""),
