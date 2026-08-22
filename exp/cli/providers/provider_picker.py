@@ -21,10 +21,16 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 
 from exp.cli.providers.experiential_cloud import (
     CATALOG_PROVIDER as HOSTED_CATALOG_PROVIDER,
+)
+from exp.cli.providers.experiential_cloud import (
     HOSTED_GATEWAY_API_KEY_ENV,
-    SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
-    SETUP_PICKER_NAME as HOSTED_SETUP_PICKER,
     hosted_gateway_base_url,
+)
+from exp.cli.providers.experiential_cloud import (
+    SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
+)
+from exp.cli.providers.experiential_cloud import (
+    SETUP_PICKER_NAME as HOSTED_SETUP_PICKER,
 )
 from exp.cli.shared.picker import (
     PickerAction,

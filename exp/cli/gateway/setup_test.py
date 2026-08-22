@@ -10,12 +10,12 @@ import typer
 from exp.cli.gateway import setup
 from exp.cli.providers import model_picker, provider_picker
 from exp.cli.providers.experiential_cloud import SETUP_PICKER_LABEL, SETUP_PICKER_NAME
-
-_LOCAL_GATEWAY_EXCLUDE = frozenset({SETUP_PICKER_NAME})
 from exp.cli.shared.picker import PickerKey
 from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.config import load_settings
 from exp.common.models import ConnectionConfig, ModelCapabilities, PricingSource, ProviderConnection
+
+_LOCAL_GATEWAY_EXCLUDE = frozenset({SETUP_PICKER_NAME})
 
 
 def _prepared_gateway_models() -> tuple[

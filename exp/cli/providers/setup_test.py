@@ -287,8 +287,7 @@ def test_noninteractive_provider_flags_validate_without_prompts_or_writes(tmp_pa
     assert "duplicate --provider value 'openai'" in output
     assert (
         "choose from: openai, anthropic, gemini, openrouter, openai-compatible, azure, "
-        "bedrock, experiential-cloud"
-        in output
+        "bedrock, experiential-cloud" in output
     )
     assert "Select the providers you want to use" not in output
     assert not (root / "models.toml").exists()
