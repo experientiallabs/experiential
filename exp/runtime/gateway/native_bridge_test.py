@@ -597,7 +597,7 @@ def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) 
     ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
     with mock.patch.object(
         ledger,
-        "finish_attempt",
+        "apply_finish_attempt",
         side_effect=RuntimeError("simulated terminal write loss"),
     ):
         with pytest.raises(NativeBridgeError):
