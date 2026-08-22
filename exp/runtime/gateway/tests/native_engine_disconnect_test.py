@@ -310,14 +310,25 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         port = 0
         while True:
             # The driver retries a lost bind race on a fresh port, so always
-            # poll the most recently announced one.
+            # poll the most recently announced one. Liveness alone could be
+            # answered by a foreign listener that claimed a stolen port, so
+            # the port is accepted only once it also serves the seeded grant
+            # for our own key, which nothing but this engine can do.
             if announced_ports:
                 port = announced_ports[-1]
                 try:
                     live = httpx.get(f"http://{_HOST}:{port}/health/live", timeout=1.0)
-                    if live.status_code == 200:
-                        break
-                except httpx.HTTPError:
+                    if live.status_code == 200 and live.json() == {"status": "live"}:
+                        models = httpx.get(
+                            f"http://{_HOST}:{port}/v1/models",
+                            headers={"authorization": f"Bearer {raw_key}"},
+                            timeout=2.0,
+                        )
+                        if models.status_code == 200 and [
+                            item["id"] for item in models.json()["data"]
+                        ] == ["coding"]:
+                            break
+                except (httpx.HTTPError, ValueError, KeyError, TypeError):
                     pass
             assert process.poll() is None, f"driver died: {stderr_log.read_text()}"
             assert time.monotonic() < live_deadline, "native engine never became live"
