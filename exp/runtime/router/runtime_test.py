@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import threading
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1073,6 +1074,62 @@ def test_resolver_generations_sharing_one_pool_keep_the_aggregate_selection_boun
     occupant.join(timeout=1)
 
     assert reloaded_client.embed_calls == 0
+
+
+def test_selection_pool_shutdown_bounds_its_wait_on_a_running_selection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Shutdown drains queued work and reports, not blocks on, a running selection."""
+    runtime, client = _runtime()
+    release = threading.Event()
+    entered = threading.Event()
+
+    def blocking_embed(texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Occupy the only worker past the shutdown drain bound."""
+        del texts
+        entered.set()
+        release.wait(timeout=5)
+        return (Embedding(values=(1.0, 0.0)),)
+
+    client.__dict__["embed"] = blocking_embed
+    model_request = gateway_model_request(
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="route"),),
+        )
+    )
+    workers = SelectionWorkerPool(maximum_outstanding_selections=1)
+    running = workers.submit(
+        runtime,
+        model_request,
+        episode_id="episode-one",
+        deadline=RequestDeadline(time.monotonic() + 5),
+    )
+    queued = workers.submit(
+        runtime,
+        model_request,
+        episode_id="episode-two",
+        deadline=RequestDeadline(time.monotonic() + 5),
+    )
+    assert entered.wait(timeout=1)
+
+    started = time.monotonic()
+    with caplog.at_level("WARNING"):
+        workers.shutdown(drain_timeout_seconds=0.05)
+    elapsed = time.monotonic() - started
+    release.set()
+    running.result(timeout=5)
+
+    assert elapsed < 1
+    assert queued.cancelled()
+    assert "router selection call(s) running" in caplog.text
+    with pytest.raises(RuntimeError):
+        workers.submit(
+            runtime,
+            model_request,
+            episode_id="episode-three",
+            deadline=RequestDeadline(time.monotonic() + 5),
+        )
 
 
 def test_expired_submission_that_escapes_cancellation_fails_before_embedding() -> None:

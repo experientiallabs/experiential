@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 from collections.abc import Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 
@@ -30,6 +32,10 @@ from exp.runtime.models.providers.async_transport import ProviderDeadlineExceede
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 from exp.runtime.router.runtime import RouterRuntime
 from exp.runtime.router.runtime import _PreparedSelection as PreparedSelection  # noqa: PLC2701
+
+_SELECTION_DRAIN_SECONDS = 5.0
+
+_logger = logging.getLogger(__name__)
 
 
 class GatewayRoutingError(ValueError):
@@ -411,6 +417,8 @@ class SelectionWorkerPool:
             max_workers=maximum_outstanding_selections,
             thread_name_prefix="exp-router-selection",
         )
+        self._lock = threading.Lock()
+        self._outstanding: set[Future[PreparedSelection]] = set()
 
     def submit(
         self,
@@ -421,17 +429,43 @@ class SelectionWorkerPool:
         deadline: RequestDeadline,
     ) -> Future[PreparedSelection]:
         """Queue one deadline-guarded unretained selection in the shared lane."""
-        return self._workers.submit(
+        submitted = self._workers.submit(
             _select_within_deadline,
             runtime,
             model_request,
             episode_id=episode_id,
             deadline=deadline,
         )
+        with self._lock:
+            self._outstanding.add(submitted)
+        submitted.add_done_callback(self._forget)
+        return submitted
 
-    def shutdown(self) -> None:
-        """Stop accepting selections and drop still-queued work."""
+    def shutdown(self, *, drain_timeout_seconds: float = _SELECTION_DRAIN_SECONDS) -> None:
+        """Stop accepting selections, drop queued work, and drain running work.
+
+        A selection already inside a synchronous provider embedding call cannot
+        be preempted, so shutdown waits a bounded time for it and reports the
+        remainder instead of blocking teardown. Selection touches no ledger and
+        no policy, so a straggler that outlives the bound can only discard its
+        own result.
+
+        Args:
+            drain_timeout_seconds: Bound on waiting for running selections.
+        """
         self._workers.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            outstanding = frozenset(self._outstanding)
+        _, running = wait(outstanding, timeout=drain_timeout_seconds)
+        if running:
+            _logger.warning(
+                "gateway shutdown left %d router selection call(s) running", len(running)
+            )
+
+    def _forget(self, completed: Future[PreparedSelection]) -> None:
+        """Drop one settled selection from the outstanding drain set."""
+        with self._lock:
+            self._outstanding.discard(completed)
 
 
 class RouterProjectTargetResolver:
