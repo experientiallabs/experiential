@@ -220,7 +220,7 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
     with mock.patch.object(
         ledger,
-        "finish_attempt",
+        "apply_finish_attempt",
         side_effect=RuntimeError("simulated terminal write loss"),
     ):
         with pytest.raises(NativeBridgeError):
@@ -230,6 +230,67 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     assert control.settle(settlement) == "{}"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
+
+
+def test_bridge_writes_route_through_the_group_commit_writer(tmp_path: Path) -> None:
+    """Admission and settlement never use the raw ledger's one-fsync-per-write
+    methods; every bridge write reaches SQLite through the shared batching
+    writer and still lands in the usage report."""
+    control, raw_key = _control_plane(tmp_path)
+    ledger = control._components.ledger  # noqa: SLF001 - wiring assertion for the test.
+    direct_writes = mock.Mock(side_effect=AssertionError("bridge used the raw per-write path"))
+    with (
+        mock.patch.object(ledger, "accept_request", direct_writes),
+        mock.patch.object(ledger, "start_attempt", direct_writes),
+        mock.patch.object(ledger, "finish_attempt", direct_writes),
+        mock.patch.object(ledger, "finish_request", direct_writes),
+    ):
+        admission = _admit(control, raw_key, _chat_body())
+        assert (
+            control.settle(
+                json.dumps(
+                    {
+                        "request_id": admission["request_id"],
+                        "attempt_id": admission["attempt_id"],
+                        "outcome": "completed",
+                        "usage": {"input_tokens": 7, "output_tokens": 2},
+                        "tool_names": [],
+                        "failure": None,
+                    }
+                )
+            )
+            == "{}"
+        )
+    direct_writes.assert_not_called()
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
+    assert report["totals"]["input_tokens"] == 7
+
+
+def test_closed_writer_makes_settle_raise_and_keeps_the_entry_retryable(
+    tmp_path: Path,
+) -> None:
+    """A settle against a closed group-commit writer raises the sanitized
+    boundary error and retains the exact settlement for later replay."""
+    control, raw_key = _control_plane(tmp_path)
+    admission = _admit(control, raw_key, _chat_body())
+    control._components.write_ledger.close()  # noqa: SLF001 - shutdown-ordering fault injection.
+    settlement = json.dumps(
+        {
+            "request_id": admission["request_id"],
+            "attempt_id": admission["attempt_id"],
+            "outcome": "completed",
+            "usage": {"input_tokens": 4, "output_tokens": 1},
+            "tool_names": [],
+            "failure": None,
+        }
+    )
+    with pytest.raises(NativeBridgeError):
+        control.settle(settlement)
+    with control._lock:  # noqa: SLF001 - registry state assertion.
+        entry = control._inflight[str(admission["request_id"])]  # noqa: SLF001
+    assert entry.pending_settlement is not None
+    assert entry.pending_settlement["outcome"] == "completed"
 
 
 def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None:
@@ -250,7 +311,7 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
     ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
     with mock.patch.object(
         ledger,
-        "finish_attempt",
+        "apply_finish_attempt",
         side_effect=RuntimeError("simulated terminal write loss"),
     ):
         with pytest.raises(NativeBridgeError):
@@ -1255,3 +1316,242 @@ def test_responses_admission_rejects_invalid_bodies_and_bad_keys(tmp_path: Path)
     assert json.loads(bad_key.value.public_error_json)["status_code"] == 401
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 0
+
+
+def _configured_project_singletons(
+    root: Path,
+    *,
+    base_url: str = "http://127.0.0.1:9/v1",
+) -> tuple[GatewayManagement, str]:
+    """Create one project alias whose candidates each own a singleton pool."""
+    from exp.common.models import (
+        BillingSource,
+        ConnectionConfig,
+        ModelRecord,
+        load_model_catalog,
+        write_model_catalog,
+    )
+    from exp.runtime.gateway.catalog_authority import upsert_connection
+
+    manager = GatewayManagement(root)
+    manager.initialize()
+    for deployment_alias in ("cheap", "baseline"):
+        upsert_connection(
+            root,
+            name=f"{deployment_alias}-provider",
+            connection=ConnectionConfig(
+                provider="openai-compatible",
+                base_url=base_url,
+                api_key_env=f"{deployment_alias.upper()}_PROVIDER_KEY",
+            ),
+            replace=False,
+        )
+    authored = load_model_catalog(root / "models.toml")
+    models = dict(authored.models)
+    models["embedder"] = ModelRecord(
+        connection="cheap-provider",
+        model="embedder-model",
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        capabilities=ModelCapabilities(supports_embeddings=True),
+    )
+    write_model_catalog(root / "models.toml", authored.model_copy(update={"models": models}))
+    normalized = None
+    snapshot = None
+    for deployment_alias in ("cheap", "baseline"):
+        normalized, snapshot, _changed = upsert_singleton_deployment(
+            root,
+            deployment_alias=deployment_alias,
+            connection_name=f"{deployment_alias}-provider",
+            provider_model=f"{deployment_alias}-model",
+            exact_model_id="model-revision-exact",
+            revision=None,
+            capabilities=ModelCapabilities(),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            prices=GatewayTokenPrices(),
+            pricing_source=None,
+            replace=False,
+        )
+    assert normalized is not None
+    assert snapshot is not None
+    manager.activate_project_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-project-one",
+        project_ref="project-one",
+        activation_ref="activation-one",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.create_identity(identity_id="default", display_name="Default")
+    manager.add_grant(identity_id="default", alias_id="coding")
+    issued = manager.issue_key(identity_id="default", key_id="key-one")
+    return manager, issued.raw_key
+
+
+def _project_control_plane(
+    root: Path,
+    *,
+    base_url: str = "http://127.0.0.1:9/v1",
+) -> tuple[GatewayManagement, NativeControlPlane, str]:
+    """Load the native control plane over one real project-backed alias."""
+    from exp.runtime.gateway.lifecycle_test import (
+        _project_activation,
+        _ReadinessProjectRepository,
+    )
+
+    environment = {
+        "CHEAP_PROVIDER_KEY": "cheap-secret-canary",
+        "BASELINE_PROVIDER_KEY": "baseline-secret-canary",
+    }
+    manager, raw_key = _configured_project_singletons(root, base_url=base_url)
+    components = load_gateway_components(
+        root,
+        environment=environment,
+        project_repository=_ReadinessProjectRepository(
+            _project_activation(
+                root,
+                candidate_aliases=("baseline", "cheap"),
+                environment=environment,
+            )
+        ),
+    )
+    return manager, NativeControlPlane(components), raw_key
+
+
+def test_project_alias_embedding_failure_serves_the_frozen_baseline_natively(
+    tmp_path: Path,
+) -> None:
+    """A project alias admits natively and a failed embed lands the baseline.
+
+    The unreachable provider endpoint makes the request-time embed fail, so
+    the frozen conservative baseline serves the request with content-free
+    accounting instead of escalating to the python engine.
+    """
+    import sqlite3
+
+    manager, control, raw_key = _project_control_plane(tmp_path)
+    body = json.dumps(
+        {"model": "coding", "messages": [{"role": "user", "content": "project-prompt-canary"}]}
+    )
+    admission = _admit(control, raw_key, body)
+    assert "escalate" not in admission
+    assert admission["route_reason"] == "learned_router"
+    assert admission["model_id"] == "baseline-model"
+    assert admission["exact_model_id"] == "model-revision-exact"
+    assert admission["alias_revision_id"] == "revision-project-one"
+    headers = admission["headers"]
+    assert isinstance(headers, dict)
+    assert headers["Authorization"] == "Bearer baseline-secret-canary"
+
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "attempt_id": admission["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 6, "output_tokens": 2},
+                    "tool_names": [],
+                    "failure": None,
+                }
+            )
+        )
+        == "{}"
+    )
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
+    with sqlite3.connect(manager.database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT route_reason, fallback_reason, exact_model_id, state, content_retained
+            FROM gateway_attempts
+            """
+        ).fetchall()
+    assert rows == [("learned_router", "embedding_error", "model-revision-exact", "completed", 0)]
+    durable = manager.database_path.read_bytes()
+    wal = manager.database_path.with_name("gateway.db-wal")
+    if wal.exists():
+        durable += wal.read_bytes()
+    assert b"project-prompt-canary" not in durable
+    assert b"cheap-secret-canary" not in durable
+    assert b"baseline-secret-canary" not in durable
+
+
+def test_project_alias_native_selection_matches_the_python_resolver(tmp_path: Path) -> None:
+    """Native admission and the python async resolver pick one deployment.
+
+    A loopback embeddings endpoint gives both engines the same frozen policy
+    inputs, so the deployment the native bridge admits equals the deployment
+    the python engine's async route resolution selects.
+    """
+    import asyncio
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespace
+
+    class EmbeddingHandler(BaseHTTPRequestHandler):
+        """Serve deterministic embeddings for request-time selection."""
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            """Suppress nondeterministic loopback server logs."""
+            del format, args
+
+        def do_POST(self) -> None:
+            """Return one fixed embedding vector for any embed request."""
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length))
+            body = json.dumps(
+                {
+                    "data": [{"embedding": [1.0, 0.0], "index": 0}],
+                    "model": str(payload["model"]),
+                    "usage": {"prompt_tokens": 3, "total_tokens": 3},
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), EmbeddingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_port}/v1"
+        _manager, control, raw_key = _project_control_plane(tmp_path, base_url=base_url)
+        admission = _admit(control, raw_key, _chat_body())
+        assert "escalate" not in admission
+        assert admission["route_reason"] == "learned_router"
+
+        components = control._components  # noqa: SLF001 - parity over one loaded state.
+        request = decode_chat(json.loads(_chat_body())).request
+        authorization = components.store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=request,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+        episode = episode_namespace(
+            namespace=ProtocolNamespace(
+                organization_id=authorization.organization_id,
+                identity_id=authorization.identity_id,
+                alias_revision_id=authorization.alias_revision_id,
+            ),
+            caller_episode_key=None,
+            request_id=authorization.request_id,
+        )
+        route = asyncio.run(
+            components.routes.resolve(
+                authorization=authorization,
+                request=request,
+                episode_namespace=episode,
+            )
+        )
+        assert route.deployment.deployment_id == admission["deployment_id"]
+        assert route.route_reason == admission["route_reason"]
+        assert not route.fallback_deployments
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

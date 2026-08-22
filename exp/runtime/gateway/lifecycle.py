@@ -51,6 +51,7 @@ from exp.runtime.gateway.routing import (
     CatalogRouteResolver,
     GatewayRoutingError,
     RouterProjectTargetResolver,
+    SelectionWorkerPool,
 )
 from exp.runtime.gateway.service import GatewayService
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore, SystemGatewayClock
@@ -79,6 +80,7 @@ class LocalGatewayRuntime:
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
     write_ledger: GroupCommitAttemptLedger | None = None
+    selection_workers: SelectionWorkerPool | None = None
 
     @property
     def app(self) -> FastAPI:
@@ -108,8 +110,10 @@ class LocalGatewayRuntime:
         return await self.runtime.drain(timeout_seconds=timeout_seconds)
 
     async def shutdown(self) -> bool:
-        """Shut down the shared runtime, then stop the drained ledger writer."""
+        """Shut down the runtime, the selection lane, and the drained ledger writer."""
         stopped = await self.runtime.shutdown()
+        if self.selection_workers is not None:
+            self.selection_workers.shutdown()
         if self.write_ledger is not None:
             self.write_ledger.close()
         return stopped
@@ -144,6 +148,7 @@ class _AliasAuthorityReloader:
         state: _AliasAuthorityState,
         routes: CatalogRouteResolver,
         executor: GatewayExecutor,
+        selection_workers: SelectionWorkerPool,
         retention_seconds: float = _RETIRED_REVISION_RETENTION_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -154,12 +159,14 @@ class _AliasAuthorityReloader:
             state: Fully validated startup generation.
             routes: Shared route resolver whose catalog index this reloader swaps.
             executor: Shared executor whose runtime catalogs this reloader swaps.
+            selection_workers: Process-wide selection lane reused by every generation.
             retention_seconds: How long retired revisions stay resolvable.
             monotonic: Monotonic clock used for retirement bookkeeping.
         """
         self._loader = loader
         self._routes = routes
         self._executor = executor
+        self._selection_workers = selection_workers
         self._retention_seconds = retention_seconds
         self._monotonic = monotonic
         self._lock = threading.Lock()
@@ -255,7 +262,9 @@ class _AliasAuthorityReloader:
         self._executor.swap_catalogs(runtime)
         self._routes.swap_catalogs(
             normalized,
-            project_resolver=_project_resolver(activations, exact_models),
+            project_resolver=_project_resolver(
+                activations, exact_models, selection_workers=self._selection_workers
+            ),
             listing_pools=listing_pools,
         )
         self._state = merged
@@ -395,6 +404,7 @@ class LocalGatewayComponents:
     routes: CatalogRouteResolver
     executor: GatewayExecutor
     reloader: _AliasAuthorityReloader
+    selection_workers: SelectionWorkerPool
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
 
@@ -455,9 +465,12 @@ def load_gateway_components(
         )
 
     state = loader()
+    selection_workers = SelectionWorkerPool()
     routes = CatalogRouteResolver(
         state.normalized_catalogs,
-        project_resolver=_project_resolver(state.activations, state.exact_models),
+        project_resolver=_project_resolver(
+            state.activations, state.exact_models, selection_workers=selection_workers
+        ),
         listing_pools=state.listing_pools,
     )
     executor = GatewayExecutor(state.runtime_catalogs, write_ledger)
@@ -466,6 +479,7 @@ def load_gateway_components(
         state=state,
         routes=routes,
         executor=executor,
+        selection_workers=selection_workers,
     )
     return LocalGatewayComponents(
         manager=manager,
@@ -475,6 +489,7 @@ def load_gateway_components(
         routes=routes,
         executor=executor,
         reloader=reloader,
+        selection_workers=selection_workers,
         reconciled_expired_requests=expired,
         reconciled_unknown_attempts=unknown,
     )
@@ -535,6 +550,7 @@ def compose_local_gateway(
     return LocalGatewayRuntime(
         runtime=runtime,
         write_ledger=components.write_ledger,
+        selection_workers=components.selection_workers,
         reconciled_expired_requests=components.reconciled_expired_requests,
         reconciled_unknown_attempts=components.reconciled_unknown_attempts,
     )
@@ -589,13 +605,15 @@ def load_local_gateway(
 def _project_resolver(
     activations: Mapping[tuple[str, str, str], RouterRuntime],
     exact_models: Mapping[tuple[str, str, str, str], str],
+    *,
+    selection_workers: SelectionWorkerPool,
 ) -> ProjectTargetResolver | None:
-    """Build one selection-only project bridge when any activation is loaded."""
+    """Build one selection-only project bridge on the shared worker lane."""
     if not activations:
         return None
     return cast(
         ProjectTargetResolver,
-        RouterProjectTargetResolver(activations, exact_models),
+        RouterProjectTargetResolver(activations, exact_models, selection_workers=selection_workers),
     )
 
 

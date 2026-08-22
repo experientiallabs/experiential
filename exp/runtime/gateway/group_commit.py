@@ -7,6 +7,12 @@ proceeding, so acceptance, budget reservation, and terminal settlement keep
 their exact fail-closed semantics while the per-request fsync cost is
 amortized across all operations sharing a batch. There is no flush window:
 no caller observes success before its write is durable on disk.
+
+Two callers share the one queue and writer thread: the asyncio engine awaits
+:class:`GroupCommitAttemptLedger`, while threads without an event loop (the
+native data plane's worker threads) block on :class:`SyncGroupCommitLedger`.
+Operations from both interleave in the same batches, so the two gateway
+engines amortize their fsyncs together.
 """
 
 from __future__ import annotations
@@ -125,6 +131,9 @@ class GroupCommitAttemptLedger:
         self._max_batch_size = max_batch_size
         self._queue: queue.SimpleQueue[_PendingWrite | None] = queue.SimpleQueue()
         self._closed = False
+        # Serializes enqueue against close so no operation can land behind the
+        # stop sentinel and strand its caller after the writer thread exits.
+        self._submit_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run,
             name="gateway-ledger-writer",
@@ -231,19 +240,30 @@ class GroupCommitAttemptLedger:
         await self._submit(lambda connection: None)
 
     def close(self) -> None:
-        """Stop the writer thread after draining every queued operation."""
-        if self._closed:
-            return
-        self._closed = True
-        self._queue.put(None)
+        """Stop the writer thread after draining every queued operation.
+
+        Operations enqueued before close still commit durably; the enqueue
+        lock guarantees nothing can be queued behind the stop sentinel, and
+        every later submission fails fast with a closed-writer error.
+        """
+        with self._submit_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._queue.put(None)
         self._thread.join(timeout=30)
 
     def _run(self) -> None:
         """Drain queued operations into one durable SQLite transaction per batch."""
-        connection = connect_database(
-            self.core.database_path,
-            busy_timeout_ms=self.core.busy_timeout_ms,
-        )
+        try:
+            connection = connect_database(
+                self.core.database_path,
+                busy_timeout_ms=self.core.busy_timeout_ms,
+            )
+        except Exception:  # noqa: BLE001 - every blocked caller receives the closed error.
+            _logger.exception("gateway ledger writer failed to open its connection")
+            self._fail_pending()
+            return
         try:
             stopping = False
             while not stopping:
@@ -260,9 +280,41 @@ class GroupCommitAttemptLedger:
                         stopping = True
                         break
                     batch.append(extra)
-                self._commit_batch(connection, batch)
+                try:
+                    self._commit_batch(connection, batch)
+                except Exception as exc:  # noqa: BLE001 - blocked callers receive the failure.
+                    _logger.exception("gateway ledger batch failed outside its own transaction")
+                    for pending in batch:
+                        if not pending.future.done():
+                            _resolve_exception(pending.future, exc)
+                    if connection.in_transaction:
+                        try:
+                            connection.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            _logger.exception(
+                                "gateway ledger batch rollback failed after batch failure"
+                            )
         finally:
             connection.close()
+            self._fail_pending()
+
+    def _fail_pending(self) -> None:
+        """Latch closed and fail every still-queued operation with a clear error.
+
+        Runs on the writer thread as it exits, whether by graceful close or by
+        an unexpected failure, so no blocked caller (async or sync) can be
+        stranded waiting on an operation the writer will never commit.
+        """
+        with self._submit_lock:
+            self._closed = True
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    return
+                if item is None:
+                    continue
+                _resolve_exception(item.future, _closed_error())
 
     @staticmethod
     def _commit_batch(
@@ -315,6 +367,27 @@ class GroupCommitAttemptLedger:
             else:
                 _resolve_result(pending.future, value)
 
+    def submit_blocking(self, apply: Callable[[sqlite3.Connection], _T]) -> _T:
+        """Enqueue one operation and block the calling thread on its durable commit.
+
+        For threads with no running event loop, such as the native data
+        plane's worker threads. The operation shares the queue and writer
+        thread with async submissions, so both engines' writes interleave in
+        the same batches. The writer is a separate dedicated thread, so
+        blocking here can never deadlock a caller.
+
+        Args:
+            apply: Operation run on the writer connection inside the batch transaction.
+
+        Returns:
+            The operation's return value after its batch has committed.
+
+        Raises:
+            RuntimeError: The writer is closed, before or while waiting.
+            Exception: The operation itself failed and was rolled back.
+        """
+        return self._enqueue(apply).result()
+
     async def _submit(self, apply: Callable[[sqlite3.Connection], _T]) -> _T:
         """Enqueue one operation and await its durable batch commit.
 
@@ -328,13 +401,155 @@ class GroupCommitAttemptLedger:
         Returns:
             The operation's return value after its batch has committed.
         """
-        if self._closed:
-            raise RuntimeError("gateway ledger writer is closed")
+        return await asyncio.shield(asyncio.wrap_future(self._enqueue(apply)))
+
+    def _enqueue(self, apply: Callable[[sqlite3.Connection], _T]) -> concurrent.futures.Future[_T]:
+        """Queue one operation for the writer thread and return its commit future.
+
+        Args:
+            apply: Operation run on the writer connection inside the batch transaction.
+
+        Returns:
+            Future resolved only after the operation's batch has committed.
+
+        Raises:
+            RuntimeError: The writer is closed and can accept no operation.
+        """
         future: concurrent.futures.Future[_T] = concurrent.futures.Future()
-        self._queue.put(
-            _PendingWrite(
-                apply=apply,
-                future=cast("concurrent.futures.Future[object]", future),
+        with self._submit_lock:
+            if self._closed:
+                raise _closed_error()
+            self._queue.put(
+                _PendingWrite(
+                    apply=apply,
+                    future=cast("concurrent.futures.Future[object]", future),
+                )
+            )
+        return future
+
+
+def _closed_error() -> RuntimeError:
+    """Build the error every closed-writer submission or stranded wait receives."""
+    return RuntimeError(
+        "gateway ledger writer is closed; the gateway is shutting down, retry after restart"
+    )
+
+
+class SyncGroupCommitLedger:
+    """Blocking attempt-ledger facade over one shared group-commit writer.
+
+    Mirrors the async ledger surface with plain synchronous methods for
+    callers that run on threads without an event loop (the native data
+    plane's worker threads and its settlement sweep). Every method enqueues
+    onto the same queue and writer thread as the async path, so operations
+    from both engines share batches, and returns only after its own
+    operation's batch is durable on disk. A failed or rolled-back operation
+    raises its original exception; a closed writer raises a clear
+    RuntimeError instead of blocking forever.
+    """
+
+    def __init__(self, writer: GroupCommitAttemptLedger) -> None:
+        """Bind the shared group-commit writer.
+
+        Args:
+            writer: The engine-shared batching writer to submit through.
+        """
+        self._writer = writer
+
+    def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
+        """Durably persist accepted authority before route selection or dispatch.
+
+        Args:
+            authorization: Frozen authority and request identity.
+        """
+        self._writer.submit_blocking(
+            lambda connection: self._writer.core.apply_accept_request(
+                connection, authorization=authorization
             )
         )
-        return await asyncio.shield(asyncio.wrap_future(future))
+
+    def start_attempt(
+        self,
+        *,
+        snapshot: ExecutionSnapshot,
+        deployment: ExactModelDeployment,
+        attempt_ordinal: int,
+        route_depth: int,
+        maximum_cost_micro_usd: int | None = None,
+        route_reason: str | None = None,
+        fallback_reason: str | None = None,
+    ) -> AttemptId:
+        """Durably reserve budget and record one dispatch before provider work.
+
+        Args:
+            snapshot: Route-bound immutable request plan.
+            deployment: Exact deployment about to receive the request.
+            attempt_ordinal: Zero-based physical dispatch position for this request.
+            route_depth: Zero-based operational route position.
+            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            route_reason: Optional learned-selection reason code.
+            fallback_reason: Optional embedding or router fallback reason code.
+
+        Returns:
+            Stable new attempt ID.
+        """
+        return self._writer.submit_blocking(
+            lambda connection: self._writer.core.apply_start_attempt(
+                connection,
+                snapshot=snapshot,
+                deployment=deployment,
+                attempt_ordinal=attempt_ordinal,
+                route_depth=route_depth,
+                maximum_cost_micro_usd=maximum_cost_micro_usd,
+                route_reason=route_reason,
+                fallback_reason=fallback_reason,
+            )
+        )
+
+    def finish_attempt(
+        self,
+        *,
+        attempt_id: AttemptId,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+    ) -> None:
+        """Durably settle one attempt with normalized content-free fields.
+
+        Args:
+            attempt_id: Stable attempt ID.
+            terminal_event: Provider terminal event, possibly carrying usage.
+            failure: Sanitized failure when no successful terminal event exists.
+            finalize_request: Whether this attempt is the final route for its parent request.
+        """
+        self._writer.submit_blocking(
+            lambda connection: self._writer.core.apply_finish_attempt(
+                connection,
+                attempt_id=attempt_id,
+                terminal_event=terminal_event,
+                failure=failure,
+                finalize_request=finalize_request,
+            )
+        )
+
+    def finish_request(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+    ) -> None:
+        """Durably terminalize accepted work that never reached dispatch.
+
+        Args:
+            authorization: Frozen authority identifying the accepted request.
+            failure: Sanitized pre-dispatch terminal failure.
+        """
+        self._writer.submit_blocking(
+            lambda connection: self._writer.core.apply_finish_request(
+                connection, authorization=authorization, failure=failure
+            )
+        )
+
+    def flush(self) -> None:
+        """Return after every previously enqueued operation is durably committed."""
+        self._writer.submit_blocking(lambda connection: None)

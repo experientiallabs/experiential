@@ -72,8 +72,8 @@ def start_gateway(
             raise typer.BadParameter("--policy and --ghost require --project")
     if engine == "rust" and project is not None:
         raise typer.BadParameter(
-            "--engine rust serves direct aliases only; project-backed serving "
-            "requires the python engine"
+            "--engine rust serves the default multi-alias gateway; the "
+            "single-project compatibility launch requires the python engine"
         )
     if project is None and engine != "python":
         blocker = _rust_engine_blocker(root)
@@ -250,8 +250,8 @@ def _run_rust_gateway(
 
     The rust engine owns the public socket and the anonymous Chat Completions
     fast path; a python engine over the same authority, ledger, and routes
-    runs on an internal loopback port and serves Responses, replay-keyed
-    chat, and project-backed aliases.
+    runs on an internal loopback port and serves Responses and replay-keyed
+    chat.
 
     Args:
         root: Local artifact and model-catalog root.

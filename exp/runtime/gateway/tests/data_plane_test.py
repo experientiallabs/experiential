@@ -386,6 +386,25 @@ class _ProjectResolver:
             fallback_reason="embedding_error",
         )
 
+    def select_blocking(
+        self,
+        *,
+        target: GatewayTarget,
+        request: GatewayRequest,
+        episode_namespace: tuple[str, str, str, str],
+        deadline_monotonic: float,
+    ) -> ProjectSelection:
+        """Return the same learned selection on the synchronous seam."""
+        del request, deadline_monotonic
+        assert isinstance(target, ProjectTarget)
+        self.episodes.append(episode_namespace)
+        return ProjectSelection(
+            exact_model_id="exact-one",
+            selected_alias="source-one",
+            activation_ref=target.activation_ref,
+            fallback_reason="embedding_error",
+        )
+
 
 class _FailOnceContinuationStore(BoundedContinuationStore):
     """Reject the first continuation write, then retain subsequent state normally."""

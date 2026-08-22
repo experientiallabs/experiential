@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import threading
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,11 +57,16 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.routing import (
     RouterProjectTargetResolver,
+    SelectionWorkerPool,
+    _select_within_deadline,  # noqa: PLC2701
     gateway_model_request,
     project_episode_identity,
 )
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
-from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
+from exp.runtime.models.providers.async_transport import (
+    ProviderDeadlineExceeded,
+    RequestDeadline,
+)
 from exp.runtime.router import RouterRuntime, RouterRuntimeIntegrityError
 from exp.runtime.router.economics import (
     RoutedProviderComponent,
@@ -838,6 +844,345 @@ def test_timed_out_project_selection_cannot_publish_late_sticky_state() -> None:
     assert runtime._episode_decisions == {}  # noqa: SLF001 - deadline isolation regression
     assert runtime._request_decisions == {}  # noqa: SLF001 - deadline isolation regression
     assert recorded == []
+
+
+def test_blocking_selection_matches_async_selection_and_shares_sticky_state() -> None:
+    """The synchronous seam returns the async decision and reuses its retained state."""
+    runtime, client = _runtime()
+    target = ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256=_DIGEST,
+    )
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): runtime},
+        {
+            ("project-one", "activation-one", _DIGEST, "baseline"): "exact-baseline",
+            ("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap",
+        },
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+    namespace = ("org", "identity", "revision", "episode")
+
+    blocking = resolver.select_blocking(
+        target=target,
+        request=request,
+        episode_namespace=namespace,
+        deadline_monotonic=__import__("time").monotonic() + 1,
+    )
+    async_selection = asyncio.run(
+        resolver.select(
+            target=target,
+            request=request,
+            episode_namespace=namespace,
+            deadline_monotonic=__import__("time").monotonic() + 1,
+        )
+    )
+
+    assert async_selection == blocking
+    assert client.embed_calls == 1
+
+
+def test_blocking_selection_falls_back_to_frozen_baseline_on_embedding_failure() -> None:
+    """A request-time embed failure lands the conservative baseline synchronously."""
+    runtime, client = _runtime()
+    client.embedding_values = RuntimeError("embed failed")
+    target = ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256=_DIGEST,
+    )
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): runtime},
+        {("project-one", "activation-one", _DIGEST, "baseline"): "exact-baseline"},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+
+    selection = resolver.select_blocking(
+        target=target,
+        request=request,
+        episode_namespace=("org", "identity", "revision", "episode"),
+        deadline_monotonic=__import__("time").monotonic() + 1,
+    )
+
+    assert selection.selected_alias == "baseline"
+    assert selection.exact_model_id == "exact-baseline"
+    assert selection.fallback_reason == "embedding_error"
+    assert client.embed_calls == 1
+
+
+def test_blocking_selection_deadline_expiring_mid_embed_fails_without_late_sticky_state() -> None:
+    """A blocked embed frees the caller at the deadline and never publishes sticky state."""
+    runtime, client = _runtime()
+    recorded: list[object] = []
+    runtime._decision_sink = recorded.append  # noqa: SLF001 - deadline publication regression
+    release = threading.Event()
+    completed = threading.Event()
+
+    def blocking_embed(texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Hold selection beyond the gateway deadline, then report completion."""
+        del texts
+        release.wait(timeout=1)
+        completed.set()
+        return (Embedding(values=(1.0, 0.0)),)
+
+    client.__dict__["embed"] = blocking_embed
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): runtime},
+        {("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap"},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+
+    with pytest.raises(ProviderDeadlineExceeded):
+        resolver.select_blocking(
+            target=ProjectTarget(
+                project_ref="project-one",
+                activation_ref="activation-one",
+                catalog_sha256=_DIGEST,
+            ),
+            request=request,
+            episode_namespace=("org", "identity", "revision", "episode"),
+            deadline_monotonic=__import__("time").monotonic() + 0.01,
+        )
+    release.set()
+    assert completed.wait(timeout=1)
+
+    assert runtime._episode_decisions == {}  # noqa: SLF001 - deadline isolation regression
+    assert runtime._request_decisions == {}  # noqa: SLF001 - deadline isolation regression
+    assert recorded == []
+
+
+def test_timed_out_queued_selection_is_cancelled_and_never_embeds() -> None:
+    """A queued selection abandoned at its deadline is cancelled before it runs."""
+    runtime, client = _runtime()
+    release = threading.Event()
+    embed_calls: list[int] = []
+
+    def blocking_embed(texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Count each embed and hold the single worker until released."""
+        del texts
+        embed_calls.append(1)
+        release.wait(timeout=1)
+        return (Embedding(values=(1.0, 0.0)),)
+
+    client.__dict__["embed"] = blocking_embed
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): runtime},
+        {("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap"},
+        maximum_outstanding_selections=1,
+    )
+    target = ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256=_DIGEST,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+    occupant = threading.Thread(
+        target=resolver.select_blocking,
+        kwargs={
+            "target": target,
+            "request": request,
+            "episode_namespace": ("org", "identity", "revision", "episode-one"),
+            "deadline_monotonic": __import__("time").monotonic() + 5,
+        },
+    )
+    occupant.start()
+    while not embed_calls:
+        __import__("time").sleep(0.005)
+
+    with pytest.raises(ProviderDeadlineExceeded):
+        resolver.select_blocking(
+            target=target,
+            request=request,
+            episode_namespace=("org", "identity", "revision", "episode-two"),
+            deadline_monotonic=__import__("time").monotonic() + 0.05,
+        )
+    release.set()
+    occupant.join(timeout=1)
+
+    assert embed_calls == [1]
+
+
+def test_resolver_generations_sharing_one_pool_keep_the_aggregate_selection_bound() -> None:
+    """A replacement resolver generation cannot widen the shared selection bound."""
+    occupying_runtime, occupying_client = _runtime()
+    reloaded_runtime, reloaded_client = _runtime()
+    release = threading.Event()
+    entered = threading.Event()
+
+    def blocking_embed(texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Hold the only shared worker until the test releases it."""
+        del texts
+        entered.set()
+        release.wait(timeout=1)
+        return (Embedding(values=(1.0, 0.0)),)
+
+    occupying_client.__dict__["embed"] = blocking_embed
+    workers = SelectionWorkerPool(maximum_outstanding_selections=1)
+    exact_models = {("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap"}
+    occupying = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): occupying_runtime},
+        exact_models,
+        selection_workers=workers,
+    )
+    reloaded = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): reloaded_runtime},
+        exact_models,
+        selection_workers=workers,
+    )
+    target = ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256=_DIGEST,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+    occupant = threading.Thread(
+        target=occupying.select_blocking,
+        kwargs={
+            "target": target,
+            "request": request,
+            "episode_namespace": ("org", "identity", "revision", "episode-one"),
+            "deadline_monotonic": __import__("time").monotonic() + 5,
+        },
+    )
+    occupant.start()
+    assert entered.wait(timeout=1)
+
+    with pytest.raises(ProviderDeadlineExceeded):
+        reloaded.select_blocking(
+            target=target,
+            request=request,
+            episode_namespace=("org", "identity", "revision", "episode-two"),
+            deadline_monotonic=__import__("time").monotonic() + 0.05,
+        )
+    release.set()
+    occupant.join(timeout=1)
+
+    assert reloaded_client.embed_calls == 0
+
+
+def test_selection_pool_shutdown_bounds_its_wait_on_a_running_selection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Shutdown drains queued work and reports, not blocks on, a running selection."""
+    runtime, client = _runtime()
+    release = threading.Event()
+    entered = threading.Event()
+
+    def blocking_embed(texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Occupy the only worker past the shutdown drain bound."""
+        del texts
+        entered.set()
+        release.wait(timeout=5)
+        return (Embedding(values=(1.0, 0.0)),)
+
+    client.__dict__["embed"] = blocking_embed
+    model_request = gateway_model_request(
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="route"),),
+        )
+    )
+    workers = SelectionWorkerPool(maximum_outstanding_selections=1)
+    running = workers.submit(
+        runtime,
+        model_request,
+        episode_id="episode-one",
+        deadline=RequestDeadline(time.monotonic() + 5),
+    )
+    queued = workers.submit(
+        runtime,
+        model_request,
+        episode_id="episode-two",
+        deadline=RequestDeadline(time.monotonic() + 5),
+    )
+    assert entered.wait(timeout=1)
+
+    started = time.monotonic()
+    with caplog.at_level("WARNING"):
+        workers.shutdown(drain_timeout_seconds=0.05)
+    elapsed = time.monotonic() - started
+    release.set()
+    running.result(timeout=5)
+
+    assert elapsed < 1
+    assert queued.cancelled()
+    assert "router selection call(s) running" in caplog.text
+    assert all(
+        thread.daemon
+        for thread in threading.enumerate()
+        if thread.name.startswith("exp-router-selection")
+    )
+    with pytest.raises(RuntimeError):
+        workers.submit(
+            runtime,
+            model_request,
+            episode_id="episode-three",
+            deadline=RequestDeadline(time.monotonic() + 5),
+        )
+
+
+def test_expired_submission_that_escapes_cancellation_fails_before_embedding() -> None:
+    """A worker re-checks the deadline first, so an expired pickup never embeds."""
+    runtime, client = _runtime()
+    model_request = gateway_model_request(
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="route"),),
+        )
+    )
+    with pytest.raises(ProviderDeadlineExceeded):
+        _select_within_deadline(
+            runtime,
+            model_request,
+            episode_id="episode",
+            deadline=RequestDeadline(__import__("time").monotonic() - 1),
+        )
+    assert client.embed_calls == 0
+
+
+def test_blocking_selection_expired_deadline_raises_before_any_selection_work() -> None:
+    """An already-expired request deadline fails closed without touching the client."""
+    runtime, client = _runtime()
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): runtime},
+        {("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap"},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+
+    with pytest.raises(ProviderDeadlineExceeded):
+        resolver.select_blocking(
+            target=ProjectTarget(
+                project_ref="project-one",
+                activation_ref="activation-one",
+                catalog_sha256=_DIGEST,
+            ),
+            request=request,
+            episode_namespace=("org", "identity", "revision", "episode"),
+            deadline_monotonic=__import__("time").monotonic() - 1,
+        )
+
+    assert client.embed_calls == 0
+    assert runtime._episode_decisions == {}  # noqa: SLF001 - deadline isolation regression
+    assert runtime._request_decisions == {}  # noqa: SLF001 - deadline isolation regression
 
 
 def test_cached_selection_and_completion_reuse_sealed_activation_without_rehashing() -> None:

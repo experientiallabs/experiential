@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import threading
@@ -28,6 +29,7 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
     ModelRecord,
+    ModelRequest,
     PricingSnapshot,
     RoutedCandidateSnapshot,
     load_model_catalog,
@@ -42,6 +44,7 @@ from exp.runtime.gateway.catalog_authority import (
 from exp.runtime.gateway.lifecycle import (
     GatewayLifecycleError,
     _ReadyControlStore,
+    compose_local_gateway,
     gateway_instance_lock,
     load_gateway_components,
     load_local_gateway,
@@ -50,6 +53,7 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.project_activation import ProjectActivation, ProjectActivationError
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models.providers.async_transport import RequestDeadline
 from exp.runtime.openai_protocol.requests import decode_chat
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -1429,6 +1433,26 @@ def _activate_coding_revision_two(root: Path, manager: GatewayManagement) -> str
         catalog_sha256=normalized.identity_sha256(),
     )
     return normalized.identity_sha256()
+
+
+def test_gateway_shutdown_stops_the_shared_selection_worker_pool(tmp_path: Path) -> None:
+    """Shutdown owns the selection lane, so no worker outlives the stopped gateway."""
+    _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    runtime = compose_local_gateway(components)
+
+    asyncio.run(runtime.shutdown())
+
+    with pytest.raises(RuntimeError):
+        components.selection_workers.submit(
+            cast(RouterRuntime, None),
+            cast(ModelRequest, None),
+            episode_id="episode",
+            deadline=RequestDeadline(time.monotonic() + 5.0),
+        )
 
 
 def test_authority_minted_at_the_swap_instant_stays_authorized_on_the_retired_revision(

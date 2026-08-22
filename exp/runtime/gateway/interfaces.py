@@ -137,6 +137,17 @@ class ProjectTargetResolver(Protocol):
         """Resolve one direct or project target to a frozen exact logical model."""
         ...
 
+    def select_blocking(
+        self,
+        *,
+        target: GatewayTarget,
+        request: GatewayRequest,
+        episode_namespace: tuple[ArtifactId, ArtifactId, ArtifactId, str],
+        deadline_monotonic: float,
+    ) -> ProjectSelection:
+        """Resolve one project target synchronously for callers without an event loop."""
+        ...
+
 
 class GatewayClock(Protocol):
     """Injectable wall and monotonic clock for deadlines and persisted timestamps."""
