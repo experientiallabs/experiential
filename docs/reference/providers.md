@@ -8,9 +8,15 @@ Configure connections with `exp config providers` or the first `exp build` on a 
 An interactive terminal opens a provider list: Up and Down move focus, Enter selects or deselects
 the focused provider, and the Complete row submits the selection. Agents skip that list with
 repeatable `--provider` flags (`openai`, `anthropic`, `gemini`, `openrouter`,
-`openai-compatible`, `azure`, `bedrock`). Unsupported or duplicate values fail before any catalog
-write. Azure and Bedrock still require manual model IDs. Other selected providers use account
-model discovery when credentials are available.
+`openai-compatible`, `azure`, `bedrock`, `experiential-cloud`). Unsupported or duplicate values
+fail before any catalog write. Azure and Bedrock still require manual model IDs. Other selected
+providers use account model discovery when credentials are available.
+
+`experiential-cloud` is a setup picker for the hosted Platform gateway. It persists
+`provider = "openai-compatible"` with `base_url` `https://api.experientiallabs.ai/v1` (or
+`EXP_GATEWAY_URL` when that override is set) and `api_key_env = "EXPLABS_API_KEY"`. The CLI does
+not rebuild a local gateway authority for that hosted path. Local `exp run` first-run setup keeps
+the offline provider list and does not offer Experiential Cloud.
 
 Setup writes only secret-free catalog fields and never prints a credential value. Interactive
 `exp config providers` persists pasted API keys outside the repository in the platform
@@ -41,6 +47,7 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 | Anthropic | `anthropic` | `api_key_env` (suggested `ANTHROPIC_API_KEY`) | Official Anthropic origin |
 | Gemini | `gemini` | `api_key_env` (suggested `GEMINI_API_KEY`) | Official Gemini origin |
 | OpenAI-compatible | `openai-compatible` | `api_key_env` plus explicit `base_url` | Catalog `base_url` |
+| Experiential Cloud | `openai-compatible` (picker `experiential-cloud`) | `EXPLABS_API_KEY` plus the hosted Platform `/v1` origin | `https://api.experientiallabs.ai/v1` or `EXP_GATEWAY_URL` |
 | Azure OpenAI / Foundry | `azure` | `api_key_env` plus explicit resource endpoint and `api_version` | Endpoint and API version |
 | Amazon Bedrock | `bedrock` | AWS credential chain. No `api_key_env` | Optional catalog `region` |
 | Tinker sampling | `tinker` | `api_key_env` | Official Tinker origin |

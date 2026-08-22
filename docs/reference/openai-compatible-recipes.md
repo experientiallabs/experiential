@@ -116,3 +116,29 @@ micro-USD prices from the active catalog. `exp config providers --provider opena
 reads those optional fields, converts micro-USD prices to USD per million tokens, and leaves
 unknown any field the catalog did not declare. It does not treat official OpenAI listing
 metadata the same way.
+
+## Experiential Cloud
+
+Experiential Cloud is the first-party hosted Platform lane, not a local gateway recipe. Customers
+call `https://api.experientiallabs.ai/v1` with a durable Platform `xpl_` key stored as
+`EXPLABS_API_KEY`. Setup does not prompt for a base URL and does not write a local `gateway.db`
+authority for this path.
+
+```bash
+export EXPLABS_API_KEY=...   # from https://platform.experientiallabs.ai/settings/api-keys
+
+exp config providers --provider experiential-cloud --root ROOT
+```
+
+Preview or staging may replace the origin with `EXP_GATEWAY_URL`. Non-interactive automation uses
+the frozen catalog provider:
+
+```bash
+exp config providers --non-interactive --root ROOT \
+  --connection-json '{"name":"experiential-cloud","provider":"openai-compatible","api_key_env":"EXPLABS_API_KEY","base_url":"https://api.experientiallabs.ai/v1"}' \
+  --model-json '...'
+```
+
+`exp config gateway call`, `models`, and `key check` already accept `--url` / `EXP_GATEWAY_URL`
+plus the Platform key. Use those as callers against the hosted gateway. Keep `exp run` and
+`exp config gateway` for genuine local or offline serving.
