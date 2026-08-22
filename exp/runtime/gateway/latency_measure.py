@@ -130,7 +130,7 @@ class _MockChatHandler(BaseHTTPRequestHandler):
             for frame in frames:
                 self.wfile.write(frame)
                 self.wfile.flush()
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
 
 
@@ -539,10 +539,11 @@ def start_gateway_process(
     pump.start()
     try:
         _wait_for_ready(port, process, lines)
+        engine = _wait_for_engine_receipt(lines)
     except Exception:
         stop_gateway_process(process)
         raise
-    return process, _engine_from_output(lines)
+    return process, engine
 
 
 def stop_gateway_process(process: subprocess.Popen[str]) -> None:
@@ -604,14 +605,38 @@ def _wait_for_ready(
     raise RuntimeError(f"gateway did not become ready on port {port}")
 
 
-def _engine_from_output(lines: list[str]) -> str:
-    """Read the launch receipt engine, defaulting to ``python``.
+def _wait_for_engine_receipt(lines: list[str], *, timeout_s: float = 2.0) -> str:
+    """Wait until the launch receipt is pumped, then return its engine.
+
+    HTTP readiness can succeed before the stdout pump thread appends the JSON
+    receipt. The rust engine prints ``engine: rust`` before it binds; the python
+    engine prints a ready receipt without an engine field.
+
+    Args:
+        lines: Captured gateway stdout lines from the pump thread.
+        timeout_s: Bound for waiting on the receipt after readiness.
+
+    Returns:
+        ``rust`` or ``python``. Defaults to ``python`` only after the timeout.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        engine = _engine_from_output(lines)
+        if engine is not None:
+            return engine
+        time.sleep(0.02)
+    return _engine_from_output(lines) or "python"
+
+
+def _engine_from_output(lines: list[str]) -> str | None:
+    """Read the launch receipt engine when the JSON line is already pumped.
 
     Args:
         lines: Captured gateway stdout lines.
 
     Returns:
-        ``rust`` or ``python``.
+        ``rust`` or ``python`` when a ready receipt is present, otherwise
+        ``None`` so callers can wait for the pump thread.
     """
     for line in lines:
         text = line.strip()
@@ -621,8 +646,10 @@ def _engine_from_output(lines: list[str]) -> str:
             payload = json.loads(text)
         except json.JSONDecodeError:
             continue
-        if isinstance(payload, dict):
-            engine = payload.get("engine")
-            if engine in {"rust", "python"}:
-                return engine
-    return "python"
+        if not isinstance(payload, dict) or payload.get("status") != "ready":
+            continue
+        engine = payload.get("engine")
+        if engine == "rust":
+            return "rust"
+        return "python"
+    return None
