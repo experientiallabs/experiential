@@ -286,8 +286,8 @@ def test_noninteractive_provider_flags_validate_without_prompts_or_writes(tmp_pa
     assert "unsupported --provider value 'not-a-provider'" in output
     assert "duplicate --provider value 'openai'" in output
     assert (
-        "choose from: openai, anthropic, gemini, openrouter, openai-compatible, azure, "
-        "bedrock, experiential-cloud" in output
+        "choose from: experiential-cloud, openai, anthropic, gemini, openrouter, "
+        "openai-compatible, azure, bedrock" in output
     )
     assert "Select the providers you want to use" not in output
     assert not (root / "models.toml").exists()
@@ -604,7 +604,7 @@ def test_wizard_recommended_setup_needs_only_provider_and_one_default_choice(
     root = tmp_path / ".exp"
     console, catalog = _setup(
         root,
-        "1\n\n\n",
+        "2\n\n\n",
         monkeypatch=monkeypatch,
         offer_recommended_defaults=True,
     )
@@ -648,7 +648,7 @@ def test_wizard_recommended_setup_prefers_provider_diversity_for_router_candidat
 
     console, catalog = _setup(
         tmp_path / ".exp",
-        "1,2\n\n\n",
+        "2,3\n\n\n",
         monkeypatch=monkeypatch,
         lister=lister,
         offer_recommended_defaults=True,
@@ -698,7 +698,7 @@ def test_wizard_recommended_setup_falls_back_by_verified_capability_and_cost(
 
     _console, catalog = _setup(
         tmp_path / ".exp",
-        "2,3\n\n\n",
+        "3,4\n\n\n",
         monkeypatch=monkeypatch,
         lister=lister,
         offer_recommended_defaults=True,
@@ -757,7 +757,7 @@ def test_interactive_setup_saves_providers_models_and_roles_it_derived(
     """
     root = tmp_path / ".exp"
 
-    console, catalog = _setup(root, "1\n\n1\n\n1\n\n2\n1,2\n\n\n\n1\ny\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "2\n\n1\n\n1\n\n2\n1,2\n\n\n\n1\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -799,7 +799,7 @@ def test_interactive_final_rejection_writes_no_catalog(
     """
     root = tmp_path / ".exp"
 
-    console, catalog = _setup(root, "1\n\n1\n\n1\n\n1\n\nn\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "2\n\n1\n\n1\n\n1\n\nn\n", monkeypatch=monkeypatch)
 
     assert catalog is None
     assert "Configuration" in console.output
@@ -818,7 +818,7 @@ def test_interactive_cancellation_writes_no_catalog(
     """
     root = tmp_path / ".exp"
 
-    console, catalog = _setup(root, "1\n\nq\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "2\n\nq\n", monkeypatch=monkeypatch)
 
     assert catalog is None
     assert "Setup cancelled. Nothing was written." in console.output
@@ -848,7 +848,7 @@ def test_back_from_the_model_screen_reselects_providers_without_losing_answers(
 
     console, catalog = _setup(
         root,
-        "1\n\nb\n2\n\n1\n\n1\n\n1\n1,2\n\n\n1\ny\n",
+        "2\n\nb\n3\n\n1\n\n1\n\n1\n1,2\n\n\n1\ny\n",
         monkeypatch=monkeypatch,
         lister=lister,
     )
@@ -891,7 +891,7 @@ def test_rerunning_setup_preserves_unrelated_models_and_router_state(
         ),
     )
 
-    _, catalog = _setup(root, "2\n\n2,4\n\n1\n\n1\n\n1\n\n\ny\n", monkeypatch=monkeypatch)
+    _, catalog = _setup(root, "3\n\n2,4\n\n1\n\n1\n\n1\n\n\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -930,7 +930,7 @@ def test_setup_preserves_entries_owned_by_providers_it_does_not_configure(
         ),
     )
 
-    console, catalog = _setup(root, "1\n\n1\n\n1\n\n1\n\ny\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "2\n\n1\n\n1\n\n1\n\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -1243,7 +1243,7 @@ def test_role_flags_preselect_the_roles_the_picker_offers(
 
     _, catalog = _setup(
         root,
-        "1\n\n1,2,3\n\n\n\n\n\n\n\ny\n",
+        "2\n\n1,2,3\n\n\n\n\n\n\n\ny\n",
         monkeypatch=monkeypatch,
         options=options,
     )

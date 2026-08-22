@@ -120,18 +120,18 @@ metadata the same way.
 ## Experiential Cloud
 
 Experiential Cloud is the first-party hosted Platform lane, not a local gateway recipe. Customers
-call `https://api.experientiallabs.ai/v1` with a durable Platform `xpl_` key stored as
-`EXPLABS_API_KEY`. Setup does not prompt for a base URL and does not write a local `gateway.db`
-authority for this path.
+call `https://api.experientiallabs.ai/v1` with a durable Platform `xpl_` key resolved from
+`EXPLABS_API_KEY` or the user-data credential file. Setup does not prompt for a base URL and does not write a local `gateway.db`
+authority for this path. In an interactive terminal, the command opens Platform approval and
+stores the returned key after the loopback callback completes.
 
 ```bash
-export EXPLABS_API_KEY=...   # from https://platform.experientiallabs.ai/settings/api-keys
-
 exp config providers --provider experiential-cloud --root ROOT
 ```
 
-Preview or staging may replace the origin with `EXP_GATEWAY_URL`. Non-interactive automation uses
-the frozen catalog provider:
+For headless or CI setup, export `EXPLABS_API_KEY` before running the same command. Preview or
+staging may replace the browser origin with `EXP_PLATFORM_URL` and the API origin with
+`EXP_GATEWAY_URL`. Non-interactive automation uses the frozen catalog provider:
 
 ```bash
 exp config providers --non-interactive --root ROOT \

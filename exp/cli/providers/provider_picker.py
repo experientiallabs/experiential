@@ -25,6 +25,7 @@ from exp.cli.providers.experiential_cloud import (
 from exp.cli.providers.experiential_cloud import (
     HOSTED_GATEWAY_API_KEY_ENV,
     hosted_gateway_base_url,
+    hosted_platform_login,
 )
 from exp.cli.providers.experiential_cloud import (
     SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
@@ -65,6 +66,7 @@ from exp.runtime.models.providers import (
 )
 
 SETUP_PROVIDER_LABELS = {
+    HOSTED_SETUP_PICKER: HOSTED_SETUP_LABEL,
     "openai": "openai",
     "anthropic": "anthropic",
     "gemini": "gemini",
@@ -72,7 +74,6 @@ SETUP_PROVIDER_LABELS = {
     "openai-compatible": "openai-compatible",
     "azure": "azure",
     "bedrock": "bedrock",
-    HOSTED_SETUP_PICKER: HOSTED_SETUP_LABEL,
 }
 CANONICAL_CREDENTIAL_ENV = CANONICAL_API_KEY_ENV
 _MANUAL_MODEL_PROVIDERS = frozenset({"azure", "bedrock"})
@@ -566,7 +567,7 @@ def _reused_connection(
             or connection.region != region
         ):
             continue
-        if provider != "openai-compatible" and connection.api_key_env != api_key_env:
+        if api_key_env is not None and connection.api_key_env != api_key_env:
             continue
         matches.append(connection)
     if len(matches) == 1:
@@ -666,6 +667,9 @@ def _resolve_credential(
         Raises:
             SetupCancelled: The prompt reached end of input.
         """
+        platform_key = hosted_platform_login(connection, console=console, environment=environment)
+        if platform_key is not None:
+            return platform_key
         console.print(f"[dim]{label} API key[/dim]")
         try:
             return getpass(f"{label} API key (hidden, empty line skips this provider): ")

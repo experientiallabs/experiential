@@ -54,8 +54,8 @@ _PROVIDER_OPTION = typer.Option(
     "--provider",
     help=(
         "Repeatable provider that skips the opening list during interactive setup. "
-        "Supported values: openai, anthropic, gemini, openrouter, openai-compatible, "
-        "azure, bedrock, experiential-cloud."
+        "Supported values: experiential-cloud, openai, anthropic, gemini, openrouter, "
+        "openai-compatible, azure, bedrock."
     ),
 )
 

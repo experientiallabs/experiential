@@ -7,8 +7,8 @@ embedding alias must declare the protocol features and token prices it uses.
 Configure connections with `exp config providers` or the first `exp build` on a clean checkout.
 An interactive terminal opens a provider list: Up and Down move focus, Enter selects or deselects
 the focused provider, and the Complete row submits the selection. Agents skip that list with
-repeatable `--provider` flags (`openai`, `anthropic`, `gemini`, `openrouter`,
-`openai-compatible`, `azure`, `bedrock`, `experiential-cloud`). Unsupported or duplicate values
+repeatable `--provider` flags (`experiential-cloud`, `openai`, `anthropic`, `gemini`, `openrouter`,
+`openai-compatible`, `azure`, `bedrock`). Unsupported or duplicate values
 fail before any catalog write. Azure and Bedrock still require manual model IDs. Other selected
 providers use account model discovery when credentials are available.
 
@@ -18,8 +18,14 @@ providers use account model discovery when credentials are available.
 not rebuild a local gateway authority for that hosted path. Local `exp run` first-run setup keeps
 the offline provider list and does not offer Experiential Cloud.
 
+When an interactive terminal selects Experiential Cloud without an environment or stored key,
+setup opens the Platform `/cli/auth` approval page. After approval, the new `xpl_` key returns
+through a loopback callback, is verified by model discovery, and is stored in the user-data
+credential file. Set `EXP_PLATFORM_URL` for a preview or staging Platform web origin. Headless
+and CI setup should provide `EXPLABS_API_KEY` instead.
+
 Setup writes only secret-free catalog fields and never prints a credential value. Interactive
-`exp config providers` persists pasted API keys outside the repository in the platform
+`exp config providers` persists browser-approved or pasted API keys outside the repository in the platform
 user-data file (`$XDG_DATA_HOME/exp/auth.json` or `~/.local/share/exp/auth.json` on Linux).
 When the operator edits an existing provider that already has a stored key, the same wizard
 can keep, replace, or remove that record. Known providers keep their canonical environment

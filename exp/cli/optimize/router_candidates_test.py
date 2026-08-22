@@ -80,7 +80,7 @@ def test_router_candidate_picker_discovers_only_eligible_completion_models(
 
     picked = run_router_candidate_picker(
         catalog,
-        console=ScriptedConsole("1\n\n1,2\n\n\n\n1\n"),
+        console=ScriptedConsole("2\n\n1,2\n\n\n\n1\n"),
         lister=_FakeLister(),
         environment={"OPENAI_API_KEY": "openai-secret"},
     )

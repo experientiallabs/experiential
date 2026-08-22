@@ -152,7 +152,7 @@ def _forbid_getpass(prompt: str = "") -> str:
 
 def test_provider_screen_never_names_credential_variables() -> None:
     """The one opening screen shows plain provider names without credential status."""
-    console = ScriptedConsole("1\n\n")
+    console = ScriptedConsole("2\n\n")
 
     selection = select_providers(
         SetupSession(), console=console, environment={"OPENAI_API_KEY": "secret-key"}
@@ -165,7 +165,7 @@ def test_provider_screen_never_names_credential_variables() -> None:
 
 def test_provider_screen_selects_several_providers_in_one_session() -> None:
     """A user selects every provider they want before setup contacts any of them."""
-    console = ScriptedConsole("1,2,4\n\n")
+    console = ScriptedConsole("2,3,5\n\n")
 
     selection = select_providers(
         SetupSession(), console=console, environment={"OPENAI_API_KEY": "secret-key"}
@@ -183,10 +183,11 @@ def test_keyboard_provider_list_selects_without_typed_numbers() -> None:
     """Up, Down, and Enter toggle providers; Complete is the only submit action."""
     keys = iter(
         (
+            PickerKey.DOWN,
             PickerKey.ENTER,
             PickerKey.DOWN,
             PickerKey.ENTER,
-            *(PickerKey.DOWN for _ in range(7)),
+            *(PickerKey.DOWN for _ in range(6)),
             PickerKey.ENTER,
         )
     )
@@ -388,6 +389,49 @@ def test_missing_credential_is_pasted_masked_and_persisted(
     assert "kept in this process only" not in console.output
     assert ProviderAuthStore(default_auth_path()).get("openai") == "pasted-secret"
     assert tmp_path.exists()
+
+
+def test_experiential_cloud_uses_platform_login_before_masked_paste(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hosted Cloud connection stores the browser key without invoking getpass."""
+    monkeypatch.setattr(
+        provider_picker,
+        "hosted_platform_login",
+        lambda _connection, **_kwargs: "xpl_browser_key",
+    )
+    monkeypatch.setattr(provider_picker, "getpass", _forbid_getpass)
+    console = ScriptedConsole("")
+    lister = _FakeLister(
+        {
+            "openai-compatible": [
+                (
+                    DiscoveredModel(
+                        provider="openai-compatible",
+                        model="deepseek-v4-flash",
+                        supports_completions=True,
+                        supports_structured_output=True,
+                        input_cost_per_million_tokens_usd=0.072,
+                        output_cost_per_million_tokens_usd=0.162,
+                    ),
+                )
+            ]
+        }
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("experiential-cloud",),
+        lister=lister,
+        environment={},
+    )
+
+    assert prepared is not None
+    endpoints, _ = prepared
+    assert endpoints[0].api_key == "xpl_browser_key"
+    assert endpoints[0].connection.api_key_env == HOSTED_GATEWAY_API_KEY_ENV
+    assert ProviderAuthStore(default_auth_path()).get("experiential-cloud") == ("xpl_browser_key")
+    assert "xpl_browser_key" not in console.output
 
 
 def test_empty_masked_paste_skips_that_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1048,9 +1092,9 @@ def test_release_tty_walk_selects_azure_then_completes() -> None:
     """The installed-wheel provider walk still lands on Azure, then Complete."""
     keys = iter(
         (
-            *(PickerKey.DOWN for _ in range(5)),
+            *(PickerKey.DOWN for _ in range(6)),
             PickerKey.ENTER,
-            *(PickerKey.DOWN for _ in range(3)),
+            *(PickerKey.DOWN for _ in range(2)),
             PickerKey.ENTER,
         )
     )
@@ -1069,7 +1113,7 @@ def test_release_tty_walk_selects_azure_then_completes() -> None:
 
 def test_azure_and_bedrock_force_explicit_manual_model_declaration() -> None:
     """Providers without a safe listing API make the manual model row available explicitly."""
-    console = ScriptedConsole("6,7\n\n")
+    console = ScriptedConsole("7,8\n\n")
 
     selection = select_providers(SetupSession(), console=console, environment={})
 
@@ -1182,14 +1226,14 @@ def test_experiential_cloud_lists_through_the_openai_compatible_family() -> None
 def test_resolve_setup_providers_accepts_experiential_cloud() -> None:
     """The hosted picker is a first-class --provider value."""
     assert resolve_setup_providers(("experiential-cloud", "openai")) == (
-        "openai",
         "experiential-cloud",
+        "openai",
     )
 
 
 def test_provider_screen_lists_experiential_cloud() -> None:
     """Builder setup shows the hosted Platform picker as its own row."""
-    console = ScriptedConsole("8\n\n")
+    console = ScriptedConsole("1\n\n")
 
     selection = select_providers(SetupSession(), console=console, environment={})
 
