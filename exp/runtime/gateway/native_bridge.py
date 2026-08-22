@@ -122,6 +122,8 @@ class NativeAttemptLedger(Protocol):
         attempt_ordinal: int,
         route_depth: int,
         maximum_cost_micro_usd: int | None = None,
+        route_reason: str | None = None,
+        fallback_reason: str | None = None,
     ) -> AttemptId:
         """Reserve and persist one provider attempt."""
         ...
@@ -455,14 +457,25 @@ class NativeControlPlane:
             require_gateway_provider(deployment.provider)
             preflight_gateway_request(provider_request, deployment.gateway.capabilities)
             upstream_payload = dialect_stream_payload(profile, provider_request)
-            attempt_id = self._write_ledger.start_attempt(
-                snapshot=route.snapshot,
-                deployment=deployment,
-                attempt_ordinal=0,
-                route_depth=0,
-                maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(request, deployment),
-            )
-            if self._route_context_recorder is not None:
+            maximum_cost = maximum_attempt_cost_micro_usd(request, deployment)
+            if self._route_context_recorder is None:
+                attempt_id = self._write_ledger.start_attempt(
+                    snapshot=route.snapshot,
+                    deployment=deployment,
+                    attempt_ordinal=0,
+                    route_depth=0,
+                    maximum_cost_micro_usd=maximum_cost,
+                    route_reason=route.route_reason,
+                    fallback_reason=route.fallback_reason,
+                )
+            else:
+                attempt_id = self._write_ledger.start_attempt(
+                    snapshot=route.snapshot,
+                    deployment=deployment,
+                    attempt_ordinal=0,
+                    route_depth=0,
+                    maximum_cost_micro_usd=maximum_cost,
+                )
                 self._route_context_recorder(
                     attempt_id,
                     route.route_reason,

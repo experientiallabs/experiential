@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -219,6 +220,20 @@ def test_admit_records_host_route_context_after_reservation(tmp_path: Path) -> N
     admission = _admit(control, raw_key, _chat_body())
 
     assert contexts == [(admission["attempt_id"], "direct", None)]
+
+
+def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> None:
+    """The default local composition retains durable route provenance."""
+    control, raw_key = _control_plane(tmp_path)
+
+    admission = _admit(control, raw_key, _chat_body())
+
+    with sqlite3.connect(control._components.ledger.database_path) as connection:  # noqa: SLF001
+        row = connection.execute(
+            "select route_reason, fallback_reason from gateway_attempts where attempt_id = ?",
+            (admission["attempt_id"],),
+        ).fetchone()
+    assert row == ("direct", None)
 
 
 def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None:
