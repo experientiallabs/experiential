@@ -191,6 +191,84 @@ def test_gateway_setup_can_edit_the_displayed_defaults(
     assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
 
 
+def test_gateway_setup_requires_explicit_reconfigure_opt_in(
+    tmp_path: Path,
+) -> None:
+    """An initialized gateway remains protected unless the caller supplies explicit consent."""
+    setup.GatewayManagement(tmp_path).initialize()
+
+    with pytest.raises(ValueError, match="requires an uninitialized gateway"):
+        setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole(""))
+
+
+def test_gateway_setup_reconfigures_provider_alias_and_existing_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmed reconfiguration replaces serving revisions while retaining gateway authority."""
+    endpoints, models = _prepared_gateway_models()
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
+    )
+    first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    manager = setup.GatewayManagement(tmp_path)
+    first_revision = manager.aliases()[0].revision_id
+
+    updated_connection = ProviderConnection(
+        name="openai",
+        provider="openai",
+        api_key_env="UPDATED_OPENAI_API_KEY",
+    )
+    updated_endpoint = provider_picker.PreparedEndpoint(
+        connection=updated_connection,
+        api_key="secret",
+        configured=False,
+    )
+    updated_model = provider_picker.AvailableModel(
+        alias=models[0].alias,
+        connection="openai",
+        provider="openai",
+        model="gpt-5-6-luna-v2",
+        capabilities=models[0].capabilities,
+        pricing_source=models[0].pricing_source,
+        configured=False,
+    )
+    monkeypatch.setattr(
+        setup,
+        "prepare_providers",
+        lambda *_args, **_kwargs: ((updated_endpoint,), (updated_model,)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(updated_model, "medium"),
+    )
+
+    result = setup.interactive_gateway_setup(
+        tmp_path,
+        console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\n"),
+        allow_reconfigure=True,
+    )
+
+    assert result.alias == first.alias
+    assert result.identity_id == first.identity_id
+    connections = {item.connection_id: item for item in manager.provider_connections()}
+    assert connections["openai"].config.api_key_env == "UPDATED_OPENAI_API_KEY"
+    assert manager.aliases()[0].revision_id != first_revision
+    assert manager.status().active_identities == 1
+    assert manager.status().active_keys == 2
+    assert manager.status().grants == 1
+    assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
+
+
 def test_gateway_setup_writes_budget_before_gateway_initialization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
