@@ -18,12 +18,12 @@ from exp.runtime.gateway.discovery import (
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 _AUTHORITY = ("coding", "revision-one", "a" * 64)
-_WMO_LISTING_CONTRACT = {
+_EXP_LISTING_CONTRACT = {
     "id": "coding",
     "object": "model",
     "created": 0,
-    "owned_by": "wmo",
-    "wmo": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
+    "owned_by": "exp",
+    "exp": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
     "supports_completions": True,
     "supports_tools": True,
     "supports_structured_output": True,
@@ -70,8 +70,8 @@ def test_public_model_object_keeps_the_openai_keys_and_adds_authority() -> None:
         "id": "coding",
         "object": "model",
         "created": 0,
-        "owned_by": "wmo",
-        "wmo": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
+        "owned_by": "exp",
+        "exp": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
     }
 
 
@@ -80,7 +80,7 @@ def test_public_model_list_marks_even_an_empty_authority_envelope() -> None:
     assert public_model_list(()) == {
         "object": "list",
         "data": [],
-        "wmo": {"authority_schema_version": 1},
+        "exp": {"authority_schema_version": 1},
     }
 
 
@@ -125,7 +125,7 @@ def test_public_model_object_copies_catalog_capabilities_limits_and_prices() -> 
 
     payload = public_model_object(_AUTHORITY, metadata=metadata)
 
-    assert payload == _WMO_LISTING_CONTRACT
+    assert payload == _EXP_LISTING_CONTRACT
     assert "context_window_tokens" not in payload
     assert "cache_write" not in str(payload)
 
@@ -162,8 +162,8 @@ def test_missing_deployment_publishes_no_extension_fields() -> None:
         "id": "coding",
         "object": "model",
         "created": 0,
-        "owned_by": "wmo",
-        "wmo": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
+        "owned_by": "exp",
+        "exp": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
     }
 
 
@@ -187,8 +187,8 @@ def test_public_model_list_attaches_per_alias_catalog_metadata() -> None:
 
     assert public_model_list((_AUTHORITY,), metadata_by_alias={"coding": metadata}) == {
         "object": "list",
-        "data": [_WMO_LISTING_CONTRACT],
-        "wmo": {"authority_schema_version": 1},
+        "data": [_EXP_LISTING_CONTRACT],
+        "exp": {"authority_schema_version": 1},
     }
 
 

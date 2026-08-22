@@ -123,7 +123,7 @@ def test_openai_listing_discards_optional_entry_metadata() -> None:
     assert model.input_cost_per_million_tokens_usd is None
 
 
-def test_openai_compatible_listing_reads_validated_wmo_gateway_metadata() -> None:
+def test_openai_compatible_listing_reads_validated_exp_gateway_metadata() -> None:
     """The hosted gateway contract supplies capabilities, limits, and micro-USD prices."""
     transport = _transport(
         _ok(
@@ -133,8 +133,8 @@ def test_openai_compatible_listing_reads_validated_wmo_gateway_metadata() -> Non
                         "id": "coding",
                         "object": "model",
                         "created": 0,
-                        "owned_by": "wmo",
-                        "wmo": {
+                        "owned_by": "exp",
+                        "exp": {
                             "alias_revision_id": "revision-one",
                             "catalog_sha256": "a" * 64,
                         },

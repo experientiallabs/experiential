@@ -1620,8 +1620,8 @@ def test_model_discovery_is_enriched_and_detail_is_not_an_existence_oracle() -> 
             "id": "public-model",
             "object": "model",
             "created": 0,
-            "owned_by": "wmo",
-            "wmo": {"alias_revision_id": "revision-one", "catalog_sha256": digest},
+            "owned_by": "exp",
+            "exp": {"alias_revision_id": "revision-one", "catalog_sha256": digest},
         }
         transport = httpx.ASGITransport(app=create_gateway_app(service))
         async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
@@ -1635,7 +1635,7 @@ def test_model_discovery_is_enriched_and_detail_is_not_an_existence_oracle() -> 
         assert listed.json() == {
             "object": "list",
             "data": [expected],
-            "wmo": {"authority_schema_version": 1},
+            "exp": {"authority_schema_version": 1},
         }
         assert granted.status_code == 200
         assert granted.json() == expected
@@ -1710,8 +1710,8 @@ def test_model_discovery_publishes_the_revision_direct_pool_not_a_name_match() -
             "id": "public-model",
             "object": "model",
             "created": 0,
-            "owned_by": "wmo",
-            "wmo": {"alias_revision_id": "revision-one", "catalog_sha256": digest},
+            "owned_by": "exp",
+            "exp": {"alias_revision_id": "revision-one", "catalog_sha256": digest},
             "supports_completions": True,
             "supports_tools": True,
             "supports_structured_output": True,
@@ -1726,7 +1726,7 @@ def test_model_discovery_publishes_the_revision_direct_pool_not_a_name_match() -
         assert listed.json() == {
             "object": "list",
             "data": [expected],
-            "wmo": {"authority_schema_version": 1},
+            "exp": {"authority_schema_version": 1},
         }
         assert granted.status_code == 200
         assert granted.json() == expected
