@@ -8,9 +8,12 @@ import socket
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 import uvicorn
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
 
 _LOOPBACK_HOST = "127.0.0.1"
 _FALLBACK_START_TIMEOUT_SECONDS = 30.0
@@ -100,7 +103,7 @@ def serve_native_gateway(
         separators=(",", ":"),
     )
     try:
-        native.serve(control_plane, config)
+        native.serve(cast("NativeControlPlane", control_plane), config)
     except RuntimeError as exc:
         raise NativeGatewayServerError(f"the native gateway failed: {exc}") from exc
     finally:

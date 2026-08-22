@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 import pytest
@@ -30,6 +31,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.discovery import listing_metadata_by_alias
+from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import _ReadyControlStore, load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
@@ -228,7 +230,8 @@ def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> No
 
     admission = _admit(control, raw_key, _chat_body())
 
-    with sqlite3.connect(control._components.ledger.database_path) as connection:  # noqa: SLF001
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
         row = connection.execute(
             "select route_reason, fallback_reason from gateway_attempts where attempt_id = ?",
             (admission["attempt_id"],),
