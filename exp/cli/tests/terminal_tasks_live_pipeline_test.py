@@ -308,7 +308,7 @@ def _wait_for_server(port: int, process: subprocess.Popen[bytes]) -> None:
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise AssertionError(f"exp run exited early with code {process.returncode}")
+            raise AssertionError(f"exp gateway exited early with code {process.returncode}")
         try:
             status, _ = _http_json(port, "GET", "/v1/models")
         except (ConnectionError, OSError):
@@ -317,7 +317,7 @@ def _wait_for_server(port: int, process: subprocess.Popen[bytes]) -> None:
         if status == 200:
             return
         time.sleep(1)
-    raise AssertionError("exp run never became ready on loopback")
+    raise AssertionError("exp gateway never became ready on loopback")
 
 
 def _serve_and_exercise(root: Path, *, ghost: bool) -> None:
@@ -326,7 +326,7 @@ def _serve_and_exercise(root: Path, *, ghost: bool) -> None:
         sys.executable,
         "-m",
         "exp",
-        "run",
+        "--project",
         _PROJECT,
         "--root",
         str(root),

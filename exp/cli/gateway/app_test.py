@@ -179,7 +179,7 @@ def test_noninteractive_management_story_emits_stable_secret_safe_json(
 
     readiness = runner.invoke(
         app,
-        ["run", "--root", str(tmp_path), "--check", "--non-interactive", "--json"],
+        ["--root", str(tmp_path), "--check", "--non-interactive", "--json"],
     )
     assert readiness.exit_code == 0, readiness.output
     assert json.loads(readiness.stdout)["status"] == "ready"

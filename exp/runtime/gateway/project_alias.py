@@ -120,7 +120,7 @@ def prepare_project_gateway_alias(
         manager.create_identity(
             identity_id=identity_id,
             display_name=f"Project {project}",
-            description="Compatibility identity for exp run PROJECT.",
+            description="Compatibility identity for an exp --project gateway.",
         )
         identity_changed = True
     grant_changed = manager.add_grant(identity_id=identity_id, alias_id=project)

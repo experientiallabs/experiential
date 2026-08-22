@@ -1,6 +1,6 @@
 """Caller-side commands that drive one live authenticated gateway over HTTP.
 
-These commands cover the agent core loop against a running ``exp run`` gateway: discover
+These commands cover the agent core loop against a running default ``exp`` gateway: discover
 the aliases a virtual key can use, validate a key, and make one chat completion. They are
 pure HTTP callers: spend authority stays entirely with the gateway's key grants and
 monthly budgets, no provider client or provider credential is ever constructed, and the
@@ -502,6 +502,6 @@ def _unreachable_gateway(url: str) -> typer.BadParameter:
         Usage error naming the URL and the exact way to start or select a gateway.
     """
     return typer.BadParameter(
-        f"no gateway answered at {url}; start one with 'exp run' or point "
+        f"no gateway answered at {url}; start one with 'exp' or point "
         "--url (or EXP_GATEWAY_URL) at a live gateway"
     )

@@ -130,7 +130,7 @@ def test_fireworks_recipe_reaches_gateway_readiness_without_a_provider_call(
 
     readiness = CliRunner().invoke(
         app,
-        ["run", "--root", str(tmp_path), "--check", "--non-interactive", "--json"],
+        ["--root", str(tmp_path), "--check", "--non-interactive", "--json"],
     )
 
     assert readiness.exit_code == 0, readiness.output
@@ -156,7 +156,7 @@ def test_modal_recipe_fails_closed_without_its_deployment_base_url(
 
     readiness = CliRunner().invoke(
         app,
-        ["run", "--root", str(tmp_path), "--check", "--non-interactive", "--json"],
+        ["--root", str(tmp_path), "--check", "--non-interactive", "--json"],
     )
 
     assert readiness.exit_code == 2
@@ -189,7 +189,7 @@ def test_modal_recipe_reaches_readiness_with_its_deployment_base_url(
 
     readiness = CliRunner().invoke(
         app,
-        ["run", "--root", str(tmp_path), "--check", "--non-interactive", "--json"],
+        ["--root", str(tmp_path), "--check", "--non-interactive", "--json"],
     )
 
     assert readiness.exit_code == 0, readiness.output

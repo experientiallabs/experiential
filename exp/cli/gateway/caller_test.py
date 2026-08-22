@@ -237,7 +237,7 @@ def test_unreachable_gateway_is_a_usage_error_naming_the_url(
     assert result.exit_code == 2
     normalized = " ".join(unstyle(result.output).replace("│", " ").split())
     assert "no gateway answered at http://127.0.0.1:9/v1" in normalized
-    assert "exp run" in normalized
+    assert "start one with 'exp'" in normalized
 
 
 def test_models_prints_the_caller_view_with_granted_revisions(

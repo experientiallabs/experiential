@@ -680,7 +680,7 @@ def _load_alias_state(
         detail = f": {unavailable}" if unavailable else ""
         raise GatewayLifecycleError(
             "no granted active alias is locally available"
-            f"{detail}; fix the listed provider configuration and rerun 'exp run'"
+            f"{detail}; fix the listed provider configuration and rerun 'exp'"
         )
 
     return _AliasAuthorityState(

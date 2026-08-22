@@ -8,7 +8,7 @@ serves Responses, replay-keyed chat, project-backed aliases, and the usage
 page. This report records the benchmark evidence behind that design and where
 each engine's limits actually are. Reproduction: build the extension
 (`just native`), configure direct aliases with `exp config gateway`, serve
-with `exp run`, and drive `POST /v1/chat/completions` at fixed concurrency
+with `exp`, and drive `POST /v1/chat/completions` at fixed concurrency
 ladders; every number below is the summary of one such arm.
 
 All measurements ran on one 16-vCPU Azure VM (Standard_D16ds_v5), with the

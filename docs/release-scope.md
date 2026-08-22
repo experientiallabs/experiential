@@ -6,16 +6,16 @@ on the exact release checkout.
 
 ## Supported and verified
 
-- Root CLI commands are exactly `build`, `config`, `optimize`, and `run`; optimizer commands are
-  exactly `router` and `model`.
+- Root CLI commands are exactly `build`, `config`, and `optimize`; an invocation with no subcommand
+  opens the default gateway home screen. Optimizer commands are exactly `router` and `model`.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses, bounded in-memory continuation and replay,
   content-free SQLite accounting, monthly integer micro-USD enforcement, and loopback-only health
   and usage views.
-- Bare `exp` and the explicit no-argument `exp run` gateway launch, plus the retained
-  `exp run PROJECT [--ghost]` compatibility form, are installed-wheel surfaces. Gateway startup
-  is provider-idle and requires explicit authority.
+- The no-subcommand default gateway launch and the `exp --project PROJECT [--ghost]` compatibility
+  form are installed-wheel surfaces. Gateway startup is provider-idle and requires explicit
+  authority.
 - The installed-wheel gateway lane uses real SQLite, a real subprocess listener, a real loopback
   upstream, and OpenAI `3.0.0`. It covers `OpenAI` and `AsyncOpenAI` across Chat Completions and
   Responses, with both stream and non-stream requests. HTML and JSON usage are checked for the same

@@ -2,7 +2,8 @@
 
 ## Supported surface
 
-Bare `exp` and no-argument `exp run` start an authenticated multi-alias gateway on `127.0.0.1`.
+`exp` opens the default gateway home screen. Its `Default Gateway` choice starts an authenticated
+multi-alias gateway on `127.0.0.1`.
 It serves:
 
 - `GET /v1/models`
@@ -12,13 +13,13 @@ It serves:
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 
-`exp run PROJECT` is compatibility sugar that activates one project-backed alias and launches this
-same gateway application. It does not create a router HTTP server. Gateway startup and readiness
+`exp --project PROJECT` is compatibility sugar that activates one project-backed alias and launches
+this same gateway application. It does not create a router HTTP server. Gateway startup and readiness
 perform no provider request. Only an authorized model request may cross the provider boundary.
 
 ## Data-plane engines
 
-The gateway has two data planes over one control plane. `exp run` resolves
+The gateway has two data planes over one control plane. The default `exp` flow resolves
 `--engine auto` (the default) to the native engine when the `exp_gateway_native`
 extension is built, and otherwise prints the reason and serves through the
 python engine. `--engine rust` and `--engine python` force one engine.

@@ -123,7 +123,8 @@ def load_router(
 
     Returns:
         Official OpenAI client whose Chat Completions and Responses resources call the same
-        authenticated gateway application as ``exp run``. Close it or use it as a context manager
+        authenticated gateway application as the default ``exp`` flow. Close it or use it as a
+        context manager
         to revoke its ephemeral virtual key.
     """
     if ghost and decision_sink is not None:
