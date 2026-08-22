@@ -461,16 +461,16 @@ class SelectionWorkerPool:
             if self._closed:
                 raise RuntimeError("selection worker pool is shut down")
             self._outstanding.add(submitted)
-        submitted.add_done_callback(self._forget)
-        self._queue.put(
-            _QueuedSelection(
-                future=submitted,
-                runtime=runtime,
-                model_request=model_request,
-                episode_id=episode_id,
-                deadline=deadline,
+            self._queue.put(
+                _QueuedSelection(
+                    future=submitted,
+                    runtime=runtime,
+                    model_request=model_request,
+                    episode_id=episode_id,
+                    deadline=deadline,
+                )
             )
-        )
+        submitted.add_done_callback(self._forget)
         return submitted
 
     def shutdown(self, *, drain_timeout_seconds: float = _SELECTION_DRAIN_SECONDS) -> None:
@@ -484,19 +484,21 @@ class SelectionWorkerPool:
         Args:
             drain_timeout_seconds: Bound on waiting for running selections.
         """
+        abandoned: list[_QueuedSelection] = []
         with self._lock:
             self._closed = True
-        while True:
-            try:
-                item = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            if item is not None:
-                item.future.cancel()
-        for _ in self._threads:
-            self._queue.put(None)
-        with self._lock:
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    abandoned.append(item)
+            for _ in self._threads:
+                self._queue.put(None)
             outstanding = frozenset(self._outstanding)
+        for item in abandoned:
+            item.future.cancel()
         _, running = wait(outstanding, timeout=drain_timeout_seconds)
         if running:
             _logger.warning(
