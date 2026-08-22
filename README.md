@@ -63,9 +63,8 @@ uvicorn.run(gateway.app, lifespan="on")
 ```
 
 For hosted workers with their own storage and provider services, use the lower-level
-`exp.create_gateway_runtime(...)` composition API.
-
-The API is unchanged: the default data plane is `Rust`, with faster streaming than `Python`.
+`exp.create_gateway_runtime(...)` composition API. The API is unchanged; the default `Rust`
+data plane keeps streaming latency flatter and handles more concurrent streams than `Python`.
 
 ## Optimize from Traffic
 
