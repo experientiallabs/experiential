@@ -185,15 +185,10 @@ class SQLiteGatewayPlatform:
         self,
         command: ProviderConnectionMutationCommand,
     ) -> NaturalMutationOutcome:
-        """Upsert or disable a provider connection without claiming a receipt.
-
-        Raises:
-            GatewayStoreError: An upsert names a provider the gateway cannot serve.
-        """
+        """Upsert or disable a provider connection, failing closed on non-servable providers."""
         if isinstance(command, UpsertProviderConnectionCommand):
             require_gateway_servable_provider(
-                connection_id=command.connection_id,
-                provider=command.provider,
+                connection_id=command.connection_id, provider=command.provider
             )
             secret_reference = command.secret_reference
             if (
