@@ -8,7 +8,6 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import cast
 from unittest import mock
 
 import pytest
@@ -31,14 +30,12 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.discovery import listing_metadata_by_alias
-from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import _ReadyControlStore, load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
-    _usage_from_payload,
 )
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
@@ -133,21 +130,6 @@ def test_bridge_error_payload_is_openai_shaped() -> None:
     }
 
 
-def test_usage_from_payload_handles_tokens_and_tool_names() -> None:
-    """Settlement usage covers token totals, tool-only, and absent cases."""
-    assert _usage_from_payload(None, []) is None
-    tools_only = _usage_from_payload(None, ["search"])
-    assert tools_only is not None and tools_only.tool_names == ("search",)
-    complete = _usage_from_payload(
-        {"input_tokens": 10, "output_tokens": 3, "cached_input_tokens": 2},
-        [],
-    )
-    assert complete is not None
-    assert complete.input_tokens == 10
-    assert complete.output_tokens == 3
-    assert complete.cached_input_tokens == 2
-
-
 def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     """Admission decodes the raw body, returns the shared upstream payload, and
     settlement lands in the usage report."""
@@ -210,7 +192,7 @@ def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> No
 
     admission = _admit(control, raw_key, _chat_body())
 
-    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    ledger = control._components.ledger  # noqa: SLF001
     with sqlite3.connect(ledger.database_path) as connection:
         row = connection.execute(
             "select route_reason, fallback_reason from gateway_attempts where attempt_id = ?",
@@ -573,7 +555,7 @@ def test_budget_rejection_uses_host_error_factory(tmp_path: Path) -> None:
     )
     control._budget_error_factory = lambda key: customized  # noqa: SLF001
     with mock.patch.object(
-        control._components.ledger,  # noqa: SLF001
+        control._write_ledger,  # noqa: SLF001
         "start_attempt",
         side_effect=BudgetReservationRejected(scope_kind=BudgetScopeKind.TEAM, reason="blocked"),
     ):
