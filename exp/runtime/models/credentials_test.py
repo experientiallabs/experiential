@@ -10,6 +10,7 @@ from exp.common.auth import ProviderAuthStore, StoredCredentialBinding
 from exp.common.models import ConnectionConfig
 from exp.runtime.models.credentials import (
     CredentialResolution,
+    MissingModelCredentialError,
     ModelCredentialError,
     lookup_connection_credential,
     read_connection_api_key,
@@ -137,10 +138,12 @@ def test_same_provider_connections_resolve_independently(tmp_path: Path) -> None
 
 def test_missing_environment_and_store_fails_without_prompting() -> None:
     """Noninteractive resolution names the env var and login command, never a secret."""
-    with pytest.raises(ModelCredentialError, match="OPENAI_API_KEY") as captured:
+    with pytest.raises(MissingModelCredentialError, match="OPENAI_API_KEY") as captured:
         read_connection_api_key(_openai(), connection_id="openai", environment={})
 
     message = str(captured.value)
+    assert captured.value.environment_variable == "OPENAI_API_KEY"
+    assert captured.value.connection_id == "openai"
     assert "exp config providers" in message
     assert _SECRET not in message
 

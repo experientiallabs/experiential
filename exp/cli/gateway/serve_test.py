@@ -225,8 +225,8 @@ def test_first_run_delivers_credentials_before_readiness_failure(
         raise ValueError(
             "no granted active alias is locally available: "
             "gpt-5-6-luna (connection credential environment variable "
-            "'OPENAI_API_KEY' is not set); fix the listed provider configuration and rerun "
-            "'exp'"
+            "'OPENAI_API_KEY' is not set); run "
+            "'OPENAI_API_KEY=YOUR_API_KEY exp'"
         )
 
     @contextmanager
@@ -268,5 +268,5 @@ def test_first_run_delivers_credentials_before_readiness_failure(
     assert f"export EXP_GATEWAY_KEY={raw_key}" in transcript
     assert "export OPENAI_API_KEY" not in transcript
     assert "First-run gateway setup completed, but the gateway is not ready." in transcript
-    assert "fix the listed provider configuration and rerun 'exp'" in str(failure.value)
+    assert "run 'OPENAI_API_KEY=YOUR_API_KEY exp'" in str(failure.value)
     assert "exp config gateway key issue default --key-id RECOVERY_KEY --json" in transcript

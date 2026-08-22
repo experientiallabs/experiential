@@ -148,6 +148,25 @@ def describe_connection_credential(
     )
 
 
+class MissingModelCredentialError(ModelCredentialError):
+    """A configured credential is absent from both the environment and local store."""
+
+    def __init__(self, environment_variable: str, *, connection_id: str) -> None:
+        """Record the missing references without reading or exposing a secret.
+
+        Args:
+            environment_variable: Name of the configured credential environment variable.
+            connection_id: Exact catalog or gateway connection name checked in the store.
+        """
+        self.environment_variable = environment_variable
+        self.connection_id = connection_id
+        self.detail = (
+            f"connection credential environment variable {environment_variable!r} is not set "
+            f"and no stored credential exists for connection {connection_id!r}"
+        )
+        super().__init__(f"{self.detail}; run 'exp config providers' or export the variable")
+
+
 def read_connection_api_key(
     connection: ConnectionConfig,
     *,
@@ -190,10 +209,9 @@ def read_connection_api_key(
                 f"no stored credential exists for connection {connection_id!r}; "
                 "run 'exp config providers' to supply one"
             )
-        raise ModelCredentialError(
-            f"connection credential environment variable {connection.api_key_env!r} is not set "
-            f"and no stored credential exists for connection {connection_id!r}; "
-            "run 'exp config providers' or export the variable"
+        raise MissingModelCredentialError(
+            connection.api_key_env,
+            connection_id=connection_id,
         )
     return resolved.value
 

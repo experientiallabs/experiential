@@ -56,7 +56,7 @@ from exp.runtime.gateway.service import GatewayService
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore, SystemGatewayClock
 from exp.runtime.gateway.usage import read_usage_report
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
-from exp.runtime.models.credentials import ModelCredentialError
+from exp.runtime.models.credentials import MissingModelCredentialError, ModelCredentialError
 from exp.runtime.openai_protocol.state import ResponseContinuationStore, ResponseReplayStore
 from exp.runtime.router.errors import RouterApplicationError
 from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntimeIntegrityError
@@ -600,6 +600,7 @@ def _load_alias_state(
     exact_models: dict[tuple[str, str, str, str], str] = {}
     readiness: list[ExecutionSnapshot] = []
     unavailable_aliases: list[tuple[str, str]] = []
+    missing_credential_variables: set[str] = set()
 
     for alias in aliases:
         try:
@@ -614,7 +615,11 @@ def _load_alias_state(
             try:
                 proof = _direct_readiness(manager, alias, normalized, runtime_catalog)
             except (GatewayLifecycleError, ModelConnectionError, ModelCredentialError) as exc:
-                unavailable_aliases.append((alias.alias_name, str(exc)))
+                if isinstance(exc, MissingModelCredentialError):
+                    unavailable_aliases.append((alias.alias_name, exc.detail))
+                    missing_credential_variables.add(exc.environment_variable)
+                else:
+                    unavailable_aliases.append((alias.alias_name, str(exc)))
                 continue
             normalized_catalogs[key] = normalized
             runtime_catalogs[key] = runtime_catalog
@@ -666,7 +671,11 @@ def _load_alias_state(
             ProjectActivationError,
             RouterRuntimeIntegrityError,
         ) as exc:
-            unavailable_aliases.append((alias.alias_name, str(exc)))
+            if isinstance(exc, MissingModelCredentialError):
+                unavailable_aliases.append((alias.alias_name, exc.detail))
+                missing_credential_variables.add(exc.environment_variable)
+            else:
+                unavailable_aliases.append((alias.alias_name, str(exc)))
             continue
         activations[(project_ref, activation_ref, catalog_sha256)] = runtime
         normalized_catalogs[key] = normalized
@@ -678,9 +687,15 @@ def _load_alias_state(
             f"{alias_name} ({reason})" for alias_name, reason in sorted(unavailable_aliases)
         )
         detail = f": {unavailable}" if unavailable else ""
+        if missing_credential_variables:
+            assignments = " ".join(
+                f"{variable}=YOUR_API_KEY" for variable in sorted(missing_credential_variables)
+            )
+            remediation = f"; run '{assignments} exp'"
+        else:
+            remediation = "; fix the listed provider configuration and rerun 'exp'"
         raise GatewayLifecycleError(
-            "no granted active alias is locally available"
-            f"{detail}; fix the listed provider configuration and rerun 'exp'"
+            f"no granted active alias is locally available{detail}{remediation}"
         )
 
     return _AliasAuthorityState(
