@@ -13,8 +13,8 @@ returns one JSON string so the boundary stays narrow and typed on both sides.
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
 the caller, mirroring ``GatewayService`` error mapping. Requests the native
-path cannot serve (project aliases, multi-deployment pools, providers without
-a native dialect) are answered with an ``{"escalate": reason}`` admission
+path cannot serve (multi-deployment pools, providers without a native
+dialect) are answered with an ``{"escalate": reason}`` admission
 disposition before any ledger write; the data plane replays those against the
 embedded python engine, which performs its own full authorization and
 accounting, so nothing is double-counted.
@@ -78,6 +78,7 @@ from exp.runtime.openai_protocol.requests import (
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
     ProtocolNamespace,
+    episode_namespace,
     replay_key,
 )
 
@@ -312,13 +313,11 @@ class NativeControlPlane:
         # full accounting for every request it serves. Routing failures found
         # by the probe are recorded against the accepted request below, the
         # same order the python engine writes them.
-        if not isinstance(authorization.target, DirectTarget):
-            return _escalation("project-backed aliases use learned selection on the python engine")
         probe_failure: Exception | None = None
         route: GatewayRoute | None = None
         profile: GatewayWireProfile | None = None
         try:
-            route = self._components.routes.resolve_direct(authorization)
+            route = self._resolve_route(authorization, request)
             profile = self._wire_profile(route)
         except _NativeDialectUnavailableError as exc:
             return _escalation(str(exc))
@@ -334,9 +333,7 @@ class NativeControlPlane:
             self._components.ledger.accept_request(authorization=authorization)
             accepted = True
             if probe_failure is not None or route is None or profile is None:
-                raise probe_failure or GatewayRoutingError(
-                    "authorized direct route did not resolve"
-                )
+                raise probe_failure or GatewayRoutingError("authorized route did not resolve")
             deployment = route.deployment
             require_gateway_provider(deployment.provider)
             preflight_gateway_request(provider_request, deployment.gateway.capabilities)
@@ -723,6 +720,49 @@ class NativeControlPlane:
             )
         except OpenAIProtocolError as exc:
             raise NativeBridgeError(exc) from exc
+
+    def _resolve_route(
+        self,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+    ) -> GatewayRoute:
+        """Resolve one direct or project route without an event loop.
+
+        Direct pools resolve entirely inside frozen in-memory catalogs.
+        Project targets run frozen learned selection synchronously on this
+        worker thread through the same selection seam and the same episode
+        identity derivation the python engine uses, so the two engines share
+        one policy execution path. Request-time embedding failure falls back
+        to the frozen conservative baseline inside the shared runtime, and
+        neither path mutates policy or evidence.
+
+        Args:
+            authorization: Frozen authenticated alias revision and target.
+            request: Canonical decoded gateway request.
+
+        Returns:
+            Frozen exact model, pool, and one launch deployment.
+
+        Raises:
+            GatewayRoutingError: Catalog identity or target resolution failed.
+            ProviderDeadlineExceeded: No request-wide time remains.
+        """
+        if isinstance(authorization.target, DirectTarget):
+            return self._components.routes.resolve_direct(authorization)
+        episode = episode_namespace(
+            namespace=ProtocolNamespace(
+                organization_id=authorization.organization_id,
+                identity_id=authorization.identity_id,
+                alias_revision_id=authorization.alias_revision_id,
+            ),
+            caller_episode_key=request.idempotency_key or request.client_request_id,
+            request_id=authorization.request_id,
+        )
+        return self._components.routes.resolve_project_blocking(
+            authorization=authorization,
+            request=request,
+            episode_namespace=episode,
+        )
 
     def _wire_profile(self, route: GatewayRoute) -> GatewayWireProfile:
         """Resolve one deployment's public wire profile for the data plane.

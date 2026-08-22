@@ -1244,6 +1244,25 @@ class _ProjectResolver:
             activation_ref=target.activation_ref,
         )
 
+    def select_blocking(
+        self,
+        *,
+        target: GatewayTarget,
+        request: GatewayRequest,
+        episode_namespace: tuple[str, str, str, str],
+        deadline_monotonic: float,
+    ) -> ProjectSelection:
+        """Return the fixed decision on the synchronous selection seam."""
+        del request, episode_namespace, deadline_monotonic
+        if not isinstance(target, ProjectTarget):
+            raise AssertionError("project resolver received a direct target")
+        self.calls += 1
+        return ProjectSelection(
+            exact_model_id="exact-one",
+            selected_alias=self._selected_alias,
+            activation_ref=target.activation_ref,
+        )
+
 
 class _ScriptedProvider:
     """Open scripted streams or failures while recording dispatch identity."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -12,6 +13,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
+from exp.common.routing.policy import RoutingDecision
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -170,6 +172,65 @@ class CatalogRouteResolver:
             episode_namespace=episode_namespace,
             deadline_monotonic=authorization.deadline_monotonic,
         )
+        return self._project_route(view=view, authorization=authorization, selection=selection)
+
+    def resolve_project_blocking(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        episode_namespace: tuple[str, str, str, str],
+    ) -> GatewayRoute:
+        """Resolve one project target from a caller thread without an event loop.
+
+        The native engine's control-plane bridge runs on Rust worker threads, so
+        it uses this synchronous path. It applies the same frozen-catalog checks,
+        the same selection seam, and the same route construction as the async
+        resolver, so the two engines cannot drift on project routing.
+
+        Args:
+            authorization: Frozen authenticated alias revision and target.
+            request: Canonical request visible to learned selection.
+            episode_namespace: Tenant-isolated sticky selection identity.
+
+        Returns:
+            Frozen exact model, pool, and one launch deployment.
+
+        Raises:
+            GatewayRoutingError: Catalog identity or target resolution is invalid.
+            ProviderDeadlineExceeded: No request-wide time remains for selection.
+        """
+        target = authorization.target
+        if not isinstance(target, ProjectTarget):
+            raise GatewayRoutingError("blocking project resolution requires a project target")
+        view = self._catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
+        if view is None:
+            raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
+        if target.catalog_sha256 != authorization.catalog_sha256:
+            raise GatewayRoutingError("project target catalog differs from authorized authority")
+        if self._project_resolver is None:
+            raise GatewayRoutingError("project target is not activated in this process")
+        try:
+            selection = self._project_resolver.select_blocking(
+                target=target,
+                request=request,
+                episode_namespace=episode_namespace,
+                deadline_monotonic=authorization.deadline_monotonic,
+            )
+        except (GatewayRoutingError, ProviderDeadlineExceeded):
+            raise
+        except Exception as exc:
+            raise GatewayRoutingError("project selection failed") from exc
+        return self._project_route(view=view, authorization=authorization, selection=selection)
+
+    def _project_route(
+        self,
+        *,
+        view: _CatalogView,
+        authorization: AuthorizationSnapshot,
+        selection: ProjectSelection,
+    ) -> GatewayRoute:
+        """Map one learned selection to its unambiguous frozen pool and route."""
         selected_deployments = tuple(
             item
             for item in view.catalog.deployments
@@ -344,6 +405,9 @@ class RouterProjectTargetResolver:
         self._activations = dict(activations)
         self._exact_models_by_alias = dict(exact_models_by_alias)
         self._permits = asyncio.Semaphore(maximum_outstanding_selections)
+        # The blocking path runs on data-plane worker threads with no event
+        # loop, so it keeps its own bounded lane of the same width.
+        self._thread_permits = threading.Semaphore(maximum_outstanding_selections)
 
     async def select(
         self,
@@ -364,11 +428,7 @@ class RouterProjectTargetResolver:
         Returns:
             Exact logical model and content-free learned selection details.
         """
-        runtime = self._activations.get(
-            (target.project_ref, target.activation_ref, target.catalog_sha256)
-        )
-        if runtime is None:
-            raise GatewayRoutingError("project activation is not loaded")
+        runtime = self._runtime(target)
         deadline = RequestDeadline(deadline_monotonic)
         deadline.attempt_timeout()
         model_request = gateway_model_request(request)
@@ -398,6 +458,71 @@ class RouterProjectTargetResolver:
                 episode_id=episode_id,
                 prepared=prepared,
             )
+        return self._selection(target, decision)
+
+    def select_blocking(
+        self,
+        *,
+        target: ProjectTarget,
+        request: GatewayRequest,
+        episode_namespace: tuple[str, str, str, str],
+        deadline_monotonic: float,
+    ) -> ProjectSelection:
+        """Select one logical model synchronously on the caller's thread.
+
+        The frozen ``RouterRuntime`` selection primitives are thread-safe, so
+        this runs the same sticky reuse, unretained selection, and retention
+        sequence as :meth:`select` without an event loop. A selection that
+        overruns the request-wide deadline is detected after it returns, at
+        the post-selection deadline check.
+
+        Args:
+            target: Frozen project activation target.
+            request: Canonical gateway request converted only for learned selection.
+            episode_namespace: Tenant-isolated sticky episode identity.
+            deadline_monotonic: Absolute request-wide deadline.
+
+        Returns:
+            Exact logical model and content-free learned selection details.
+        """
+        runtime = self._runtime(target)
+        deadline = RequestDeadline(deadline_monotonic)
+        deadline.attempt_timeout()
+        model_request = gateway_model_request(request)
+        episode_id = project_episode_identity(episode_namespace)
+        decision = runtime._reuse_sticky_selection(  # noqa: SLF001 - selection-only bridge.
+            model_request,
+            episode_id=episode_id,
+        )
+        if decision is None:
+            if not self._thread_permits.acquire(timeout=deadline.attempt_timeout()):
+                raise ProviderDeadlineExceeded("router selection queue deadline exceeded")
+            try:
+                prepared = runtime._select_unretained(  # noqa: SLF001 - selection-only bridge.
+                    model_request,
+                    episode_id=episode_id,
+                )
+            finally:
+                self._thread_permits.release()
+            deadline.attempt_timeout()
+            decision = runtime._retain_prepared_selection(  # noqa: SLF001 - selection-only.
+                model_request,
+                episode_id=episode_id,
+                prepared=prepared,
+            )
+        return self._selection(target, decision)
+
+    def _runtime(self, target: ProjectTarget) -> RouterRuntime:
+        """Return the loaded frozen runtime for one activation or fail closed."""
+        runtime = self._activations.get(
+            (target.project_ref, target.activation_ref, target.catalog_sha256)
+        )
+        if runtime is None:
+            raise GatewayRoutingError("project activation is not loaded")
+        return runtime
+
+    def _selection(self, target: ProjectTarget, decision: RoutingDecision) -> ProjectSelection:
+        """Project one routing decision onto its frozen exact-model identity."""
         exact_model_id = self._exact_models_by_alias.get(
             (
                 target.project_ref,

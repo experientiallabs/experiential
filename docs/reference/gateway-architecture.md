@@ -42,7 +42,7 @@ The public surface is identical under either engine. An embedded python engine
 over the same authority, ledger, and routes listens on an internal loopback
 port, and the native engine forwards to it everything outside its fast path:
 `POST /v1/responses`, chat requests carrying `Idempotency-Key` or
-`X-Client-Request-Id` (replay semantics), project-backed aliases,
+`X-Client-Request-Id` (replay semantics),
 multi-deployment pools (the certified waterfall), providers without a native
 dialect, and unknown routes. Escalation happens
 before any ledger write, so each request is accounted exactly once by the

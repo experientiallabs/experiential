@@ -840,6 +840,106 @@ def test_timed_out_project_selection_cannot_publish_late_sticky_state() -> None:
     assert recorded == []
 
 
+def test_blocking_selection_matches_async_selection_and_shares_sticky_state() -> None:
+    """The synchronous seam returns the async decision and reuses its retained state."""
+    runtime, client = _runtime()
+    target = ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256=_DIGEST,
+    )
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): runtime},
+        {
+            ("project-one", "activation-one", _DIGEST, "baseline"): "exact-baseline",
+            ("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap",
+        },
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+    namespace = ("org", "identity", "revision", "episode")
+
+    blocking = resolver.select_blocking(
+        target=target,
+        request=request,
+        episode_namespace=namespace,
+        deadline_monotonic=__import__("time").monotonic() + 1,
+    )
+    async_selection = asyncio.run(
+        resolver.select(
+            target=target,
+            request=request,
+            episode_namespace=namespace,
+            deadline_monotonic=__import__("time").monotonic() + 1,
+        )
+    )
+
+    assert async_selection == blocking
+    assert client.embed_calls == 1
+
+
+def test_blocking_selection_falls_back_to_frozen_baseline_on_embedding_failure() -> None:
+    """A request-time embed failure lands the conservative baseline synchronously."""
+    runtime, client = _runtime()
+    client.embedding_values = RuntimeError("embed failed")
+    target = ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256=_DIGEST,
+    )
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): runtime},
+        {("project-one", "activation-one", _DIGEST, "baseline"): "exact-baseline"},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+
+    selection = resolver.select_blocking(
+        target=target,
+        request=request,
+        episode_namespace=("org", "identity", "revision", "episode"),
+        deadline_monotonic=__import__("time").monotonic() + 1,
+    )
+
+    assert selection.selected_alias == "baseline"
+    assert selection.exact_model_id == "exact-baseline"
+    assert selection.fallback_reason == "embedding_error"
+    assert client.embed_calls == 1
+
+
+def test_blocking_selection_expired_deadline_raises_before_any_selection_work() -> None:
+    """An already-expired request deadline fails closed without touching the client."""
+    runtime, client = _runtime()
+    resolver = RouterProjectTargetResolver(
+        {("project-one", "activation-one", _DIGEST): runtime},
+        {("project-one", "activation-one", _DIGEST, "cheap"): "exact-cheap"},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="route"),),
+    )
+
+    with pytest.raises(ProviderDeadlineExceeded):
+        resolver.select_blocking(
+            target=ProjectTarget(
+                project_ref="project-one",
+                activation_ref="activation-one",
+                catalog_sha256=_DIGEST,
+            ),
+            request=request,
+            episode_namespace=("org", "identity", "revision", "episode"),
+            deadline_monotonic=__import__("time").monotonic() - 1,
+        )
+
+    assert client.embed_calls == 0
+    assert runtime._episode_decisions == {}  # noqa: SLF001 - deadline isolation regression
+    assert runtime._request_decisions == {}  # noqa: SLF001 - deadline isolation regression
+
+
 def test_cached_selection_and_completion_reuse_sealed_activation_without_rehashing() -> None:
     """Forged decisions reject while exact retries reuse immutable activation state."""
     runtime, client = _runtime()
