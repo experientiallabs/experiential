@@ -86,10 +86,9 @@ jobs:
         if: matrix.cargo-target == null
         shell: bash
         run: |
-          uv venv --python 3.12 /tmp/native-smoke || uv venv --python 3.12 native-smoke
-          venv_python="/tmp/native-smoke/bin/python"
+          uv venv --python 3.12 native-smoke
+          venv_python="native-smoke/bin/python"
           [ -x "$venv_python" ] || venv_python="native-smoke/Scripts/python.exe"
-          [ -x "$venv_python" ] || venv_python="native-smoke/bin/python"
           uv pip install --python "$venv_python" native-dist/*.whl
           "$venv_python" -c "import exp_gateway_native as n; assert n.__version__; assert callable(n.serve)"
       - uses: actions/upload-artifact@v4
