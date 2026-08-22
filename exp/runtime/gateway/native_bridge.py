@@ -54,7 +54,7 @@ from exp.runtime.gateway.execution import (
 )
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
-from exp.runtime.gateway.usage import read_usage_report
+from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 from exp.runtime.models.providers import (
     preflight_gateway_request,
     require_gateway_provider,
@@ -435,13 +435,64 @@ class NativeControlPlane:
         return json.dumps(body, separators=(",", ":"))
 
     def usage_json(self, argument: str) -> str:
-        """Return the content-free usage report body."""
-        del argument
-        report = read_usage_report(
+        """Return the content-free usage report body.
+
+        Args:
+            argument: JSON object with an optional ``raw_key``. A presented
+                key scopes the report to its owning identity; an absent key
+                returns the organization-wide report.
+
+        Returns:
+            The schema-versioned usage report as one JSON object.
+
+        Raises:
+            NativeBridgeError: The presented key is invalid, expired, or revoked.
+        """
+        report = self._usage_report(argument)
+        return json.dumps(report.model_dump(mode="json"), separators=(",", ":"))
+
+    def usage_page(self, argument: str) -> str:
+        """Return the content-free usage page rendering.
+
+        Args:
+            argument: JSON object with an optional ``raw_key``, scoped exactly
+                like :meth:`usage_json`.
+
+        Returns:
+            JSON object with one ``html`` field holding the rendered page.
+
+        Raises:
+            NativeBridgeError: The presented key is invalid, expired, or revoked.
+        """
+        report = self._usage_report(argument)
+        return json.dumps({"html": usage_html(report)}, separators=(",", ":"))
+
+    def _usage_report(self, argument: str) -> GatewayUsageReport:
+        """Read the usage report for one optionally key-scoped callback.
+
+        Args:
+            argument: JSON object with an optional ``raw_key``.
+
+        Returns:
+            The organization-wide report, or the report scoped to the
+            presented key's identity.
+
+        Raises:
+            NativeBridgeError: The presented key is invalid, expired, or revoked.
+        """
+        data = json.loads(argument)
+        raw_key = data.get("raw_key")
+        identity_id: str | None = None
+        if raw_key is not None:
+            try:
+                _, identity_id = self._components.store.authenticated_identity(raw_key=str(raw_key))
+            except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+                raise _authority_error(exc) from exc
+        return read_usage_report(
             self._components.ledger,
             organization_id=self._components.organization_id,
+            identity_id=identity_id,
         )
-        return json.dumps(report.model_dump(mode="json"), separators=(",", ":"))
 
     def readiness(self, argument: str) -> str:
         """Return whether shared executor and bridge accounting stay healthy."""

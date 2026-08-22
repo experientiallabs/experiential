@@ -44,7 +44,7 @@ port, and the native engine forwards to it everything outside its fast path:
 `POST /v1/responses`, chat requests carrying `Idempotency-Key` or
 `X-Client-Request-Id` (replay semantics), project-backed aliases,
 multi-deployment pools (the certified waterfall), providers without a native
-dialect, `GET /usage`, and unknown routes. Escalation happens
+dialect, and unknown routes. Escalation happens
 before any ledger write, so each request is accounted exactly once by the
 engine that serves it. Shutdown drains admitted work on both engines within
 `--graceful-timeout`.
@@ -214,6 +214,9 @@ SQLite stores hashes, frozen authority, route identity, state transitions, token
 and estimated cost. It never stores prompts, responses, raw tool arguments, raw virtual keys, or
 provider secrets. `GET /usage` and `GET /usage.json` are two renderings of the same schema-v2 report
 and expose only aggregate, per-identity, and physical-attempt `by_billing_source` accounting.
+An anonymous request reads the organization-wide report; a request carrying a virtual key as
+`Authorization: Bearer <key>` reads the report scoped to that key's identity, and an invalid
+key is rejected with the standard 401 error.
 Source buckets conserve attempt, token, known-cost, unknown-cost, and terminal-state totals but do
 not partition logical request counts. Estimated cost is attribution, not a provider invoice.
 

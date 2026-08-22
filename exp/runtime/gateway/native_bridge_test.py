@@ -577,3 +577,65 @@ def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
         )
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 2
+
+
+def _settle_one_completed_chat(control: NativeControlPlane, raw_key: str) -> None:
+    """Admit and settle one completed chat request for the presented key."""
+    admission = _admit(control, raw_key, _chat_body())
+    settled = control.settle(
+        json.dumps(
+            {
+                "request_id": admission["request_id"],
+                "attempt_id": admission["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+    assert settled == "{}"
+
+
+def test_usage_callbacks_scope_reports_to_the_presented_key(tmp_path: Path) -> None:
+    """A key sees only its own identity; anonymous callers see the whole organization."""
+    control, raw_key = _control_plane(tmp_path)
+    manager = GatewayManagement(tmp_path)
+    manager.create_identity(identity_id="neighbor", display_name="Neighbor")
+    manager.add_grant(identity_id="neighbor", alias_id="coding")
+    neighbor_key = manager.issue_key(identity_id="neighbor", key_id="key-neighbor").raw_key
+    _settle_one_completed_chat(control, raw_key)
+
+    organization_wide = json.loads(control.usage_json("{}"))
+    assert organization_wide["totals"]["requests"] == 1
+    assert [item["identity_id"] for item in organization_wide["identities"]] == [
+        "default",
+        "neighbor",
+    ]
+
+    scoped = json.loads(control.usage_json(json.dumps({"raw_key": raw_key})))
+    assert scoped["totals"]["requests"] == 1
+    assert [item["identity_id"] for item in scoped["identities"]] == ["default"]
+
+    isolated = json.loads(control.usage_json(json.dumps({"raw_key": neighbor_key})))
+    assert isolated["totals"]["requests"] == 0
+    assert isolated["totals"]["input_tokens"] == 0
+    assert [item["identity_id"] for item in isolated["identities"]] == ["neighbor"]
+    assert isolated["by_billing_source"] == []
+
+    page = json.loads(control.usage_page(json.dumps({"raw_key": raw_key})))
+    assert "Gateway usage" in page["html"]
+    assert "default" in page["html"]
+    isolated_page = json.loads(control.usage_page(json.dumps({"raw_key": neighbor_key})))
+    assert "default" not in isolated_page["html"]
+
+
+def test_usage_callbacks_reject_an_invalid_key(tmp_path: Path) -> None:
+    """A bad key on either usage callback maps to the shared 401 public error."""
+    control, _raw_key = _control_plane(tmp_path)
+    for callback in (control.usage_json, control.usage_page):
+        with pytest.raises(NativeBridgeError) as excinfo:
+            callback(json.dumps({"raw_key": "exp_vk_invalid"}))
+        payload = json.loads(excinfo.value.public_error_json)
+        assert payload["status_code"] == 401
+        assert payload["code"] == "invalid_key"

@@ -251,7 +251,7 @@ def _run_rust_gateway(
     The rust engine owns the public socket and the anonymous Chat Completions
     fast path; a python engine over the same authority, ledger, and routes
     runs on an internal loopback port and serves Responses, replay-keyed
-    chat, project-backed aliases, and the usage page.
+    chat, and project-backed aliases.
 
     Args:
         root: Local artifact and model-catalog root.

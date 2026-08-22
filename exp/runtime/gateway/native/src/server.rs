@@ -157,7 +157,8 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         .route("/v1/chat/completions", post(chat))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route("/usage.json", get(usage_json))
+        .route("/usage.json", get(usage_json).fallback(proxy_fallback))
+        .route("/usage", get(usage_page).fallback(proxy_fallback))
         .fallback(proxy_fallback)
         .with_state(state);
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
@@ -275,10 +276,45 @@ async fn health_ready(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn usage_json(State(state): State<AppState>) -> Response {
-    match state.bridge.call("usage_json", "{}".to_string()).await {
+/// Build the usage callback argument: an anonymous request reads the
+/// organization-wide report, a Bearer key scopes it to the key's identity.
+fn usage_argument(headers: &HeaderMap) -> Result<String, PublicError> {
+    if headers.get(header::AUTHORIZATION).is_none() {
+        return Ok("{}".to_string());
+    }
+    let raw_key = bearer_key(headers)?;
+    Ok(compact_json(&json!({"raw_key": raw_key})))
+}
+
+async fn usage_json(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let argument = match usage_argument(&headers) {
+        Ok(argument) => argument,
+        Err(error) => return error_response(&error),
+    };
+    match state.bridge.call("usage_json", argument).await {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
             Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
+            Err(_) => error_response(&PublicError::internal()),
+        },
+        Err(error) => error_response(&error),
+    }
+}
+
+async fn usage_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let argument = match usage_argument(&headers) {
+        Ok(argument) => argument,
+        Err(error) => return error_response(&error),
+    };
+    match state.bridge.call("usage_page", argument).await {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(payload) => match payload.get("html").and_then(Value::as_str) {
+                Some(html) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                    .body(Body::from(html.to_string()))
+                    .unwrap_or_else(|_| Response::new(Body::empty())),
+                None => error_response(&PublicError::internal()),
+            },
             Err(_) => error_response(&PublicError::internal()),
         },
         Err(error) => error_response(&error),

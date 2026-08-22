@@ -26,9 +26,9 @@ use crate::server::ServeConfig;
 /// Serve the gateway data plane until shutdown (SIGINT or SIGTERM).
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
-/// `settle`, `models`, `model_detail`, `usage_json`, and `readiness`, each
-/// taking and returning one JSON string. `config_json` carries host, port,
-/// and concurrency bounds.
+/// `settle`, `models`, `model_detail`, `usage_json`, `usage_page`, and
+/// `readiness`, each taking and returning one JSON string. `config_json`
+/// carries host, port, and concurrency bounds.
 #[pyfunction]
 fn serve(py: Python<'_>, control_plane: Py<PyAny>, config_json: &str) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)

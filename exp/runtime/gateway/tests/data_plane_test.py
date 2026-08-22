@@ -136,6 +136,11 @@ class _ControlStore:
         """Authenticate one key without loading grants or request content."""
         self.raw_keys_seen.append(raw_key)
 
+    def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
+        """Return the fixed organization and identity owning every key."""
+        self.raw_keys_seen.append(raw_key)
+        return ("organization-one", "identity-one")
+
     def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
         """Return the only granted public alias."""
         self.raw_keys_seen.append(raw_key)

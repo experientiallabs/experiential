@@ -293,6 +293,10 @@ class _ReadyControlStore:
         """Delegate authentication without consulting alias readiness."""
         self.store.authenticate_key(raw_key=raw_key)
 
+    def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
+        """Delegate key-owner resolution without consulting alias readiness."""
+        return self.store.authenticated_identity(raw_key=raw_key)
+
     def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
         """Return granted aliases whose active revision is currently served."""
         return tuple(
@@ -515,9 +519,14 @@ def compose_local_gateway(
         executor=components.executor,
         clock=SystemGatewayClock(),
         readiness=readiness_probe,
-        usage=lambda: read_usage_report(
+        usage=lambda raw_key: read_usage_report(
             components.ledger,
             organization_id=components.organization_id,
+            identity_id=(
+                None
+                if raw_key is None
+                else components.store.authenticated_identity(raw_key=raw_key)[1]
+            ),
         ),
         replay=replay,
         continuations=continuations,

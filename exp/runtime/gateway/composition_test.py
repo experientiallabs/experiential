@@ -20,14 +20,17 @@ from exp.runtime.gateway.composition import (
     GatewayRuntime,
     GatewayRuntimeConfig,
     GatewayTerminalFlusher,
+    GatewayUsageSupplier,
     create_gateway_runtime,
 )
 from exp.runtime.gateway.contracts import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
+from exp.runtime.gateway.interfaces import GatewayControlStore
+from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import LocalGatewayRuntime, load_local_gateway
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.tests.launch_test import _configure_gateway, _LoopbackProvider
-from exp.runtime.gateway.usage import read_usage_report
+from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report
 
 _DYNAMIC_FIELDS = frozenset({"completed_at", "created", "created_at", "id", "request_id"})
 
@@ -186,7 +189,7 @@ def test_injected_runtime_matches_local_http_surface_end_to_end(tmp_path: Path) 
         executor=service._executor,  # noqa: SLF001 - parity seam evidence
         clock=service._clock,  # noqa: SLF001 - parity seam evidence
         readiness=service._readiness_probe,  # noqa: SLF001 - parity seam evidence
-        usage=lambda: read_usage_report(ledger.core, organization_id=manager.organization_id),
+        usage=_scoped_usage_supplier(service._control, ledger.core, manager.organization_id),  # noqa: SLF001 - parity seam evidence
     )
 
     try:
@@ -223,9 +226,39 @@ def _compose_from_local(
         executor=service._executor,  # noqa: SLF001 - parity seam evidence
         clock=service._clock,  # noqa: SLF001 - parity seam evidence
         readiness=readiness or service._readiness_probe,  # noqa: SLF001
-        usage=lambda: read_usage_report(ledger.core, organization_id=manager.organization_id),
+        usage=_scoped_usage_supplier(service._control, ledger.core, manager.organization_id),  # noqa: SLF001 - parity seam evidence
         terminal_flusher=terminal_flusher,
     )
+
+
+def _scoped_usage_supplier(
+    control: GatewayControlStore,
+    ledger: SQLiteAttemptLedger,
+    organization_id: str,
+) -> GatewayUsageSupplier:
+    """Build a usage supplier scoping presented keys to their identity.
+
+    Args:
+        control: Authority resolving a raw key to its owning identity.
+        ledger: Attempt ledger aggregated into the report.
+        organization_id: Organization owning the reported identities.
+
+    Returns:
+        Supplier matching the managed application's usage seam.
+    """
+
+    def _supply(raw_key: str | None) -> GatewayUsageReport:
+        """Read the report, scoped to the presented key's identity if any."""
+        identity_id = (
+            None if raw_key is None else control.authenticated_identity(raw_key=raw_key)[1]
+        )
+        return read_usage_report(
+            ledger,
+            organization_id=organization_id,
+            identity_id=identity_id,
+        )
+
+    return _supply
 
 
 def _exercise_surface(client: TestClient, *, raw_key: str) -> dict[str, JsonValue]:
