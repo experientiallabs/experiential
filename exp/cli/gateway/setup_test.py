@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,8 @@ from exp.cli.shared.picker import PickerKey
 from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.config import load_settings
 from exp.common.models import ConnectionConfig, ModelCapabilities, PricingSource, ProviderConnection
+from exp.runtime.gateway.auth import IssuedVirtualKey
+from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 _LOCAL_GATEWAY_EXCLUDE = frozenset({SETUP_PICKER_NAME})
 
@@ -423,6 +426,58 @@ def test_gateway_setup_rolls_back_all_authority_when_key_issue_fails(
         manager.keys(),
     )
     assert after == before
+
+
+def test_gateway_setup_keeps_selected_budget_when_activation_outcome_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown SQLite outcome keeps settings aligned with potentially committed authority."""
+    endpoints, models = _prepared_gateway_models()
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
+    )
+    first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    issued = IssuedVirtualKey(
+        key_id="key-unknown",
+        organization_id="local",
+        identity_id=first.identity_id,
+        prefix="exp_vk_test",
+        raw_key="exp_vk_test_secret",
+        expires_at=None,
+        created_at=datetime.now(UTC),
+    )
+
+    def unknown_activation(*_args: object, **_kwargs: object) -> tuple[bool, IssuedVirtualKey]:
+        """Simulate an activation whose COMMIT acknowledgement is indeterminate."""
+        raise AliasActivationOutcomeUnknownError(
+            alias_id=first.alias,
+            revision_id="revision-unknown",
+            issued=issued,
+        )
+
+    monkeypatch.setattr(
+        setup.GatewayManagement,
+        "configure_direct_alias_with_identity",
+        unknown_activation,
+    )
+
+    with pytest.raises(AliasActivationOutcomeUnknownError, match="operation_outcome_unknown"):
+        setup.interactive_gateway_setup(
+            tmp_path,
+            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\n"),
+            allow_reconfigure=True,
+        )
+
+    assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
 
 
 def test_gateway_setup_writes_budget_before_gateway_initialization(

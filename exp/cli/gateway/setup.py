@@ -59,7 +59,7 @@ class InteractiveSetupResult:
 
 @contextmanager
 def _command_budget_compensation(root: Path, maximum_cost_usd: float) -> Iterator[None]:
-    """Persist the selected budget and restore its exact preimage on setup failure.
+    """Persist the selected budget and compensate only proven setup failures.
 
     Args:
         root: EXP root owning the settings file.
@@ -77,6 +77,10 @@ def _command_budget_compensation(root: Path, maximum_cost_usd: float) -> Iterato
     try:
         set_maximum_command_cost_usd(maximum_cost_usd, root)
         yield
+    except AliasActivationOutcomeUnknownError:
+        # The SQLite commit may have landed, so keep the selected budget alongside the
+        # potentially committed serving authority for operator reconciliation.
+        raise
     except BaseException:
         try:
             with file_write_lock(configured_path, what="gateway setup budget compensation"):

@@ -6,6 +6,7 @@ import io
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -19,6 +20,8 @@ import exp.cli.gateway.serve as run_app
 from exp.cli.app import app
 from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 from exp.cli.gateway.setup import InteractiveSetupResult
+from exp.runtime.gateway.auth import IssuedVirtualKey
+from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 
 @pytest.mark.parametrize("ghost", [False, True])
@@ -269,4 +272,54 @@ def test_first_run_delivers_credentials_before_readiness_failure(
     assert "export OPENAI_API_KEY" not in transcript
     assert "First-run gateway setup completed, but the gateway is not ready." in transcript
     assert "run 'OPENAI_API_KEY=YOUR_API_KEY exp'" in str(failure.value)
+    assert "exp config gateway key issue default --key-id RECOVERY_KEY --json" in transcript
+
+
+def test_first_run_unknown_setup_outcome_delivers_the_only_raw_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The serving boundary preserves a key attached to an indeterminate setup commit."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, highlight=False)
+    issued = IssuedVirtualKey(
+        key_id="key-unknown",
+        organization_id="local",
+        identity_id="default",
+        prefix="exp_vk_test",
+        raw_key="exp_vk_unknown_secret",
+        expires_at=None,
+        created_at=datetime.now(UTC),
+    )
+
+    def interactive_setup(root: Path) -> InteractiveSetupResult:
+        """Raise the typed uncertainty that must retain its one-time secret."""
+        assert root == tmp_path
+        raise AliasActivationOutcomeUnknownError(
+            alias_id="default-gateway",
+            revision_id="revision-unknown",
+            issued=issued,
+        )
+
+    monkeypatch.setattr(run_app, "_console", console)
+    monkeypatch.setattr("exp.cli.gateway.setup.interactive_gateway_setup", interactive_setup)
+    monkeypatch.setattr(run_app.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(run_app.sys, "stdout", SimpleNamespace(isatty=lambda: True))
+
+    with pytest.raises(typer.BadParameter, match="operation_outcome_unknown"):
+        run_app._run_gateway(
+            project=None,
+            root=tmp_path,
+            policy=None,
+            port=8000,
+            ghost=False,
+            non_interactive=False,
+            json_output=False,
+            check=True,
+            graceful_timeout=10.0,
+        )
+
+    transcript = output.getvalue()
+    assert "export EXP_GATEWAY_KEY=exp_vk_unknown_secret" in transcript
+    assert "Preserve this one-time gateway key: exp_vk_unknown_secret" in transcript
     assert "exp config gateway key issue default --key-id RECOVERY_KEY --json" in transcript

@@ -13,6 +13,7 @@ from rich.text import Text
 
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
+from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 LOOPBACK_HOST = "127.0.0.1"
 _LOOPBACK_HOST = LOOPBACK_HOST
@@ -149,8 +150,13 @@ def _run_gateway(
     elif not manager.initialized:
         if non_interactive or json_output or not sys.stdin.isatty() or not sys.stdout.isatty():
             _gateway_not_initialized(json_output=json_output)
-        with usage_error(ValueError):
+        try:
             setup = interactive_gateway_setup(root)
+        except AliasActivationOutcomeUnknownError as exc:
+            _emit_setup_unknown_recovery(port=port, error=exc)
+            raise typer.BadParameter(str(exc)) from None
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from None
         if setup is not None:
             _emit_setup_credentials(port=port, setup=setup)
 
@@ -421,6 +427,46 @@ def emit_setup_credentials(*, port: int, setup: object, console: Console | None 
         console: Optional console receiving the user-facing exports.
     """
     _emit_setup_credentials(port=port, setup=setup, console=console)
+
+
+def _emit_setup_unknown_recovery(
+    *,
+    port: int,
+    error: AliasActivationOutcomeUnknownError,
+) -> None:
+    """Deliver the only raw key when first-run setup has an unknown commit outcome.
+
+    Args:
+        port: Loopback port that the gateway will serve if the setup committed.
+        error: Typed activation error carrying the one-time key material when available.
+    """
+    if error.issued is None:
+        return
+    from exp.cli.gateway.setup import InteractiveSetupResult
+
+    setup = InteractiveSetupResult(
+        identity_id=error.issued.identity_id,
+        alias=error.alias_id,
+        raw_key=error.issued.raw_key,
+    )
+    _emit_setup_credentials(port=port, setup=setup)
+    _console.print(
+        "[yellow]First-run gateway setup outcome is unknown; inspect gateway status before "
+        "retrying.[/yellow]",
+        markup=True,
+    )
+    _console.print(
+        f"Preserve this one-time gateway key: {setup.raw_key}",
+        markup=False,
+    )
+    _console.print(
+        "If the key was not saved, issue a replacement with:",
+        markup=False,
+    )
+    _console.print(
+        f"  exp config gateway key issue {setup.identity_id} --key-id RECOVERY_KEY --json",
+        markup=False,
+    )
 
 
 def _emit_setup_recovery(*, setup: object) -> None:
