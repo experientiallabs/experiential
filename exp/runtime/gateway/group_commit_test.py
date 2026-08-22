@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -22,7 +24,11 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
-from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger, abandoned_write_outcome
+from exp.runtime.gateway.group_commit import (
+    GroupCommitAttemptLedger,
+    SyncGroupCommitLedger,
+    abandoned_write_outcome,
+)
 from exp.runtime.gateway.ledger import GatewayLedgerError, SQLiteAttemptLedger
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
@@ -295,6 +301,137 @@ def test_max_batch_size_must_be_positive(tmp_path: Path) -> None:
     _, core, _ = _authority_fixture(tmp_path, clock)
     with pytest.raises(ValueError, match="at least one"):
         GroupCommitAttemptLedger(core, max_batch_size=0)
+
+
+def test_sync_facade_commits_full_lifecycle_durably_without_an_event_loop(
+    tmp_path: Path,
+) -> None:
+    """The blocking facade lands acceptance, dispatch, and settlement exactly."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    authorization = _authorize(store, clock, raw_key, "sync-prompt")
+    facade.accept_request(authorization=authorization)
+    attempt_id = facade.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        route_reason="direct_alias",
+        fallback_reason=None,
+    )
+    facade.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=100, output_tokens=40),
+        ),
+        failure=None,
+    )
+    facade.flush()
+    grouped.close()
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT state, input_tokens, output_tokens FROM gateway_attempts WHERE attempt_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    request = connection.execute("SELECT terminal_state FROM gateway_requests").fetchone()
+    connection.close()
+    assert row is not None
+    assert str(row["state"]) == "completed"
+    assert int(row["input_tokens"]) == 100
+    assert int(row["output_tokens"]) == 40
+    assert str(request["terminal_state"]) == "completed"
+
+
+def test_sync_facade_raises_the_original_failure_and_stays_usable(tmp_path: Path) -> None:
+    """A rolled-back sync operation re-raises to its caller; the writer keeps
+    serving later operations."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    with pytest.raises(GatewayLedgerError):
+        facade.finish_attempt(attempt_id="attempt-missing", terminal_event=None, failure=None)
+    survivor = _authorize(store, clock, raw_key, "survivor-prompt")
+    facade.accept_request(authorization=survivor)
+    grouped.close()
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    count = connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0]
+    connection.close()
+    assert int(count) == 1
+
+
+def test_concurrent_sync_threads_all_commit_exactly_once(tmp_path: Path) -> None:
+    """Blocking callers on many threads each observe exactly their own durable row."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    authorizations = [_authorize(store, clock, raw_key, f"thread-{index}") for index in range(16)]
+    barrier = threading.Barrier(len(authorizations))
+    errors: list[BaseException] = []
+
+    def accept(authorization: AuthorizationSnapshot) -> None:
+        """Block one thread on its own durable acceptance.
+
+        Args:
+            authorization: This thread's frozen authority snapshot.
+        """
+        try:
+            barrier.wait(timeout=10)
+            facade.accept_request(authorization=authorization)
+        except BaseException as exc:  # noqa: BLE001 - the test asserts no error.
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=accept, args=(authorization,)) for authorization in authorizations
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+    grouped.close()
+    assert errors == []
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    request_ids = [
+        str(row[0])
+        for row in connection.execute("SELECT request_id FROM gateway_requests").fetchall()
+    ]
+    connection.close()
+    assert sorted(request_ids) == sorted(item.request_id for item in authorizations)
+
+
+def test_closed_writer_rejects_sync_operations(tmp_path: Path) -> None:
+    """Sync submissions after close fail fast with a clear closed-writer error."""
+    clock = FakeLedgerClock()
+    _, core, _ = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    grouped.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        facade.flush()
+
+
+def test_writer_startup_failure_fails_sync_callers_instead_of_hanging(
+    tmp_path: Path,
+) -> None:
+    """A writer thread that dies before serving rejects callers rather than
+    stranding them on a queue nothing will ever drain."""
+    clock = FakeLedgerClock()
+    _, core, _ = _authority_fixture(tmp_path, clock)
+    with mock.patch(
+        "exp.runtime.gateway.group_commit.connect_database",
+        side_effect=sqlite3.OperationalError("simulated writer connection loss"),
+    ):
+        grouped = GroupCommitAttemptLedger(core)
+        grouped._thread.join(timeout=10)  # noqa: SLF001 - deterministic crash ordering.
+    facade = SyncGroupCommitLedger(grouped)
+    with pytest.raises(RuntimeError, match="closed"):
+        facade.flush()
 
 
 def test_abandoned_write_returns_committed_attempt_id() -> None:

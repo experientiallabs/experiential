@@ -195,7 +195,7 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
     with mock.patch.object(
         ledger,
-        "finish_attempt",
+        "apply_finish_attempt",
         side_effect=RuntimeError("simulated terminal write loss"),
     ):
         with pytest.raises(NativeBridgeError):
@@ -205,6 +205,67 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     assert control.settle(settlement) == "{}"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
+
+
+def test_bridge_writes_route_through_the_group_commit_writer(tmp_path: Path) -> None:
+    """Admission and settlement never use the raw ledger's one-fsync-per-write
+    methods; every bridge write reaches SQLite through the shared batching
+    writer and still lands in the usage report."""
+    control, raw_key = _control_plane(tmp_path)
+    ledger = control._components.ledger  # noqa: SLF001 - wiring assertion for the test.
+    direct_writes = mock.Mock(side_effect=AssertionError("bridge used the raw per-write path"))
+    with (
+        mock.patch.object(ledger, "accept_request", direct_writes),
+        mock.patch.object(ledger, "start_attempt", direct_writes),
+        mock.patch.object(ledger, "finish_attempt", direct_writes),
+        mock.patch.object(ledger, "finish_request", direct_writes),
+    ):
+        admission = _admit(control, raw_key, _chat_body())
+        assert (
+            control.settle(
+                json.dumps(
+                    {
+                        "request_id": admission["request_id"],
+                        "attempt_id": admission["attempt_id"],
+                        "outcome": "completed",
+                        "usage": {"input_tokens": 7, "output_tokens": 2},
+                        "tool_names": [],
+                        "failure": None,
+                    }
+                )
+            )
+            == "{}"
+        )
+    direct_writes.assert_not_called()
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
+    assert report["totals"]["input_tokens"] == 7
+
+
+def test_closed_writer_makes_settle_raise_and_keeps_the_entry_retryable(
+    tmp_path: Path,
+) -> None:
+    """A settle against a closed group-commit writer raises the sanitized
+    boundary error and retains the exact settlement for later replay."""
+    control, raw_key = _control_plane(tmp_path)
+    admission = _admit(control, raw_key, _chat_body())
+    control._components.write_ledger.close()  # noqa: SLF001 - shutdown-ordering fault injection.
+    settlement = json.dumps(
+        {
+            "request_id": admission["request_id"],
+            "attempt_id": admission["attempt_id"],
+            "outcome": "completed",
+            "usage": {"input_tokens": 4, "output_tokens": 1},
+            "tool_names": [],
+            "failure": None,
+        }
+    )
+    with pytest.raises(NativeBridgeError):
+        control.settle(settlement)
+    with control._lock:  # noqa: SLF001 - registry state assertion.
+        entry = control._inflight[str(admission["request_id"])]  # noqa: SLF001
+    assert entry.pending_settlement is not None
+    assert entry.pending_settlement["outcome"] == "completed"
 
 
 def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None:
@@ -225,7 +286,7 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
     ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
     with mock.patch.object(
         ledger,
-        "finish_attempt",
+        "apply_finish_attempt",
         side_effect=RuntimeError("simulated terminal write loss"),
     ):
         with pytest.raises(NativeBridgeError):

@@ -6,8 +6,11 @@ protocol- and authority-shaped happens here, in the same code the python
 engine runs: request decoding through ``decode_chat``, authorization through
 the shared control store, upstream payload construction through the shared
 ``streaming_requests`` builders, and the same durable SQLite ledger
-transactions. Every boundary call takes and returns one JSON string so the
-boundary stays narrow and typed on both sides.
+transactions. Ledger writes go through the blocking facade over the shared
+group-commit writer, so both engines' writes interleave in the same batched
+fsyncs while every caller still blocks until its own write is durable. Every
+boundary call takes and returns one JSON string so the boundary stays narrow
+and typed on both sides.
 
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
@@ -52,6 +55,7 @@ from exp.runtime.gateway.execution import (
     GatewayExecutionError,
     _require_deployment_identity,  # noqa: PLC2701
 )
+from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.usage import read_usage_report
@@ -159,11 +163,14 @@ def _budget_quota_error() -> NativeBridgeError:
 class NativeControlPlane:
     """Authority and accounting callbacks for the native data plane.
 
-    Methods are called from multiple Rust worker threads. SQLite access is
-    safe through the per-thread connection cache in the gateway store and
-    ledger; the in-flight request registry is guarded by one lock and swept
-    opportunistically so an abandoned reservation cannot outlive its request
-    deadline by more than the sweep grace.
+    Methods are called from multiple Rust worker threads. Ledger writes block
+    on the shared group-commit writer's blocking facade, so concurrent
+    settlements from both engines amortize one fsync per batch while each
+    caller still observes only its own durable commit; reads use the raw
+    ledger's per-thread connection cache. The in-flight request registry is
+    guarded by one lock and swept opportunistically so an abandoned
+    reservation cannot outlive its request deadline by more than the sweep
+    grace.
     """
 
     def __init__(
@@ -181,6 +188,7 @@ class NativeControlPlane:
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
+        self._write_ledger = SyncGroupCommitLedger(components.write_ledger)
         self._request_timeout_seconds = request_timeout_seconds
         self._inflight: dict[str, _InflightAttempt] = {}
         self._lock = threading.Lock()
@@ -288,7 +296,7 @@ class NativeControlPlane:
         accepted = False
         attempt_id: str | None = None
         try:
-            self._components.ledger.accept_request(authorization=authorization)
+            self._write_ledger.accept_request(authorization=authorization)
             accepted = True
             if probe_failure is not None or route is None or profile is None:
                 raise probe_failure or GatewayRoutingError(
@@ -298,7 +306,7 @@ class NativeControlPlane:
             require_gateway_provider(deployment.provider)
             preflight_gateway_request(provider_request, deployment.gateway.capabilities)
             upstream_payload = _build_upstream_payload(profile, provider_request)
-            attempt_id = self._components.ledger.start_attempt(
+            attempt_id = self._write_ledger.start_attempt(
                 snapshot=route.snapshot,
                 deployment=deployment,
                 attempt_ordinal=0,
@@ -386,7 +394,7 @@ class NativeControlPlane:
             return "{}"
         terminal, failure = _terminal_from_settlement(data)
         try:
-            self._components.ledger.finish_attempt(
+            self._write_ledger.finish_attempt(
                 attempt_id=entry.attempt_id,
                 terminal_event=terminal,
                 failure=failure,
@@ -594,7 +602,7 @@ class NativeControlPlane:
     ) -> None:
         """Land one swept settlement; keep the entry for retry on failure."""
         try:
-            self._components.ledger.finish_attempt(
+            self._write_ledger.finish_attempt(
                 attempt_id=entry.attempt_id,
                 terminal_event=terminal,
                 failure=failure,
@@ -614,7 +622,7 @@ class NativeControlPlane:
     ) -> None:
         """Finalize accepted pre-dispatch work without masking the primary failure."""
         try:
-            self._components.ledger.finish_request(
+            self._write_ledger.finish_request(
                 authorization=authorization,
                 failure=failure,
             )
@@ -625,7 +633,7 @@ class NativeControlPlane:
         """Settle one started attempt without masking the primary failure."""
         terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
         try:
-            self._components.ledger.finish_attempt(
+            self._write_ledger.finish_attempt(
                 attempt_id=attempt_id,
                 terminal_event=terminal,
                 failure=failure,
