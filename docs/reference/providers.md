@@ -88,7 +88,7 @@ published or operator-declared context window and both cache prices. The gateway
 those values, and setup never infers them.
 
 The hosted gateway `/v1/models` response keeps the standard OpenAI list shape (`object`, `data`,
-and the four OpenAI model keys) and only adds these extension fields plus the existing `wmo`
+and the four OpenAI model keys) and only adds these extension fields plus the existing `exp`
 authority marker.
 
 ## Azure
