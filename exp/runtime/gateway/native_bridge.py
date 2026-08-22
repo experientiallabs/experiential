@@ -58,7 +58,7 @@ from exp.runtime.gateway.execution import (
     _require_deployment_identity,  # noqa: PLC2701
 )
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
-from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continued_request,
@@ -191,11 +191,15 @@ class NativeControlPlane:
 
     def __init__(
         self,
-        components: LocalGatewayComponents,
+        components: NativeGatewayComponents,
         *,
         request_timeout_seconds: float = _REQUEST_TIMEOUT_SECONDS,
         data_plane_metrics: Callable[[], str] | None = None,
         continuation_store: BoundedContinuationStore | None = None,
+        readiness_probe: Callable[[], bool] | None = None,
+        usage_reporter: Callable[[], JsonObject] | None = None,
+        budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
+        native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -209,6 +213,10 @@ class NativeControlPlane:
             continuation_store: Optional Responses continuation state, shared
                 with the embedded python engine so both engines resolve and
                 retain the same bounded namespaced history.
+            readiness_probe: Optional hosted lifecycle readiness callback.
+            usage_reporter: Optional hosted usage report callback.
+            budget_error_factory: Optional hosted mapping for a rejected reservation.
+            native_route_eligible: Optional hosted policy for complete native semantics.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -219,6 +227,10 @@ class NativeControlPlane:
         self._continuations = (
             continuation_store if continuation_store is not None else BoundedContinuationStore()
         )
+        self._readiness_probe = readiness_probe
+        self._usage_reporter = usage_reporter
+        self._budget_error_factory = budget_error_factory
+        self._native_route_eligible = native_route_eligible
         self._inflight: dict[str, _InflightAttempt] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
@@ -341,6 +353,13 @@ class NativeControlPlane:
             probe_failure = exc
         if route is not None and route.fallback_deployments:
             return _escalation("multi-deployment pools use the python engine's certified waterfall")
+        if route is not None and self._native_route_eligible is not None:
+            try:
+                native_route_eligible = self._native_route_eligible(route, request)
+            except Exception:  # noqa: BLE001 - hosted policy fails closed to Python.
+                native_route_eligible = False
+            if not native_route_eligible:
+                return _escalation("host policy requires the python execution engine")
 
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         accepted = False
@@ -354,17 +373,22 @@ class NativeControlPlane:
             require_gateway_provider(deployment.provider)
             preflight_gateway_request(provider_request, deployment.gateway.capabilities)
             upstream_payload = dialect_stream_payload(profile, provider_request)
+            maximum_cost = maximum_attempt_cost_micro_usd(request, deployment)
             attempt_id = self._write_ledger.start_attempt(
                 snapshot=route.snapshot,
                 deployment=deployment,
                 attempt_ordinal=0,
                 route_depth=0,
-                maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(request, deployment),
+                maximum_cost_micro_usd=maximum_cost,
                 route_reason=route.route_reason,
                 fallback_reason=route.fallback_reason,
             )
         except BudgetReservationRejected as exc:
-            error = _budget_quota_error()
+            error = (
+                _budget_quota_error()
+                if self._budget_error_factory is None
+                else self._budget_error_factory(data["raw_key"])
+            )
             self._finish_request_quietly(
                 authorization,
                 GatewayFailure(
@@ -627,6 +651,8 @@ class NativeControlPlane:
         Raises:
             NativeBridgeError: The presented key is invalid, expired, or revoked.
         """
+        if self._usage_reporter is not None:
+            return json.dumps(self._usage_reporter(), separators=(",", ":"))
         report = self._usage_report(argument)
         return json.dumps(report.model_dump(mode="json"), separators=(",", ":"))
 
@@ -711,6 +737,11 @@ class NativeControlPlane:
         del argument
         if not self._accounting_healthy:
             return "false"
+        if self._readiness_probe is not None:
+            try:
+                return "true" if self._readiness_probe() else "false"
+            except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
+                return "false"
         try:
             self._components.executor.require_healthy()
         except GatewayExecutionError:

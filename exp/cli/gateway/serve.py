@@ -268,12 +268,7 @@ def _run_rust_gateway(
     if not json_output:
         _emit_exp_wordmark()
 
-    import importlib
     import socket
-    import threading
-    import time
-
-    import uvicorn
 
     from exp.optimize.router.activation import verify_automatic_router_policy
     from exp.runtime.gateway.lifecycle import (
@@ -283,17 +278,12 @@ def _run_rust_gateway(
     )
     from exp.runtime.gateway.management import GatewayManagement
     from exp.runtime.gateway.native_bridge import NativeControlPlane
+    from exp.runtime.gateway.native_server import (
+        NativeGatewayServerError,
+        serve_native_gateway,
+    )
     from exp.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
     from exp.runtime.openai_protocol.state import BoundedContinuationStore
-
-    try:
-        exp_gateway_native = importlib.import_module("exp_gateway_native")
-    except ModuleNotFoundError as exc:
-        raise typer.BadParameter(
-            "the Rust gateway engine is not built; run 'just native' "
-            "(uv run maturin develop --uv --release "
-            "--manifest-path exp/runtime/gateway/native/Cargo.toml) and retry"
-        ) from exc
 
     manager = GatewayManagement(root)
     if not manager.initialized:
@@ -350,56 +340,17 @@ def _run_rust_gateway(
                         f"port {port} is unavailable on {_LOOPBACK_HOST}: {exc}"
                     ) from exc
 
-            # The fallback socket stays bound from allocation to serving so
-            # the ephemeral port cannot be lost to another process.
-            fallback_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            fallback_socket.bind((_LOOPBACK_HOST, 0))
-            fallback_port = fallback_socket.getsockname()[1]
-            fallback = uvicorn.Server(
-                uvicorn.Config(
-                    runtime.app,
-                    host=_LOOPBACK_HOST,
-                    port=fallback_port,
-                    log_level="warning",
-                )
-            )
-            fallback_thread = threading.Thread(
-                target=lambda: fallback.run(sockets=[fallback_socket]),
-                name="exp-fallback-engine",
-                daemon=True,
-            )
-            fallback_thread.start()
-            deadline = time.monotonic() + 30
-            while not fallback.started:
-                if not fallback_thread.is_alive() or time.monotonic() > deadline:
-                    raise typer.BadParameter(
-                        "the embedded python fallback engine failed to start; "
-                        "inspect the gateway configuration with 'exp --engine python'"
-                    )
-                time.sleep(0.05)
             try:
-                config = json.dumps(
-                    {
-                        "host": _LOOPBACK_HOST,
-                        "port": port,
-                        "max_active_requests": max_active_requests,
-                        "request_timeout_seconds": control_plane.request_timeout_seconds,
-                        "fallback_port": fallback_port,
-                        "graceful_timeout_seconds": graceful_timeout,
-                    }
+                serve_native_gateway(
+                    runtime.app,
+                    control_plane,
+                    host=_LOOPBACK_HOST,
+                    port=port,
+                    max_active_requests=max_active_requests,
+                    graceful_timeout_seconds=graceful_timeout,
                 )
-                try:
-                    exp_gateway_native.serve(control_plane, config)
-                except KeyboardInterrupt:
-                    # SIGINT already drained the data plane gracefully inside
-                    # serve; the launch exits cleanly like the uvicorn path.
-                    pass
-                except RuntimeError as exc:
-                    raise typer.BadParameter(f"the gateway engine failed: {exc}") from exc
-            finally:
-                fallback.should_exit = True
-                fallback_thread.join(timeout=graceful_timeout + 5)
-                fallback_socket.close()
+            except NativeGatewayServerError as exc:
+                raise typer.BadParameter(str(exc)) from exc
 
 
 def _emit_exp_wordmark() -> None:

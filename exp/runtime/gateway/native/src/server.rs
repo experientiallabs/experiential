@@ -54,6 +54,8 @@ pub struct ServeConfig {
     pub callback_permits: usize,
     /// Loopback port of the embedded python engine serving escalated requests.
     pub fallback_port: u16,
+    #[serde(default = "default_native_usage_enabled")]
+    pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
     pub graceful_timeout_seconds: f64,
 }
@@ -72,6 +74,10 @@ fn default_request_timeout_seconds() -> f64 {
 
 fn default_callback_permits() -> usize {
     4
+}
+
+fn default_native_usage_enabled() -> bool {
+    true
 }
 
 /// Shared server state.
@@ -176,11 +182,14 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         .route("/v1/responses", post(responses))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route("/usage.json", get(usage_json).fallback(proxy_fallback))
-        .route("/usage", get(usage_page).fallback(proxy_fallback))
-        .route("/metrics.json", get(metrics_json))
-        .fallback(proxy_fallback)
-        .with_state(state);
+        .route("/metrics.json", get(metrics_json));
+    let app = if config.native_usage_enabled {
+        app.route("/usage.json", get(usage_json).fallback(proxy_fallback))
+            .route("/usage", get(usage_page).fallback(proxy_fallback))
+    } else {
+        app
+    };
+    let app = app.fallback(proxy_fallback).with_state(state);
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
         .map_err(|error| format!("failed to bind {}:{}: {error}", config.host, config.port))?
@@ -1457,11 +1466,19 @@ async fn stream_response(
                 };
                 for event in events {
                     track_event(&event, &mut usage, &mut tool_names);
-                    // The terminal is recorded before its frames flush, so a
-                    // disconnect during the final flush still settles by the
-                    // provider's outcome instead of as a cancellation.
                     if event.is_terminal() {
                         terminal = Some(event.clone());
+                        if !settle_stream_end(
+                            &mut guard,
+                            terminal.as_ref(),
+                            usage.as_ref(),
+                            &tool_names,
+                            false,
+                        )
+                        .await
+                        {
+                            return;
+                        }
                     }
                     let encoded = match encoder.feed(&event) {
                         Ok(encoded) => encoded,
@@ -1498,7 +1515,7 @@ async fn stream_response(
                         }
                     }
                     if terminal.is_some() {
-                        break 'outer;
+                        return;
                     }
                 }
             }
@@ -1522,6 +1539,17 @@ async fn stream_response(
                     track_event(&event, &mut usage, &mut tool_names);
                     if event.is_terminal() {
                         terminal = Some(event.clone());
+                        if !settle_stream_end(
+                            &mut guard,
+                            terminal.as_ref(),
+                            usage.as_ref(),
+                            &tool_names,
+                            false,
+                        )
+                        .await
+                        {
+                            return;
+                        }
                     }
                     let encoded = match encoder.feed(&event) {
                         Ok(encoded) => encoded,
@@ -1557,6 +1585,9 @@ async fn stream_response(
                             return;
                         }
                     }
+                    if terminal.is_some() {
+                        return;
+                    }
                 }
             }
         }
@@ -1567,7 +1598,7 @@ async fn stream_response(
                 "provider stream ended without a terminal event",
             ));
         }
-        settle_stream_end(
+        let _ = settle_stream_end(
             &mut guard,
             terminal.as_ref(),
             usage.as_ref(),
@@ -1613,23 +1644,21 @@ async fn settle_stream_end(
     usage: Option<&Usage>,
     tool_names: &[String],
     disconnected: bool,
-) {
+) -> bool {
     match terminal {
         Some(Event::Failed(failure)) => {
             let failure = failure.clone().boundary();
             guard
                 .settle("failed", usage, tool_names, Some(&failure))
-                .await;
+                .await
         }
-        Some(Event::Incomplete) => {
-            guard.settle("incomplete", usage, tool_names, None).await;
-        }
-        Some(_) => {
-            guard.settle("completed", usage, tool_names, None).await;
-        }
+        Some(Event::Incomplete) => guard.settle("incomplete", usage, tool_names, None).await,
+        Some(_) => guard.settle("completed", usage, tool_names, None).await,
         None => {
             if disconnected {
-                guard.settle_cancelled(usage, tool_names).await;
+                guard.settle_cancelled(usage, tool_names).await
+            } else {
+                true
             }
         }
     }
