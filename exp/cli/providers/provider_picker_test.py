@@ -202,6 +202,7 @@ def test_keyboard_provider_list_selects_without_typed_numbers() -> None:
     assert selection == (("openai", "anthropic"), False)
     assert "\u276f [x] openai" in console.output
     assert "Complete" in console.output
+    assert "/ search" in console.output
     assert "Numbers or ranges" not in console.output
 
 

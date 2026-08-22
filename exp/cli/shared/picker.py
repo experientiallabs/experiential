@@ -159,14 +159,16 @@ def select_many(
         if word in _ALL_WORDS:
             selected = _merged(selected, tuple(option.value for option in visible))
             continue
-        if answer == "/":
-            searching = True
-            continue
         if answer.startswith("/"):
-            answer = answer[1:]
-            if not answer:
+            query = answer[1:]
+            if not query:
                 searching = True
                 continue
+            expanded = False
+            if not _filtered(options, query):
+                console.print(f"[yellow]No row matches {query!r}.[/yellow]")
+                query = ""
+            continue
         positions = _positions(answer, count=len(visible))
         if positions is None:
             query = answer
@@ -236,14 +238,16 @@ def select_one(
         if word in _MORE_WORDS:
             expanded = True
             continue
-        if answer == "/":
-            searching = True
-            continue
         if answer.startswith("/"):
-            answer = answer[1:]
-            if not answer:
+            query = answer[1:]
+            if not query:
                 searching = True
                 continue
+            expanded = False
+            if not _filtered(options, query):
+                console.print(f"[yellow]No row matches {query!r}.[/yellow]")
+                query = ""
+            continue
         positions = _positions(answer, count=len(visible))
         if positions is not None and len(positions) == 1:
             return PickerResult(values=(visible[positions[0] - 1].value,))

@@ -153,6 +153,24 @@ def test_single_select_accepts_a_slash_prefixed_search_query() -> None:
     assert result.values == ("model-12",)
 
 
+def test_numeric_slash_query_is_not_parsed_as_a_multi_select_row_number() -> None:
+    """A numeric slash query filters model IDs before the row-number parser can run."""
+    console = _console("/2\n2\n\n")
+
+    result = select_many(console, title="Models", options=_options(20))
+
+    assert result.values == ("model-12",)
+
+
+def test_numeric_slash_query_is_not_parsed_as_a_single_select_row_number() -> None:
+    """Single-select numeric searches also choose the matching model, not row two."""
+    console = _console("/2\n2\n")
+
+    result = select_one(console, title="Model", options=_options(20))
+
+    assert result.values == ("model-12",)
+
+
 def test_preselected_values_survive_reentering_a_screen() -> None:
     """Answers already given stay selected when a screen is shown again."""
     console = _console("\n")
