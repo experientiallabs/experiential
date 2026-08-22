@@ -77,6 +77,9 @@ struct AppState {
     fallback_base: String,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pending_settlements: Arc<AtomicUsize>,
+    /// Requests handled since start; the idle reclaim loop trims the
+    /// allocator once per burst when this advances and the plane is idle.
+    handled_requests: Arc<AtomicUsize>,
 }
 
 /// The wire configuration returned by one successful admission. The upstream
@@ -106,14 +109,23 @@ struct Admission {
 pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String> {
     let http = crate::upstream::build_client()?;
     let pending_settlements = Arc::new(AtomicUsize::new(0));
+    let max_active_requests = config.max_active_requests.max(1);
+    let handled_requests = Arc::new(AtomicUsize::new(0));
     let state = AppState {
         bridge,
         http,
-        permits: Arc::new(Semaphore::new(config.max_active_requests.max(1))),
+        permits: Arc::new(Semaphore::new(max_active_requests)),
         request_timeout: Duration::from_secs_f64(config.request_timeout_seconds),
         fallback_base: format!("http://127.0.0.1:{}", config.fallback_port),
         pending_settlements: pending_settlements.clone(),
+        handled_requests: handled_requests.clone(),
     };
+    tokio::spawn(crate::memory::reclaim_when_idle(
+        state.permits.clone(),
+        max_active_requests,
+        handled_requests,
+        pending_settlements.clone(),
+    ));
     let app = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/models/{model_id}", get(model_detail))
@@ -311,6 +323,7 @@ async fn proxy_fallback(
     State(state): State<AppState>,
     request: axum::extract::Request,
 ) -> Response {
+    state.handled_requests.fetch_add(1, Ordering::Relaxed);
     let (parts, body) = request.into_parts();
     let bytes = match read_body(body).await {
         Ok(bytes) => bytes,
@@ -531,6 +544,7 @@ impl Drop for AttemptGuard {
 }
 
 async fn chat(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    state.handled_requests.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
     let deadline = started + state.request_timeout;
     let (parts, raw_body) = request.into_parts();

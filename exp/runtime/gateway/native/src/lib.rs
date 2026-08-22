@@ -10,6 +10,7 @@ mod dialects;
 mod encode;
 mod errors;
 mod events;
+mod memory;
 mod server;
 mod sse;
 mod upstream;
