@@ -151,6 +151,10 @@ uv run pytest -q
   (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
   The one exception is deliberate user-facing CLI presentation, which goes through a local rich
   `Console` owned by the command module (that is product output, not logging).
+- Library import, CLI import, and pytest collection must not import Unix-only stdlib modules
+  (`fcntl`, `pty`, `termios`, `tty`) at module scope. Load those modules only inside the POSIX
+  helpers that need them. Pseudo-terminal child runners and Darwin file-descriptor probes stay
+  POSIX and skip elsewhere.
 
 ## Writing
 

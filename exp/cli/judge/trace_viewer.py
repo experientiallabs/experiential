@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import json
 import sys
-import termios
-import tty
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -558,6 +556,9 @@ def _read_key() -> str:
     Returns:
         Single character, or a normalized name such as ``up`` or ``pgdn``.
     """
+    import termios
+    import tty
+
     descriptor = sys.stdin.fileno()
     saved = termios.tcgetattr(descriptor)
     try:
