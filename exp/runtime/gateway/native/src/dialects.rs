@@ -475,8 +475,9 @@ impl Normalizer {
                     .get("usage")
                     .and_then(Value::as_object)
                     .ok_or_else(|| malformed("Anthropic message_delta.usage must be an object"))?;
-                self.output_tokens = count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
-                    .map_err(|message| malformed(&message))?;
+                self.output_tokens =
+                    count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
+                        .map_err(|message| malformed(&message))?;
                 if self.stop_reason.as_deref() == Some("refusal") && !self.refusal_seen {
                     self.refusal_seen = true;
                     events.push(Event::RefusalDelta(String::new()));
