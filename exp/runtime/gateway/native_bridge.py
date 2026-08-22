@@ -27,6 +27,7 @@ import time
 from dataclasses import replace
 
 from exp.common.core.artifacts import JsonObject, stable_id
+from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.budgets import BudgetReservationRejected, maximum_attempt_cost_micro_usd
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -53,7 +54,6 @@ from exp.runtime.gateway.execution import (
 )
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
-from exp.runtime.gateway.service import boundary_protocol_error
 from exp.runtime.gateway.usage import read_usage_report
 from exp.runtime.models.providers import (
     preflight_gateway_request,
