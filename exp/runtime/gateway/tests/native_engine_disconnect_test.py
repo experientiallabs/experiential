@@ -12,10 +12,11 @@ These tests exercise three reviewed-but-untested behaviors of the compiled
 
 ``exp_gateway_native.serve`` blocks its caller and stops only on SIGINT or
 SIGTERM, so one shared serving subprocess (a small generated driver that
-composes ``NativeControlPlane`` over a seeded root, exactly like the CLI's
-``_run_rust_gateway``) hosts every scenario. Each test observes settlement
-deltas through the content-free ``/usage.json`` report, and the subprocess is
-stopped with SIGTERM at module teardown.
+composes ``NativeControlPlane`` over a seeded root) hosts every scenario. Its
+host policy deliberately escalates Responses requests so the dead-fallback
+case exercises the proxy boundary even though Responses is natively supported.
+Each test observes settlement deltas through the content-free ``/usage.json``
+report, and the subprocess is stopped with SIGTERM at module teardown.
 """
 
 from __future__ import annotations
@@ -63,10 +64,16 @@ _DRIVER_SOURCE = textwrap.dedent(
     import sys
     from pathlib import Path
 
+    from exp.runtime.gateway.contracts import GatewayApiSurface
     from exp.runtime.gateway.lifecycle import load_gateway_components
     from exp.runtime.gateway.native_bridge import NativeControlPlane
 
     import exp_gateway_native
+
+
+    def native_route_eligible(_route, request) -> bool:
+        """Escalate Responses requests to exercise the fallback boundary."""
+        return request.surface != GatewayApiSurface.RESPONSES
 
 
     def main() -> None:
@@ -85,6 +92,7 @@ _DRIVER_SOURCE = textwrap.dedent(
         control_plane = NativeControlPlane(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
+            native_route_eligible=native_route_eligible,
         )
         last_error = None
         for _attempt in range(5):
