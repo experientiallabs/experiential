@@ -33,12 +33,14 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.management import GatewayManagement
 
 pytest.importorskip("exp_gateway_native")
 
@@ -80,7 +82,10 @@ _DRIVER_SOURCE = textwrap.dedent(
         config = json.loads(sys.argv[1])
         components = load_gateway_components(
             Path(config["root"]),
-            environment={"TEST_PROVIDER_KEY": os.environ["TEST_PROVIDER_KEY"]},
+            environment={
+                "TEST_PROVIDER_KEY": os.environ["TEST_PROVIDER_KEY"],
+                "TEST_GEMINI_KEY": os.environ["TEST_GEMINI_KEY"],
+            },
         )
         control_plane = NativeControlPlane(
             components,
@@ -119,6 +124,59 @@ _DRIVER_SOURCE = textwrap.dedent(
         main()
     '''
 ).strip()
+
+
+def _seed_escalating_alias(root: Path, manager: GatewayManagement) -> None:
+    """Grant one alias the native path can never serve.
+
+    The provider has no native dialect, so admission escalates it to the
+    embedded python engine regardless of which public surfaces later become
+    native (Responses and project aliases already did). The dead-fallback
+    test needs a route that is escalated by construction.
+
+    Args:
+        root: Seeded gateway root.
+        manager: Management handle over the same root.
+    """
+    from exp.common.models import (
+        GatewayDeploymentCapabilities,
+        GatewayTokenPrices,
+        ModelCapabilities,
+    )
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    upsert_connection(
+        root,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        root,
+        deployment_alias="escalated",
+        connection_name="gemini-main",
+        provider_model="gemini-model-exact",
+        exact_model_id="gemini-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="escalated",
+        alias_name="escalated",
+        revision_id="revision-escalated",
+        pool_id="escalated",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="escalated")
 
 
 def _sse_frame(payload: object) -> bytes:
@@ -271,10 +329,11 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     upstream = ThreadingHTTPServer((_HOST, 0), _SseUpstream)
     upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     upstream_thread.start()
-    _manager, raw_key = _configured_gateway(
+    manager, raw_key = _configured_gateway(
         root,
         base_url=f"http://{_HOST}:{upstream.server_address[1]}/v1",
     )
+    _seed_escalating_alias(root, manager)
     driver = root / "native_engine_driver.py"
     driver.write_text(_DRIVER_SOURCE + "\n")
     config = json.dumps(
@@ -287,6 +346,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     stderr_log = root / "driver-stderr.log"
     environment = dict(os.environ)
     environment["TEST_PROVIDER_KEY"] = "provider-secret-canary"
+    environment["TEST_GEMINI_KEY"] = "gemini-secret-canary"
     stderr_sink = stderr_log.open("wb")
     process = subprocess.Popen(  # noqa: S603 - the interpreter runs our generated driver.
         [sys.executable, str(driver), config],
@@ -326,7 +386,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
                         )
                         if models.status_code == 200 and [
                             item["id"] for item in models.json()["data"]
-                        ] == ["coding"]:
+                        ] == ["coding", "escalated"]:
                             break
                 except (httpx.HTTPError, ValueError, KeyError, TypeError):
                     pass
@@ -383,13 +443,16 @@ def test_dead_fallback_engine_degrades_only_escalated_routes(
     ``/health/ready`` intentionally reports only the native control plane's
     health and does not cover the fallback host: the CLI owns the embedded
     python engine's thread and its liveness, so a dead fallback degrades the
-    escalated surfaces to an explicit 502 while readiness stays green.
+    escalated surfaces to an explicit 502 while readiness stays green. The
+    probe uses the ``escalated`` alias, whose provider has no native dialect,
+    because every dialect-capable single-deployment surface (chat, Responses,
+    project aliases) is now served natively and never reaches the fallback.
     """
     headers = {"authorization": f"Bearer {engine.raw_key}"}
     escalated = httpx.post(
-        f"{engine.base}/v1/responses",
+        f"{engine.base}/v1/chat/completions",
         headers=headers,
-        json={"model": "coding", "input": "hi"},
+        json={"model": "escalated", "messages": [{"role": "user", "content": "hi"}]},
         timeout=10.0,
     )
     assert escalated.status_code == 502
