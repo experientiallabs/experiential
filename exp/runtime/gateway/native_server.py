@@ -104,6 +104,9 @@ def serve_native_gateway(
     )
     try:
         native.serve(cast("NativeControlPlane", control_plane), config)
+    except KeyboardInterrupt:
+        # The native server drains on SIGINT before returning control to Python.
+        pass
     except RuntimeError as exc:
         raise NativeGatewayServerError(f"the native gateway failed: {exc}") from exc
     finally:

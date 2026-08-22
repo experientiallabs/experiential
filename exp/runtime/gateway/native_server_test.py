@@ -89,3 +89,21 @@ def test_host_maps_native_runtime_failures_and_stops_fallback(
             port=8080,
         )
     assert _FallbackServer.last is not None and _FallbackServer.last.should_exit
+
+
+def test_host_treats_native_keyboard_interrupt_as_clean_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native SIGINT drain returns normally and stops the fallback server."""
+    native = SimpleNamespace(serve=mock.Mock(side_effect=KeyboardInterrupt))
+    monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
+    monkeypatch.setattr(native_server.uvicorn, "Server", _FallbackServer)
+
+    serve_native_gateway(
+        mock.Mock(),
+        SimpleNamespace(request_timeout_seconds=10.0),
+        host="127.0.0.1",
+        port=8080,
+    )
+
+    assert _FallbackServer.last is not None and _FallbackServer.last.should_exit
