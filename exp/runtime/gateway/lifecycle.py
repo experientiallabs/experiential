@@ -384,7 +384,6 @@ def load_gateway_components(
     project_repository: ProjectActivationRepository | None = None,
     decision_sink: DecisionSink | None = None,
     only_aliases: frozenset[str] | None = None,
-    only_target_kinds: frozenset[str] | None = None,
 ) -> LocalGatewayComponents:
     """Load granted active aliases into engine-neutral gateway components.
 
@@ -394,8 +393,6 @@ def load_gateway_components(
         project_repository: Repository for verified immutable project activations.
         decision_sink: Optional aggregate-safe recorder for served project selections.
         only_aliases: Optional exact public aliases to expose.
-        only_target_kinds: Optional alias target kinds to expose, for engines
-            that serve a subset (the Rust engine serves only ``direct``).
 
     Returns:
         Hot-reloadable authority, ledger, routes, executor, and startup proof.
@@ -417,7 +414,6 @@ def load_gateway_components(
             project_repository=project_repository,
             decision_sink=decision_sink,
             only_aliases=only_aliases,
-            only_target_kinds=only_target_kinds,
         )
 
     state = loader()
@@ -564,7 +560,6 @@ def _load_alias_state(
     project_repository: ProjectActivationRepository | None,
     decision_sink: DecisionSink | None,
     only_aliases: frozenset[str] | None,
-    only_target_kinds: frozenset[str] | None = None,
 ) -> _AliasAuthorityState:
     """Load and validate every granted active alias into one complete generation.
 
@@ -574,8 +569,6 @@ def _load_alias_state(
         project_repository: Repository for verified immutable project activations.
         decision_sink: Optional aggregate-safe recorder for served project selections.
         only_aliases: Optional exact public aliases to expose.
-        only_target_kinds: Optional alias target kinds to expose, for engines
-            that serve a subset (the Rust engine serves only ``direct``).
 
     Returns:
         Fully validated authority generation ready for atomic publication.
@@ -586,8 +579,6 @@ def _load_alias_state(
     aliases = _granted_active_aliases(manager)
     if only_aliases is not None:
         aliases = tuple(item for item in aliases if item.alias_name in only_aliases)
-    if only_target_kinds is not None:
-        aliases = tuple(item for item in aliases if item.target_kind in only_target_kinds)
     if not aliases:
         raise GatewayLifecycleError(
             "gateway has no granted active alias; create an identity, alias, and grant first"

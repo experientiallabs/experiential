@@ -8,10 +8,16 @@ publish = false
 
 [lib]
 name = "exp_gateway_native"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# `cargo test --no-default-features` links the unit-test binary against a
+# host libpython; the shipped wheel keeps the extension-module link mode.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["abi3-py312", "extension-module"] }
+pyo3 = { version = "0.23", features = ["abi3-py312"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 tokio-stream = "0.1"
 axum = "0.8"

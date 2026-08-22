@@ -1,16 +1,17 @@
-"""Tests for the Rust-engine control plane and Rust/Python parity fixtures."""
+"""Tests for the native-engine control plane and Rust/Python parity fixtures."""
 
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
-from typing import cast
 from unittest import mock
 
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.discovery import listing_metadata_by_alias
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import (
@@ -18,26 +19,38 @@ from exp.runtime.gateway.native_bridge import (
     NativeControlPlane,
     _usage_from_payload,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat
 
 
-def _control_plane(root: Path) -> tuple[NativeControlPlane, str]:
+def _control_plane(
+    root: Path,
+    *,
+    request_timeout_seconds: float = 120.0,
+) -> tuple[NativeControlPlane, str]:
     """Seed one direct alias and load the native control plane over it."""
     _manager, raw_key = _configured_gateway(root)
     components = load_gateway_components(
         root,
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
-        only_target_kinds=frozenset({"direct"}),
     )
-    return NativeControlPlane(components), raw_key
+    control = NativeControlPlane(components, request_timeout_seconds=request_timeout_seconds)
+    return control, raw_key
 
 
-def _chat_canonical(*, stream: bool = False) -> JsonObject:
-    """Return one canonical GatewayRequest payload dict."""
-    decoded = decode_chat({"model": "coding", "messages": [{"role": "user", "content": "hi"}]})
-    request = decoded.request.model_copy(update={"stream": stream})
-    return cast(JsonObject, request.model_dump(mode="json"))
+def _chat_body(*, model: str = "coding", stream: bool = False) -> str:
+    """Return one raw Chat Completions request body."""
+    payload: JsonObject = {"model": model, "messages": [{"role": "user", "content": "hi"}]}
+    if stream:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+    return json.dumps(payload)
+
+
+def _admit(control: NativeControlPlane, raw_key: str, body: str) -> JsonObject:
+    """Run one admission call and decode its JSON response."""
+    return json.loads(control.admit(json.dumps({"raw_key": raw_key, "body": body})))
 
 
 def test_bridge_error_payload_is_openai_shaped() -> None:
@@ -77,29 +90,30 @@ def test_usage_from_payload_handles_tokens_and_tool_names() -> None:
     assert complete.cached_input_tokens == 2
 
 
-def test_admit_and_settle_account_one_request(tmp_path: Path) -> None:
-    """Admission returns wire config and settlement lands in the usage report."""
+def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
+    """Admission decodes the raw body, returns the shared upstream payload, and
+    settlement lands in the usage report."""
     control, raw_key = _control_plane(tmp_path)
     assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
 
-    admission = json.loads(
-        control.admit(
-            json.dumps(
-                {
-                    "raw_key": raw_key,
-                    "alias": "coding",
-                    "request": _chat_canonical(),
-                    "stream": False,
-                }
-            )
-        )
-    )
+    admission = _admit(control, raw_key, _chat_body())
     assert admission["dialect"] == "openai_compatible"
-    assert admission["url"].endswith("/chat/completions")
+    url = admission["url"]
+    assert isinstance(url, str) and url.endswith("/chat/completions")
     assert admission["model_id"] == "provider-model-exact"
-    assert admission["headers"]["Authorization"] == "Bearer provider-secret-canary"
+    headers = admission["headers"]
+    assert isinstance(headers, dict)
+    assert headers["Authorization"] == "Bearer provider-secret-canary"
     assert admission["provider"] == "openai-compatible"
     assert admission["route_reason"] == "direct"
+    assert admission["stream"] is False
+    assert admission["include_usage"] is False
+
+    decoded = decode_chat(json.loads(_chat_body()))
+    provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
+    assert admission["upstream_payload"] == openai_compatible_stream_payload(
+        "provider-model-exact", provider_request
+    )
 
     settled = control.settle(
         json.dumps(
@@ -132,21 +146,29 @@ def test_admit_and_settle_account_one_request(tmp_path: Path) -> None:
     assert repeat == "{}"
 
 
+def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None:
+    """Invalid JSON, non-objects, and protocol violations use the shared codes."""
+    control, raw_key = _control_plane(tmp_path)
+    with pytest.raises(NativeBridgeError) as invalid_json:
+        control.admit(json.dumps({"raw_key": raw_key, "body": "{not json"}))
+    assert json.loads(invalid_json.value.public_error_json)["code"] == "invalid_json"
+    with pytest.raises(NativeBridgeError) as not_object:
+        control.admit(json.dumps({"raw_key": raw_key, "body": "[1, 2]"}))
+    assert json.loads(not_object.value.public_error_json)["code"] == "invalid_request"
+    rejected = json.dumps(
+        {"model": "coding", "messages": [{"role": "user", "content": "x"}], "logprobs": True}
+    )
+    with pytest.raises(NativeBridgeError) as protocol:
+        control.admit(json.dumps({"raw_key": raw_key, "body": rejected}))
+    assert json.loads(protocol.value.public_error_json)["status_code"] == 400
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 0
+
+
 def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     """A lost terminal write latches readiness but stays settleable on retry."""
     control, raw_key = _control_plane(tmp_path)
-    admission = json.loads(
-        control.admit(
-            json.dumps(
-                {
-                    "raw_key": raw_key,
-                    "alias": "coding",
-                    "request": _chat_canonical(),
-                    "stream": False,
-                }
-            )
-        )
-    )
+    admission = _admit(control, raw_key, _chat_body())
     settlement = json.dumps(
         {
             "request_id": admission["request_id"],
@@ -171,6 +193,21 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     assert report["totals"]["requests"] == 1
 
 
+def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path) -> None:
+    """An admitted request the data plane never settles is closed by the sweep."""
+    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
+    abandoned = _admit(control, raw_key, _chat_body())
+    time.sleep(0.05)
+    with mock.patch("exp.runtime.gateway.native_bridge._SWEEP_GRACE_SECONDS", 0.0):
+        second = _admit(control, raw_key, _chat_body())
+    with control._lock:  # noqa: SLF001 - registry state assertion.
+        inflight = dict(control._inflight)  # noqa: SLF001
+    assert abandoned["request_id"] not in inflight
+    assert second["request_id"] in inflight
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 2
+
+
 def test_admit_escalates_native_unsupported_providers_before_accounting(
     tmp_path: Path,
 ) -> None:
@@ -185,7 +222,6 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
         upsert_connection,
         upsert_singleton_deployment,
     )
-    from exp.runtime.gateway.lifecycle_test import _configured_gateway
 
     manager, raw_key = _configured_gateway(tmp_path)
     upsert_connection(
@@ -224,19 +260,9 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
         },
     )
     control = NativeControlPlane(components)
-    with pytest.raises(NativeBridgeError) as excinfo:
-        control.admit(
-            json.dumps(
-                {
-                    "raw_key": raw_key,
-                    "alias": "gem",
-                    "request": _chat_canonical(),
-                    "stream": False,
-                }
-            )
-        )
-    payload = json.loads(excinfo.value.public_error_json)
-    assert payload["code"] == "native_unsupported"
+    admission = _admit(control, raw_key, _chat_body(model="gem"))
+    assert "escalate" in admission
+    assert "request_id" not in admission
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 0
 
@@ -245,16 +271,7 @@ def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:
     """An ungranted alias maps to the shared 403 public error."""
     control, raw_key = _control_plane(tmp_path)
     with pytest.raises(NativeBridgeError) as excinfo:
-        control.admit(
-            json.dumps(
-                {
-                    "raw_key": raw_key,
-                    "alias": "ungranted",
-                    "request": _chat_canonical(),
-                    "stream": False,
-                }
-            )
-        )
+        control.admit(json.dumps({"raw_key": raw_key, "body": _chat_body(model="ungranted")}))
     payload = json.loads(excinfo.value.public_error_json)
     assert payload["status_code"] == 403
     assert payload["code"] == "model_not_granted"
@@ -271,154 +288,59 @@ def test_authenticate_rejects_an_invalid_key(tmp_path: Path) -> None:
 
 
 def test_models_and_detail_mirror_the_python_discovery_bodies(tmp_path: Path) -> None:
-    """Model discovery bodies match the shared discovery encoding."""
+    """Model discovery bodies match the shared discovery encoding with metadata."""
     control, raw_key = _control_plane(tmp_path)
+    components = control._components  # noqa: SLF001 - expected-body construction.
+    authorities = components.store.granted_alias_authorities(raw_key=raw_key)
+    metadata = listing_metadata_by_alias(authorities, components.routes.published_metadata)
+    assert "coding" in metadata
+
     models = json.loads(control.models(json.dumps({"raw_key": raw_key})))
     assert [item["id"] for item in models["data"]] == ["coding"]
     assert models["wmo"]["authority_schema_version"] == 1
+    listed = models["data"][0]
+    for key, value in metadata["coding"].extension_fields().items():
+        assert listed[key] == value
     detail = json.loads(
         control.model_detail(json.dumps({"raw_key": raw_key, "model_id": "coding"}))
     )
-    assert detail == models["data"][0]
+    assert detail == listed
     with pytest.raises(NativeBridgeError) as excinfo:
         control.model_detail(json.dumps({"raw_key": raw_key, "model_id": "missing"}))
     assert json.loads(excinfo.value.public_error_json)["status_code"] == 404
 
 
-def test_readiness_reflects_startup_proof(tmp_path: Path) -> None:
-    """Readiness is true after load and stays content-free."""
+def test_readiness_reflects_startup_proof_and_executor_health(tmp_path: Path) -> None:
+    """Readiness is true after load and follows the shared executor latch."""
     control, _raw_key = _control_plane(tmp_path)
     assert control.readiness("{}") == "true"
+    control._components.executor.mark_accounting_unhealthy()  # noqa: SLF001 - fault injection.
+    assert control.readiness("{}") == "false"
 
 
-_CHAT_FIXTURES: tuple[JsonObject, ...] = (
-    {"model": "coding", "messages": [{"role": "user", "content": "hi"}]},
-    {
-        "model": "coding",
-        "messages": [
-            {"role": "system", "content": "be terse"},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "join "},
-                    {"type": "text", "text": "me"},
-                ],
-            },
-        ],
-        "max_completion_tokens": 64,
-        "temperature": 0.5,
-        "top_p": 0.9,
-        "stop": ["END", "STOP"],
-    },
-    {
-        "model": "coding",
-        "messages": [
-            {"role": "user", "content": "use tools"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call-1",
-                        "type": "function",
-                        "function": {"name": "search", "arguments": '{"q": "x"}'},
-                    }
-                ],
-            },
-            {"role": "tool", "content": "result", "tool_call_id": "call-1"},
-        ],
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "search",
-                    "description": "find things",
-                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
-                },
-            }
-        ],
-        "tool_choice": {"type": "function", "function": {"name": "search"}},
-        "parallel_tool_calls": False,
-    },
-    {
-        "model": "coding",
-        "messages": [{"role": "user", "content": "structured"}],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "result",
-                "schema": {"type": "object", "properties": {"a": {"type": "integer"}}},
-                "strict": True,
-            },
-        },
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    },
-)
+def test_rust_failure_taxonomy_matches_public_failure_error() -> None:
+    """The Rust failure-to-public-error table equals `public_failure_error`.
 
-_REJECTED_FIXTURES: tuple[JsonObject, ...] = (
-    {"model": "coding", "messages": [{"role": "user", "content": "x"}], "logprobs": True},
-    {"model": "coding", "messages": [{"role": "user", "content": "x"}], "unknown_field": 1},
-    {
-        "model": "coding",
-        "messages": [{"role": "user", "content": "x"}],
-        "max_tokens": 5,
-        "max_completion_tokens": 6,
-    },
-    {"model": "coding", "messages": [{"role": "user", "content": "x"}], "tool_choice": "bad"},
-    {"model": "coding", "messages": [{"role": "user", "content": "x"}], "stop": ["a", "a"]},
-    {"model": "coding", "messages": []},
-)
-
-
-def test_rust_decode_matches_python_decode() -> None:
-    """The Rust decoder produces the identical canonical request per fixture."""
+    Quota exhaustion is exempt from message and retry-after comparison: its
+    reset boundary is computed control-plane side and never crosses the
+    bridge as a Rust failure.
+    """
     native = pytest.importorskip("exp_gateway_native")
-    for fixture in _CHAT_FIXTURES:
-        decoded = json.loads(native.decode_chat_canonical(json.dumps(fixture)))
-        expected = decode_chat(dict(fixture))
-        assert decoded["alias"] == expected.alias
-        rust_request = GatewayRequest.model_validate(decoded["canonical"])
-        assert rust_request == expected.request
-    for fixture in _REJECTED_FIXTURES:
-        with pytest.raises(OpenAIProtocolError):
-            decode_chat(dict(fixture))
-        with pytest.raises(ValueError):
-            native.decode_chat_canonical(json.dumps(fixture))
-
-
-def test_rust_upstream_payloads_match_python_builders() -> None:
-    """Rust dialect payloads equal the Python builders on shared fixtures."""
-    native = pytest.importorskip("exp_gateway_native")
-    from exp.runtime.models.providers.streaming_requests import (
-        anthropic_messages_stream_payload,
-        openai_compatible_stream_payload,
-        openai_responses_stream_payload,
-    )
-
-    for fixture in _CHAT_FIXTURES:
-        expected = decode_chat(dict(fixture))
-        decoded = json.loads(native.decode_chat_canonical(json.dumps(fixture)))
-        canonical = json.dumps(decoded["canonical"])
-        compatible = json.loads(
-            native.build_upstream_payload("openai_compatible", canonical, "model-x")
+    for failure_class in GatewayFailureClass:
+        failure = GatewayFailure(
+            failure_class=failure_class,
+            safe_message="parity probe message",
         )
-        assert compatible == openai_compatible_stream_payload("model-x", expected.request)
-        if not expected.request.stop:
-            responses = json.loads(
-                native.build_upstream_payload("openai_responses", canonical, "model-x")
-            )
-            assert responses == openai_responses_stream_payload(
-                "model-x",
-                expected.request,
-                supports_temperature=True,
-                reasoning_effort=None,
-            )
-        if expected.request.structured_text is None:
-            anthropic = json.loads(
-                native.build_upstream_payload("anthropic_messages", canonical, "model-x")
-            )
-            assert anthropic == anthropic_messages_stream_payload("model-x", expected.request)
+        expected = public_failure_error(failure)
+        actual = json.loads(
+            native.failure_public_error_fixture(failure_class.value, "parity probe message")
+        )
+        assert actual["status_code"] == expected.status_code, failure_class
+        assert actual["code"] == expected.detail.code, failure_class
+        assert actual["error_type"] == expected.detail.type, failure_class
+        if failure_class != GatewayFailureClass.QUOTA_EXCEEDED:
+            assert actual["message"] == expected.detail.message, failure_class
+            assert actual["retry_after_seconds"] == expected.retry_after_seconds, failure_class
 
 
 def test_rust_chat_sse_frames_match_python_encoder() -> None:

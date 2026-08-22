@@ -16,19 +16,6 @@ class _ControlPlane(Protocol):
     def readiness(self, argument: str) -> str: ...
 
 def serve(control_plane: _ControlPlane, config_json: str) -> None: ...
-def decode_chat_canonical(
-    body: str,
-    idempotency_key: str | None = None,
-    client_request_id: str | None = None,
-) -> str: ...
-def build_upstream_payload(
-    dialect: str,
-    canonical_request: str,
-    model_id: str,
-    supports_temperature: bool = True,
-    reasoning_effort: str | None = None,
-    token_limit_key: str = "max_tokens",
-) -> str: ...
 def encode_chat_fixture(
     request_id: str,
     model: str,
@@ -36,3 +23,4 @@ def encode_chat_fixture(
     include_usage: bool,
     events_json: str,
 ) -> list[str]: ...
+def failure_public_error_fixture(failure_class: str, safe_message: str) -> str: ...

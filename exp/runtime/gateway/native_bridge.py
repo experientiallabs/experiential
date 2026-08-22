@@ -1,15 +1,22 @@
-"""Python control plane for the Rust gateway data plane.
+"""Python control plane for the native (Rust) gateway data plane.
 
-The Rust engine (`exp_gateway_native`) owns the HTTP socket, protocol decode,
-upstream streaming, and SSE encoding. It calls back into this module for the
-authority and accounting work the Python engine performs on the same request
-path: key authentication, request authorization, ledger acceptance, attempt
-start with budget reservation, and terminal settlement. Every method takes and
-returns one JSON string so the boundary stays narrow and typed on both sides.
+The native engine (`exp_gateway_native`) owns the HTTP socket, upstream
+streaming, provider-event normalization, and public SSE encoding. Everything
+protocol- and authority-shaped happens here, in the same code the python
+engine runs: request decoding through ``decode_chat``, authorization through
+the shared control store, upstream payload construction through the shared
+``streaming_requests`` builders, and the same durable SQLite ledger
+transactions. Every boundary call takes and returns one JSON string so the
+boundary stays narrow and typed on both sides.
 
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
-the caller, mirroring ``GatewayService`` error mapping.
+the caller, mirroring ``GatewayService`` error mapping. Requests the native
+path cannot serve (project aliases, multi-deployment pools, providers without
+a native dialect) are answered with an ``{"escalate": reason}`` admission
+disposition before any ledger write; the data plane replays those against the
+embedded python engine, which performs its own full authorization and
+accounting, so nothing is double-counted.
 """
 
 from __future__ import annotations
@@ -17,8 +24,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-
-from pydantic import ValidationError
+from dataclasses import replace
 
 from exp.common.core.artifacts import JsonObject, stable_id
 from exp.runtime.gateway.budgets import BudgetReservationRejected, maximum_attempt_cost_micro_usd
@@ -33,9 +39,17 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.discovery import (
+    listing_metadata_by_alias,
     public_model_list,
     public_model_object,
     require_granted_authority,
+)
+
+# The executor's identity check is the authoritative pre-dispatch invariant;
+# the native path must enforce the same one, so the private helper is shared.
+from exp.runtime.gateway.execution import (
+    GatewayExecutionError,
+    _require_deployment_identity,  # noqa: PLC2701
 )
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
@@ -49,15 +63,19 @@ from exp.runtime.models.providers import (
     preflight_gateway_request,
     require_gateway_provider,
 )
-from exp.runtime.models.providers.base import ProviderHttpClient
+from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
 from exp.runtime.models.providers.errors import ProviderCapabilityError
-from exp.runtime.openai_protocol.errors import (
-    OpenAIProtocolError,
-    invalid_field,
-    public_failure_error,
+from exp.runtime.models.providers.streaming_requests import (
+    anthropic_messages_stream_payload,
+    openai_compatible_stream_payload,
+    openai_responses_stream_payload,
 )
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
+from exp.runtime.openai_protocol.requests import DecodedGatewayRequest, decode_chat
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
+_SWEEP_GRACE_SECONDS = 5.0
+_SWEEP_BATCH = 16
 
 _TERMINAL_KINDS = {
     "completed": GatewayEventKind.COMPLETED,
@@ -71,7 +89,7 @@ class _NativeDialectUnavailableError(RuntimeError):
 
 
 class NativeBridgeError(Exception):
-    """One sanitized boundary failure delivered to the Rust data plane."""
+    """One sanitized boundary failure delivered to the native data plane."""
 
     def __init__(self, error: OpenAIProtocolError) -> None:
         """Retain the public error as the JSON payload the data plane returns.
@@ -97,13 +115,15 @@ def _authority_error(exception: Exception) -> NativeBridgeError:
     """Map authority failures exactly like ``GatewayService`` boundary mapping.
 
     Args:
-        exception: Store, grant, or routing failure raised during admission.
+        exception: Store, grant, routing, or execution failure.
 
     Returns:
         A boundary error carrying the matching public OpenAI error.
     """
     if isinstance(exception, OpenAIProtocolError):
         return NativeBridgeError(exception)
+    if isinstance(exception, GatewayExecutionError):
+        return NativeBridgeError(public_failure_error(exception.failure))
     if isinstance(exception, InvalidVirtualKeyError):
         return NativeBridgeError(
             OpenAIProtocolError(
@@ -166,28 +186,19 @@ def _authority_error(exception: Exception) -> NativeBridgeError:
     )
 
 
-def _native_unsupported_error(reason: str) -> NativeBridgeError:
-    """Signal that the python engine must serve this request.
+def _escalation(reason: str) -> str:
+    """Return the admission disposition that hands this request to python.
 
-    The Rust data plane recognizes the ``native_unsupported`` code and
-    replays the original HTTP request against the embedded python engine,
-    which performs its own full authorization and accounting; no ledger
-    row exists yet when this is raised.
+    No ledger row exists when this is returned; the embedded python engine
+    performs complete authorization and accounting on the replayed request.
 
     Args:
         reason: Display-safe reason the native path cannot serve the request.
 
     Returns:
-        The boundary error carrying the sentinel code.
+        The JSON admission body carrying the escalation disposition.
     """
-    return NativeBridgeError(
-        OpenAIProtocolError(
-            status_code=501,
-            code="native_unsupported",
-            message=reason,
-            error_type="api_error",
-        )
-    )
+    return json.dumps({"escalate": reason}, separators=(",", ":"))
 
 
 def _budget_quota_error() -> NativeBridgeError:
@@ -200,11 +211,13 @@ def _budget_quota_error() -> NativeBridgeError:
 
 
 class NativeControlPlane:
-    """Authority and accounting callbacks for the Rust data plane.
+    """Authority and accounting callbacks for the native data plane.
 
-    Methods are called from multiple Rust worker threads. SQLite access is safe
-    through the per-thread connection cache in the gateway store and ledger;
-    the in-flight request registry is guarded by one lock.
+    Methods are called from multiple Rust worker threads. SQLite access is
+    safe through the per-thread connection cache in the gateway store and
+    ledger; the in-flight request registry is guarded by one lock and swept
+    opportunistically so an abandoned reservation cannot outlive its request
+    deadline by more than the sweep grace.
     """
 
     def __init__(
@@ -223,9 +236,14 @@ class NativeControlPlane:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
         self._request_timeout_seconds = request_timeout_seconds
-        self._inflight: dict[str, tuple[AuthorizationSnapshot, str]] = {}
+        self._inflight: dict[str, tuple[AuthorizationSnapshot, str, float]] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
+
+    @property
+    def request_timeout_seconds(self) -> float:
+        """Return the per-request budget shared with the data plane."""
+        return self._request_timeout_seconds
 
     @property
     def reconciled_expired_requests(self) -> int:
@@ -238,7 +256,7 @@ class NativeControlPlane:
         return self._components.reconciled_unknown_attempts
 
     def authenticate(self, argument: str) -> str:
-        """Authenticate one virtual key before the data plane decodes content.
+        """Authenticate one virtual key before the data plane reads the body.
 
         Args:
             argument: JSON object with ``raw_key``.
@@ -257,62 +275,75 @@ class NativeControlPlane:
         return "{}"
 
     def admit(self, argument: str) -> str:
-        """Authorize, accept, route, and durably start one provider attempt.
+        """Decode, authorize, route, and durably start one provider attempt.
+
+        The raw body is decoded with the same ``decode_chat`` the python
+        engine uses, and the upstream payload is built with the same shared
+        payload builders, so the two engines cannot drift at the protocol or
+        provider boundary.
 
         Args:
-            argument: JSON object with ``raw_key``, ``alias``, ``request``
-                (canonical ``GatewayRequest`` shape), and ``stream``.
+            argument: JSON object with ``raw_key`` and ``body`` (raw request
+                body text).
 
         Returns:
-            JSON wire configuration for the single resolved deployment.
+            JSON wire configuration for the single resolved deployment,
+            including the fully built upstream payload, or an
+            ``{"escalate": reason}`` disposition (returned only before any
+            ledger write) handing the request to the python engine.
 
         Raises:
-            NativeBridgeError: Authorization, routing, capability, or budget
-                admission failed; the ledger is finalized before raising when
-                the request was already accepted.
+            NativeBridgeError: Decoding, authorization, routing, capability,
+                or budget admission failed.
         """
+        self._sweep_expired()
         data = json.loads(argument)
-        try:
-            request = GatewayRequest.model_validate(data["request"])
-        except ValidationError as exc:
-            raise NativeBridgeError(invalid_field("body")) from exc
+        decoded = self._decode_body(data["body"])
+        request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
         try:
             authorization = self._components.store.authorize_request(
                 raw_key=data["raw_key"],
-                alias=data["alias"],
+                alias=decoded.alias,
                 request=request,
                 deadline_monotonic=deadline,
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
 
+        # Escalation runs before any ledger write: the python engine performs
+        # full accounting for every request it serves. Routing failures found
+        # by the probe are recorded against the accepted request below, the
+        # same order the python engine writes them.
         if not isinstance(authorization.target, DirectTarget):
-            raise _native_unsupported_error(
-                "project-backed aliases use learned selection on the python engine"
-            )
+            return _escalation("project-backed aliases use learned selection on the python engine")
+        probe_failure: Exception | None = None
+        route: GatewayRoute | None = None
+        profile: GatewayWireProfile | None = None
         try:
             route = self._components.routes.resolve_direct(authorization)
-            deployment = route.deployment
-            provider_request = request.model_copy(update={"stream": True, "include_usage": True})
-            require_gateway_provider(deployment.provider)
-            preflight_gateway_request(provider_request, deployment.gateway.capabilities)
-            wire = self._wire_configuration(route)
+            profile = self._wire_profile(route)
         except _NativeDialectUnavailableError as exc:
-            raise _native_unsupported_error(str(exc)) from exc
-        except ProviderCapabilityError as exc:
-            failure = GatewayFailure(
-                failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
-                safe_message="the resolved deployment does not support the requested capability",
-            )
-            raise NativeBridgeError(public_failure_error(failure)) from exc
-        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-            raise _authority_error(exc) from exc
+            return _escalation(str(exc))
+        except Exception as exc:  # noqa: BLE001 - recorded after acceptance below.
+            probe_failure = exc
+        if route is not None and route.fallback_deployments:
+            return _escalation("multi-deployment pools use the python engine's certified waterfall")
 
+        provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         accepted = False
+        attempt_id: str | None = None
         try:
             self._components.ledger.accept_request(authorization=authorization)
             accepted = True
+            if probe_failure is not None or route is None or profile is None:
+                raise probe_failure or GatewayRoutingError(
+                    "authorized direct route did not resolve"
+                )
+            deployment = route.deployment
+            require_gateway_provider(deployment.provider)
+            preflight_gateway_request(provider_request, deployment.gateway.capabilities)
+            upstream_payload = _build_upstream_payload(profile, provider_request)
             attempt_id = self._components.ledger.start_attempt(
                 snapshot=route.snapshot,
                 deployment=deployment,
@@ -335,30 +366,46 @@ class NativeControlPlane:
                 ),
             )
             raise error from exc
+        except ProviderCapabilityError as exc:
+            failure = GatewayFailure(
+                failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
+                safe_message="the resolved deployment does not support the requested capability",
+            )
+            self._finish_request_quietly(authorization, failure)
+            raise NativeBridgeError(public_failure_error(failure)) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             error = _authority_error(exc)
-            if accepted:
-                self._finish_request_quietly(
-                    authorization,
-                    GatewayFailure(
-                        failure_class=GatewayFailureClass.INTERNAL,
-                        safe_message="gateway admission failed before provider dispatch",
-                    ),
-                )
+            failure = GatewayFailure(
+                failure_class=GatewayFailureClass.INTERNAL,
+                safe_message="gateway admission failed before provider dispatch",
+            )
+            if attempt_id is not None:
+                self._finish_attempt_quietly(attempt_id, failure)
+            elif accepted:
+                self._finish_request_quietly(authorization, failure)
             raise error from exc
 
         with self._lock:
-            self._inflight[authorization.request_id] = (authorization, attempt_id)
+            self._inflight[authorization.request_id] = (authorization, attempt_id, deadline)
         response: JsonObject = {
             "request_id": authorization.request_id,
             "attempt_id": attempt_id,
             "alias": authorization.alias,
             "alias_revision_id": authorization.alias_revision_id,
+            "stream": request.stream,
+            "include_usage": request.include_usage,
+            "maximum_output_tokens": request.maximum_output_tokens,
             "exact_model_id": route.snapshot.exact_model_id,
             "provider": route.deployment.provider,
             "deployment_id": route.deployment.deployment_id,
             "route_reason": route.route_reason,
-            **wire,
+            "dialect": profile.dialect,
+            "url": profile.url,
+            "headers": dict(profile.headers),
+            "model_id": profile.model_id,
+            "timeout_seconds": profile.timeout_seconds,
+            "upstream_payload": upstream_payload,
+            "idempotency_key": _deployment_operation_key(route),
         }
         return json.dumps(response, separators=(",", ":"))
 
@@ -374,7 +421,8 @@ class NativeControlPlane:
 
         Raises:
             NativeBridgeError: The durable terminal write failed; readiness is
-                latched unhealthy first, mirroring executor accounting.
+                latched unhealthy first, and the in-flight entry is kept so a
+                retried settlement can still reach the ledger.
         """
         data = json.loads(argument)
         request_id = str(data["request_id"])
@@ -382,7 +430,7 @@ class NativeControlPlane:
             context = self._inflight.get(request_id)
         if context is None:
             return "{}"
-        _authorization, attempt_id = context
+        _authorization, attempt_id, _deadline = context
         usage = _usage_from_payload(data.get("usage"), data.get("tool_names") or [])
         failure_payload = data.get("failure")
         failure = None
@@ -419,9 +467,15 @@ class NativeControlPlane:
         data = json.loads(argument)
         try:
             authorities = self._components.store.granted_alias_authorities(raw_key=data["raw_key"])
+            body = public_model_list(
+                authorities,
+                metadata_by_alias=listing_metadata_by_alias(
+                    authorities, self._components.routes.published_metadata
+                ),
+            )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
-        return json.dumps(public_model_list(authorities), separators=(",", ":"))
+        return json.dumps(body, separators=(",", ":"))
 
     def model_detail(self, argument: str) -> str:
         """Return one granted model object or the shared no-oracle 404."""
@@ -429,9 +483,15 @@ class NativeControlPlane:
         try:
             authorities = self._components.store.granted_alias_authorities(raw_key=data["raw_key"])
             authority = require_granted_authority(authorities, data["model_id"])
+            body = public_model_object(
+                authority,
+                metadata=listing_metadata_by_alias(
+                    (authority,), self._components.routes.published_metadata
+                ).get(authority[0]),
+            )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
-        return json.dumps(public_model_object(authority), separators=(",", ":"))
+        return json.dumps(body, separators=(",", ":"))
 
     def usage_json(self, argument: str) -> str:
         """Return the content-free usage report body."""
@@ -443,25 +503,71 @@ class NativeControlPlane:
         return json.dumps(report.model_dump(mode="json"), separators=(",", ":"))
 
     def readiness(self, argument: str) -> str:
-        """Return whether startup proof holds and accounting stays healthy."""
+        """Return whether the executor and bridge accounting stay healthy."""
         del argument
-        ready = bool(self._components.readiness) and self._accounting_healthy
-        return "true" if ready else "false"
+        if not self._accounting_healthy or not self._components.readiness:
+            return "false"
+        try:
+            self._components.executor.require_healthy()
+        except GatewayExecutionError:
+            return "false"
+        return "true"
 
-    def _wire_configuration(self, route: GatewayRoute) -> JsonObject:
+    def _decode_body(self, body: str) -> DecodedGatewayRequest:
+        """Decode one raw Chat Completions body with the shared decoder.
+
+        Args:
+            body: Raw request body text.
+
+        Returns:
+            The public alias and canonical request.
+
+        Raises:
+            NativeBridgeError: The body is not JSON, not an object, or fails
+                the shared protocol validation.
+        """
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise NativeBridgeError(
+                OpenAIProtocolError(
+                    status_code=400,
+                    code="invalid_json",
+                    message=(
+                        "Request body must contain valid JSON. Re-encode the payload and resend."
+                    ),
+                )
+            ) from exc
+        if not isinstance(payload, dict):
+            raise NativeBridgeError(
+                OpenAIProtocolError(
+                    status_code=400,
+                    code="invalid_request",
+                    message="Request body must be a JSON object. Re-encode the payload and resend.",
+                )
+            )
+        try:
+            return decode_chat(payload)
+        except OpenAIProtocolError as exc:
+            raise NativeBridgeError(exc) from exc
+
+    def _wire_profile(self, route: GatewayRoute) -> GatewayWireProfile:
         """Resolve one deployment's public wire profile for the data plane.
 
         Args:
             route: Resolved single-deployment route.
 
         Returns:
-            Dialect, URL, authenticated headers, and timing hints.
+            The dialect, endpoint, headers, and timing facts for dispatch,
+            with the model identity filled from the resolved snapshot when
+            the profile leaves it empty.
 
         Raises:
             _NativeDialectUnavailableError: The provider has no native-dialect
                 implementation; the python engine serves the request.
             GatewayRoutingError: The resolved client cannot stream or the
                 authorized catalog is not loaded.
+            ValueError: The resolved client drifts from the frozen deployment.
         """
         authorization = route.snapshot.authorization
         catalog = self._components.runtime_catalogs.get(
@@ -471,6 +577,7 @@ class NativeControlPlane:
             raise GatewayRoutingError("runtime catalog is not loaded for the authorized revision")
         deployment = route.deployment
         resolved = catalog.resolve(deployment.source_alias)
+        _require_deployment_identity(deployment, resolved)
         client = resolved.client
         if getattr(client, "stream", None) is None:
             raise GatewayRoutingError("resolved gateway deployment has no streaming capability")
@@ -486,17 +593,45 @@ class NativeControlPlane:
             raise _NativeDialectUnavailableError(
                 f"provider {deployment.provider!r} has no native dialect implementation"
             ) from exc
-        return {
-            "dialect": profile.dialect,
-            "url": profile.url,
-            "headers": dict(profile.headers),
-            "model_id": profile.model_id or resolved.snapshot.model_id,
-            "timeout_seconds": profile.timeout_seconds,
-            "supports_temperature": profile.supports_temperature,
-            "reasoning_effort": profile.reasoning_effort,
-            "token_limit_key": profile.token_limit_key,
-            "idempotency_key": _deployment_operation_key(route),
-        }
+        if not profile.model_id:
+            profile = replace(profile, model_id=resolved.snapshot.model_id)
+        return profile
+
+    def _sweep_expired(self) -> None:
+        """Settle abandoned in-flight attempts whose deadline has passed.
+
+        The data plane settles every request it serves, including on client
+        disconnect; this sweep is the backstop for wire-contract failures and
+        data-plane crashes short of process death, so a budget reservation
+        can never outlive its request deadline by more than the grace.
+        """
+        now = time.monotonic()
+        with self._lock:
+            expired = [
+                (request_id, context)
+                for request_id, context in self._inflight.items()
+                if context[2] + _SWEEP_GRACE_SECONDS < now
+            ][:_SWEEP_BATCH]
+        if not expired:
+            return
+        failure = GatewayFailure(
+            failure_class=GatewayFailureClass.CANCELLED,
+            safe_message="gateway request was abandoned before settlement",
+        )
+        terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
+        for request_id, (_authorization, attempt_id, _deadline) in expired:
+            try:
+                self._components.ledger.finish_attempt(
+                    attempt_id=attempt_id,
+                    terminal_event=terminal,
+                    failure=failure,
+                    finalize_request=True,
+                )
+            except Exception:  # noqa: BLE001 - latch and keep the entry for retry.
+                self._accounting_healthy = False
+                continue
+            with self._lock:
+                self._inflight.pop(request_id, None)
 
     def _finish_request_quietly(
         self,
@@ -511,6 +646,52 @@ class NativeControlPlane:
             )
         except Exception:  # noqa: BLE001 - primary admission failure stays authoritative.
             self._accounting_healthy = False
+
+    def _finish_attempt_quietly(self, attempt_id: str, failure: GatewayFailure) -> None:
+        """Settle one started attempt without masking the primary failure."""
+        terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
+        try:
+            self._components.ledger.finish_attempt(
+                attempt_id=attempt_id,
+                terminal_event=terminal,
+                failure=failure,
+                finalize_request=True,
+            )
+        except Exception:  # noqa: BLE001 - primary admission failure stays authoritative.
+            self._accounting_healthy = False
+
+
+def _build_upstream_payload(
+    profile: GatewayWireProfile,
+    provider_request: GatewayRequest,
+) -> JsonObject:
+    """Build the provider wire payload with the shared dialect builders.
+
+    Args:
+        profile: The resolved connection's wire profile.
+        provider_request: Canonical request forced into streaming mode.
+
+    Returns:
+        The exact JSON payload the python engine would send upstream.
+
+    Raises:
+        ProviderCapabilityError: The request uses a capability this dialect
+            cannot preserve, mirroring the python engine's dispatch behavior.
+    """
+    if profile.dialect == "openai_responses":
+        return openai_responses_stream_payload(
+            profile.model_id,
+            provider_request,
+            supports_temperature=profile.supports_temperature,
+            reasoning_effort=profile.reasoning_effort,
+        )
+    if profile.dialect == "anthropic_messages":
+        return anthropic_messages_stream_payload(profile.model_id, provider_request)
+    return openai_compatible_stream_payload(
+        profile.model_id,
+        provider_request,
+        token_limit_key=profile.token_limit_key,
+    )
 
 
 def _deployment_operation_key(route: GatewayRoute) -> str:

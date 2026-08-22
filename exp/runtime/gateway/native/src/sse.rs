@@ -102,3 +102,38 @@ fn decode_line(raw_line: &[u8]) -> Result<String, String> {
     String::from_utf8(raw_line.to_vec())
         .map_err(|_| "provider stream contains invalid UTF-8".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feed_splits_events_on_blank_lines() {
+        let mut decoder = SseDecoder::new();
+        let events = decoder
+            .feed(b"event: ping\ndata: {\"a\":1}\n\ndata: [DONE]\n\n")
+            .expect("valid SSE");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event.as_deref(), Some("ping"));
+        assert_eq!(events[0].data, "{\"a\":1}");
+        assert_eq!(events[1].data, "[DONE]");
+    }
+
+    #[test]
+    fn finish_recovers_an_unterminated_trailing_event() {
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.feed(b"data: tail").expect("valid SSE").is_empty());
+        let tail = decoder.finish().expect("valid tail").expect("one event");
+        assert_eq!(tail.data, "tail");
+        assert!(decoder.finish().expect("idempotent").is_none());
+    }
+
+    #[test]
+    fn feed_rejects_an_oversized_event() {
+        let mut decoder = SseDecoder::new();
+        let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
+        let mut chunk = b"data: ".to_vec();
+        chunk.extend_from_slice(&oversized);
+        assert!(decoder.feed(&chunk).is_err());
+    }
+}

@@ -141,6 +141,15 @@ impl PublicError {
         .with_param("model")
     }
 
+    pub fn request_too_large() -> Self {
+        Self::new(
+            413,
+            "request_too_large",
+            "Request body exceeds the gateway limit. Reduce the request size and resend.",
+            "invalid_request_error",
+        )
+    }
+
     pub fn provider_output_too_large() -> Self {
         Self::new(
             502,
@@ -211,6 +220,23 @@ impl Failure {
         }
     }
 
+    /// Coerce this failure to its boundary form: the python engine replaces
+    /// malformed-response detail with one generic safe message before both
+    /// accounting and the public error, so the native plane does the same.
+    pub fn boundary(self) -> Self {
+        match self.failure_class {
+            FailureClass::MalformedResponse
+                if self.safe_message != "provider returned a malformed response; retry the request" =>
+            {
+                Failure::new(
+                    FailureClass::MalformedResponse,
+                    "provider returned a malformed response; retry the request",
+                )
+            }
+            _ => self,
+        }
+    }
+
     /// Map one failure to its public error, mirroring `public_failure_error`.
     ///
     /// Quota exhaustion omits the Python engine's month-boundary suffix because
@@ -237,5 +263,35 @@ impl Failure {
             _ => None,
         };
         error
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boundary_replaces_malformed_detail_with_the_generic_message() {
+        let coerced = Failure::new(FailureClass::MalformedResponse, "specific detail").boundary();
+        assert_eq!(
+            coerced.safe_message,
+            "provider returned a malformed response; retry the request"
+        );
+        let transport = Failure::new(FailureClass::Transport, "kept").boundary();
+        assert_eq!(transport.safe_message, "kept");
+    }
+
+    #[test]
+    fn failure_classes_round_trip_through_their_wire_names() {
+        for class in [
+            FailureClass::InvalidRequest,
+            FailureClass::QuotaExceeded,
+            FailureClass::MalformedResponse,
+            FailureClass::Cancelled,
+        ] {
+            let wire = serde_json::to_value(class).expect("serializable");
+            let back: FailureClass = serde_json::from_value(wire).expect("round trip");
+            assert_eq!(back.as_str(), class.as_str());
+        }
     }
 }

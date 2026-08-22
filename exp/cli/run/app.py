@@ -124,6 +124,8 @@ def run(
             )
             return
         if engine == "rust":
+            if blocker == _NOT_INITIALIZED_BLOCKER:
+                _gateway_not_initialized(json_output=json_output)
             raise typer.BadParameter(blocker)
         if not json_output:
             _console.print(f"[yellow]rust engine unavailable ({blocker}); using python[/yellow]")
@@ -236,6 +238,9 @@ def _run_gateway(
         raise
 
 
+_NOT_INITIALIZED_BLOCKER = "the gateway is not initialized yet"
+
+
 def _rust_engine_blocker(root: Path) -> str | None:
     """Return why the rust data plane cannot serve this root, or ``None``.
 
@@ -258,7 +263,7 @@ def _rust_engine_blocker(root: Path) -> str | None:
         )
     manager = GatewayManagement(root)
     if not manager.initialized:
-        return "the gateway is not initialized yet"
+        return _NOT_INITIALIZED_BLOCKER
     return None
 
 
@@ -335,9 +340,41 @@ def _run_rust_gateway(
                 graceful_timeout_seconds=graceful_timeout,
             )
             asyncio.run(runtime.service.preflight())
+            receipt = {
+                "schema_version": 1,
+                "operation": "gateway.check" if check else "gateway.run",
+                "status": "ready",
+                "engine": "rust",
+                "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
+                "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage",
+                "reconciled_expired_requests": control_plane.reconciled_expired_requests,
+                "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
+                "launch_mode": "gateway",
+            }
+            if json_output:
+                typer.echo(json.dumps(receipt, separators=(",", ":")))
+            elif not check:
+                _console.print(
+                    f"[green]Gateway ready (rust engine)[/green] http://{_LOOPBACK_HOST}:{port}/v1",
+                    markup=True,
+                )
+            if check:
+                return
+
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                probe.bind((_LOOPBACK_HOST, 0))
-                fallback_port = probe.getsockname()[1]
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    probe.bind((_LOOPBACK_HOST, port))
+                except OSError as exc:
+                    raise typer.BadParameter(
+                        f"port {port} is unavailable on {_LOOPBACK_HOST}: {exc}"
+                    ) from exc
+
+            # The fallback socket stays bound from allocation to serving so
+            # the ephemeral port cannot be lost to another process.
+            fallback_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            fallback_socket.bind((_LOOPBACK_HOST, 0))
+            fallback_port = fallback_socket.getsockname()[1]
             fallback = uvicorn.Server(
                 uvicorn.Config(
                     runtime.app,
@@ -347,7 +384,7 @@ def _run_rust_gateway(
                 )
             )
             fallback_thread = threading.Thread(
-                target=fallback.run,
+                target=lambda: fallback.run(sockets=[fallback_socket]),
                 name="exp-fallback-engine",
                 daemon=True,
             )
@@ -360,35 +397,13 @@ def _run_rust_gateway(
                         "inspect the gateway configuration with 'exp run --engine python'"
                     )
                 time.sleep(0.05)
-            receipt = {
-                "schema_version": 1,
-                "operation": "gateway.check" if check else "gateway.run",
-                "status": "ready",
-                "engine": "rust",
-                "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
-                "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage",
-                "reconciled_expired_requests": control_plane.reconciled_expired_requests,
-                "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
-                "launch_mode": "gateway",
-            }
             try:
-                if json_output:
-                    typer.echo(json.dumps(receipt, separators=(",", ":")))
-                elif check:
-                    pass
-                else:
-                    _console.print(
-                        f"[green]Gateway ready (rust engine)[/green] "
-                        f"http://{_LOOPBACK_HOST}:{port}/v1",
-                        markup=True,
-                    )
-                if check:
-                    return
                 config = json.dumps(
                     {
                         "host": _LOOPBACK_HOST,
                         "port": port,
                         "max_active_requests": max_active_requests,
+                        "request_timeout_seconds": control_plane.request_timeout_seconds,
                         "fallback_port": fallback_port,
                         "graceful_timeout_seconds": graceful_timeout,
                     }
@@ -397,6 +412,7 @@ def _run_rust_gateway(
             finally:
                 fallback.should_exit = True
                 fallback_thread.join(timeout=graceful_timeout + 5)
+                fallback_socket.close()
 
 
 def _emit_exp_wordmark() -> None:

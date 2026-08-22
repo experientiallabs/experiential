@@ -2,11 +2,10 @@
 //!
 //! `serve` blocks the calling Python thread (with the GIL released) while the
 //! tokio server owns the socket; the Python control plane is reached through
-//! bounded callbacks. `decode_chat_canonical` exposes the Rust decoder for
-//! byte-level parity tests against the Python decoder.
+//! bounded callbacks. The fixture functions expose the Rust SSE encoder and
+//! failure taxonomy for byte-level parity tests against the Python engine.
 
 mod bridge;
-mod decode;
 mod dialects;
 mod encode;
 mod errors;
@@ -23,7 +22,7 @@ use pyo3::prelude::*;
 use crate::bridge::Bridge;
 use crate::server::ServeConfig;
 
-/// Serve the gateway data plane until shutdown (SIGINT).
+/// Serve the gateway data plane until shutdown (SIGINT or SIGTERM).
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
 /// `settle`, `models`, `model_detail`, `usage_json`, and `readiness`, each
@@ -42,61 +41,6 @@ fn serve(py: Python<'_>, control_plane: Py<PyAny>, config_json: &str) -> PyResul
         runtime.block_on(server::run(bridge, config))
     });
     outcome.map_err(PyRuntimeError::new_err)
-}
-
-/// Decode one Chat Completions body with the Rust decoder for parity tests.
-///
-/// Returns a JSON envelope `{"alias": ..., "canonical": ...}` or raises
-/// `ValueError` whose message is the public-error JSON payload.
-#[pyfunction]
-#[pyo3(signature = (body, idempotency_key=None, client_request_id=None))]
-fn decode_chat_canonical(
-    body: &str,
-    idempotency_key: Option<&str>,
-    client_request_id: Option<&str>,
-) -> PyResult<String> {
-    let payload: serde_json::Value = serde_json::from_str(body)
-        .map_err(|_| PyValueError::new_err(error_payload(&errors::PublicError::invalid_json())))?;
-    let object = payload
-        .as_object()
-        .ok_or_else(|| PyValueError::new_err(error_payload(&errors::PublicError::not_json_object())))?;
-    match decode::decode_chat(object, idempotency_key, client_request_id) {
-        Ok(decoded) => Ok(serde_json::json!({
-            "alias": decoded.alias,
-            "canonical": decoded.canonical,
-        })
-        .to_string()),
-        Err(error) => Err(PyValueError::new_err(error_payload(&error))),
-    }
-}
-
-/// Build one upstream payload with the Rust dialect builders for parity tests.
-#[pyfunction]
-#[pyo3(signature = (dialect, canonical_request, model_id, supports_temperature=true, reasoning_effort=None, token_limit_key="max_tokens"))]
-fn build_upstream_payload(
-    dialect: &str,
-    canonical_request: &str,
-    model_id: &str,
-    supports_temperature: bool,
-    reasoning_effort: Option<String>,
-    token_limit_key: &str,
-) -> PyResult<String> {
-    let request: serde_json::Value = serde_json::from_str(canonical_request)
-        .map_err(|error| PyValueError::new_err(format!("invalid canonical request: {error}")))?;
-    let parsed = dialects::Dialect::from_str(dialect)
-        .ok_or_else(|| PyValueError::new_err(format!("unknown dialect: {dialect}")))?;
-    let hints = dialects::WireHints {
-        model_id: model_id.to_string(),
-        supports_temperature,
-        reasoning_effort,
-        token_limit_key: token_limit_key.to_string(),
-    };
-    match dialects::build_payload(parsed, &request, &hints) {
-        Ok(payload) => Ok(payload.to_string()),
-        Err(failure) => Err(PyValueError::new_err(
-            serde_json::to_string(&failure).unwrap_or_default(),
-        )),
-    }
 }
 
 /// Encode one normalized event fixture through the Rust Chat SSE encoder for
@@ -123,6 +67,17 @@ fn encode_chat_fixture(
         );
     }
     Ok(frames)
+}
+
+/// Map one failure class and safe message to the Rust public-error JSON for
+/// taxonomy parity tests against `public_failure_error`.
+#[pyfunction]
+fn failure_public_error_fixture(failure_class: &str, safe_message: &str) -> PyResult<String> {
+    let parsed: errors::FailureClass =
+        serde_json::from_value(serde_json::Value::String(failure_class.to_string()))
+            .map_err(|_| PyValueError::new_err(format!("unknown failure class: {failure_class}")))?;
+    let failure = errors::Failure::new(parsed, safe_message);
+    Ok(error_payload(&failure.public_error()))
 }
 
 fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String> {
@@ -212,9 +167,8 @@ fn error_payload(error: &errors::PublicError) -> String {
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(serve, module)?)?;
-    module.add_function(wrap_pyfunction!(decode_chat_canonical, module)?)?;
-    module.add_function(wrap_pyfunction!(build_upstream_payload, module)?)?;
     module.add_function(wrap_pyfunction!(encode_chat_fixture, module)?)?;
+    module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

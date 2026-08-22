@@ -15,8 +15,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
         run: uv sync --extra dev
+      - name: cargo fmt
+        run: cargo fmt --check --manifest-path exp/runtime/gateway/native/Cargo.toml
+      - name: cargo clippy
+        run: >-
+          cargo clippy --manifest-path exp/runtime/gateway/native/Cargo.toml
+          --no-default-features -- -D warnings
+      - name: cargo test
+        run: >-
+          cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml
+          --no-default-features
+      - name: Build the native gateway extension so parity tests cannot skip
+        run: >-
+          uv run maturin develop --uv --release
+          --manifest-path exp/runtime/gateway/native/Cargo.toml
+      - name: Native parity tests are present, not skipped
+        run: >-
+          uv run pytest -q exp/runtime/gateway/native_bridge_test.py
+          -k "rust" -rs --no-header
       - name: ruff check
         run: uv run ruff check .
       - name: ruff format
