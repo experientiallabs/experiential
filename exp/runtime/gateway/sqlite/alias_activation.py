@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 
 from exp.common.core.artifacts import Sha256
+from exp.runtime.gateway.auth import IssuedVirtualKey
 from exp.runtime.gateway.contracts import DirectTarget, GatewayTarget, ProjectTarget
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
@@ -19,15 +20,23 @@ ConnectionFactory = Callable[[], AbstractContextManager[sqlite3.Connection]]
 class AliasActivationOutcomeUnknownError(ValueError):
     """An alias activation could not prove whether its COMMIT landed."""
 
-    def __init__(self, *, alias_id: str, revision_id: str) -> None:
-        """Create a content-free recovery error for one immutable alias revision.
+    def __init__(
+        self,
+        *,
+        alias_id: str,
+        revision_id: str,
+        issued: IssuedVirtualKey | None = None,
+    ) -> None:
+        """Create a recovery error for one immutable alias revision.
 
         Args:
             alias_id: Stable public alias identifier.
             revision_id: Immutable revision whose commit outcome is unknown.
+            issued: Optional one-time credential whose raw secret must be preserved for recovery.
         """
         self.alias_id = alias_id
         self.revision_id = revision_id
+        self.issued = issued
         super().__init__(
             "operation_outcome_unknown: inspect alias "
             f"{alias_id!r} revision {revision_id!r} before retrying"

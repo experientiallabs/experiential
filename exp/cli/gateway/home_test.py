@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,9 @@ from exp.cli.gateway import home
 from exp.cli.gateway.serve import DEFAULT_MAX_ACTIVE_REQUESTS
 from exp.cli.gateway.setup import InteractiveSetupResult
 from exp.cli.shared.picker_test import ScriptedConsole
+from exp.runtime.gateway.auth import IssuedVirtualKey
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 
 def test_home_screen_starts_with_brand_and_recommends_default_gateway(tmp_path: Path) -> None:
@@ -143,6 +146,40 @@ def test_setup_gateway_warns_and_reconfigures_an_initialized_gateway(
     assert "history remain." in console.output
     assert "export EXP_GATEWAY_KEY=exp_vk_reconfigured" in console.output
     assert "Gateway reconfigured" in console.output
+
+
+def test_setup_gateway_preserves_a_key_when_reconfiguration_outcome_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambiguous activation surfaces the non-reconstructable key for recovery."""
+    GatewayManagement(tmp_path).initialize()
+    issued = IssuedVirtualKey(
+        key_id="key-unknown",
+        organization_id="local",
+        identity_id="default",
+        prefix="exp_vk_test",
+        raw_key="exp_vk_test_secret",
+        expires_at=None,
+        created_at=datetime.now(UTC),
+    )
+
+    def setup_gateway(_root: Path, **_: object) -> InteractiveSetupResult:
+        """Raise the same typed uncertainty produced by alias activation."""
+        raise AliasActivationOutcomeUnknownError(
+            alias_id="default-gateway",
+            revision_id="revision-unknown",
+            issued=issued,
+        )
+
+    monkeypatch.setattr("exp.cli.gateway.setup.interactive_gateway_setup", setup_gateway)
+    console = ScriptedConsole("3\ny\n5\n")
+
+    home.default_gateway(root=tmp_path, console=console)
+
+    assert "outcome is unknown" in console.output
+    assert "Preserve this one-time gateway key: exp_vk_test_secret" in console.output
+    assert "Gateway reconfigured" not in console.output
 
 
 def test_setup_gateway_declines_initialized_gateway_reconfiguration(

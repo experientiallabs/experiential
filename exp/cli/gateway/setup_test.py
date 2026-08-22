@@ -366,6 +366,7 @@ def test_gateway_setup_rolls_back_all_authority_when_key_issue_fails(
     first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
     manager = setup.GatewayManagement(tmp_path)
     before = (
+        (tmp_path / "settings.toml").read_bytes(),
         (tmp_path / "models.toml").read_bytes(),
         manager.provider_connections(),
         manager.aliases(),
@@ -403,16 +404,17 @@ def test_gateway_setup_rolls_back_all_authority_when_key_issue_fails(
         """Fail after alias activation and grant staging inside the shared transaction."""
         raise RuntimeError("key issue failed")
 
-    monkeypatch.setattr(setup_authority, "_issue_key", fail_key)
+    monkeypatch.setattr(setup_authority, "_persist_key", fail_key)
 
     with pytest.raises(RuntimeError, match="key issue failed"):
         setup.interactive_gateway_setup(
             tmp_path,
-            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n50\n"),
+            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\n"),
             allow_reconfigure=True,
         )
 
     after = (
+        (tmp_path / "settings.toml").read_bytes(),
         (tmp_path / "models.toml").read_bytes(),
         manager.provider_connections(),
         manager.aliases(),

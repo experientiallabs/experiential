@@ -20,6 +20,7 @@ from exp.cli.gateway.serve import (
 from exp.cli.shared.picker import PickerAction, PickerOption, choose_one
 from exp.cli.shared.theme import EXP_THEME
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 _MENU_OPTIONS = (
     PickerOption(
@@ -261,6 +262,17 @@ def _setup_from_menu(console: Console, *, root: Path, port: int) -> None:
             setup = interactive_gateway_setup(root, console=console)
     except typer.Abort:
         console.print("[yellow]Gateway setup cancelled.[/yellow]")
+        return
+    except AliasActivationOutcomeUnknownError as exc:
+        console.print(
+            "[yellow]Gateway setup outcome is unknown; inspect gateway status before "
+            "retrying.[/yellow]"
+        )
+        if exc.issued is not None:
+            console.print(
+                f"Preserve this one-time gateway key: {exc.issued.raw_key}",
+                markup=False,
+            )
         return
     except ValueError as exc:
         console.print(f"[yellow]{exc}[/yellow]")

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import MutableMapping
-from contextlib import nullcontext
+from collections.abc import Iterator, MutableMapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,8 +27,13 @@ from exp.cli.providers.provider_picker import (
 )
 from exp.cli.shared.progress import progress_display
 from exp.cli.shared.theme import EXP_THEME
-from exp.common.config import resolve_command_budget_usd, set_maximum_command_cost_usd
+from exp.common.config import (
+    resolve_command_budget_usd,
+    set_maximum_command_cost_usd,
+    settings_path,
+)
 from exp.common.core.artifacts import stable_id
+from exp.common.core.files import resolve_write_target, write_bytes_atomic
 from exp.common.core.locks import file_write_lock
 from exp.common.models import GatewayDeploymentCapabilities, GatewayTokenPrices, ModelCapabilities
 from exp.common.progress import report
@@ -50,6 +55,41 @@ class InteractiveSetupResult:
     identity_id: str
     alias: str
     raw_key: str
+
+
+@contextmanager
+def _command_budget_compensation(root: Path, maximum_cost_usd: float) -> Iterator[None]:
+    """Persist the selected budget and restore its exact preimage on setup failure.
+
+    Args:
+        root: EXP root owning the settings file.
+        maximum_cost_usd: Budget selected by the operator.
+
+    Yields:
+        Control to the rest of gateway setup.
+
+    Raises:
+        RuntimeError: The settings preimage cannot be restored after setup failure.
+    """
+    configured_path = settings_path(root)
+    target_path = resolve_write_target(configured_path)
+    original = target_path.read_bytes() if target_path.exists() else None
+    try:
+        set_maximum_command_cost_usd(maximum_cost_usd, root)
+        yield
+    except BaseException:
+        try:
+            with file_write_lock(configured_path, what="gateway setup budget compensation"):
+                if original is None:
+                    target_path.unlink(missing_ok=True)
+                else:
+                    write_bytes_atomic(target_path, original)
+        except BaseException as compensation_error:
+            raise RuntimeError(
+                "gateway setup settings compensation outcome is unknown; inspect settings "
+                "before retrying"
+            ) from compensation_error
+        raise
 
 
 @dataclass(frozen=True)
@@ -142,82 +182,82 @@ def interactive_gateway_setup(
     progress_context = (
         progress_display(console, single_line=True) if console.is_interactive else nullcontext(None)
     )
-    with progress_context as progress:
+    with _command_budget_compensation(root, values.maximum_cost_usd):
+        with progress_context as progress:
 
-        def advance(detail: str) -> None:
-            """Advance the gateway setup progress bar after one completed mutation."""
-            nonlocal completed_steps
-            completed_steps += 1
-            report(
-                progress,
-                "gateway setup",
-                completed=completed_steps,
-                total=total_steps,
-                detail=detail,
-            )
-
-        set_maximum_command_cost_usd(values.maximum_cost_usd, root)
-        advance("save budget")
-        manager.initialize()
-        advance("initialize")
-        serving_connections = {
-            item.connection_id: item.config for item in manager.provider_connections()
-        }
-        for endpoint in session.endpoints:
-            serving_connections[endpoint.connection.name] = endpoint.connection.catalog_config()
-            advance(f"prepare {endpoint.connection.name}")
-        catalog_path = root / "models.toml"
-        with file_write_lock(catalog_path, what="the interactive gateway setup"):
-            update = plan_singleton_deployment_update(
-                root,
-                deployment_alias=values.alias,
-                connection_name=selected.connection,
-                provider_model=selected.model,
-                exact_model_id=_gateway_exact_model_id(selected),
-                revision=None,
-                capabilities=capabilities,
-                gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
-                prices=GatewayTokenPrices(),
-                pricing_source=None,
-                replace=reconfigure,
-                serving_connections=serving_connections,
-            )
-            revision_id = f"revision-{uuid.uuid4().hex}"
-            key_id = f"key-{uuid.uuid4().hex}"
-            try:
-                apply_singleton_deployment_update(root, update)
-                identity_created, issued = manager.configure_direct_alias_with_identity(
-                    alias_id=values.alias,
-                    alias_name=values.alias,
-                    revision_id=revision_id,
-                    pool_id=values.alias,
-                    snapshot_ref=f"catalog-snapshots/{update.snapshot.name}",
-                    catalog_sha256=update.normalized.identity_sha256(),
-                    provider_connections=update.updated.connections,
-                    replace=reconfigure,
-                    identity_id=values.identity_id,
-                    identity_display_name=values.identity_id,
-                    key_id=key_id,
+            def advance(detail: str) -> None:
+                """Advance the gateway setup progress bar after one completed mutation."""
+                nonlocal completed_steps
+                completed_steps += 1
+                report(
+                    progress,
+                    "gateway setup",
+                    completed=completed_steps,
+                    total=total_steps,
+                    detail=detail,
                 )
-            except AliasActivationOutcomeUnknownError:
-                raise
-            except BaseException:
+
+            advance("save budget")
+            manager.initialize()
+            advance("initialize")
+            serving_connections = {
+                item.connection_id: item.config for item in manager.provider_connections()
+            }
+            for endpoint in session.endpoints:
+                serving_connections[endpoint.connection.name] = endpoint.connection.catalog_config()
+                advance(f"prepare {endpoint.connection.name}")
+            catalog_path = root / "models.toml"
+            with file_write_lock(catalog_path, what="the interactive gateway setup"):
+                update = plan_singleton_deployment_update(
+                    root,
+                    deployment_alias=values.alias,
+                    connection_name=selected.connection,
+                    provider_model=selected.model,
+                    exact_model_id=_gateway_exact_model_id(selected),
+                    revision=None,
+                    capabilities=capabilities,
+                    gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                    prices=GatewayTokenPrices(),
+                    pricing_source=None,
+                    replace=reconfigure,
+                    serving_connections=serving_connections,
+                )
+                revision_id = f"revision-{uuid.uuid4().hex}"
+                key_id = f"key-{uuid.uuid4().hex}"
                 try:
-                    rollback_singleton_deployment_update(root, update)
-                except GatewayCatalogCompensationError as compensation_error:
-                    raise RuntimeError(
-                        "gateway setup catalog compensation outcome is unknown; inspect "
-                        "catalog and gateway status before retrying"
-                    ) from compensation_error
-                raise
-            advance("write catalog")
-            advance("activate alias")
-            if identity_created:
-                advance("create identity")
-            else:
-                advance("reuse identity")
-            advance("grant alias")
-            advance("issue key")
+                    apply_singleton_deployment_update(root, update)
+                    identity_created, issued = manager.configure_direct_alias_with_identity(
+                        alias_id=values.alias,
+                        alias_name=values.alias,
+                        revision_id=revision_id,
+                        pool_id=values.alias,
+                        snapshot_ref=f"catalog-snapshots/{update.snapshot.name}",
+                        catalog_sha256=update.normalized.identity_sha256(),
+                        provider_connections=update.updated.connections,
+                        replace=reconfigure,
+                        identity_id=values.identity_id,
+                        identity_display_name=values.identity_id,
+                        key_id=key_id,
+                    )
+                except AliasActivationOutcomeUnknownError:
+                    raise
+                except BaseException:
+                    try:
+                        rollback_singleton_deployment_update(root, update)
+                    except GatewayCatalogCompensationError as compensation_error:
+                        raise RuntimeError(
+                            "gateway setup catalog compensation outcome is unknown; inspect "
+                            "catalog and gateway status before retrying"
+                        ) from compensation_error
+                    raise
+                advance("write catalog")
+                advance("activate alias")
+                if identity_created:
+                    advance("create identity")
+                else:
+                    advance("reuse identity")
+                advance("grant alias")
+                advance("issue key")
     console.print("[green]✓ Gateway configured[/green]")
     return InteractiveSetupResult(
         identity_id=values.identity_id,

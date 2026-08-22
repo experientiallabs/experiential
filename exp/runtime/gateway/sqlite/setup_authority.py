@@ -17,6 +17,7 @@ from exp.runtime.gateway.auth import (
 )
 from exp.runtime.gateway.contracts import DirectTarget
 from exp.runtime.gateway.sqlite.alias_activation import (
+    AliasActivationOutcomeUnknownError,
     alias_activation_transaction,
     register_catalog_snapshot_in_transaction,
 )
@@ -155,48 +156,21 @@ def configure_direct_alias_with_identity(
     """
     target = DirectTarget(pool_id=pool_id)
     now = utc_text(store._clock.now())
+    issued, fingerprint_version, fingerprint = _prepare_key(
+        store,
+        organization_id=organization_id,
+        identity_id=identity_id,
+        key_id=key_id,
+        created_at=now,
+    )
     connect = cast(
         Callable[[], AbstractContextManager[sqlite3.Connection]],
         store._connect,
     )
     identity_created = False
-    issued: IssuedVirtualKey | None = None
-    with alias_activation_transaction(
-        connect=connect,
-        organization_id=organization_id,
-        alias_id=alias_id,
-        alias_name=alias_name,
-        revision_id=revision_id,
-        target=target,
-        snapshot_ref=snapshot_ref,
-        catalog_sha256=catalog_sha256,
-        refusal_failover=False,
-    ) as connection:
-        identity_created = _ensure_identity(
-            connection,
-            organization_id=organization_id,
-            identity_id=identity_id,
-            display_name=identity_display_name,
-            now=now,
-            store_error=store._store_error,
-        )
-        bindings = _stage_provider_connections(
-            connection,
-            organization_id=organization_id,
-            provider_connections=provider_connections,
-            replace=replace,
-            now=now,
-        )
-        register_catalog_snapshot_in_transaction(
-            connection,
-            organization_id=organization_id,
-            snapshot_ref=snapshot_ref,
-            catalog_sha256=catalog_sha256,
-            now=now,
-            store_error=store._store_error,
-        )
-        activate_alias_revision(
-            connection,
+    try:
+        with alias_activation_transaction(
+            connect=connect,
             organization_id=organization_id,
             alias_id=alias_id,
             alias_name=alias_name,
@@ -204,28 +178,67 @@ def configure_direct_alias_with_identity(
             target=target,
             snapshot_ref=snapshot_ref,
             catalog_sha256=catalog_sha256,
-            provider_connections=bindings,
             refusal_failover=False,
-            now=now,
-            store_error=store._store_error,
-        )
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO identity_alias_grants (
-                organization_id, identity_id, alias_id, created_at
-            ) VALUES (?, ?, ?, ?)
-            """,
-            (organization_id, identity_id, alias_id, now),
-        )
-        issued = _issue_key(
-            connection,
-            store=store,
-            organization_id=organization_id,
-            identity_id=identity_id,
-            key_id=key_id,
-            created_at=now,
-        )
-    assert issued is not None
+        ) as connection:
+            identity_created = _ensure_identity(
+                connection,
+                organization_id=organization_id,
+                identity_id=identity_id,
+                display_name=identity_display_name,
+                now=now,
+                store_error=store._store_error,
+            )
+            bindings = _stage_provider_connections(
+                connection,
+                organization_id=organization_id,
+                provider_connections=provider_connections,
+                replace=replace,
+                now=now,
+            )
+            register_catalog_snapshot_in_transaction(
+                connection,
+                organization_id=organization_id,
+                snapshot_ref=snapshot_ref,
+                catalog_sha256=catalog_sha256,
+                now=now,
+                store_error=store._store_error,
+            )
+            activate_alias_revision(
+                connection,
+                organization_id=organization_id,
+                alias_id=alias_id,
+                alias_name=alias_name,
+                revision_id=revision_id,
+                target=target,
+                snapshot_ref=snapshot_ref,
+                catalog_sha256=catalog_sha256,
+                provider_connections=bindings,
+                refusal_failover=False,
+                now=now,
+                store_error=store._store_error,
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO identity_alias_grants (
+                    organization_id, identity_id, alias_id, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (organization_id, identity_id, alias_id, now),
+            )
+            _persist_key(
+                connection,
+                store=store,
+                issued=issued,
+                fingerprint_version=fingerprint_version,
+                fingerprint=fingerprint,
+                created_at=now,
+            )
+    except AliasActivationOutcomeUnknownError as activation_error:
+        raise AliasActivationOutcomeUnknownError(
+            alias_id=alias_id,
+            revision_id=revision_id,
+            issued=issued,
+        ) from activation_error
     return identity_created, issued
 
 
@@ -291,19 +304,43 @@ def _ensure_identity(
     return True
 
 
-def _issue_key(
-    connection: sqlite3.Connection,
-    *,
+def _prepare_key(
     store: SQLiteGatewayStore,
+    *,
     organization_id: str,
     identity_id: str,
     key_id: str,
     created_at: str,
-) -> IssuedVirtualKey:
-    """Generate and persist one setup key inside the serving transaction."""
+) -> tuple[IssuedVirtualKey, int, Sha256]:
+    """Generate setup key material before entering the ambiguous transaction boundary."""
     prefix, raw_key = issue_key_material()
     pepper = store._pepper.current()
     fingerprint = fingerprint_virtual_key(raw_key, pepper)
+    return (
+        IssuedVirtualKey(
+            key_id=key_id,
+            organization_id=organization_id,
+            identity_id=identity_id,
+            prefix=prefix,
+            raw_key=raw_key,
+            expires_at=None,
+            created_at=datetime.fromisoformat(created_at),
+        ),
+        pepper.version,
+        fingerprint,
+    )
+
+
+def _persist_key(
+    connection: sqlite3.Connection,
+    *,
+    store: SQLiteGatewayStore,
+    issued: IssuedVirtualKey,
+    fingerprint_version: int,
+    fingerprint: Sha256,
+    created_at: str,
+) -> None:
+    """Persist prepared setup key material inside the serving transaction."""
     try:
         connection.execute(
             """
@@ -313,11 +350,11 @@ def _issue_key(
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                key_id,
-                organization_id,
-                identity_id,
-                prefix,
-                pepper.version,
+                issued.key_id,
+                issued.organization_id,
+                issued.identity_id,
+                issued.prefix,
+                fingerprint_version,
                 fingerprint,
                 created_at,
             ),
@@ -326,12 +363,3 @@ def _issue_key(
         raise store._store_error(
             "virtual key issuance conflicts with existing gateway authority"
         ) from None
-    return IssuedVirtualKey(
-        key_id=key_id,
-        organization_id=organization_id,
-        identity_id=identity_id,
-        prefix=prefix,
-        raw_key=raw_key,
-        expires_at=None,
-        created_at=datetime.fromisoformat(created_at),
-    )
