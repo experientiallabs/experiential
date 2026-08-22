@@ -2,7 +2,8 @@
 
 Setup opens with one provider screen, resolves each selected provider's credential from its
 environment override, a stored local credential, or a masked paste that persists, then asks
-that provider which models the authenticated account may call. Discovery lists identities.
+that provider which models the authenticated account may call. Editing a configured connection
+with a stored key can keep, replace, or remove that record. Discovery lists identities.
 Verification is a separate step:
 maintained or provider-published metadata can prove a role, and identity-only OpenAI-compatible
 models stay visible as unknown until the operator declares the minimum fields for a selected role.
@@ -67,6 +68,9 @@ UNKNOWN_METADATA_LABEL = "unknown capabilities/prices"
 _RECOVERY_RETRY = "retry"
 _RECOVERY_SKIP = "skip"
 _RECOVERY_BACK = "back"
+_CREDENTIAL_KEEP = "keep"
+_CREDENTIAL_REPLACE = "replace"
+_CREDENTIAL_REMOVE = "remove"
 _PROVIDER_VISIBLE_ROWS = 3
 
 
@@ -496,6 +500,7 @@ def _resolve_endpoint(
         connection=connection,
         console=console,
         environment=environment,
+        configured=configured,
     )
     if api_key is None:
         return None
@@ -541,6 +546,49 @@ def _reused_connection(
     return None
 
 
+def _stored_credential_action(
+    label: str,
+    *,
+    connection_id: str,
+    console: Console,
+    store: ProviderAuthStore,
+) -> str:
+    """Ask how to handle a stored key when editing a configured connection.
+
+    Connections with no stored record keep the current env-then-store path without an extra
+    screen.
+
+    Args:
+        label: Readable provider name.
+        connection_id: Catalog connection being edited.
+        console: Interactive console that owns the menu.
+        store: User-data credential store.
+
+    Returns:
+        One of ``_CREDENTIAL_KEEP``, ``_CREDENTIAL_REPLACE``, or ``_CREDENTIAL_REMOVE``.
+
+    Raises:
+        SetupCancelled: The operator cancelled the menu.
+    """
+    if connection_id not in store.connection_ids():
+        return _CREDENTIAL_KEEP
+    result = choose_one(
+        console,
+        title=f"{label} stored credential",
+        options=(
+            PickerOption(value=_CREDENTIAL_KEEP, label="Keep the stored credential"),
+            PickerOption(value=_CREDENTIAL_REPLACE, label="Replace the stored credential"),
+            PickerOption(value=_CREDENTIAL_REMOVE, label="Remove the stored credential"),
+        ),
+        default=_CREDENTIAL_KEEP,
+    )
+    if result.action is PickerAction.CANCEL:
+        raise SetupCancelled
+    if result.action is PickerAction.BACK:
+        return _CREDENTIAL_KEEP
+    return result.values[0]
+
+
 def _resolve_credential(
     label: str,
     *,
@@ -548,6 +596,7 @@ def _resolve_credential(
     console: Console,
     environment: MutableMapping[str, str],
     force_prompt: bool = False,
+    configured: bool = False,
     store: ProviderAuthStore | None = None,
 ) -> str | None:
     """Resolve one credential from env, store, or a masked paste that persists.
@@ -558,6 +607,7 @@ def _resolve_credential(
         console: Terminal used for the masked prompt.
         environment: Process environment consulted for override values.
         force_prompt: Whether to ignore the current environment and stored values.
+        configured: Whether this connection already exists in the catalog.
         store: Optional credential store used by tests.
 
     Returns:
@@ -566,6 +616,18 @@ def _resolve_credential(
     Raises:
         SetupCancelled: The prompt reached end of input.
     """
+    auth_store = store if store is not None else ProviderAuthStore()
+    if not force_prompt and configured:
+        action = _stored_credential_action(
+            label,
+            connection_id=connection.name,
+            console=console,
+            store=auth_store,
+        )
+        if action == _CREDENTIAL_REPLACE:
+            force_prompt = True
+        elif action == _CREDENTIAL_REMOVE:
+            auth_store.remove(connection.name)
 
     def _prompt() -> str | None:
         """Read one hidden API key, or cancel setup on a closed input stream.
@@ -586,7 +648,7 @@ def _resolve_credential(
         connection.catalog_config(),
         connection_id=connection.name,
         environment=environment,
-        store=store,
+        store=auth_store,
         prompt=_prompt,
         force_prompt=force_prompt,
     )

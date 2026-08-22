@@ -141,9 +141,9 @@ def config_providers(
     """Configure provider connections before selecting exact build-time role models.
 
     Catalog writes stay secret-free. Interactive setup pastes API keys into the user-data
-    credential store, while environment variables remain the override. Repeatable
-    ``--provider`` flags skip the opening list. Router candidates remain untouched until
-    ``exp optimize router``.
+    credential store and can replace or remove a stored key when that provider is edited.
+    Environment variables remain the override. Repeatable ``--provider`` flags skip the
+    opening list. Router candidates remain untouched until ``exp optimize router``.
     """
     options = ProviderSetupOptions(
         providers=tuple(provider or ()),
