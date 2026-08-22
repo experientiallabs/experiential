@@ -51,6 +51,7 @@ from exp.runtime.gateway.routing import (
     CatalogRouteResolver,
     GatewayRoutingError,
     RouterProjectTargetResolver,
+    SelectionWorkerPool,
 )
 from exp.runtime.gateway.service import GatewayService
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore, SystemGatewayClock
@@ -144,6 +145,7 @@ class _AliasAuthorityReloader:
         state: _AliasAuthorityState,
         routes: CatalogRouteResolver,
         executor: GatewayExecutor,
+        selection_workers: SelectionWorkerPool,
         retention_seconds: float = _RETIRED_REVISION_RETENTION_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -154,12 +156,15 @@ class _AliasAuthorityReloader:
             state: Fully validated startup generation.
             routes: Shared route resolver whose catalog index this reloader swaps.
             executor: Shared executor whose runtime catalogs this reloader swaps.
+            selection_workers: Process-wide bounded selection lane every replacement
+                project resolver keeps using, so a reload cannot widen the bound.
             retention_seconds: How long retired revisions stay resolvable.
             monotonic: Monotonic clock used for retirement bookkeeping.
         """
         self._loader = loader
         self._routes = routes
         self._executor = executor
+        self._selection_workers = selection_workers
         self._retention_seconds = retention_seconds
         self._monotonic = monotonic
         self._lock = threading.Lock()
@@ -255,7 +260,11 @@ class _AliasAuthorityReloader:
         self._executor.swap_catalogs(runtime)
         self._routes.swap_catalogs(
             normalized,
-            project_resolver=_project_resolver(activations, exact_models),
+            project_resolver=_project_resolver(
+                activations,
+                exact_models,
+                selection_workers=self._selection_workers,
+            ),
             listing_pools=listing_pools,
         )
         self._state = merged
@@ -455,9 +464,14 @@ def load_gateway_components(
         )
 
     state = loader()
+    selection_workers = SelectionWorkerPool()
     routes = CatalogRouteResolver(
         state.normalized_catalogs,
-        project_resolver=_project_resolver(state.activations, state.exact_models),
+        project_resolver=_project_resolver(
+            state.activations,
+            state.exact_models,
+            selection_workers=selection_workers,
+        ),
         listing_pools=state.listing_pools,
     )
     executor = GatewayExecutor(state.runtime_catalogs, write_ledger)
@@ -466,6 +480,7 @@ def load_gateway_components(
         state=state,
         routes=routes,
         executor=executor,
+        selection_workers=selection_workers,
     )
     return LocalGatewayComponents(
         manager=manager,
@@ -589,13 +604,28 @@ def load_local_gateway(
 def _project_resolver(
     activations: Mapping[tuple[str, str, str], RouterRuntime],
     exact_models: Mapping[tuple[str, str, str, str], str],
+    *,
+    selection_workers: SelectionWorkerPool,
 ) -> ProjectTargetResolver | None:
-    """Build one selection-only project bridge when any activation is loaded."""
+    """Build one selection-only project bridge when any activation is loaded.
+
+    Args:
+        activations: Verified frozen runtimes for every retained activation.
+        exact_models: Frozen exact-model identity for every candidate alias.
+        selection_workers: Shared bounded lane carried across every generation.
+
+    Returns:
+        A selection-only resolver, or ``None`` when no activation is loaded.
+    """
     if not activations:
         return None
     return cast(
         ProjectTargetResolver,
-        RouterProjectTargetResolver(activations, exact_models),
+        RouterProjectTargetResolver(
+            activations,
+            exact_models,
+            selection_workers=selection_workers,
+        ),
     )
 
 

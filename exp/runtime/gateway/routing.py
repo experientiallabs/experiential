@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 
@@ -385,6 +385,55 @@ def _index_catalogs(
     return indexed
 
 
+class SelectionWorkerPool:
+    """Bounded selection lane owned for the process rather than one generation.
+
+    One pool is the single aggregate bound on concurrent frozen selections,
+    shared by the event-loop path, the blocking native path, and every
+    resolver generation an alias-authority reload installs. Timed-out
+    submissions are cancelled while queued, and a worker re-checks the
+    request deadline before embedding, so abandoned work never runs ahead
+    of live requests.
+    """
+
+    def __init__(self, *, maximum_outstanding_selections: int = 4) -> None:
+        """Open one bounded worker lane.
+
+        Args:
+            maximum_outstanding_selections: Running plus detached selection calls allowed.
+
+        Raises:
+            ValueError: The requested bound admits no selection at all.
+        """
+        if maximum_outstanding_selections < 1:
+            raise ValueError("maximum_outstanding_selections must be at least one")
+        self._workers = ThreadPoolExecutor(
+            max_workers=maximum_outstanding_selections,
+            thread_name_prefix="exp-router-selection",
+        )
+
+    def submit(
+        self,
+        runtime: RouterRuntime,
+        model_request: ModelRequest,
+        *,
+        episode_id: str,
+        deadline: RequestDeadline,
+    ) -> Future[PreparedSelection]:
+        """Queue one deadline-guarded unretained selection in the shared lane."""
+        return self._workers.submit(
+            _select_within_deadline,
+            runtime,
+            model_request,
+            episode_id=episode_id,
+            deadline=deadline,
+        )
+
+    def shutdown(self) -> None:
+        """Stop accepting selections and drop still-queued work."""
+        self._workers.shutdown(wait=False, cancel_futures=True)
+
+
 class RouterProjectTargetResolver:
     """Run synchronous ``RouterRuntime.select`` in a bounded selection worker lane."""
 
@@ -394,6 +443,7 @@ class RouterProjectTargetResolver:
         exact_models_by_alias: Mapping[tuple[str, str, str, str], str],
         *,
         maximum_outstanding_selections: int = 4,
+        selection_workers: SelectionWorkerPool | None = None,
     ) -> None:
         """Bind frozen activations and an exact-model projection.
 
@@ -401,20 +451,15 @@ class RouterProjectTargetResolver:
             activations: Project, activation, and catalog digest mapped to verified
                 runtimes, so each retained revision keeps its own selection policy.
             exact_models_by_alias: Project, activation, catalog, and candidate alias mappings.
-            maximum_outstanding_selections: Running plus detached selection calls allowed.
+            maximum_outstanding_selections: Running plus detached selection calls allowed
+                when this resolver opens its own lane.
+            selection_workers: Pool shared with every other resolver generation, so an
+                alias-authority reload cannot split the aggregate selection bound.
         """
-        if maximum_outstanding_selections < 1:
-            raise ValueError("maximum_outstanding_selections must be at least one")
         self._activations = dict(activations)
         self._exact_models_by_alias = dict(exact_models_by_alias)
-        # One worker pool is the single aggregate bound on concurrent
-        # selections, shared by the event-loop path and the blocking path.
-        # Timed-out submissions are cancelled while queued, and a worker
-        # re-checks the request deadline before embedding, so abandoned
-        # work never runs ahead of live requests.
-        self._selection_workers = ThreadPoolExecutor(
-            max_workers=maximum_outstanding_selections,
-            thread_name_prefix="exp-router-selection",
+        self._selection_workers = selection_workers or SelectionWorkerPool(
+            maximum_outstanding_selections=maximum_outstanding_selections
         )
 
     async def select(
@@ -447,7 +492,6 @@ class RouterProjectTargetResolver:
         )
         if decision is None:
             submitted = self._selection_workers.submit(
-                _select_within_deadline,
                 runtime,
                 model_request,
                 episode_id=episode_id,
@@ -507,7 +551,6 @@ class RouterProjectTargetResolver:
         )
         if decision is None:
             future = self._selection_workers.submit(
-                _select_within_deadline,
                 runtime,
                 model_request,
                 episode_id=episode_id,
