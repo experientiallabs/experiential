@@ -187,7 +187,8 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     ):
         with pytest.raises(NativeBridgeError):
             control.settle(settlement)
-    assert control.readiness("{}") == "false"
+    # A transient failure does not latch readiness; the data plane retries.
+    assert control.readiness("{}") == "true"
     assert control.settle(settlement) == "{}"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1

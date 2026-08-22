@@ -53,11 +53,7 @@ from exp.runtime.gateway.execution import (
 )
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
-from exp.runtime.gateway.sqlite.store import (
-    AliasNotGrantedError,
-    GatewayStoreError,
-    InvalidVirtualKeyError,
-)
+from exp.runtime.gateway.service import boundary_protocol_error
 from exp.runtime.gateway.usage import read_usage_report
 from exp.runtime.models.providers import (
     preflight_gateway_request,
@@ -112,7 +108,7 @@ class NativeBridgeError(Exception):
 
 
 def _authority_error(exception: Exception) -> NativeBridgeError:
-    """Map authority failures exactly like ``GatewayService`` boundary mapping.
+    """Map boundary failures through the shared service-layer mapper.
 
     Args:
         exception: Store, grant, routing, or execution failure.
@@ -120,70 +116,7 @@ def _authority_error(exception: Exception) -> NativeBridgeError:
     Returns:
         A boundary error carrying the matching public OpenAI error.
     """
-    if isinstance(exception, OpenAIProtocolError):
-        return NativeBridgeError(exception)
-    if isinstance(exception, GatewayExecutionError):
-        return NativeBridgeError(public_failure_error(exception.failure))
-    if isinstance(exception, InvalidVirtualKeyError):
-        return NativeBridgeError(
-            OpenAIProtocolError(
-                status_code=401,
-                code="invalid_key",
-                message=(
-                    "The gateway key is invalid, expired, or revoked. Ask the gateway operator "
-                    "to issue a new virtual key."
-                ),
-                error_type="authentication_error",
-            )
-        )
-    if isinstance(exception, AliasNotGrantedError):
-        return NativeBridgeError(
-            OpenAIProtocolError(
-                status_code=403,
-                code="model_not_granted",
-                message=(
-                    "The requested model alias is not granted to this identity. "
-                    "GET /v1/models lists the model aliases available to this key."
-                ),
-                error_type="permission_error",
-                param="model",
-            )
-        )
-    if isinstance(exception, GatewayRoutingError):
-        return NativeBridgeError(
-            OpenAIProtocolError(
-                status_code=503,
-                code="unavailable_route",
-                message=(
-                    "The authorized model route is unavailable. Retry after a short delay; "
-                    "if this persists, ask the gateway operator to check the alias deployments."
-                ),
-                error_type="api_error",
-            )
-        )
-    if isinstance(exception, GatewayStoreError):
-        return NativeBridgeError(
-            OpenAIProtocolError(
-                status_code=400,
-                code="invalid_request",
-                message=(
-                    "The gateway request is invalid. Verify the model alias and request "
-                    "fields, then resend."
-                ),
-                error_type="invalid_request_error",
-            )
-        )
-    return NativeBridgeError(
-        OpenAIProtocolError(
-            status_code=500,
-            code="internal_error",
-            message=(
-                "The gateway request failed. Retry the request; if this persists, "
-                "ask the gateway operator to inspect the server logs."
-            ),
-            error_type="api_error",
-        )
-    )
+    return NativeBridgeError(boundary_protocol_error(exception))
 
 
 def _escalation(reason: str) -> str:
@@ -416,9 +349,9 @@ class NativeControlPlane:
             An empty JSON object; repeated settlement is a no-op.
 
         Raises:
-            NativeBridgeError: The durable terminal write failed; readiness is
-                latched unhealthy first, and the in-flight entry is kept so a
-                retried settlement can still reach the ledger.
+            NativeBridgeError: The durable terminal write failed; the
+                in-flight entry is kept so a retried settlement (from the
+                data plane or the deadline sweep) can still reach the ledger.
         """
         data = json.loads(argument)
         request_id = str(data["request_id"])
@@ -449,10 +382,10 @@ class NativeControlPlane:
                 failure=failure,
                 finalize_request=True,
             )
-        except Exception as exc:  # noqa: BLE001 - latch any durable ledger failure.
+        except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The in-flight entry is kept so a retried settlement can still
-            # reach the ledger; finish_attempt is idempotent on success.
-            self._accounting_healthy = False
+            # reach the ledger; a durable loss is latched by the sweep, which
+            # keeps retrying the entry after its deadline.
             raise _authority_error(exc) from exc
         with self._lock:
             self._inflight.pop(request_id, None)
@@ -499,9 +432,9 @@ class NativeControlPlane:
         return json.dumps(report.model_dump(mode="json"), separators=(",", ":"))
 
     def readiness(self, argument: str) -> str:
-        """Return whether the executor and bridge accounting stay healthy."""
+        """Return whether shared executor and bridge accounting stay healthy."""
         del argument
-        if not self._accounting_healthy or not self._components.readiness:
+        if not self._accounting_healthy:
             return "false"
         try:
             self._components.executor.require_healthy()

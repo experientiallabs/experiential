@@ -433,6 +433,9 @@ async fn deliver_settlement(bridge: &Bridge, argument: String) -> bool {
             return true;
         }
     }
+    // The control plane keeps the in-flight entry; its sweep keeps retrying
+    // and latches readiness if the loss is durable. Leave an operator signal.
+    eprintln!("exp-gateway-native: settlement not yet durable after retries: {argument}");
     false
 }
 
@@ -754,6 +757,24 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
+/// Deliver one public frame bounded by the request deadline, so a connected
+/// client that stops reading cannot pin the admission permit and the upstream
+/// connection forever. `false` means the client is gone or out of time.
+async fn send_bounded(
+    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    deadline: Instant,
+    data: Bytes,
+) -> bool {
+    let bound = remaining(deadline);
+    if bound.is_zero() {
+        return false;
+    }
+    matches!(
+        tokio::time::timeout(bound, sender.send(Ok(data))).await,
+        Ok(Ok(()))
+    )
+}
+
 /// Classify one mid-stream chunk timeout the way the python transport does:
 /// a stalled provider read is a transport failure unless the request's own
 /// deadline is exhausted.
@@ -963,7 +984,7 @@ async fn stream_response(
         macro_rules! fail_stream {
             ($failure:expr) => {{
                 let failure = $failure.boundary();
-                emit_failure(&sender, &mut encoder, &failure).await;
+                emit_failure(&sender, deadline, &mut encoder, &failure).await;
                 guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure))
                     .await;
@@ -981,7 +1002,7 @@ async fn stream_response(
             }
         };
         for frame in start_frames {
-            if sender.send(Ok(Bytes::from(frame))).await.is_err() {
+            if !send_bounded(&sender, deadline, Bytes::from(frame)).await {
                 guard.settle_cancelled(usage.as_ref(), &tool_names).await;
                 return;
             }
@@ -1030,7 +1051,7 @@ async fn stream_response(
                         }
                     };
                     for data in encoded {
-                        if sender.send(Ok(Bytes::from(data))).await.is_err() {
+                        if !send_bounded(&sender, deadline, Bytes::from(data)).await {
                             settle_stream_end(
                                 &mut guard,
                                 terminal.as_ref(),
@@ -1078,7 +1099,7 @@ async fn stream_response(
                         }
                     };
                     for data in encoded {
-                        if sender.send(Ok(Bytes::from(data))).await.is_err() {
+                        if !send_bounded(&sender, deadline, Bytes::from(data)).await {
                             settle_stream_end(
                                 &mut guard,
                                 terminal.as_ref(),
@@ -1100,7 +1121,7 @@ async fn stream_response(
                 "provider stream ended without a terminal event",
             )
             .boundary();
-            emit_failure(&sender, &mut encoder, &failure).await;
+            emit_failure(&sender, deadline, &mut encoder, &failure).await;
             guard
                 .settle("failed", usage.as_ref(), &tool_names, Some(&failure))
                 .await;
@@ -1180,6 +1201,7 @@ fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Vec<St
 /// stream has not already reached a terminal.
 async fn emit_failure(
     sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    deadline: Instant,
     encoder: &mut ChatSseEncoder,
     failure: &Failure,
 ) {
@@ -1195,7 +1217,7 @@ async fn emit_failure(
             ]
         });
     for frame in frames {
-        if sender.send(Ok(Bytes::from(frame))).await.is_err() {
+        if !send_bounded(sender, deadline, Bytes::from(frame)).await {
             return;
         }
     }

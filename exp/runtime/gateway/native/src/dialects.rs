@@ -9,8 +9,8 @@ use serde_json::{Map, Value};
 
 use crate::errors::{Failure, FailureClass};
 use crate::events::{
-    openai_compatible_usage, openai_usage, require_string, require_u64, Event, ToolAccumulator,
-    Usage,
+    count_or_zero, openai_compatible_usage, openai_usage, require_string, require_u64, Event,
+    ToolAccumulator, Usage,
 };
 use crate::sse::SseEvent;
 
@@ -353,15 +353,17 @@ impl Normalizer {
                     .get("usage")
                     .and_then(Value::as_object)
                     .ok_or_else(|| malformed("Anthropic message_start.usage must be an object"))?;
-                self.input_tokens = require_u64(usage, "input_tokens", "Anthropic input_tokens")
+                // Absent usage fields count as zero (require_integer parity);
+                // present malformed values fail the stream.
+                self.input_tokens = count_or_zero(usage, "input_tokens", "Anthropic input_tokens")
                     .map_err(|message| malformed(&message))?;
-                self.cache_read = require_u64(
+                self.cache_read = count_or_zero(
                     usage,
                     "cache_read_input_tokens",
                     "Anthropic cache_read_input_tokens",
                 )
                 .map_err(|message| malformed(&message))?;
-                self.cache_write = require_u64(
+                self.cache_write = count_or_zero(
                     usage,
                     "cache_creation_input_tokens",
                     "Anthropic cache_creation_input_tokens",
@@ -473,7 +475,7 @@ impl Normalizer {
                     .get("usage")
                     .and_then(Value::as_object)
                     .ok_or_else(|| malformed("Anthropic message_delta.usage must be an object"))?;
-                self.output_tokens = require_u64(usage, "output_tokens", "Anthropic output_tokens")
+                self.output_tokens = count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
                     .map_err(|message| malformed(&message))?;
                 if self.stop_reason.as_deref() == Some("refusal") && !self.refusal_seen {
                     self.refusal_seen = true;

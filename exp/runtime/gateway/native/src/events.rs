@@ -114,7 +114,7 @@ impl ToolAccumulator {
 /// Read an optional non-negative count, mirroring `require_integer`: absent
 /// or null counts as zero because providers omit zero-valued usage fields,
 /// while a present non-integer value is a provider contract violation.
-fn count_or_zero(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
+pub fn count_or_zero(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
     match object.get(key) {
         None | Some(Value::Null) => Ok(0),
         Some(value) => value

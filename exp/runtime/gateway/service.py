@@ -792,8 +792,19 @@ def _bearer_key(value: str | None) -> str:
     return value[7:].strip()
 
 
-def _exception_response(exception: BaseException) -> Response:
-    """Map sanitized protocol, authority, routing, and execution failures to JSON."""
+def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
+    """Map one sanitized boundary failure to its stable public protocol error.
+
+    This is the single authority for exception-to-public-error mapping; the
+    HTTP layer and the native engine's control-plane bridge both use it so
+    the two data planes cannot answer the same failure differently.
+
+    Args:
+        exception: Protocol, authority, routing, or execution failure.
+
+    Returns:
+        OpenAI-shaped protocol error carrying its HTTP representation.
+    """
     error: OpenAIProtocolError
     if isinstance(exception, OpenAIProtocolError):
         error = exception
@@ -915,6 +926,12 @@ def _exception_response(exception: BaseException) -> Response:
             ),
             error_type="api_error",
         )
+    return error
+
+
+def _exception_response(exception: BaseException) -> Response:
+    """Map sanitized protocol, authority, routing, and execution failures to JSON."""
+    error = boundary_protocol_error(exception)
     return JSONResponse(error.json_body(), status_code=error.status_code, headers=error.headers())
 
 
