@@ -70,7 +70,13 @@ _DRIVER_SOURCE = textwrap.dedent(
 
 
     def main() -> None:
-        """Compose the control plane, announce the public port, and serve."""
+        """Compose the control plane, announce the public port, and serve.
+
+        The port is probed with a bind-then-close, so another process could
+        claim it before the engine's own bind; a failed bind is retried on a
+        fresh port, and every attempt announces its port as one JSON line so
+        the test always polls the latest announcement.
+        """
         config = json.loads(sys.argv[1])
         components = load_gateway_components(
             Path(config["root"]),
@@ -80,24 +86,33 @@ _DRIVER_SOURCE = textwrap.dedent(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
         )
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-        sys.stdout.write(json.dumps({"port": port}) + "\\n")
-        sys.stdout.flush()
-        exp_gateway_native.serve(
-            control_plane,
-            json.dumps(
-                {
-                    "host": "127.0.0.1",
-                    "port": port,
-                    "max_active_requests": 8,
-                    "request_timeout_seconds": config["request_timeout_seconds"],
-                    "fallback_port": config["fallback_port"],
-                    "graceful_timeout_seconds": 2.0,
-                }
-            ),
-        )
+        last_error = None
+        for _attempt in range(5):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            sys.stdout.write(json.dumps({"port": port}) + "\\n")
+            sys.stdout.flush()
+            try:
+                exp_gateway_native.serve(
+                    control_plane,
+                    json.dumps(
+                        {
+                            "host": "127.0.0.1",
+                            "port": port,
+                            "max_active_requests": 8,
+                            "request_timeout_seconds": config["request_timeout_seconds"],
+                            "fallback_port": config["fallback_port"],
+                            "graceful_timeout_seconds": 2.0,
+                        }
+                    ),
+                )
+                return
+            except RuntimeError as error:
+                if "failed to bind" not in str(error):
+                    raise
+                last_error = error
+        raise SystemExit(f"no loopback port could be bound: {last_error}")
 
 
     if __name__ == "__main__":
@@ -132,7 +147,7 @@ class _SseUpstream(BaseHTTPRequestHandler):
 
     The user message content selects the streaming shape: ``fast-token``
     answers immediately, ``slow-token`` spreads a short answer over several
-    seconds, and ``flood-token`` emits megabytes of chunks so the gateway's
+    seconds, and ``flood-token`` streams chunks without end so the gateway's
     public send channel and socket buffers fill against a stalled reader.
     """
 
@@ -151,8 +166,11 @@ class _SseUpstream(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     time.sleep(0.5)
             elif prompt == "flood-token":
+                # Never terminates: the stream grows until the gateway drops
+                # the connection, so no host's TCP buffering can absorb it
+                # and the attempt can only settle through the deadline path.
                 block = _content_chunk("x" * 2048)
-                for _ in range(1500):
+                while True:
                     self.wfile.write(block)
                     self.wfile.flush()
             else:
@@ -278,17 +296,29 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         text=True,
     )
     try:
-        assert process.stdout is not None
-        announced = process.stdout.readline()
-        assert announced, f"driver exited before announcing a port: {stderr_log.read_text()}"
-        port = int(json.loads(announced)["port"])
+        announced_ports: list[int] = []
+
+        def _collect_announcements() -> None:
+            """Record every port announcement the driver prints on stdout."""
+            assert process.stdout is not None
+            for line in process.stdout:
+                announced_ports.append(int(json.loads(line)["port"]))
+
+        reader = threading.Thread(target=_collect_announcements, daemon=True)
+        reader.start()
         live_deadline = time.monotonic() + 30
+        port = 0
         while True:
-            try:
-                if httpx.get(f"http://{_HOST}:{port}/health/live", timeout=1.0).status_code == 200:
-                    break
-            except httpx.HTTPError:
-                pass
+            # The driver retries a lost bind race on a fresh port, so always
+            # poll the most recently announced one.
+            if announced_ports:
+                port = announced_ports[-1]
+                try:
+                    live = httpx.get(f"http://{_HOST}:{port}/health/live", timeout=1.0)
+                    if live.status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
             assert process.poll() is None, f"driver died: {stderr_log.read_text()}"
             assert time.monotonic() < live_deadline, "native engine never became live"
             time.sleep(0.05)
@@ -374,10 +404,11 @@ def test_stalled_reader_cannot_pin_the_gateway_past_the_deadline(
 ) -> None:
     """A stalled streaming reader is settled by the request deadline.
 
-    The client opens a streaming chat request against a flooding upstream,
-    reads the first SSE bytes, then stops reading while keeping the socket
-    open. A small client receive buffer plus the multi-megabyte stream fills
-    the gateway's bounded frame channel, so ``send_bounded`` blocks until the
+    The client opens a streaming chat request against an unbounded flooding
+    upstream, reads the first SSE bytes, then stops reading while keeping the
+    socket open. A small client receive buffer plus the never-ending stream
+    fills the gateway's bounded frame channel, so ``send_bounded`` blocks
+    until the
     request deadline and the attempt settles as cancelled even though the
     client never disconnects. The observation window ends before the
     control-plane sweep could close the attempt, so the settlement is the
