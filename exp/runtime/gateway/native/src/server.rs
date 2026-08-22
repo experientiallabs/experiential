@@ -41,6 +41,14 @@ pub struct ServeConfig {
     pub request_timeout_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
+    /// Loopback port of the embedded python engine serving escalated requests.
+    pub fallback_port: u16,
+    #[serde(default = "default_graceful_timeout_seconds")]
+    pub graceful_timeout_seconds: f64,
+}
+
+fn default_graceful_timeout_seconds() -> f64 {
+    10.0
 }
 
 fn default_max_active_requests() -> usize {
@@ -62,6 +70,7 @@ struct AppState {
     http: reqwest::Client,
     permits: Arc<Semaphore>,
     request_timeout: Duration,
+    fallback_base: String,
 }
 
 /// The wire configuration returned by one successful admission.
@@ -105,15 +114,16 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         http,
         permits: Arc::new(Semaphore::new(config.max_active_requests.max(1))),
         request_timeout: Duration::from_secs_f64(config.request_timeout_seconds),
+        fallback_base: format!("http://127.0.0.1:{}", config.fallback_port),
     };
     let app = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/models/{model_id}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
-        .route("/v1/responses", post(responses_unsupported))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .route("/usage.json", get(usage_json))
+        .fallback(proxy_fallback)
         .with_state(state);
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
@@ -122,12 +132,19 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         .tap_io(|stream| {
             let _ = stream.set_nodelay(true);
         });
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+    let graceful = Duration::from_secs_f64(config.graceful_timeout_seconds.max(0.1));
+    let server = axum::serve(listener, app).with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    });
+    // SIGINT starts the graceful drain above; the arm below bounds it, so a
+    // stuck stream cannot hold shutdown past the configured timeout.
+    tokio::select! {
+        outcome = server => outcome.map_err(|error| format!("gateway server failed: {error}")),
+        _ = async {
             let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .map_err(|error| format!("gateway server failed: {error}"))
+            tokio::time::sleep(graceful).await;
+        } => Ok(()),
+    }
 }
 
 fn error_response(error: &PublicError) -> Response {
@@ -201,8 +218,76 @@ async fn usage_json(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn responses_unsupported() -> Response {
-    error_response(&PublicError::responses_unsupported())
+/// Replay one HTTP request against the embedded python engine and stream the
+/// response back unchanged. Serves every surface the native plane does not
+/// implement (Responses, replay-keyed chat, usage pages, unknown routes).
+async fn proxy_to_python(
+    state: &AppState,
+    method: reqwest::Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
+    let url = format!("{}{}", state.fallback_base, path_and_query);
+    let mut request = state.http.request(method, url);
+    for (name, value) in headers {
+        let lowered = name.as_str().to_ascii_lowercase();
+        if matches!(
+            lowered.as_str(),
+            "host" | "connection" | "content-length" | "transfer-encoding" | "keep-alive"
+                | "te" | "trailer" | "upgrade"
+        ) {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    let upstream = match request.body(body).send().await {
+        Ok(upstream) => upstream,
+        Err(_) => {
+            return error_response(&PublicError::new(
+                502,
+                "fallback_engine_unavailable",
+                "The python fallback engine did not answer. Retry shortly; if this persists, restart the gateway.",
+                "api_error",
+            ))
+        }
+    };
+    let status = StatusCode::from_u16(upstream.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder().status(status);
+    for (name, value) in upstream.headers() {
+        let lowered = name.as_str().to_ascii_lowercase();
+        if matches!(
+            lowered.as_str(),
+            "connection" | "transfer-encoding" | "keep-alive" | "te" | "trailer" | "upgrade"
+        ) {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Route every path the native plane does not own to the python engine.
+async fn proxy_fallback(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, 512 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return error_response(&PublicError::invalid_json()),
+    };
+    let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+        .unwrap_or(reqwest::Method::GET);
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+    proxy_to_python(&state, method, &path_and_query, &parts.headers, bytes).await
 }
 
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -346,6 +431,17 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
     };
     let idempotency_key = header_string(&headers, "idempotency-key");
     let client_request_id = header_string(&headers, "x-client-request-id");
+    if idempotency_key.is_some() || client_request_id.is_some() {
+        // Replay-keyed chat keeps the python engine's idempotency semantics.
+        return proxy_to_python(
+            &state,
+            reqwest::Method::POST,
+            "/v1/chat/completions",
+            &headers,
+            body,
+        )
+        .await;
+    }
     let decoded = match decode_chat(object, idempotency_key.as_deref(), client_request_id.as_deref())
     {
         Ok(decoded) => decoded,
@@ -383,7 +479,20 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
             Ok(admission) => admission,
             Err(_) => return error_response(&PublicError::internal()),
         },
-        Err(error) => return error_response(&error),
+        Err(error) => {
+            if error.code == "native_unsupported" {
+                drop(permit);
+                return proxy_to_python(
+                    &state,
+                    reqwest::Method::POST,
+                    "/v1/chat/completions",
+                    &headers,
+                    body,
+                )
+                .await;
+            }
+            return error_response(&error);
+        }
     };
 
     let dialect = match Dialect::from_str(&admission.dialect) {

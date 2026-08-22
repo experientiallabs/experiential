@@ -27,7 +27,11 @@ from exp.common.models import (
 )
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport, RequestDeadline
-from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
+from exp.runtime.models.providers.base import (
+    DEFAULT_RETRY_POLICY,
+    DEFAULT_TIMEOUT_SECONDS,
+    GatewayWireProfile,
+)
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderRefusalError,
@@ -264,6 +268,18 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             deadline=deadline,
             idempotency_key=idempotency_key,
             retry_policy=retry_policy or self._retry_policy,
+            timeout_seconds=self._timeout_seconds,
+            supports_temperature=self._supports_temperature,
+            reasoning_effort=self._reasoning_effort,
+        )
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the native Responses wire profile for this connection."""
+        return GatewayWireProfile(
+            dialect="openai_responses",
+            url=f"{self._base_url}/{self._request_path(self._completion_path())}",
+            headers=self._headers(),
+            model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
             supports_temperature=self._supports_temperature,
             reasoning_effort=self._reasoning_effort,

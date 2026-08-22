@@ -19,6 +19,7 @@ from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.async_transport import RequestDeadline
 from exp.runtime.models.providers.base import (
     DEFAULT_MAXIMUM_OUTPUT_TOKENS,
+    GatewayWireProfile,
     ProviderHttpClient,
 )
 from exp.runtime.models.providers.errors import (
@@ -194,6 +195,16 @@ class AnthropicClient(ProviderHttpClient):
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
         }
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the native Messages wire profile for this connection."""
+        return GatewayWireProfile(
+            dialect="anthropic_messages",
+            url=f"{self._base_url}/{self._request_path(self._completion_path())}",
+            headers=self._headers(),
+            model_id=self._model.model_id,
+            timeout_seconds=self._timeout_seconds,
+        )
 
     def _completion_path(self) -> str:
         """Return the native Messages route."""

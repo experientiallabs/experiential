@@ -445,6 +445,59 @@ def load_gateway_components(
     )
 
 
+def compose_local_gateway(
+    components: LocalGatewayComponents,
+    *,
+    graceful_timeout_seconds: float = _DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
+    replay: ResponseReplayStore | None = None,
+    continuations: ResponseContinuationStore | None = None,
+) -> LocalGatewayRuntime:
+    """Compose the loopback application over already loaded components.
+
+    Args:
+        components: Loaded authority, ledger, routes, executor, and reloader.
+        graceful_timeout_seconds: Shutdown drain bound. Defaults to ten seconds.
+        replay: Optional shared Chat and Responses replay state.
+        continuations: Optional shared Responses continuation state.
+
+    Returns:
+        Composed service, application, health state, and recovery counts.
+
+    Raises:
+        GatewayLifecycleError: The drain bound is not positive.
+    """
+    if graceful_timeout_seconds <= 0:
+        raise GatewayLifecycleError("graceful timeout must be positive")
+
+    async def readiness_probe() -> ExecutionSnapshot:
+        """Return the current generation's credential and route proof."""
+        return components.reloader.state.proof
+
+    runtime = create_gateway_runtime(
+        config=GatewayRuntimeConfig(
+            graceful_timeout_seconds=graceful_timeout_seconds,
+            title="EXP local gateway",
+        ),
+        authority=components.store,
+        ledger=components.ledger,
+        routes=components.routes,
+        executor=components.executor,
+        clock=SystemGatewayClock(),
+        readiness=readiness_probe,
+        usage=lambda: read_usage_report(
+            components.ledger,
+            organization_id=components.organization_id,
+        ),
+        replay=replay,
+        continuations=continuations,
+    )
+    return LocalGatewayRuntime(
+        runtime=runtime,
+        reconciled_expired_requests=components.reconciled_expired_requests,
+        reconciled_unknown_attempts=components.reconciled_unknown_attempts,
+    )
+
+
 def load_local_gateway(
     root: Path = Path(ARTIFACT_DIR),
     *,
@@ -483,33 +536,11 @@ def load_local_gateway(
         decision_sink=decision_sink,
         only_aliases=only_aliases,
     )
-
-    async def readiness_probe() -> ExecutionSnapshot:
-        """Return the current generation's credential and route proof."""
-        return components.reloader.state.proof
-
-    runtime = create_gateway_runtime(
-        config=GatewayRuntimeConfig(
-            graceful_timeout_seconds=graceful_timeout_seconds,
-            title="EXP local gateway",
-        ),
-        authority=components.store,
-        ledger=components.ledger,
-        routes=components.routes,
-        executor=components.executor,
-        clock=SystemGatewayClock(),
-        readiness=readiness_probe,
-        usage=lambda: read_usage_report(
-            components.ledger,
-            organization_id=components.organization_id,
-        ),
+    return compose_local_gateway(
+        components,
+        graceful_timeout_seconds=graceful_timeout_seconds,
         replay=replay,
         continuations=continuations,
-    )
-    return LocalGatewayRuntime(
-        runtime=runtime,
-        reconciled_expired_requests=components.reconciled_expired_requests,
-        reconciled_unknown_attempts=components.reconciled_unknown_attempts,
     )
 
 

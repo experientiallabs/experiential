@@ -22,7 +22,7 @@ from exp.common.models import (
 )
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.async_transport import RequestDeadline
-from exp.runtime.models.providers.base import ProviderHttpClient
+from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
@@ -252,6 +252,17 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             deadline=deadline,
             idempotency_key=idempotency_key,
             retry_policy=retry_policy or self._retry_policy,
+            timeout_seconds=self._timeout_seconds,
+            token_limit_key=self.token_limit_key,
+        )
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the Chat Completions wire profile for this connection."""
+        return GatewayWireProfile(
+            dialect="openai_compatible",
+            url=f"{self._base_url}/{self._request_path(self._completion_path())}",
+            headers=self._headers(),
+            model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
             token_limit_key=self.token_limit_key,
         )

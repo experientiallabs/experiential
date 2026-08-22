@@ -171,6 +171,76 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     assert report["totals"]["requests"] == 1
 
 
+def test_admit_escalates_native_unsupported_providers_before_accounting(
+    tmp_path: Path,
+) -> None:
+    """A provider without a native dialect escalates with no ledger rows."""
+    from exp.common.models import (
+        GatewayDeploymentCapabilities,
+        GatewayTokenPrices,
+        ModelCapabilities,
+    )
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+    from exp.runtime.gateway.lifecycle_test import _configured_gateway
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="gem",
+        connection_name="gemini-main",
+        provider_model="gemini-model-exact",
+        exact_model_id="gemini-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="gem",
+        alias_name="gem",
+        revision_id="revision-gem",
+        pool_id="gem",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="gem")
+    components = load_gateway_components(
+        tmp_path,
+        environment={
+            "TEST_PROVIDER_KEY": "provider-secret-canary",
+            "TEST_GEMINI_KEY": "gemini-secret-canary",
+        },
+    )
+    control = NativeControlPlane(components)
+    with pytest.raises(NativeBridgeError) as excinfo:
+        control.admit(
+            json.dumps(
+                {
+                    "raw_key": raw_key,
+                    "alias": "gem",
+                    "request": _chat_canonical(),
+                    "stream": False,
+                }
+            )
+        )
+    payload = json.loads(excinfo.value.public_error_json)
+    assert payload["code"] == "native_unsupported"
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 0
+
+
 def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:
     """An ungranted alias maps to the shared 403 public error."""
     control, raw_key = _control_plane(tmp_path)

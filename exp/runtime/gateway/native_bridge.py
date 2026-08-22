@@ -17,8 +17,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-from pathlib import Path
-from typing import Protocol, cast
 
 from pydantic import ValidationError
 
@@ -26,6 +24,7 @@ from exp.common.core.artifacts import JsonObject, stable_id
 from exp.runtime.gateway.budgets import BudgetReservationRejected, maximum_attempt_cost_micro_usd
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
+    DirectTarget,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -38,7 +37,7 @@ from exp.runtime.gateway.discovery import (
     public_model_object,
     require_granted_authority,
 )
-from exp.runtime.gateway.lifecycle import LocalGatewayComponents, load_gateway_components
+from exp.runtime.gateway.lifecycle import LocalGatewayComponents
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
@@ -50,6 +49,7 @@ from exp.runtime.models.providers import (
     preflight_gateway_request,
     require_gateway_provider,
 )
+from exp.runtime.models.providers.base import ProviderHttpClient
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
@@ -65,27 +65,9 @@ _TERMINAL_KINDS = {
     "failed": GatewayEventKind.FAILED,
 }
 
-_PROVIDER_DIALECTS = {
-    "openai": ("openai_responses", "responses"),
-    "anthropic": ("anthropic_messages", "messages"),
-    "openai-compatible": ("openai_compatible", "chat/completions"),
-}
 
-
-class _WireClient(Protocol):
-    """The provider-client wiring the PoC data plane needs.
-
-    This names the private client internals the bridge reads; promoting a
-    public wire-config accessor onto gateway-capable clients replaces it when
-    the engine leaves proof-of-concept status.
-    """
-
-    _base_url: str
-    _timeout_seconds: float
-
-    def _headers(self) -> dict[str, str]:
-        """Return the authenticated provider request headers."""
-        ...
+class _NativeDialectUnavailableError(RuntimeError):
+    """The resolved provider has no native dialect; python must serve it."""
 
 
 class NativeBridgeError(Exception):
@@ -179,6 +161,30 @@ def _authority_error(exception: Exception) -> NativeBridgeError:
                 "The gateway request failed. Retry the request; if this persists, "
                 "ask the gateway operator to inspect the server logs."
             ),
+            error_type="api_error",
+        )
+    )
+
+
+def _native_unsupported_error(reason: str) -> NativeBridgeError:
+    """Signal that the python engine must serve this request.
+
+    The Rust data plane recognizes the ``native_unsupported`` code and
+    replays the original HTTP request against the embedded python engine,
+    which performs its own full authorization and accounting; no ledger
+    row exists yet when this is raised.
+
+    Args:
+        reason: Display-safe reason the native path cannot serve the request.
+
+    Returns:
+        The boundary error carrying the sentinel code.
+    """
+    return NativeBridgeError(
+        OpenAIProtocolError(
+            status_code=501,
+            code="native_unsupported",
+            message=reason,
             error_type="api_error",
         )
     )
@@ -281,16 +287,32 @@ class NativeControlPlane:
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
 
-        accepted = False
+        if not isinstance(authorization.target, DirectTarget):
+            raise _native_unsupported_error(
+                "project-backed aliases use learned selection on the python engine"
+            )
         try:
-            self._components.ledger.accept_request(authorization=authorization)
-            accepted = True
             route = self._components.routes.resolve_direct(authorization)
             deployment = route.deployment
             provider_request = request.model_copy(update={"stream": True, "include_usage": True})
             require_gateway_provider(deployment.provider)
             preflight_gateway_request(provider_request, deployment.gateway.capabilities)
             wire = self._wire_configuration(route)
+        except _NativeDialectUnavailableError as exc:
+            raise _native_unsupported_error(str(exc)) from exc
+        except ProviderCapabilityError as exc:
+            failure = GatewayFailure(
+                failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
+                safe_message="the resolved deployment does not support the requested capability",
+            )
+            raise NativeBridgeError(public_failure_error(failure)) from exc
+        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            raise _authority_error(exc) from exc
+
+        accepted = False
+        try:
+            self._components.ledger.accept_request(authorization=authorization)
+            accepted = True
             attempt_id = self._components.ledger.start_attempt(
                 snapshot=route.snapshot,
                 deployment=deployment,
@@ -313,14 +335,6 @@ class NativeControlPlane:
                 ),
             )
             raise error from exc
-        except ProviderCapabilityError as exc:
-            failure = GatewayFailure(
-                failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
-                safe_message="the resolved deployment does not support the requested capability",
-            )
-            if accepted:
-                self._finish_request_quietly(authorization, failure)
-            raise NativeBridgeError(public_failure_error(failure)) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             error = _authority_error(exc)
             if accepted:
@@ -435,11 +449,7 @@ class NativeControlPlane:
         return "true" if ready else "false"
 
     def _wire_configuration(self, route: GatewayRoute) -> JsonObject:
-        """Extract upstream wire configuration for one resolved deployment.
-
-        This is a PoC seam: it reads the resolved provider client's private
-        wiring. Productionizing this engine would promote a public wire-config
-        accessor onto the gateway-capable provider clients.
+        """Resolve one deployment's public wire profile for the data plane.
 
         Args:
             route: Resolved single-deployment route.
@@ -448,8 +458,10 @@ class NativeControlPlane:
             Dialect, URL, authenticated headers, and timing hints.
 
         Raises:
-            GatewayRoutingError: The provider has no supported native dialect
-                or the resolved client drifts from the frozen deployment.
+            _NativeDialectUnavailableError: The provider has no native-dialect
+                implementation; the python engine serves the request.
+            GatewayRoutingError: The resolved client cannot stream or the
+                authorized catalog is not loaded.
         """
         authorization = route.snapshot.authorization
         catalog = self._components.runtime_catalogs.get(
@@ -458,31 +470,31 @@ class NativeControlPlane:
         if catalog is None:
             raise GatewayRoutingError("runtime catalog is not loaded for the authorized revision")
         deployment = route.deployment
-        dialect_entry = _PROVIDER_DIALECTS.get(deployment.provider)
-        if dialect_entry is None:
-            raise GatewayRoutingError(
-                "the Rust gateway engine does not support this provider in the proof of concept"
-            )
-        dialect, path = dialect_entry
         resolved = catalog.resolve(deployment.source_alias)
         client = resolved.client
         if getattr(client, "stream", None) is None:
             raise GatewayRoutingError("resolved gateway deployment has no streaming capability")
-        # PoC seam: private client wiring; a public wire-config accessor on the
-        # gateway-capable clients is the productionization path.
-        wire_client = cast(_WireClient, client)
-        base_url = wire_client._base_url  # noqa: SLF001
-        headers = wire_client._headers()  # noqa: SLF001
-        timeout_seconds = wire_client._timeout_seconds  # noqa: SLF001
+        if not isinstance(client, ProviderHttpClient):
+            raise _NativeDialectUnavailableError(
+                f"provider {deployment.provider!r} has no native wire profile"
+            )
+        try:
+            profile = client.gateway_wire_profile()
+        except ProviderCapabilityError as exc:
+            if exc.capability != "native_data_plane":
+                raise
+            raise _NativeDialectUnavailableError(
+                f"provider {deployment.provider!r} has no native dialect implementation"
+            ) from exc
         return {
-            "dialect": dialect,
-            "url": f"{base_url}/{path}",
-            "headers": dict(headers),
-            "model_id": resolved.snapshot.model_id,
-            "timeout_seconds": timeout_seconds,
-            "supports_temperature": getattr(client, "_supports_temperature", True),
-            "reasoning_effort": getattr(client, "_reasoning_effort", None),
-            "token_limit_key": "max_tokens",
+            "dialect": profile.dialect,
+            "url": profile.url,
+            "headers": dict(profile.headers),
+            "model_id": profile.model_id or resolved.snapshot.model_id,
+            "timeout_seconds": profile.timeout_seconds,
+            "supports_temperature": profile.supports_temperature,
+            "reasoning_effort": profile.reasoning_effort,
+            "token_limit_key": profile.token_limit_key,
             "idempotency_key": _deployment_operation_key(route),
         }
 
@@ -557,24 +569,3 @@ def _optional_count(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
-
-
-def load_native_control_plane(
-    root: Path,
-    *,
-    request_timeout_seconds: float = _REQUEST_TIMEOUT_SECONDS,
-) -> NativeControlPlane:
-    """Load direct-alias gateway components for the Rust data plane.
-
-    Args:
-        root: Initialized EXP root.
-        request_timeout_seconds: Total per-request budget from admission.
-
-    Returns:
-        A control plane over the same SQLite authority the Python engine uses.
-    """
-    components = load_gateway_components(root, only_target_kinds=frozenset({"direct"}))
-    return NativeControlPlane(
-        components,
-        request_timeout_seconds=request_timeout_seconds,
-    )

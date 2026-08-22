@@ -54,9 +54,9 @@ _ENGINE_OPTION = typer.Option(
     "auto",
     "--engine",
     help=(
-        "Data-plane engine: 'auto' (rust when available, otherwise python), "
-        "'rust' (exp_gateway_native, Chat Completions only), or 'python' "
-        "(uvicorn, full surface including /v1/responses)."
+        "Data-plane engine: 'auto' (rust when built, otherwise python), 'rust' "
+        "(native data plane with an embedded python engine for Responses, "
+        "replay, and project aliases), or 'python' (uvicorn only)."
     ),
 )
 _MAX_ACTIVE_REQUESTS_OPTION = typer.Option(
@@ -120,6 +120,7 @@ def run(
                 json_output=json_output,
                 check=check,
                 max_active_requests=max_active_requests,
+                graceful_timeout=graceful_timeout,
             )
             return
         if engine == "rust":
@@ -258,8 +259,6 @@ def _rust_engine_blocker(root: Path) -> str | None:
     manager = GatewayManagement(root)
     if not manager.initialized:
         return "the gateway is not initialized yet"
-    if any(alias.target_kind != "direct" for alias in manager.aliases() if alias.active):
-        return "project-backed aliases require the python engine"
     return None
 
 
@@ -270,11 +269,14 @@ def _run_rust_gateway(
     json_output: bool,
     check: bool,
     max_active_requests: int,
+    graceful_timeout: float,
 ) -> None:
-    """Serve the rust data plane over the same local authority.
+    """Serve the rust data plane with an embedded python fallback engine.
 
-    The rust engine serves Chat Completions, model discovery, health, and
-    usage; callers that need /v1/responses select ``--engine python``.
+    The rust engine owns the public socket and the anonymous Chat Completions
+    fast path; a python engine over the same authority, ledger, and routes
+    runs on an internal loopback port and serves Responses, replay-keyed
+    chat, project-backed aliases, and the usage page.
 
     Args:
         root: Local artifact and model-catalog root.
@@ -282,19 +284,31 @@ def _run_rust_gateway(
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
         max_active_requests: Concurrent-admission bound for the data plane.
+        graceful_timeout: Gateway shutdown drain bound in seconds.
 
     Raises:
         typer.BadParameter: The extension module is missing or the gateway
-            configuration cannot form one ready direct route.
+            configuration cannot form one ready route.
     """
     if not json_output:
         _emit_exp_wordmark()
 
     import importlib
+    import socket
+    import threading
+    import time
 
-    from exp.runtime.gateway.lifecycle import gateway_instance_lock
+    import uvicorn
+
+    from exp.optimize.router.activation import verify_automatic_router_policy
+    from exp.runtime.gateway.lifecycle import (
+        compose_local_gateway,
+        gateway_instance_lock,
+        load_gateway_components,
+    )
     from exp.runtime.gateway.management import GatewayManagement
-    from exp.runtime.gateway.native_bridge import load_native_control_plane
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
+    from exp.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
 
     try:
         exp_gateway_native = importlib.import_module("exp_gateway_native")
@@ -310,35 +324,79 @@ def _run_rust_gateway(
         _gateway_not_initialized(json_output=json_output)
     with usage_error(ValueError):
         with gateway_instance_lock(root, port=port):
-            control_plane = load_native_control_plane(root)
+            project_repository = LocalArtifactProjectActivationRepository(
+                root,
+                verifier=verify_automatic_router_policy,
+            )
+            components = load_gateway_components(root, project_repository=project_repository)
+            control_plane = NativeControlPlane(components)
+            runtime = compose_local_gateway(
+                components,
+                graceful_timeout_seconds=graceful_timeout,
+            )
+            asyncio.run(runtime.service.preflight())
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((_LOOPBACK_HOST, 0))
+                fallback_port = probe.getsockname()[1]
+            fallback = uvicorn.Server(
+                uvicorn.Config(
+                    runtime.app,
+                    host=_LOOPBACK_HOST,
+                    port=fallback_port,
+                    log_level="warning",
+                )
+            )
+            fallback_thread = threading.Thread(
+                target=fallback.run,
+                name="exp-fallback-engine",
+                daemon=True,
+            )
+            fallback_thread.start()
+            deadline = time.monotonic() + 30
+            while not fallback.started:
+                if not fallback_thread.is_alive() or time.monotonic() > deadline:
+                    raise typer.BadParameter(
+                        "the embedded python fallback engine failed to start; "
+                        "inspect the gateway configuration with 'exp run --engine python'"
+                    )
+                time.sleep(0.05)
             receipt = {
                 "schema_version": 1,
                 "operation": "gateway.check" if check else "gateway.run",
                 "status": "ready",
                 "engine": "rust",
                 "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
-                "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage.json",
+                "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage",
                 "reconciled_expired_requests": control_plane.reconciled_expired_requests,
                 "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
                 "launch_mode": "gateway",
             }
-            if json_output:
-                typer.echo(json.dumps(receipt, separators=(",", ":")))
-            else:
-                _console.print(
-                    f"[green]Gateway ready (rust engine)[/green] http://{_LOOPBACK_HOST}:{port}/v1",
-                    markup=True,
+            try:
+                if json_output:
+                    typer.echo(json.dumps(receipt, separators=(",", ":")))
+                elif check:
+                    pass
+                else:
+                    _console.print(
+                        f"[green]Gateway ready (rust engine)[/green] "
+                        f"http://{_LOOPBACK_HOST}:{port}/v1",
+                        markup=True,
+                    )
+                if check:
+                    return
+                config = json.dumps(
+                    {
+                        "host": _LOOPBACK_HOST,
+                        "port": port,
+                        "max_active_requests": max_active_requests,
+                        "fallback_port": fallback_port,
+                        "graceful_timeout_seconds": graceful_timeout,
+                    }
                 )
-            if check:
-                return
-            config = json.dumps(
-                {
-                    "host": _LOOPBACK_HOST,
-                    "port": port,
-                    "max_active_requests": max_active_requests,
-                }
-            )
-            exp_gateway_native.serve(control_plane, config)
+                exp_gateway_native.serve(control_plane, config)
+            finally:
+                fallback.should_exit = True
+                fallback_thread.join(timeout=graceful_timeout + 5)
 
 
 def _emit_exp_wordmark() -> None:

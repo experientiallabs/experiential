@@ -6,6 +6,7 @@ import abc
 import asyncio
 import time
 from collections.abc import Coroutine, Mapping
+from dataclasses import dataclass, field
 from typing import ClassVar
 from uuid import uuid4
 
@@ -19,7 +20,10 @@ from exp.runtime.models.providers.async_transport import (
     run_then_close_pooled_client,
     run_with_retry_async,
 )
-from exp.runtime.models.providers.errors import ProviderRetryableResponseError
+from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
+    ProviderRetryableResponseError,
+)
 from exp.runtime.models.providers.transport import (
     JsonHttpTransport,
     ProviderTransportError,
@@ -56,6 +60,40 @@ def completion_timeout_seconds(
         return configured_timeout_seconds
     scaled = maximum_output_tokens * COMPLETION_SECONDS_PER_OUTPUT_TOKEN
     return max(configured_timeout_seconds, min(scaled, MAXIMUM_COMPLETION_TIMEOUT_SECONDS))
+
+
+@dataclass(frozen=True)
+class GatewayWireProfile:
+    """Everything a gateway data plane needs to dispatch one provider call.
+
+    The native (Rust) data plane builds provider payloads and parses provider
+    streams itself; this profile carries the connection-specific wire facts
+    that only the resolved Python client knows.
+    """
+
+    dialect: str
+    """Wire dialect: openai_responses, anthropic_messages, or openai_compatible."""
+
+    url: str
+    """Full endpoint URL, including provider-specific query parameters."""
+
+    headers: Mapping[str, str] = field(default_factory=dict)
+    """Authenticated request headers for every dispatch."""
+
+    model_id: str = ""
+    """Exact provider model identifier."""
+
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    """Per-attempt timeout floor; completion calls scale above it."""
+
+    supports_temperature: bool = True
+    """Whether the exact model accepts explicit sampling temperature."""
+
+    reasoning_effort: str | None = None
+    """Optional catalog-pinned reasoning effort."""
+
+    token_limit_key: str = "max_tokens"
+    """Wire field carrying the output-token ceiling on Chat Completions."""
 
 
 class ProviderHttpClient(abc.ABC):
@@ -177,6 +215,18 @@ class ProviderHttpClient(abc.ABC):
             attempt_timeout_seconds=completion_timeout,
             classify=_classify_complete_retry,
         )
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the native data plane's wire profile for this connection.
+
+        Returns:
+            The dialect, endpoint, headers, and timing facts for one dispatch.
+
+        Raises:
+            ProviderCapabilityError: This provider has no native-dialect
+                implementation; the request belongs on the Python engine.
+        """
+        raise ProviderCapabilityError(capability="native_data_plane")
 
     def _headers(self) -> dict[str, str]:
         """Build the authenticated JSON headers sent with every request."""
