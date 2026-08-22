@@ -67,6 +67,7 @@ from exp.runtime.gateway.native_responses import (
 )
 from exp.runtime.gateway.native_settlement import (
     deployment_operation_key,
+    first_token_at_from_settlement,
     optional_text,
     terminal_from_settlement,
 )
@@ -588,12 +589,14 @@ class NativeControlPlane:
         if entry is None:
             return "{}"
         terminal, failure = terminal_from_settlement(data)
+        first_token_at = first_token_at_from_settlement(data)
         try:
             self._write_ledger.finish_attempt(
                 attempt_id=entry.attempt_id,
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=True,
+                first_token_at=first_token_at,
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The exact settlement is retained so a retry (from the data

@@ -64,6 +64,9 @@ from exp.runtime.gateway.sqlite.platform_records import (
     key_record as _key_record,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
+    optional_datetime as _optional_datetime,
+)
+from exp.runtime.gateway.sqlite.platform_records import (
     optional_int as _optional_int,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
@@ -574,6 +577,7 @@ class SQLiteGatewayPlatform:
             terminal_event=request.terminal_event,
             failure=request.failure,
             finalize_request=request.finalize_request,
+            first_token_at=request.first_token_at,
         )
         row = self._attempt_row(
             organization_id=request.organization_id,
@@ -610,6 +614,7 @@ class SQLiteGatewayPlatform:
             usage_source=AttemptUsageSource(str(row["usage_source"] or "unknown")),
             estimated_cost_micro_usd=_optional_int(row["estimated_cost_micro_usd"]),
             settled_micro_usd=_optional_int(row["budget_settled_micro_usd"]),
+            first_token_at=_optional_datetime(row["first_token_at"]),
         )
         _require_settlement_replay(settlement, request=request)
         return settlement

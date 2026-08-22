@@ -865,6 +865,8 @@ def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
         alias: str,
         request: GatewayRequest,
         deadline_monotonic: float,
+        app_referer: str | None = None,
+        app_title: str | None = None,
     ) -> AuthorizationSnapshot:
         """Mint the authorization, then stall until the activation swap lands."""
         authorization = original(
@@ -872,6 +874,8 @@ def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
             alias=alias,
             request=request,
             deadline_monotonic=deadline_monotonic,
+            app_referer=app_referer,
+            app_title=app_title,
         )
         minted.set()
         assert swapped.wait(timeout=10)

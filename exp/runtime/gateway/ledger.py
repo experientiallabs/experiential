@@ -239,8 +239,9 @@ class SQLiteAttemptLedger:
             INSERT INTO gateway_requests (
                 request_id, organization_id, identity_id, key_id, alias_id,
                 alias_revision_id, api_surface, canonical_request_sha256,
-                caller_operation_sha256, accepted_at, deadline_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                caller_operation_sha256, accepted_at, deadline_at,
+                app_referer, app_title
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 authorization.request_id,
@@ -254,6 +255,8 @@ class SQLiteAttemptLedger:
                 authorization.caller_operation_sha256,
                 utc_text(now),
                 utc_text(deadline_at),
+                authorization.app_referer,
+                authorization.app_title,
             ),
         )
 
@@ -414,6 +417,7 @@ class SQLiteAttemptLedger:
         terminal_event: GatewayEvent | None,
         failure: GatewayFailure | None,
         finalize_request: bool = True,
+        first_token_at: datetime | None = None,
     ) -> None:
         """Idempotently settle one attempt with normalized content-free fields.
 
@@ -422,6 +426,7 @@ class SQLiteAttemptLedger:
             terminal_event: Provider terminal event, possibly carrying usage.
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
+            first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
         """
         with self._transaction() as connection:
             self.apply_finish_attempt(
@@ -430,6 +435,7 @@ class SQLiteAttemptLedger:
                 terminal_event=terminal_event,
                 failure=failure,
                 finalize_request=finalize_request,
+                first_token_at=first_token_at,
             )
 
     def apply_finish_attempt(
@@ -440,6 +446,7 @@ class SQLiteAttemptLedger:
         terminal_event: GatewayEvent | None,
         failure: GatewayFailure | None,
         finalize_request: bool = True,
+        first_token_at: datetime | None = None,
     ) -> None:
         """Run the attempt settlement inside the caller's open write transaction.
 
@@ -449,6 +456,7 @@ class SQLiteAttemptLedger:
             terminal_event: Provider terminal event, possibly carrying usage.
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
+            first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
         """
         state, normalized_failure, usage = _terminal_values(terminal_event, failure)
         row = connection.execute(
@@ -482,7 +490,7 @@ class SQLiteAttemptLedger:
         connection.execute(
             """
             UPDATE gateway_attempts
-            SET state = ?, terminal_at = ?, failure_class = ?,
+            SET state = ?, terminal_at = ?, first_token_at = ?, failure_class = ?,
                 input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
                 reasoning_tokens = ?, usage_source = ?, estimated_cost_micro_usd = ?,
                 budget_settled_micro_usd = ?
@@ -491,6 +499,7 @@ class SQLiteAttemptLedger:
             (
                 state,
                 terminal_at,
+                None if first_token_at is None else utc_text(first_token_at),
                 normalized_failure,
                 None if usage is None else usage.input_tokens,
                 None if usage is None else usage.cached_input_tokens,

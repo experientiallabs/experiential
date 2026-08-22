@@ -109,6 +109,7 @@ class _ControlStore:
         self._catalog_sha256 = catalog_sha256
         self._request_digest = request_digest
         self.raw_keys_seen: list[str] = []
+        self.app_seen: list[tuple[str | None, str | None]] = []
 
     def authorize_request(
         self,
@@ -117,9 +118,12 @@ class _ControlStore:
         alias: str,
         request: GatewayRequest,
         deadline_monotonic: float,
+        app_referer: str | None = None,
+        app_title: str | None = None,
     ) -> AuthorizationSnapshot:
         """Return one frozen direct-target authority snapshot."""
         self.raw_keys_seen.append(raw_key)
+        self.app_seen.append((app_referer, app_title))
         return AuthorizationSnapshot(
             request_id="request-one",
             organization_id="organization-one",
@@ -134,6 +138,8 @@ class _ControlStore:
                 self._request_digest(request) if self._request_digest is not None else _DIGEST
             ),
             deadline_monotonic=deadline_monotonic,
+            app_referer=app_referer,
+            app_title=app_title,
         )
 
     def authenticate_key(self, *, raw_key: str) -> None:
@@ -164,6 +170,7 @@ class _Ledger:
         self.started: list[ExecutionSnapshot] = []
         self.routes: list[tuple[str | None, str | None]] = []
         self.finished: list[tuple[GatewayEvent | None, GatewayFailure | None]] = []
+        self.first_token_ats: list[datetime | None] = []
         self.fail_finishes = False
         self.fail_starts = False
         self.reject_starts: AttemptRejectedError | None = None
@@ -200,12 +207,14 @@ class _Ledger:
         terminal_event: GatewayEvent | None,
         failure: GatewayFailure | None,
         finalize_request: bool = True,
+        first_token_at: datetime | None = None,
     ) -> None:
         """Capture one terminal settlement."""
         del attempt_id, finalize_request
         if self.fail_finishes:
             raise RuntimeError("terminal ledger unavailable")
         self.finished.append((terminal_event, failure))
+        self.first_token_ats.append(first_token_at)
 
     async def finish_request(
         self,
@@ -1801,5 +1810,48 @@ def test_model_discovery_publishes_the_revision_direct_pool_not_a_name_match() -
         assert granted.status_code == 200
         assert granted.json() == expected
         assert len(provider.streams) == 0
+
+    asyncio.run(scenario())
+
+
+def test_app_identity_headers_reach_authorization_for_attribution() -> None:
+    """HTTP-Referer and X-Title app headers reach the frozen authority for attribution."""
+
+    async def scenario() -> None:
+        """Post one chat request carrying OpenRouter-style app identity headers."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TEXT_DELTA,
+                        sequence_number=0,
+                        text_delta="hi",
+                    ),
+                    GatewayEvent(
+                        kind=GatewayEventKind.COMPLETED,
+                        sequence_number=1,
+                        usage=GatewayUsage(input_tokens=3, output_tokens=1),
+                    ),
+                )
+            )
+        )
+        service, control, _ledger, _proof = _service(provider)
+        transport = httpx.ASGITransport(app=create_gateway_app(service))
+        async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "public-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={
+                    "authorization": "Bearer caller-secret",
+                    "HTTP-Referer": "https://app.example.com",
+                    "X-Title": "Example App",
+                },
+            )
+
+        assert response.status_code == 200
+        assert ("https://app.example.com", "Example App") in control.app_seen
 
     asyncio.run(scenario())

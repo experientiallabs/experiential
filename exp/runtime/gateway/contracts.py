@@ -315,6 +315,10 @@ class AuthorizationSnapshot(ContractModel):
     caller_operation_sha256: Sha256 | None = None
     refusal_failover: bool = False
     deadline_monotonic: float = Field(gt=0)
+    app_referer: str | None = Field(default=None, max_length=2_048)
+    """Caller-supplied ``HTTP-Referer`` app identity, content-free and never a credential."""
+    app_title: str | None = Field(default=None, max_length=256)
+    """Caller-supplied ``X-Title`` app label used only for content-free app attribution."""
 
 
 class ExecutionSnapshot(ContractModel):

@@ -267,12 +267,16 @@ class GatewayService:
         *,
         raw_key: str,
         decoded: DecodedGatewayRequest,
+        app_referer: str | None = None,
+        app_title: str | None = None,
     ) -> Response:
         """Authorize and execute one decoded Chat or Responses request.
 
         Args:
             raw_key: Presented virtual key.
             decoded: Validated public alias and canonical request.
+            app_referer: Caller ``HTTP-Referer`` app identity for content-free attribution.
+            app_title: Caller ``X-Title`` app label for content-free attribution.
 
         Returns:
             Streaming or completed OpenAI-compatible HTTP response.
@@ -284,7 +288,12 @@ class GatewayService:
                 self._active_tasks.add(current_task)
         streaming = False
         try:
-            response = await self._complete_admitted(raw_key=raw_key, decoded=decoded)
+            response = await self._complete_admitted(
+                raw_key=raw_key,
+                decoded=decoded,
+                app_referer=app_referer,
+                app_title=app_title,
+            )
             streaming = isinstance(response, StreamingResponse)
         finally:
             if current_task is not None:
@@ -299,6 +308,8 @@ class GatewayService:
         *,
         raw_key: str,
         decoded: DecodedGatewayRequest,
+        app_referer: str | None = None,
+        app_title: str | None = None,
     ) -> Response:
         """Execute one request after lifecycle admission has been reserved."""
         deadline = self._clock.monotonic() + self._request_timeout_seconds
@@ -307,6 +318,8 @@ class GatewayService:
             alias=decoded.alias,
             request=decoded.request,
             deadline_monotonic=deadline,
+            app_referer=app_referer,
+            app_title=app_title,
         )
         namespace = _protocol_namespace(authorization)
         execution_request, episode = await self._continued_request(
@@ -699,6 +712,8 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
         authorization: str | None = Header(default=None),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         client_request_id: str | None = Header(default=None, alias="X-Client-Request-Id"),
+        app_referer: str | None = Header(default=None, alias="HTTP-Referer"),
+        app_title: str | None = Header(default=None, alias="X-Title"),
     ) -> Response:
         """Decode, authorize, and serve one Chat Completions request."""
         return await _dispatch(
@@ -708,6 +723,8 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
             decoder=decode_chat,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
+            app_referer=app_referer,
+            app_title=app_title,
         )
 
     @app.post("/v1/responses")
@@ -716,6 +733,8 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
         authorization: str | None = Header(default=None),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         client_request_id: str | None = Header(default=None, alias="X-Client-Request-Id"),
+        app_referer: str | None = Header(default=None, alias="HTTP-Referer"),
+        app_title: str | None = Header(default=None, alias="X-Title"),
     ) -> Response:
         """Decode, authorize, and serve one Responses request."""
         return await _dispatch(
@@ -725,6 +744,8 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
             decoder=decode_responses,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
+            app_referer=app_referer,
+            app_title=app_title,
         )
 
     return app
@@ -738,6 +759,8 @@ async def _dispatch(
     decoder: Callable[..., DecodedGatewayRequest],
     idempotency_key: str | None,
     client_request_id: str | None,
+    app_referer: str | None = None,
+    app_title: str | None = None,
 ) -> Response:
     """Decode one body and translate every sanitized gateway boundary failure."""
     try:
@@ -765,6 +788,8 @@ async def _dispatch(
         return await service.complete(
             raw_key=raw_key,
             decoded=decoded,
+            app_referer=app_referer,
+            app_title=app_title,
         )
     except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
         return _exception_response(exc)

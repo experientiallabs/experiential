@@ -25,6 +25,7 @@ import sqlite3
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TypeVar, cast
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -198,6 +199,7 @@ class GroupCommitAttemptLedger:
         terminal_event: GatewayEvent | None,
         failure: GatewayFailure | None,
         finalize_request: bool = True,
+        first_token_at: datetime | None = None,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -206,6 +208,7 @@ class GroupCommitAttemptLedger:
             terminal_event: Provider terminal event, possibly carrying usage.
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
+            first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
         """
         await self._submit(
             lambda connection: self.core.apply_finish_attempt(
@@ -214,6 +217,7 @@ class GroupCommitAttemptLedger:
                 terminal_event=terminal_event,
                 failure=failure,
                 finalize_request=finalize_request,
+                first_token_at=first_token_at,
             )
         )
 
@@ -513,6 +517,7 @@ class SyncGroupCommitLedger:
         terminal_event: GatewayEvent | None,
         failure: GatewayFailure | None,
         finalize_request: bool = True,
+        first_token_at: datetime | None = None,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -521,6 +526,7 @@ class SyncGroupCommitLedger:
             terminal_event: Provider terminal event, possibly carrying usage.
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
+            first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
         """
         self._writer.submit_blocking(
             lambda connection: self._writer.core.apply_finish_attempt(
@@ -529,6 +535,7 @@ class SyncGroupCommitLedger:
                 terminal_event=terminal_event,
                 failure=failure,
                 finalize_request=finalize_request,
+                first_token_at=first_token_at,
             )
         )
 

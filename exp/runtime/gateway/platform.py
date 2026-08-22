@@ -315,6 +315,8 @@ class AttemptSettlementRequest(ContractModel):
     terminal_event: GatewayEvent | None = None
     failure: GatewayFailure | None = None
     finalize_request: bool = True
+    first_token_at: AwareDatetime | None = None
+    """Wall-clock time the winning attempt streamed its first token, or ``None``."""
 
     @model_validator(mode="after")
     def _require_terminal_input(self) -> AttemptSettlementRequest:
@@ -366,6 +368,13 @@ class AttemptSettlementRecord(ContractModel):
     usage_source: AttemptUsageSource
     estimated_cost_micro_usd: int | None = Field(default=None, ge=0)
     settled_micro_usd: int | None = Field(default=None, ge=0)
+    first_token_at: AwareDatetime | None = None
+    """Wall-clock time this attempt streamed its first token, or ``None`` when it never did.
+
+    The platform stores this alongside ``terminal_at`` to derive time-to-first-token relative
+    to the parent request's ``accepted_at`` and to narrow generation duration to the streaming
+    window. It is absent for attempts that failed before any token or crashed unobserved.
+    """
 
     @model_validator(mode="after")
     def _require_settlement_coherence(self) -> AttemptSettlementRecord:
@@ -387,6 +396,7 @@ class AttemptSettlementRecord(ContractModel):
             self.failure_class is not None
             or self.usage is not None
             or self.usage_source is not AttemptUsageSource.UNKNOWN
+            or self.first_token_at is not None
         ):
             raise ValueError("unknown crash settlement cannot claim failure or usage evidence")
         if self.usage is None and self.usage_source is AttemptUsageSource.OBSERVED:

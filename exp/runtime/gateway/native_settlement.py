@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from exp.common.core.artifacts import JsonObject, stable_id
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
@@ -51,6 +53,28 @@ def terminal_from_settlement(
         failure=failure if kind == GatewayEventKind.FAILED else None,
     )
     return terminal, failure
+
+
+def first_token_at_from_settlement(data: JsonObject) -> datetime | None:
+    """Return the winning attempt's first-token wall-clock time from a settlement payload.
+
+    The native data plane includes ``first_token_at`` as an ISO-8601 timestamp only when it
+    observed a first streamed token. A missing, non-string, or unparseable value yields
+    ``None`` so accounting stays backward-compatible with engines that omit the field.
+
+    Args:
+        data: Parsed native settlement payload.
+
+    Returns:
+        The timezone-aware first-token time, or ``None`` when it is absent or malformed.
+    """
+    raw = data.get("first_token_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
 
 
 def _usage_from_payload(

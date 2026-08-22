@@ -687,3 +687,94 @@ def test_attempt_wrapper_returns_precise_reservation_and_settlement(
                 ),
             )
         )
+
+
+def test_settlement_surfaces_first_token_time_for_ttft(tmp_path: Path) -> None:
+    """A settlement request carrying first_token_at durably surfaces it on the record."""
+    platform = _platform(tmp_path)
+    platform.control.create_identity(
+        organization_id="org-one",
+        identity_id="builders",
+        display_name="Builders",
+    )
+    platform.control.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="catalog-one",
+        catalog_sha256=_DIGEST,
+    )
+    platform.control.activate_alias_revision(
+        organization_id="org-one",
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="alias-revision-one",
+        target=DirectTarget(pool_id="coding-pool"),
+        snapshot_ref="catalog-one",
+        catalog_sha256=_DIGEST,
+    )
+    platform.control.grant_alias(
+        organization_id="org-one",
+        identity_id="builders",
+        alias_id="coding",
+    )
+    raw_key = platform.control.issue_virtual_key(
+        organization_id="org-one",
+        identity_id="builders",
+        key_id="builders-key",
+    ).raw_key
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="bounded request"),),
+    )
+    authorization = platform.control.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=10**9,
+    )
+    platform.attempts.accept_request(authorization=authorization)
+    snapshot = ExecutionSnapshot(
+        authorization=authorization,
+        exact_model_id="exact-coding",
+        pool_id="coding-pool",
+        deployment_ids=("deployment-one",),
+    )
+    deployment = ExactModelDeployment(
+        deployment_id="deployment-one",
+        source_alias="deployment-one",
+        exact_model_id="exact-coding",
+        connection="openai",
+        provider="openai",
+        provider_model="gpt-test",
+        connection_sha256="b" * 64,
+        capabilities_sha256="c" * 64,
+        gateway=GatewayDeploymentMetadata(
+            prices=GatewayTokenPrices(
+                input_micro_usd_per_million_tokens=1_000_000,
+                output_micro_usd_per_million_tokens=1_000_000,
+            )
+        ),
+    )
+    reservation = platform.reserve_attempt(
+        AttemptReservationRequest(
+            organization_id="org-one",
+            snapshot=snapshot,
+            deployment=deployment,
+            attempt_ordinal=0,
+            route_depth=0,
+            maximum_cost_micro_usd=100,
+        )
+    )
+    first_token_at = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    settlement = platform.settle_attempt(
+        AttemptSettlementRequest(
+            organization_id="org-one",
+            attempt_id=reservation.attempt_id,
+            terminal_event=GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=0,
+                usage=GatewayUsage(input_tokens=10, output_tokens=5),
+            ),
+            first_token_at=first_token_at,
+        )
+    )
+    assert settlement.first_token_at == first_token_at

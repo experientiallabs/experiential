@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class GatewaySchemaError(RuntimeError):
@@ -523,6 +523,12 @@ _MIGRATION_8 = (
     """,
 )
 
+_MIGRATION_9 = (
+    "ALTER TABLE gateway_attempts ADD COLUMN first_token_at TEXT",
+    "ALTER TABLE gateway_requests ADD COLUMN app_referer TEXT",
+    "ALTER TABLE gateway_requests ADD COLUMN app_title TEXT",
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -532,6 +538,7 @@ _MIGRATIONS = {
     6: _MIGRATION_6,
     7: _MIGRATION_7,
     8: _MIGRATION_8,
+    9: _MIGRATION_9,
 }
 
 

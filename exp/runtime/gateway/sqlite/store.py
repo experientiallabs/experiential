@@ -668,6 +668,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         alias: str,
         request: GatewayRequest,
         deadline_monotonic: float,
+        app_referer: str | None = None,
+        app_title: str | None = None,
     ) -> AuthorizationSnapshot:
         """Authenticate and authorize before any model or provider work.
 
@@ -676,6 +678,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             alias: Requested public model alias.
             request: Canonical content-bearing request used only for its digest.
             deadline_monotonic: Absolute request-wide monotonic deadline.
+            app_referer: Caller ``HTTP-Referer`` and ``app_title`` its ``X-Title`` app identity.
 
         Returns:
             Immutable content-free authority snapshot.
@@ -735,6 +738,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             surface=request.surface,
             caller_operation_sha256=caller_operation,
             refusal_failover=bool(row["refusal_failover"]),
+            app_referer=app_referer,
+            app_title=app_title,
         )
 
     def authenticate_key(self, *, raw_key: str) -> None:

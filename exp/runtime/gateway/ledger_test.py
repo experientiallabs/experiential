@@ -849,3 +849,102 @@ def test_concurrent_multi_identity_wal_preserves_receipts_grants_and_attempts(
         assert connection.execute("SELECT COUNT(*) FROM identity_alias_grants").fetchone()[0] == 8
     finally:
         connection.close()
+
+
+def test_accept_and_finish_persist_app_attribution_and_first_token_at(tmp_path: Path) -> None:
+    """Accept freezes the caller app identity and finish records the first-token time."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("prompt-content-canary"),
+        deadline_monotonic=clock.monotonic() + 30,
+        app_referer="https://app.example.com",
+        app_title="Example App",
+    )
+    assert authorization.app_referer == "https://app.example.com"
+    assert authorization.app_title == "Example App"
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    clock.advance(0.2)
+    first_token_at = clock.now()
+    clock.advance(0.3)
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=10, output_tokens=5),
+        ),
+        failure=None,
+        first_token_at=first_token_at,
+    )
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection.row_factory = sqlite3.Row
+    try:
+        attempt_row = connection.execute(
+            "SELECT first_token_at, terminal_at FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        request_row = connection.execute(
+            "SELECT app_referer, app_title FROM gateway_requests WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert datetime.fromisoformat(str(attempt_row["first_token_at"])) == first_token_at
+    assert str(attempt_row["terminal_at"]) != str(attempt_row["first_token_at"])
+    assert str(request_row["app_referer"]) == "https://app.example.com"
+    assert str(request_row["app_title"]) == "Example App"
+
+
+def test_first_token_and_app_attribution_default_to_null(tmp_path: Path) -> None:
+    """An attempt that never streamed a token and a caller without app headers stay null."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("prompt"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    assert authorization.app_referer is None
+    assert authorization.app_title is None
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="upstream unavailable",
+        ),
+    )
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection.row_factory = sqlite3.Row
+    try:
+        attempt_row = connection.execute(
+            "SELECT first_token_at FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        request_row = connection.execute(
+            "SELECT app_referer, app_title FROM gateway_requests WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert attempt_row["first_token_at"] is None
+    assert request_row["app_referer"] is None
+    assert request_row["app_title"] is None

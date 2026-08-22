@@ -38,8 +38,14 @@ class GatewayControlStore(Protocol):
         alias: str,
         request: GatewayRequest,
         deadline_monotonic: float,
+        app_referer: str | None = None,
+        app_title: str | None = None,
     ) -> AuthorizationSnapshot:
-        """Authenticate, authorize, and freeze authority before route selection."""
+        """Authenticate, authorize, and freeze authority before route selection.
+
+        ``app_referer`` and ``app_title`` carry the caller's OpenRouter-style app identity
+        (the ``HTTP-Referer`` and ``X-Title`` request headers) for content-free attribution.
+        """
         ...
 
     def granted_aliases(self, *, raw_key: str) -> tuple[str, ...]:
@@ -92,8 +98,14 @@ class AttemptLedger(Protocol):
         terminal_event: GatewayEvent | None,
         failure: GatewayFailure | None,
         finalize_request: bool = True,
+        first_token_at: datetime | None = None,
     ) -> None:
-        """Settle one physical attempt and optionally finalize its parent request."""
+        """Settle one physical attempt and optionally finalize its parent request.
+
+        ``first_token_at`` is the wall-clock time this attempt streamed its first token,
+        surfaced only for the winning attempt and left ``None`` for attempts that produced
+        no token.
+        """
         ...
 
     async def finish_request(

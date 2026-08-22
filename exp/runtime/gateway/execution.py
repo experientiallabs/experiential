@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import cast
 
 from exp.common.core.artifacts import stable_id
@@ -25,9 +26,10 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.group_commit import abandoned_write_outcome
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
-from exp.runtime.gateway.interfaces import AttemptLedger, ProviderStream
+from exp.runtime.gateway.interfaces import AttemptLedger, GatewayClock, ProviderStream
 from exp.runtime.gateway.ledger import AttemptRejectedError, GatewayLedgerError
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers import (
     AsyncGatewayProvider,
@@ -89,6 +91,7 @@ class _PhysicalAttempt:
     stream: ProviderStream | None = None
     iterator: AsyncIterator[GatewayEvent] | None = None
     latest_usage: GatewayUsage | None = None
+    first_token_at: datetime | None = None
     tool_names: list[str] = field(default_factory=list)
     last_provider_sequence: int = -1
     withheld_refusals: list[GatewayEvent] = field(default_factory=list)
@@ -114,6 +117,7 @@ class GatewayExecutionStream:
         maximum_total_attempts: int,
         maximum_same_deployment_attempts: int,
         refusal_failover: bool,
+        clock: GatewayClock,
     ) -> None:
         """Bind one frozen logical route to its finite physical-attempt policy.
 
@@ -129,6 +133,7 @@ class GatewayExecutionStream:
             maximum_total_attempts: Hard cap across retries and deployments.
             maximum_same_deployment_attempts: Initial dispatch plus safe retries per deployment.
             refusal_failover: Whether a typed precommit refusal may advance to another deployment.
+            clock: Wall clock stamping the winning attempt's first streamed token.
         """
         self._route = route
         self._request = request
@@ -141,6 +146,7 @@ class GatewayExecutionStream:
         self._maximum_total_attempts = maximum_total_attempts
         self._maximum_same_deployment_attempts = maximum_same_deployment_attempts
         self._refusal_failover = refusal_failover
+        self._clock = clock
         self._attempt_counts = [0 for _ in resolved]
         self._total_attempts = 0
         self._current: _PhysicalAttempt | None = None
@@ -249,6 +255,8 @@ class GatewayExecutionStream:
             if event.kind in _SEMANTIC_EVENTS:
                 if event.kind == GatewayEventKind.REFUSAL_DELTA:
                     current.visible_refusal = True
+                if current.first_token_at is None:
+                    current.first_token_at = self._clock.now()
                 self._committed = True
                 return self._outward(event)
             if event.kind not in _TERMINAL_EVENTS:
@@ -394,6 +402,7 @@ class GatewayExecutionStream:
                     terminal_event=terminal,
                     failure=failure,
                     finalize_request=True,
+                    first_token_at=current.first_token_at,
                 )
                 current.settled = True
                 self._parent_finalized = True
@@ -559,6 +568,7 @@ class GatewayExecutionStream:
                     terminal_event=terminal,
                     failure=failure,
                     finalize_request=finalize_request,
+                    first_token_at=current.first_token_at,
                 )
                 current.settled = True
                 if finalize_request:
@@ -656,6 +666,8 @@ class GatewayExecutionStream:
             current: Physical attempt holding in-memory refusal deltas.
             *following: Semantic or terminal events that arrived after the refusal.
         """
+        if current.first_token_at is None:
+            current.first_token_at = self._clock.now()
         self._committed = True
         current.visible_refusal = True
         self._pending_outward.extend(current.withheld_refusals)
@@ -736,6 +748,7 @@ class GatewayExecutor:
         maximum_total_attempts: int = 8,
         maximum_same_deployment_attempts: int = 2,
         health: DeploymentHealthRegistry | None = None,
+        clock: GatewayClock | None = None,
     ) -> None:
         """Bind runtime providers, attempt policy, health, and finite request admission.
 
@@ -759,6 +772,7 @@ class GatewayExecutor:
         self._maximum_total_attempts = maximum_total_attempts
         self._maximum_same_deployment_attempts = maximum_same_deployment_attempts
         self._health = health or DeploymentHealthRegistry()
+        self._clock = clock or SystemGatewayClock()
         self._accounting_healthy = True
 
     def swap_catalogs(self, catalogs: Mapping[tuple[str, str], RuntimeModelCatalog]) -> None:
@@ -828,6 +842,7 @@ class GatewayExecutor:
             maximum_total_attempts=self._maximum_total_attempts,
             maximum_same_deployment_attempts=self._maximum_same_deployment_attempts,
             refusal_failover=route.snapshot.authorization.refusal_failover,
+            clock=self._clock,
         )
         try:
             await execution.open()

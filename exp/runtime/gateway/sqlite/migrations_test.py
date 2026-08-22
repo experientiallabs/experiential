@@ -592,7 +592,7 @@ def test_v8_migration_adds_default_off_strict_unknown_cost(tmp_path: Path) -> No
             "SELECT strict_unknown_cost FROM gateway_monthly_budgets WHERE budget_id = 'budget-one'"
         ).fetchone()
         assert row == (0,)
-        assert current.execute("PRAGMA user_version").fetchone() == (8,)
+        assert current.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
     finally:
         current.close()
     prior = sqlite3.connect(backup)
