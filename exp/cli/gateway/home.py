@@ -82,14 +82,18 @@ def default_gateway(
     """
     provided_console = console is not None
     output = console or Console(theme=EXP_THEME)
-    if policy is not None or ghost or _requires_direct_start(
-        project=project,
-        non_interactive=non_interactive,
-        json_output=json_output,
-        check=check,
-        engine=engine,
-        max_active_requests=max_active_requests,
-        provided_console=provided_console,
+    if (
+        policy is not None
+        or ghost
+        or _requires_direct_start(
+            project=project,
+            non_interactive=non_interactive,
+            json_output=json_output,
+            check=check,
+            engine=engine,
+            max_active_requests=max_active_requests,
+            provided_console=provided_console,
+        )
     ):
         start_gateway(
             project=project,
