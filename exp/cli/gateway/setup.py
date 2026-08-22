@@ -183,9 +183,10 @@ def interactive_gateway_setup(
                 serving_connections=serving_connections,
             )
             revision_id = f"revision-{uuid.uuid4().hex}"
+            key_id = f"key-{uuid.uuid4().hex}"
             try:
                 apply_singleton_deployment_update(root, update)
-                manager.configure_direct_alias(
+                identity_created, issued = manager.configure_direct_alias_with_identity(
                     alias_id=values.alias,
                     alias_name=values.alias,
                     revision_id=revision_id,
@@ -194,6 +195,9 @@ def interactive_gateway_setup(
                     catalog_sha256=update.normalized.identity_sha256(),
                     provider_connections=update.updated.connections,
                     replace=reconfigure,
+                    identity_id=values.identity_id,
+                    identity_display_name=values.identity_id,
+                    key_id=key_id,
                 )
             except AliasActivationOutcomeUnknownError:
                 raise
@@ -208,17 +212,12 @@ def interactive_gateway_setup(
                 raise
             advance("write catalog")
             advance("activate alias")
-        if _ensure_setup_identity(manager, identity_id=values.identity_id):
-            advance("create identity")
-        else:
-            advance("reuse identity")
-        manager.add_grant(identity_id=values.identity_id, alias_id=values.alias)
-        advance("grant alias")
-        issued = manager.issue_key(
-            identity_id=values.identity_id,
-            key_id=f"key-{uuid.uuid4().hex}",
-        )
-        advance("issue key")
+            if identity_created:
+                advance("create identity")
+            else:
+                advance("reuse identity")
+            advance("grant alias")
+            advance("issue key")
     console.print("[green]✓ Gateway configured[/green]")
     return InteractiveSetupResult(
         identity_id=values.identity_id,
@@ -242,22 +241,6 @@ def _validate_setup_identity(manager: GatewayManagement, *, identity_id: str) ->
             raise ValueError(
                 f"identity {identity_id!r} is disabled; choose an active identity for setup"
             )
-
-
-def _ensure_setup_identity(manager: GatewayManagement, *, identity_id: str) -> bool:
-    """Create a new setup identity or reuse an active one already in the gateway.
-
-    Args:
-        manager: Initialized gateway authority being configured.
-        identity_id: Identity selected by the operator.
-
-    Returns:
-        True when a new identity was created, or False when an existing identity was reused.
-    """
-    if any(identity.identity_id == identity_id for identity in manager.identities()):
-        return False
-    manager.create_identity(identity_id=identity_id, display_name=identity_id)
-    return True
 
 
 def _collect_gateway_values(

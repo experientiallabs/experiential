@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import typer
 
+import exp.runtime.gateway.sqlite.setup_authority as setup_authority
 import exp.runtime.gateway.sqlite.store as gateway_store
 from exp.cli.gateway import setup
 from exp.cli.providers import model_picker, provider_picker
@@ -343,6 +344,83 @@ def test_gateway_setup_rolls_back_catalog_and_provider_when_alias_activation_fai
     assert (tmp_path / "models.toml").read_bytes() == catalog_before
     assert manager.provider_connections() == providers_before
     assert manager.aliases() == aliases_before
+
+
+def test_gateway_setup_rolls_back_all_authority_when_key_issue_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-alias credential failure rolls back every serving mutation atomically."""
+    endpoints, models = _prepared_gateway_models()
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
+    )
+    first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    manager = setup.GatewayManagement(tmp_path)
+    before = (
+        (tmp_path / "models.toml").read_bytes(),
+        manager.provider_connections(),
+        manager.aliases(),
+        manager.identities(),
+        manager.grants(),
+        manager.keys(),
+    )
+
+    updated_model = provider_picker.AvailableModel(
+        alias=models[0].alias,
+        connection=models[0].connection,
+        provider=models[0].provider,
+        model="gpt-5-6-luna-v2",
+        capabilities=models[0].capabilities,
+        pricing_source=models[0].pricing_source,
+        configured=False,
+    )
+    updated_endpoint = provider_picker.PreparedEndpoint(
+        connection=endpoints[0].connection,
+        api_key="secret",
+        configured=False,
+    )
+    monkeypatch.setattr(
+        setup,
+        "prepare_providers",
+        lambda *_args, **_kwargs: ((updated_endpoint,), (updated_model,)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(updated_model, "medium"),
+    )
+
+    def fail_key(*_args: object, **_kwargs: object) -> None:
+        """Fail after alias activation and grant staging inside the shared transaction."""
+        raise RuntimeError("key issue failed")
+
+    monkeypatch.setattr(setup_authority, "_issue_key", fail_key)
+
+    with pytest.raises(RuntimeError, match="key issue failed"):
+        setup.interactive_gateway_setup(
+            tmp_path,
+            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n50\n"),
+            allow_reconfigure=True,
+        )
+
+    after = (
+        (tmp_path / "models.toml").read_bytes(),
+        manager.provider_connections(),
+        manager.aliases(),
+        manager.identities(),
+        manager.grants(),
+        manager.keys(),
+    )
+    assert after == before
 
 
 def test_gateway_setup_writes_budget_before_gateway_initialization(

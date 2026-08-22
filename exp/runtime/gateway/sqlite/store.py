@@ -34,15 +34,17 @@ from exp.runtime.gateway.sqlite import key_delivery
 from exp.runtime.gateway.sqlite.alias_activation import (
     activate_alias_revision_in_transaction,
     alias_activation_transaction,
-    register_catalog_snapshot_in_transaction,
 )
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
     ProviderConnectionMutation,
-    upsert_provider_connection,
 )
 from exp.runtime.gateway.sqlite.provider_store import ProviderConnectionStoreMixin
+from exp.runtime.gateway.sqlite.setup_authority import (
+    configure_direct_alias_with_identity,
+    upsert_provider_connections_and_activate_direct_alias,
+)
 
 _LAST_USED_REFRESH_SECONDS = 60.0
 
@@ -514,80 +516,55 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         replace: bool,
         refusal_failover: bool = False,
     ) -> None:
-        """Atomically revise providers, register a snapshot, and activate one direct alias.
-
-        Args:
-            organization_id: Owning tenant.
-            alias_id: Stable alias resource ID.
-            alias_name: Public model string.
-            revision_id: Immutable alias revision ID.
-            pool_id: Direct target pool identifier.
-            snapshot_ref: Content-addressed catalog snapshot reference.
-            catalog_sha256: Exact normalized catalog digest.
-            provider_connections: Desired provider connection revisions for the snapshot.
-            replace: Whether differing active provider metadata may be revised.
-            refusal_failover: Whether typed precommit refusals may advance.
-
-        Raises:
-            GatewayStoreError: The snapshot or alias invariants conflict.
-            ProviderAuthorityError: A provider replacement violates SQLite authority.
-            AliasActivationOutcomeUnknownError: SQLite COMMIT outcome is ambiguous.
-        """
-        target = DirectTarget(pool_id=pool_id)
-        now = utc_text(self._clock.now())
-        with alias_activation_transaction(
-            connect=self._connect,
+        """Atomically revise providers, register a snapshot, and activate one direct alias."""
+        upsert_provider_connections_and_activate_direct_alias(
+            self,
             organization_id=organization_id,
             alias_id=alias_id,
             alias_name=alias_name,
             revision_id=revision_id,
-            target=target,
+            pool_id=pool_id,
             snapshot_ref=snapshot_ref,
             catalog_sha256=catalog_sha256,
+            provider_connections=provider_connections,
+            replace=replace,
             refusal_failover=refusal_failover,
-        ) as connection:
-            authorities = []
-            for mutation in provider_connections:
-                _changed, authority = upsert_provider_connection(
-                    connection,
-                    organization_id=organization_id,
-                    connection_id=mutation.connection_id,
-                    revision_id=mutation.revision_id,
-                    config=mutation.config,
-                    replace=replace,
-                    now=now,
-                )
-                authorities.append(authority)
-            bindings = tuple(
-                ProviderConnectionBinding(
-                    connection_id=authority.connection_id,
-                    connection_revision_id=authority.revision_id,
-                    connection_sha256=authority.connection_sha256,
-                )
-                for authority in authorities
-            )
-            register_catalog_snapshot_in_transaction(
-                connection,
-                organization_id=organization_id,
-                snapshot_ref=snapshot_ref,
-                catalog_sha256=catalog_sha256,
-                now=now,
-                store_error=GatewayStoreError,
-            )
-            activate_alias_revision_in_transaction(
-                connection,
-                organization_id=organization_id,
-                alias_id=alias_id,
-                alias_name=alias_name,
-                revision_id=revision_id,
-                target=target,
-                snapshot_ref=snapshot_ref,
-                catalog_sha256=catalog_sha256,
-                provider_connections=bindings,
-                refusal_failover=refusal_failover,
-                now=now,
-                store_error=GatewayStoreError,
-            )
+            activate_alias_revision=activate_alias_revision_in_transaction,
+        )
+
+    def configure_direct_alias_with_identity(
+        self,
+        *,
+        organization_id: str,
+        alias_id: str,
+        alias_name: str,
+        revision_id: str,
+        pool_id: str,
+        snapshot_ref: str,
+        catalog_sha256: Sha256,
+        provider_connections: tuple[ProviderConnectionMutation, ...],
+        replace: bool,
+        identity_id: str,
+        identity_display_name: str,
+        key_id: str,
+    ) -> tuple[bool, IssuedVirtualKey]:
+        """Atomically configure serving authority and setup caller credentials."""
+        return configure_direct_alias_with_identity(
+            self,
+            organization_id=organization_id,
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            pool_id=pool_id,
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            provider_connections=provider_connections,
+            replace=replace,
+            identity_id=identity_id,
+            identity_display_name=identity_display_name,
+            key_id=key_id,
+            activate_alias_revision=activate_alias_revision_in_transaction,
+        )
 
     def disable_alias(self, *, organization_id: str, alias_id: str) -> bool:
         """Disable one alias and release its active project binding.
