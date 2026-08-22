@@ -809,11 +809,16 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
             return error_response(&PublicError::internal());
         }
     };
+    let mut guard = AttemptGuard::new(
+        &state,
+        admission.request_id.clone(),
+        admission.attempt_id.clone(),
+    );
     // The replay key was authorized independently of admission. If an alias
-    // activation landed between the two, the admitted response belongs to a
-    // newer revision than the claimed replay scope, so the claim is abandoned
-    // rather than caching a response under the wrong revision's namespace;
-    // waiting duplicates fail closed and retry against the new revision.
+    // activation landed between the two, the admitted work belongs to a newer
+    // revision than the claimed replay scope, so the attempt fails closed:
+    // executing without ownership would let a concurrent duplicate own the
+    // new revision's key and run the same keyed operation a second time.
     if lease
         .as_ref()
         .is_some_and(|owner| owner.alias_revision_id() != admission.alias_revision_id)
@@ -821,12 +826,26 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
+        guard
+            .settle(
+                "failed",
+                None,
+                &[],
+                Some(&Failure::new(
+                    FailureClass::Internal,
+                    "the alias revision changed during keyed admission",
+                )),
+            )
+            .await;
+        let mut error = PublicError::new(
+            409,
+            "idempotency_replay_unavailable",
+            "The alias revision changed while the keyed request was admitted. Retry the request.",
+            "api_error",
+        );
+        error.param = Some("Idempotency-Key".to_string());
+        return error_response(&error);
     }
-    let mut guard = AttemptGuard::new(
-        &state,
-        admission.request_id.clone(),
-        admission.attempt_id.clone(),
-    );
 
     let dialect = match Dialect::from_str(&admission.dialect) {
         Some(dialect) => dialect,
@@ -1318,12 +1337,17 @@ async fn stream_response(
                     let withhold = lease.is_some() && terminal.is_some();
                     for data in encoded {
                         let data = Bytes::from(data);
+                        if withhold {
+                            // Withheld terminal frames are captured exactly
+                            // once, at publication time inside
+                            // `finish_stream_terminal`.
+                            withheld.push(data);
+                            continue;
+                        }
                         if lease.is_some() {
                             replayable = capture_frame(&mut capture, &data, replayable);
                         }
-                        if withhold {
-                            withheld.push(data);
-                        } else if !send_bounded(&sender, deadline, data).await {
+                        if !send_bounded(&sender, deadline, data).await {
                             settle_stream_end(
                                 &mut guard,
                                 terminal.as_ref(),
@@ -1373,12 +1397,17 @@ async fn stream_response(
                     let withhold = lease.is_some() && terminal.is_some();
                     for data in encoded {
                         let data = Bytes::from(data);
+                        if withhold {
+                            // Withheld terminal frames are captured exactly
+                            // once, at publication time inside
+                            // `finish_stream_terminal`.
+                            withheld.push(data);
+                            continue;
+                        }
                         if lease.is_some() {
                             replayable = capture_frame(&mut capture, &data, replayable);
                         }
-                        if withhold {
-                            withheld.push(data);
-                        } else if !send_bounded(&sender, deadline, data).await {
+                        if !send_bounded(&sender, deadline, data).await {
                             settle_stream_end(
                                 &mut guard,
                                 terminal.as_ref(),
