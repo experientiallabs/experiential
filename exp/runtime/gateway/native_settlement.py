@@ -13,6 +13,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 
 _TERMINAL_KINDS = {
     "completed": GatewayEventKind.COMPLETED,
@@ -128,3 +129,12 @@ def deployment_operation_key(route: GatewayRoute) -> str:
 def optional_text(value: object) -> str | None:
     """Return one optional boundary string value or ``None``."""
     return value if isinstance(value, str) else None
+
+
+def budget_quota_protocol_error() -> OpenAIProtocolError:
+    """Return the public quota error for an exhausted monthly allocation."""
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.QUOTA_EXCEEDED,
+        safe_message="monthly gateway allocation is exhausted",
+    )
+    return public_failure_error(failure)

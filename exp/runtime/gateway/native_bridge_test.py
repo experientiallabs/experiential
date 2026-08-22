@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 import pytest
@@ -30,6 +31,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.discovery import listing_metadata_by_alias
+from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import _ReadyControlStore, load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
@@ -37,6 +39,7 @@ from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
 )
+from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -192,7 +195,7 @@ def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> No
 
     admission = _admit(control, raw_key, _chat_body())
 
-    ledger = control._components.ledger  # noqa: SLF001
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
     with sqlite3.connect(ledger.database_path) as connection:
         row = connection.execute(
             "select route_reason, fallback_reason from gateway_attempts where attempt_id = ?",
@@ -291,7 +294,9 @@ def test_closed_writer_makes_settle_raise_and_keeps_the_entry_retryable(
     boundary error and retains the exact settlement for later replay."""
     control, raw_key = _control_plane(tmp_path)
     admission = _admit(control, raw_key, _chat_body())
-    control._components.write_ledger.close()  # noqa: SLF001 - shutdown-ordering fault injection.
+    writer = control._components.write_ledger  # noqa: SLF001 - shutdown-ordering fault injection.
+    assert writer is not None
+    writer.close()
     settlement = json.dumps(
         {
             "request_id": admission["request_id"],
@@ -1658,7 +1663,7 @@ def test_admit_persists_caller_app_identity_for_attribution(tmp_path: Path) -> N
         )
     )
 
-    ledger = control._components.ledger  # noqa: SLF001
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
     with sqlite3.connect(ledger.database_path) as connection:
         row = connection.execute(
             """
@@ -1670,3 +1675,64 @@ def test_admit_persists_caller_app_identity_for_attribution(tmp_path: Path) -> N
             (admission["attempt_id"],),
         ).fetchone()
     assert row == ("https://app.example.com", "Example App")
+
+
+class _HostedComponents:
+    """Hosted-shaped components: no group-commit writer, sync ledger only.
+
+    Mirrors a platform composition over its own store (for example Postgres),
+    which cannot provide the local engine's SQLite batching writer. Both the
+    protocol-conformant ``write_ledger = None`` and a components object with
+    no such attribute at all must compose, because the hosted seam promises
+    settlement through the plain synchronous ledger.
+    """
+
+    def __init__(self, inner: object, *, omit_write_ledger: bool) -> None:
+        self._inner = inner
+        if not omit_write_ledger:
+            self.write_ledger = None
+
+    def __getattr__(self, name: str) -> object:
+        if name == "write_ledger":
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
+@pytest.mark.parametrize("omit_write_ledger", [False, True])
+def test_hosted_components_without_group_commit_writer_settle(
+    tmp_path: Path,
+    omit_write_ledger: bool,
+) -> None:
+    """A composition without the local batching writer settles via its ledger.
+
+    Regression: the control plane once accessed ``components.write_ledger``
+    unconditionally, so a hosted composition (platform #620) crashed with
+    AttributeError before binding anything.
+    """
+    _manager, raw_key = _configured_gateway(tmp_path)
+    inner = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    hosted = _HostedComponents(inner, omit_write_ledger=omit_write_ledger)
+    control = NativeControlPlane(
+        cast("NativeGatewayComponents", hosted),
+        request_timeout_seconds=120.0,
+    )
+    admission = _admit(control, raw_key, _chat_body())
+    settled = control.settle(
+        json.dumps(
+            {
+                "request_id": admission["request_id"],
+                "attempt_id": admission["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 4, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+    assert settled == "{}"
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
+    assert report["totals"]["terminal_counts"] == [{"state": "completed", "attempts": 1}]

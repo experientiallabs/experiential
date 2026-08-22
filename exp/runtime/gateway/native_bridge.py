@@ -30,6 +30,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.boundary import boundary_protocol_error
@@ -58,7 +59,8 @@ from exp.runtime.gateway.execution import (
     _require_deployment_identity,  # noqa: PLC2701
 )
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
-from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continued_request,
@@ -66,6 +68,7 @@ from exp.runtime.gateway.native_responses import (
     responses_envelope,
 )
 from exp.runtime.gateway.native_settlement import (
+    budget_quota_protocol_error,
     deployment_operation_key,
     first_token_at_from_settlement,
     optional_text,
@@ -168,15 +171,6 @@ def _escalation(reason: str) -> str:
     return json.dumps({"escalate": reason}, separators=(",", ":"))
 
 
-def _budget_quota_error() -> NativeBridgeError:
-    """Return the public quota error for an exhausted monthly allocation."""
-    failure = GatewayFailure(
-        failure_class=GatewayFailureClass.QUOTA_EXCEEDED,
-        safe_message="monthly gateway allocation is exhausted",
-    )
-    return NativeBridgeError(public_failure_error(failure))
-
-
 class NativeControlPlane:
     """Authority and accounting callbacks for the native data plane.
 
@@ -222,7 +216,12 @@ class NativeControlPlane:
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
-        self._write_ledger = SyncGroupCommitLedger(components.write_ledger)
+        # Hosted compositions have no local group-commit writer; they settle
+        # directly through their own synchronous ledger.
+        group_writer = getattr(components, "write_ledger", None)
+        self._write_ledger: SyncWriteLedger = (
+            SyncGroupCommitLedger(group_writer) if group_writer is not None else components.ledger
+        )
         self._request_timeout_seconds = request_timeout_seconds
         self._data_plane_metrics = data_plane_metrics
         self._continuations = (
@@ -392,7 +391,7 @@ class NativeControlPlane:
             )
         except BudgetReservationRejected as exc:
             error = (
-                _budget_quota_error()
+                NativeBridgeError(budget_quota_protocol_error())
                 if self._budget_error_factory is None
                 else self._budget_error_factory(data["raw_key"])
             )
@@ -704,8 +703,10 @@ class NativeControlPlane:
                 _, identity_id = self._components.store.authenticated_identity(raw_key=str(raw_key))
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
                 raise _authority_error(exc) from exc
+        # Only the local composition (SQLite ledger) serves native usage;
+        # hosted compositions disable it and own their own usage surface.
         return read_usage_report(
-            self._components.ledger,
+            cast("SQLiteAttemptLedger", self._components.ledger),
             organization_id=self._components.organization_id,
             identity_id=identity_id,
         )
