@@ -613,25 +613,12 @@ def _project_resolver(
     *,
     selection_workers: SelectionWorkerPool,
 ) -> ProjectTargetResolver | None:
-    """Build one selection-only project bridge when any activation is loaded.
-
-    Args:
-        activations: Verified frozen runtimes for every retained activation.
-        exact_models: Frozen exact-model identity for every candidate alias.
-        selection_workers: Shared bounded lane carried across every generation.
-
-    Returns:
-        A selection-only resolver, or ``None`` when no activation is loaded.
-    """
+    """Build one selection-only project bridge on the shared worker lane."""
     if not activations:
         return None
     return cast(
         ProjectTargetResolver,
-        RouterProjectTargetResolver(
-            activations,
-            exact_models,
-            selection_workers=selection_workers,
-        ),
+        RouterProjectTargetResolver(activations, exact_models, selection_workers=selection_workers),
     )
 
 
