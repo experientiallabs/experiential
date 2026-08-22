@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
 from exp.common.core.artifacts import JsonObject, stable_id
 from exp.runtime.gateway.boundary import boundary_protocol_error
@@ -71,6 +71,7 @@ from exp.runtime.openai_protocol.requests import DecodedGatewayRequest, decode_c
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
 _SWEEP_GRACE_SECONDS = 5.0
+_SWEEP_INTERVAL_SECONDS = 5.0
 _SWEEP_BATCH = 16
 
 _TERMINAL_KINDS = {
@@ -82,6 +83,18 @@ _TERMINAL_KINDS = {
 
 class _NativeDialectUnavailableError(RuntimeError):
     """The resolved provider has no native dialect; python must serve it."""
+
+
+@dataclass
+class _InflightAttempt:
+    """One admitted attempt awaiting its durable terminal settlement."""
+
+    authorization: AuthorizationSnapshot
+    attempt_id: str
+    deadline_monotonic: float
+    # The exact settlement the data plane could not land; the sweep replays it
+    # verbatim so a completed outcome and its usage are never downgraded.
+    pending_settlement: JsonObject | None = field(default=None)
 
 
 class NativeBridgeError(Exception):
@@ -169,9 +182,17 @@ class NativeControlPlane:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
         self._request_timeout_seconds = request_timeout_seconds
-        self._inflight: dict[str, tuple[AuthorizationSnapshot, str, float]] = {}
+        self._inflight: dict[str, _InflightAttempt] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
+        # The sweep also runs on a timer so retained settlements and abandoned
+        # attempts are recovered even when no further requests arrive.
+        self._sweeper = threading.Thread(
+            target=self._sweep_loop,
+            name="exp-native-settlement-sweep",
+            daemon=True,
+        )
+        self._sweeper.start()
 
     @property
     def request_timeout_seconds(self) -> float:
@@ -316,7 +337,11 @@ class NativeControlPlane:
             raise error from exc
 
         with self._lock:
-            self._inflight[authorization.request_id] = (authorization, attempt_id, deadline)
+            self._inflight[authorization.request_id] = _InflightAttempt(
+                authorization=authorization,
+                attempt_id=attempt_id,
+                deadline_monotonic=deadline,
+            )
         response: JsonObject = {
             "request_id": authorization.request_id,
             "attempt_id": attempt_id,
@@ -356,36 +381,23 @@ class NativeControlPlane:
         data = json.loads(argument)
         request_id = str(data["request_id"])
         with self._lock:
-            context = self._inflight.get(request_id)
-        if context is None:
+            entry = self._inflight.get(request_id)
+        if entry is None:
             return "{}"
-        _authorization, attempt_id, _deadline = context
-        usage = _usage_from_payload(data.get("usage"), data.get("tool_names") or [])
-        failure_payload = data.get("failure")
-        failure = None
-        if failure_payload is not None:
-            failure = GatewayFailure(
-                failure_class=GatewayFailureClass(failure_payload["failure_class"]),
-                safe_message=failure_payload["safe_message"],
-            )
-        kind = _TERMINAL_KINDS[data["outcome"]]
-        terminal = GatewayEvent(
-            kind=kind,
-            sequence_number=0,
-            usage=usage,
-            failure=failure if kind == GatewayEventKind.FAILED else None,
-        )
+        terminal, failure = _terminal_from_settlement(data)
         try:
             self._components.ledger.finish_attempt(
-                attempt_id=attempt_id,
+                attempt_id=entry.attempt_id,
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=True,
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
-            # The in-flight entry is kept so a retried settlement can still
-            # reach the ledger; a durable loss is latched by the sweep, which
-            # keeps retrying the entry after its deadline.
+            # The exact settlement is retained so a retry (from the data
+            # plane or the timer sweep) lands the ORIGINAL outcome and usage,
+            # never a downgraded cancellation.
+            with self._lock:
+                entry.pending_settlement = data
             raise _authority_error(exc) from exc
         with self._lock:
             self._inflight.pop(request_id, None)
@@ -526,41 +538,74 @@ class NativeControlPlane:
             profile = replace(profile, model_id=resolved.snapshot.model_id)
         return profile
 
-    def _sweep_expired(self) -> None:
-        """Settle abandoned in-flight attempts whose deadline has passed.
+    def _sweep_loop(self) -> None:
+        """Run the settlement sweep on a timer for the process lifetime."""
+        while True:
+            time.sleep(_SWEEP_INTERVAL_SECONDS)
+            self._sweep_expired()
 
-        The data plane settles every request it serves, including on client
-        disconnect; this sweep is the backstop for wire-contract failures and
-        data-plane crashes short of process death, so a budget reservation
-        can never outlive its request deadline by more than the grace.
+    def _sweep_expired(self) -> None:
+        """Recover retained settlements and close abandoned attempts.
+
+        A retained settlement (the data plane's terminal write failed) is
+        replayed verbatim so the original outcome and usage land. An attempt
+        with no settlement at all past its deadline plus grace is closed as
+        cancelled; that is the backstop for wire-contract failures and
+        data-plane crashes short of process death. A retained settlement that
+        fails again here latches accounting-unhealthy as a durable loss.
         """
         now = time.monotonic()
         with self._lock:
-            expired = [
-                (request_id, context)
-                for request_id, context in self._inflight.items()
-                if context[2] + _SWEEP_GRACE_SECONDS < now
+            retained = [
+                (request_id, entry)
+                for request_id, entry in self._inflight.items()
+                if entry.pending_settlement is not None
             ][:_SWEEP_BATCH]
-        if not expired:
+            abandoned = [
+                (request_id, entry)
+                for request_id, entry in self._inflight.items()
+                if entry.pending_settlement is None
+                and entry.deadline_monotonic + _SWEEP_GRACE_SECONDS < now
+            ][:_SWEEP_BATCH]
+        for request_id, entry in retained:
+            settlement = entry.pending_settlement
+            if settlement is None:
+                continue
+            terminal, failure = _terminal_from_settlement(settlement)
+            self._settle_swept(request_id, entry, terminal, failure, latch_on_failure=True)
+        if not abandoned:
             return
-        failure = GatewayFailure(
+        cancelled = GatewayFailure(
             failure_class=GatewayFailureClass.CANCELLED,
             safe_message="gateway request was abandoned before settlement",
         )
-        terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
-        for request_id, (_authorization, attempt_id, _deadline) in expired:
-            try:
-                self._components.ledger.finish_attempt(
-                    attempt_id=attempt_id,
-                    terminal_event=terminal,
-                    failure=failure,
-                    finalize_request=True,
-                )
-            except Exception:  # noqa: BLE001 - latch and keep the entry for retry.
+        terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=cancelled)
+        for request_id, entry in abandoned:
+            self._settle_swept(request_id, entry, terminal, cancelled, latch_on_failure=True)
+
+    def _settle_swept(
+        self,
+        request_id: str,
+        entry: _InflightAttempt,
+        terminal: GatewayEvent,
+        failure: GatewayFailure | None,
+        *,
+        latch_on_failure: bool,
+    ) -> None:
+        """Land one swept settlement; keep the entry for retry on failure."""
+        try:
+            self._components.ledger.finish_attempt(
+                attempt_id=entry.attempt_id,
+                terminal_event=terminal,
+                failure=failure,
+                finalize_request=True,
+            )
+        except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
+            if latch_on_failure:
                 self._accounting_healthy = False
-                continue
-            with self._lock:
-                self._inflight.pop(request_id, None)
+            return
+        with self._lock:
+            self._inflight.pop(request_id, None)
 
     def _finish_request_quietly(
         self,
@@ -645,6 +690,41 @@ def _deployment_operation_key(route: GatewayRoute) -> str:
             "connection_sha256": route.deployment.connection_sha256,
         },
     )
+
+
+def _terminal_from_settlement(
+    data: JsonObject,
+) -> tuple[GatewayEvent, GatewayFailure | None]:
+    """Build the durable terminal event from one settlement payload.
+
+    Args:
+        data: Parsed settlement with ``outcome``, optional ``usage``,
+            ``tool_names``, and ``failure``.
+
+    Returns:
+        The terminal event and the optional normalized failure.
+    """
+    raw_usage = data.get("usage")
+    raw_tool_names = data.get("tool_names")
+    usage = _usage_from_payload(
+        raw_usage if isinstance(raw_usage, dict) else None,
+        [str(name) for name in raw_tool_names] if isinstance(raw_tool_names, list) else [],
+    )
+    failure_payload = data.get("failure")
+    failure = None
+    if isinstance(failure_payload, dict):
+        failure = GatewayFailure(
+            failure_class=GatewayFailureClass(str(failure_payload["failure_class"])),
+            safe_message=str(failure_payload["safe_message"]),
+        )
+    kind = _TERMINAL_KINDS[str(data["outcome"])]
+    terminal = GatewayEvent(
+        kind=kind,
+        sequence_number=0,
+        usage=usage,
+        failure=failure if kind == GatewayEventKind.FAILED else None,
+    )
+    return terminal, failure
 
 
 def _usage_from_payload(

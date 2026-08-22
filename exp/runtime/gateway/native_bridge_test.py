@@ -194,6 +194,38 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     assert report["totals"]["requests"] == 1
 
 
+def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None:
+    """A retained settlement lands its completed outcome and usage, never a
+    downgraded cancellation."""
+    control, raw_key = _control_plane(tmp_path)
+    admission = _admit(control, raw_key, _chat_body())
+    settlement = json.dumps(
+        {
+            "request_id": admission["request_id"],
+            "attempt_id": admission["attempt_id"],
+            "outcome": "completed",
+            "usage": {"input_tokens": 9, "output_tokens": 4},
+            "tool_names": [],
+            "failure": None,
+        }
+    )
+    ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
+    with mock.patch.object(
+        ledger,
+        "finish_attempt",
+        side_effect=RuntimeError("simulated terminal write loss"),
+    ):
+        with pytest.raises(NativeBridgeError):
+            control.settle(settlement)
+    control._sweep_expired()  # noqa: SLF001 - the timer normally drives this.
+    with control._lock:  # noqa: SLF001 - registry state assertion.
+        assert admission["request_id"] not in control._inflight  # noqa: SLF001
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
+    assert report["totals"]["input_tokens"] == 9
+    assert report["totals"]["terminal_counts"] == [{"state": "completed", "attempts": 1}]
+
+
 def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path) -> None:
     """An admitted request the data plane never settles is closed by the sweep."""
     control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
