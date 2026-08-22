@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
 import threading
 from collections.abc import Mapping
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 
@@ -391,6 +392,17 @@ def _index_catalogs(
     return indexed
 
 
+@dataclass(frozen=True)
+class _QueuedSelection:
+    """One submitted selection waiting for a daemon worker to pick it up."""
+
+    future: Future[PreparedSelection]
+    runtime: RouterRuntime
+    model_request: ModelRequest
+    episode_id: str
+    deadline: RequestDeadline
+
+
 class SelectionWorkerPool:
     """Bounded selection lane owned for the process rather than one generation.
 
@@ -399,11 +411,14 @@ class SelectionWorkerPool:
     resolver generation an alias-authority reload installs. Timed-out
     submissions are cancelled while queued, and a worker re-checks the
     request deadline before embedding, so abandoned work never runs ahead
-    of live requests.
+    of live requests. Workers are daemon threads: a selection blocked inside
+    a synchronous embedding call past the shutdown drain bound can only
+    discard its own result (selection touches no ledger and no policy), and
+    it never pins interpreter exit.
     """
 
     def __init__(self, *, maximum_outstanding_selections: int = 4) -> None:
-        """Open one bounded worker lane.
+        """Open one bounded daemon worker lane.
 
         Args:
             maximum_outstanding_selections: Running plus detached selection calls allowed.
@@ -413,12 +428,20 @@ class SelectionWorkerPool:
         """
         if maximum_outstanding_selections < 1:
             raise ValueError("maximum_outstanding_selections must be at least one")
-        self._workers = ThreadPoolExecutor(
-            max_workers=maximum_outstanding_selections,
-            thread_name_prefix="exp-router-selection",
-        )
         self._lock = threading.Lock()
+        self._closed = False
+        self._queue: queue.SimpleQueue[_QueuedSelection | None] = queue.SimpleQueue()
         self._outstanding: set[Future[PreparedSelection]] = set()
+        self._threads = tuple(
+            threading.Thread(
+                target=self._work,
+                name=f"exp-router-selection-{index}",
+                daemon=True,
+            )
+            for index in range(maximum_outstanding_selections)
+        )
+        for thread in self._threads:
+            thread.start()
 
     def submit(
         self,
@@ -428,17 +451,26 @@ class SelectionWorkerPool:
         episode_id: str,
         deadline: RequestDeadline,
     ) -> Future[PreparedSelection]:
-        """Queue one deadline-guarded unretained selection in the shared lane."""
-        submitted = self._workers.submit(
-            _select_within_deadline,
-            runtime,
-            model_request,
-            episode_id=episode_id,
-            deadline=deadline,
-        )
+        """Queue one deadline-guarded unretained selection in the shared lane.
+
+        Raises:
+            RuntimeError: The lane is shut down and accepts no new selection.
+        """
+        submitted: Future[PreparedSelection] = Future()
         with self._lock:
+            if self._closed:
+                raise RuntimeError("selection worker pool is shut down")
             self._outstanding.add(submitted)
         submitted.add_done_callback(self._forget)
+        self._queue.put(
+            _QueuedSelection(
+                future=submitted,
+                runtime=runtime,
+                model_request=model_request,
+                episode_id=episode_id,
+                deadline=deadline,
+            )
+        )
         return submitted
 
     def shutdown(self, *, drain_timeout_seconds: float = _SELECTION_DRAIN_SECONDS) -> None:
@@ -446,14 +478,23 @@ class SelectionWorkerPool:
 
         A selection already inside a synchronous provider embedding call cannot
         be preempted, so shutdown waits a bounded time for it and reports the
-        remainder instead of blocking teardown. Selection touches no ledger and
-        no policy, so a straggler that outlives the bound can only discard its
-        own result.
+        remainder instead of blocking teardown. A reported straggler runs on a
+        daemon thread, so it cannot keep the process alive after shutdown.
 
         Args:
             drain_timeout_seconds: Bound on waiting for running selections.
         """
-        self._workers.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            self._closed = True
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None:
+                item.future.cancel()
+        for _ in self._threads:
+            self._queue.put(None)
         with self._lock:
             outstanding = frozenset(self._outstanding)
         _, running = wait(outstanding, timeout=drain_timeout_seconds)
@@ -461,6 +502,26 @@ class SelectionWorkerPool:
             _logger.warning(
                 "gateway shutdown left %d router selection call(s) running", len(running)
             )
+
+    def _work(self) -> None:
+        """Run queued selections on one daemon worker until the stop sentinel."""
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            if not item.future.set_running_or_notify_cancel():
+                continue
+            try:
+                prepared = _select_within_deadline(
+                    item.runtime,
+                    item.model_request,
+                    episode_id=item.episode_id,
+                    deadline=item.deadline,
+                )
+            except BaseException as failure:  # noqa: BLE001 - relayed to the waiting caller.
+                item.future.set_exception(failure)
+            else:
+                item.future.set_result(prepared)
 
     def _forget(self, completed: Future[PreparedSelection]) -> None:
         """Drop one settled selection from the outstanding drain set."""

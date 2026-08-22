@@ -1123,6 +1123,11 @@ def test_selection_pool_shutdown_bounds_its_wait_on_a_running_selection(
     assert elapsed < 1
     assert queued.cancelled()
     assert "router selection call(s) running" in caplog.text
+    assert all(
+        thread.daemon
+        for thread in threading.enumerate()
+        if thread.name.startswith("exp-router-selection")
+    )
     with pytest.raises(RuntimeError):
         workers.submit(
             runtime,
