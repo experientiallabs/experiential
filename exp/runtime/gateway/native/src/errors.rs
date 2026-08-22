@@ -151,6 +151,66 @@ impl PublicError {
         )
     }
 
+}
+
+/// Stable failure classes shared with `GatewayFailureClass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    InvalidRequest,
+    UnsupportedCapability,
+    Authentication,
+    Authorization,
+    QuotaExceeded,
+    Throttled,
+    Transport,
+    Timeout,
+    ProviderAuthentication,
+    ProviderNotFound,
+    Refusal,
+    MalformedResponse,
+    ProviderInternal,
+    Cancelled,
+    Internal,
+}
+
+impl FailureClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FailureClass::InvalidRequest => "invalid_request",
+            FailureClass::UnsupportedCapability => "unsupported_capability",
+            FailureClass::Authentication => "authentication",
+            FailureClass::Authorization => "authorization",
+            FailureClass::QuotaExceeded => "quota_exceeded",
+            FailureClass::Throttled => "throttled",
+            FailureClass::Transport => "transport",
+            FailureClass::Timeout => "timeout",
+            FailureClass::ProviderAuthentication => "provider_authentication",
+            FailureClass::ProviderNotFound => "provider_not_found",
+            FailureClass::Refusal => "refusal",
+            FailureClass::MalformedResponse => "malformed_response",
+            FailureClass::ProviderInternal => "provider_internal",
+            FailureClass::Cancelled => "cancelled",
+            FailureClass::Internal => "internal",
+        }
+    }
+}
+
+/// One sanitized provider failure, the Rust mirror of `GatewayFailure`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Failure {
+    pub failure_class: FailureClass,
+    pub safe_message: String,
+}
+
+impl Failure {
+    pub fn new(failure_class: FailureClass, safe_message: &str) -> Self {
+        Self {
+            failure_class,
+            safe_message: safe_message.to_string(),
+        }
+    }
+
     /// Map one failure to its public error, mirroring `public_failure_error`.
     ///
     /// Quota exhaustion omits the Python engine's month-boundary suffix because
