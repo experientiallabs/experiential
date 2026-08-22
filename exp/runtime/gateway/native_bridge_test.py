@@ -224,6 +224,29 @@ def test_admit_records_host_route_context_after_reservation(tmp_path: Path) -> N
     assert contexts == [(admission["attempt_id"], "direct", None)]
 
 
+def test_admit_ignores_host_route_context_failure_after_reservation(tmp_path: Path) -> None:
+    """Display-only hosted provenance cannot abort an admitted provider request."""
+    _manager, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+
+    def reject_context(
+        _attempt_id: str,
+        _route_reason: str | None,
+        _fallback_reason: str | None,
+    ) -> None:
+        """Simulate an unavailable hosted display-context sink."""
+        raise RuntimeError("display sink unavailable")
+
+    control = NativeControlPlane(components, route_context_recorder=reject_context)
+
+    admission = _admit(control, raw_key, _chat_body())
+
+    assert admission["attempt_id"]
+
+
 def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> None:
     """The default local composition retains durable route provenance."""
     control, raw_key = _control_plane(tmp_path)

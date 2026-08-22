@@ -476,11 +476,14 @@ class NativeControlPlane:
                     route_depth=0,
                     maximum_cost_micro_usd=maximum_cost,
                 )
-                self._route_context_recorder(
-                    attempt_id,
-                    route.route_reason,
-                    route.fallback_reason,
-                )
+                try:
+                    self._route_context_recorder(
+                        attempt_id,
+                        route.route_reason,
+                        route.fallback_reason,
+                    )
+                except Exception:  # noqa: BLE001 - display context is best-effort.
+                    pass
         except BudgetReservationRejected as exc:
             error = (
                 _budget_quota_error()
