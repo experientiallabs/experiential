@@ -44,6 +44,7 @@ from exp.runtime.gateway.execution import (
 )
 from exp.runtime.gateway.group_commit import abandoned_write_outcome
 from exp.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayControlStore
+from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
 from exp.runtime.models.providers.errors import normalized_provider_failure
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
@@ -846,6 +847,8 @@ async def _abandon_quietly(lease: ReplayLease) -> None:
 def _failure_for_exception(exception: BaseException) -> GatewayFailure:
     """Return one sanitized durable failure for accepted pre-dispatch work."""
     if isinstance(exception, GatewayExecutionError):
+        return exception.failure
+    if isinstance(exception, AttemptRejectedError):
         return exception.failure
     if isinstance(exception, asyncio.CancelledError):
         return GatewayFailure(
