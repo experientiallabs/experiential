@@ -6,7 +6,7 @@ These tests exercise three reviewed-but-untested behaviors of the compiled
 1. A client disconnect mid non-streaming request settles the admitted attempt
    through the ``AttemptGuard`` drop backstop.
 2. A dead python fallback engine degrades only escalated routes; the native
-   chat path and readiness stay healthy.
+   chat, unkeyed Responses, and readiness paths stay healthy.
 3. A connected client that stops reading a stream cannot pin the gateway past
    the request deadline; ``send_bounded`` settles the attempt.
 
@@ -378,17 +378,26 @@ def test_client_disconnect_mid_nonstreaming_request_settles_cancelled(
 def test_dead_fallback_engine_degrades_only_escalated_routes(
     engine: _ServingEngine,
 ) -> None:
-    """A closed fallback port fails escalated routes without hurting chat.
+    """A closed fallback port fails escalated routes without hurting native ones.
 
-    ``/health/ready`` intentionally reports only the native control plane's
-    health and does not cover the fallback host: the CLI owns the embedded
-    python engine's thread and its liveness, so a dead fallback degrades the
-    escalated surfaces to an explicit 502 while readiness stays green.
+    Unkeyed ``/v1/responses`` is served on the native plane, so a dead
+    fallback must not change it. Replay-keyed Responses still belongs to the
+    python engine and must fail closed with ``fallback_engine_unavailable``.
+    ``/health/ready`` reports only the native control plane: the CLI owns the
+    embedded python engine's thread and its liveness, so readiness stays green.
     """
     headers = {"authorization": f"Bearer {engine.raw_key}"}
-    escalated = httpx.post(
+    native_responses = httpx.post(
         f"{engine.base}/v1/responses",
         headers=headers,
+        json={"model": "coding", "input": "hi"},
+        timeout=10.0,
+    )
+    assert native_responses.status_code == 200
+
+    escalated = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={**headers, "Idempotency-Key": "dead-fallback-replay"},
         json={"model": "coding", "input": "hi"},
         timeout=10.0,
     )
