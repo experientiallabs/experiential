@@ -756,12 +756,9 @@ def _load_alias_state(
             remediation = f"; run '{keys} exp'"
         else:
             remediation = "; fix the listed provider configuration and rerun 'exp'"
-        raise GatewayLifecycleError(
-            f"no granted active alias is locally available{detail}{remediation}"
-        )
+        message = f"no granted active alias is locally available{detail}{remediation}"
+        raise GatewayLifecycleError(message)
 
-    for alias_name, reason in sorted(unavailable_aliases):
-        _logger.warning("gateway alias %r is unavailable: %s", alias_name, reason)
     return _AliasAuthorityState(
         authorities=frozenset(_authority_key(item) for item in readiness),
         normalized_catalogs=normalized_catalogs,
