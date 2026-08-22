@@ -1,4 +1,4 @@
-"""Regression coverage for the locked customer CLI help surface."""
+"""Regression coverage for the supported customer CLI help surface."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from exp.cli.app import app
     [
         ["--help"],
         ["build", "--help"],
+        ["run", "--help"],
         ["config", "telemetry", "--help"],
         ["config", "budget", "--help"],
         ["config", "providers", "--help"],
@@ -25,6 +26,7 @@ from exp.cli.app import app
     ids=[
         "root",
         "build",
+        "run",
         "telemetry",
         "budget",
         "providers",

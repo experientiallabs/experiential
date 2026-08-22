@@ -21,6 +21,101 @@ from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 from exp.cli.gateway.setup import InteractiveSetupResult
 
 
+def test_run_command_starts_the_gateway_directly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The explicit run command forwards its arguments to the shared gateway launcher."""
+    captured: list[
+        tuple[
+            str | None,
+            Path,
+            str | None,
+            int,
+            bool,
+            bool,
+            bool,
+            bool,
+            float,
+            str,
+            int,
+        ]
+    ] = []
+
+    def capture_start(
+        *,
+        project: str | None,
+        root: Path,
+        policy: str | None,
+        port: int,
+        ghost: bool,
+        non_interactive: bool,
+        json_output: bool,
+        check: bool,
+        graceful_timeout: float,
+        engine: str,
+        max_active_requests: int,
+    ) -> None:
+        """Capture the shared launcher arguments without starting a server."""
+        captured.append(
+            (
+                project,
+                root,
+                policy,
+                port,
+                ghost,
+                non_interactive,
+                json_output,
+                check,
+                graceful_timeout,
+                engine,
+                max_active_requests,
+            )
+        )
+
+    monkeypatch.setattr(run_app, "start_gateway", capture_start)
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            "project-a",
+            "--root",
+            str(tmp_path),
+            "--policy",
+            "policy-a",
+            "--port",
+            "8123",
+            "--ghost",
+            "--non-interactive",
+            "--json",
+            "--check",
+            "--graceful-timeout",
+            "4.5",
+            "--engine",
+            "python",
+            "--max-active-requests",
+            "7",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == [
+        (
+            "project-a",
+            tmp_path,
+            "policy-a",
+            8123,
+            True,
+            True,
+            True,
+            True,
+            4.5,
+            "python",
+            7,
+        )
+    ]
+
+
 @pytest.mark.parametrize("ghost", [False, True])
 def test_project_option_launches_the_normal_gateway_on_loopback(
     monkeypatch: pytest.MonkeyPatch,

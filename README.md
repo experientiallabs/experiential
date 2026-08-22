@@ -25,9 +25,6 @@ pip install experiential
 exp
 ```
 
-Bare `exp` is a shortcut for `exp run`; the explicit form remains available. Use `exp --help`
-or `exp help` for the root command help.
-
 Choose a public alias such as `support-agent`, capture the issued key, and send a request:
 
 ```bash

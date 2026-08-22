@@ -1,4 +1,4 @@
-"""Tests for the locked command surface exposed by the root Typer application."""
+"""Tests for the supported command surface exposed by the root Typer application."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def test_root_cli_and_subgroups_are_exact() -> None:
     """
     root = get_group(app)
     root_context = Context(root)
-    assert set(root.list_commands(root_context)) == {"build", "config", "optimize"}
+    assert set(root.list_commands(root_context)) == {"build", "config", "optimize", "run"}
 
     for name, expected in EXPECTED_SUBCOMMANDS.items():
         command = root.get_command(root_context, name)

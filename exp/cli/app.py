@@ -14,6 +14,7 @@ from exp.cli.gateway.serve import (
     DEFAULT_GATEWAY_PORT,
     DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
     DEFAULT_MAX_ACTIVE_REQUESTS,
+    run,
 )
 from exp.cli.shared.defer import add_deferred_typer
 from exp.cli.shared.options import ROOT_OPTION
@@ -33,6 +34,7 @@ add_deferred_typer(
     known_names=("router", "model"),
 )
 app.command("build", help="Build a reusable grounded world model from local trace evidence.")(build)
+app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
 
 
 @app.callback()

@@ -5,6 +5,7 @@ The root surface is deliberately small:
 | Command | Purpose | Local result |
 |---|---|---|
 | `exp` | Open the branded home screen. `Default Gateway` is the recommended setup-and-start path. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
+| `exp run [PROJECT] [--root ROOT] [--check] [--engine auto\|rust\|python]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Launch the guided end-to-end build when traces are omitted, or use one explicit local source for automation. | Simulation, serving RAG, fit RAG, syllabus, evaluation evidence, and a runnable automatic router. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |

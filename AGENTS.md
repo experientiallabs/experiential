@@ -30,7 +30,7 @@ uv run pytest -q
   may not import optimize or cli; optimize may not import cli. Optimize owns application
   orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
   every current forbidden edge directly and proves that the package graph is acyclic.
-- The root CLI command set is exact: `build`, `config`, and `optimize`. An invocation without a
+- The root CLI command set is exact: `build`, `config`, `optimize`, and `run`. An invocation without a
   subcommand opens the default gateway home screen. `exp/cli/app_test.py` and the release tests
   enforce the current command and distribution shape.
 
@@ -119,7 +119,7 @@ uv run pytest -q
   orchestration lives in `automatic/`, manual judge calibration in `judging/`, offline policy work
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
-- The root CLI is locked to `build`, `optimize`, and `config`. The optimize group is locked
+- The root CLI is locked to `build`, `optimize`, `config`, and `run`. The optimize group is locked
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.

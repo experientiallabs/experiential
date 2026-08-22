@@ -11,7 +11,7 @@ import typer
 from rich.console import Console
 from rich.text import Text
 
-from exp.cli.shared.options import usage_error
+from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -31,6 +31,92 @@ _EXP_WORDMARK = "\n".join(
     )
 )
 _MAX_ACTIVE_REQUESTS_DEFAULT = DEFAULT_MAX_ACTIVE_REQUESTS
+
+
+def run(
+    project: str | None = typer.Argument(
+        None,
+        help="Optional project to expose as one project-backed gateway alias.",
+    ),
+    root: Path = ROOT_OPTION,
+    policy: str | None = typer.Option(
+        None,
+        "--policy",
+        help="Exact frozen policy ID for the optional project-backed alias.",
+    ),
+    port: int = typer.Option(DEFAULT_GATEWAY_PORT, "--port", min=1, max=65_535),
+    ghost: bool = typer.Option(
+        False,
+        "--ghost",
+        help=(
+            "Compatibility flag: project journals stay disabled while gateway accounting "
+            "remains on."
+        ),
+    ),
+    non_interactive: bool = typer.Option(
+        False,
+        "--non-interactive",
+        help="Never open first-run prompts.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Write a versioned launch receipt."),
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Validate readiness and exit without binding.",
+    ),
+    graceful_timeout: float = typer.Option(
+        DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
+        "--graceful-timeout",
+        min=0.1,
+        help="Seconds to drain admitted gateway work during shutdown.",
+    ),
+    engine: str = typer.Option(
+        "auto",
+        "--engine",
+        help=(
+            "Data-plane engine: 'auto' (rust when built, otherwise python), 'rust' "
+            "(native data plane with an embedded python engine for Responses, "
+            "replay, and project aliases), or 'python' (uvicorn only)."
+        ),
+    ),
+    max_active_requests: int = typer.Option(
+        DEFAULT_MAX_ACTIVE_REQUESTS,
+        "--max-active-requests",
+        min=1,
+        help="Rust engine only: maximum concurrently admitted requests.",
+    ),
+) -> None:
+    """Start the local gateway directly, optionally with one project-backed alias.
+
+    Args:
+        project: Optional project identifier and endpoint alias.
+        root: Local artifact and model-catalog root.
+        policy: Exact policy for an ambiguous project.
+        port: Local loopback TCP port.
+        ghost: Compatibility marker for project traffic, which always uses gateway accounting.
+        non_interactive: Whether first-run gateway prompts are forbidden.
+        json_output: Whether startup output is one versioned JSON receipt.
+        check: Whether to validate gateway readiness without binding.
+        graceful_timeout: Gateway shutdown drain bound in seconds.
+        engine: Data-plane engine: ``auto``, ``rust``, or ``python``.
+        max_active_requests: Rust engine concurrent-admission bound.
+
+    Raises:
+        typer.BadParameter: The selected project form or activation is invalid.
+    """
+    start_gateway(
+        project=project,
+        root=root,
+        policy=policy,
+        port=port,
+        ghost=ghost,
+        non_interactive=non_interactive,
+        json_output=json_output,
+        check=check,
+        graceful_timeout=graceful_timeout,
+        engine=engine,
+        max_active_requests=max_active_requests,
+    )
 
 
 def start_gateway(
