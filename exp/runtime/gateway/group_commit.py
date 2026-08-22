@@ -280,7 +280,20 @@ class GroupCommitAttemptLedger:
                         stopping = True
                         break
                     batch.append(extra)
-                self._commit_batch(connection, batch)
+                try:
+                    self._commit_batch(connection, batch)
+                except Exception as exc:  # noqa: BLE001 - blocked callers receive the failure.
+                    _logger.exception("gateway ledger batch failed outside its own transaction")
+                    for pending in batch:
+                        if not pending.future.done():
+                            _resolve_exception(pending.future, exc)
+                    if connection.in_transaction:
+                        try:
+                            connection.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            _logger.exception(
+                                "gateway ledger batch rollback failed after batch failure"
+                            )
         finally:
             connection.close()
             self._fail_pending()

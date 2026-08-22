@@ -416,6 +416,31 @@ def test_closed_writer_rejects_sync_operations(tmp_path: Path) -> None:
         facade.flush()
 
 
+def test_batch_machinery_failure_fails_blocked_callers_and_writer_recovers(
+    tmp_path: Path,
+) -> None:
+    """A batch that fails outside its own transaction still fails its callers
+    instead of stranding them, and the writer keeps serving afterwards."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    with mock.patch.object(
+        grouped,
+        "_commit_batch",
+        side_effect=RuntimeError("simulated savepoint machinery loss"),
+    ):
+        with pytest.raises(RuntimeError, match="savepoint machinery"):
+            facade.flush()
+    survivor = _authorize(store, clock, raw_key, "post-failure-prompt")
+    facade.accept_request(authorization=survivor)
+    grouped.close()
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    count = connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0]
+    connection.close()
+    assert int(count) == 1
+
+
 def test_writer_startup_failure_fails_sync_callers_instead_of_hanging(
     tmp_path: Path,
 ) -> None:
