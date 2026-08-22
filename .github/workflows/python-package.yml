@@ -202,4 +202,4 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Publish to PyPI with trusted publishing
-        run: uv publish --trusted-publishing always dist/*
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*

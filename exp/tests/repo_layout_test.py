@@ -146,3 +146,34 @@ def test_no_local_state_or_cache_is_tracked() -> None:
         or path.endswith(".pyc")
     ]
     assert not offenders, f"local state or cache files are tracked: {offenders}"
+
+
+def test_native_crate_versions_stay_in_lockstep() -> None:
+    """The extension's two manifests and the flagship dependency floor agree.
+
+    The crate version feeds ``exp_gateway_native.__version__`` from Cargo and
+    the published wheel from its pyproject; the flagship's dependency floor is
+    what forces a fresh wheel onto users. If any of the three drift, a release
+    can pair new python code with a stale compiled engine (or fail to publish
+    at all, since PyPI rejects re-uploads of an existing version's files).
+    """
+    import re
+    import tomllib
+
+    crate_dir = REPO_ROOT / "exp" / "runtime" / "gateway" / "native"
+    cargo_version = re.search(
+        r'^version = "([^"]+)"',
+        (crate_dir / "Cargo.toml").read_text(),
+        re.MULTILINE,
+    )
+    assert cargo_version is not None
+    with (crate_dir / "pyproject.toml").open("rb") as handle:
+        wheel_version = tomllib.load(handle)["project"]["version"]
+    assert cargo_version.group(1) == wheel_version
+
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        dependencies = tomllib.load(handle)["project"]["dependencies"]
+    floor = next(
+        requirement for requirement in dependencies if requirement.startswith("exp-gateway-native")
+    )
+    assert floor == f"exp-gateway-native>={wheel_version},<0.2"
