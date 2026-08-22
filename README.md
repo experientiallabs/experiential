@@ -43,7 +43,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 Prefer a managed gateway to running one locally? The hosted platform at
 [platform.experientiallabs.ai](https://platform.experientiallabs.ai) serves the same
 OpenAI-compatible (and Anthropic Messages) API at `https://api.experientiallabs.ai/v1`.
-See [setup.md](./setup.md) for copy-paste prompts you hand to your coding agent
+See [SETUP.md](./SETUP.md) for copy-paste prompts you hand to your coding agent
 (Claude Code, Cursor, Codex, and similar); the agent runs the setup for you. It
 collects four prompts:
 
