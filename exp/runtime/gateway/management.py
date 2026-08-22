@@ -27,6 +27,26 @@ from exp.runtime.gateway.sqlite.store import GatewayStoreError, SQLiteGatewaySto
 from exp.runtime.models import SUPPORTED_PROVIDERS
 
 
+def require_gateway_servable_provider(*, connection_id: str, provider: str) -> None:
+    """Fail closed on a provider the gateway cannot serve.
+
+    Args:
+        connection_id: Operator-facing connection name used in the error.
+        provider: Authored provider identifier to validate.
+
+    Raises:
+        GatewayStoreError: The provider is outside the runtime registry set or
+            its records never become gateway deployments.
+    """
+    servable = SUPPORTED_PROVIDERS - GATEWAY_EXCLUDED_PROVIDERS
+    if provider not in servable:
+        supported = ", ".join(sorted(servable))
+        raise GatewayStoreError(
+            f"provider connection {connection_id!r} uses unsupported provider "
+            f"{provider!r}; choose one of: {supported}"
+        )
+
+
 class GatewayIdentityView(ContractModel):
     """One content-free local identity."""
 
@@ -160,13 +180,10 @@ class GatewayManagement:
                 construct a client for it or because its records never become
                 gateway deployments.
         """
-        servable = SUPPORTED_PROVIDERS - GATEWAY_EXCLUDED_PROVIDERS
-        if config.provider not in servable:
-            supported = ", ".join(sorted(servable))
-            raise GatewayStoreError(
-                f"provider connection {connection_id!r} uses unsupported provider "
-                f"{config.provider!r}; choose one of: {supported}"
-            )
+        require_gateway_servable_provider(
+            connection_id=connection_id,
+            provider=config.provider,
+        )
         revision_id = stable_id(
             "provider-connection-revision",
             {

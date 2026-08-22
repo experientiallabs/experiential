@@ -61,7 +61,11 @@ from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudg
 from exp.runtime.gateway.contracts import DirectTarget, ExecutionSnapshot
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.sqlite.platform import SQLiteGatewayPlatform
-from exp.runtime.gateway.sqlite.store import OperationConflictError, OperationReplayUnavailableError
+from exp.runtime.gateway.sqlite.store import (
+    GatewayStoreError,
+    OperationConflictError,
+    OperationReplayUnavailableError,
+)
 
 _DIGEST = "a" * 64
 
@@ -275,6 +279,11 @@ def test_naturally_idempotent_mutations_are_tenant_scoped_and_unreceipted(
             reference="OPENAI_API_KEY",
         ),
     )
+    with pytest.raises(GatewayStoreError, match="unsupported provider 'tinker'"):
+        platform.mutate_provider_connection(
+            provider.model_copy(update={"connection_id": "training", "provider": "tinker"})
+        )
+    assert platform.provider_connection_revisions(organization_id="org-one") == ()
     assert platform.mutate_provider_connection(provider).changed
     assert not platform.mutate_provider_connection(provider).changed
     with pytest.raises(ValueError, match="different immutable revision"):

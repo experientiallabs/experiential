@@ -16,6 +16,7 @@ from exp.runtime.gateway.budgets import (
 )
 from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayUsage, ProjectTarget
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.management import require_gateway_servable_provider
 from exp.runtime.gateway.platform import (
     ActivateAliasRevisionCommand,
     AliasMutationCommand,
@@ -184,8 +185,16 @@ class SQLiteGatewayPlatform:
         self,
         command: ProviderConnectionMutationCommand,
     ) -> NaturalMutationOutcome:
-        """Upsert or disable a provider connection without claiming a receipt."""
+        """Upsert or disable a provider connection without claiming a receipt.
+
+        Raises:
+            GatewayStoreError: An upsert names a provider the gateway cannot serve.
+        """
         if isinstance(command, UpsertProviderConnectionCommand):
+            require_gateway_servable_provider(
+                connection_id=command.connection_id,
+                provider=command.provider,
+            )
             secret_reference = command.secret_reference
             if (
                 secret_reference is not None
