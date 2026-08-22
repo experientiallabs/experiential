@@ -9,7 +9,12 @@ from pathlib import Path
 from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel, stable_id
-from exp.common.models import ConnectionConfig, ModelCatalog, load_model_catalog
+from exp.common.models import (
+    GATEWAY_EXCLUDED_PROVIDERS,
+    ConnectionConfig,
+    ModelCatalog,
+    load_model_catalog,
+)
 from exp.runtime.gateway.auth import IssuedVirtualKey
 from exp.runtime.gateway.contracts import DirectTarget, ProjectTarget
 from exp.runtime.gateway.sqlite import key_delivery
@@ -150,11 +155,14 @@ class GatewayManagement:
         """Create or revise one SQLite-authoritative serving connection.
 
         Raises:
-            GatewayStoreError: The connection names a provider the runtime
-                registry cannot construct a client for.
+            GatewayStoreError: The connection names a provider the gateway
+                cannot serve, either because the runtime registry cannot
+                construct a client for it or because its records never become
+                gateway deployments.
         """
-        if config.provider not in SUPPORTED_PROVIDERS:
-            supported = ", ".join(sorted(SUPPORTED_PROVIDERS))
+        servable = SUPPORTED_PROVIDERS - GATEWAY_EXCLUDED_PROVIDERS
+        if config.provider not in servable:
+            supported = ", ".join(sorted(servable))
             raise GatewayStoreError(
                 f"provider connection {connection_id!r} uses unsupported provider "
                 f"{config.provider!r}; choose one of: {supported}"

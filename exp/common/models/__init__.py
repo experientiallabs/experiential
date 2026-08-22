@@ -32,6 +32,7 @@ from exp.common.models.discovery import (
     serves_role,
 )
 from exp.common.models.gateway_catalog import (
+    GATEWAY_EXCLUDED_PROVIDERS,
     DeploymentId,
     ExactModelDeployment,
     ExactModelId,
@@ -115,6 +116,7 @@ __all__ = [
     "ExactModelId",
     "ExactModelPool",
     "ExactModelPoolId",
+    "GATEWAY_EXCLUDED_PROVIDERS",
     "GatewayDeploymentCapabilities",
     "GatewayDeploymentMetadata",
     "GatewayEquivalenceCertification",

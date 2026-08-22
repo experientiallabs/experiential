@@ -384,9 +384,10 @@ def _emit_unavailable_aliases(unavailable_aliases: tuple[tuple[str, str], ...]) 
     """
     for alias_name, reason in unavailable_aliases:
         _console.print(
-            f"[yellow]! alias {alias_name!r} is unavailable and will answer "
-            f"503 unavailable_route: {reason}[/yellow]",
-            markup=True,
+            f"! alias {alias_name!r} is unavailable and will answer "
+            f"503 unavailable_route: {reason}",
+            style="yellow",
+            markup=False,
         )
 
 

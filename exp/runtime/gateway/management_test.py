@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.models import ConnectionConfig
+from exp.common.models import GATEWAY_EXCLUDED_PROVIDERS, ConnectionConfig
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.sqlite.store import GatewayStoreError
 from exp.runtime.models import SUPPORTED_PROVIDERS
@@ -30,8 +30,8 @@ def test_upsert_provider_connection_rejects_an_unsupported_provider(tmp_path: Pa
     assert manager.provider_connections() == ()
 
 
-def test_upsert_provider_connection_error_lists_every_supported_provider(tmp_path: Path) -> None:
-    """The rejection names the full registry-supported provider set for remediation."""
+def test_upsert_provider_connection_error_lists_every_servable_provider(tmp_path: Path) -> None:
+    """The rejection names every gateway-servable provider and no excluded one."""
     manager = GatewayManagement(tmp_path)
     manager.initialize()
 
@@ -42,8 +42,26 @@ def test_upsert_provider_connection_error_lists_every_supported_provider(tmp_pat
         )
 
     message = str(excinfo.value)
-    for provider in SUPPORTED_PROVIDERS:
+    for provider in SUPPORTED_PROVIDERS - GATEWAY_EXCLUDED_PROVIDERS:
         assert provider in message
+    for provider in GATEWAY_EXCLUDED_PROVIDERS:
+        assert provider not in message
+
+
+def test_upsert_provider_connection_rejects_gateway_excluded_providers(tmp_path: Path) -> None:
+    """Runtime-only providers whose records never serve are rejected at configuration."""
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+
+    with pytest.raises(GatewayStoreError, match="unsupported provider 'tinker'"):
+        manager.upsert_provider_connection(
+            connection_id="training",
+            config=ConnectionConfig(provider="tinker"),
+        )
+
+    assert manager.provider_connections() == ()
+    assert "tinker" in SUPPORTED_PROVIDERS
+    assert "tinker" in GATEWAY_EXCLUDED_PROVIDERS
 
 
 def test_upsert_provider_connection_accepts_registry_supported_providers(

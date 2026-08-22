@@ -17,6 +17,9 @@ ExactModelId = ArtifactId
 DeploymentId = ArtifactId
 ExactModelPoolId = ArtifactId
 
+GATEWAY_EXCLUDED_PROVIDERS = frozenset({"tinker"})
+"""Runtime-resolvable providers whose records never become gateway deployments."""
+
 
 class ExactModelDeployment(ContractModel):
     """One callable catalog model with explicit provider and exact-model identity."""
@@ -121,7 +124,7 @@ def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog
     deployments: list[ExactModelDeployment] = []
     for alias, record in sorted(catalog.models.items()):
         connection = catalog.connections[record.connection]
-        if connection.provider == "tinker" or record.sft_provenance is not None:
+        if connection.provider in GATEWAY_EXCLUDED_PROVIDERS or record.sft_provenance is not None:
             continue
         capabilities_sha256 = _capability_declaration_sha256(record.capabilities)
         exact_model_id = (
