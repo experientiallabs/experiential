@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from exp.common.core.artifacts import JsonObject, stable_id
@@ -172,20 +173,28 @@ class NativeControlPlane:
         components: LocalGatewayComponents,
         *,
         request_timeout_seconds: float = _REQUEST_TIMEOUT_SECONDS,
+        data_plane_metrics: Callable[[], str] | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
         Args:
             components: Authority, ledger, routes, and runtime catalogs.
             request_timeout_seconds: Total per-request budget from admission.
+            data_plane_metrics: Optional provider of the native engine's
+                content-free metrics snapshot as one JSON string; the local
+                launch injects ``exp_gateway_native.metrics_snapshot_json``.
+                Without it the snapshot reports ``data_plane`` as ``None``.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
         self._request_timeout_seconds = request_timeout_seconds
+        self._data_plane_metrics = data_plane_metrics
         self._inflight: dict[str, _InflightAttempt] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
+        self._sweep_retained_replayed = 0
+        self._sweep_abandoned_cancelled = 0
         # The sweep also runs on a timer so retained settlements and abandoned
         # attempts are recovered even when no further requests arrive.
         self._sweeper = threading.Thread(
@@ -589,6 +598,39 @@ class NativeControlPlane:
             identity_id=identity_id,
         )
 
+    def metrics_snapshot(self) -> JsonObject:
+        """Compose the one content-free observability snapshot.
+
+        ``data_plane`` carries the native engine's registry (request outcomes,
+        escalations, retries, latency histograms) when a provider is bound,
+        otherwise ``None``. ``control_plane`` carries this bridge's own sweep
+        recoveries, in-flight registry size, startup reconciliation counts,
+        and accounting health. Hosted compositions re-expose this dictionary
+        under their own application; the native ``/metrics.json`` route serves
+        exactly this body.
+
+        Returns:
+            The snapshot with ``data_plane`` and ``control_plane`` sections.
+        """
+        data_plane: JsonObject | None = None
+        if self._data_plane_metrics is not None:
+            data_plane = json.loads(self._data_plane_metrics())
+        with self._lock:
+            control_plane: JsonObject = {
+                "sweep_retained_settlements_replayed": self._sweep_retained_replayed,
+                "sweep_abandoned_attempts_cancelled": self._sweep_abandoned_cancelled,
+                "inflight_attempts": len(self._inflight),
+                "reconciled_expired_requests": self._components.reconciled_expired_requests,
+                "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
+                "accounting_healthy": self._accounting_healthy,
+            }
+        return {"data_plane": data_plane, "control_plane": control_plane}
+
+    def metrics_json(self, argument: str) -> str:
+        """Return the content-free metrics snapshot body for the data plane."""
+        del argument
+        return json.dumps(self.metrics_snapshot(), separators=(",", ":"))
+
     def readiness(self, argument: str) -> str:
         """Return whether shared executor and bridge accounting stay healthy."""
         del argument
@@ -730,7 +772,9 @@ class NativeControlPlane:
             if settlement is None:
                 continue
             terminal, failure = _terminal_from_settlement(settlement)
-            self._settle_swept(request_id, entry, terminal, failure, latch_on_failure=True)
+            if self._settle_swept(request_id, entry, terminal, failure, latch_on_failure=True):
+                with self._lock:
+                    self._sweep_retained_replayed += 1
         if not abandoned:
             return
         cancelled = GatewayFailure(
@@ -739,7 +783,9 @@ class NativeControlPlane:
         )
         terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=cancelled)
         for request_id, entry in abandoned:
-            self._settle_swept(request_id, entry, terminal, cancelled, latch_on_failure=True)
+            if self._settle_swept(request_id, entry, terminal, cancelled, latch_on_failure=True):
+                with self._lock:
+                    self._sweep_abandoned_cancelled += 1
 
     def _settle_swept(
         self,
@@ -749,8 +795,12 @@ class NativeControlPlane:
         failure: GatewayFailure | None,
         *,
         latch_on_failure: bool,
-    ) -> None:
-        """Land one swept settlement; keep the entry for retry on failure."""
+    ) -> bool:
+        """Land one swept settlement; keep the entry for retry on failure.
+
+        Returns:
+            Whether the swept terminal write reached the ledger.
+        """
         try:
             self._components.ledger.finish_attempt(
                 attempt_id=entry.attempt_id,
@@ -761,9 +811,10 @@ class NativeControlPlane:
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             if latch_on_failure:
                 self._accounting_healthy = False
-            return
+            return False
         with self._lock:
             self._inflight.pop(request_id, None)
+        return True
 
     def _finish_request_quietly(
         self,

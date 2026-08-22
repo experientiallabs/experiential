@@ -304,7 +304,10 @@ def _run_rust_gateway(
                 verifier=verify_automatic_router_policy,
             )
             components = load_gateway_components(root, project_repository=project_repository)
-            control_plane = NativeControlPlane(components)
+            control_plane = NativeControlPlane(
+                components,
+                data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
+            )
             runtime = compose_local_gateway(
                 components,
                 graceful_timeout_seconds=graceful_timeout,

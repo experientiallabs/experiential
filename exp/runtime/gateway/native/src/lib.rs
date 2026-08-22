@@ -11,6 +11,7 @@ mod encode;
 mod errors;
 mod events;
 mod memory;
+mod metrics;
 mod replay;
 mod server;
 mod sse;
@@ -27,7 +28,8 @@ use crate::server::ServeConfig;
 /// Serve the gateway data plane until shutdown (SIGINT or SIGTERM).
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
-/// `settle`, `models`, `model_detail`, `usage_json`, `usage_page`, and
+/// `settle`, `models`, `model_detail`, `usage_json`, `usage_page`,
+/// `metrics_json`, and
 /// `readiness`, each taking and returning one JSON string. `config_json`
 /// carries host, port, and concurrency bounds.
 #[pyfunction]
@@ -68,6 +70,14 @@ fn encode_chat_fixture(
         );
     }
     Ok(frames)
+}
+
+/// Snapshot the process-global data-plane metrics registry as one JSON
+/// object. Python hosts compose this content-free snapshot with the control
+/// plane's own counters (see `NativeControlPlane.metrics_snapshot`).
+#[pyfunction]
+fn metrics_snapshot_json() -> String {
+    metrics::METRICS.snapshot().to_string()
 }
 
 /// Map one failure class and safe message to the Rust public-error JSON for
@@ -177,6 +187,7 @@ fn error_payload(error: &errors::PublicError) -> String {
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(serve, module)?)?;
+    module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;
     module.add_function(wrap_pyfunction!(encode_chat_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
