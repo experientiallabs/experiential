@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import cast
 
 import pytest
 
@@ -226,6 +227,22 @@ def test_counters_end_in_total_and_histograms_close_at_inf() -> None:
     }
     assert inf_counts == totals
     assert len(inf_counts) == 4
+
+
+def test_a_torn_snapshot_still_renders_an_internally_consistent_histogram() -> None:
+    """A count sampled behind the buckets never breaks +Inf equals _count.
+
+    The registry samples each atomic independently, so a concurrent recording
+    can leave the snapshot's total one behind the bucket counters. The
+    exposition derives _count from the bucket total itself.
+    """
+    snapshot = _snapshot()
+    data_plane = cast("JsonObject", snapshot["data_plane"])
+    torn = cast("JsonObject", data_plane["time_to_first_byte_ms"])
+    torn["count"] = 3
+    rendered = render_metrics_text(snapshot)
+    assert 'exp_gateway_time_to_first_byte_ms_bucket{le="+Inf"} 4' in rendered
+    assert "exp_gateway_time_to_first_byte_ms_count 4" in rendered
 
 
 def test_absent_data_plane_renders_only_control_plane_metrics() -> None:

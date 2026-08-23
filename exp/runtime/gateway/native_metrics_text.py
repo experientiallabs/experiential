@@ -121,7 +121,11 @@ def _histogram(section: JsonObject, key: str, help_text: str) -> list[str]:
 
     The snapshot stores per-bucket counts with millisecond upper bounds and a
     ``null`` bound for the overflow bucket; the exposition requires cumulative
-    ``_bucket`` samples ending in ``le="+Inf"`` equal to ``_count``.
+    ``_bucket`` samples ending in ``le="+Inf"`` equal to ``_count``. The
+    registry samples each atomic independently under concurrent recording, so
+    ``_count`` is emitted from the bucket total itself rather than the
+    separately sampled snapshot count, keeping every scrape internally
+    consistent.
 
     Args:
         section: Snapshot section holding the histogram object at ``key``.
@@ -141,7 +145,7 @@ def _histogram(section: JsonObject, key: str, help_text: str) -> list[str]:
         bound = "+Inf" if upper is None else str(upper)
         samples.append(f'{name}_bucket{{le="{bound}"}} {cumulative}')
     samples.append(f"{name}_sum {_value(histogram['sum_ms'])}")
-    samples.append(f"{name}_count {_value(histogram['count'])}")
+    samples.append(f"{name}_count {cumulative}")
     return _family(name, "histogram", help_text, samples)
 
 
