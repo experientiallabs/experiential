@@ -12,7 +12,7 @@ Experiential is an open source gateway and router for agent workflows:
 
 <p align="center">
   🌐 <a href="https://platform.experientiallabs.ai">Platform</a> |
-  📚 <a href="https://github.com/experientiallabs/experiential/tree/main/docs">Docs</a> |
+  📚 <a href="https://platform.experientiallabs.ai/docs">Docs</a> |
   <a href="https://discord.gg/B6sM8xTVwU"><img src="https://cdn.simpleicons.org/discord/5865F2" alt="" width="16" height="16"> Discord</a>
 </p>
 
