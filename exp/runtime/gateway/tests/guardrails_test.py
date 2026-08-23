@@ -455,6 +455,64 @@ def test_textless_streaming_modify_encodes_without_duplicate_sequences() -> None
     asyncio.run(scenario())
 
 
+def test_refusal_only_responses_modify_encodes_without_mixed_deltas() -> None:
+    """A Responses refusal-only modify is text-only and does not return 502."""
+
+    async def scenario() -> None:
+        """Stream one refusal-only Responses completion through output modify."""
+        classifier = ScriptedClassifier(
+            output_verdict=ClassifierVerdict(flagged=True, replacement_text="safe")
+        )
+        events = (
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=0,
+                text_delta="I cannot",
+            ),
+            GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=1,
+                usage=GatewayUsage(input_tokens=3, output_tokens=1),
+            ),
+        )
+        provider = _RecordingProvider(lambda: _EventStream(events))
+        service, _control, _ledger, _proof = _service(
+            provider,
+            guardrails=_engine(
+                classifier,
+                checks=(
+                    _check(
+                        "output-safety",
+                        stage=GuardrailCheckStage.OUTPUT,
+                        action=GuardrailAction.MODIFY,
+                    ),
+                ),
+            ),
+        )
+
+        response = await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_responses(
+                {
+                    "model": "public-model",
+                    "input": "hello",
+                    "stream": True,
+                }
+            ),
+        )
+
+        assert isinstance(response, StreamingResponse)
+        frames: list[bytes] = []
+        async for frame in cast(AsyncIterator[bytes], response.body_iterator):
+            frames.append(frame)
+        body = b"".join(frames)
+        assert b"invalid_provider_stream" not in body
+        assert b"safe" in body
+        assert b"I cannot" not in body
+
+    asyncio.run(scenario())
+
+
 def test_tool_call_arguments_are_blocked_not_rewritten() -> None:
     """A modify action on a tool-calling completion becomes a block."""
 

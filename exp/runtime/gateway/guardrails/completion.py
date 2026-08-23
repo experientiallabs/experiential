@@ -32,28 +32,31 @@ def apply_text_replacement(
     events: tuple[GatewayEvent, ...],
     replacement: str,
 ) -> tuple[GatewayEvent, ...]:
-    """Replace text deltas with one rewritten delta and leave other events intact.
+    """Replace visible completion text and drop refusal deltas.
 
     Tool-call events are never rewritten. Callers must block those completions
-    instead of asking this helper to edit arguments.
+    instead of asking this helper to edit arguments. Refusal deltas are
+    discarded so the rewritten stream is text-only and valid for both Chat
+    and Responses encoders.
 
     Args:
         events: Winning normalized provider events.
         replacement: Sanitized replacement text.
 
     Returns:
-        A new event sequence with a single text delta when text was present,
-        or with one inserted text delta before the terminal event.
+        A new event sequence with one text delta, no refusal deltas, and
+        strictly increasing sequence numbers starting at zero.
     """
     rewritten: list[GatewayEvent] = []
     inserted = False
-    bump = 0
     terminals = {
         GatewayEventKind.COMPLETED,
         GatewayEventKind.INCOMPLETE,
         GatewayEventKind.FAILED,
     }
     for event in events:
+        if event.kind is GatewayEventKind.REFUSAL_DELTA:
+            continue
         if event.kind is GatewayEventKind.TEXT_DELTA:
             if inserted:
                 continue
@@ -69,13 +72,10 @@ def apply_text_replacement(
                 )
             )
             inserted = True
-            bump = 1
-        rewritten.append(
-            event.model_copy(update={"sequence_number": event.sequence_number + bump})
-            if bump
-            else event
-        )
-    return tuple(rewritten)
+        rewritten.append(event)
+    return tuple(
+        event.model_copy(update={"sequence_number": index}) for index, event in enumerate(rewritten)
+    )
 
 
 def _tool_call(call: ToolCall) -> GuardrailToolCall:

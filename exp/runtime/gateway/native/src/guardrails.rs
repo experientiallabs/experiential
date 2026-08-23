@@ -67,12 +67,13 @@ pub fn output_argument(request_id: &str, events: &[Event]) -> String {
     }))
 }
 
-/// Replace text deltas with one rewritten delta. Tool-call events stay intact.
+/// Replace text deltas with one rewritten delta. Refusal deltas are dropped.
 pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event> {
     let mut rewritten = Vec::with_capacity(events.len());
     let mut inserted = false;
     for event in events {
         match event {
+            Event::RefusalDelta(_) => {}
             Event::TextDelta(_) => {
                 if inserted {
                     continue;
@@ -188,5 +189,19 @@ mod tests {
         let rewritten = apply_text_replacement(&events, "safe");
         assert!(matches!(rewritten[0], Event::TextDelta(ref text) if text == "safe"));
         assert!(matches!(rewritten[1], Event::Completed));
+    }
+
+    #[test]
+    fn refusal_only_replacement_drops_refusal_deltas() {
+        let events = vec![
+            Event::RefusalDelta("I cannot".to_string()),
+            Event::Completed,
+        ];
+        let rewritten = apply_text_replacement(&events, "safe");
+        assert!(matches!(rewritten[0], Event::TextDelta(ref text) if text == "safe"));
+        assert!(matches!(rewritten[1], Event::Completed));
+        assert!(!rewritten
+            .iter()
+            .any(|event| matches!(event, Event::RefusalDelta(_))));
     }
 }
