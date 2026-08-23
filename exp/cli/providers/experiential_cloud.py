@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import html
 import os
-import queue
 import secrets
 import select
 import sys
@@ -104,7 +103,7 @@ class BrowserLogin:
             """Accept the Platform key only on the matching loopback callback."""
 
             def do_GET(self) -> None:  # noqa: N802 - http.server contract
-                """Validate one callback and place its key on the login queue."""
+                """Validate one callback and publish its key to the login waiter."""
                 parsed = urlparse(self.path)
                 if parsed.path != "/callback":
                     self.send_error(404)
@@ -297,31 +296,7 @@ def hosted_platform_login(
                     "[dim]Approve the connection in your browser, or paste an existing key "
                     "to continue.[/dim]"
                 )
-                fallback_values: queue.Queue[str | None] = queue.Queue(maxsize=1)
-                fallback_errors: queue.Queue[Exception] = queue.Queue(maxsize=1)
-                fallback_done = threading.Event()
-
-                def _run_fallback() -> None:
-                    """Read a pasted key without blocking the callback waiter."""
-                    try:
-                        fallback_values.put(fallback(attempt.wait))
-                    except Exception as exc:  # noqa: BLE001 - preserve injected fallback errors
-                        fallback_errors.put(exc)
-                    finally:
-                        fallback_done.set()
-
-                fallback_thread = threading.Thread(target=_run_fallback, daemon=True)
-                fallback_thread.start()
-                while not fallback_done.is_set():
-                    token = attempt.wait(timeout=0.05)
-                    if token is not None:
-                        fallback_thread.join(timeout=1)
-                        console.print("[green]Platform login received.[/green]")
-                        return token
-                fallback_thread.join(timeout=1)
-                if not fallback_errors.empty():
-                    raise fallback_errors.get()
-                fallback_key = fallback_values.get()
+                fallback_key = fallback(attempt.wait)
                 token = attempt.wait(timeout=0.1)
                 if token is not None:
                     console.print("[green]Platform login received.[/green]")
@@ -367,10 +342,15 @@ def read_masked_key_with_callback(
         owns_fd = False
 
     old_attributes = termios.tcgetattr(fd)
+    was_blocking = os.get_blocking(fd)
     hidden_attributes = old_attributes.copy()
     hidden_attributes[3] &= ~termios.ECHO
     prompted = False
     try:
+        # Keep the final read non-blocking even if terminal readiness changes between
+        # select() and os.read(). This lets callback completion restore echo before
+        # returning, with no daemon reader left owning the terminal.
+        os.set_blocking(fd, False)
         termios.tcsetattr(fd, termios.TCSADRAIN, hidden_attributes)
         console.print(prompt, end="")
         prompted = True
@@ -381,12 +361,16 @@ def read_masked_key_with_callback(
             readable, _, _ = select.select([fd], [], [], 0.05)
             if not readable:
                 continue
-            data = os.read(fd, 4096)
+            try:
+                data = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
             if not data:
                 raise EOFError
             return data.decode("utf-8", errors="replace").strip() or None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attributes)
+        os.set_blocking(fd, was_blocking)
         if owns_fd:
             os.close(fd)
         if prompted:
