@@ -104,11 +104,13 @@ class ScriptedClassifier:
 
 
 class KeywordClassifier:
-    """Operator-authored needle matcher for one capability.
+    """Coarse, test-oriented needle matcher for local experiments.
 
-    This is a coarse, local adapter. It is not a hosted detector and does not
-    call a model provider. Needles are compared as case-folded substrings of
-    message text or of completion text and tool-call arguments.
+    Needles are compared as case-folded substrings of message text or of
+    completion text and tool-call arguments. This is not a production
+    prompt-injection or content-safety classifier. Production policies bind
+    replaceable hosted adapters, including a hosted PII redactor, through
+    ``http_json``.
     """
 
     def __init__(self, needles: tuple[str, ...]) -> None:

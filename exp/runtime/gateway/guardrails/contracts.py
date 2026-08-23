@@ -29,6 +29,7 @@ class GuardrailCapabilityKind(StrEnum):
     """
 
     PII = "pii"
+    SECRET_LEAKAGE = "secret_leakage"
     PROMPT_INJECTION = "prompt_injection"
     CONTENT_SAFETY = "content_safety"
 
@@ -58,6 +59,23 @@ class GuardrailCheck(ContractModel):
     action: GuardrailAction
     timeout_ms: int = Field(ge=1, le=30_000)
     adapter_id: ArtifactId
+
+    @model_validator(mode="after")
+    def _reject_output_prompt_injection(self) -> GuardrailCheck:
+        """Prompt injection inspects inbound text only.
+
+        Returns:
+            The validated check.
+
+        Raises:
+            ValueError: The check asks for output-stage prompt injection.
+        """
+        if (
+            self.stage is GuardrailCheckStage.OUTPUT
+            and self.capability is GuardrailCapabilityKind.PROMPT_INJECTION
+        ):
+            raise ValueError("prompt_injection is input-only")
+        return self
 
 
 class GuardrailPolicy(ContractModel):
@@ -92,6 +110,9 @@ class GuardrailPolicy(ContractModel):
         ids = tuple(check.check_id for check in self.checks)
         if len(set(ids)) != len(ids):
             raise ValueError("guardrail check IDs must be unique")
+        pairs = tuple((check.stage, check.capability) for check in self.checks)
+        if len(set(pairs)) != len(pairs):
+            raise ValueError("guardrail checks must not repeat a capability on the same stage")
         return self
 
     @property

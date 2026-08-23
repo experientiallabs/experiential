@@ -67,9 +67,44 @@ def test_capability_kinds_name_jobs_not_providers() -> None:
     """Capability names stay provider-neutral."""
     assert {item.value for item in GuardrailCapabilityKind} == {
         "pii",
+        "secret_leakage",
         "prompt_injection",
         "content_safety",
     }
+
+
+def test_prompt_injection_is_input_only() -> None:
+    """Output-stage prompt injection is rejected at check construction."""
+    with pytest.raises(ValueError, match="input-only"):
+        GuardrailCheck(
+            check_id="output-injection",
+            capability=GuardrailCapabilityKind.PROMPT_INJECTION,
+            stage=GuardrailCheckStage.OUTPUT,
+            action=GuardrailAction.BLOCK,
+            timeout_ms=250,
+            adapter_id="hosted-injection",
+        )
+
+
+def test_policy_rejects_duplicate_stage_capability_pairs() -> None:
+    """Two checks for the same capability on one stage are ambiguous."""
+    with pytest.raises(ValueError, match="same stage"):
+        GuardrailPolicy(
+            policy_id="member-policy",
+            organization_id="organization-one",
+            identity_id="identity-one",
+            checks=(
+                _check("input-one"),
+                GuardrailCheck(
+                    check_id="input-two",
+                    capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                    stage=GuardrailCheckStage.INPUT,
+                    action=GuardrailAction.BLOCK,
+                    timeout_ms=250,
+                    adapter_id="keyword-safety",
+                ),
+            ),
+        )
 
 
 def test_request_and_completion_byte_counts_cover_tool_arguments() -> None:

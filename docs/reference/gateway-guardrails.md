@@ -41,11 +41,23 @@ use its own transport, not the public gateway.
 Capability kinds name the inspection job, not a vendor:
 
 - `pii`
+- `secret_leakage`
 - `prompt_injection`
 - `content_safety`
 
-The only built-in adapter kind is `keyword`: operator-authored needles compared
-as case-folded substrings. Other adapters are injected in code.
+`prompt_injection` is input-only.
+
+Built-in adapter kinds:
+
+- `keyword`: coarse, test-oriented needle matching. Case-folded substrings of
+  message text, completion text, or tool-call arguments. This is not a
+  production prompt-injection or content-safety classifier.
+- `http_json`: production async adapter that POSTs a strict inspect contract to
+  a dedicated classifier endpoint. It never calls `POST /v1/chat/completions`
+  or `POST /v1/responses`. Operators bind replaceable hosted adapters,
+  including a hosted PII redactor, by `adapter_id`.
+
+Other adapters may still be injected in code when composing a `GuardrailEngine`.
 
 Each check has an action (`allow`, `modify`, `block`, `error`), a per-check
 timeout, and an adapter identity. `modify` may rewrite request messages or
@@ -87,7 +99,84 @@ Replacements exist only in memory for the remainder of the request.
 ## Configuration
 
 Place an optional file at `ROOT/gateway/guardrails.json`. Missing files leave
-every organization and identity unguarded.
+every organization and identity unguarded. There is no global switch that
+turns classifiers on for every identity.
+
+The `standard` preset is opt-in per organization and identity. It is never
+implied. The operator must name `preset: standard` and bind an `adapter_id`
+for every capability. Load fails closed on a malformed preset, a missing
+capability binding, a duplicate or ambiguous authored check, or a preset
+combined with a manual `checks` list.
+
+Expanded standard order, with a conservative 250 ms default timeout per check:
+
+1. input `pii`: modify (redact)
+2. input `secret_leakage`: modify (redact)
+3. input `prompt_injection`: block
+4. input `content_safety`: block
+5. output `pii`: modify (redact)
+6. output `secret_leakage`: modify (redact)
+7. output `content_safety`: block
+
+Timeouts stay configurable. `timeout_ms` sets the default. `timeouts` overrides
+individual checks by check ID (`standard-input-pii`) or `stage.capability`
+(`input.pii`).
+
+```json
+{
+  "adapters": [
+    {
+      "adapter_id": "hosted-pii",
+      "kind": "http_json",
+      "url": "https://classifier.example.invalid/v1/inspect",
+      "bearer_env": "CLASSIFIER_BEARER"
+    },
+    {
+      "adapter_id": "hosted-secrets",
+      "kind": "http_json",
+      "url": "https://classifier.example.invalid/v1/inspect"
+    },
+    {
+      "adapter_id": "hosted-injection",
+      "kind": "http_json",
+      "url": "https://classifier.example.invalid/v1/inspect"
+    },
+    {
+      "adapter_id": "hosted-safety",
+      "kind": "http_json",
+      "url": "https://classifier.example.invalid/v1/inspect"
+    }
+  ],
+  "policies": [
+    {
+      "policy_id": "standard-member",
+      "organization_id": "organization-one",
+      "identity_id": "identity-one",
+      "protected": true,
+      "preset": "standard",
+      "timeout_ms": 250,
+      "capability_adapters": {
+        "pii": "hosted-pii",
+        "secret_leakage": "hosted-secrets",
+        "prompt_injection": "hosted-injection",
+        "content_safety": "hosted-safety"
+      }
+    }
+  ]
+}
+```
+
+`bearer_env` is the name of a process environment variable. The document never
+stores a credential. The adapter reads that name at inspect time and sends a
+bearer header. Missing values are classifier uncertainty.
+
+The `http_json` request includes `capability`, `stage`, `action`, `check_id`,
+and exactly one subject: `request` or `completion`. The response must validate
+as `ClassifierVerdict`. Non-2xx statuses, malformed JSON, oversized bodies,
+invalid replacements, and contract drift become classifier uncertainty. The
+outer `GuardrailEngine` still owns per-check and request deadlines.
+
+Hand-authored checks remain available when a preset is not used:
 
 ```json
 {
@@ -128,9 +217,9 @@ a `GuardrailEngine`.
 
 Content-safety checks can block or redact disallowed text in prompts and
 completions. They are not a substitute for provider-side safety systems, legal
-review, or human moderation. Keyword adapters are coarse. A `modify` action
-needs the adapter to supply a replacement; otherwise the check errors.
-Protected streaming may add classifier latency before the first token.
+review, or human moderation. Keyword adapters are coarse and test-oriented. A
+`modify` action needs the adapter to supply a replacement; otherwise the check
+errors. Protected streaming may add classifier latency before the first token.
 
 ## Limitations
 

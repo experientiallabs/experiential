@@ -37,7 +37,7 @@ def _check() -> GuardrailCheck:
 
 
 def test_keyword_classifier_flags_needles_in_text_and_tool_arguments() -> None:
-    """Local needles match message text, completion text, and tool arguments."""
+    """Coarse local needles match message text, completion text, and tool arguments."""
     classifier = KeywordClassifier(("forbidden",))
     request = GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,

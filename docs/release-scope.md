@@ -17,7 +17,8 @@ on the exact release checkout.
   provider fallback, Chat Completions, Responses, bounded in-memory continuation and replay,
   content-free SQLite accounting, monthly integer micro-USD enforcement, loopback-only health
   and usage views, and optional identity-scoped guardrails that stay off until a policy is
-  assigned.
+  assigned. The bundled standard classifier pack is also default-off and is enabled only
+  when one organization and identity opts in and binds an adapter for every capability.
 - The no-subcommand default gateway launch, the direct `exp run [PROJECT]` form, and the
   `exp --project PROJECT [--ghost]` compatibility form are installed-wheel surfaces. Gateway
   startup is provider-idle and requires explicit authority.

@@ -34,10 +34,16 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailToolCall,
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.http_json import (
+    ClassifierProtocolError,
+    HttpJsonClassifier,
+)
+from exp.runtime.gateway.guardrails.preset import STANDARD_PRESET_NAME
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 
 __all__ = [
     "BoundedSyncClassifier",
+    "ClassifierProtocolError",
     "ClassifierRegistry",
     "ClassifierVerdict",
     "DirectClassifierClient",
@@ -51,9 +57,11 @@ __all__ = [
     "GuardrailRecursionError",
     "GuardrailRejected",
     "GuardrailToolCall",
+    "HttpJsonClassifier",
     "InternalClassifierClient",
     "KeywordClassifier",
     "MappingGuardrailStore",
+    "STANDARD_PRESET_NAME",
     "ScriptedClassifier",
     "assert_not_internal_classification",
     "classification_scope",

@@ -162,7 +162,7 @@ def _check(
     """Build one valid check."""
     return GuardrailCheck(
         check_id=check_id,
-        capability=GuardrailCapabilityKind.PROMPT_INJECTION,
+        capability=GuardrailCapabilityKind.CONTENT_SAFETY,
         stage=stage,
         action=action,
         timeout_ms=timeout_ms,

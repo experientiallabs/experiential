@@ -6,7 +6,9 @@ from exp.runtime.gateway.guardrails import (
     BoundedSyncClassifier,
     GuardrailEngine,
     GuardrailPolicy,
+    HttpJsonClassifier,
     MappingGuardrailStore,
+    STANDARD_PRESET_NAME,
     load_guardrail_engine,
 )
 
@@ -16,5 +18,7 @@ def test_package_exports_the_operator_facing_types() -> None:
     assert BoundedSyncClassifier is not None
     assert GuardrailEngine is not None
     assert GuardrailPolicy is not None
+    assert HttpJsonClassifier is not None
     assert MappingGuardrailStore is not None
+    assert STANDARD_PRESET_NAME == "standard"
     assert load_guardrail_engine is not None
