@@ -3,6 +3,7 @@ name = "experiential"
 version = "0.5.2"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.12"
 dependencies = [
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
@@ -62,6 +63,7 @@ include = [
     "/docs/release-scope.md",
     "/docs/usage.md",
     "/README.md",
+    "/LICENSE",
     "/pyproject.toml",
     "/conftest.py",
 ]

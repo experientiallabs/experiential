@@ -32,6 +32,7 @@ ALLOWED_TOP_FILES = {
     ".gitignore",
     "AGENTS.md",
     "CLAUDE.md",
+    "LICENSE",
     "README.md",
     "conftest.py",
     "justfile",
