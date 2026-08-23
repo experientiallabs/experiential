@@ -43,6 +43,13 @@ from exp.runtime.gateway.execution import (
     GatewayExecutor,
 )
 from exp.runtime.gateway.group_commit import abandoned_write_outcome
+from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
+from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy, GuardrailRejected
+from exp.runtime.gateway.guardrails.delivery import (
+    collect_and_enforce_output,
+    requires_output_buffer,
+)
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayControlStore
 from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
@@ -99,6 +106,7 @@ class GatewayService:
         continuation_store: ResponseContinuationStore | None = None,
         wall_clock: Callable[[], float] = time.time,
         terminal_flusher: Callable[[], Awaitable[None]] | None = None,
+        guardrails: GuardrailEngine | None = None,
     ) -> None:
         """Bind all injected gateway dependencies without registering public CLI behavior.
 
@@ -114,6 +122,8 @@ class GatewayService:
             wall_clock: Injectable epoch clock for public object timestamps.
             readiness_probe: Credential-free proof that one granted alias can route.
             terminal_flusher: Hook that flushes queued terminal accounting after drain.
+            guardrails: Optional identity-scoped engine. ``None`` leaves the
+                existing hot path unchanged and never calls a classifier.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -132,6 +142,7 @@ class GatewayService:
         self._wall_clock = wall_clock
         self._readiness_probe = readiness_probe
         self._terminal_flusher = terminal_flusher or _flush_synchronous_ledger
+        self._guardrails = guardrails
         self._accepting = True
         self._active_requests = 0
         self._active_streams: set[GatewayExecutionStream] = set()
@@ -281,6 +292,7 @@ class GatewayService:
         Returns:
             Streaming or completed OpenAI-compatible HTTP response.
         """
+        assert_not_internal_classification()
         await self._enter_request()
         current_task = asyncio.current_task()
         if current_task is not None:
@@ -327,6 +339,13 @@ class GatewayService:
             authorization=authorization,
             request=decoded.request,
         )
+        policy = self._assigned_policy(authorization.identity_id)
+        if policy is not None and self._guardrails is not None:
+            execution_request = self._guardrails.enforce_input(
+                policy=policy,
+                request=execution_request,
+                deadline_monotonic=deadline,
+            )
         caller_operation = decoded.request.idempotency_key or decoded.request.client_request_id
         key = replay_key(
             namespace=namespace,
@@ -370,6 +389,26 @@ class GatewayService:
         if decoded.request.stream:
             async with self._lifecycle:
                 self._active_streams.add(stream)
+            buffered = None
+            if (
+                requires_output_buffer(policy)
+                and self._guardrails is not None
+                and policy is not None
+            ):
+                try:
+                    buffered = await collect_and_enforce_output(
+                        engine=self._guardrails,
+                        policy=policy,
+                        stream=stream,
+                        deadline_monotonic=deadline,
+                    )
+                except BaseException as exc:
+                    await _settle_stream_quietly(stream, exc)
+                    if lease is not None:
+                        await _abandon_quietly(lease)
+                    async with self._lifecycle:
+                        self._active_streams.discard(stream)
+                    raise
             return StreamingResponse(
                 self._stream_body(
                     request=execution_request,
@@ -380,6 +419,9 @@ class GatewayService:
                     lease=lease,
                     headers=headers,
                     episode=episode,
+                    policy=policy,
+                    deadline_monotonic=deadline,
+                    buffered=buffered,
                 ),
                 status_code=200,
                 media_type="text/event-stream",
@@ -394,6 +436,8 @@ class GatewayService:
             lease=lease,
             headers=headers,
             episode=episode,
+            policy=policy,
+            deadline_monotonic=deadline,
         )
 
     async def _enter_request(self) -> None:
@@ -447,6 +491,12 @@ class GatewayService:
             ),
         )
 
+    def _assigned_policy(self, identity_id: str) -> GuardrailPolicy | None:
+        """Return the identity policy, or ``None`` when guardrails are off."""
+        if self._guardrails is None:
+            return None
+        return self._guardrails.policy_for(identity_id)
+
     async def _stream_body(
         self,
         *,
@@ -458,6 +508,9 @@ class GatewayService:
         lease: ReplayLease | None,
         headers: dict[str, str],
         episode: tuple[str, str, str, str],
+        policy: GuardrailPolicy | None = None,
+        deadline_monotonic: float | None = None,
+        buffered: tuple[GatewayEvent, ...] | None = None,
     ) -> AsyncIterator[bytes]:
         """Encode true provider events while capturing only a bounded replay result."""
         encoder = stream_encoder(
@@ -477,6 +530,18 @@ class GatewayService:
             async with self._lifecycle:
                 self._active_tasks.add(current_task)
         try:
+            if buffered is None and (
+                requires_output_buffer(policy)
+                and self._guardrails is not None
+                and policy is not None
+                and deadline_monotonic is not None
+            ):
+                buffered = await collect_and_enforce_output(
+                    engine=self._guardrails,
+                    policy=policy,
+                    stream=stream,
+                    deadline_monotonic=deadline_monotonic,
+                )
             for frame in encoder.start():
                 data = frame.encode()
                 replayable = capture_frame(
@@ -486,7 +551,7 @@ class GatewayService:
                     maximum_bytes=_STREAM_REPLAY_CAPTURE_BYTES,
                 )
                 yield data
-            async for event in stream:
+            async for event in _event_source(stream, buffered):
                 if retainable:
                     try:
                         events.append(event)
@@ -565,18 +630,33 @@ class GatewayService:
         lease: ReplayLease | None,
         headers: dict[str, str],
         episode: tuple[str, str, str, str],
+        policy: GuardrailPolicy | None = None,
+        deadline_monotonic: float | None = None,
     ) -> Response:
         """Consume one true upstream stream into a non-streaming public response."""
         events = BoundedGatewayEvents()
         try:
-            async for event in stream:
-                events.append(event)
+            if (
+                requires_output_buffer(policy)
+                and self._guardrails is not None
+                and policy is not None
+                and deadline_monotonic is not None
+            ):
+                retained = await collect_and_enforce_output(
+                    engine=self._guardrails,
+                    policy=policy,
+                    stream=stream,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            else:
+                async for event in stream:
+                    events.append(event)
+                retained = events.snapshot()
         except BaseException as exc:
             await _settle_stream_quietly(stream, exc)
             if lease is not None:
                 await _abandon_quietly(lease)
             raise
-        retained = events.snapshot()
         terminal = next((event for event in reversed(retained) if is_terminal(event)), None)
         if terminal is None:
             if lease is not None:
@@ -869,8 +949,23 @@ async def _abandon_quietly(lease: ReplayLease) -> None:
         return
 
 
+async def _event_source(
+    stream: GatewayExecutionStream,
+    buffered: tuple[GatewayEvent, ...] | None,
+) -> AsyncIterator[GatewayEvent]:
+    """Yield buffered output-checked events, or the live provider stream."""
+    if buffered is not None:
+        for event in buffered:
+            yield event
+        return
+    async for event in stream:
+        yield event
+
+
 def _failure_for_exception(exception: BaseException) -> GatewayFailure:
     """Return one sanitized durable failure for accepted pre-dispatch work."""
+    if isinstance(exception, GuardrailRejected):
+        return exception.failure
     if isinstance(exception, GatewayExecutionError):
         return exception.failure
     if isinstance(exception, AttemptRejectedError):

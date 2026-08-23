@@ -52,6 +52,7 @@ def test_public_factory_is_injected_and_worker_owned() -> None:
         "continuations",
         "wall_clock",
         "terminal_flusher",
+        "guardrails",
     )
     assert all(item.kind is Parameter.KEYWORD_ONLY for item in parameters.values())
     with pytest.raises(ValueError, match="finite and positive"):

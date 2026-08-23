@@ -277,6 +277,7 @@ class GatewayFailureClass(StrEnum):
     MALFORMED_RESPONSE = "malformed_response"
     PROVIDER_INTERNAL = "provider_internal"
     CANCELLED = "cancelled"
+    GUARDRAIL = "guardrail"
     INTERNAL = "internal"
 
 

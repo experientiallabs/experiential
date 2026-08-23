@@ -27,6 +27,7 @@ use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder
 use crate::encode_responses::{completed_responses_body, ResponsesEnvelope, ResponsesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{CompletedToolCall, Event, Usage};
+use crate::guardrails;
 use crate::metrics::{classify_escalation, METRICS};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey, ReplayStore};
 use crate::sse::SseDecoder;
@@ -148,6 +149,11 @@ struct Admission {
     /// omit it.
     #[serde(default)]
     envelope: Option<ResponsesEnvelope>,
+    /// When true, buffer the winning completion and call `enforce_output` once
+    /// before any caller byte or replay retention. Unguarded admissions omit
+    /// the flag (default false) and never invoke that callback.
+    #[serde(default)]
+    output_guardrail: bool,
 }
 
 /// Run the data plane until shutdown; returns after graceful stop.
@@ -1102,6 +1108,21 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
 
+    if admission.output_guardrail {
+        return guarded_chat_response(
+            admission,
+            guard,
+            dialect,
+            response,
+            created_at,
+            deadline,
+            phase_timeout,
+            permit,
+            lease,
+            client_request_id,
+        )
+        .await;
+    }
     if admission.stream {
         stream_response(
             admission,
@@ -1358,6 +1379,275 @@ async fn completed_response(
     if let Some(mut owner) = lease.take() {
         // Publish the exact response body and headers, then answer from the
         // stored copy, matching the python engine's `_cached_response`.
+        let mut sorted = headers.clone();
+        sorted.sort();
+        let cached = CachedResponse {
+            status_code: 200,
+            media_type: "application/json".to_string(),
+            headers: sorted,
+            body: compact_json(&aggregated.body).into_bytes(),
+        };
+        return match owner.complete(cached.clone()).await {
+            Ok(()) => cached_response(&cached),
+            Err(error) => error_response(&error),
+        };
+    }
+    json_response(StatusCode::OK, &aggregated.body, &headers)
+}
+
+async fn apply_output_guardrail(
+    admission: &Admission,
+    bridge: &Bridge,
+    events: Vec<Event>,
+) -> Result<Vec<Event>, Failure> {
+    if !admission.output_guardrail {
+        return Ok(events);
+    }
+    guardrails::enforce_collected_output(bridge, &admission.request_id, events).await
+}
+
+fn encode_chat_sse(
+    admission: &Admission,
+    created_at: i64,
+    events: &[Event],
+) -> Result<Vec<u8>, PublicError> {
+    let mut encoder = ChatSseEncoder::new(
+        &admission.request_id,
+        &admission.alias,
+        created_at,
+        admission.include_usage,
+    );
+    let mut body = Vec::new();
+    for frame in encoder.start().map_err(|_| PublicError::internal())? {
+        body.extend_from_slice(frame.as_bytes());
+    }
+    for event in events {
+        for frame in encoder.feed(event).map_err(|_| PublicError::internal())? {
+            body.extend_from_slice(frame.as_bytes());
+        }
+    }
+    Ok(body)
+}
+
+fn sse_body_response(headers: &[(String, String)], body: Vec<u8>) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream");
+    for (name, value) in headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            header::HeaderName::try_from(name.as_str()),
+            HeaderValue::try_from(value.as_str()),
+        ) {
+            builder = builder.header(header_name, header_value);
+        }
+    }
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn guarded_chat_response(
+    admission: Admission,
+    mut guard: AttemptGuard,
+    dialect: Dialect,
+    response: reqwest::Response,
+    created_at: i64,
+    deadline: Instant,
+    phase_timeout: Duration,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    mut lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
+) -> Response {
+    let _permit = permit;
+    let collected =
+        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
+            Ok(events) => events,
+            Err(failure) => {
+                let failure = failure.boundary();
+                let error = collection_public_error(&failure);
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
+                return error_response(&error);
+            }
+        };
+    let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
+        Ok(events) => events,
+        Err(failure) => {
+            guard.settle("failed", None, &[], Some(&failure)).await;
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return error_response(&failure.public_error());
+        }
+    };
+    if admission.stream {
+        let aggregated =
+            match completed_chat_body(&admission.request_id, &admission.alias, created_at, &events)
+            {
+                Ok(aggregated) => aggregated,
+                Err(error) => {
+                    guard
+                        .settle(
+                            "failed",
+                            None,
+                            &[],
+                            Some(
+                                &Failure::new(
+                                    FailureClass::MalformedResponse,
+                                    "provider stream ended without a terminal event",
+                                )
+                                .boundary(),
+                            ),
+                        )
+                        .await;
+                    if let Some(mut owner) = lease.take() {
+                        owner.abandon().await;
+                    }
+                    return error_response(&error);
+                }
+            };
+        if let Some(failure) = &aggregated.failure {
+            let failure = failure.clone().boundary();
+            let error = failure.public_error();
+            guard
+                .settle(
+                    "failed",
+                    aggregated.usage.as_ref(),
+                    &aggregated.tool_names,
+                    Some(&failure),
+                )
+                .await;
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return error_response(&error);
+        }
+        let outcome = if aggregated.incomplete {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        if !guard
+            .settle(
+                outcome,
+                aggregated.usage.as_ref(),
+                &aggregated.tool_names,
+                None,
+            )
+            .await
+        {
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return error_response(&PublicError::internal());
+        }
+        let body = match encode_chat_sse(&admission, created_at, &events) {
+            Ok(body) => body,
+            Err(error) => return error_response(&error),
+        };
+        let mut headers = commit_independent(&admission, client_request_id.as_deref());
+        headers.extend(commit_dependent(&admission));
+        if let Some(mut owner) = lease.take() {
+            let mut sorted = headers.clone();
+            sorted.sort();
+            let cached = CachedResponse {
+                status_code: 200,
+                media_type: "text/event-stream".to_string(),
+                headers: sorted,
+                body: body.clone(),
+            };
+            return match owner.complete(cached.clone()).await {
+                Ok(()) => cached_response(&cached),
+                Err(error) => error_response(&error),
+            };
+        }
+        return sse_body_response(&headers, body);
+    }
+    completed_response_from_events(
+        admission,
+        guard,
+        events,
+        created_at,
+        lease,
+        client_request_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn completed_response_from_events(
+    admission: Admission,
+    mut guard: AttemptGuard,
+    events: Vec<Event>,
+    created_at: i64,
+    mut lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
+) -> Response {
+    let aggregated =
+        match completed_chat_body(&admission.request_id, &admission.alias, created_at, &events) {
+            Ok(aggregated) => aggregated,
+            Err(error) => {
+                guard
+                    .settle(
+                        "failed",
+                        None,
+                        &[],
+                        Some(
+                            &Failure::new(
+                                FailureClass::MalformedResponse,
+                                "provider stream ended without a terminal event",
+                            )
+                            .boundary(),
+                        ),
+                    )
+                    .await;
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
+                return error_response(&error);
+            }
+        };
+    if let Some(failure) = &aggregated.failure {
+        let failure = failure.clone().boundary();
+        let error = failure.public_error();
+        guard
+            .settle(
+                "failed",
+                aggregated.usage.as_ref(),
+                &aggregated.tool_names,
+                Some(&failure),
+            )
+            .await;
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
+        return error_response(&error);
+    }
+    let outcome = if aggregated.incomplete {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    let settled = guard
+        .settle(
+            outcome,
+            aggregated.usage.as_ref(),
+            &aggregated.tool_names,
+            None,
+        )
+        .await;
+    if !settled {
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
+        return error_response(&PublicError::internal());
+    }
+    let mut headers = commit_independent(&admission, client_request_id.as_deref());
+    headers.extend(commit_dependent(&admission));
+    if let Some(mut owner) = lease.take() {
         let mut sorted = headers.clone();
         sorted.sort();
         let cached = CachedResponse {
@@ -1903,6 +2193,20 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
         .map(|elapsed| elapsed.as_secs_f64())
         .unwrap_or(0.0);
 
+    if admission.output_guardrail {
+        return guarded_responses(
+            state,
+            admission,
+            guard,
+            dialect,
+            response,
+            created_at,
+            deadline,
+            phase_timeout,
+            permit,
+        )
+        .await;
+    }
     if admission.stream {
         stream_responses(
             state.clone(),
@@ -2104,6 +2408,138 @@ async fn completed_responses(
     }
     let mut headers = commit_independent(&admission, None);
     headers.extend(commit_dependent(&admission));
+    json_response(StatusCode::OK, &aggregated.body, &headers)
+}
+
+fn encode_responses_sse(
+    admission: &Admission,
+    created_at: f64,
+    events: &[Event],
+) -> Result<Vec<u8>, PublicError> {
+    let envelope = admission.envelope.clone().unwrap_or_default();
+    let mut encoder = ResponsesSseEncoder::new(
+        &admission.request_id,
+        &admission.alias,
+        created_at,
+        envelope,
+    );
+    let mut body = Vec::new();
+    for frame in encoder.start()? {
+        body.extend_from_slice(frame.as_bytes());
+    }
+    for event in events {
+        for frame in encoder.feed(event)? {
+            body.extend_from_slice(frame.as_bytes());
+        }
+    }
+    Ok(body)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn guarded_responses(
+    state: AppState,
+    admission: Admission,
+    mut guard: AttemptGuard,
+    dialect: Dialect,
+    response: reqwest::Response,
+    created_at: f64,
+    deadline: Instant,
+    phase_timeout: Duration,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let _permit = permit;
+    let collected =
+        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
+            Ok(events) => events,
+            Err(failure) => {
+                let failure = failure.boundary();
+                let error = collection_public_error(&failure);
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                return error_response(&error);
+            }
+        };
+    let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
+        Ok(events) => events,
+        Err(failure) => {
+            guard.settle("failed", None, &[], Some(&failure)).await;
+            return error_response(&failure.public_error());
+        }
+    };
+    let envelope = admission.envelope.clone().unwrap_or_default();
+    let aggregated = match completed_responses_body(
+        &admission.request_id,
+        &admission.alias,
+        created_at,
+        envelope,
+        &events,
+    ) {
+        Ok(aggregated) => aggregated,
+        Err(error) => {
+            guard
+                .settle(
+                    "failed",
+                    None,
+                    &[],
+                    Some(
+                        &Failure::new(
+                            FailureClass::MalformedResponse,
+                            "provider stream ended without a terminal event",
+                        )
+                        .boundary(),
+                    ),
+                )
+                .await;
+            return error_response(&error);
+        }
+    };
+    if let Some(failure) = &aggregated.failure {
+        let failure = failure.clone().boundary();
+        let error = failure.public_error();
+        guard
+            .settle(
+                "failed",
+                aggregated.usage.as_ref(),
+                &aggregated.tool_names,
+                Some(&failure),
+            )
+            .await;
+        return error_response(&error);
+    }
+    let retention = ResponsesRetention {
+        text: aggregated.text.clone(),
+        refusal: !aggregated.refusal.is_empty(),
+        tool_calls: aggregated.tool_calls.clone(),
+        ..ResponsesRetention::default()
+    };
+    let remembered = remember_continuation(&state, &admission.request_id, &retention).await;
+    let outcome = if aggregated.incomplete {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    let settled = guard
+        .settle(
+            outcome,
+            aggregated.usage.as_ref(),
+            &aggregated.tool_names,
+            None,
+        )
+        .await;
+    if let Err(error) = remembered {
+        return error_response(&error);
+    }
+    if !settled {
+        return error_response(&PublicError::internal());
+    }
+    let mut headers = commit_independent(&admission, None);
+    headers.extend(commit_dependent(&admission));
+    if admission.stream {
+        let body = match encode_responses_sse(&admission, created_at, &events) {
+            Ok(body) => body,
+            Err(error) => return error_response(&error),
+        };
+        return sse_body_response(&headers, body);
+    }
     json_response(StatusCode::OK, &aggregated.body, &headers)
 }
 

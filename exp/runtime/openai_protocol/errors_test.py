@@ -70,6 +70,22 @@ def test_throttled_failure_advertises_a_default_retry_after() -> None:
     assert error.headers() == {"Retry-After": str(THROTTLED_RETRY_AFTER_SECONDS)}
 
 
+def test_guardrail_failure_uses_content_filter_shape() -> None:
+    """A guardrail block is a sanitized 400 with no request content."""
+    error = public_failure_error(
+        GatewayFailure(
+            failure_class=GatewayFailureClass.GUARDRAIL,
+            safe_message="The request was blocked by a gateway guardrail.",
+        )
+    )
+
+    assert error.status_code == 400
+    assert error.detail.code == "content_filter"
+    assert error.detail.type == "invalid_request_error"
+    assert error.retry_after_seconds is None
+    assert "prompt" not in error.detail.message
+
+
 def test_non_retryable_failures_carry_no_retry_after_header() -> None:
     """Only quota and throttling errors advertise a wait."""
     error = public_failure_error(

@@ -127,6 +127,7 @@ pub enum FailureClass {
     MalformedResponse,
     ProviderInternal,
     Cancelled,
+    Guardrail,
     Internal,
 }
 
@@ -147,6 +148,7 @@ impl FailureClass {
             FailureClass::MalformedResponse => "malformed_response",
             FailureClass::ProviderInternal => "provider_internal",
             FailureClass::Cancelled => "cancelled",
+            FailureClass::Guardrail => "guardrail",
             FailureClass::Internal => "internal",
         }
     }
@@ -202,6 +204,7 @@ impl Failure {
             FailureClass::Throttled => (429, "unavailable_route", "api_error"),
             FailureClass::Timeout => (504, "deadline_exceeded", "api_error"),
             FailureClass::Cancelled => (499, "request_cancelled", "api_error"),
+            FailureClass::Guardrail => (400, "content_filter", "invalid_request_error"),
             _ => (502, "all_routes_failed", "api_error"),
         };
         let mut error = PublicError::new(status, code, &self.safe_message, error_type);

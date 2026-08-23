@@ -38,11 +38,12 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.execution import GatewayExecutor
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
+from exp.runtime.gateway.guardrails.config import load_guardrail_engine
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
 from exp.runtime.gateway.project_activation import (
-    ProjectActivation,
     ProjectActivationError,
     ProjectActivationRepository,
     require_project_activation_authority,
@@ -512,6 +513,7 @@ def compose_local_gateway(
     graceful_timeout_seconds: float = _DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
     replay: ResponseReplayStore | None = None,
     continuations: ResponseContinuationStore | None = None,
+    guardrails: GuardrailEngine | None = None,
 ) -> LocalGatewayRuntime:
     """Compose the loopback application over already loaded components.
 
@@ -520,6 +522,7 @@ def compose_local_gateway(
         graceful_timeout_seconds: Shutdown drain bound. Defaults to ten seconds.
         replay: Optional shared Chat and Responses replay state.
         continuations: Optional shared Responses continuation state.
+        guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
 
     Returns:
         Composed service, application, health state, and recovery counts.
@@ -557,6 +560,7 @@ def compose_local_gateway(
         replay=replay,
         continuations=continuations,
         terminal_flusher=components.write_ledger.flush,
+        guardrails=guardrails,
     )
     return LocalGatewayRuntime(
         runtime=runtime,
@@ -611,6 +615,7 @@ def load_local_gateway(
         graceful_timeout_seconds=graceful_timeout_seconds,
         replay=replay,
         continuations=continuations,
+        guardrails=load_guardrail_engine(root),
     )
 
 
@@ -707,11 +712,14 @@ def _load_alias_state(
                 activation_ref,
                 runtime_catalog=runtime_catalog,
             )
-            _require_activation_authority(
-                activation,
-                project_ref=project_ref,
-                activation_ref=activation_ref,
-            )
+            try:
+                require_project_activation_authority(
+                    activation,
+                    project_ref=project_ref,
+                    activation_ref=activation_ref,
+                )
+            except ProjectActivationError as exc:
+                raise GatewayLifecycleError(str(exc)) from exc
             runtime = RouterRuntime.from_activation(
                 activation,
                 runtime_catalog,
@@ -980,20 +988,3 @@ def _required(value: str | None, name: str, alias: GatewayAliasView) -> str:
     if value is None:
         raise GatewayLifecycleError(f"alias {alias.alias_name!r} is missing {name}")
     return value
-
-
-def _require_activation_authority(
-    activation: ProjectActivation,
-    *,
-    project_ref: str,
-    activation_ref: str,
-) -> None:
-    """Require repository output to match the exact authorized project target."""
-    try:
-        require_project_activation_authority(
-            activation,
-            project_ref=project_ref,
-            activation_ref=activation_ref,
-        )
-    except ProjectActivationError as exc:
-        raise GatewayLifecycleError(str(exc)) from exc

@@ -53,6 +53,7 @@ from exp.runtime.gateway.execution import (
     GatewayExecutor,
     _require_deployment_identity,
 )
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.ledger import (
     AttemptRejectedError,
     GatewayLedgerError,
@@ -533,6 +534,7 @@ def _service(
     request_digest: Callable[[GatewayRequest], str] | None = None,
     listing_pools: dict[tuple[str, str, str], str] | None = None,
     catalog_bundle: tuple[NormalizedGatewayCatalog, ExactModelDeployment] | None = None,
+    guardrails: GuardrailEngine | None = None,
 ) -> tuple[GatewayService, _ControlStore, _Ledger, ExecutionSnapshot]:
     """Compose the full launch data plane with deterministic injected dependencies."""
     catalog, deployment = _catalog() if catalog_bundle is None else catalog_bundle
@@ -584,6 +586,7 @@ def _service(
         replay_store=replay_store,
         continuation_store=continuation_store,
         terminal_flusher=flush,
+        guardrails=guardrails,
     )
     control.raw_keys_seen.clear()
     return service, control, ledger, proof

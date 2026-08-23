@@ -4,11 +4,26 @@ from __future__ import annotations
 
 from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.guardrails.contracts import (
+    GuardrailAction,
+    GuardrailRejected,
+    guardrail_failure,
+)
 from exp.runtime.gateway.ledger import (
     AttemptRejectedError,
     IdempotencyConflictError,
     IdempotencyReplayUnavailableError,
 )
+
+
+def test_guardrail_rejection_maps_to_the_sanitized_public_failure() -> None:
+    """A guardrail exception keeps its terminal content-filter shape."""
+    error = boundary_protocol_error(
+        GuardrailRejected(guardrail_failure(action=GuardrailAction.BLOCK, check_id="safety"))
+    )
+    assert error.status_code == 400
+    assert error.detail.code == "content_filter"
+    assert error.detail.message == "The request was blocked by a gateway guardrail."
 
 
 def test_idempotency_conflict_keeps_409_ahead_of_generic_rejection_mapping() -> None:

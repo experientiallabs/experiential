@@ -59,8 +59,13 @@ from exp.runtime.gateway.execution import (
     _require_deployment_identity,  # noqa: PLC2701
 )
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
+from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
+from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy, GuardrailRejected
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_native_output
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
+from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
@@ -85,11 +90,7 @@ from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpCl
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
-from exp.runtime.openai_protocol.requests import (
-    DecodedGatewayRequest,
-    decode_chat,
-    decode_responses,
-)
+from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
     ProtocolNamespace,
@@ -120,6 +121,7 @@ class _InflightAttempt:
     # Responses-only retention facts consumed by ``remember`` after a
     # successful terminal; chat attempts carry ``None``.
     continuation: ContinuationContext | None = field(default=None)
+    policy: GuardrailPolicy | None = field(default=None)
 
 
 class NativeBridgeError(Exception):
@@ -196,6 +198,7 @@ class NativeControlPlane:
         usage_reporter: Callable[[], JsonObject] | None = None,
         budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
+        guardrails: GuardrailEngine | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -213,6 +216,7 @@ class NativeControlPlane:
             usage_reporter: Optional hosted usage report callback.
             budget_error_factory: Optional hosted mapping for a rejected reservation.
             native_route_eligible: Optional hosted policy for complete native semantics.
+            guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -232,6 +236,7 @@ class NativeControlPlane:
         self._usage_reporter = usage_reporter
         self._budget_error_factory = budget_error_factory
         self._native_route_eligible = native_route_eligible
+        self._guardrails = guardrails
         self._inflight: dict[str, _InflightAttempt] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
@@ -304,6 +309,7 @@ class NativeControlPlane:
             NativeBridgeError: Decoding, authorization, routing, capability,
                 or budget admission failed.
         """
+        assert_not_internal_classification()
         self._sweep_expired()
         data = json.loads(argument)
         surface = str(data.get("surface", "chat"))
@@ -368,6 +374,17 @@ class NativeControlPlane:
             if not native_route_eligible:
                 return _escalation("host policy requires the python execution engine")
 
+        policy = None
+        try:
+            request, policy = enforce_native_input(
+                self._guardrails,
+                authorization=authorization,
+                request=request,
+                deadline_monotonic=deadline,
+            )
+        except GuardrailRejected as exc:
+            raise NativeBridgeError(public_failure_error(exc.failure)) from exc
+
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         accepted = False
         attempt_id: str | None = None
@@ -429,6 +446,7 @@ class NativeControlPlane:
                 attempt_id=attempt_id,
                 deadline_monotonic=deadline,
                 continuation=continuation_context,
+                policy=policy,
             )
         response: JsonObject = {
             "request_id": authorization.request_id,
@@ -448,11 +466,27 @@ class NativeControlPlane:
             "timeout_seconds": profile.timeout_seconds,
             "upstream_payload": upstream_payload,
             "idempotency_key": deployment_operation_key(route),
+            "output_guardrail": bool(policy is not None and policy.output_checks),
         }
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(request)
         return json.dumps(response, separators=(",", ":"))
+
+    def enforce_output(self, argument: str) -> str:
+        """Run one output-chain callback for a native buffered completion."""
+        data = json.loads(argument)
+        request_id = str(data.get("request_id") or "")
+        with self._lock:
+            entry = self._inflight.get(request_id)
+            policy = None if entry is None else entry.policy
+            deadline = time.monotonic() if entry is None else entry.deadline_monotonic
+        return enforce_native_output(
+            self._guardrails,
+            policy,
+            argument,
+            deadline_monotonic=deadline,
+        )
 
     def claim_scope(self, argument: str) -> str:
         """Resolve the replay-store scope for one keyed Chat Completions request.
@@ -770,50 +804,16 @@ class NativeControlPlane:
         idempotency_key: str | None = None,
         client_request_id: str | None = None,
     ) -> DecodedGatewayRequest:
-        """Decode one raw request body with the shared surface decoder.
-
-        Args:
-            body: Raw request body text.
-            surface: Public surface, ``"chat"`` or ``"responses"``.
-            idempotency_key: Optional raw ``Idempotency-Key`` header value.
-            client_request_id: Optional raw ``X-Client-Request-Id`` header value.
-
-        Returns:
-            The public alias and canonical request.
-
-        Raises:
-            NativeBridgeError: The body is not JSON, not an object, or fails
-                the shared protocol validation.
-        """
+        """Decode one raw request body with the shared surface decoder."""
         try:
-            payload = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise NativeBridgeError(
-                OpenAIProtocolError(
-                    status_code=400,
-                    code="invalid_json",
-                    message=(
-                        "Request body must contain valid JSON. Re-encode the payload and resend."
-                    ),
-                )
-            ) from exc
-        if not isinstance(payload, dict):
-            raise NativeBridgeError(
-                OpenAIProtocolError(
-                    status_code=400,
-                    code="invalid_request",
-                    message="Request body must be a JSON object. Re-encode the payload and resend.",
-                )
-            )
-        decoder = decode_responses if surface == "responses" else decode_chat
-        try:
-            return decoder(
-                payload,
+            return decode_native_body(
+                body,
+                surface=surface,
                 idempotency_key=idempotency_key,
                 client_request_id=client_request_id,
             )
-        except OpenAIProtocolError as exc:
-            raise NativeBridgeError(exc) from exc
+        except NativeDecodeError as exc:
+            raise NativeBridgeError(exc.error) from exc
 
     def _resolve_route(
         self,

@@ -366,6 +366,7 @@ def _run_rust_gateway(
     import socket
 
     from exp.optimize.router.activation import verify_automatic_router_policy
+    from exp.runtime.gateway.guardrails.config import load_guardrail_engine
     from exp.runtime.gateway.lifecycle import (
         compose_local_gateway,
         gateway_instance_lock,
@@ -398,15 +399,18 @@ def _run_rust_gateway(
             # so this composition can wire the content-free metrics snapshot
             # into the control plane before the process host ever starts.
             exp_gateway_native = importlib.import_module("exp_gateway_native")
+            guardrails = load_guardrail_engine(root)
             control_plane = NativeControlPlane(
                 components,
                 data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
                 continuation_store=continuations,
+                guardrails=guardrails,
             )
             runtime = compose_local_gateway(
                 components,
                 graceful_timeout_seconds=graceful_timeout,
                 continuations=continuations,
+                guardrails=guardrails,
             )
             asyncio.run(runtime.service.preflight())
             receipt = {

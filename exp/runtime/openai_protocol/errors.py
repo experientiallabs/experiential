@@ -178,6 +178,7 @@ def public_failure_error(
         GatewayFailureClass.THROTTLED: (429, "unavailable_route", "api_error"),
         GatewayFailureClass.TIMEOUT: (504, "deadline_exceeded", "api_error"),
         GatewayFailureClass.CANCELLED: (499, "request_cancelled", "api_error"),
+        GatewayFailureClass.GUARDRAIL: (400, "content_filter", "invalid_request_error"),
     }
     status, code, error_type = mappings.get(
         failure.failure_class,

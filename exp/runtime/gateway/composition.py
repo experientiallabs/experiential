@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from exp.runtime.gateway.contracts import ExecutionSnapshot
 from exp.runtime.gateway.execution import GatewayExecutor
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayControlStore
 from exp.runtime.gateway.routing import CatalogRouteResolver
 from exp.runtime.gateway.service import (
@@ -148,6 +149,7 @@ def create_gateway_runtime(
     continuations: ResponseContinuationStore | None = None,
     wall_clock: Callable[[], float] | None = None,
     terminal_flusher: GatewayTerminalFlusher | None = None,
+    guardrails: GuardrailEngine | None = None,
 ) -> GatewayRuntime:
     """Compose one hosted-safe gateway runtime entirely from injected dependencies.
 
@@ -171,6 +173,8 @@ def create_gateway_runtime(
         continuations: Optional bounded Responses continuation state.
         wall_clock: Optional epoch clock for public OpenAI object timestamps.
         terminal_flusher: Optional bounded durable-accounting flush hook.
+        guardrails: Optional identity-scoped engine. ``None`` leaves unguarded
+            traffic on the existing hot path.
 
     Returns:
         An explicit owned lifecycle handle containing the composed FastAPI application.
@@ -187,6 +191,7 @@ def create_gateway_runtime(
         continuation_store=continuations,
         wall_clock=wall_clock or time.time,
         terminal_flusher=terminal_flusher,
+        guardrails=guardrails,
     )
     state = GatewayLifecycleState()
     runtime = GatewayRuntime(
