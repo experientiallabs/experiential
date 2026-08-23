@@ -13,6 +13,7 @@ from exp.cli.providers.experiential_cloud import (
     hosted_connection,
     hosted_credential_binding,
     hosted_platform_login,
+    read_masked_key_with_callback,
 )
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.auth import ProviderAuthStore
@@ -43,12 +44,20 @@ def run_login(
 
     fallback_used = False
 
-    def _read_key() -> str | None:
+    def _read_key(
+        wait_for_callback: Callable[[float], str | None] | None = None,
+    ) -> str | None:
         """Read one masked fallback key and convert closed input into an abort."""
         nonlocal fallback_used
         fallback_used = True
         console.print("[dim]Experiential Cloud API key[/dim]")
         try:
+            if wait_for_callback is not None and read_key is getpass:
+                return read_masked_key_with_callback(
+                    "Experiential Cloud API key (hidden, empty line cancels): ",
+                    console=console,
+                    wait_for_callback=wait_for_callback,
+                )
             return read_key("Experiential Cloud API key (hidden, empty line cancels): ")
         except (EOFError, KeyboardInterrupt):
             raise typer.Abort from None

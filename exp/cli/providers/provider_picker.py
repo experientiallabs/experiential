@@ -12,7 +12,7 @@ Providers without a safe listing API keep manual declaration on the model screen
 
 from __future__ import annotations
 
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from getpass import getpass
 
@@ -28,6 +28,7 @@ from exp.cli.providers.experiential_cloud import (
 from exp.cli.providers.experiential_cloud import (
     hosted_connection,
     hosted_platform_login,
+    read_masked_key_with_callback,
 )
 from exp.cli.shared.picker import (
     PickerAction,
@@ -83,6 +84,7 @@ _CREDENTIAL_KEEP = "keep"
 _CREDENTIAL_REPLACE = "replace"
 _CREDENTIAL_REMOVE = "remove"
 _PROVIDER_VISIBLE_ROWS = 3
+_DEFAULT_GETPASS = getpass
 
 
 class SetupCancelled(Exception):
@@ -660,9 +662,15 @@ def _resolve_credential(
             SetupCancelled: The prompt reached end of input.
         """
 
-        def _read_key() -> str:
+        def _read_key(wait_for_callback: Callable[[float], str | None]) -> str | None:
             """Read the masked fallback key while the printed callback URL remains live."""
             try:
+                if getpass is _DEFAULT_GETPASS:
+                    return read_masked_key_with_callback(
+                        f"{label} API key (hidden, empty line skips this provider): ",
+                        console=console,
+                        wait_for_callback=wait_for_callback,
+                    )
                 return getpass(f"{label} API key (hidden, empty line skips this provider): ")
             except (EOFError, KeyboardInterrupt) as exc:
                 raise SetupCancelled from exc

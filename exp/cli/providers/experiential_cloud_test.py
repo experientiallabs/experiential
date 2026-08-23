@@ -188,7 +188,7 @@ def test_hosted_platform_login_keeps_manual_url_callback_alive() -> None:
         approval_url = url
         return False
 
-    def approve_from_fallback() -> None:
+    def approve_from_fallback(_wait_for_callback: object) -> None:
         """Complete the printed callback while the masked fallback is active."""
         params = parse_qs(urlparse(approval_url).query)
         status, _ = _request(
@@ -226,7 +226,7 @@ def test_hosted_platform_login_offers_pasted_key_without_waiting_for_timeout() -
         connection,
         console=console,
         open_browser=lambda _url: False,
-        fallback=lambda: "xpl_pasted_key",
+        fallback=lambda _wait_for_callback: "xpl_pasted_key",
         timeout=300,
     )
 

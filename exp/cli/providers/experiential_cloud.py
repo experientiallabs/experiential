@@ -14,6 +14,9 @@ import html
 import os
 import queue
 import secrets
+import select
+import sys
+import termios
 import threading
 import webbrowser
 from collections.abc import Callable, Mapping
@@ -248,7 +251,7 @@ def hosted_platform_login(
     environment: Mapping[str, str] | None = None,
     open_browser: Callable[[str], bool] = webbrowser.open,
     timeout: float = PLATFORM_LOGIN_TIMEOUT_SECONDS,
-    fallback: Callable[[], str | None] | None = None,
+    fallback: Callable[[Callable[[float], str | None]], str | None] | None = None,
 ) -> str | None:
     """Receive an Experiential Cloud key through the Platform browser approval flow.
 
@@ -261,7 +264,8 @@ def hosted_platform_login(
         environment: Optional process environment used for the Platform origin.
         open_browser: Browser opener, injectable for deterministic tests.
         timeout: Maximum time to wait for the browser callback.
-        fallback: Optional masked-key reader used immediately when the browser cannot open.
+        fallback: Optional masked-key reader used immediately when the browser cannot open. The
+            reader receives a callback waiter so browser approval can win while input is pending.
 
     Returns:
         The new Platform organization key, or ``None`` when browser login is unavailable
@@ -287,7 +291,7 @@ def hosted_platform_login(
                     "[dim]Approve the connection in your browser, or paste an existing key "
                     "to continue.[/dim]"
                 )
-                fallback_key = fallback()
+                fallback_key = fallback(attempt.wait)
                 token = attempt.wait(timeout=0.1)
                 if token is not None:
                     console.print("[green]Platform login received.[/green]")
@@ -302,6 +306,61 @@ def hosted_platform_login(
         return token
     finally:
         attempt.close()
+
+
+def read_masked_key_with_callback(
+    prompt: str,
+    *,
+    console: Console,
+    wait_for_callback: Callable[[float], str | None],
+) -> str | None:
+    """Read one hidden terminal line while polling a hosted login callback.
+
+    Args:
+        prompt: Prompt written without a trailing newline.
+        console: Terminal receiving the prompt and its final line break.
+        wait_for_callback: Bounded callback waiter polled while input is pending.
+
+    Returns:
+        The pasted key, the callback key, or ``None`` for an empty line.
+
+    Raises:
+        EOFError: The controlling terminal closes before a line is entered.
+        OSError: The terminal cannot be opened or read.
+        termios.error: Terminal echo settings cannot be changed.
+    """
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        owns_fd = True
+    except OSError:
+        fd = sys.stdin.fileno()
+        owns_fd = False
+
+    old_attributes = termios.tcgetattr(fd)
+    hidden_attributes = old_attributes.copy()
+    hidden_attributes[3] &= ~termios.ECHO
+    prompted = False
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, hidden_attributes)
+        console.print(prompt, end="")
+        prompted = True
+        while True:
+            token = wait_for_callback(0.05)
+            if token is not None:
+                return token
+            readable, _, _ = select.select([fd], [], [], 0.05)
+            if not readable:
+                continue
+            data = os.read(fd, 4096)
+            if not data:
+                raise EOFError
+            return data.decode("utf-8", errors="replace").strip() or None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attributes)
+        if owns_fd:
+            os.close(fd)
+        if prompted:
+            console.print()
 
 
 def _is_experiential_cloud_connection(
