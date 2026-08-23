@@ -61,11 +61,13 @@ failed check and continue the remaining chain.
 Input enforcement is on the request critical path after continuation expansion
 and before dispatch. Output enforcement for a protected identity delays the
 first visible byte until the winning completion is buffered and the output
-chain returns. Each inspect runs on a daemon worker and is bounded by the
-tighter of the check timeout and the remaining request deadline. A hung
-adapter fails at that bound without blocking the asyncio event loop or
-waiting for the inspect to return. Request and response content are bounded
-by `max_request_bytes` and `max_response_bytes` on the policy.
+chain returns. Each inspect runs on a worker thread and is bounded by the tighter of the
+check timeout and the remaining request deadline. A hung adapter fails at
+that bound without blocking the asyncio event loop or waiting for the inspect
+to return. Timed-out workers keep their slot until they finish, so at most
+32 inspects can be live. Further calls fail closed instead of starting another
+thread. Request and response content are bounded by `max_request_bytes` and
+`max_response_bytes` on the policy.
 
 ## Privacy
 
@@ -130,5 +132,7 @@ Protected streaming may add classifier latency before the first token.
   body. Native already ran the input chain before deciding to escalate, so a
   block never reaches python.
 - Classifiers must not call the public gateway. Recursion fails closed.
+- At most 32 classifier inspects can be in flight. Additional inspects fail
+  closed until a worker slot is free.
 - Oversized tool arguments count against the response byte bound and are
   blocked, not rewritten.
