@@ -1,6 +1,6 @@
 [project]
 name = "experiential"
-version = "0.5.1"
+version = "0.5.2"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 requires-python = ">=3.12"
