@@ -71,12 +71,14 @@ def load_guardrail_engine(
     *,
     http_client: httpx.AsyncClient | None = None,
 ) -> GuardrailEngine | None:
-    """Return an engine when ``ROOT/gateway/guardrails.json`` exists.
+    """Return an engine when a file assigns at least one identity policy.
 
-    Missing files leave the gateway unguarded. The file assigns policies by
-    organization and identity. It may register ``keyword`` adapters for local
-    tests and ``http_json`` adapters for dedicated classifier endpoints. It
-    never stores raw prompts, responses, detector payloads, or credentials.
+    Missing files leave the gateway unguarded. A valid file with an empty
+    policy list is also unguarded: the exact no-engine hot path. The file
+    assigns policies by organization and identity. It may register ``keyword``
+    adapters for local tests and ``http_json`` adapters for dedicated
+    classifier endpoints. It never stores raw prompts, responses, detector
+    payloads, or credentials.
 
     Args:
         root: Initialized EXP root that contains the ``gateway`` directory.
@@ -84,7 +86,8 @@ def load_guardrail_engine(
             adapter. Production loads omit this and use the process pool.
 
     Returns:
-        A composed engine, or ``None`` when no file is present.
+        A composed engine, or ``None`` when no file is present or the
+        validated document has no policies.
 
     Raises:
         ValueError: The file exists but is not a valid policy document.
@@ -98,7 +101,12 @@ def load_guardrail_engine(
         raise ValueError("gateway guardrail configuration is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise ValueError("gateway guardrail configuration must be a JSON object")
-    return engine_from_document(cast(JsonObject, payload), http_client=http_client)
+    document = cast(JsonObject, payload)
+    engine = engine_from_document(document, http_client=http_client)
+    policies = document.get("policies", [])
+    if not isinstance(policies, list) or not policies:
+        return None
+    return engine
 
 
 def engine_from_document(

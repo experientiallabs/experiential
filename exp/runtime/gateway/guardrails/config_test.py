@@ -69,6 +69,27 @@ def test_missing_file_leaves_the_gateway_unguarded(tmp_path: Path) -> None:
     assert load_guardrail_engine(tmp_path) is None
 
 
+def test_empty_policies_file_leaves_the_gateway_unguarded(tmp_path: Path) -> None:
+    """A valid file with no policies uses the same no-engine hot path as a missing file."""
+    path = tmp_path / "gateway"
+    path.mkdir()
+    (path / "guardrails.json").write_text(
+        json.dumps({"adapters": [], "policies": [], "retention": "operator-owned"}),
+        encoding="utf-8",
+    )
+    assert load_guardrail_engine(tmp_path) is None
+
+
+def test_unrelated_top_level_fields_are_accepted_by_the_loader() -> None:
+    """Extra document fields that the loader does not own do not fail a valid file."""
+    document = _standard_document()
+    document["retention"] = "operator-owned"
+    engine = engine_from_document(document)
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+    assert policy.policy_id == "standard-member"
+
+
 def test_document_registers_keyword_adapters_and_identity_policies() -> None:
     """A valid document binds one identity to a local keyword adapter."""
     engine = engine_from_document(

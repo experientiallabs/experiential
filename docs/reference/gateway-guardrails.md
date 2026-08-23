@@ -109,8 +109,9 @@ Replacements exist only in memory for the remainder of the request.
 ## Configuration
 
 Place an optional file at `ROOT/gateway/guardrails.json`. Missing files leave
-every organization and identity unguarded. There is no global switch that
-turns classifiers on for every identity.
+every organization and identity unguarded. A valid file whose `policies` list
+is empty is also unguarded: the loader returns no engine. There is no global
+switch that turns classifiers on for every identity.
 
 ## Interactive setup
 
@@ -134,7 +135,15 @@ hand-authored policy that is not the setup-owned standard pack is shown as
 
 Hand-author `ROOT/gateway/guardrails.json` when you need extra adapters,
 timeouts, identities, or checks that setup does not own. That file is the
-advanced escape hatch. Missing files remain the unguarded path.
+advanced escape hatch. Missing files, and valid files with no policies, remain
+the unguarded path. Setup-owned adapter and policy IDs are deterministic
+`stable_id` values over organization and identity. They do not concatenate
+those fragments, so hyphenated pairs cannot collide.
+
+If the configured path is a symlink, setup writes through it and never
+removes the link. Disabling the last setup-owned pack writes an empty valid
+document through that symlink so the link and target stay usable. A regular
+file created solely by setup is deleted when it becomes empty.
 
 ## Standard preset
 

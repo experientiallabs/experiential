@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Literal
 
@@ -22,9 +23,10 @@ from exp.cli.gateway.guardrail_setup import (
     setup_adapter_id,
     setup_policy_id,
 )
+from exp.cli.gateway.guardrail_setup_store import capability_order
 from exp.cli.shared.picker_test import ScriptedConsole
-from exp.common.core.artifacts import validate_artifact_id
-from exp.common.core.locks import file_write_lock
+from exp.common.core.artifacts import stable_id, validate_artifact_id
+from exp.common.core.locks import FileLockTimeout, file_write_lock
 from exp.runtime.gateway.guardrails.config import engine_from_document, load_guardrail_engine
 from exp.runtime.gateway.guardrails.preset import STANDARD_DEFAULT_TIMEOUT_MS, STANDARD_PRESET_STEPS
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
@@ -95,13 +97,21 @@ def _custom_document(*, identity_id: str = _IDENTITY) -> dict[str, object]:
 
 
 def test_setup_owned_ids_are_deterministic_valid_artifact_ids() -> None:
-    """Setup IDs stay scoped to organization and identity and validate as ArtifactIds."""
+    """Setup IDs are stable_id values that do not embed raw identity fragments."""
     adapter_id = setup_adapter_id(_ORG, _IDENTITY)
     policy_id = setup_policy_id(_ORG, "operator")
-    assert adapter_id == "setup-http-json-local-default"
-    assert policy_id == "setup-standard-local-operator"
+    assert adapter_id == stable_id(
+        "setup-http-json",
+        {"organization_id": _ORG, "identity_id": _IDENTITY},
+    )
+    assert policy_id == stable_id(
+        "setup-standard",
+        {"organization_id": _ORG, "identity_id": "operator"},
+    )
     assert validate_artifact_id(adapter_id) == adapter_id
     assert validate_artifact_id(policy_id) == policy_id
+    assert _ORG not in adapter_id
+    assert "operator" not in policy_id
     assert setup_adapter_id(_ORG, "operator") != adapter_id
 
 
@@ -346,7 +356,7 @@ def test_apply_takes_the_write_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         held.append(what)
         return real_lock(path, what=what, timeout_s=timeout_s)
 
-    monkeypatch.setattr("exp.cli.gateway.guardrail_setup.file_write_lock", _capture)
+    monkeypatch.setattr("exp.cli.gateway.guardrail_setup_store.file_write_lock", _capture)
     apply_setup_guardrails(tmp_path, _plan())
     assert "gateway guardrail configuration" in held
 
@@ -405,3 +415,97 @@ def test_collect_rejects_ambiguous_custom_answers(tmp_path: Path) -> None:
             identity_id=_IDENTITY,
             edit=True,
         )
+
+
+def test_apply_preserves_unrelated_top_level_fields(tmp_path: Path) -> None:
+    """A loader-accepted extra field survives enable, update, and disable."""
+    apply_setup_guardrails(tmp_path, _plan())
+    path = guardrail_config_path(tmp_path)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["retention"] = "operator-owned"
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    apply_setup_guardrails(
+        tmp_path,
+        _plan(classifier_url="https://classifier.example.invalid/v2/inspect"),
+    )
+    updated = json.loads(path.read_text(encoding="utf-8"))
+    assert updated["retention"] == "operator-owned"
+    assert inspect_setup_guardrails(tmp_path, _ORG, _IDENTITY).mode is GuardrailSetupMode.STANDARD
+    apply_setup_guardrails(tmp_path, _plan(action="off", bearer_env=None))
+    remaining = json.loads(path.read_text(encoding="utf-8"))
+    assert remaining["retention"] == "operator-owned"
+    assert remaining["policies"] == []
+    assert load_guardrail_engine(tmp_path) is None
+
+
+def test_disable_through_symlink_keeps_link_and_target(tmp_path: Path) -> None:
+    """Disabling through a symlink writes an empty document instead of dangling the link."""
+    target = tmp_path / "shared" / "guardrails.json"
+    configured = guardrail_config_path(tmp_path)
+    configured.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    configured.symlink_to(target)
+    apply_setup_guardrails(tmp_path, _plan())
+    apply_setup_guardrails(tmp_path, _plan(action="off", bearer_env=None))
+    assert configured.is_symlink()
+    assert target.is_file()
+    assert not target.is_symlink()
+    emptied = json.loads(target.read_text(encoding="utf-8"))
+    assert emptied["adapters"] == []
+    assert emptied["policies"] == []
+    assert load_guardrail_engine(tmp_path) is None
+    assert inspect_setup_guardrails(tmp_path, _ORG, _IDENTITY).mode is GuardrailSetupMode.OFF
+
+
+def test_compensation_holds_the_lock_across_the_setup_window(tmp_path: Path) -> None:
+    """A second writer cannot land between the selected mutation and compensation."""
+    apply_setup_guardrails(tmp_path, _plan())
+    path = guardrail_config_path(tmp_path)
+    before = path.read_bytes()
+    blocked: list[bool] = []
+
+    def _contend() -> None:
+        """Fail closed if the compensation lock is still held."""
+        try:
+            with file_write_lock(path, what="contending guardrail writer", timeout_s=0.05):
+                blocked.append(False)
+        except FileLockTimeout:
+            blocked.append(True)
+
+    with pytest.raises(RuntimeError, match="catalog failed"):
+        with guardrail_setup_compensation(tmp_path, _plan(action="off", bearer_env=None)):
+            assert (
+                inspect_setup_guardrails(tmp_path, _ORG, _IDENTITY).mode is GuardrailSetupMode.OFF
+            )
+            thread = threading.Thread(target=_contend)
+            thread.start()
+            thread.join()
+            assert blocked == [True]
+            raise RuntimeError("catalog failed")
+    assert path.read_bytes() == before
+    with file_write_lock(path, what="contending guardrail writer", timeout_s=0.05):
+        pass
+
+
+def test_disable_keeps_a_setup_adapter_still_referenced_elsewhere(tmp_path: Path) -> None:
+    """An adapter bound by another identity is not removed when setup turns one identity off."""
+    apply_setup_guardrails(tmp_path, _plan())
+    adapter_id = setup_adapter_id(_ORG, _IDENTITY)
+    path = guardrail_config_path(tmp_path)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["policies"].append(
+        {
+            "policy_id": "other-member",
+            "organization_id": _ORG,
+            "identity_id": "operator",
+            "protected": True,
+            "preset": "standard",
+            "timeout_ms": STANDARD_DEFAULT_TIMEOUT_MS,
+            "capability_adapters": {capability: adapter_id for capability in capability_order()},
+        }
+    )
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    apply_setup_guardrails(tmp_path, _plan(action="off", bearer_env=None))
+    remaining = json.loads(path.read_text(encoding="utf-8"))
+    assert {item["adapter_id"] for item in remaining["adapters"]} == {adapter_id}
+    assert {item["identity_id"] for item in remaining["policies"]} == {"operator"}
