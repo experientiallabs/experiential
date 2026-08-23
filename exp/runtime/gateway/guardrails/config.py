@@ -227,9 +227,7 @@ def _reject_credential_literals(item: dict[str, object]) -> None:
         ValueError: A forbidden credential field is present.
     """
     forbidden = sorted(
-        key
-        for key in item
-        if key.lower().replace("-", "_") in _FORBIDDEN_ADAPTER_KEYS
+        key for key in item if key.lower().replace("-", "_") in _FORBIDDEN_ADAPTER_KEYS
     )
     if forbidden:
         raise ValueError(

@@ -85,7 +85,9 @@ STANDARD_PRESET_STEPS: Final[tuple[StandardPresetStep, ...]] = (
     ),
 )
 
-STANDARD_CHECK_IDS: Final[frozenset[str]] = frozenset(step.check_id for step in STANDARD_PRESET_STEPS)
+STANDARD_CHECK_IDS: Final[frozenset[str]] = frozenset(
+    step.check_id for step in STANDARD_PRESET_STEPS
+)
 _STAGE_CAPABILITY_TO_CHECK_ID: Final[dict[tuple[str, str], str]] = {
     (step.stage.value, step.capability.value): step.check_id for step in STANDARD_PRESET_STEPS
 }
@@ -118,7 +120,10 @@ class AuthoredStandardPolicy(ContractModel):
     max_response_bytes: int = Field(default=DEFAULT_MAX_RESPONSE_BYTES, ge=1, le=64 * 1024 * 1024)
 
 
-def policy_from_authored(item: Mapping[str, object], adapter_ids: frozenset[str]) -> GuardrailPolicy:
+def policy_from_authored(
+    item: Mapping[str, object],
+    adapter_ids: frozenset[str],
+) -> GuardrailPolicy:
     """Validate one authored policy object and expand a preset when requested.
 
     The standard pack is never implied. An identity opts in by setting
@@ -226,11 +231,7 @@ def _manual_policy(item: Mapping[str, object], adapter_ids: frozenset[str]) -> G
     except ValidationError as exc:
         raise ValueError("guardrail policy is malformed") from exc
     missing = sorted(
-        {
-            check.adapter_id
-            for check in authored.checks
-            if check.adapter_id not in adapter_ids
-        }
+        {check.adapter_id for check in authored.checks if check.adapter_id not in adapter_ids}
     )
     if missing:
         raise ValueError(
@@ -259,9 +260,7 @@ def _bound_adapters(
     for name, adapter_id in capability_adapters.items():
         bound[GuardrailCapabilityKind(name)] = adapter_id
     missing = sorted(
-        capability.value
-        for capability in STANDARD_REQUIRED_CAPABILITIES
-        if capability not in bound
+        capability.value for capability in STANDARD_REQUIRED_CAPABILITIES if capability not in bound
     )
     if missing:
         raise ValueError(

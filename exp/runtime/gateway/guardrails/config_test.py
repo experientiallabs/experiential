@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayFailureClass,
@@ -34,7 +35,7 @@ _BINDINGS = {
 }
 
 
-def _http_adapters() -> list[dict[str, object]]:
+def _http_adapters() -> list[JsonObject]:
     """Return four dedicated HTTP adapters that share one inspect URL."""
     return [
         {
@@ -46,7 +47,7 @@ def _http_adapters() -> list[dict[str, object]]:
     ]
 
 
-def _standard_document() -> dict[str, object]:
+def _standard_document() -> JsonObject:
     """Return one identity-scoped standard-preset document."""
     return {
         "adapters": _http_adapters(),

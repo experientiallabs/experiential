@@ -67,9 +67,7 @@ def _classifier(
     client: httpx.AsyncClient | None = None,
 ) -> tuple[HttpJsonClassifier, httpx.AsyncClient]:
     """Bind one adapter to an injected MockTransport client."""
-    resolved = client or httpx.AsyncClient(
-        transport=handler or httpx.MockTransport(_allow_handler)
-    )
+    resolved = client or httpx.AsyncClient(transport=handler or httpx.MockTransport(_allow_handler))
     adapter = HttpJsonClassifier(
         adapter_id="hosted-pii",
         url=_URL,

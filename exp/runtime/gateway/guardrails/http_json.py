@@ -209,7 +209,12 @@ class HttpJsonClassifier:
             payload=_inspect_payload(check=check, request=None, completion=completion),
         )
 
-    async def _inspect(self, *, check: GuardrailCheck, payload: dict[str, object]) -> ClassifierVerdict:
+    async def _inspect(
+        self,
+        *,
+        check: GuardrailCheck,
+        payload: dict[str, object],
+    ) -> ClassifierVerdict:
         """POST the inspect envelope and validate the classifier contract."""
         headers = {"accept": "application/json"}
         authorization = _authorization_header(self._bearer_env)
