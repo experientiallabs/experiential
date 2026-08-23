@@ -66,9 +66,10 @@ inspect as a task under `asyncio.wait` and a per-loop concurrency cap. A hung
 adapter is cancelled at the tighter of the check timeout and the remaining
 request deadline. The caller returns immediately and the inflight slot is
 released without waiting for cancellation to be acknowledged. An adapter that
-swallows cancellation is quarantined on that event loop until its detached
-task finishes. Further calls to that adapter fail immediately and do not
-create another task. Other adapters keep their capacity. Native callbacks
+swallows cancellation is quarantined on that event loop until every
+abandoned inspect for that adapter finishes. Further calls to that adapter
+fail immediately and do not create another task. Other adapters keep their
+capacity. Native callbacks
 submit the same coroutines onto one shared daemon event loop so a Rust worker
 can return even when a quarantined task is still running. Leftover
 synchronous test adapters, when still needed, run only through a private

@@ -52,7 +52,7 @@ class BoundedInspect:
             WeakKeyDictionary()
         )
         self._detached_by_loop: WeakKeyDictionary[
-            asyncio.AbstractEventLoop, dict[str, asyncio.Future[object]]
+            asyncio.AbstractEventLoop, dict[str, set[asyncio.Future[object]]]
         ] = WeakKeyDictionary()
 
     def detached_inspect_count(self) -> int:
@@ -61,7 +61,8 @@ class BoundedInspect:
             return sum(
                 1
                 for mapping in self._detached_by_loop.values()
-                for task in mapping.values()
+                for tasks in mapping.values()
+                for task in tasks
                 if not task.done()
             )
 
@@ -71,8 +72,8 @@ class BoundedInspect:
             return frozenset(
                 adapter_id
                 for mapping in self._detached_by_loop.values()
-                for adapter_id, task in mapping.items()
-                if not task.done()
+                for adapter_id, tasks in mapping.items()
+                if any(not task.done() for task in tasks)
             )
 
     def _slots(self, loop: asyncio.AbstractEventLoop) -> asyncio.Semaphore:
@@ -90,8 +91,8 @@ class BoundedInspect:
             mapping = self._detached_by_loop.get(loop)
             if mapping is None:
                 return False
-            task = mapping.get(adapter_id)
-            return task is not None and not task.done()
+            tasks = mapping.get(adapter_id)
+            return tasks is not None and any(not task.done() for task in tasks)
 
     def _finish_detached(
         self,
@@ -99,13 +100,17 @@ class BoundedInspect:
         adapter_id: str,
         task: asyncio.Future[object],
     ) -> None:
-        """Absorb one abandoned inspect and lift quarantine when it is current."""
+        """Absorb one abandoned inspect and lift quarantine when none remain."""
         _absorb_abandoned(task)
         with self._lock:
             mapping = self._detached_by_loop.get(loop)
             if mapping is None:
                 return
-            if mapping.get(adapter_id) is task:
+            tasks = mapping.get(adapter_id)
+            if tasks is None:
+                return
+            tasks.discard(task)
+            if not tasks:
                 del mapping[adapter_id]
             if not mapping:
                 self._detached_by_loop.pop(loop, None)
@@ -127,7 +132,7 @@ class BoundedInspect:
             return
         with self._lock:
             mapping = self._detached_by_loop.setdefault(loop, {})
-            mapping[adapter_id] = task
+            mapping.setdefault(adapter_id, set()).add(task)
         _logger.info("guardrail adapter quarantined adapter_id=%s", adapter_id)
 
     async def run[T](

@@ -149,6 +149,64 @@ def test_suppressed_cancellation_quarantines_only_that_adapter() -> None:
     asyncio.run(scenario())
 
 
+def test_concurrent_timeouts_keep_quarantine_until_every_detached_task_finishes() -> None:
+    """One finished rogue inspect cannot lift quarantine while another is still live."""
+
+    async def scenario() -> None:
+        """Time out two inspects on one adapter, then release them one at a time."""
+        bound = BoundedInspect(max_inflight=2)
+        holds: list[asyncio.Event] = []
+
+        async def swallow() -> int:
+            """Ignore cancellation and wait on a per-inspect hold."""
+            hold = asyncio.Event()
+            holds.append(hold)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await hold.wait()
+                return 1
+            return 0
+
+        async def rogue() -> None:
+            """Run one cancel-swallowing inspect past its timeout."""
+            with pytest.raises(ClassifierTimeoutError):
+                await bound.run(swallow, 0.08, adapter_id="rogue")
+
+        await asyncio.gather(rogue(), rogue())
+        assert len(holds) == 2
+        assert bound.detached_inspect_count() == 2
+        assert bound.quarantined_adapter_ids() == frozenset({"rogue"})
+
+        holds[0].set()
+        for _ in range(10):
+            if bound.detached_inspect_count() == 1:
+                break
+            await asyncio.sleep(0)
+        assert bound.detached_inspect_count() == 1
+        assert bound.quarantined_adapter_ids() == frozenset({"rogue"})
+
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(ClassifierTimeoutError, match="quarantined"):
+            await bound.run(swallow, 0.5, adapter_id="rogue")
+        assert asyncio.get_running_loop().time() - started < 0.2
+        assert bound.detached_inspect_count() == 1
+
+        async def healthy() -> int:
+            """Return immediately."""
+            return 5
+
+        assert await bound.run(healthy, 0.5, adapter_id="healthy") == 5
+        holds[1].set()
+        for _ in range(10):
+            if bound.detached_inspect_count() == 0:
+                break
+            await asyncio.sleep(0)
+        assert bound.detached_inspect_count() == 0
+
+    asyncio.run(scenario())
+
+
 def test_external_cancellation_propagates_and_releases_the_slot() -> None:
     """Caller cancellation is not converted into a classifier timeout."""
 
