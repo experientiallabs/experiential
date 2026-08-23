@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import pytest
 
+from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models import ToolCall
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+    GatewayToolDefinition,
+)
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
     GuardrailCapabilityKind,
@@ -86,29 +92,40 @@ def test_prompt_injection_is_input_only() -> None:
         )
 
 
-def test_policy_rejects_duplicate_stage_capability_pairs() -> None:
-    """Two checks for the same capability on one stage are ambiguous."""
-    with pytest.raises(ValueError, match="same stage"):
-        GuardrailPolicy(
-            policy_id="member-policy",
-            organization_id="organization-one",
-            identity_id="identity-one",
-            checks=(
-                _check("input-one"),
-                GuardrailCheck(
-                    check_id="input-two",
-                    capability=GuardrailCapabilityKind.CONTENT_SAFETY,
-                    stage=GuardrailCheckStage.INPUT,
-                    action=GuardrailAction.BLOCK,
-                    timeout_ms=250,
-                    adapter_id="keyword-safety",
-                ),
+def test_policy_allows_repeated_stage_capability_pairs() -> None:
+    """Manual chains may run two classifiers for the same capability and stage."""
+    policy = GuardrailPolicy(
+        policy_id="member-policy",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        checks=(
+            GuardrailCheck(
+                check_id="input-pii-one",
+                capability=GuardrailCapabilityKind.PII,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.MODIFY,
+                timeout_ms=250,
+                adapter_id="hosted-pii-one",
             ),
-        )
+            GuardrailCheck(
+                check_id="input-pii-two",
+                capability=GuardrailCapabilityKind.PII,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.MODIFY,
+                timeout_ms=250,
+                adapter_id="hosted-pii-two",
+            ),
+        ),
+    )
+
+    assert [check.check_id for check in policy.input_checks] == [
+        "input-pii-one",
+        "input-pii-two",
+    ]
 
 
-def test_request_and_completion_byte_counts_cover_tool_arguments() -> None:
-    """Byte bounds include tool-call arguments, not only visible text."""
+def test_request_content_bytes_count_the_compact_json_subject() -> None:
+    """The request bound is the compact JSON sent to classifiers, not message text."""
     request = GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         messages=(
@@ -125,11 +142,19 @@ def test_request_and_completion_byte_counts_cover_tool_arguments() -> None:
                 ),
             ),
         ),
+        tools=(
+            GatewayToolDefinition(
+                name="lookup",
+                description="look up a record",
+                parameters={"type": "object", "properties": {"q": {"type": "string"}}},
+            ),
+        ),
     )
     completion = GuardrailCompletion(
         text="ok",
         tool_calls=(GuardrailToolCall(call_id="call-1", name="lookup", arguments='{"q":"ab"}'),),
     )
 
-    assert request_content_bytes(request) == len("hi") + len('{"q":"ab"}')
+    assert request_content_bytes(request) == len(canonical_json_bytes(request))
+    assert request_content_bytes(request) > len("hi") + len('{"q":"ab"}')
     assert completion.content_bytes() == len("ok") + len('{"q":"ab"}')

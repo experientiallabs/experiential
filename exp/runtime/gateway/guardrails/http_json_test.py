@@ -9,6 +9,7 @@ import os
 import httpx
 import pytest
 
+from exp.common.core.artifacts import JsonObject, canonical_json_bytes
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
@@ -16,6 +17,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailCheckStage,
     GuardrailCompletion,
+    request_content_bytes,
 )
 from exp.runtime.gateway.guardrails.http_json import (
     ClassifierProtocolError,
@@ -36,6 +38,18 @@ def _input_check() -> GuardrailCheck:
         action=GuardrailAction.MODIFY,
         timeout_ms=250,
         adapter_id="hosted-pii",
+    )
+
+
+def _block_check() -> GuardrailCheck:
+    """Return one input content-safety block check."""
+    return GuardrailCheck(
+        check_id="standard-input-content-safety",
+        capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+        stage=GuardrailCheckStage.INPUT,
+        action=GuardrailAction.BLOCK,
+        timeout_ms=250,
+        adapter_id="hosted-safety",
     )
 
 
@@ -151,6 +165,23 @@ def test_outbound_request_includes_capability_stage_action_and_one_subject() -> 
     assert "request" not in captured
 
 
+def test_outbound_request_subject_matches_request_content_bytes() -> None:
+    """The adapter sends the same compact JSON counted by the request bound."""
+    captured: JsonObject = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Capture the request subject without logging it."""
+        captured["request"] = json.loads(request.content)["request"]
+        return httpx.Response(200, json={"flagged": False})
+
+    adapter, _client = _classifier(httpx.MockTransport(handler))
+    request = _request()
+    asyncio.run(adapter.inspect_input(request=request, check=_input_check()))
+
+    assert canonical_json_bytes(captured["request"]) == canonical_json_bytes(request)
+    assert request_content_bytes(request) == len(canonical_json_bytes(request))
+
+
 def test_bearer_env_sends_authorization_without_embedding_the_value() -> None:
     """Auth is present as Bearer plus the live environment value."""
     env_name = "CLASSIFIER_BEARER"
@@ -250,6 +281,84 @@ def test_invalid_input_replacement_is_classifier_uncertainty() -> None:
         asyncio.run(adapter.inspect_input(request=_request(), check=_input_check()))
 
 
+def test_non_modify_verdict_cannot_include_a_replacement() -> None:
+    """Block and allow checks reject any replacement payload."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        """Return a replacement on a block check."""
+        return httpx.Response(
+            200,
+            json={
+                "flagged": True,
+                "replacement_messages": [{"role": "user", "content": "redacted"}],
+            },
+        )
+
+    adapter, _client = _classifier(httpx.MockTransport(handler))
+
+    with pytest.raises(ClassifierProtocolError, match="non-modify"):
+        asyncio.run(adapter.inspect_input(request=_request(), check=_block_check()))
+
+
+def test_flagged_modify_requires_the_stage_replacement() -> None:
+    """A flagged modify verdict without its replacement is contract drift."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        """Flag without supplying a replacement."""
+        return httpx.Response(200, json={"flagged": True})
+
+    adapter, _client = _classifier(httpx.MockTransport(handler))
+
+    with pytest.raises(ClassifierProtocolError, match="replacement_messages"):
+        asyncio.run(adapter.inspect_input(request=_request(), check=_input_check()))
+    with pytest.raises(ClassifierProtocolError, match="replacement_text"):
+        asyncio.run(
+            adapter.inspect_output(
+                completion=GuardrailCompletion(text="ok"),
+                check=_output_check(),
+            )
+        )
+
+
+def test_both_replacement_types_together_are_rejected() -> None:
+    """A verdict may carry at most one replacement subject."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        """Return both replacement fields."""
+        return httpx.Response(
+            200,
+            json={
+                "flagged": True,
+                "replacement_text": "redacted",
+                "replacement_messages": [{"role": "user", "content": "redacted"}],
+            },
+        )
+
+    adapter, _client = _classifier(httpx.MockTransport(handler))
+
+    with pytest.raises(ClassifierProtocolError, match="both replacement types"):
+        asyncio.run(adapter.inspect_input(request=_request(), check=_input_check()))
+
+
+def test_unflagged_verdict_cannot_include_a_replacement() -> None:
+    """Allowing a request still forbids leftover replacement fields."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        """Return an unflagged verdict with a replacement."""
+        return httpx.Response(
+            200,
+            json={
+                "flagged": False,
+                "replacement_messages": [{"role": "user", "content": "redacted"}],
+            },
+        )
+
+    adapter, _client = _classifier(httpx.MockTransport(handler))
+
+    with pytest.raises(ClassifierProtocolError, match="unflagged"):
+        asyncio.run(adapter.inspect_input(request=_request(), check=_input_check()))
+
+
 def test_invalid_output_replacement_is_classifier_uncertainty() -> None:
     """Output inspects accept replacement text, not request messages."""
 
@@ -284,6 +393,15 @@ def test_invalid_output_replacement_is_classifier_uncertainty() -> None:
         "file:///tmp/classifier",
         "/v1/inspect",
         "https://user:pass@classifier.example.invalid/v1/inspect",
+        "https://classifier.example.invalid/v1/inspect#next",
+        "https://classifier.example.invalid/%76%31/chat/completions",
+        "https://classifier.example.invalid/v1/%63hat/completions",
+        "https://classifier.example.invalid/foo/../v1/chat/completions",
+        "https://classifier.example.invalid/v1/./responses",
+        "https://classifier.example.invalid/%2e%2e/v1/models",
+        "https://classifier.example.invalid/%2fv1%2fchat%2fcompletions",
+        "https://classifier.example.invalid/v1/chat/completions%2fextra",
+        "https://classifier.example.invalid/%2576%2531/chat/completions",
     ],
 )
 def test_public_gateway_and_invalid_urls_are_rejected(url: str) -> None:
@@ -295,3 +413,13 @@ def test_public_gateway_and_invalid_urls_are_rejected(url: str) -> None:
 def test_dedicated_classifier_url_is_accepted() -> None:
     """A non-gateway inspect path is valid."""
     assert validate_classifier_url(_URL) == _URL
+
+
+def test_shared_client_does_not_follow_redirects() -> None:
+    """Redirects stay disabled so a classifier cannot bounce to a public route."""
+
+    async def scenario() -> None:
+        """Inspect the shared client's redirect setting."""
+        assert shared_http_json_client().follow_redirects is False
+
+    asyncio.run(scenario())

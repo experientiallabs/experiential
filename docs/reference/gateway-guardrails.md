@@ -73,21 +73,31 @@ failed check and continue the remaining chain.
 Input enforcement is on the request critical path after continuation expansion
 and before dispatch. Output enforcement for a protected identity delays the
 first visible byte until the winning completion is buffered and the output
-chain returns. Production adapters are async. The Python gateway awaits each
-inspect as a task under `asyncio.wait` and a per-loop concurrency cap. A hung
-adapter is cancelled at the tighter of the check timeout and the remaining
-request deadline. The caller returns immediately and the inflight slot is
-released without waiting for cancellation to be acknowledged. An adapter that
+chain returns.
+
+The standard pack is seven ordered checks: four on input and three on output.
+Each check has its own timeout. The conservative default is 250 ms per check,
+not 250 ms for the whole chain. Worst-case classifier waiting is the sum of
+the configured check timeouts, then capped by the remaining request deadline.
+Shared keep-alive on `http_json` removes connection setup from later inspects.
+It does not remove classifier inference latency.
+
+Production adapters are async. The Python gateway awaits each inspect as a
+task under `asyncio.wait` and a per-loop concurrency cap. A hung adapter is
+cancelled at the tighter of the check timeout and the remaining request
+deadline. The caller returns immediately and the inflight slot is released
+without waiting for cancellation to be acknowledged. An adapter that
 swallows cancellation is quarantined on that event loop until every
 abandoned inspect for that adapter finishes. Further calls to that adapter
 fail immediately and do not create another task. Other adapters keep their
-capacity. Native callbacks
-submit the same coroutines onto one shared daemon event loop so a Rust worker
-can return even when a quarantined task is still running. Leftover
-synchronous test adapters, when still needed, run only through a private
-bounded compatibility wrapper. Exhaustion of that wrapper cannot take async
-capacity from healthy adapters. Request and response content are bounded by
-`max_request_bytes` and `max_response_bytes` on the policy.
+capacity. Native callbacks submit the same coroutines onto one shared daemon
+event loop so a Rust worker can return even when a quarantined task is still
+running. Leftover synchronous test adapters, when still needed, run only
+through a private bounded compatibility wrapper. Exhaustion of that wrapper
+cannot take async capacity from healthy adapters. Request bounds count the
+compact JSON request subject sent to classifiers, including tool definitions,
+structured schemas, and metadata. Response bounds count completion text and
+tool-call arguments.
 
 ## Privacy
 
@@ -103,10 +113,13 @@ every organization and identity unguarded. There is no global switch that
 turns classifiers on for every identity.
 
 The `standard` preset is opt-in per organization and identity. It is never
-implied. The operator must name `preset: standard` and bind an `adapter_id`
-for every capability. Load fails closed on a malformed preset, a missing
-capability binding, a duplicate or ambiguous authored check, or a preset
-combined with a manual `checks` list.
+implied. The operator must name `preset: standard`, set an explicit
+`protected` boolean (`true` fail-closed or `false` fail-open), and bind an
+`adapter_id` for every capability. Load fails closed on a malformed preset, an
+empty or null `preset`, a missing `protected` field, a missing capability
+binding, a duplicate check ID, or a `preset` key combined with a `checks` key
+(including an empty check list). `capability_adapters` is rejected whenever
+`preset` is absent, including an empty map.
 
 Expanded standard order, with a conservative 250 ms default timeout per check:
 
@@ -171,10 +184,16 @@ stores a credential. The adapter reads that name at inspect time and sends a
 bearer header. Missing values are classifier uncertainty.
 
 The `http_json` request includes `capability`, `stage`, `action`, `check_id`,
-and exactly one subject: `request` or `completion`. The response must validate
-as `ClassifierVerdict`. Non-2xx statuses, malformed JSON, oversized bodies,
-invalid replacements, and contract drift become classifier uncertainty. The
-outer `GuardrailEngine` still owns per-check and request deadlines.
+and exactly one subject: `request` or `completion`. The request subject is the
+compact deterministic JSON of the canonical `GatewayRequest`. The response
+must validate as `ClassifierVerdict`. A non-`modify` check must not return a
+replacement. A flagged `modify` verdict must contain exactly the
+stage-appropriate replacement (`replacement_messages` on input,
+`replacement_text` on output). Unflagged verdicts cannot include replacements.
+Both replacement types together, wrong-stage replacements, non-2xx statuses,
+malformed JSON, oversized bodies, and other contract drift become classifier
+uncertainty. Redirects are disabled. The outer `GuardrailEngine` still owns
+per-check and request deadlines.
 
 Hand-authored checks remain available when a preset is not used:
 

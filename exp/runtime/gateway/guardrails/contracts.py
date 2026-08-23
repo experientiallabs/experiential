@@ -6,7 +6,7 @@ from enum import StrEnum
 
 from pydantic import Field, model_validator
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject
+from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, canonical_json_bytes
 from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
@@ -110,9 +110,6 @@ class GuardrailPolicy(ContractModel):
         ids = tuple(check.check_id for check in self.checks)
         if len(set(ids)) != len(ids):
             raise ValueError("guardrail check IDs must be unique")
-        pairs = tuple((check.stage, check.capability) for check in self.checks)
-        if len(set(pairs)) != len(pairs):
-            raise ValueError("guardrail checks must not repeat a capability on the same stage")
         return self
 
     @property
@@ -173,21 +170,19 @@ class GuardrailRejected(Exception):
 
 
 def request_content_bytes(request: GatewayRequest) -> int:
-    """Return UTF-8 size of canonical message content and tool-call arguments.
+    """Return UTF-8 size of the compact JSON request subject sent to classifiers.
+
+    The bound is the exact deterministic serialization used as the ``request``
+    subject on the ``http_json`` contract: every canonical field, including
+    messages, tool definitions, structured schemas, and metadata.
 
     Args:
         request: Canonical request after optional continuation expansion.
 
     Returns:
-        Byte count of caller-visible content only.
+        Byte count of the compact UTF-8 JSON subject.
     """
-    total = 0
-    for message in request.messages:
-        if message.content is not None:
-            total += len(message.content.encode("utf-8"))
-        for call in message.tool_calls:
-            total += len(call.arguments_json().encode("utf-8"))
-    return total
+    return len(canonical_json_bytes(request))
 
 
 def guardrail_failure(*, action: GuardrailAction, check_id: str | None = None) -> GatewayFailure:

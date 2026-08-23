@@ -6,18 +6,21 @@ import asyncio
 import json
 import logging
 import os
+import posixpath
 import re
 import threading
 from typing import Final
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from weakref import WeakKeyDictionary
 
 import httpx
 from pydantic import ValidationError
 
+from exp.common.core.artifacts import JsonObject, canonical_json_bytes
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
+    GuardrailAction,
     GuardrailCheck,
     GuardrailCheckStage,
     GuardrailCompletion,
@@ -77,6 +80,9 @@ class _CookieFreeTransport(httpx.AsyncBaseTransport):
 def validate_classifier_url(url: str) -> str:
     """Accept one dedicated classifier URL and reject public gateway paths.
 
+    Percent-encoded and dot-segment forms of the public gateway routes are
+    rejected after decode and path normalization. Fragments are rejected.
+
     Args:
         url: Absolute ``http`` or ``https`` classifier endpoint.
 
@@ -85,19 +91,44 @@ def validate_classifier_url(url: str) -> str:
 
     Raises:
         ValueError: The URL is relative, uses another scheme, embeds
-            credentials, or targets a public gateway path.
+            credentials, includes a fragment, or targets a public gateway path.
     """
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("classifier url must be an absolute http or https URL")
     if parsed.username or parsed.password:
         raise ValueError("classifier url cannot include credentials")
-    path = parsed.path or "/"
-    normalized = path.rstrip("/") or "/"
+    if parsed.fragment:
+        raise ValueError("classifier url cannot include a fragment")
+    normalized = _normalized_classifier_path(parsed.path or "/")
     for forbidden in _FORBIDDEN_GATEWAY_PATHS:
         if normalized == forbidden or normalized.startswith(f"{forbidden}/"):
             raise ValueError("classifier url must not be a public gateway path")
     return url
+
+
+def _normalized_classifier_path(path: str) -> str:
+    """Decode and normalize one URL path before comparing it to gateway routes.
+
+    Args:
+        path: Raw URL path, possibly percent-encoded or containing ``.`` / ``..``.
+
+    Returns:
+        A normalized absolute path.
+
+    Raises:
+        ValueError: Percent-decoding does not terminate.
+    """
+    decoded = path
+    for _ in range(8):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+    else:
+        raise ValueError("classifier url path encoding is not bounded")
+    normalized = posixpath.normpath("/" + decoded.lstrip("/"))
+    return normalized.rstrip("/") or "/"
 
 
 def validate_bearer_env_name(name: str) -> str:
@@ -143,6 +174,7 @@ def shared_http_json_client() -> httpx.AsyncClient:
                     )
                 ),
                 timeout=httpx.Timeout(_HTTP_TIMEOUT_SECONDS),
+                follow_redirects=False,
             )
             _clients[loop] = client
         return client
@@ -213,16 +245,21 @@ class HttpJsonClassifier:
         self,
         *,
         check: GuardrailCheck,
-        payload: dict[str, object],
+        payload: JsonObject,
     ) -> ClassifierVerdict:
         """POST the inspect envelope and validate the classifier contract."""
-        headers = {"accept": "application/json"}
+        headers = {"accept": "application/json", "content-type": "application/json"}
         authorization = _authorization_header(self._bearer_env)
         if authorization is not None:
             headers["authorization"] = authorization
         client = self._client or shared_http_json_client()
         try:
-            async with client.stream("POST", self._url, json=payload, headers=headers) as response:
+            async with client.stream(
+                "POST",
+                self._url,
+                content=canonical_json_bytes(payload),
+                headers=headers,
+            ) as response:
                 status = response.status_code
                 _logger.info(
                     "http_json classifier adapter_id=%s capability=%s stage=%s status=%s",
@@ -240,7 +277,7 @@ class HttpJsonClassifier:
             raise
         except httpx.HTTPError as exc:
             raise ClassifierProtocolError("classifier transport failed") from exc
-        return _verdict_from_body(body, stage=check.stage)
+        return _verdict_from_body(body, check=check)
 
 
 def _authorization_header(bearer_env: str | None) -> str | None:
@@ -268,22 +305,22 @@ def _inspect_payload(
     check: GuardrailCheck,
     request: GatewayRequest | None,
     completion: GuardrailCompletion | None,
-) -> dict[str, object]:
+) -> JsonObject:
     """Build the outbound inspect envelope with exactly one subject."""
     if (request is None) == (completion is None):
         raise ClassifierProtocolError("classifier inspect requires exactly one subject")
-    payload: dict[str, object] = {
-        "capability": check.capability.value,
-        "stage": check.stage.value,
+    payload: JsonObject = {
         "action": check.action.value,
+        "capability": check.capability.value,
         "check_id": check.check_id,
+        "stage": check.stage.value,
     }
     if request is not None:
-        payload["request"] = request.model_dump(mode="json")
+        payload["request"] = request.model_dump(mode="json", by_alias=True, exclude_none=False)
         return payload
     if completion is None:
         raise ClassifierProtocolError("classifier inspect requires exactly one subject")
-    payload["completion"] = completion.model_dump(mode="json")
+    payload["completion"] = completion.model_dump(mode="json", by_alias=True, exclude_none=False)
     return payload
 
 
@@ -310,19 +347,19 @@ async def _read_bounded(response: httpx.Response, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-def _verdict_from_body(body: bytes, *, stage: GuardrailCheckStage) -> ClassifierVerdict:
+def _verdict_from_body(body: bytes, *, check: GuardrailCheck) -> ClassifierVerdict:
     """Parse and validate one ``ClassifierVerdict`` response body.
 
     Args:
         body: Raw response bytes already bounded by the adapter.
-        stage: Inspection stage used to reject invalid replacements.
+        check: Inspection that produced the verdict.
 
     Returns:
         The validated verdict.
 
     Raises:
         ClassifierProtocolError: The body is not a verdict or replacements
-            do not match the stage contract.
+            do not match the action and stage contract.
     """
     try:
         parsed = json.loads(body)
@@ -332,26 +369,41 @@ def _verdict_from_body(body: bytes, *, stage: GuardrailCheckStage) -> Classifier
         verdict = ClassifierVerdict.model_validate(parsed)
     except ValidationError as exc:
         raise ClassifierProtocolError("classifier response drifted from ClassifierVerdict") from exc
-    _reject_invalid_replacements(verdict, stage)
+    _reject_invalid_replacements(verdict, check)
     return verdict
 
 
-def _reject_invalid_replacements(verdict: ClassifierVerdict, stage: GuardrailCheckStage) -> None:
-    """Reject replacements that do not belong to the inspected stage.
+def _reject_invalid_replacements(verdict: ClassifierVerdict, check: GuardrailCheck) -> None:
+    """Reject replacements that do not match the check action and stage.
 
     Args:
         verdict: Parsed classifier result.
-        stage: Inspection stage that produced the verdict.
+        check: Inspection that produced the verdict.
 
     Raises:
-        ClassifierProtocolError: A replacement is present on the wrong stage
-            or on an unflagged verdict.
+        ClassifierProtocolError: A replacement is present on the wrong action
+            or stage, both replacement types are set, or a flagged modify
+            verdict is missing its required replacement.
     """
     has_text = verdict.replacement_text is not None
     has_messages = verdict.replacement_messages is not None
-    if not verdict.flagged and (has_text or has_messages):
-        raise ClassifierProtocolError("unflagged verdict cannot include a replacement")
-    if stage is GuardrailCheckStage.INPUT and has_text:
-        raise ClassifierProtocolError("input verdict cannot include replacement_text")
-    if stage is GuardrailCheckStage.OUTPUT and has_messages:
+    if has_text and has_messages:
+        raise ClassifierProtocolError("verdict cannot include both replacement types")
+    if not verdict.flagged:
+        if has_text or has_messages:
+            raise ClassifierProtocolError("unflagged verdict cannot include a replacement")
+        return
+    if check.action is not GuardrailAction.MODIFY:
+        if has_text or has_messages:
+            raise ClassifierProtocolError("non-modify verdict cannot include a replacement")
+        return
+    if check.stage is GuardrailCheckStage.INPUT:
+        if has_text:
+            raise ClassifierProtocolError("input verdict cannot include replacement_text")
+        if not has_messages:
+            raise ClassifierProtocolError("flagged input modify requires replacement_messages")
+        return
+    if has_messages:
         raise ClassifierProtocolError("output verdict cannot include replacement_messages")
+    if not has_text:
+        raise ClassifierProtocolError("flagged output modify requires replacement_text")

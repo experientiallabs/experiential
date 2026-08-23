@@ -14,6 +14,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
+    GatewayToolDefinition,
 )
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect
 from exp.runtime.gateway.guardrails.classifiers import (
@@ -32,6 +33,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailPolicy,
     GuardrailRejected,
     GuardrailToolCall,
+    request_content_bytes,
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
@@ -375,6 +377,44 @@ def test_oversized_payload_is_a_terminal_error() -> None:
     assert classifier.input_calls == 0
     assert engine.policy_for("organization-one", "identity-two") is None
     assert engine.policy_for("organization-two", "identity-one") is None
+
+
+def test_oversized_tool_schema_is_rejected_without_calling_the_adapter() -> None:
+    """Tool descriptions and schemas count toward the request subject bound."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(
+            GatewayToolDefinition(
+                name="lookup",
+                description="x" * 200,
+                parameters={
+                    "type": "object",
+                    "properties": {"q": {"type": "string", "description": "y" * 200}},
+                },
+            ),
+        ),
+    )
+    subject_bytes = request_content_bytes(request)
+    assert subject_bytes > 200
+    engine, classifier = _engine(
+        classifier=ScriptedClassifier(),
+        checks=(_check("input-one"),),
+        max_request_bytes=subject_bytes - 1,
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    with pytest.raises(GuardrailRejected):
+        _awaited(
+            engine.enforce_input(
+                policy=policy,
+                request=request,
+                deadline_monotonic=200.0,
+            )
+        )
+
+    assert classifier.input_calls == 0
 
 
 def test_blocking_classifier_times_out_without_waiting_for_return() -> None:

@@ -111,7 +111,7 @@ class AuthoredStandardPolicy(ContractModel):
     policy_id: ArtifactId
     organization_id: OrganizationId
     identity_id: IdentityId
-    protected: bool = False
+    protected: bool
     preset: str
     timeout_ms: int = Field(default=STANDARD_DEFAULT_TIMEOUT_MS, ge=1, le=30_000)
     timeouts: dict[str, int] = Field(default_factory=dict)
@@ -127,8 +127,10 @@ def policy_from_authored(
     """Validate one authored policy object and expand a preset when requested.
 
     The standard pack is never implied. An identity opts in by setting
-    ``preset`` to ``standard`` and binding every required capability to a
-    registered ``adapter_id``.
+    ``preset`` to ``standard``, choosing an explicit ``protected`` boolean,
+    and binding every required capability to a registered ``adapter_id``.
+    Presence of ``preset`` and ``checks`` together is always ambiguous,
+    including an empty check list.
 
     Args:
         item: One policy object from ``guardrails.json``.
@@ -140,27 +142,20 @@ def policy_from_authored(
     Raises:
         ValueError: The object is malformed, mixed ambiguously, or unbound.
     """
-    has_preset = _has_value(item.get("preset"))
-    has_checks = _has_value(item.get("checks"))
-    has_bindings = _has_value(item.get("capability_adapters"))
-    if has_preset and has_checks:
+    has_preset_key = "preset" in item
+    has_checks_key = "checks" in item
+    has_bindings_key = "capability_adapters" in item
+    if has_preset_key and has_checks_key:
         raise ValueError("standard preset cannot be combined with authored checks")
-    if has_bindings and not has_preset:
+    if has_bindings_key and not has_preset_key:
         raise ValueError("capability_adapters requires the standard preset")
-    if has_preset and not has_bindings:
-        raise ValueError("standard preset requires an adapter_id for every capability")
-    if "timeouts" in item and not has_preset:
+    if "timeouts" in item and not has_preset_key:
         raise ValueError("timeouts requires the standard preset")
-    if "timeout_ms" in item and not has_preset:
+    if "timeout_ms" in item and not has_preset_key:
         raise ValueError("timeout_ms requires the standard preset")
-    if has_preset:
+    if has_preset_key:
         return _expand_standard(item, adapter_ids)
-    manual = dict(item)
-    manual.pop("preset", None)
-    manual.pop("capability_adapters", None)
-    manual.pop("timeouts", None)
-    manual.pop("timeout_ms", None)
-    return _manual_policy(manual, adapter_ids)
+    return _manual_policy(item, adapter_ids)
 
 
 def expand_standard_checks(
@@ -201,6 +196,13 @@ def expand_standard_checks(
 
 def _expand_standard(item: Mapping[str, object], adapter_ids: frozenset[str]) -> GuardrailPolicy:
     """Parse a standard-preset policy object and expand its checks."""
+    preset = item.get("preset")
+    if preset is None or preset == "":
+        raise ValueError("preset must be standard; empty or null preset is not a manual policy")
+    if "protected" not in item:
+        raise ValueError("standard preset requires an explicit protected boolean")
+    if "capability_adapters" not in item:
+        raise ValueError("standard preset requires an adapter_id for every capability")
     try:
         authored = AuthoredStandardPolicy.model_validate(item)
     except ValidationError as exc:
@@ -305,14 +307,3 @@ def _timeout_check_id(key: str) -> str:
         if check_id is not None:
             return check_id
     raise ValueError(f"unknown standard preset timeout key: {key}")
-
-
-def _has_value(value: object) -> bool:
-    """Return whether an authored field is present and non-empty."""
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value)
-    if isinstance(value, (list, dict, tuple)):
-        return bool(value)
-    return True

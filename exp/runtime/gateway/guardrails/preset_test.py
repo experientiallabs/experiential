@@ -174,6 +174,48 @@ def test_preset_combined_with_manual_checks_is_rejected() -> None:
         )
 
 
+def test_preset_combined_with_empty_checks_key_is_rejected() -> None:
+    """Presence of both keys is ambiguous even when the check list is empty."""
+    with pytest.raises(ValueError, match="cannot be combined"):
+        policy_from_authored(_standard_item(checks=[]), _ADAPTERS)
+
+
+def test_empty_capability_adapters_without_preset_are_rejected() -> None:
+    """An empty bindings map still requires an explicit standard opt-in."""
+    with pytest.raises(ValueError, match="requires the standard preset"):
+        policy_from_authored(
+            {
+                "policy_id": "member-policy",
+                "organization_id": "organization-one",
+                "identity_id": "identity-one",
+                "capability_adapters": {},
+            },
+            _ADAPTERS,
+        )
+
+
+def test_null_or_empty_preset_is_rejected() -> None:
+    """A present but empty preset is not treated as a manual policy."""
+    with pytest.raises(ValueError, match="empty or null preset"):
+        policy_from_authored(_standard_item(preset=None), _ADAPTERS)
+    with pytest.raises(ValueError, match="empty or null preset"):
+        policy_from_authored(_standard_item(preset=""), _ADAPTERS)
+
+
+def test_standard_preset_requires_explicit_protected_boolean() -> None:
+    """Fail-closed or fail-open must be chosen; it is never implied."""
+    item = _standard_item()
+    del item["protected"]
+    with pytest.raises(ValueError, match="explicit protected boolean"):
+        policy_from_authored(item, _ADAPTERS)
+
+
+def test_standard_preset_accepts_explicit_fail_open() -> None:
+    """protected=false is a deliberate fail-open choice, not a missing field."""
+    policy = policy_from_authored(_standard_item(protected=False), _ADAPTERS)
+    assert policy.protected is False
+
+
 def test_capability_adapters_without_preset_are_rejected() -> None:
     """Bindings without an explicit standard opt-in are not implied."""
     with pytest.raises(ValueError, match="requires the standard preset"):
