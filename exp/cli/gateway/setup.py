@@ -35,7 +35,12 @@ from exp.common.config import (
 from exp.common.core.artifacts import stable_id
 from exp.common.core.files import resolve_write_target, write_bytes_atomic
 from exp.common.core.locks import file_write_lock
-from exp.common.models import GatewayDeploymentCapabilities, GatewayTokenPrices, ModelCapabilities
+from exp.common.models import (
+    BillingSource,
+    GatewayDeploymentCapabilities,
+    GatewayTokenPrices,
+    ModelCapabilities,
+)
 from exp.common.progress import report
 from exp.runtime.gateway.catalog_authority import (
     GatewayCatalogCompensationError,
@@ -144,7 +149,6 @@ def interactive_gateway_setup(
                 session,
                 console=console,
                 environment=environment,
-                exclude=frozenset({HOSTED_SETUP_PICKER}),
             )
             if selection is None:
                 raise typer.Abort()
@@ -223,6 +227,11 @@ def interactive_gateway_setup(
                     gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
                     prices=GatewayTokenPrices(),
                     pricing_source=None,
+                    billing_source=(
+                        BillingSource.HOST_MANAGED
+                        if selected.connection == HOSTED_SETUP_PICKER
+                        else BillingSource.CUSTOMER_MANAGED
+                    ),
                     replace=reconfigure,
                     serving_connections=serving_connections,
                 )

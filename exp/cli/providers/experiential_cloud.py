@@ -3,9 +3,10 @@
 Experiential Cloud is a setup picker for the hosted Platform gateway. The
 persisted catalog provider stays ``openai-compatible``: the CLI does not invent
 a new runtime provider family, and it does not rebuild a local gateway
-authority for this hosted path. When no saved or environment credential is
-available, interactive setup uses the Platform approval page and a loopback
-callback to receive the new organization key.
+authority for this hosted path. Login registers the connection and synchronizes
+the authenticated account's model identities. When no saved or environment
+credential is available, interactive setup uses the Platform approval page and
+a loopback callback to receive the new organization key.
 """
 
 from __future__ import annotations

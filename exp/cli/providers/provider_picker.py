@@ -255,8 +255,7 @@ def select_providers(
         configured: Whether the catalog already holds usable models, which makes provider
             selection optional so roles can be edited offline.
         read_key: Optional keyboard source used by tests instead of the controlling terminal.
-        exclude: Provider keys omitted from this screen. Local gateway first-run
-            hides Experiential Cloud so it cannot wrap the hosted Platform path.
+        exclude: Provider keys omitted from this screen.
 
     Returns:
         Selected providers plus whether manual model declaration is needed, or ``None`` when the

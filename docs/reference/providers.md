@@ -18,13 +18,16 @@ callback, and stores that key in the user-data credential file. `experiential-cl
 picker for the same gateway. It persists
 `provider = "openai-compatible"` with `base_url` `https://api.experientiallabs.ai/v1` (or
 `EXP_GATEWAY_URL` when that override is set) and `api_key_env = "EXPLABS_API_KEY"`. The CLI does
-not rebuild a local gateway authority for that hosted path. Local `exp run` first-run setup keeps
-the offline provider list and does not offer Experiential Cloud.
+not rebuild a local gateway authority for that hosted path. Login also registers the
+`experiential-cloud` connection in the selected `.exp/models.toml` and synchronizes every model
+identity returned for the authenticated account. Local gateway setup can then select that
+provider without a second provider-configuration command.
 
-After `exp login`, run `exp config providers --provider experiential-cloud` to discover and select
-hosted models. When that setup flow has no environment or stored key, it can also open the same
-Platform approval flow as a convenience. Set `EXP_PLATFORM_URL` for a preview or staging Platform
-web origin. Headless and CI setup should provide `EXPLABS_API_KEY` instead.
+`exp config providers --provider experiential-cloud` remains available when roles need to be
+assigned, or when an explicit refresh or replacement workflow is preferred. When that setup flow
+has no environment or stored key, it can also open the same Platform approval flow as a
+convenience. Set `EXP_PLATFORM_URL` for a preview or staging Platform web origin. Headless and CI
+setup should provide `EXPLABS_API_KEY` instead.
 
 Setup writes only secret-free catalog fields and never prints a credential value. Interactive
 `exp config providers` persists browser-approved or pasted API keys outside the repository in the platform
