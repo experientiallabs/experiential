@@ -20,6 +20,7 @@ import termios
 import threading
 import webbrowser
 from collections.abc import Callable, Mapping
+from getpass import getpass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -390,6 +391,33 @@ def read_masked_key_with_callback(
             os.close(fd)
         if prompted:
             console.print()
+
+
+def read_hosted_key_fallback(
+    prompt: str,
+    wait_for_callback: Callable[[float], str | None],
+    *,
+    console: Console,
+    read_key: Callable[[str], str | None] = getpass,
+) -> str | None:
+    """Read a hosted key through callback-aware hidden input or an injected reader.
+
+    Args:
+        prompt: Prompt written to the terminal.
+        wait_for_callback: Callback waiter polled while the default reader is active.
+        console: Terminal receiving the prompt.
+        read_key: Optional injected reader used by deterministic tests.
+
+    Returns:
+        The pasted key, callback key, or ``None`` for an empty line.
+    """
+    if read_key is getpass:
+        return read_masked_key_with_callback(
+            prompt,
+            console=console,
+            wait_for_callback=wait_for_callback,
+        )
+    return read_key(prompt)
 
 
 def _is_experiential_cloud_connection(

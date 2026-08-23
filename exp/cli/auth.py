@@ -13,7 +13,7 @@ from exp.cli.providers.experiential_cloud import (
     hosted_connection,
     hosted_credential_binding,
     hosted_platform_login,
-    read_masked_key_with_callback,
+    read_hosted_key_fallback,
 )
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.auth import ProviderAuthStore
@@ -52,13 +52,15 @@ def run_login(
         fallback_used = True
         console.print("[dim]Experiential Cloud API key[/dim]")
         try:
-            if wait_for_callback is not None and read_key is getpass:
-                return read_masked_key_with_callback(
-                    "Experiential Cloud API key (hidden, empty line cancels): ",
+            prompt = "Experiential Cloud API key (hidden, empty line cancels): "
+            if wait_for_callback is not None:
+                return read_hosted_key_fallback(
+                    prompt,
+                    wait_for_callback,
                     console=console,
-                    wait_for_callback=wait_for_callback,
+                    read_key=read_key,
                 )
-            return read_key("Experiential Cloud API key (hidden, empty line cancels): ")
+            return read_key(prompt)
         except (EOFError, KeyboardInterrupt):
             raise typer.Abort from None
 
