@@ -47,6 +47,12 @@ def apply_text_replacement(
     """
     rewritten: list[GatewayEvent] = []
     inserted = False
+    bump = 0
+    terminals = {
+        GatewayEventKind.COMPLETED,
+        GatewayEventKind.INCOMPLETE,
+        GatewayEventKind.FAILED,
+    }
     for event in events:
         if event.kind is GatewayEventKind.TEXT_DELTA:
             if inserted:
@@ -54,15 +60,7 @@ def apply_text_replacement(
             rewritten.append(event.model_copy(update={"text_delta": replacement}))
             inserted = True
             continue
-        if (
-            event.kind
-            in {
-                GatewayEventKind.COMPLETED,
-                GatewayEventKind.INCOMPLETE,
-                GatewayEventKind.FAILED,
-            }
-            and not inserted
-        ):
+        if event.kind in terminals and not inserted:
             rewritten.append(
                 GatewayEvent(
                     kind=GatewayEventKind.TEXT_DELTA,
@@ -71,7 +69,12 @@ def apply_text_replacement(
                 )
             )
             inserted = True
-        rewritten.append(event)
+            bump = 1
+        rewritten.append(
+            event.model_copy(update={"sequence_number": event.sequence_number + bump})
+            if bump
+            else event
+        )
     return tuple(rewritten)
 
 

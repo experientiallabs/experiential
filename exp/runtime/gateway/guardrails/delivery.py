@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 from exp.runtime.gateway.aggregation import BoundedGatewayEvents
@@ -44,7 +45,8 @@ async def collect_and_enforce_output(
     if not policy.output_checks:
         return retained
     original = completion_from_events(retained)
-    rewritten = engine.enforce_output(
+    rewritten = await asyncio.to_thread(
+        engine.enforce_output,
         policy=policy,
         completion=original,
         deadline_monotonic=deadline_monotonic,

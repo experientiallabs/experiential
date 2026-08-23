@@ -339,9 +339,13 @@ class GatewayService:
             authorization=authorization,
             request=decoded.request,
         )
-        policy = self._assigned_policy(authorization.identity_id)
+        policy = self._assigned_policy(
+            organization_id=authorization.organization_id,
+            identity_id=authorization.identity_id,
+        )
         if policy is not None and self._guardrails is not None:
-            execution_request = self._guardrails.enforce_input(
+            execution_request = await asyncio.to_thread(
+                self._guardrails.enforce_input,
                 policy=policy,
                 request=execution_request,
                 deadline_monotonic=deadline,
@@ -491,11 +495,11 @@ class GatewayService:
             ),
         )
 
-    def _assigned_policy(self, identity_id: str) -> GuardrailPolicy | None:
-        """Return the identity policy, or ``None`` when guardrails are off."""
+    def _assigned_policy(self, *, organization_id: str, identity_id: str) -> GuardrailPolicy | None:
+        """Return the organization-scoped identity policy, or ``None`` when off."""
         if self._guardrails is None:
             return None
-        return self._guardrails.policy_for(identity_id)
+        return self._guardrails.policy_for(organization_id, identity_id)
 
     async def _stream_body(
         self,

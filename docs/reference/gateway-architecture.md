@@ -51,9 +51,10 @@ before any ledger write, so each request is accounted exactly once by the
 engine that serves it. Shutdown drains admitted work on both engines within
 `--graceful-timeout`.
 
-Identity-scoped guardrails are optional and default-off. See
-`docs/reference/gateway-guardrails.md` for policy lookup, the internal
-classifier seam, and the input and output enforcement order.
+Identity-scoped guardrails are optional and default-off. Policies are keyed by
+organization and identity. See `docs/reference/gateway-guardrails.md` for
+policy lookup, the internal classifier seam, and the input and output
+enforcement order.
 
 ## Embeddable worker composition
 

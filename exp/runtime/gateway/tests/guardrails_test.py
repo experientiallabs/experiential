@@ -101,12 +101,13 @@ def _engine(
     """Compose one engine for the data-plane identity."""
     policy = GuardrailPolicy(
         policy_id="member-policy",
+        organization_id="organization-one",
         identity_id=identity_id,
         protected=protected,
         checks=checks,
     )
     return GuardrailEngine(
-        store=MappingGuardrailStore({identity_id: policy}),
+        store=MappingGuardrailStore((policy,)),
         client=DirectClassifierClient(ClassifierRegistry({"scripted": classifier})),
         monotonic=_Clock().monotonic,
     )
@@ -171,6 +172,42 @@ def test_unguarded_traffic_never_calls_classifiers() -> None:
         assert classifier.output_calls == 0
         assert ledger.accepted
         assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_other_organization_policy_does_not_apply() -> None:
+    """The same identity ID in another organization does not share a policy."""
+
+    async def scenario() -> None:
+        """Serve one request whose identity matches only a foreign organization."""
+        classifier = ScriptedClassifier(input_verdict=ClassifierVerdict(flagged=True))
+        policy = GuardrailPolicy(
+            policy_id="foreign-policy",
+            organization_id="organization-two",
+            identity_id="identity-one",
+            protected=True,
+            checks=(_check("input-safety"),),
+        )
+        engine = GuardrailEngine(
+            store=MappingGuardrailStore((policy,)),
+            client=DirectClassifierClient(ClassifierRegistry({"scripted": classifier})),
+            monotonic=_Clock().monotonic,
+        )
+        provider = _RecordingProvider(lambda: _EventStream(_text_events("hello")))
+        service, _control, ledger, _proof = _service(provider, guardrails=engine)
+
+        response = await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_chat(
+                {"model": "public-model", "messages": [{"role": "user", "content": "hello"}]}
+            ),
+        )
+
+        assert response.status_code == 200
+        assert classifier.input_calls == 0
+        assert engine.policy_for("organization-one", "identity-one") is None
+        assert ledger.accepted
 
     asyncio.run(scenario())
 
@@ -361,6 +398,63 @@ def test_output_block_exposes_no_partial_bytes() -> None:
     asyncio.run(scenario())
 
 
+def test_textless_streaming_modify_encodes_without_duplicate_sequences() -> None:
+    """A refusal-only modify inserts text without 502 invalid_provider_stream."""
+
+    async def scenario() -> None:
+        """Stream one refusal-only completion through an output modify check."""
+        classifier = ScriptedClassifier(
+            output_verdict=ClassifierVerdict(flagged=True, replacement_text="safe")
+        )
+        events = (
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=0,
+                text_delta="I cannot",
+            ),
+            GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=1,
+                usage=GatewayUsage(input_tokens=3, output_tokens=1),
+            ),
+        )
+        provider = _RecordingProvider(lambda: _EventStream(events))
+        service, _control, _ledger, _proof = _service(
+            provider,
+            guardrails=_engine(
+                classifier,
+                checks=(
+                    _check(
+                        "output-safety",
+                        stage=GuardrailCheckStage.OUTPUT,
+                        action=GuardrailAction.MODIFY,
+                    ),
+                ),
+            ),
+        )
+
+        response = await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_chat(
+                {
+                    "model": "public-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                }
+            ),
+        )
+
+        assert isinstance(response, StreamingResponse)
+        frames: list[bytes] = []
+        async for frame in cast(AsyncIterator[bytes], response.body_iterator):
+            frames.append(frame)
+        body = b"".join(frames)
+        assert b"invalid_provider_stream" not in body
+        assert b"safe" in body
+
+    asyncio.run(scenario())
+
+
 def test_tool_call_arguments_are_blocked_not_rewritten() -> None:
     """A modify action on a tool-calling completion becomes a block."""
 
@@ -466,7 +560,7 @@ def test_waterfall_reuses_one_transformed_request_and_keeps_provider_failover() 
             classifier,
             checks=(_check("input-safety", action=GuardrailAction.MODIFY),),
         )
-        policy = engine.policy_for("identity-one")
+        policy = engine.policy_for("organization-one", "identity-one")
         assert policy is not None
         request = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -481,10 +575,14 @@ def test_waterfall_reuses_one_transformed_request_and_keeps_provider_failover() 
         events = [event async for event in stream]
 
         assert classifier.input_calls == 1
-        assert first_provider.requests == [transformed]
-        assert second_provider.requests == [transformed]
+        assert len(first_provider.requests) == 1
+        assert first_provider.requests == second_provider.requests
+        dispatched = first_provider.requests[0]
+        assert dispatched.messages == transformed.messages
+        assert dispatched.messages[0].content == "redacted"
+        assert dispatched.stream is True
+        assert dispatched.include_usage is True
         assert events[-1].kind is GatewayEventKind.COMPLETED
-        assert first_provider.requests[0].messages[0].content == "redacted"
 
     asyncio.run(scenario())
 

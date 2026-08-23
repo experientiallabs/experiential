@@ -6,6 +6,7 @@ import logging
 from collections.abc import Callable
 
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.guardrails.bounded import ClassifierTimeoutError, run_bounded
 from exp.runtime.gateway.guardrails.client import InternalClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
@@ -51,9 +52,9 @@ class GuardrailEngine:
         self.output_invocations = 0
         self.classifier_calls = 0
 
-    def policy_for(self, identity_id: str) -> GuardrailPolicy | None:
+    def policy_for(self, organization_id: str, identity_id: str) -> GuardrailPolicy | None:
         """Return the assigned policy, or ``None`` for unguarded traffic."""
-        return self._store.policy_for(identity_id)
+        return self._store.policy_for(organization_id, identity_id)
 
     def enforce_input(
         self,
@@ -159,12 +160,12 @@ class GuardrailEngine:
         started = self._monotonic()
         try:
             self.classifier_calls += 1
-            verdict = inspect()
+            verdict = run_bounded(inspect, timeout)
+        except ClassifierTimeoutError:
+            return self._uncertain(policy, check, GuardrailAction.ERROR)
         except Exception:  # noqa: BLE001 - classifier failures are fail-closed or skipped
             return self._uncertain(policy, check, GuardrailAction.ERROR)
         elapsed = self._monotonic() - started
-        if elapsed > timeout:
-            return self._uncertain(policy, check, GuardrailAction.ERROR)
         if not verdict.flagged:
             self._record(policy, check, GuardrailAction.ALLOW, elapsed)
             return None
@@ -236,9 +237,10 @@ class GuardrailEngine:
     ) -> None:
         """Emit content-free decision metadata."""
         _logger.info(
-            "guardrail decision policy_id=%s identity_id=%s check_id=%s "
-            "capability=%s action=%s latency_ms=%.1f",
+            "guardrail decision policy_id=%s organization_id=%s identity_id=%s "
+            "check_id=%s capability=%s action=%s latency_ms=%.1f",
             policy.policy_id,
+            policy.organization_id,
             policy.identity_id,
             None if check is None else check.check_id,
             None if check is None else check.capability.value,

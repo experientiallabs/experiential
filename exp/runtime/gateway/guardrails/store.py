@@ -1,46 +1,55 @@
-"""Identity-keyed lookup for immutable guardrail policies."""
+"""Organization-and-identity lookup for immutable guardrail policies."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable
 from typing import Protocol
 
-from exp.runtime.gateway.contracts import IdentityId
+from exp.runtime.gateway.contracts import IdentityId, OrganizationId
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 
 
 class GuardrailPolicyStore(Protocol):
     """Resolve at most one assigned policy for an authenticated identity."""
 
-    def policy_for(self, identity_id: IdentityId) -> GuardrailPolicy | None:
+    def policy_for(
+        self,
+        organization_id: OrganizationId,
+        identity_id: IdentityId,
+    ) -> GuardrailPolicy | None:
         """Return the assigned policy, or ``None`` when the identity is unguarded."""
         ...
 
 
 class MappingGuardrailStore:
-    """In-memory policy map keyed by identity.
+    """In-memory policy map keyed by organization and identity.
 
-    Missing identities return ``None`` so the existing gateway hot path stays
+    Missing pairs return ``None`` so the existing gateway hot path stays
     unchanged. The store never inspects request content.
     """
 
-    def __init__(self, policies: Mapping[str, GuardrailPolicy] | None = None) -> None:
-        """Index one optional policy per identity.
+    def __init__(self, policies: Iterable[GuardrailPolicy] = ()) -> None:
+        """Index one optional policy per organization-scoped identity.
 
         Args:
-            policies: Identity ID to immutable policy. Duplicate identities
-                keep the last authored entry.
+            policies: Immutable policies. Each ``(organization_id, identity_id)``
+                pair may appear at most once.
 
         Raises:
-            ValueError: A policy's identity_id does not match its map key.
+            ValueError: Two policies share the same organization and identity.
         """
-        indexed: dict[str, GuardrailPolicy] = {}
-        for identity_id, policy in (policies or {}).items():
-            if policy.identity_id != identity_id:
-                raise ValueError("guardrail policy identity must match the store key")
-            indexed[identity_id] = policy
+        indexed: dict[tuple[str, str], GuardrailPolicy] = {}
+        for policy in policies:
+            key = (policy.organization_id, policy.identity_id)
+            if key in indexed:
+                raise ValueError("guardrail policies must be unique per organization and identity")
+            indexed[key] = policy
         self._policies = indexed
 
-    def policy_for(self, identity_id: IdentityId) -> GuardrailPolicy | None:
-        """Return the assigned policy, or ``None`` when the identity is unguarded."""
-        return self._policies.get(identity_id)
+    def policy_for(
+        self,
+        organization_id: OrganizationId,
+        identity_id: IdentityId,
+    ) -> GuardrailPolicy | None:
+        """Return the assigned policy, or ``None`` when the pair is unguarded."""
+        return self._policies.get((organization_id, identity_id))

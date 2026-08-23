@@ -39,6 +39,7 @@ def test_policy_splits_input_and_output_checks_in_authored_order() -> None:
     """Input and output chains keep authored order and unique check IDs."""
     policy = GuardrailPolicy(
         policy_id="member-policy",
+        organization_id="organization-one",
         identity_id="identity-one",
         checks=(
             _check("input-one"),
@@ -56,6 +57,7 @@ def test_policy_rejects_duplicate_check_ids() -> None:
     with pytest.raises(ValueError, match="unique"):
         GuardrailPolicy(
             policy_id="member-policy",
+            organization_id="organization-one",
             identity_id="identity-one",
             checks=(_check("same-check"), _check("same-check")),
         )

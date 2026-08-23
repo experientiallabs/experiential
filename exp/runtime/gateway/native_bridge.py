@@ -286,7 +286,7 @@ class NativeControlPlane:
         return "{}"
 
     def admit(self, argument: str) -> str:
-        """Decode, authorize, route, and durably start one provider attempt.
+        """Decode, authorize, inspect, route, and durably start one attempt.
 
         The raw body is decoded with the same ``decode_chat`` the python
         engine uses, and the upstream payload is built with the same shared
@@ -350,10 +350,21 @@ class NativeControlPlane:
             except OpenAIProtocolError as exc:
                 raise NativeBridgeError(exc) from exc
 
-        # Escalation runs before any ledger write: the python engine performs
-        # full accounting for every request it serves. Routing failures found
-        # by the probe are recorded against the accepted request below, the
-        # same order the python engine writes them.
+        policy = None
+        try:
+            request, policy = enforce_native_input(
+                self._guardrails,
+                authorization=authorization,
+                request=request,
+                deadline_monotonic=deadline,
+            )
+        except GuardrailRejected as exc:
+            raise NativeBridgeError(public_failure_error(exc.failure)) from exc
+
+        # Escalation runs after input enforcement and before any ledger write.
+        # The python engine re-inspects the original public body when it
+        # serves the request. Routing failures found by the probe are recorded
+        # against the accepted request below.
         probe_failure: Exception | None = None
         route: GatewayRoute | None = None
         profile: GatewayWireProfile | None = None
@@ -373,17 +384,6 @@ class NativeControlPlane:
                 native_route_eligible = False
             if not native_route_eligible:
                 return _escalation("host policy requires the python execution engine")
-
-        policy = None
-        try:
-            request, policy = enforce_native_input(
-                self._guardrails,
-                authorization=authorization,
-                request=request,
-                deadline_monotonic=deadline,
-            )
-        except GuardrailRejected as exc:
-            raise NativeBridgeError(public_failure_error(exc.failure)) from exc
 
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         accepted = False

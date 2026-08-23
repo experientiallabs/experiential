@@ -16,6 +16,7 @@ def test_output_buffer_is_required_only_when_output_checks_exist() -> None:
     """Unguarded policies and input-only policies skip response buffering."""
     input_only = GuardrailPolicy(
         policy_id="member-policy",
+        organization_id="organization-one",
         identity_id="identity-one",
         checks=(
             GuardrailCheck(

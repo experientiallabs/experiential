@@ -2,14 +2,14 @@
 
 Identity-scoped guardrails inspect a request after authentication and, when
 configured, inspect the winning completion before any caller byte is delivered.
-They are default-off. An identity with no assigned policy keeps the existing
-gateway hot path: no classifier call, no stream buffering, and no extra native
-callback.
+They are default-off. Lookup is by authenticated `organization_id` plus
+`identity_id`. A pair with no assigned policy keeps the existing gateway hot
+path: no classifier call, no stream buffering, and no extra native callback.
 
 ## Data flow
 
 1. Authenticate the virtual key and expand an optional Responses continuation.
-2. Look up at most one immutable policy by authenticated identity. Missing
+2. Look up at most one immutable policy by organization and identity. Missing
    policies stop here.
 3. Run the input chain once. The validated or transformed canonical request is
    reused for route resolution, provider preflight, acceptance, and every
@@ -23,11 +23,13 @@ callback.
 6. Return a sanitized OpenAI-shaped error on failure. Partial blocked output is
    never exposed.
 
-The native data plane follows the same order. Input enforcement runs after the
-engine-ownership decision (so escalated requests are not inspected twice) and
-before ledger acceptance. When admission sets `output_guardrail`, Rust buffers
-the completion and calls `enforce_output` once. Unguarded admissions omit that
-flag and never invoke the callback.
+The native data plane follows the same order. Input enforcement runs after
+Responses continuation expansion and before route resolution, provider
+preflight, ledger acceptance, and attempt start. A block never reaches routing.
+When native later escalates, the embedded python engine re-inspects the
+original public body. When admission sets `output_guardrail`, Rust buffers the
+completion and calls `enforce_output` once. Unguarded admissions omit that flag
+and never invoke the callback.
 
 ## Classifier adapters
 
@@ -59,21 +61,23 @@ failed check and continue the remaining chain.
 Input enforcement is on the request critical path after continuation expansion
 and before dispatch. Output enforcement for a protected identity delays the
 first visible byte until the winning completion is buffered and the output
-chain returns. Per-check timeouts are bounded by the remaining request
-deadline. Request and response content are bounded by `max_request_bytes` and
-`max_response_bytes` on the policy.
+chain returns. Each inspect runs on a daemon worker and is bounded by the
+tighter of the check timeout and the remaining request deadline. A hung
+adapter fails at that bound without blocking the asyncio event loop or
+waiting for the inspect to return. Request and response content are bounded
+by `max_request_bytes` and `max_response_bytes` on the policy.
 
 ## Privacy
 
 Logs and durable state record only content-free decision metadata: policy,
-identity, check, capability, action, and latency. Raw prompts, completions,
-detector payloads, and replacements are not logged or persisted. Replacements
-exist only in memory for the remainder of the request.
+organization, identity, check, capability, action, and latency. Raw prompts,
+completions, detector payloads, and replacements are not logged or persisted.
+Replacements exist only in memory for the remainder of the request.
 
 ## Configuration
 
 Place an optional file at `ROOT/gateway/guardrails.json`. Missing files leave
-every identity unguarded.
+every organization and identity unguarded.
 
 ```json
 {
@@ -87,6 +91,7 @@ every identity unguarded.
   "policies": [
     {
       "policy_id": "strict-member",
+      "organization_id": "organization-one",
       "identity_id": "identity-one",
       "protected": true,
       "max_request_bytes": 1048576,
@@ -121,7 +126,9 @@ Protected streaming may add classifier latency before the first token.
 
 - Guardrails do not change routing policy, budgets, or catalog snapshots.
 - Native multi-deployment pools still escalate to the python engine, which
-  owns waterfall accounting and runs input enforcement once.
+  owns waterfall accounting and runs input enforcement on the original public
+  body. Native already ran the input chain before deciding to escalate, so a
+  block never reaches python.
 - Classifiers must not call the public gateway. Recursion fails closed.
 - Oversized tool arguments count against the response byte bound and are
   blocked, not rewritten.

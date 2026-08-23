@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 
 from exp.runtime.gateway.contracts import (
@@ -91,6 +94,7 @@ def _engine(
     """Compose one engine over a single identity policy."""
     policy = GuardrailPolicy(
         policy_id="member-policy",
+        organization_id="organization-one",
         identity_id="identity-one",
         protected=protected,
         checks=checks,
@@ -98,7 +102,7 @@ def _engine(
         max_response_bytes=max_response_bytes,
     )
     engine = GuardrailEngine(
-        store=MappingGuardrailStore({"identity-one": policy}),
+        store=MappingGuardrailStore((policy,)),
         client=DirectClassifierClient(ClassifierRegistry({"scripted": classifier})),
         monotonic=(clock or _Clock()),
     )
@@ -122,7 +126,7 @@ def test_input_chain_runs_once_and_can_transform_the_request() -> None:
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policy_for("identity-one")
+    policy = engine.policy_for("organization-one", "identity-one")
     assert policy is not None
 
     result = engine.enforce_input(
@@ -142,7 +146,7 @@ def test_input_block_is_terminal_and_content_free() -> None:
         classifier=ScriptedClassifier(input_verdict=ClassifierVerdict(flagged=True)),
         checks=(_check("input-one"),),
     )
-    policy = engine.policy_for("identity-one")
+    policy = engine.policy_for("organization-one", "identity-one")
     assert policy is not None
 
     with pytest.raises(GuardrailRejected) as raised:
@@ -164,7 +168,7 @@ def test_protected_identity_fail_closes_on_adapter_error() -> None:
         checks=(_check("input-one"),),
         protected=True,
     )
-    policy = engine.policy_for("identity-one")
+    policy = engine.policy_for("organization-one", "identity-one")
     assert policy is not None
 
     with pytest.raises(GuardrailRejected) as raised:
@@ -185,7 +189,7 @@ def test_unprotected_identity_skips_a_failed_check() -> None:
         checks=(_check("input-one"),),
         protected=False,
     )
-    policy = engine.policy_for("identity-one")
+    policy = engine.policy_for("organization-one", "identity-one")
     assert policy is not None
 
     result = engine.enforce_input(
@@ -207,7 +211,7 @@ def test_expired_deadline_fail_closes_for_protected_identities() -> None:
         protected=True,
         clock=clock,
     )
-    policy = engine.policy_for("identity-one")
+    policy = engine.policy_for("organization-one", "identity-one")
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
@@ -232,7 +236,7 @@ def test_output_modify_never_rewrites_tool_call_arguments() -> None:
             ),
         ),
     )
-    policy = engine.policy_for("identity-one")
+    policy = engine.policy_for("organization-one", "identity-one")
     assert policy is not None
     completion = GuardrailCompletion(
         text="call a tool",
@@ -256,7 +260,7 @@ def test_oversized_payload_is_a_terminal_error() -> None:
         checks=(_check("input-one"),),
         max_request_bytes=4,
     )
-    policy = engine.policy_for("identity-one")
+    policy = engine.policy_for("organization-one", "identity-one")
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
@@ -267,4 +271,76 @@ def test_oversized_payload_is_a_terminal_error() -> None:
         )
 
     assert classifier.input_calls == 0
-    assert engine.policy_for("identity-two") is None
+    assert engine.policy_for("organization-one", "identity-two") is None
+    assert engine.policy_for("organization-two", "identity-one") is None
+
+
+class _BlockingClassifier(ScriptedClassifier):
+    """Adapter that sleeps longer than any per-check timeout."""
+
+    def inspect_input(self, *, request: GatewayRequest, check: GuardrailCheck) -> ClassifierVerdict:
+        """Block the caller thread until after the check budget expires."""
+        del request, check
+        self.input_calls += 1
+        time.sleep(0.25)
+        return ClassifierVerdict(flagged=False)
+
+
+def test_blocking_classifier_times_out_without_waiting_for_return() -> None:
+    """A hung inspect fails closed at the check timeout, not after the sleep."""
+    engine, classifier = _engine(
+        classifier=_BlockingClassifier(),
+        checks=(_check("input-one", timeout_ms=50),),
+        protected=True,
+        clock=_Clock(),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    started = time.monotonic()
+    with pytest.raises(GuardrailRejected) as raised:
+        engine.enforce_input(
+            policy=policy,
+            request=_request("hello"),
+            deadline_monotonic=200.0,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert raised.value.failure.safe_details["action"] == "error"
+    assert classifier.input_calls == 1
+
+
+def test_blocking_classifier_leaves_the_event_loop_free() -> None:
+    """A hung inspect waiting off-thread still lets other tasks progress."""
+
+    async def scenario() -> None:
+        """Run one timed-out inspect alongside a short sleep."""
+        engine, _classifier = _engine(
+            classifier=_BlockingClassifier(),
+            checks=(_check("input-one", timeout_ms=80),),
+            protected=True,
+            clock=_Clock(),
+        )
+        policy = engine.policy_for("organization-one", "identity-one")
+        assert policy is not None
+        progressed = False
+
+        async def marker() -> None:
+            """Flip after a delay shorter than the inspect sleep."""
+            nonlocal progressed
+            await asyncio.sleep(0.02)
+            progressed = True
+
+        task = asyncio.create_task(marker())
+        with pytest.raises(GuardrailRejected):
+            await asyncio.to_thread(
+                engine.enforce_input,
+                policy=policy,
+                request=_request("hello"),
+                deadline_monotonic=200.0,
+            )
+        await task
+        assert progressed
+
+    asyncio.run(scenario())

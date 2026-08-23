@@ -21,8 +21,8 @@ def load_guardrail_engine(root: Path) -> GuardrailEngine | None:
     """Return an engine when ``ROOT/gateway/guardrails.json`` exists.
 
     Missing files leave the gateway unguarded. The file assigns policies by
-    identity and may register local keyword adapters. It never stores raw
-    prompts, responses, or detector payloads.
+    organization and identity and may register local keyword adapters. It
+    never stores raw prompts, responses, or detector payloads.
 
     Args:
         root: Initialized EXP root that contains the ``gateway`` directory.
@@ -60,7 +60,7 @@ def engine_from_document(payload: JsonObject) -> GuardrailEngine:
     policies = _policies(payload)
     registry = ClassifierRegistry(_keyword_adapters(payload))
     return GuardrailEngine(
-        store=MappingGuardrailStore({policy.identity_id: policy for policy in policies}),
+        store=MappingGuardrailStore(policies),
         client=DirectClassifierClient(registry),
         monotonic=time.monotonic,
     )

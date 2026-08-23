@@ -52,6 +52,7 @@ def _engine() -> GuardrailEngine:
     """Compose one blocking input-and-output engine."""
     policy = GuardrailPolicy(
         policy_id="member-policy",
+        organization_id="organization-one",
         identity_id="identity-one",
         checks=(
             GuardrailCheck(
@@ -73,7 +74,7 @@ def _engine() -> GuardrailEngine:
         ),
     )
     return GuardrailEngine(
-        store=MappingGuardrailStore({"identity-one": policy}),
+        store=MappingGuardrailStore((policy,)),
         client=DirectClassifierClient(
             ClassifierRegistry(
                 {
@@ -122,7 +123,7 @@ def test_native_output_payload_round_trips_tool_calls() -> None:
 def test_native_output_block_returns_sanitized_failure_json() -> None:
     """A blocked output chain returns action plus a content-free failure."""
     engine = _engine()
-    policy = engine.policy_for("identity-one")
+    policy = engine.policy_for("organization-one", "identity-one")
     decision = json.loads(
         enforce_native_output(
             engine,

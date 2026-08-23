@@ -59,3 +59,30 @@ def test_text_replacement_does_not_edit_tool_call_events() -> None:
 
     assert texts == ("safe",)
     assert any(event.kind is GatewayEventKind.TOOL_CALL_COMPLETED for event in rewritten)
+    numbers = tuple(event.sequence_number for event in rewritten)
+    assert numbers == tuple(sorted(set(numbers)))
+
+
+def test_textless_and_refusal_replacements_keep_strictly_increasing_sequences() -> None:
+    """Inserted text takes the terminal sequence; later events increment."""
+    refusal_only = (
+        GatewayEvent(
+            kind=GatewayEventKind.REFUSAL_DELTA,
+            sequence_number=0,
+            text_delta="I cannot",
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+    )
+    empty = (GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0),)
+
+    refusal_rewritten = apply_text_replacement(refusal_only, "safe")
+    empty_rewritten = apply_text_replacement(empty, "safe")
+
+    assert [event.sequence_number for event in refusal_rewritten] == [0, 1, 2]
+    assert [event.kind for event in refusal_rewritten] == [
+        GatewayEventKind.REFUSAL_DELTA,
+        GatewayEventKind.TEXT_DELTA,
+        GatewayEventKind.COMPLETED,
+    ]
+    assert [event.sequence_number for event in empty_rewritten] == [0, 1]
+    assert empty_rewritten[0].text_delta == "safe"

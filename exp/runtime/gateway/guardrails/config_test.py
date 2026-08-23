@@ -28,6 +28,7 @@ def test_document_registers_keyword_adapters_and_identity_policies() -> None:
             "policies": [
                 {
                     "policy_id": "strict-member",
+                    "organization_id": "organization-one",
                     "identity_id": "identity-one",
                     "protected": True,
                     "checks": [
@@ -45,8 +46,9 @@ def test_document_registers_keyword_adapters_and_identity_policies() -> None:
         }
     )
 
-    assert engine.policy_for("identity-one") is not None
-    assert engine.policy_for("identity-two") is None
+    assert engine.policy_for("organization-one", "identity-one") is not None
+    assert engine.policy_for("organization-one", "identity-two") is None
+    assert engine.policy_for("organization-two", "identity-one") is None
 
 
 def test_unknown_adapter_kind_is_rejected() -> None:

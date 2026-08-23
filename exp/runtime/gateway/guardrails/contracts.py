@@ -13,6 +13,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
     IdentityId,
+    OrganizationId,
 )
 
 DEFAULT_MAX_REQUEST_BYTES = 1_048_576
@@ -60,14 +61,18 @@ class GuardrailCheck(ContractModel):
 
 
 class GuardrailPolicy(ContractModel):
-    """Immutable guardrail assignment for one authenticated identity.
+    """Immutable guardrail assignment for one organization-scoped identity.
 
-    ``protected`` fail-closes on adapter timeout, missing adapter, oversized
-    payload, or any other classifier uncertainty. Non-protected identities
-    skip a failed check and continue the remaining chain.
+    Lookup is ``(organization_id, identity_id)``. Identities are unique only
+    inside an organization, so the same identity ID in two organizations
+    cannot share a policy. ``protected`` fail-closes on adapter timeout,
+    missing adapter, oversized payload, or any other classifier uncertainty.
+    Non-protected identities skip a failed check and continue the remaining
+    chain.
     """
 
     policy_id: ArtifactId
+    organization_id: OrganizationId
     identity_id: IdentityId
     protected: bool = False
     checks: tuple[GuardrailCheck, ...] = ()

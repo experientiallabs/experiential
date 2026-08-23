@@ -43,7 +43,7 @@ def enforce_native_input(
     assert_not_internal_classification()
     if engine is None:
         return request, None
-    policy = engine.policy_for(authorization.identity_id)
+    policy = engine.policy_for(authorization.organization_id, authorization.identity_id)
     if policy is None:
         return request, None
     return (

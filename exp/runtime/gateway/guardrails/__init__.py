@@ -1,10 +1,11 @@
 """Identity-scoped, pluggable gateway guardrails.
 
-Policies are looked up by authenticated identity. An identity with no assigned
-policy leaves the existing gateway hot path unchanged: no classifier, no
-buffering, and no extra native callback. Python owns policy lookup and
-replaceable classifier adapters. Adapters are reached only through an injected
-internal client that cannot recurse through the public gateway route.
+Policies are looked up by authenticated organization and identity. A pair with
+no assigned policy leaves the existing gateway hot path unchanged: no
+classifier, no buffering, and no extra native callback. Python owns policy
+lookup and replaceable classifier adapters. Adapters are reached only through
+an injected internal client that cannot recurse through the public gateway
+route.
 """
 
 from exp.runtime.gateway.guardrails.classifiers import (

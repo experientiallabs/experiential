@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
@@ -23,6 +24,7 @@ from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_bridge_test import _admit, _chat_body, _control_plane
+from exp.runtime.gateway.routing import GatewayRoute
 
 
 def _engine(
@@ -55,12 +57,13 @@ def _engine(
         )
     policy = GuardrailPolicy(
         policy_id="member-policy",
+        organization_id="local",
         identity_id="default",
         protected=True,
         checks=tuple(checks),
     )
     return GuardrailEngine(
-        store=MappingGuardrailStore({"default": policy}),
+        store=MappingGuardrailStore((policy,)),
         client=DirectClassifierClient(ClassifierRegistry({"scripted": classifier})),
         monotonic=lambda: 0.0,
     )
@@ -111,9 +114,90 @@ def test_output_policy_sets_the_native_callback_flag(tmp_path: Path) -> None:
     assert classifier.output_calls == 1
 
 
+def test_native_input_runs_before_route_resolution(tmp_path: Path) -> None:
+    """Admit inspects the expanded request before resolving a route."""
+    order: list[str] = []
+
+    class _OrderClassifier(ScriptedClassifier):
+        """Record input inspection before any later admit step."""
+
+        def inspect_input(
+            self,
+            *,
+            request: GatewayRequest,
+            check: GuardrailCheck,
+        ) -> ClassifierVerdict:
+            """Mark input, then allow."""
+            del request, check
+            order.append("input")
+            self.input_calls += 1
+            return ClassifierVerdict(flagged=False)
+
+    class _OrderedPlane(NativeControlPlane):
+        """Record route resolution relative to input enforcement."""
+
+        def _resolve_route(
+            self,
+            authorization: AuthorizationSnapshot,
+            request: GatewayRequest,
+        ) -> GatewayRoute:
+            """Mark resolve, then delegate."""
+            order.append("resolve")
+            return super()._resolve_route(authorization, request)
+
+    engine = _engine(_OrderClassifier())
+    control, raw_key = _native_with_engine(tmp_path, engine, plane_cls=_OrderedPlane)
+    admission = _admit(control, raw_key, _chat_body())
+
+    assert order == ["input", "resolve"]
+    assert admission["output_guardrail"] is False
+
+
+def test_native_input_block_never_resolves_a_route(tmp_path: Path) -> None:
+    """A blocked input chain fails admit before route resolution."""
+    order: list[str] = []
+
+    class _BlockClassifier(ScriptedClassifier):
+        """Record a blocking input inspection."""
+
+        def inspect_input(
+            self,
+            *,
+            request: GatewayRequest,
+            check: GuardrailCheck,
+        ) -> ClassifierVerdict:
+            """Mark input, then flag."""
+            del request, check
+            order.append("input")
+            self.input_calls += 1
+            return ClassifierVerdict(flagged=True)
+
+    class _OrderedPlane(NativeControlPlane):
+        """Fail the test if routing runs after a block."""
+
+        def _resolve_route(
+            self,
+            authorization: AuthorizationSnapshot,
+            request: GatewayRequest,
+        ) -> GatewayRoute:
+            """Mark resolve, then delegate."""
+            order.append("resolve")
+            return super()._resolve_route(authorization, request)
+
+    engine = _engine(_BlockClassifier())
+    control, issued = _native_with_engine(tmp_path, engine, plane_cls=_OrderedPlane)
+
+    with pytest.raises(NativeBridgeError):
+        _admit(control, issued, _chat_body())
+
+    assert order == ["input"]
+
+
 def _native_with_engine(
     root: Path,
     engine: GuardrailEngine,
+    *,
+    plane_cls: type[NativeControlPlane] = NativeControlPlane,
 ) -> tuple[NativeControlPlane, str]:
     """Load one configured alias and bind an injected engine."""
     _manager, raw_key = _configured_gateway(root)
@@ -121,4 +205,4 @@ def _native_with_engine(
         root,
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
     )
-    return NativeControlPlane(components, guardrails=engine), raw_key
+    return plane_cls(components, guardrails=engine), raw_key
