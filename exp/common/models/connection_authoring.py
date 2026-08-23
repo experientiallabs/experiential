@@ -129,13 +129,26 @@ def sync_provider_models(
     with file_write_lock(path, what="provider model synchronization"):
         existing = load_model_catalog(path) if path.exists() else None
         current_connections = dict(existing.connections) if existing is not None else {}
-        current = current_connections.get(connection.name)
-        if current is not None and current != connection.catalog_config() and not replace:
-            raise ProviderConnectionAuthoringError(
-                f"connection {connection.name!r} already differs; rerun with replacement"
-            )
-        current_connections[connection.name] = connection.catalog_config()
         current_models = dict(existing.models) if existing is not None else {}
+        current = current_connections.get(connection.name)
+        proposed_connection = connection.catalog_config()
+        if current is not None and current != proposed_connection:
+            protected_aliases = tuple(
+                alias
+                for alias, record in current_models.items()
+                if record.connection == connection.name and record.gateway is not None
+            )
+            if protected_aliases:
+                raise ProviderConnectionAuthoringError(
+                    f"connection {connection.name!r} differs from active gateway deployments "
+                    f"{', '.join(sorted(protected_aliases))}; use the existing endpoint or "
+                    "explicitly reconfigure the gateway"
+                )
+            if not replace:
+                raise ProviderConnectionAuthoringError(
+                    f"connection {connection.name!r} already differs; rerun with replacement"
+                )
+        current_connections[connection.name] = proposed_connection
         for alias, proposed in models.items():
             previous = current_models.get(alias)
             if previous == proposed:
