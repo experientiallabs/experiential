@@ -216,7 +216,7 @@ def unused_loopback_port() -> int:
 
 
 def percentile(values: tuple[float, ...], pct: float) -> float:
-    """Return a nearest-rank percentile, matching the LiteLLM bench convention.
+    """Return a nearest-rank percentile from the sorted samples.
 
     Args:
         values: Observed samples. Empty input returns 0.0.

@@ -72,41 +72,33 @@ def _stats(
 def _run(
     run_index: int,
     *,
-    experiential_p50: float,
+    gateway_p50: float,
     mock_p50: float = 1.0,
-    litellm_p50: float | None = None,
     failures: int = 0,
-    litellm_failures: int = 0,
 ) -> LatencyMeasuredRun:
     """Build one measured run for representative-run tests.
 
     Args:
         run_index: 1-based repeat number.
-        experiential_p50: Experiential median used for median-run selection.
+        gateway_p50: Gateway median used for median-run selection.
         mock_p50: Mock-direct median.
-        litellm_p50: Optional LiteLLM median.
-        failures: Failures applied to the Experiential arm.
-        litellm_failures: Failures applied to the LiteLLM arm.
+        failures: Failures applied to the gateway arm.
 
     Returns:
         Synthetic measured run.
     """
     mock = _stats(p50_ms=mock_p50)
-    experiential = _stats(p50_ms=experiential_p50, failures=failures)
-    litellm = None if litellm_p50 is None else _stats(p50_ms=litellm_p50, failures=litellm_failures)
+    gateway = _stats(p50_ms=gateway_p50, failures=failures)
     return LatencyMeasuredRun(
         run_index=run_index,
-        gateway_order=("experiential", "litellm") if litellm is not None else ("experiential",),
         mock_direct=mock,
-        experiential=experiential,
-        experiential_added=gateway_added(experiential, mock),
-        litellm=litellm,
-        litellm_added=None if litellm is None else gateway_added(litellm, mock),
+        gateway=gateway,
+        gateway_added=gateway_added(gateway, mock),
     )
 
 
-def test_percentile_matches_litellm_nearest_rank() -> None:
-    """Nearest-rank p50/p95/p99 follow the LiteLLM bench convention."""
+def test_percentile_matches_nearest_rank() -> None:
+    """Nearest-rank p50/p95/p99 select the expected sorted samples."""
     values = tuple(float(index) for index in range(1, 11))
     assert percentile((), 50) == 0.0
     assert percentile(values, 50) == 6.0
@@ -143,40 +135,33 @@ def test_gateway_added_is_client_observed_difference() -> None:
 
 
 def test_select_representative_run_keeps_one_whole_run() -> None:
-    """The median Experiential p50 selects one internally consistent run."""
+    """The median gateway p50 selects one internally consistent run."""
     runs = (
-        _run(1, experiential_p50=50.0, litellm_p50=80.0),
-        _run(2, experiential_p50=20.0, litellm_p50=90.0),
-        _run(3, experiential_p50=30.0, litellm_p50=70.0),
+        _run(1, gateway_p50=50.0),
+        _run(2, gateway_p50=20.0),
+        _run(3, gateway_p50=30.0),
     )
     chosen = select_representative_run(runs)
     assert chosen.run_index == 3
-    assert chosen.experiential_added.p50_ms == 29.0
-    assert chosen.litellm is not None
-    assert chosen.litellm.p50_ms == 70.0
+    assert chosen.gateway_added.p50_ms == 29.0
     with pytest.raises(ValueError, match="at least one"):
         select_representative_run(())
 
 
 def test_functional_failures_fail_closed() -> None:
     """Any measured request failure is a hard report error."""
-    with pytest.raises(RuntimeError, match="run 1 experiential"):
-        _assert_functional_success((_run(1, experiential_p50=20.0, failures=1),))
-    with pytest.raises(RuntimeError, match="run 1 litellm"):
-        _assert_functional_success(
-            (_run(1, experiential_p50=20.0, litellm_p50=30.0, litellm_failures=2),)
-        )
-    _assert_functional_success((_run(1, experiential_p50=20.0, litellm_p50=30.0),))
+    with pytest.raises(RuntimeError, match="run 1 gateway"):
+        _assert_functional_success((_run(1, gateway_p50=20.0, failures=1),))
+    _assert_functional_success((_run(1, gateway_p50=20.0),))
 
 
-def test_render_markdown_states_same_host_comparison() -> None:
-    """The job summary names hardware, both proxies, and the mock caveat."""
+def test_render_markdown_states_mock_and_gateway() -> None:
+    """The job summary names hardware, both arms, and the mock caveat."""
     mock = _stats(p50_ms=2.0, p95_ms=3.0, p99_ms=4.0, requests=40)
-    experiential = _stats(p50_ms=32.0, p95_ms=40.0, p99_ms=50.0, requests=40)
-    litellm = _stats(p50_ms=80.0, p95_ms=90.0, p99_ms=100.0, requests=40)
+    gateway = _stats(p50_ms=32.0, p95_ms=40.0, p99_ms=50.0, requests=40)
     report = LatencyReport(
         measured_at=datetime(2026, 8, 22, 18, 0, tzinfo=UTC),
-        config=default_config(compare_litellm=True),
+        config=default_config(),
         runner=RunnerContext(
             commit_sha="abc123def456",
             python_version="3.12.11",
@@ -186,42 +171,32 @@ def test_render_markdown_states_same_host_comparison() -> None:
             cpu_count=4,
             cpu_model="AMD EPYC",
             gateway_engine="rust",
-            litellm_version="1.97.0",
-            litellm_startup="litellm --config",
         ),
         representative_run=LatencyMeasuredRun(
             run_index=2,
-            gateway_order=("litellm", "experiential"),
             mock_direct=mock,
-            experiential=experiential,
-            experiential_added=gateway_added(experiential, mock),
-            litellm=litellm,
-            litellm_added=gateway_added(litellm, mock),
+            gateway=gateway,
+            gateway_added=gateway_added(gateway, mock),
             mock_direct_ttft=mock,
-            experiential_ttft=experiential,
-            experiential_added_ttft=gateway_added(experiential, mock),
-            litellm_ttft=litellm,
-            litellm_added_ttft=gateway_added(litellm, mock),
+            gateway_ttft=gateway,
+            gateway_added_ttft=gateway_added(gateway, mock),
         ),
         runs=(
-            _run(1, experiential_p50=32.0, litellm_p50=80.0),
-            _run(2, experiential_p50=32.0, litellm_p50=80.0),
-            _run(3, experiential_p50=40.0, litellm_p50=90.0),
+            _run(1, gateway_p50=32.0),
+            _run(2, gateway_p50=32.0),
+            _run(3, gateway_p50=40.0),
         ),
     )
     markdown = render_markdown(report)
     assert CAVEAT in markdown
     assert "`abc123def456`" in markdown
     assert "rust" in markdown
-    assert "experiential-added" in markdown
-    assert "litellm-added" in markdown
+    assert "gateway-added" in markdown
     assert "4 x AMD EPYC" in markdown
-    assert "litellm then experiential" in markdown
     assert "Streaming time to first token" in markdown
-    assert "1K-RPS" in markdown
     parsed = LatencyReport.model_validate_json(report.model_dump_json())
     assert parsed.schema_name == SCHEMA_NAME
-    assert parsed.schema_version == 2
+    assert parsed.schema_version == 1
 
 
 def test_mock_server_answers_json_and_first_token() -> None:
@@ -272,9 +247,6 @@ def test_parse_args_keeps_ci_defaults() -> None:
     assert args.repeats == config.repeats
     assert args.stream_requests == config.stream_measured_requests
     assert args.no_stream_ttft is False
-    assert args.compare_litellm is False
-    compare = parse_args(["--compare-litellm"])
-    assert compare.compare_litellm is True
 
 
 def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
@@ -291,17 +263,15 @@ def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:
             stream_concurrency=1,
             timeout_s=10.0,
             measure_streaming_ttft=True,
-            compare_litellm=False,
         ),
     )
     payload = json.loads(report.model_dump_json())
     assert payload["schema_name"] == SCHEMA_NAME
     assert payload["schema_version"] == SCHEMA_VERSION
     assert report.representative_run.mock_direct.failures == 0
-    assert report.representative_run.experiential.failures == 0
-    assert report.representative_run.experiential_ttft is not None
-    assert report.representative_run.experiential_ttft.failures == 0
-    assert report.representative_run.litellm is None
+    assert report.representative_run.gateway.failures == 0
+    assert report.representative_run.gateway_ttft is not None
+    assert report.representative_run.gateway_ttft.failures == 0
     assert report.runner.gateway_engine in {"rust", "python", "unknown"}
     assert "raw_key" not in payload
     assert "EXP_LATENCY_MOCK_KEY" not in json.dumps(payload)

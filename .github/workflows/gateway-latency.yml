@@ -25,15 +25,12 @@ jobs:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
         run: uv sync --extra dev
-      - name: Measure Experiential and LiteLLM against a local mock
+      - name: Measure Experiential gateway overhead against a local mock
         env:
           EXP_TELEMETRY: "0"
           DO_NOT_TRACK: "1"
-          LITELLM_LOG: "ERROR"
         run: >-
-          uv run --with 'litellm[proxy]==1.97.0'
-          python -m exp.runtime.gateway.latency_report
-          --compare-litellm
+          uv run python -m exp.runtime.gateway.latency_report
           --output-json gateway-latency.json
           --github-summary "$GITHUB_STEP_SUMMARY"
       - name: Upload the versioned latency report
