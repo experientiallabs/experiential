@@ -6,8 +6,10 @@ on the exact release checkout.
 
 ## Supported and verified
 
-- Root CLI commands are exactly `build`, `config`, `optimize`, and `run`; an invocation with no subcommand
+- Root CLI commands are exactly `build`, `config`, `login`, `optimize`, and `run`; an invocation with no subcommand
   opens the default gateway home screen. Optimizer commands are exactly `router` and `model`.
+- `exp login` opens the Platform approval flow for Experiential Cloud and stores the returned
+  organization key in the user-data credential file; no credential value is written to the project.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses, bounded in-memory continuation and replay,

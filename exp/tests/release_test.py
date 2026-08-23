@@ -3167,7 +3167,7 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     assert "by_billing_source" in usage
     assert "exp optimize route" not in usage.replace("exp optimize router", "")
     assert "exp auth" not in usage
-    assert "exp login" not in usage
+    assert "exp login" in usage
     assert "exp config credentials" not in usage
 
     scope = (docs / "release-scope.md").read_text(encoding="utf-8")

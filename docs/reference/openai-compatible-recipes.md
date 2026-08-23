@@ -122,10 +122,11 @@ metadata the same way.
 Experiential Cloud is the first-party hosted Platform lane, not a local gateway recipe. Customers
 call `https://api.experientiallabs.ai/v1` with a durable Platform `xpl_` key resolved from
 `EXPLABS_API_KEY` or the user-data credential file. Setup does not prompt for a base URL and does not write a local `gateway.db`
-authority for this path. In an interactive terminal, the command opens Platform approval and
-stores the returned key after the loopback callback completes.
+authority for this path. Run `exp login` in an interactive terminal to open Platform approval and
+store the returned key after the loopback callback completes.
 
 ```bash
+exp login
 exp config providers --provider experiential-cloud --root ROOT
 ```
 

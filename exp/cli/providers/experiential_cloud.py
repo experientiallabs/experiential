@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from rich.console import Console
 
+from exp.common.auth import StoredCredentialBinding
 from exp.common.models import ProviderConnection
 
 SETUP_PICKER_NAME = "experiential-cloud"
@@ -39,7 +40,7 @@ _FAILURE_PAGE = b"""<!doctype html>
 <html><body style="font-family: system-ui; padding: 48px; color: #171717;">
 <h1 style="font-size: 18px;">That did not match</h1>
 <p>This callback was not for the login attempt waiting in your terminal.
-Re-run <code>exp config providers --provider experiential-cloud</code> and use the new URL.</p>
+Re-run <code>exp login</code> and use the new URL.</p>
 </body></html>"""
 
 
@@ -189,6 +190,41 @@ def hosted_gateway_base_url(environment: Mapping[str, str] | None = None) -> str
     source: Mapping[str, str] = os.environ if environment is None else environment
     value = source.get(HOSTED_GATEWAY_URL_ENV, "").strip()
     return value or HOSTED_GATEWAY_DEFAULT_BASE_URL
+
+
+def hosted_connection(environment: Mapping[str, str] | None = None) -> ProviderConnection:
+    """Return the stable Experiential Cloud connection used by setup and login.
+
+    Args:
+        environment: Optional process environment used for gateway-origin overrides.
+
+    Returns:
+        Secret-free provider metadata for the first-party hosted gateway.
+    """
+    return ProviderConnection(
+        name=SETUP_PICKER_NAME,
+        provider=CATALOG_PROVIDER,
+        api_key_env=HOSTED_GATEWAY_API_KEY_ENV,
+        base_url=hosted_gateway_base_url(environment),
+    )
+
+
+def hosted_credential_binding(
+    environment: Mapping[str, str] | None = None,
+) -> StoredCredentialBinding:
+    """Return the endpoint binding for the hosted Cloud credential record.
+
+    Args:
+        environment: Optional process environment used for gateway-origin overrides.
+
+    Returns:
+        Secret-free binding that prevents a stored key from crossing hosted endpoints.
+    """
+    connection = hosted_connection(environment)
+    return StoredCredentialBinding(
+        provider=connection.provider,
+        endpoint_sha256=connection.catalog_config().identity_sha256(),
+    )
 
 
 def hosted_platform_url(environment: Mapping[str, str] | None = None) -> str:

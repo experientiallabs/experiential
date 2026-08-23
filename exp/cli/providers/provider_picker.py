@@ -20,18 +20,14 @@ from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
 from exp.cli.providers.experiential_cloud import (
-    CATALOG_PROVIDER as HOSTED_CATALOG_PROVIDER,
-)
-from exp.cli.providers.experiential_cloud import (
-    HOSTED_GATEWAY_API_KEY_ENV,
-    hosted_gateway_base_url,
-    hosted_platform_login,
-)
-from exp.cli.providers.experiential_cloud import (
     SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
 )
 from exp.cli.providers.experiential_cloud import (
     SETUP_PICKER_NAME as HOSTED_SETUP_PICKER,
+)
+from exp.cli.providers.experiential_cloud import (
+    hosted_connection,
+    hosted_platform_login,
 )
 from exp.cli.shared.picker import (
     PickerAction,
@@ -351,11 +347,7 @@ def collect_provider_connection(
     if provider not in SETUP_PROVIDER_LABELS:
         raise ValueError(f"unsupported provider {provider!r}")
     if provider == HOSTED_SETUP_PICKER:
-        return ConnectionConfig(
-            provider=HOSTED_CATALOG_PROVIDER,
-            api_key_env=HOSTED_GATEWAY_API_KEY_ENV,
-            base_url=hosted_gateway_base_url(environment),
-        )
+        return hosted_connection(environment).catalog_config()
     base_url = None
     api_version = None
     region = None

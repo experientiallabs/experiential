@@ -12,17 +12,19 @@ repeatable `--provider` flags (`experiential-cloud`, `openai`, `anthropic`, `gem
 fail before any catalog write. Azure and Bedrock still require manual model IDs. Other selected
 providers use account model discovery when credentials are available.
 
-`experiential-cloud` is a setup picker for the hosted Platform gateway. It persists
+`exp login` is the first-party authentication command for the hosted Platform gateway. It opens
+the Platform `/cli/auth` approval page, receives an organization `xpl_` key through the loopback
+callback, and stores that key in the user-data credential file. `experiential-cloud` is the setup
+picker for the same gateway. It persists
 `provider = "openai-compatible"` with `base_url` `https://api.experientiallabs.ai/v1` (or
 `EXP_GATEWAY_URL` when that override is set) and `api_key_env = "EXPLABS_API_KEY"`. The CLI does
 not rebuild a local gateway authority for that hosted path. Local `exp run` first-run setup keeps
 the offline provider list and does not offer Experiential Cloud.
 
-When an interactive terminal selects Experiential Cloud without an environment or stored key,
-setup opens the Platform `/cli/auth` approval page. After approval, the new `xpl_` key returns
-through a loopback callback, is verified by model discovery, and is stored in the user-data
-credential file. Set `EXP_PLATFORM_URL` for a preview or staging Platform web origin. Headless
-and CI setup should provide `EXPLABS_API_KEY` instead.
+After `exp login`, run `exp config providers --provider experiential-cloud` to discover and select
+hosted models. When that setup flow has no environment or stored key, it can also open the same
+Platform approval flow as a convenience. Set `EXP_PLATFORM_URL` for a preview or staging Platform
+web origin. Headless and CI setup should provide `EXPLABS_API_KEY` instead.
 
 Setup writes only secret-free catalog fields and never prints a credential value. Interactive
 `exp config providers` persists browser-approved or pasted API keys outside the repository in the platform
