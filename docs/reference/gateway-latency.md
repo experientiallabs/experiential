@@ -38,14 +38,16 @@ Local report:
 ```bash
 uv sync --extra dev
 uv run python -m exp.runtime.gateway.latency_report \
-  --output-json gateway-latency.json
+  --output-json gateway-latency.json \
+  --output-badge gateway-overhead.json
 ```
 
 Focused tests:
 
 ```bash
 uv run pytest -q exp/runtime/gateway/latency_report_test.py \
-  exp/runtime/gateway/latency_measure_test.py
+  exp/runtime/gateway/latency_measure_test.py \
+  exp/runtime/gateway/latency_badge_test.py
 ```
 
 The workflow `.github/workflows/gateway-latency.yml` runs on every push to
@@ -57,16 +59,37 @@ There is no hard latency threshold.
 ## Artifact
 
 The job uploads `gateway-latency.json` with schema
-`exp.gateway.latency_report` version 1 and writes a Markdown table to the
-GitHub Actions job summary. The JSON records the commit SHA, runner OS, CPU
-count and model, Python version, resolved Experiential engine, every repeat,
-and the median run by gateway non-stream p50.
+`exp.gateway.latency_report` version 1, plus the derived Shields endpoint
+`gateway-overhead.json`. It also writes a Markdown table to the GitHub Actions
+job summary. The report records the commit SHA, runner OS, CPU count and model,
+Python version, resolved Experiential engine, every repeat, and the median run
+by gateway non-stream p50.
 
-## Status badge
+## Numeric overhead badge
 
-A workflow-status badge is the zero-secret signal. It does not embed a
-latency number. The root README includes this badge:
+The root README shows the latest **representative p50 gateway-added
+non-stream latency** from a successful routine run on `main`. The badge is a
+Shields endpoint, not a GitHub Actions pass/fail status image. The label is
+`gateway overhead` and the message is the measured value, for example
+`14.6 ms`.
+
+After each successful `push` to `main`, the workflow copies
+`gateway-overhead.json` to the `badges` branch. Pull requests and
+`workflow_dispatch` (including the 32-core runner) measure and upload the
+artifact but do not publish the badge. That branch is not `main`, so the
+update does not require a protected-branch push and does not start gate,
+latency, or package workflows.
+
+Stable endpoint:
+
+`https://raw.githubusercontent.com/experientiallabs/experiential/badges/gateway-overhead.json`
+
+README image:
 
 ```markdown
-[![Gateway latency](https://github.com/experientiallabs/experiential/actions/workflows/gateway-latency.yml/badge.svg?branch=main)](https://github.com/experientiallabs/experiential/actions/workflows/gateway-latency.yml?query=branch%3Amain)
+[![gateway overhead](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fexperientiallabs%2Fexperiential%2Fbadges%2Fgateway-overhead.json)](https://github.com/experientiallabs/experiential/actions/workflows/gateway-latency.yml?query=branch%3Amain)
 ```
+
+The `badges` branch is created by the first successful main run after this
+workflow lands. Until that run finishes, the Shields image may render as
+invalid. Later successful main runs overwrite the same public file.

@@ -25,6 +25,7 @@ from pydantic import Field
 from rich.console import Console
 
 from exp.common.core.artifacts import ContractModel, JsonObject
+from exp.runtime.gateway.latency_badge import write_shields_endpoint
 from exp.runtime.gateway.latency_measure import (
     ALIAS_ID,
     CHAT_PATH,
@@ -572,14 +573,16 @@ def write_report_outputs(
     report: LatencyReport,
     *,
     output_json: Path | None,
+    output_badge: Path | None,
     github_summary: Path | None,
     console: Console,
 ) -> None:
-    """Write the JSON artifact, optional job summary, and console Markdown.
+    """Write the JSON artifact, optional badge endpoint, and console Markdown.
 
     Args:
         report: Completed report.
         output_json: Optional destination for the versioned JSON artifact.
+        output_badge: Optional Shields endpoint JSON for the README badge.
         github_summary: Optional GitHub Actions step-summary path.
         console: User-facing console for the Markdown table.
     """
@@ -589,6 +592,11 @@ def write_report_outputs(
         output_json.write_text(
             report.model_dump_json(indent=2) + "\n",
             encoding="utf-8",
+        )
+    if output_badge is not None:
+        write_shields_endpoint(
+            p50_ms=report.representative_run.gateway_added.p50_ms,
+            path=output_badge,
         )
     if github_summary is not None:
         github_summary.write_text(markdown, encoding="utf-8")
@@ -608,6 +616,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-json",
         type=Path,
         help="Write the versioned JSON report to this path.",
+    )
+    parser.add_argument(
+        "--output-badge",
+        type=Path,
+        help="Write the Shields endpoint JSON for the README overhead badge.",
     )
     parser.add_argument(
         "--github-summary",
@@ -663,15 +676,20 @@ def main(argv: list[str] | None = None) -> int:
         if env_summary:
             summary = Path(env_summary)
     if args.work_root is not None:
-        return _run_and_write(args.work_root, config, args.output_json, summary, console)
+        return _run_and_write(
+            args.work_root, config, args.output_json, args.output_badge, summary, console
+        )
     with tempfile.TemporaryDirectory(prefix="exp-gateway-latency-") as tmp_dir:
-        return _run_and_write(Path(tmp_dir), config, args.output_json, summary, console)
+        return _run_and_write(
+            Path(tmp_dir), config, args.output_json, args.output_badge, summary, console
+        )
 
 
 def _run_and_write(
     work_root: Path,
     config: LatencyRunConfig,
     output_json: Path | None,
+    output_badge: Path | None,
     github_summary: Path | None,
     console: Console,
 ) -> int:
@@ -681,6 +699,7 @@ def _run_and_write(
         work_root: EXP root for the temporary gateway.
         config: Fixed request schedule.
         output_json: Optional JSON artifact path.
+        output_badge: Optional Shields endpoint JSON path.
         github_summary: Optional GitHub Actions summary path.
         console: User-facing console.
 
@@ -695,6 +714,7 @@ def _run_and_write(
     write_report_outputs(
         report,
         output_json=output_json,
+        output_badge=output_badge,
         github_summary=github_summary,
         console=console,
     )

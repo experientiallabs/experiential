@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from rich.console import Console
 
 from exp.runtime.gateway.latency_measure import (
     MockOpenAIServer,
@@ -34,6 +35,7 @@ from exp.runtime.gateway.latency_report import (
     run_latency_report,
     select_representative_run,
     summarize_samples,
+    write_report_outputs,
 )
 
 
@@ -199,6 +201,43 @@ def test_render_markdown_states_mock_and_gateway() -> None:
     assert parsed.schema_version == 1
 
 
+def test_write_report_outputs_writes_badge_from_representative_p50(tmp_path: Path) -> None:
+    """The Shields file uses representative gateway-added p50, not a constant."""
+    mock = _stats(p50_ms=2.0, p95_ms=3.0, p99_ms=4.0, requests=40)
+    gateway = _stats(p50_ms=16.58, p95_ms=20.0, p99_ms=24.0, requests=40)
+    report = LatencyReport(
+        measured_at=datetime(2026, 8, 22, 18, 0, tzinfo=UTC),
+        config=default_config(),
+        runner=RunnerContext(
+            commit_sha="abc123def456",
+            python_version="3.12.11",
+            platform_name="Linux",
+            runner_name="GitHub Actions ubuntu-latest",
+            gateway_engine="rust",
+        ),
+        representative_run=LatencyMeasuredRun(
+            run_index=1,
+            mock_direct=mock,
+            gateway=gateway,
+            gateway_added=gateway_added(gateway, mock),
+        ),
+        runs=(_run(1, gateway_p50=16.58, mock_p50=2.0),),
+    )
+    report_path = tmp_path / "gateway-latency.json"
+    badge_path = tmp_path / "gateway-overhead.json"
+    write_report_outputs(
+        report,
+        output_json=report_path,
+        output_badge=badge_path,
+        github_summary=None,
+        console=Console(width=200),
+    )
+    badge = json.loads(badge_path.read_text(encoding="utf-8"))
+    assert badge["label"] == "gateway overhead"
+    assert badge["message"] == "14.6 ms"
+    assert json.loads(report_path.read_text(encoding="utf-8"))["schema_name"] == SCHEMA_NAME
+
+
 def test_mock_server_answers_json_and_first_token() -> None:
     """The loopback mock serves non-streaming JSON and an immediate first token."""
     server = MockOpenAIServer()
@@ -247,6 +286,7 @@ def test_parse_args_keeps_ci_defaults() -> None:
     assert args.repeats == config.repeats
     assert args.stream_requests == config.stream_measured_requests
     assert args.no_stream_ttft is False
+    assert args.output_badge is None
 
 
 def test_run_latency_report_against_local_mock(tmp_path: Path) -> None:

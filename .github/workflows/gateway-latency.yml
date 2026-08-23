@@ -32,11 +32,60 @@ jobs:
         run: >-
           uv run python -m exp.runtime.gateway.latency_report
           --output-json gateway-latency.json
+          --output-badge gateway-overhead.json
           --github-summary "$GITHUB_STEP_SUMMARY"
       - name: Upload the versioned latency report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: gateway-latency-report
-          path: gateway-latency.json
+          path: |
+            gateway-latency.json
+            gateway-overhead.json
           if-no-files-found: warn
+
+  publish-badge:
+    # Update the public Shields endpoint only after a successful routine
+    # ubuntu-latest run on main. Do not publish PR measurements or the
+    # 32-core workflow_dispatch runner. Pushing the orphan badges branch
+    # does not trigger gate, latency, or package workflows, and GITHUB_TOKEN
+    # pushes do not start new workflow runs.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: latency
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: gateway-overhead-badge
+      cancel-in-progress: false
+    steps:
+      - name: Download the latency report artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: gateway-latency-report
+          path: report
+      - name: Publish the Shields endpoint on the badges branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -f report/gateway-overhead.json
+          test -f report/gateway-latency.json
+          git init badges-work
+          cd badges-work
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads origin badges >/dev/null; then
+            git fetch origin badges
+            git checkout -B badges origin/badges
+          else
+            git checkout --orphan badges
+          fi
+          cp ../report/gateway-overhead.json gateway-overhead.json
+          git add gateway-overhead.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Update gateway overhead badge [skip ci]"
+          git push origin HEAD:badges
