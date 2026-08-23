@@ -112,6 +112,32 @@ Place an optional file at `ROOT/gateway/guardrails.json`. Missing files leave
 every organization and identity unguarded. There is no global switch that
 turns classifiers on for every identity.
 
+## Interactive setup
+
+Setup Gateway shows `Guardrails: Off` on a first run. Pressing Enter accepts
+that default and does not create `gateway/guardrails.json`. The selected
+identity stays on the unguarded hot path.
+
+Choosing `edit` can opt the selected identity into the standard pack. The
+prompts stay short: enable or leave off, then a dedicated classifier URL, then
+an optional bearer credential environment-variable name. Setup never asks for
+or stores the credential value. An enabled choice authors the documented
+standard preset for the local organization and that identity, with
+`protected` true and the 250 ms default timeout. One `http_json` adapter is
+bound to all four capabilities because the outbound inspect contract includes
+`capability`.
+
+Reconfiguration keeps the current file unless the operator changes it. A
+hand-authored policy that is not the setup-owned standard pack is shown as
+`Custom/preserved`. Setup will not replace it unless the operator types
+`replace`. Other identities, policies, and adapters stay unchanged.
+
+Hand-author `ROOT/gateway/guardrails.json` when you need extra adapters,
+timeouts, identities, or checks that setup does not own. That file is the
+advanced escape hatch. Missing files remain the unguarded path.
+
+## Standard preset
+
 The `standard` preset is opt-in per organization and identity. It is never
 implied. The operator must name `preset: standard`, set an explicit
 `protected` boolean (`true` fail-closed or `false` fail-open), and bind an
@@ -229,8 +255,10 @@ Hand-authored checks remain available when a preset is not used:
 }
 ```
 
-There is no management UI. Bind additional adapters in process when composing
-a `GuardrailEngine`.
+Interactive setup can author the standard pack for one identity. Bind
+additional adapters in process when composing a `GuardrailEngine`, or
+hand-author `guardrails.json` for identities and checks that setup does not
+own.
 
 ## Inappropriate-content use
 

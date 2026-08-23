@@ -14,6 +14,12 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from exp.cli.gateway.guardrail_setup import (
+    GUARDRAILS_OFF,
+    GuardrailSetupPlan,
+    collect_guardrail_setup,
+    guardrail_setup_compensation,
+)
 from exp.cli.providers.experiential_cloud import SETUP_PICKER_NAME as HOSTED_SETUP_PICKER
 from exp.cli.providers.model_picker import GatewayModelSelection, select_gateway_model
 from exp.cli.providers.provider_picker import (
@@ -60,6 +66,7 @@ class InteractiveSetupResult:
     identity_id: str
     alias: str
     raw_key: str
+    guardrails: str
 
 
 @contextmanager
@@ -108,6 +115,8 @@ class _GatewaySetupValues:
     alias: str
     identity_id: str
     maximum_cost_usd: float
+    guardrail_plan: GuardrailSetupPlan | None
+    guardrails: str
 
 
 def interactive_gateway_setup(
@@ -129,7 +138,7 @@ def interactive_gateway_setup(
             provider and alias revisions in an existing gateway.
 
     Returns:
-        Created identity, alias, and one-time key material.
+        Created identity, alias, one-time key material, and guardrail status.
 
     Raises:
         typer.Abort: The operator cancels setup or reaches end of input.
@@ -170,6 +179,7 @@ def interactive_gateway_setup(
             values = _collect_gateway_values(
                 model_selection,
                 root=root,
+                organization_id=manager.organization_id,
                 console=console,
             )
             break
@@ -184,98 +194,103 @@ def interactive_gateway_setup(
         capabilities = capabilities.model_copy(
             update={"reasoning_effort": model_selection.reasoning_effort}
         )
-    total_steps = len(session.endpoints) + 7
+    total_steps = len(session.endpoints) + 8
     completed_steps = 0
 
     progress_context = (
         progress_display(console, single_line=True) if console.is_interactive else nullcontext(None)
     )
     with _command_budget_compensation(root, values.maximum_cost_usd):
-        with progress_context as progress:
+        with guardrail_setup_compensation(root, values.guardrail_plan):
+            with progress_context as progress:
 
-            def advance(detail: str) -> None:
-                """Advance the gateway setup progress bar after one completed mutation."""
-                nonlocal completed_steps
-                completed_steps += 1
-                report(
-                    progress,
-                    "gateway setup",
-                    completed=completed_steps,
-                    total=total_steps,
-                    detail=detail,
-                )
-
-            advance("save budget")
-            manager.initialize()
-            advance("initialize")
-            serving_connections = {
-                item.connection_id: item.config for item in manager.provider_connections()
-            }
-            for endpoint in session.endpoints:
-                serving_connections[endpoint.connection.name] = endpoint.connection.catalog_config()
-                advance(f"prepare {endpoint.connection.name}")
-            catalog_path = root / "models.toml"
-            with file_write_lock(catalog_path, what="the interactive gateway setup"):
-                update = plan_singleton_deployment_update(
-                    root,
-                    deployment_alias=values.alias,
-                    connection_name=selected.connection,
-                    provider_model=selected.model,
-                    exact_model_id=_gateway_exact_model_id(selected),
-                    revision=None,
-                    capabilities=capabilities,
-                    gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
-                    prices=GatewayTokenPrices(),
-                    pricing_source=None,
-                    billing_source=(
-                        BillingSource.HOST_MANAGED
-                        if selected.connection == HOSTED_SETUP_PICKER
-                        else BillingSource.CUSTOMER_MANAGED
-                    ),
-                    replace=reconfigure,
-                    serving_connections=serving_connections,
-                )
-                revision_id = f"revision-{uuid.uuid4().hex}"
-                key_id = f"key-{uuid.uuid4().hex}"
-                try:
-                    apply_singleton_deployment_update(root, update)
-                    identity_created, issued = manager.configure_direct_alias_with_identity(
-                        alias_id=values.alias,
-                        alias_name=values.alias,
-                        revision_id=revision_id,
-                        pool_id=values.alias,
-                        snapshot_ref=f"catalog-snapshots/{update.snapshot.name}",
-                        catalog_sha256=update.normalized.identity_sha256(),
-                        provider_connections=update.updated.connections,
-                        replace=reconfigure,
-                        identity_id=values.identity_id,
-                        identity_display_name=values.identity_id,
-                        key_id=key_id,
+                def advance(detail: str) -> None:
+                    """Advance the gateway setup progress bar after one completed mutation."""
+                    nonlocal completed_steps
+                    completed_steps += 1
+                    report(
+                        progress,
+                        "gateway setup",
+                        completed=completed_steps,
+                        total=total_steps,
+                        detail=detail,
                     )
-                except AliasActivationOutcomeUnknownError:
-                    raise
-                except BaseException:
+
+                advance("save budget")
+                advance("save guardrails")
+                manager.initialize()
+                advance("initialize")
+                serving_connections = {
+                    item.connection_id: item.config for item in manager.provider_connections()
+                }
+                for endpoint in session.endpoints:
+                    serving_connections[endpoint.connection.name] = (
+                        endpoint.connection.catalog_config()
+                    )
+                    advance(f"prepare {endpoint.connection.name}")
+                catalog_path = root / "models.toml"
+                with file_write_lock(catalog_path, what="the interactive gateway setup"):
+                    update = plan_singleton_deployment_update(
+                        root,
+                        deployment_alias=values.alias,
+                        connection_name=selected.connection,
+                        provider_model=selected.model,
+                        exact_model_id=_gateway_exact_model_id(selected),
+                        revision=None,
+                        capabilities=capabilities,
+                        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                        prices=GatewayTokenPrices(),
+                        pricing_source=None,
+                        billing_source=(
+                            BillingSource.HOST_MANAGED
+                            if selected.connection == HOSTED_SETUP_PICKER
+                            else BillingSource.CUSTOMER_MANAGED
+                        ),
+                        replace=reconfigure,
+                        serving_connections=serving_connections,
+                    )
+                    revision_id = f"revision-{uuid.uuid4().hex}"
+                    key_id = f"key-{uuid.uuid4().hex}"
                     try:
-                        rollback_singleton_deployment_update(root, update)
-                    except GatewayCatalogCompensationError as compensation_error:
-                        raise RuntimeError(
-                            "gateway setup catalog compensation outcome is unknown; inspect "
-                            "catalog and gateway status before retrying"
-                        ) from compensation_error
-                    raise
-                advance("write catalog")
-                advance("activate alias")
-                if identity_created:
-                    advance("create identity")
-                else:
-                    advance("reuse identity")
-                advance("grant alias")
-                advance("issue key")
+                        apply_singleton_deployment_update(root, update)
+                        identity_created, issued = manager.configure_direct_alias_with_identity(
+                            alias_id=values.alias,
+                            alias_name=values.alias,
+                            revision_id=revision_id,
+                            pool_id=values.alias,
+                            snapshot_ref=f"catalog-snapshots/{update.snapshot.name}",
+                            catalog_sha256=update.normalized.identity_sha256(),
+                            provider_connections=update.updated.connections,
+                            replace=reconfigure,
+                            identity_id=values.identity_id,
+                            identity_display_name=values.identity_id,
+                            key_id=key_id,
+                        )
+                    except AliasActivationOutcomeUnknownError:
+                        raise
+                    except BaseException:
+                        try:
+                            rollback_singleton_deployment_update(root, update)
+                        except GatewayCatalogCompensationError as compensation_error:
+                            raise RuntimeError(
+                                "gateway setup catalog compensation outcome is unknown; inspect "
+                                "catalog and gateway status before retrying"
+                            ) from compensation_error
+                        raise
+                    advance("write catalog")
+                    advance("activate alias")
+                    if identity_created:
+                        advance("create identity")
+                    else:
+                        advance("reuse identity")
+                    advance("grant alias")
+                    advance("issue key")
     console.print("[green]✓ Gateway configured[/green]")
     return InteractiveSetupResult(
         identity_id=values.identity_id,
         alias=values.alias,
         raw_key=issued.raw_key,
+        guardrails=values.guardrails,
     )
 
 
@@ -300,6 +315,7 @@ def _collect_gateway_values(
     model_selection: GatewayModelSelection,
     *,
     root: Path,
+    organization_id: str,
     console: Console,
 ) -> _GatewaySetupValues:
     """Show and optionally edit only the user-owned gateway defaults.
@@ -307,15 +323,24 @@ def _collect_gateway_values(
     Args:
         model_selection: Provider/model and effort already selected by the shared picker.
         root: EXP root owning the shared command budget setting.
+        organization_id: Local organization used to inspect and author guardrails.
         console: Terminal used for the defaults screen and optional field edits.
 
     Returns:
-        Alias, identity, and maximum command budget accepted by the operator.
+        Alias, identity, command budget, and guardrail choice accepted by the operator.
 
     Raises:
         typer.Abort: The operator reaches end of input or interrupts the screen.
+        ValueError: The existing guardrail file is malformed or an answer is unsafe.
     """
     defaults = _gateway_defaults(model_selection, root=root)
+    accepted = collect_guardrail_setup(
+        console=console,
+        root=root,
+        organization_id=organization_id,
+        identity_id=defaults.identity_id,
+        edit=False,
+    )
     table = Table.grid(padding=(0, 2))
     table.add_column(style="dim")
     table.add_column(style="green")
@@ -323,6 +348,7 @@ def _collect_gateway_values(
         ("Alias", defaults.alias),
         ("Identity ID", defaults.identity_id),
         ("Budget", f"${defaults.maximum_cost_usd:.2f}"),
+        ("Guardrails", accepted.display),
     ):
         table.add_row(label, Text(value, style="green"))
     console.print(table)
@@ -333,20 +359,38 @@ def _collect_gateway_values(
     except (EOFError, KeyboardInterrupt) as exc:
         raise typer.Abort from exc
     if not answer:
-        return defaults
+        return _GatewaySetupValues(
+            alias=defaults.alias,
+            identity_id=defaults.identity_id,
+            maximum_cost_usd=defaults.maximum_cost_usd,
+            guardrail_plan=accepted.plan,
+            guardrails=accepted.display,
+        )
 
     try:
-        return _GatewaySetupValues(
-            alias=ask_text("Alias", console=console, default=defaults.alias),
-            identity_id=ask_text("Identity ID", console=console, default=defaults.identity_id),
-            maximum_cost_usd=ask_price(
-                "Budget (USD)",
-                console=console,
-                default=f"{defaults.maximum_cost_usd:g}",
-            ),
+        alias = ask_text("Alias", console=console, default=defaults.alias)
+        identity_id = ask_text("Identity ID", console=console, default=defaults.identity_id)
+        maximum_cost_usd = ask_price(
+            "Budget (USD)",
+            console=console,
+            default=f"{defaults.maximum_cost_usd:g}",
+        )
+        selected = collect_guardrail_setup(
+            console=console,
+            root=root,
+            organization_id=organization_id,
+            identity_id=identity_id,
+            edit=True,
         )
     except SetupCancelled as exc:
         raise typer.Abort from exc
+    return _GatewaySetupValues(
+        alias=alias,
+        identity_id=identity_id,
+        maximum_cost_usd=maximum_cost_usd,
+        guardrail_plan=selected.plan,
+        guardrails=selected.display,
+    )
 
 
 def _gateway_defaults(
@@ -367,6 +411,8 @@ def _gateway_defaults(
         alias=model_selection.model.alias,
         identity_id="default",
         maximum_cost_usd=resolve_command_budget_usd(root, None),
+        guardrail_plan=None,
+        guardrails=GUARDRAILS_OFF,
     )
 
 

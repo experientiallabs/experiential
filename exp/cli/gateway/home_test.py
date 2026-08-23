@@ -88,6 +88,7 @@ def test_setup_gateway_returns_to_home_with_one_time_credentials(
             identity_id="default",
             alias="default-gateway",
             raw_key="exp_vk_test",
+            guardrails="Off",
         ),
     )
     console = ScriptedConsole("2\n3\n")
@@ -96,6 +97,7 @@ def test_setup_gateway_returns_to_home_with_one_time_credentials(
 
     assert "export EXP_GATEWAY_URL=http://127.0.0.1:8000/v1" in console.output
     assert "export EXP_GATEWAY_KEY=exp_vk_test" in console.output
+    assert "Guardrails: Off" in console.output
     assert "Choose Run Gateway to start it." in console.output
 
 
@@ -114,6 +116,7 @@ def test_setup_gateway_warns_and_reconfigures_an_initialized_gateway(
             identity_id="default",
             alias="default-gateway",
             raw_key="exp_vk_reconfigured",
+            guardrails="Off",
         )
 
     monkeypatch.setattr("exp.cli.gateway.setup.interactive_gateway_setup", setup_gateway)

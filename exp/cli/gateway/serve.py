@@ -239,7 +239,7 @@ def _run_gateway(
         try:
             setup = interactive_gateway_setup(root)
         except AliasActivationOutcomeUnknownError as exc:
-            _emit_setup_unknown_recovery(port=port, error=exc)
+            _emit_setup_unknown_recovery(port=port, root=root, error=exc)
             raise typer.BadParameter(str(exc)) from None
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from None
@@ -548,6 +548,7 @@ def _emit_setup_credentials(
     output = console or _console
     output.print(f"export EXP_GATEWAY_URL=http://{_LOOPBACK_HOST}:{port}/v1", markup=False)
     output.print(f"export EXP_GATEWAY_KEY={setup.raw_key}", markup=False)
+    output.print(f"Guardrails: {setup.guardrails}", markup=False)
 
 
 def emit_setup_credentials(*, port: int, setup: object, console: Console | None = None) -> None:
@@ -564,22 +565,34 @@ def emit_setup_credentials(*, port: int, setup: object, console: Console | None 
 def _emit_setup_unknown_recovery(
     *,
     port: int,
+    root: Path,
     error: AliasActivationOutcomeUnknownError,
 ) -> None:
     """Deliver the only raw key when first-run setup has an unknown commit outcome.
 
     Args:
         port: Loopback port that the gateway will serve if the setup committed.
+        root: EXP root whose selected guardrail file may already have landed.
         error: Typed activation error carrying the one-time key material when available.
     """
     if error.issued is None:
         return
+    from exp.cli.gateway.guardrail_setup import GUARDRAILS_CUSTOM, inspect_setup_guardrails
     from exp.cli.gateway.setup import InteractiveSetupResult
 
+    try:
+        guardrails = inspect_setup_guardrails(
+            root,
+            error.issued.organization_id,
+            error.issued.identity_id,
+        ).display
+    except ValueError:
+        guardrails = GUARDRAILS_CUSTOM
     setup = InteractiveSetupResult(
         identity_id=error.issued.identity_id,
         alias=error.alias_id,
         raw_key=error.issued.raw_key,
+        guardrails=guardrails,
     )
     _emit_setup_credentials(port=port, setup=setup)
     _console.print(

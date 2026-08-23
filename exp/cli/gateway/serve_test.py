@@ -325,6 +325,7 @@ def test_first_run_delivers_credentials_before_readiness_failure(
         identity_id="default",
         alias="gpt-5-6-luna",
         raw_key=raw_key,
+        guardrails="Off",
     )
 
     def interactive_setup(root: Path) -> InteractiveSetupResult:

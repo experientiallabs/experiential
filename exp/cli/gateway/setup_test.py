@@ -11,6 +11,11 @@ import typer
 import exp.runtime.gateway.sqlite.setup_authority as setup_authority
 import exp.runtime.gateway.sqlite.store as gateway_store
 from exp.cli.gateway import setup
+from exp.cli.gateway.guardrail_setup import (
+    GUARDRAILS_STANDARD,
+    guardrail_config_path,
+    inspect_setup_guardrails,
+)
 from exp.cli.providers import model_picker, provider_picker
 from exp.cli.providers.experiential_cloud import SETUP_PICKER_LABEL
 from exp.cli.shared.picker import PickerKey
@@ -157,11 +162,14 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
     result = setup.interactive_gateway_setup(tmp_path, console=console)
 
     assert result.alias == "gpt-5-6-luna"
+    assert result.guardrails == "Off"
     assert "Press Enter to accept all defaults" in console.output
     assert "Alias" in console.output
     assert "Identity ID" in console.output
     assert "Budget" in console.output
+    assert "Guardrails" in console.output
     assert "$50.00" in console.output
+    assert not (tmp_path / "gateway" / "guardrails.json").exists()
     assert "Exact model ID" not in console.output
     assert "Planned local mutations" not in console.output
     assert "Create this gateway configuration?" not in console.output
@@ -239,12 +247,14 @@ def test_gateway_setup_can_edit_the_displayed_defaults(
         "select_gateway_model",
         lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
     )
-    console = ScriptedConsole("edit\ncustom-alias\noperator\n75\n")
+    console = ScriptedConsole("edit\ncustom-alias\noperator\n75\noff\n")
 
     result = setup.interactive_gateway_setup(tmp_path, console=console)
 
     assert result.alias == "custom-alias"
     assert result.identity_id == "operator"
+    assert result.guardrails == "Off"
+    assert not (tmp_path / "gateway" / "guardrails.json").exists()
     assert "Alias" in console.output
     assert "Identity ID" in console.output
     assert "Budget" in console.output
@@ -315,7 +325,7 @@ def test_gateway_setup_reconfigures_provider_alias_and_existing_identity(
 
     result = setup.interactive_gateway_setup(
         tmp_path,
-        console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\n"),
+        console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\noff\n"),
         allow_reconfigure=True,
     )
 
@@ -396,7 +406,7 @@ def test_gateway_setup_rolls_back_catalog_and_provider_when_alias_activation_fai
     with pytest.raises(RuntimeError, match="alias activation failed"):
         setup.interactive_gateway_setup(
             tmp_path,
-            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n50\n"),
+            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n50\noff\n"),
             allow_reconfigure=True,
         )
 
@@ -468,7 +478,7 @@ def test_gateway_setup_rolls_back_all_authority_when_key_issue_fails(
     with pytest.raises(RuntimeError, match="key issue failed"):
         setup.interactive_gateway_setup(
             tmp_path,
-            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\n"),
+            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\noff\n"),
             allow_reconfigure=True,
         )
 
@@ -529,11 +539,211 @@ def test_gateway_setup_keeps_selected_budget_when_activation_outcome_is_unknown(
     with pytest.raises(AliasActivationOutcomeUnknownError, match="operation_outcome_unknown"):
         setup.interactive_gateway_setup(
             tmp_path,
-            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\n"),
+            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\noff\n"),
             allow_reconfigure=True,
         )
 
     assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
+
+
+def _stub_gateway_pickers(monkeypatch: pytest.MonkeyPatch) -> provider_picker.AvailableModel:
+    """Install the shared first-run picker seams used by setup tests.
+
+    Args:
+        monkeypatch: Active pytest monkeypatch.
+
+    Returns:
+        The selected completion model so callers can reuse its alias.
+    """
+    endpoints, models = _prepared_gateway_models()
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
+    )
+    return models[0]
+
+
+def test_gateway_setup_can_opt_the_selected_identity_into_standard_guardrails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Edit is the only path that authors the standard pack for the selected identity."""
+    model = _stub_gateway_pickers(monkeypatch)
+    console = ScriptedConsole(
+        "edit\n"
+        f"{model.alias}\n"
+        "default\n"
+        "50\n"
+        "on\n"
+        "https://classifier.example.invalid/v1/inspect\n"
+        "CLASSIFIER_BEARER\n"
+    )
+
+    result = setup.interactive_gateway_setup(tmp_path, console=console)
+
+    assert result.guardrails == GUARDRAILS_STANDARD
+    inspection = inspect_setup_guardrails(tmp_path, "local", "default")
+    assert inspection.display == GUARDRAILS_STANDARD
+    assert inspection.classifier_url == "https://classifier.example.invalid/v1/inspect"
+    assert inspection.bearer_env == "CLASSIFIER_BEARER"
+    payload = guardrail_config_path(tmp_path).read_text(encoding="utf-8")
+    assert "CLASSIFIER_BEARER" in payload
+    assert "sk-" not in payload
+
+
+def test_gateway_setup_reconfigure_enter_preserves_existing_standard_guardrails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconfiguration Enter keeps an existing setup-owned pack and does not rewrite it."""
+    model = _stub_gateway_pickers(monkeypatch)
+    first = setup.interactive_gateway_setup(
+        tmp_path,
+        console=ScriptedConsole(
+            "edit\n"
+            f"{model.alias}\n"
+            "default\n"
+            "50\n"
+            "on\n"
+            "https://classifier.example.invalid/v1/inspect\n"
+            "CLASSIFIER_BEARER\n"
+        ),
+    )
+    before = guardrail_config_path(tmp_path).read_bytes()
+
+    result = setup.interactive_gateway_setup(
+        tmp_path,
+        console=ScriptedConsole("\n"),
+        allow_reconfigure=True,
+    )
+
+    assert result.identity_id == first.identity_id
+    assert result.guardrails == GUARDRAILS_STANDARD
+    assert guardrail_config_path(tmp_path).read_bytes() == before
+
+
+def test_gateway_setup_restores_guardrails_when_alias_activation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proven catalog failure restores the previous guardrail file."""
+    model = _stub_gateway_pickers(monkeypatch)
+    setup.interactive_gateway_setup(
+        tmp_path,
+        console=ScriptedConsole(
+            "edit\n"
+            f"{model.alias}\n"
+            "default\n"
+            "50\n"
+            "on\n"
+            "https://classifier.example.invalid/v1/inspect\n"
+            "CLASSIFIER_BEARER\n"
+        ),
+    )
+    before = guardrail_config_path(tmp_path).read_bytes()
+
+    def fail_alias_activation(*_args: object, **_kwargs: object) -> None:
+        """Fail after the selected guardrail file has already been published."""
+        raise RuntimeError("alias activation failed")
+
+    monkeypatch.setattr(
+        gateway_store,
+        "activate_alias_revision_in_transaction",
+        fail_alias_activation,
+    )
+
+    with pytest.raises(RuntimeError, match="alias activation failed"):
+        setup.interactive_gateway_setup(
+            tmp_path,
+            console=ScriptedConsole(
+                "edit\n"
+                f"{model.alias}\n"
+                "default\n"
+                "50\n"
+                "on\n"
+                "https://classifier.example.invalid/v2/inspect\n"
+                "CLASSIFIER_BEARER\n"
+            ),
+            allow_reconfigure=True,
+        )
+
+    assert guardrail_config_path(tmp_path).read_bytes() == before
+    assert inspect_setup_guardrails(tmp_path, "local", "default").classifier_url == (
+        "https://classifier.example.invalid/v1/inspect"
+    )
+
+
+def test_gateway_setup_keeps_selected_guardrails_when_activation_outcome_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown SQLite outcome keeps the selected guardrail file with the budget."""
+    _stub_gateway_pickers(monkeypatch)
+    first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    issued = IssuedVirtualKey(
+        key_id="key-unknown",
+        organization_id="local",
+        identity_id=first.identity_id,
+        prefix="exp_vk_test",
+        raw_key="exp_vk_test_secret",
+        expires_at=None,
+        created_at=datetime.now(UTC),
+    )
+
+    def unknown_activation(*_args: object, **_kwargs: object) -> tuple[bool, IssuedVirtualKey]:
+        """Simulate an activation whose COMMIT acknowledgement is indeterminate."""
+        raise AliasActivationOutcomeUnknownError(
+            alias_id=first.alias,
+            revision_id="revision-unknown",
+            issued=issued,
+        )
+
+    monkeypatch.setattr(
+        setup.GatewayManagement,
+        "configure_direct_alias_with_identity",
+        unknown_activation,
+    )
+
+    with pytest.raises(AliasActivationOutcomeUnknownError, match="operation_outcome_unknown"):
+        setup.interactive_gateway_setup(
+            tmp_path,
+            console=ScriptedConsole(
+                "edit\n"
+                f"{first.alias}\n"
+                "default\n"
+                "75\n"
+                "on\n"
+                "https://classifier.example.invalid/v1/inspect\n"
+                "CLASSIFIER_BEARER\n"
+            ),
+            allow_reconfigure=True,
+        )
+
+    assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
+    assert inspect_setup_guardrails(tmp_path, "local", "default").display == GUARDRAILS_STANDARD
+
+
+def test_gateway_setup_fails_closed_on_malformed_guardrail_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present but invalid guardrail file blocks setup instead of reporting Off."""
+    _stub_gateway_pickers(monkeypatch)
+    path = tmp_path / "gateway" / "guardrails.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not valid JSON"):
+        setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    assert path.read_text(encoding="utf-8") == "{"
+    assert not setup.GatewayManagement(tmp_path).initialized
 
 
 def test_gateway_setup_writes_budget_before_gateway_initialization(
