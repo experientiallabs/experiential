@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.client import (
@@ -19,6 +20,10 @@ from exp.runtime.gateway.guardrails.contracts import (
 )
 
 DEFAULT_SYNC_COMPAT_WORKERS = 2
+
+
+class SyncClassifierBusyError(TimeoutError):
+    """No private sync worker is free, so the inspect was not queued."""
 
 
 class ClassifierRegistry:
@@ -165,7 +170,9 @@ class BoundedSyncClassifier:
     This wrapper is only for leftover synchronous adapters. Hung sync
     inspects occupy only this wrapper's private workers. They cannot take
     async inflight slots from healthy adapters, and they cannot share a
-    process-wide thread pool with other wrappers.
+    process-wide thread pool with other wrappers. Admission is capped at
+    ``max_workers``: a full wrapper fails immediately instead of queueing
+    another executor job that timeout cannot cancel.
     """
 
     def __init__(
@@ -186,10 +193,19 @@ class BoundedSyncClassifier:
         if max_workers < 1:
             raise ValueError("max_workers must be a positive integer")
         self._inner = inner
+        self._max_workers = max_workers
+        self._slots = threading.BoundedSemaphore(max_workers)
+        self._admitted = 0
+        self._admitted_lock = threading.Lock()
         self._pool = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="exp-guardrail-sync",
         )
+
+    def admitted_inspects(self) -> int:
+        """Return submitted sync inspects that have not finished."""
+        with self._admitted_lock:
+            return self._admitted
 
     async def inspect_input(
         self,
@@ -204,7 +220,7 @@ class BoundedSyncClassifier:
             with classification_scope():
                 return self._inner.inspect_input(request=request, check=check)
 
-        return await asyncio.get_running_loop().run_in_executor(self._pool, call)
+        return await self._run(call)
 
     async def inspect_output(
         self,
@@ -219,7 +235,73 @@ class BoundedSyncClassifier:
             with classification_scope():
                 return self._inner.inspect_output(completion=completion, check=check)
 
-        return await asyncio.get_running_loop().run_in_executor(self._pool, call)
+        return await self._run(call)
+
+    async def _run(self, fn: Callable[[], ClassifierVerdict]) -> ClassifierVerdict:
+        """Admit at most ``max_workers`` jobs and await one without cancelling it.
+
+        Args:
+            fn: Synchronous inspect to run on a private worker.
+
+        Returns:
+            The inspect verdict.
+
+        Raises:
+            SyncClassifierBusyError: Every private worker is already occupied.
+        """
+        if not self._admit():
+            raise SyncClassifierBusyError("sync classifier has no free worker")
+        try:
+            future = self._pool.submit(fn)
+        except Exception:
+            self._release_admission()
+            raise
+        waiter = asyncio.get_running_loop().create_future()
+        future.add_done_callback(lambda done: self._finish(done, waiter))
+        return await waiter
+
+    def _admit(self) -> bool:
+        """Reserve one private worker, or refuse if the cap is full."""
+        if not self._slots.acquire(blocking=False):
+            return False
+        with self._admitted_lock:
+            self._admitted += 1
+        return True
+
+    def _release_admission(self) -> None:
+        """Release one reserved private worker after its job finishes."""
+        with self._admitted_lock:
+            self._admitted -= 1
+        self._slots.release()
+
+    def _finish(
+        self,
+        future: Future[ClassifierVerdict],
+        waiter: asyncio.Future[ClassifierVerdict],
+    ) -> None:
+        """Release admission and complete the asyncio waiter without cancelling work.
+
+        Args:
+            future: Executor future that just became done.
+            waiter: Asyncio future the inspect coroutine is awaiting.
+        """
+        self._release_admission()
+        loop = waiter.get_loop()
+
+        def complete() -> None:
+            """Copy the worker result onto the waiter if it is still pending."""
+            if waiter.done():
+                return
+            if future.cancelled():
+                waiter.cancel()
+                return
+            error = future.exception()
+            if error is not None:
+                waiter.set_exception(error)
+                return
+            waiter.set_result(future.result())
+
+        loop.call_soon_threadsafe(complete)
 
 
 def _contains_needle(text: str, needles: tuple[str, ...]) -> bool:

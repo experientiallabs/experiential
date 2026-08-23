@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 
 import pytest
 
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
 from exp.runtime.gateway.guardrails.classifiers import (
     BoundedSyncClassifier,
     ClassifierRegistry,
     KeywordClassifier,
     ScriptedClassifier,
+    SyncClassifierBusyError,
 )
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
@@ -123,3 +127,120 @@ def test_bounded_sync_classifier_runs_leftover_adapters_on_a_private_pool() -> N
     verdict = asyncio.run(wrapper.inspect_input(request=request, check=_check()))
 
     assert verdict.flagged is False
+    assert wrapper.admitted_inspects() == 0
+
+
+class _HungSyncClassifier:
+    """Synchronous adapter that blocks until the test releases it."""
+
+    def __init__(self) -> None:
+        """Start with empty call counts and a closed gate."""
+        self.input_calls = 0
+        self.output_calls = 0
+        self.started = threading.Event()
+        self.finished = threading.Event()
+        self._block = threading.Event()
+
+    def release(self) -> None:
+        """Unblock every waiting worker thread."""
+        self._block.set()
+
+    def inspect_input(
+        self,
+        *,
+        request: GatewayRequest,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Block the private executor thread after signalling start."""
+        del request, check
+        self.input_calls += 1
+        self.started.set()
+        self._block.wait()
+        self.finished.set()
+        return ClassifierVerdict(flagged=False)
+
+    def inspect_output(
+        self,
+        *,
+        completion: GuardrailCompletion,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Block the private executor thread after signalling start."""
+        del completion, check
+        self.output_calls += 1
+        self.started.set()
+        self._block.wait()
+        self.finished.set()
+        return ClassifierVerdict(flagged=False)
+
+
+def _request() -> GatewayRequest:
+    """Return one empty-content request for sync-wrapper tests."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hello"),),
+    )
+
+
+def test_bounded_sync_classifier_rejects_overflow_instead_of_queueing() -> None:
+    """A blocked worker fails later inspects immediately and does not grow the queue."""
+
+    async def scenario() -> None:
+        """Occupy one worker, hammer the wrapper, then recover after release."""
+        hung = _HungSyncClassifier()
+        wrapper = BoundedSyncClassifier(hung, max_workers=1)
+        first = asyncio.create_task(wrapper.inspect_input(request=_request(), check=_check()))
+        await asyncio.get_running_loop().run_in_executor(None, hung.started.wait)
+        assert wrapper.admitted_inspects() == 1
+        started = time.monotonic()
+        overflow = await asyncio.gather(
+            *[wrapper.inspect_input(request=_request(), check=_check()) for _ in range(20)],
+            return_exceptions=True,
+        )
+        elapsed = time.monotonic() - started
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert elapsed < 0.2
+        assert hung.input_calls == 1
+        assert wrapper.admitted_inspects() == 1
+        assert all(isinstance(item, SyncClassifierBusyError) for item in overflow)
+        hung.release()
+        await asyncio.get_running_loop().run_in_executor(None, hung.finished.wait)
+        assert wrapper.admitted_inspects() == 0
+        recovered = await wrapper.inspect_input(request=_request(), check=_check())
+        assert recovered.flagged is False
+        assert hung.input_calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_bounded_sync_classifier_times_out_promptly_under_bounded_inspect() -> None:
+    """The first hung inspect uses the check deadline; later ones fail without queueing."""
+
+    async def scenario() -> None:
+        """Run one admitted hung inspect, then prove overflow is immediate."""
+        hung = _HungSyncClassifier()
+        wrapper = BoundedSyncClassifier(hung, max_workers=1)
+        inspects = BoundedInspect(max_inflight=8)
+        started = time.monotonic()
+        with pytest.raises(ClassifierTimeoutError):
+            await inspects.run(
+                lambda: wrapper.inspect_input(request=_request(), check=_check()),
+                0.05,
+                adapter_id="sync-blocked",
+            )
+        first_elapsed = time.monotonic() - started
+        await asyncio.get_running_loop().run_in_executor(None, hung.started.wait)
+        overflow_started = time.monotonic()
+        with pytest.raises(SyncClassifierBusyError):
+            await wrapper.inspect_input(request=_request(), check=_check())
+        overflow_elapsed = time.monotonic() - overflow_started
+        assert 0.04 <= first_elapsed < 0.3
+        assert overflow_elapsed < 0.2
+        assert hung.input_calls == 1
+        assert wrapper.admitted_inspects() == 1
+        hung.release()
+        await asyncio.get_running_loop().run_in_executor(None, hung.finished.wait)
+
+    asyncio.run(scenario())
