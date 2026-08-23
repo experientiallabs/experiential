@@ -182,7 +182,8 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         .route("/v1/responses", post(responses))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route("/metrics.json", get(metrics_json));
+        .route("/metrics.json", get(metrics_json))
+        .route("/metrics", get(metrics_text));
     let app = if config.native_usage_enabled {
         app.route("/usage.json", get(usage_json).fallback(proxy_fallback))
             .route("/usage", get(usage_page).fallback(proxy_fallback))
@@ -357,6 +358,29 @@ async fn metrics_json(State(state): State<AppState>) -> Response {
     match state.bridge.call("metrics_json", "{}".to_string()).await {
         Ok(text) => match serde_json::from_str::<Value>(&text) {
             Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
+            Err(_) => error_response(&PublicError::internal()),
+        },
+        Err(error) => error_response(&error),
+    }
+}
+
+/// Serve the same content-free snapshot rendered in the Prometheus text
+/// exposition format. The control plane renders the body; this handler only
+/// unwraps the `text` field and stamps the exposition content type.
+async fn metrics_text(State(state): State<AppState>) -> Response {
+    match state.bridge.call("metrics_text", "{}".to_string()).await {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(payload) => match payload.get("text").and_then(Value::as_str) {
+                Some(exposition) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        header::CONTENT_TYPE,
+                        "text/plain; version=0.0.4; charset=utf-8",
+                    )
+                    .body(Body::from(exposition.to_string()))
+                    .unwrap_or_else(|_| Response::new(Body::empty())),
+                None => error_response(&PublicError::internal()),
+            },
             Err(_) => error_response(&PublicError::internal()),
         },
         Err(error) => error_response(&error),

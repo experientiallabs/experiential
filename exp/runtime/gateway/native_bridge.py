@@ -61,6 +61,7 @@ from exp.runtime.gateway.execution import (
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
+from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continued_request,
@@ -714,16 +715,11 @@ class NativeControlPlane:
     def metrics_snapshot(self) -> JsonObject:
         """Compose the one content-free observability snapshot.
 
-        ``data_plane`` carries the native engine's registry (request outcomes,
-        escalations, retries, latency histograms) when a provider is bound,
-        otherwise ``None``. ``control_plane`` carries this bridge's own sweep
-        recoveries, in-flight registry size, startup reconciliation counts,
-        and accounting health. Hosted compositions re-expose this dictionary
-        under their own application; the native ``/metrics.json`` route serves
-        exactly this body.
-
-        Returns:
-            The snapshot with ``data_plane`` and ``control_plane`` sections.
+        ``data_plane`` carries the native engine's registry when a provider
+        is bound, otherwise ``None``; ``control_plane`` carries this bridge's
+        own sweep recoveries, in-flight registry size, reconciliation counts,
+        and accounting health. The native ``/metrics.json`` route serves
+        exactly this body; ``/metrics`` serves its Prometheus text rendering.
         """
         data_plane: JsonObject | None = None
         if self._data_plane_metrics is not None:
@@ -743,6 +739,12 @@ class NativeControlPlane:
         """Return the content-free metrics snapshot body for the data plane."""
         del argument
         return json.dumps(self.metrics_snapshot(), separators=(",", ":"))
+
+    def metrics_text(self, argument: str) -> str:
+        """Return ``{"text": ...}`` holding the snapshot's Prometheus exposition."""
+        del argument
+        text = render_metrics_text(self.metrics_snapshot())
+        return json.dumps({"text": text}, separators=(",", ":"))
 
     def readiness(self, argument: str) -> str:
         """Return whether shared executor and bridge accounting stay healthy."""

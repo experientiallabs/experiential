@@ -30,7 +30,8 @@ use crate::server::ServeConfig;
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
 /// `settle`, `remember`, `models`, `model_detail`, `usage_json`,
-/// `usage_page`, `metrics_json`, and `readiness`, each taking and returning
+/// `usage_page`, `metrics_json`, `metrics_text`, and `readiness`, each
+/// taking and returning
 /// one JSON string. `config_json` carries host, port, and concurrency
 /// bounds.
 #[pyfunction]

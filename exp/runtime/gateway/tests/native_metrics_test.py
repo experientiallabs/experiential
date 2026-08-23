@@ -6,7 +6,8 @@ port is deliberately dead. Plain and replay-keyed chat is served natively; an
 alias on a provider without a native dialect escalates, and its relay against
 the dead fallback also exercises the fallback-unavailable signal. The test
 asserts the ``/metrics.json`` snapshot moved for served, escalated, and
-proxied traffic and that the body stays content-free.
+proxied traffic, that the same snapshot serves at ``/metrics`` in the
+Prometheus text format, and that both bodies stay content-free.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from exp.runtime.gateway.catalog_authority import (
 )
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.native_metrics_text import METRICS_CONTENT_TYPE
 
 _CHILD_SOURCE = """\
 import json
@@ -258,6 +260,21 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
         rendered = snapshot.text
         for forbidden in ("coding", "gem", raw_key, prompt_canary, "provider-secret-canary"):
             assert forbidden not in rendered
+
+        # The same snapshot serves at /metrics in the Prometheus text format,
+        # equally content-free and carrying the same driven-traffic counts.
+        exposition = httpx.get(f"{base}/metrics", timeout=10)
+        assert exposition.status_code == 200
+        assert exposition.headers["content-type"] == METRICS_CONTENT_TYPE
+        text = exposition.text
+        assert 'exp_gateway_requests_total{outcome="completed"} 3' in text
+        assert "exp_gateway_served_requests_total 3" in text
+        assert 'exp_gateway_escalated_requests_total{kind="provider_dialect"} 1' in text
+        assert "exp_gateway_fallback_engine_unavailable_total 1" in text
+        assert 'exp_gateway_time_to_first_byte_ms_bucket{le="+Inf"} 3' in text
+        assert "exp_gateway_accounting_healthy 1" in text
+        for forbidden in ("coding", "gem", raw_key, prompt_canary, "provider-secret-canary"):
+            assert forbidden not in text
 
         child.send_signal(signal.SIGTERM)
         assert child.wait(timeout=20) == 0
