@@ -27,8 +27,10 @@ python engine. `--engine rust` and `--engine python` force one engine.
 The native engine is a Rust HTTP server compiled as a PyO3 extension. It owns
 the public socket and the anonymous Chat Completions fast path: upstream
 dispatch, provider stream normalization, and public SSE encoding run off the
-GIL, with three JSON-string callbacks into python per request (authenticate,
-admit, settle). Everything protocol- and authority-shaped stays in the shared
+GIL, with JSON-string callbacks into python per request (authenticate,
+admit, settle, and `enforce_output` only when admission sets
+`output_guardrail`). Unguarded traffic never calls that output callback.
+Everything protocol- and authority-shaped stays in the shared
 python code: admission decodes the raw body with the same `decode_chat`,
 enforces the same deployment-identity invariant, builds the upstream payload
 with the same `streaming_requests` builders, and writes the same durable
@@ -48,6 +50,10 @@ dialect, and unknown routes. Escalation happens
 before any ledger write, so each request is accounted exactly once by the
 engine that serves it. Shutdown drains admitted work on both engines within
 `--graceful-timeout`.
+
+Identity-scoped guardrails are optional and default-off. See
+`docs/reference/gateway-guardrails.md` for policy lookup, the internal
+classifier seam, and the input and output enforcement order.
 
 ## Embeddable worker composition
 

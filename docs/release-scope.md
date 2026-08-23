@@ -15,8 +15,9 @@ on the exact release checkout.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
   provider fallback, Chat Completions, Responses, bounded in-memory continuation and replay,
-  content-free SQLite accounting, monthly integer micro-USD enforcement, and loopback-only health
-  and usage views.
+  content-free SQLite accounting, monthly integer micro-USD enforcement, loopback-only health
+  and usage views, and optional identity-scoped guardrails that stay off until a policy is
+  assigned.
 - The no-subcommand default gateway launch, the direct `exp run [PROJECT]` form, and the
   `exp --project PROJECT [--ghost]` compatibility form are installed-wheel surfaces. Gateway
   startup is provider-idle and requires explicit authority.
