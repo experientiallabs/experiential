@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import threading
 from collections.abc import Iterator, Mapping
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -169,10 +170,8 @@ def test_hosted_platform_login_receives_key_without_printing_it() -> None:
     assert "Platform login received." in transcript.getvalue()
 
 
-def test_hosted_platform_login_falls_back_when_browser_cannot_open(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A browserless terminal returns to masked paste instead of waiting for a callback."""
+def test_hosted_platform_login_keeps_manual_url_callback_alive() -> None:
+    """A printed URL can complete login when automatic browser opening fails."""
     transcript = io.StringIO()
     console = Console(file=transcript, force_terminal=True, no_color=True)
     connection = ProviderConnection(
@@ -182,16 +181,24 @@ def test_hosted_platform_login_falls_back_when_browser_cannot_open(
         base_url=HOSTED_GATEWAY_DEFAULT_BASE_URL,
     )
 
-    def unexpected_wait(*_args: object, **_kwargs: object) -> str | None:
-        """Fail if browser-unavailable setup waits for a callback."""
-        raise AssertionError("browser-unavailable login should not wait for a callback")
+    def manually_approve(url: str) -> bool:
+        """Use the printed URL through the loopback callback without opening a browser."""
+        params = parse_qs(urlparse(url).query)
+        threading.Thread(
+            target=_request,
+            args=(f"http://127.0.0.1:{params['port'][0]}/callback",),
+            kwargs={"params": {"state": params["state"][0], "token": "xpl_manual_key"}},
+            daemon=True,
+        ).start()
+        return False
 
-    monkeypatch.setattr(BrowserLogin, "wait", unexpected_wait)
     token = hosted_platform_login(
         connection,
         console=console,
-        open_browser=lambda _url: False,
+        open_browser=manually_approve,
+        timeout=1,
     )
 
-    assert token is None
+    assert token == "xpl_manual_key"
     assert "Open this URL to connect Experiential Cloud:" in transcript.getvalue()
+    assert "Platform login received." in transcript.getvalue()

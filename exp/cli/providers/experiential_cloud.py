@@ -280,7 +280,6 @@ def hosted_platform_login(
             opened = False
         if not opened:
             console.print(f"[yellow]Open this URL to connect Experiential Cloud:[/yellow] {url}")
-            return None
         console.print("[dim]Approve the connection in your browser to continue.[/dim]")
         token = attempt.wait(timeout)
         if token is None:
