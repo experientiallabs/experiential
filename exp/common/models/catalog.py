@@ -34,7 +34,7 @@ _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
 _AWS_REGION_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
-_EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible"})
+_EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
 
 def _normalize_base_url(value: str) -> str:
@@ -126,6 +126,25 @@ class ConnectionConfig(ContractModel):
                 raise ValueError("api_version is only accepted for provider='azure'")
             if self.region is not None and not _AWS_REGION_NAME.fullmatch(self.region):
                 raise ValueError("bedrock region must be an AWS region name")
+        elif self.provider == "vertex":
+            if self.base_url is None:
+                raise ValueError(
+                    "vertex requires base_url naming the project-and-location root, such as "
+                    "https://us-central1-aiplatform.googleapis.com/v1/projects/PROJECT/"
+                    "locations/us-central1"
+                )
+            if self.api_key_env is None:
+                raise ValueError(
+                    "vertex requires api_key_env naming the environment variable that holds "
+                    "the service-account JSON credential"
+                )
+            if self.api_version is not None:
+                raise ValueError("api_version is only accepted for provider='azure'")
+            if self.region is not None:
+                raise ValueError(
+                    "region is only accepted for provider='bedrock'; the Vertex location "
+                    "lives inside base_url"
+                )
         else:
             if self.api_version is not None:
                 raise ValueError("api_version is only accepted for provider='azure'")

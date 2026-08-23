@@ -43,6 +43,7 @@ from exp.runtime.models.providers.tinker_sampling import (
     create_tinker_sampler,
 )
 from exp.runtime.models.providers.transport import JsonHttpTransport
+from exp.runtime.models.providers.vertex import VertexClient, VertexTokenProviderFactory
 
 ProviderTransport = AsyncJsonHttpTransport | JsonHttpTransport
 
@@ -124,6 +125,7 @@ class RuntimeModelCatalog:
         transport_factory: Callable[[], ProviderTransport] = HttpxAsyncJsonTransport,
         tinker_sampler_factory: TinkerSamplerFactory | None = None,
         bedrock_runtime_factory: BedrockRuntimeFactory | None = None,
+        vertex_token_provider_factory: VertexTokenProviderFactory | None = None,
     ) -> None:
         """Create a local resolver without importing SDK registries or contacting providers.
 
@@ -134,12 +136,15 @@ class RuntimeModelCatalog:
             tinker_sampler_factory: Optional deterministic test override for completed-handle
                 sampling. Omit it to use the runtime-owned Tinker SDK construction seam.
             bedrock_runtime_factory: Optional deterministic Bedrock runtime factory used by tests.
+            vertex_token_provider_factory: Optional deterministic Vertex bearer-token seam used
+                by tests. Omit it to mint tokens from the connection's service-account JSON.
         """
         self._catalog = catalog
         self._environment = os.environ if environment is None else environment
         self._transport_factory = transport_factory
         self._tinker_sampler_factory = tinker_sampler_factory
         self._bedrock_runtime_factory = bedrock_runtime_factory
+        self._vertex_token_provider_factory = vertex_token_provider_factory
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
         """Resolve static identity and exact capability evidence without provider access.
@@ -239,6 +244,33 @@ class RuntimeModelCatalog:
             connection_id=record.connection,
             environment=self._environment,
         )
+        if provider == "vertex":
+            if connection.base_url is None:
+                raise ModelConnectionError(
+                    f"Vertex alias {alias!r} needs connection.base_url naming the "
+                    "project-and-location root, such as https://us-central1-aiplatform."
+                    "googleapis.com/v1/projects/PROJECT/locations/us-central1"
+                )
+            token_provider = (
+                None
+                if self._vertex_token_provider_factory is None
+                else self._vertex_token_provider_factory(credentials_json=api_key)
+            )
+            vertex_client = VertexClient(
+                model=snapshot,
+                api_key=api_key,
+                base_url=connection.base_url,
+                transport=self._transport_factory(),
+                token_provider=token_provider,
+            )
+            return ResolvedModel(
+                alias,
+                snapshot,
+                capabilities,
+                vertex_client,
+                None,
+                served_model_id=record.served_model_id,
+            )
         if provider == "openai":
             openai_client = OpenAIClient(
                 model=snapshot,
@@ -397,6 +429,7 @@ class RuntimeModelCatalog:
             transport_factory=self._transport_factory,
             tinker_sampler_factory=self._tinker_sampler_factory,
             bedrock_runtime_factory=self._bedrock_runtime_factory,
+            vertex_token_provider_factory=self._vertex_token_provider_factory,
         )
 
 
@@ -407,7 +440,13 @@ _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
     "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
 }
 
-SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {"azure", "bedrock", "openai", "tinker"}
+SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {
+    "azure",
+    "bedrock",
+    "openai",
+    "tinker",
+    "vertex",
+}
 """Every provider identifier the runtime registry can construct a client for."""
 
 
