@@ -475,12 +475,12 @@ wheels = [
 
 [[package]]
 name = "exp-gateway-native"
-version = "0.1.2"
+version = "0.1.3"
 source = { directory = "exp/runtime/gateway/native" }
 
 [[package]]
 name = "experiential"
-version = "0.5.2"
+version = "0.5.3"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
