@@ -65,7 +65,7 @@ and the median run by gateway non-stream p50.
 ## Status badge
 
 A workflow-status badge is the zero-secret signal. It does not embed a
-latency number. Proposed README insertion (requires explicit README approval):
+latency number. The root README includes this badge:
 
 ```markdown
 [![Gateway latency](https://github.com/experientiallabs/experiential/actions/workflows/gateway-latency.yml/badge.svg?branch=main)](https://github.com/experientiallabs/experiential/actions/workflows/gateway-latency.yml?query=branch%3Amain)
