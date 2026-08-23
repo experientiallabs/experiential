@@ -10,6 +10,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayNamedToolChoice
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.model_adapter import model_request
 from exp.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
     decode_chat,
@@ -300,6 +301,186 @@ def test_invalid_tool_arguments_and_conflicting_operation_headers_are_specific()
         )
     assert operation.value.detail.code == "idempotency_conflict"
     assert operation.value.detail.param == "Idempotency-Key"
+
+
+def _assert_no_cache_control(decoded: DecodedGatewayRequest) -> None:
+    """Require cache_control to be absent from canonical and provider-bound messages."""
+    for message in decoded.request.messages:
+        assert "cache_control" not in message.model_dump(mode="json")
+    adapted = model_request(decoded.request)
+    for message in adapted.messages:
+        assert "cache_control" not in message.model_dump(mode="json")
+
+
+def test_chat_decoder_drops_opencode_message_cache_control() -> None:
+    """OpenCode Chat Completions annotate messages with Anthropic cache_control.
+
+    The live failure is Invalid value for 'messages.0.cache_control' because the
+    closed Chat wire model forbids that nested field before routing. Supported
+    ephemeral forms must decode and never reach the canonical or provider-bound
+    message.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are concise.",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "role": "user",
+                    "content": "hello",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                },
+                {
+                    "role": "assistant",
+                    "content": "hi",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+                {"role": "user", "content": "again", "cache_control": None},
+            ],
+            "top_p": 1,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+    )
+
+    assert tuple(message.content for message in decoded.request.messages) == (
+        "You are concise.",
+        "hello",
+        "hi",
+        "again",
+    )
+    assert decoded.request.top_p == 1.0
+    assert decoded.request.stream
+    assert decoded.request.include_usage
+    _assert_no_cache_control(decoded)
+
+
+def test_chat_decoder_drops_opencode_text_part_cache_control() -> None:
+    """OpenCode openai-compatible conversion can put cache_control on text parts.
+
+    applyCaching marks the last content part, and @ai-sdk/openai-compatible
+    keeps that annotation on the text block when the user message has more
+    than one part.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "prefix "},
+                        {
+                            "type": "text",
+                            "text": "cached suffix",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert decoded.request.messages[0].content == "prefix cached suffix"
+    _assert_no_cache_control(decoded)
+
+
+@pytest.mark.parametrize(
+    "cache_control",
+    (
+        {"type": "persistent"},
+        {"type": "ephemeral", "ttl": "2h"},
+        {"type": "ephemeral", "extra": True},
+        "ephemeral",
+        1,
+        [],
+    ),
+)
+def test_chat_decoder_rejects_malformed_message_cache_control(cache_control: object) -> None:
+    """Unsupported cache_control shapes fail at messages.<index>.cache_control."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hello", "cache_control": cache_control}],
+            }
+        )
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "messages.0.cache_control"
+    assert captured.value.detail.message == "Invalid value for 'messages.0.cache_control'."
+
+
+def test_chat_decoder_rejects_malformed_text_part_cache_control() -> None:
+    """Unsupported text-part cache_control stays a field-specific invalid value."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "hello",
+                                "cache_control": {"type": "persistent"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "messages.0.content.0.cache_control"
+
+
+def test_chat_decoder_still_rejects_unknown_nested_message_fields() -> None:
+    """Dropping cache_control must not weaken unrelated unknown nested fields."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "hello",
+                        "cache_control": {"type": "ephemeral"},
+                        "providerOptions": {},
+                    }
+                ],
+            }
+        )
+    param = captured.value.detail.param
+    assert param == "messages.0.providerOptions"
+
+
+def test_chat_decoder_still_rejects_unknown_text_part_fields_with_cache_control() -> None:
+    """A valid text-part cache_control drop still rejects other extra part keys."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "hello",
+                                "cache_control": {"type": "ephemeral"},
+                                "future": 1,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    param = captured.value.detail.param
+    assert param is not None and param.startswith("messages.0.content")
 
 
 def test_chat_decoder_accepts_opencode_nucleus_and_usage_stream_shape() -> None:
