@@ -8,6 +8,7 @@ from pathlib import Path
 from exp.common.core.artifacts import validate_artifact_id
 from exp.common.core.locks import file_write_lock
 from exp.common.models.catalog import (
+    ConnectionConfig,
     ModelCatalog,
     ModelRecord,
     ModelRoles,
@@ -94,6 +95,7 @@ def sync_provider_models(
     *,
     connection: ProviderConnection,
     models: Mapping[str, ModelRecord],
+    protected_connections: Mapping[str, ConnectionConfig] | None = None,
     replace: bool = True,
 ) -> ModelCatalog:
     """Atomically register one provider and its authenticated model identities.
@@ -105,6 +107,8 @@ def sync_provider_models(
         path: Local ``models.toml`` path.
         connection: Secret-free provider connection to register.
         models: Secret-free records keyed by their local catalog aliases.
+        protected_connections: Active SQLite gateway connections keyed by connection name. A
+            changed endpoint cannot replace one of these authorities during account sync.
         replace: Whether changed non-serving model metadata may be refreshed.
 
     Returns:
@@ -132,11 +136,18 @@ def sync_provider_models(
         current_models = dict(existing.models) if existing is not None else {}
         current = current_connections.get(connection.name)
         proposed_connection = connection.catalog_config()
+        protected = (protected_connections or {}).get(connection.name)
+        if protected is not None and protected != proposed_connection:
+            raise ProviderConnectionAuthoringError(
+                f"connection {connection.name!r} differs from active gateway authority; use the "
+                "existing endpoint or explicitly reconfigure the gateway"
+            )
         if current is not None and current != proposed_connection:
             protected_aliases = tuple(
                 alias
                 for alias, record in current_models.items()
-                if record.connection == connection.name and record.gateway is not None
+                if record.connection == connection.name
+                and (record.gateway is not None or protected is not None)
             )
             if protected_aliases:
                 raise ProviderConnectionAuthoringError(

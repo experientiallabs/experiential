@@ -23,6 +23,7 @@ from exp.common.models import (
     load_model_catalog,
     write_model_catalog,
 )
+from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.models.providers import ProviderEndpoint
 
 
@@ -127,6 +128,51 @@ def test_login_rejects_endpoint_replacement_for_an_active_gateway(
     monkeypatch.setattr(auth, "hosted_platform_login", lambda _connection, **_kwargs: "xpl_new_key")
 
     with pytest.raises(typer.BadParameter, match="active gateway deployments"):
+        auth.run_login(
+            console=Console(file=io.StringIO(), no_color=True),
+            environment=new_environment,
+            store=store,
+            root=root,
+            lister=_AccountModelLister("xpl_new_key"),
+        )
+
+    assert (
+        store.get(
+            "experiential-cloud",
+            binding=hosted_credential_binding(old_environment),
+        )
+        == "xpl_old_key"
+    )
+
+
+def test_login_rejects_endpoint_replacement_for_a_sqlite_owned_gateway_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gateway-owned provider remains protected before any catalog model is deployed."""
+    root = tmp_path / ".exp"
+    old_environment = {"EXP_GATEWAY_URL": "https://api.experientiallabs.ai/v1"}
+    old_connection = ProviderConnection(
+        name="experiential-cloud",
+        provider="openai-compatible",
+        api_key_env="EXPLABS_API_KEY",
+        base_url=old_environment["EXP_GATEWAY_URL"],
+    )
+    manager = GatewayManagement(root)
+    manager.initialize()
+    manager.upsert_provider_connection(
+        connection_id=old_connection.name,
+        config=old_connection.catalog_config(),
+    )
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put(
+        "experiential-cloud",
+        "xpl_old_key",
+        binding=hosted_credential_binding(old_environment),
+    )
+    new_environment = {"EXP_GATEWAY_URL": "https://api.preview.experientiallabs.ai/v1"}
+    monkeypatch.setattr(auth, "hosted_platform_login", lambda _connection, **_kwargs: "xpl_new_key")
+
+    with pytest.raises(typer.BadParameter, match="active gateway authority"):
         auth.run_login(
             console=Console(file=io.StringIO(), no_color=True),
             environment=new_environment,

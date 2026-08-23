@@ -15,6 +15,7 @@ from exp.common.models import (
     resolve_discovered_model,
     sync_provider_models,
 )
+from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.models.providers import (
     HttpProviderModelLister,
     ProviderEndpoint,
@@ -93,6 +94,10 @@ def sync_account_models(
         catalog_path,
         connection=connection,
         models=records,
+        protected_connections={
+            authority.connection_id: authority.config
+            for authority in GatewayManagement(root).provider_connections()
+        },
     )
     console.print(f"[green]Synced Experiential Cloud: {len(aliases)} models.[/green]")
     return tuple(aliases)
