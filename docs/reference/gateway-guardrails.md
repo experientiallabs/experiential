@@ -62,15 +62,19 @@ Input enforcement is on the request critical path after continuation expansion
 and before dispatch. Output enforcement for a protected identity delays the
 first visible byte until the winning completion is buffered and the output
 chain returns. Production adapters are async. The Python gateway awaits each
-inspect directly under `asyncio.timeout` and a per-loop concurrency cap. A
-hung adapter is cancelled at the tighter of the check timeout and the remaining
-request deadline, and cancellation releases that slot immediately. Native
-callbacks run the same coroutines on a private event loop so they never block
-the Python gateway loop. Leftover synchronous test adapters, when still
-needed, run only through a private bounded compatibility wrapper. Exhaustion
-of that wrapper cannot take async capacity from healthy adapters. Request and
-response content are bounded by `max_request_bytes` and `max_response_bytes`
-on the policy.
+inspect as a task under `asyncio.wait` and a per-loop concurrency cap. A hung
+adapter is cancelled at the tighter of the check timeout and the remaining
+request deadline. The caller returns immediately and the inflight slot is
+released without waiting for cancellation to be acknowledged. An adapter that
+swallows cancellation is quarantined on that event loop until its detached
+task finishes. Further calls to that adapter fail immediately and do not
+create another task. Other adapters keep their capacity. Native callbacks
+submit the same coroutines onto one shared daemon event loop so a Rust worker
+can return even when a quarantined task is still running. Leftover
+synchronous test adapters, when still needed, run only through a private
+bounded compatibility wrapper. Exhaustion of that wrapper cannot take async
+capacity from healthy adapters. Request and response content are bounded by
+`max_request_bytes` and `max_response_bytes` on the policy.
 
 ## Privacy
 
@@ -137,6 +141,8 @@ Protected streaming may add classifier latency before the first token.
 - Classifiers must not call the public gateway. Recursion fails closed.
 - At most 32 async classifier inspects can be in flight on one event loop.
   Additional inspects wait only until their remaining timeout, then fail
-  closed. Cancellation returns that slot immediately.
+  closed. Cancellation returns that slot immediately. An adapter that
+  ignores cancellation stays quarantined on that loop until its abandoned
+  task finishes.
 - Oversized tool arguments count against the response byte bound and are
   blocked, not rewritten.

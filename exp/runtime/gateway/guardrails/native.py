@@ -7,7 +7,7 @@ from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
-from exp.runtime.gateway.guardrails.bounded import run_on_private_loop
+from exp.runtime.gateway.guardrails.bounded import run_on_native_loop
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
@@ -48,7 +48,7 @@ def enforce_native_input(
     if policy is None:
         return request, None
     return (
-        run_on_private_loop(
+        run_on_native_loop(
             engine.enforce_input(
                 policy=policy,
                 request=request,
@@ -133,7 +133,7 @@ def enforce_native_output(
     data = cast(JsonObject, json.loads(argument))
     completion = parse_output_payload(data)
     try:
-        result = run_on_private_loop(
+        result = run_on_native_loop(
             engine.enforce_output(
                 policy=policy,
                 completion=completion,

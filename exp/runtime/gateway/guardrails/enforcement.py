@@ -164,7 +164,11 @@ class GuardrailEngine:
         started = self._monotonic()
         try:
             self.classifier_calls += 1
-            verdict = await self._inspects.run(inspect, timeout)
+            verdict = await self._inspects.run(
+                inspect,
+                timeout,
+                adapter_id=check.adapter_id,
+            )
         except ClassifierTimeoutError:
             return self._uncertain(policy, check, GuardrailAction.ERROR)
         except Exception:  # noqa: BLE001 - classifier failures are fail-closed or skipped

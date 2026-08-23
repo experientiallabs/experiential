@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+import time
+
+import pytest
 
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -11,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.guardrails.bounded import BoundedInspect
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
@@ -19,7 +25,9 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCapabilityKind,
     GuardrailCheck,
     GuardrailCheckStage,
+    GuardrailCompletion,
     GuardrailPolicy,
+    GuardrailRejected,
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import (
@@ -170,3 +178,135 @@ def test_missing_policy_on_output_callback_fail_closes() -> None:
 
     assert decision["action"] == "error"
     assert encode_output_decision(action="allow") == '{"action":"allow"}'
+
+
+class _NativeCancelSwallow:
+    """Native-loop adapter that swallows cancellation until teardown."""
+
+    def __init__(self) -> None:
+        """Start with an empty call count and a closed hold."""
+        self.input_calls = 0
+        self._hold = threading.Event()
+
+    def release(self) -> None:
+        """Allow every abandoned inspect to finish."""
+        self._hold.set()
+
+    async def inspect_input(
+        self,
+        *,
+        request: GatewayRequest,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Ignore cancellation and wait for teardown."""
+        del request, check
+        self.input_calls += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            while not self._hold.is_set():
+                await asyncio.sleep(0.05)
+            return ClassifierVerdict(flagged=False)
+        return ClassifierVerdict(flagged=False)
+
+    async def inspect_output(
+        self,
+        *,
+        completion: GuardrailCompletion,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Native tests do not use the output path."""
+        del completion, check
+        raise AssertionError("output inspect is unused")
+
+
+def test_native_callback_returns_while_adapter_ignores_cancellation() -> None:
+    """A native worker returns at the timeout even when the inspect stays live."""
+    rogue = _NativeCancelSwallow()
+    healthy = ScriptedClassifier()
+    inspects = BoundedInspect(max_inflight=2)
+    rogue_policy = GuardrailPolicy(
+        policy_id="rogue-policy",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        protected=True,
+        checks=(
+            GuardrailCheck(
+                check_id="rogue-input",
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.BLOCK,
+                timeout_ms=40,
+                adapter_id="rogue",
+            ),
+        ),
+    )
+    healthy_policy = GuardrailPolicy(
+        policy_id="healthy-policy",
+        organization_id="organization-one",
+        identity_id="identity-healthy",
+        checks=(
+            GuardrailCheck(
+                check_id="healthy-input",
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.ALLOW,
+                timeout_ms=200,
+                adapter_id="healthy",
+            ),
+        ),
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((rogue_policy, healthy_policy)),
+        client=DirectClassifierClient(ClassifierRegistry({"rogue": rogue, "healthy": healthy})),
+        monotonic=time.monotonic,
+        inspects=inspects,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hello"),),
+    )
+    try:
+        started = time.monotonic()
+        with pytest.raises(GuardrailRejected):
+            enforce_native_input(
+                engine,
+                authorization=_authorization(),
+                request=request,
+                deadline_monotonic=time.monotonic() + 30,
+            )
+        assert time.monotonic() - started < 0.5
+        assert inspects.detached_inspect_count() == 1
+        assert rogue.input_calls == 1
+
+        started = time.monotonic()
+        with pytest.raises(GuardrailRejected):
+            enforce_native_input(
+                engine,
+                authorization=_authorization(),
+                request=request,
+                deadline_monotonic=time.monotonic() + 30,
+            )
+        assert time.monotonic() - started < 0.2
+        assert inspects.detached_inspect_count() == 1
+        assert rogue.input_calls == 1
+
+        healthy_auth = _authorization().model_copy(update={"identity_id": "identity-healthy"})
+        started = time.monotonic()
+        rewritten, policy = enforce_native_input(
+            engine,
+            authorization=healthy_auth,
+            request=request,
+            deadline_monotonic=time.monotonic() + 30,
+        )
+        assert time.monotonic() - started < 0.2
+        assert policy is not None
+        assert rewritten.messages[0].content == "hello"
+        assert healthy.input_calls == 1
+    finally:
+        rogue.release()
+        for _ in range(50):
+            if inspects.detached_inspect_count() == 0:
+                break
+            time.sleep(0.02)
+        assert inspects.detached_inspect_count() == 0

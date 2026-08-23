@@ -486,7 +486,7 @@ def test_repeated_blocked_adapter_does_not_starve_a_healthy_adapter() -> None:
 
         assert result.messages[0].content == "hello"
         assert healthy.input_calls == 1
-        assert hung.input_calls == 8
+        assert hung.input_calls >= 1
         assert elapsed < 0.2
 
     asyncio.run(scenario())
@@ -543,5 +543,119 @@ def test_hung_sync_compat_adapter_cannot_starve_healthy_async_adapters() -> None
             assert elapsed < 0.2
         finally:
             hung_inner.release()
+
+    asyncio.run(scenario())
+
+
+class _CancelSwallowingClassifier:
+    """Adapter that swallows cancellation and waits until the test releases it."""
+
+    def __init__(self) -> None:
+        """Start with an empty call count and a closed hold."""
+        self.input_calls = 0
+        self.output_calls = 0
+        self._hold = asyncio.Event()
+
+    def release(self) -> None:
+        """Allow every abandoned inspect to finish."""
+        self._hold.set()
+
+    async def inspect_input(
+        self,
+        *,
+        request: GatewayRequest,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Ignore cancellation and wait for teardown."""
+        del request, check
+        self.input_calls += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await self._hold.wait()
+            return ClassifierVerdict(flagged=False)
+        return ClassifierVerdict(flagged=False)
+
+    async def inspect_output(
+        self,
+        *,
+        completion: GuardrailCompletion,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Ignore cancellation and wait for teardown."""
+        del completion, check
+        self.output_calls += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await self._hold.wait()
+            return ClassifierVerdict(flagged=False)
+        return ClassifierVerdict(flagged=False)
+
+
+def test_cancel_swallowing_adapter_fail_closes_without_starving_others() -> None:
+    """Protected requests return at the timeout while another adapter stays healthy."""
+
+    async def scenario() -> None:
+        """Quarantine a cancel-swallowing adapter, then inspect a healthy one."""
+        rogue = _CancelSwallowingClassifier()
+        healthy = ScriptedClassifier()
+        inspects = BoundedInspect(max_inflight=2)
+        rogue_policy = GuardrailPolicy(
+            policy_id="rogue-policy",
+            organization_id="organization-one",
+            identity_id="identity-rogue",
+            protected=True,
+            checks=(_check("rogue-input", adapter_id="rogue", timeout_ms=40),),
+        )
+        healthy_policy = GuardrailPolicy(
+            policy_id="healthy-policy",
+            organization_id="organization-one",
+            identity_id="identity-healthy",
+            checks=(_check("healthy-input", adapter_id="healthy", timeout_ms=200),),
+        )
+        engine = GuardrailEngine(
+            store=MappingGuardrailStore((rogue_policy, healthy_policy)),
+            client=DirectClassifierClient(ClassifierRegistry({"rogue": rogue, "healthy": healthy})),
+            monotonic=time.monotonic,
+            inspects=inspects,
+        )
+        try:
+            started = time.monotonic()
+            with pytest.raises(GuardrailRejected) as raised:
+                await engine.enforce_input(
+                    policy=rogue_policy,
+                    request=_request("hello"),
+                    deadline_monotonic=time.monotonic() + 30,
+                )
+            assert time.monotonic() - started < 0.5
+            assert raised.value.failure.safe_details["action"] == "error"
+            assert inspects.detached_inspect_count() == 1
+            assert rogue.input_calls == 1
+
+            started = time.monotonic()
+            with pytest.raises(GuardrailRejected):
+                await engine.enforce_input(
+                    policy=rogue_policy,
+                    request=_request("hello"),
+                    deadline_monotonic=time.monotonic() + 30,
+                )
+            assert time.monotonic() - started < 0.2
+            assert inspects.detached_inspect_count() == 1
+            assert rogue.input_calls == 1
+
+            started = time.monotonic()
+            result = await engine.enforce_input(
+                policy=healthy_policy,
+                request=_request("hello"),
+                deadline_monotonic=time.monotonic() + 30,
+            )
+            assert time.monotonic() - started < 0.2
+            assert result.messages[0].content == "hello"
+            assert healthy.input_calls == 1
+        finally:
+            rogue.release()
+            await asyncio.sleep(0)
+            assert inspects.detached_inspect_count() == 0
 
     asyncio.run(scenario())

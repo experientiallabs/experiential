@@ -157,9 +157,11 @@ class KeywordClassifier:
 
 
 class BoundedSyncClassifier:
-    """Wrap a leftover synchronous adapter with a private executor.
+    """Compatibility wrapper for leftover synchronous test adapters.
 
-    Hung sync inspects occupy only this wrapper's workers. They cannot take
+    Production transports implement the async inspect contract directly.
+    This wrapper is only for leftover synchronous adapters. Hung sync
+    inspects occupy only this wrapper's private workers. They cannot take
     async inflight slots from healthy adapters, and they cannot share a
     process-wide thread pool with other wrappers.
     """
