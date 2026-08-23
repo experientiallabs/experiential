@@ -58,7 +58,9 @@ class BrowserLogin:
         """
         self.web_url = web_url.rstrip("/")
         self.state = secrets.token_urlsafe(24)
-        self._tokens: queue.Queue[str] = queue.Queue(maxsize=1)
+        self._token: str | None = None
+        self._token_event = threading.Event()
+        self._token_lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -84,8 +86,10 @@ class BrowserLogin:
         """
         if self._server is not None:
             raise RuntimeError("browser login listener is already running")
-        tokens = self._tokens
+        login = self
         expected_state = self.state
+        token_event = self._token_event
+        token_lock = self._token_lock
         platform_url = html.escape(self.web_url, quote=True)
         success_page = f"""<!doctype html>
 <html><head><meta http-equiv="refresh" content="1;url={platform_url}"></head>
@@ -112,11 +116,12 @@ class BrowserLogin:
                 ):
                     self._respond(400, _FAILURE_PAGE)
                     return
-                try:
-                    tokens.put_nowait(token)
-                except queue.Full:
-                    self._respond(400, _FAILURE_PAGE)
-                    return
+                with token_lock:
+                    if login._token is not None:
+                        self._respond(400, _FAILURE_PAGE)
+                        return
+                    login._token = token
+                    token_event.set()
                 self._respond(200, success_page)
 
             def _respond(self, status: int, body: bytes) -> None:
@@ -165,10 +170,10 @@ class BrowserLogin:
         """
         if timeout <= 0:
             raise ValueError("browser login timeout must be positive")
-        try:
-            return self._tokens.get(timeout=timeout)
-        except queue.Empty:
+        if not self._token_event.wait(timeout=timeout):
             return None
+        with self._token_lock:
+            return self._token
 
     def close(self) -> None:
         """Stop the callback listener; repeated cleanup is safe."""
@@ -291,7 +296,31 @@ def hosted_platform_login(
                     "[dim]Approve the connection in your browser, or paste an existing key "
                     "to continue.[/dim]"
                 )
-                fallback_key = fallback(attempt.wait)
+                fallback_values: queue.Queue[str | None] = queue.Queue(maxsize=1)
+                fallback_errors: queue.Queue[Exception] = queue.Queue(maxsize=1)
+                fallback_done = threading.Event()
+
+                def _run_fallback() -> None:
+                    """Read a pasted key without blocking the callback waiter."""
+                    try:
+                        fallback_values.put(fallback(attempt.wait))
+                    except Exception as exc:  # noqa: BLE001 - preserve injected fallback errors
+                        fallback_errors.put(exc)
+                    finally:
+                        fallback_done.set()
+
+                fallback_thread = threading.Thread(target=_run_fallback, daemon=True)
+                fallback_thread.start()
+                while not fallback_done.is_set():
+                    token = attempt.wait(timeout=0.05)
+                    if token is not None:
+                        fallback_thread.join(timeout=1)
+                        console.print("[green]Platform login received.[/green]")
+                        return token
+                fallback_thread.join(timeout=1)
+                if not fallback_errors.empty():
+                    raise fallback_errors.get()
+                fallback_key = fallback_values.get()
                 token = attempt.wait(timeout=0.1)
                 if token is not None:
                     console.print("[green]Platform login received.[/green]")
