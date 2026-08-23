@@ -14,6 +14,7 @@ from pydantic import (
     JsonValue,
     TypeAdapter,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -55,10 +56,22 @@ class _WireModel(BaseModel):
 
 
 class _EphemeralCacheControl(_WireModel):
-    """OpenCode/Anthropic cache breakpoint accepted only so it can be dropped."""
+    """OpenCode/Anthropic cache breakpoint accepted only so it can be dropped.
+
+    The object form is ``{"type": "ephemeral"}`` with an optional ``ttl`` of
+    ``5m`` or ``1h``. An explicit ``ttl: null`` is not in that allowlist.
+    """
 
     type: Literal["ephemeral"]
     ttl: Literal["5m", "1h"] | None = None
+
+    @field_validator("ttl", mode="before")
+    @classmethod
+    def _reject_null_ttl(cls, value: object) -> object:
+        """Reject an explicit null TTL while still allowing the key to be omitted."""
+        if value is None:
+            raise ValueError("ttl must be 5m or 1h when present")
+        return value
 
 
 class _TextPart(_WireModel):

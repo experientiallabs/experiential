@@ -394,6 +394,7 @@ def test_chat_decoder_drops_opencode_text_part_cache_control() -> None:
     (
         {"type": "persistent"},
         {"type": "ephemeral", "ttl": "2h"},
+        {"type": "ephemeral", "ttl": None},
         {"type": "ephemeral", "extra": True},
         "ephemeral",
         1,
