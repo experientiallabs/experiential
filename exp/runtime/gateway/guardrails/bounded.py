@@ -197,37 +197,81 @@ class BoundedInspect:
 class _NativeCallbackRunner:
     """One lazily started daemon loop shared by native guardrail callbacks."""
 
-    def __init__(self) -> None:
-        """Create an unstarted runner."""
+    def __init__(self, *, start_timeout: float = 5.0) -> None:
+        """Create an unstarted runner.
+
+        Args:
+            start_timeout: Seconds to wait for the daemon loop to become ready.
+
+        Raises:
+            ValueError: ``start_timeout`` is not positive.
+        """
+        if start_timeout <= 0:
+            raise ValueError("start_timeout must be positive")
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._start_count = 0
+        self._start_timeout = start_timeout
 
     def loop(self) -> asyncio.AbstractEventLoop:
-        """Return the running daemon loop, starting it on first use."""
+        """Return the running daemon loop, starting it on first use.
+
+        Exactly one caller may create the runner thread. Concurrent first
+        callers wait on the same ready event outside the lock. A dead or
+        failed startup is cleared so a later call can retry.
+        """
         with self._lock:
             current = self._loop
-            if current is not None and current.is_running():
+            thread = self._thread
+            if (
+                current is not None
+                and current.is_running()
+                and thread is not None
+                and thread.is_alive()
+            ):
                 return current
-            self._ready.clear()
-            thread = threading.Thread(
-                target=self._run_forever,
-                name="exp-guardrail-native",
-                daemon=True,
-            )
-            thread.start()
-        if not self._ready.wait(timeout=5.0):
+            starting = thread is not None and thread.is_alive()
+            if not starting:
+                self._ready.clear()
+                self._loop = None
+                self._thread = threading.Thread(
+                    target=self._run_forever,
+                    name="exp-guardrail-native",
+                    daemon=True,
+                )
+                self._start_count += 1
+                self._thread.start()
+        if not self._ready.wait(timeout=self._start_timeout):
+            self._reset_dead_startup()
             raise RuntimeError("native guardrail callback loop failed to start")
         started = self._loop
-        if started is None or not started.is_running():
+        thread = self._thread
+        if started is None or not started.is_running() or thread is None or not thread.is_alive():
+            self._reset_dead_startup()
             raise RuntimeError("native guardrail callback loop failed to start")
         return started
 
+    def _reset_dead_startup(self) -> None:
+        """Clear a failed start so a later caller can create one new thread."""
+        with self._lock:
+            thread = self._thread
+            if thread is not None and thread.is_alive():
+                return
+            self._thread = None
+            self._loop = None
+            self._ready.clear()
+
     def _run_forever(self) -> None:
         """Own one event loop for the life of the process."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._loop = loop
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+        except Exception:
+            self._ready.set()
+            raise
         self._ready.set()
         loop.run_forever()
 

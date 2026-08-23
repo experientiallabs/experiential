@@ -11,6 +11,7 @@ import pytest
 from exp.runtime.gateway.guardrails.bounded import (
     BoundedInspect,
     ClassifierTimeoutError,
+    _NativeCallbackRunner,
     run_on_native_loop,
 )
 
@@ -234,6 +235,74 @@ def test_external_cancellation_propagates_and_releases_the_slot() -> None:
         assert await bound.run(healthy, 0.5, adapter_id="healthy") == 2
 
     asyncio.run(scenario())
+
+
+def test_fresh_native_runner_shares_one_loop_across_concurrent_first_calls() -> None:
+    """Concurrent first callers start exactly one daemon loop and one thread."""
+    runner = _NativeCallbackRunner()
+    workers = 8
+    barrier = threading.Barrier(workers)
+    loop_ids: list[int] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        """Submit one inspect as soon as every caller is ready."""
+        barrier.wait(timeout=2.0)
+
+        async def inspect() -> int:
+            """Return the running loop identity."""
+            return id(asyncio.get_running_loop())
+
+        loop_id = runner.submit(inspect())
+        with lock:
+            loop_ids.append(loop_id)
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2.0)
+        assert not thread.is_alive()
+
+    assert len(loop_ids) == workers
+    assert loop_ids == [loop_ids[0]] * workers
+    assert runner._start_count == 1
+    assert runner._thread is not None
+    assert runner._thread.is_alive()
+
+
+def test_native_runner_retries_after_a_dead_startup() -> None:
+    """A later caller can start the loop after the first thread dies."""
+
+    class _FailOnce(_NativeCallbackRunner):
+        """Die on the first start, then run the normal daemon loop."""
+
+        def __init__(self) -> None:
+            """Use a short ready wait so the failed start does not stall."""
+            super().__init__(start_timeout=0.2)
+            self._attempts = 0
+
+        def _run_forever(self) -> None:
+            """Return immediately once, then own a loop."""
+            self._attempts += 1
+            if self._attempts == 1:
+                return
+            super()._run_forever()
+
+    runner = _FailOnce()
+    with pytest.raises(RuntimeError, match="failed to start"):
+        runner.loop()
+    assert runner._thread is None
+
+    async def inspect() -> int:
+        """Return a constant."""
+        return 1
+
+    assert runner.submit(inspect()) == 1
+    assert runner._attempts == 2
+    assert runner._start_count == 2
+    assert runner._thread is not None
+    assert runner._thread.is_alive()
 
 
 def test_run_on_native_loop_executes_without_a_running_loop() -> None:
