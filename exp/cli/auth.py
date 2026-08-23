@@ -40,21 +40,36 @@ def run_login(
         ValueError: The credential store cannot safely persist the key.
     """
     connection = hosted_connection(environment)
+
+    fallback_used = False
+
+    def _read_key() -> str | None:
+        """Read one masked fallback key and convert closed input into an abort."""
+        nonlocal fallback_used
+        fallback_used = True
+        console.print("[dim]Experiential Cloud API key[/dim]")
+        try:
+            return read_key("Experiential Cloud API key (hidden, empty line cancels): ")
+        except (EOFError, KeyboardInterrupt):
+            raise typer.Abort from None
+
     if open_browser is None:
-        key = hosted_platform_login(connection, console=console, environment=environment)
+        key = hosted_platform_login(
+            connection,
+            console=console,
+            environment=environment,
+            fallback=_read_key,
+        )
     else:
         key = hosted_platform_login(
             connection,
             console=console,
             environment=environment,
             open_browser=open_browser,
+            fallback=_read_key,
         )
-    if key is None:
-        console.print("[dim]Experiential Cloud API key[/dim]")
-        try:
-            key = read_key("Experiential Cloud API key (hidden, empty line cancels): ")
-        except (EOFError, KeyboardInterrupt):
-            raise typer.Abort from None
+    if key is None and not fallback_used:
+        key = _read_key()
     if key is None or not key.strip():
         raise typer.Abort
 

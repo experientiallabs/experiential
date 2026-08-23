@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import threading
 from collections.abc import Iterator, Mapping
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -181,24 +180,55 @@ def test_hosted_platform_login_keeps_manual_url_callback_alive() -> None:
         base_url=HOSTED_GATEWAY_DEFAULT_BASE_URL,
     )
 
-    def manually_approve(url: str) -> bool:
-        """Use the printed URL through the loopback callback without opening a browser."""
-        params = parse_qs(urlparse(url).query)
-        threading.Thread(
-            target=_request,
-            args=(f"http://127.0.0.1:{params['port'][0]}/callback",),
-            kwargs={"params": {"state": params["state"][0], "token": "xpl_manual_key"}},
-            daemon=True,
-        ).start()
+    approval_url = ""
+
+    def browser_unavailable(url: str) -> bool:
+        """Record the printed URL while simulating a browser launch failure."""
+        nonlocal approval_url
+        approval_url = url
         return False
+
+    def approve_from_fallback() -> None:
+        """Complete the printed callback while the masked fallback is active."""
+        params = parse_qs(urlparse(approval_url).query)
+        status, _ = _request(
+            f"http://127.0.0.1:{params['port'][0]}/callback",
+            {"state": params["state"][0], "token": "xpl_manual_key"},
+        )
+        assert status == 200
+        return None
 
     token = hosted_platform_login(
         connection,
         console=console,
-        open_browser=manually_approve,
-        timeout=1,
+        open_browser=browser_unavailable,
+        fallback=approve_from_fallback,
+        timeout=300,
     )
 
     assert token == "xpl_manual_key"
     assert "Open this URL to connect Experiential Cloud:" in transcript.getvalue()
     assert "Platform login received." in transcript.getvalue()
+
+
+def test_hosted_platform_login_offers_pasted_key_without_waiting_for_timeout() -> None:
+    """A browserless terminal reaches masked paste immediately while its callback stays live."""
+    transcript = io.StringIO()
+    console = Console(file=transcript, force_terminal=True, no_color=True)
+    connection = ProviderConnection(
+        name="experiential-cloud",
+        provider="openai-compatible",
+        api_key_env=HOSTED_GATEWAY_API_KEY_ENV,
+        base_url=HOSTED_GATEWAY_DEFAULT_BASE_URL,
+    )
+
+    token = hosted_platform_login(
+        connection,
+        console=console,
+        open_browser=lambda _url: False,
+        fallback=lambda: "xpl_pasted_key",
+        timeout=300,
+    )
+
+    assert token == "xpl_pasted_key"
+    assert "paste an existing key" in transcript.getvalue()

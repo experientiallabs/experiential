@@ -659,7 +659,20 @@ def _resolve_credential(
         Raises:
             SetupCancelled: The prompt reached end of input.
         """
-        platform_key = hosted_platform_login(connection, console=console, environment=environment)
+
+        def _read_key() -> str:
+            """Read the masked fallback key while the printed callback URL remains live."""
+            try:
+                return getpass(f"{label} API key (hidden, empty line skips this provider): ")
+            except (EOFError, KeyboardInterrupt) as exc:
+                raise SetupCancelled from exc
+
+        platform_key = hosted_platform_login(
+            connection,
+            console=console,
+            environment=environment,
+            fallback=_read_key,
+        )
         if platform_key is not None:
             return platform_key
         console.print(f"[dim]{label} API key[/dim]")

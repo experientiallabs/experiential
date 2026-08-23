@@ -248,6 +248,7 @@ def hosted_platform_login(
     environment: Mapping[str, str] | None = None,
     open_browser: Callable[[str], bool] = webbrowser.open,
     timeout: float = PLATFORM_LOGIN_TIMEOUT_SECONDS,
+    fallback: Callable[[], str | None] | None = None,
 ) -> str | None:
     """Receive an Experiential Cloud key through the Platform browser approval flow.
 
@@ -260,6 +261,7 @@ def hosted_platform_login(
         environment: Optional process environment used for the Platform origin.
         open_browser: Browser opener, injectable for deterministic tests.
         timeout: Maximum time to wait for the browser callback.
+        fallback: Optional masked-key reader used immediately when the browser cannot open.
 
     Returns:
         The new Platform organization key, or ``None`` when browser login is unavailable
@@ -280,6 +282,17 @@ def hosted_platform_login(
             opened = False
         if not opened:
             console.print(f"[yellow]Open this URL to connect Experiential Cloud:[/yellow] {url}")
+            if fallback is not None:
+                console.print(
+                    "[dim]Approve the connection in your browser, or paste an existing key "
+                    "to continue.[/dim]"
+                )
+                fallback_key = fallback()
+                token = attempt.wait(timeout=0.1)
+                if token is not None:
+                    console.print("[green]Platform login received.[/green]")
+                    return token
+                return fallback_key
         console.print("[dim]Approve the connection in your browser to continue.[/dim]")
         token = attempt.wait(timeout)
         if token is None:
