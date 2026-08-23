@@ -202,7 +202,7 @@ def test_render_markdown_states_mock_and_gateway() -> None:
 
 
 def test_write_report_outputs_writes_badge_from_representative_p50(tmp_path: Path) -> None:
-    """The Shields file uses representative gateway-added p50, not a constant."""
+    """The Shields file uses representative gateway p50, not a constant."""
     mock = _stats(p50_ms=2.0, p95_ms=3.0, p99_ms=4.0, requests=40)
     gateway = _stats(p50_ms=16.58, p95_ms=20.0, p99_ms=24.0, requests=40)
     report = LatencyReport(
@@ -223,8 +223,8 @@ def test_write_report_outputs_writes_badge_from_representative_p50(tmp_path: Pat
         ),
         runs=(_run(1, gateway_p50=16.58, mock_p50=2.0),),
     )
-    report_path = tmp_path / "gateway-latency.json"
-    badge_path = tmp_path / "gateway-overhead.json"
+    report_path = tmp_path / "gateway-latency-report.json"
+    badge_path = tmp_path / "gateway-latency.json"
     write_report_outputs(
         report,
         output_json=report_path,
@@ -233,8 +233,9 @@ def test_write_report_outputs_writes_badge_from_representative_p50(tmp_path: Pat
         console=Console(width=200),
     )
     badge = json.loads(badge_path.read_text(encoding="utf-8"))
-    assert badge["label"] == "gateway overhead"
-    assert badge["message"] == "14.6 ms"
+    assert badge["label"] == "gateway latency"
+    assert badge["message"] == "16.6 ms"
+    assert "overhead" not in badge["label"]
     assert json.loads(report_path.read_text(encoding="utf-8"))["schema_name"] == SCHEMA_NAME
 
 

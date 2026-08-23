@@ -582,7 +582,7 @@ def write_report_outputs(
     Args:
         report: Completed report.
         output_json: Optional destination for the versioned JSON artifact.
-        output_badge: Optional Shields endpoint JSON for the README badge.
+        output_badge: Optional Shields endpoint JSON for the README latency badge.
         github_summary: Optional GitHub Actions step-summary path.
         console: User-facing console for the Markdown table.
     """
@@ -595,7 +595,7 @@ def write_report_outputs(
         )
     if output_badge is not None:
         write_shields_endpoint(
-            p50_ms=report.representative_run.gateway_added.p50_ms,
+            p50_ms=report.representative_run.gateway.p50_ms,
             path=output_badge,
         )
     if github_summary is not None:
@@ -620,7 +620,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-badge",
         type=Path,
-        help="Write the Shields endpoint JSON for the README overhead badge.",
+        help="Write the Shields endpoint JSON for the README latency badge.",
     )
     parser.add_argument(
         "--github-summary",

@@ -1,4 +1,4 @@
-"""Tests for the Shields gateway-overhead badge payload."""
+"""Tests for the Shields gateway-latency badge payload."""
 
 from __future__ import annotations
 
@@ -13,37 +13,41 @@ from exp.runtime.gateway.latency_badge import (
     SHIELDS_COLOR,
     SHIELDS_IMAGE_URL,
     SHIELDS_LABEL,
-    format_overhead_ms,
-    overhead_p50_ms_from_report_json,
+    format_latency_ms,
+    gateway_p50_ms_from_report_json,
     shields_endpoint,
     write_shields_endpoint,
 )
 
 
-def test_format_overhead_ms_uses_one_decimal() -> None:
-    """The badge message rounds the representative p50 to one decimal place."""
-    assert format_overhead_ms(14.58) == "14.6 ms"
-    assert format_overhead_ms(3.0) == "3.0 ms"
-    assert format_overhead_ms(-1.24) == "-1.2 ms"
+def test_format_latency_ms_uses_one_decimal() -> None:
+    """The badge message rounds the representative gateway p50 to one decimal."""
+    assert format_latency_ms(22.204) == "22.2 ms"
+    assert format_latency_ms(3.0) == "3.0 ms"
+    assert format_latency_ms(14.58) == "14.6 ms"
 
 
 def test_shields_endpoint_is_schema_version_one() -> None:
     """The payload is a Shields endpoint with a numeric millisecond message."""
-    payload = shields_endpoint(p50_ms=14.58)
+    payload = shields_endpoint(p50_ms=22.204)
     assert payload == {
         "schemaVersion": 1,
         "label": SHIELDS_LABEL,
-        "message": "14.6 ms",
+        "message": "22.2 ms",
         "color": SHIELDS_COLOR,
         "cacheSeconds": 300,
     }
-    assert SHIELDS_LABEL == "gateway overhead"
+    assert SHIELDS_LABEL == "gateway latency"
     message = payload["message"]
     assert isinstance(message, str)
     assert message.endswith(" ms")
     assert "badge.svg" not in SHIELDS_IMAGE_URL
+    assert BADGE_FILENAME == "gateway-latency.json"
     assert BADGE_FILENAME in RAW_ENDPOINT_URL
     assert "img.shields.io/endpoint" in SHIELDS_IMAGE_URL
+    assert "overhead" not in SHIELDS_LABEL
+    assert "overhead" not in RAW_ENDPOINT_URL
+    assert "overhead" not in SHIELDS_IMAGE_URL
 
 
 def test_write_shields_endpoint_round_trips(tmp_path: Path) -> None:
@@ -53,48 +57,61 @@ def test_write_shields_endpoint_round_trips(tmp_path: Path) -> None:
     loaded = json.loads(path.read_text(encoding="utf-8"))
     assert loaded == written
     assert loaded["message"] == "22.2 ms"
+    assert loaded["label"] == "gateway latency"
 
 
-def test_overhead_p50_ms_from_report_json_reads_representative_run(tmp_path: Path) -> None:
-    """Badge generation reads p50 from the versioned report, not a constant."""
-    report = tmp_path / "gateway-latency.json"
+def test_gateway_p50_ms_from_report_json_reads_representative_gateway(tmp_path: Path) -> None:
+    """Badge generation reads gateway p50 from the report, not a constant."""
+    report = tmp_path / "report.json"
     report.write_text(
         json.dumps(
             {
-                "representative_run": {"gateway_added": {"p50_ms": 8.44}},
+                "representative_run": {
+                    "gateway": {"p50_ms": 22.204},
+                    "gateway_added": {"p50_ms": 14.58},
+                },
             }
         ),
         encoding="utf-8",
     )
-    assert overhead_p50_ms_from_report_json(report) == pytest.approx(8.44)
+    assert gateway_p50_ms_from_report_json(report) == pytest.approx(22.204)
     payload = write_shields_endpoint(
-        p50_ms=overhead_p50_ms_from_report_json(report),
+        p50_ms=gateway_p50_ms_from_report_json(report),
         path=tmp_path / BADGE_FILENAME,
     )
-    assert payload["message"] == "8.4 ms"
+    assert payload["message"] == "22.2 ms"
+    assert payload["message"] != "14.6 ms"
 
 
-def test_overhead_p50_ms_from_report_json_rejects_missing_fields(tmp_path: Path) -> None:
-    """A report without a numeric representative p50 fails closed."""
+def test_gateway_p50_ms_from_report_json_rejects_missing_fields(tmp_path: Path) -> None:
+    """A report without a numeric representative gateway p50 fails closed."""
     report = tmp_path / "bad.json"
     report.write_text("[]", encoding="utf-8")
     with pytest.raises(ValueError, match="JSON object"):
-        overhead_p50_ms_from_report_json(report)
+        gateway_p50_ms_from_report_json(report)
     report.write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="representative_run"):
-        overhead_p50_ms_from_report_json(report)
+        gateway_p50_ms_from_report_json(report)
     report.write_text(
-        json.dumps({"representative_run": {"gateway_added": {"p50_ms": "fast"}}}),
+        json.dumps({"representative_run": {"gateway_added": {"p50_ms": 14.58}}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="representative_run.gateway"):
+        gateway_p50_ms_from_report_json(report)
+    report.write_text(
+        json.dumps({"representative_run": {"gateway": {"p50_ms": "fast"}}}),
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="must be a number"):
-        overhead_p50_ms_from_report_json(report)
+        gateway_p50_ms_from_report_json(report)
 
 
 def test_readme_uses_shields_endpoint_not_actions_status() -> None:
     """The root README renders the numeric Shields badge, not a workflow status."""
     readme = Path(__file__).resolve().parents[3] / "README.md"
     text = readme.read_text(encoding="utf-8")
-    assert SHIELDS_IMAGE_URL in text
-    assert RAW_ENDPOINT_URL.split("https://")[1] in text or "endpoint?url=" in text
+    first_lines = "\n".join(text.splitlines()[:6])
+    assert SHIELDS_IMAGE_URL in first_lines
+    assert "gateway latency" in first_lines
+    assert "overhead" not in first_lines
     assert "actions/workflows/gateway-latency.yml/badge.svg" not in text

@@ -17,8 +17,8 @@ The runner starts a loopback mock, then measures the same
 2. the Experiential native gateway
 
 The gateway aliases the public model name `latency` to the same mock, so the
-request body is identical. Reported overhead is the client-observed difference
-(gateway minus mock) for p50, p95, and p99.
+request body is identical. The report records gateway p50, p95, and p99, and
+also the client-observed difference versus the mock for those percentiles.
 
 The schedule is:
 
@@ -39,7 +39,7 @@ Local report:
 uv sync --extra dev
 uv run python -m exp.runtime.gateway.latency_report \
   --output-json gateway-latency.json \
-  --output-badge gateway-overhead.json
+  --output-badge shields/gateway-latency.json
 ```
 
 Focused tests:
@@ -60,21 +60,21 @@ There is no hard latency threshold.
 
 The job uploads `gateway-latency.json` with schema
 `exp.gateway.latency_report` version 1, plus the derived Shields endpoint
-`gateway-overhead.json`. It also writes a Markdown table to the GitHub Actions
-job summary. The report records the commit SHA, runner OS, CPU count and model,
-Python version, resolved Experiential engine, every repeat, and the median run
-by gateway non-stream p50.
+`shields/gateway-latency.json`. It also writes a Markdown table to the GitHub
+Actions job summary. The report records the commit SHA, runner OS, CPU count
+and model, Python version, resolved Experiential engine, every repeat, and the
+median run by gateway non-stream p50.
 
-## Numeric overhead badge
+## Numeric latency badge
 
-The root README shows the latest **representative p50 gateway-added
-non-stream latency** from a successful routine run on `main`. The badge is a
-Shields endpoint, not a GitHub Actions pass/fail status image. The label is
-`gateway overhead` and the message is the measured value, for example
-`14.6 ms`.
+The root README shows the latest **representative gateway p50 request
+latency** (`representative_run.gateway.p50_ms`) from a successful routine run
+on `main`. The badge is a Shields endpoint, not a GitHub Actions pass/fail
+status image. The label is `gateway latency` and the message is the measured
+value, for example `22.2 ms`.
 
-After each successful `push` to `main`, the workflow copies
-`gateway-overhead.json` to the `badges` branch. Pull requests and
+After each successful `push` to `main`, the workflow publishes
+`gateway-latency.json` on the `badges` branch. Pull requests and
 `workflow_dispatch` (including the 32-core runner) measure and upload the
 artifact but do not publish the badge. That branch is not `main`, so the
 update does not require a protected-branch push and does not start gate,
@@ -82,12 +82,12 @@ latency, or package workflows.
 
 Stable endpoint:
 
-`https://raw.githubusercontent.com/experientiallabs/experiential/badges/gateway-overhead.json`
+`https://raw.githubusercontent.com/experientiallabs/experiential/badges/gateway-latency.json`
 
 README image:
 
 ```markdown
-[![gateway overhead](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fexperientiallabs%2Fexperiential%2Fbadges%2Fgateway-overhead.json)](https://github.com/experientiallabs/experiential/actions/workflows/gateway-latency.yml?query=branch%3Amain)
+[![gateway latency](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fexperientiallabs%2Fexperiential%2Fbadges%2Fgateway-latency.json)](https://github.com/experientiallabs/experiential/actions/workflows/gateway-latency.yml?query=branch%3Amain)
 ```
 
 The `badges` branch is created by the first successful main run after this

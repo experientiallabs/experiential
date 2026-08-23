@@ -1,6 +1,6 @@
 name: gateway latency
 
-# Mock-isolated gateway overhead report. No paid providers and no secrets.
+# Mock-isolated gateway latency report. No paid providers and no secrets.
 on:
   push:
     branches: [main]
@@ -25,14 +25,14 @@ jobs:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
         run: uv sync --extra dev
-      - name: Measure Experiential gateway overhead against a local mock
+      - name: Measure Experiential gateway latency against a local mock
         env:
           EXP_TELEMETRY: "0"
           DO_NOT_TRACK: "1"
         run: >-
           uv run python -m exp.runtime.gateway.latency_report
           --output-json gateway-latency.json
-          --output-badge gateway-overhead.json
+          --output-badge shields/gateway-latency.json
           --github-summary "$GITHUB_STEP_SUMMARY"
       - name: Upload the versioned latency report
         if: always()
@@ -41,7 +41,7 @@ jobs:
           name: gateway-latency-report
           path: |
             gateway-latency.json
-            gateway-overhead.json
+            shields/gateway-latency.json
           if-no-files-found: warn
 
   publish-badge:
@@ -56,7 +56,7 @@ jobs:
     permissions:
       contents: write
     concurrency:
-      group: gateway-overhead-badge
+      group: gateway-latency-badge
       cancel-in-progress: false
     steps:
       - name: Download the latency report artifact
@@ -69,8 +69,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test -f report/gateway-overhead.json
           test -f report/gateway-latency.json
+          test -f report/shields/gateway-latency.json
           git init badges-work
           cd badges-work
           git config user.name "github-actions[bot]"
@@ -82,10 +82,10 @@ jobs:
           else
             git checkout --orphan badges
           fi
-          cp ../report/gateway-overhead.json gateway-overhead.json
-          git add gateway-overhead.json
+          cp ../report/shields/gateway-latency.json gateway-latency.json
+          git add gateway-latency.json
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m "Update gateway overhead badge [skip ci]"
+          git commit -m "Update gateway latency badge [skip ci]"
           git push origin HEAD:badges
