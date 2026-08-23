@@ -126,9 +126,13 @@ authority for this path. Run `exp login` in an interactive terminal to open Plat
 store the returned key after the loopback callback completes.
 
 ```bash
-exp login
-exp config providers --provider experiential-cloud --root ROOT
+exp login --root ROOT
 ```
+
+Login registers the `experiential-cloud` connection and synchronizes every model identity returned
+by the hosted `/v1/models` endpoint for the authenticated account. Local gateway setup can select
+those models immediately. Use `exp config providers --provider experiential-cloud --root ROOT`
+later only when assigning build roles or explicitly refreshing the catalog.
 
 For headless or CI setup, export `EXPLABS_API_KEY` before running the same command. Preview or
 staging may replace the browser origin with `EXP_PLATFORM_URL` and the API origin with

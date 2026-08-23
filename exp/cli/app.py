@@ -36,7 +36,10 @@ add_deferred_typer(
 )
 app.command("build", help="Build a reusable grounded world model from local trace evidence.")(build)
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
-app.command("login", help="Sign in to Experiential Cloud through Platform.")(login)
+app.command(
+    "login",
+    help="Sign in to Experiential Cloud through Platform and sync account models.",
+)(login)
 
 
 @app.callback()

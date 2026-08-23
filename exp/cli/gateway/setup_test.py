@@ -12,15 +12,20 @@ import exp.runtime.gateway.sqlite.setup_authority as setup_authority
 import exp.runtime.gateway.sqlite.store as gateway_store
 from exp.cli.gateway import setup
 from exp.cli.providers import model_picker, provider_picker
-from exp.cli.providers.experiential_cloud import SETUP_PICKER_LABEL, SETUP_PICKER_NAME
+from exp.cli.providers.experiential_cloud import SETUP_PICKER_LABEL
 from exp.cli.shared.picker import PickerKey
 from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.config import load_settings
-from exp.common.models import ConnectionConfig, ModelCapabilities, PricingSource, ProviderConnection
+from exp.common.models import (
+    BillingSource,
+    ConnectionConfig,
+    ModelCapabilities,
+    PricingSource,
+    ProviderConnection,
+    load_model_catalog,
+)
 from exp.runtime.gateway.auth import IssuedVirtualKey
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
-
-_LOCAL_GATEWAY_EXCLUDE = frozenset({SETUP_PICKER_NAME})
 
 
 def _prepared_gateway_models() -> tuple[
@@ -58,11 +63,12 @@ def test_gateway_setup_uses_the_shared_provider_setup_seams() -> None:
 @pytest.mark.parametrize(
     ("answer", "provider"),
     (
-        ("1", "openai"),
-        ("2", "anthropic"),
-        ("5", "openai-compatible"),
-        ("6", "azure"),
-        ("7", "bedrock"),
+        ("1", "experiential-cloud"),
+        ("2", "openai"),
+        ("3", "anthropic"),
+        ("6", "openai-compatible"),
+        ("7", "azure"),
+        ("8", "bedrock"),
     ),
 )
 def test_gateway_provider_selector_exposes_primary_and_legacy_providers(
@@ -76,13 +82,19 @@ def test_gateway_provider_selector_exposes_primary_and_legacy_providers(
         provider_picker.SetupSession(),
         console=console,
         environment={},
-        exclude=_LOCAL_GATEWAY_EXCLUDE,
     )
 
     assert selected == ((provider,), provider in {"azure", "bedrock"})
-    for expected in ("openai", "anthropic", "azure", "bedrock", "openai-compatible"):
+    for expected in (
+        "Experiential Cloud",
+        "openai",
+        "anthropic",
+        "azure",
+        "bedrock",
+        "openai-compatible",
+    ):
         assert expected in console.output
-    assert SETUP_PICKER_LABEL not in console.output
+    assert SETUP_PICKER_LABEL in console.output
 
 
 def test_gateway_provider_selector_accepts_multiple_providers() -> None:
@@ -93,10 +105,9 @@ def test_gateway_provider_selector_accepts_multiple_providers() -> None:
         provider_picker.SetupSession(),
         console=console,
         environment={},
-        exclude=_LOCAL_GATEWAY_EXCLUDE,
     )
 
-    assert selected == (("openai", "anthropic", "azure", "bedrock"), True)
+    assert selected == (("experiential-cloud", "openai", "openai-compatible", "azure"), True)
 
 
 def test_gateway_provider_selector_uses_the_builder_keyboard_picker() -> None:
@@ -105,8 +116,7 @@ def test_gateway_provider_selector_uses_the_builder_keyboard_picker() -> None:
         (
             *(PickerKey.DOWN for _ in range(5)),
             PickerKey.ENTER,
-            PickerKey.DOWN,
-            PickerKey.DOWN,
+            *(PickerKey.DOWN for _ in range(3)),
             PickerKey.ENTER,
         )
     )
@@ -117,10 +127,9 @@ def test_gateway_provider_selector_uses_the_builder_keyboard_picker() -> None:
         console=console,
         environment={},
         read_key=lambda: next(keys),
-        exclude=_LOCAL_GATEWAY_EXCLUDE,
     )
 
-    assert selected == (("azure",), True)
+    assert selected == (("openai-compatible",), False)
     assert "Providers" in console.output
     assert "openai" in console.output
     assert "bedrock" in console.output
@@ -164,6 +173,53 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
     }
     assert {item.alias_id for item in manager.aliases()} == {"gpt-5-6-luna"}
     assert load_settings(tmp_path).commands.maximum_cost_usd == 50.0
+
+
+def test_gateway_setup_marks_experiential_deployment_as_host_managed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting the hosted provider preserves platform-owned billing in the local catalog."""
+    connection = ProviderConnection(
+        name="experiential-cloud",
+        provider="openai-compatible",
+        api_key_env="EXPLABS_API_KEY",
+        base_url="https://api.experientiallabs.ai/v1",
+    )
+    endpoint = provider_picker.PreparedEndpoint(
+        connection=connection,
+        api_key="secret",
+        configured=True,
+    )
+    model = provider_picker.AvailableModel(
+        alias="exp-chat",
+        connection=connection.name,
+        provider=connection.provider,
+        model="exp-chat",
+        capabilities=ModelCapabilities(supports_completions=True),
+        pricing_source=PricingSource.UNKNOWN,
+        configured=True,
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("experiential-cloud",), False),
+    )
+    monkeypatch.setattr(
+        setup,
+        "prepare_providers",
+        lambda *_args, **_kwargs: ((endpoint,), (model,)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(model, None),
+    )
+
+    setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    assert catalog.models["exp-chat"].billing_source is BillingSource.HOST_MANAGED
 
 
 def test_gateway_setup_can_edit_the_displayed_defaults(
