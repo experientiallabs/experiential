@@ -13,6 +13,8 @@ ROOT_PYTHON_FILES = frozenset(
         "__init__.py",
         "app.py",
         "app_test.py",
+        "auth.py",
+        "auth_test.py",
     }
 )
 CLI_PACKAGES = frozenset(
