@@ -1,81 +1,97 @@
-"""Bounded classifier execution that cannot stall the request deadline."""
+"""Cancellable async classifier execution under a per-loop inflight cap."""
 
 from __future__ import annotations
 
-import threading
-import time
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable, Coroutine
+from weakref import WeakKeyDictionary
 
-MAX_INFLIGHT_CLASSIFIER_CALLS = 32
-_INFLIGHT = threading.BoundedSemaphore(MAX_INFLIGHT_CLASSIFIER_CALLS)
+MAX_INFLIGHT_ASYNC_CLASSIFIER_CALLS = 32
 
 
 class ClassifierTimeoutError(TimeoutError):
-    """A classifier exceeded its per-check timeout without returning."""
+    """A classifier exceeded its per-check timeout or inflight wait."""
 
 
-def run_bounded[T](
-    fn: Callable[[], T],
-    timeout: float,
-    *,
-    slots: threading.BoundedSemaphore | None = None,
-) -> T:
-    """Run ``fn`` on a worker thread and raise if it exceeds ``timeout``.
+class BoundedInspect:
+    """Run inspect coroutines under ``asyncio.timeout`` and a per-loop cap.
 
-    The caller waits at most ``timeout`` seconds. ``fn`` never runs on the
-    caller's thread, so a synchronous inspect cannot block an asyncio event
-    loop that invoked this helper through ``asyncio.to_thread``. Timed-out
-    workers keep their slot until they finish, so at most
-    ``MAX_INFLIGHT_CLASSIFIER_CALLS`` inspects can be live. Further calls
-    fail closed at the same timeout instead of starting another thread. The
-    worker is a daemon so a hung adapter cannot stall process shutdown.
+    Each event loop has its own semaphore. Cancellation exits the slot
+    immediately, so a cancelled inspect cannot retain capacity for later
+    healthy adapters. Native callbacks use a private loop and therefore cannot
+    consume the Python gateway loop's slots.
+    """
+
+    def __init__(self, max_inflight: int = MAX_INFLIGHT_ASYNC_CLASSIFIER_CALLS) -> None:
+        """Bind one concurrency cap, realized separately on each event loop.
+
+        Args:
+            max_inflight: Maximum concurrent async inspects per event loop.
+
+        Raises:
+            ValueError: ``max_inflight`` is not a positive integer.
+        """
+        if max_inflight < 1:
+            raise ValueError("max_inflight must be a positive integer")
+        self._max_inflight = max_inflight
+        self._slots_by_loop: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+            WeakKeyDictionary()
+        )
+
+    def _slots(self) -> asyncio.Semaphore:
+        """Return the semaphore bound to the running event loop."""
+        loop = asyncio.get_running_loop()
+        slots = self._slots_by_loop.get(loop)
+        if slots is None:
+            slots = asyncio.Semaphore(self._max_inflight)
+            self._slots_by_loop[loop] = slots
+        return slots
+
+    async def run[T](self, fn: Callable[[], Awaitable[T]], timeout: float) -> T:
+        """Await ``fn`` and cancel it when ``timeout`` elapses.
+
+        Args:
+            fn: Zero-argument coroutine factory for one inspect.
+            timeout: Positive seconds budget, including slot wait.
+
+        Returns:
+            The inspect result.
+
+        Raises:
+            ClassifierTimeoutError: The budget elapsed before ``fn`` returned.
+            Exception: Whatever ``fn`` raised.
+        """
+        if timeout <= 0:
+            raise ClassifierTimeoutError("classifier timeout is not positive")
+        try:
+            async with asyncio.timeout(timeout):
+                async with self._slots():
+                    return await fn()
+        except TimeoutError as exc:
+            raise ClassifierTimeoutError("classifier exceeded its per-check timeout") from exc
+
+
+def run_on_private_loop[T](coro: Coroutine[object, object, T]) -> T:
+    """Run one coroutine on a private event loop for native callbacks.
+
+    Rust invokes control-plane methods on worker threads that do not own the
+    Python gateway loop. ``asyncio.run`` creates a private loop on that
+    thread so the callback never attaches to, or blocks, the gateway loop.
 
     Args:
-        fn: Synchronous inspect call.
-        timeout: Positive seconds budget.
-        slots: Optional inflight limiter. Tests inject a smaller semaphore.
-            Production uses the process-wide classifier cap.
+        coro: Coroutine produced by ``enforce_input`` or ``enforce_output``.
 
     Returns:
-        The inspect result.
+        The coroutine result.
 
     Raises:
-        ClassifierTimeoutError: The wait expired, or no worker slot was free
-            before the timeout.
-        Exception: Whatever ``fn`` raised.
+        RuntimeError: This thread already has a running event loop.
+        Exception: Whatever the coroutine raised.
     """
-    if timeout <= 0:
-        raise ClassifierTimeoutError("classifier timeout is not positive")
-    limiter = _INFLIGHT if slots is None else slots
-    started = time.monotonic()
-    if not limiter.acquire(timeout=timeout):
-        raise ClassifierTimeoutError("classifier worker capacity is exhausted")
-    remaining = timeout - (time.monotonic() - started)
-    if remaining <= 0:
-        limiter.release()
-        raise ClassifierTimeoutError("classifier exceeded its per-check timeout")
-    box: list[T] = []
-    errors: list[Exception] = []
-    done = threading.Event()
-
-    def worker() -> None:
-        """Execute the inspect call, then release the inflight slot."""
-        try:
-            box.append(fn())
-        except Exception as exc:  # noqa: BLE001 - inspect failures are returned to the chain
-            errors.append(exc)
-        finally:
-            done.set()
-            limiter.release()
-
-    thread = threading.Thread(target=worker, name="exp-guardrail-inspect", daemon=True)
     try:
-        thread.start()
+        asyncio.get_running_loop()
     except RuntimeError:
-        limiter.release()
-        raise
-    if not done.wait(remaining):
-        raise ClassifierTimeoutError("classifier exceeded its per-check timeout")
-    if errors:
-        raise errors[0]
-    return box[0]
+        return asyncio.run(coro)
+    raise RuntimeError(
+        "native guardrail callbacks cannot run on a thread that already owns an event loop"
+    )

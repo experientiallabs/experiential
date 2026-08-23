@@ -1,80 +1,132 @@
-"""Bounded classifier execution tests."""
+"""Bounded async classifier execution tests."""
 
 from __future__ import annotations
 
-import threading
-import time
+import asyncio
 
 import pytest
 
-from exp.runtime.gateway.guardrails.bounded import ClassifierTimeoutError, run_bounded
+from exp.runtime.gateway.guardrails.bounded import (
+    BoundedInspect,
+    ClassifierTimeoutError,
+    run_on_private_loop,
+)
 
 
-def test_run_bounded_returns_the_inspect_result() -> None:
+def test_bounded_inspect_returns_the_inspect_result() -> None:
     """A timely inspect result is returned to the caller."""
-    assert run_bounded(lambda: 7, 0.5) == 7
+
+    async def scenario() -> None:
+        """Await one immediate inspect."""
+        bound = BoundedInspect()
+
+        async def inspect() -> int:
+            """Return a constant."""
+            return 7
+
+        assert await bound.run(inspect, 0.5) == 7
+
+    asyncio.run(scenario())
 
 
-def test_run_bounded_raises_without_waiting_for_a_blocking_inspect() -> None:
-    """A hung inspect times out on the caller before the worker returns."""
+def test_bounded_inspect_cancels_a_hung_inspect_and_releases_the_slot() -> None:
+    """A hung inspect times out, then a later inspect can take the same slot."""
 
-    def hang() -> int:
-        """Sleep longer than the allowed timeout."""
-        time.sleep(0.25)
-        return 1
+    async def scenario() -> None:
+        """Fill one slot with a never-returning inspect, then reuse it."""
+        bound = BoundedInspect(max_inflight=1)
+        entered = asyncio.Event()
 
-    started = time.monotonic()
-    with pytest.raises(ClassifierTimeoutError):
-        run_bounded(hang, 0.05)
-    assert time.monotonic() - started < 1.0
+        async def hang() -> int:
+            """Wait forever after marking entry."""
+            entered.set()
+            await asyncio.Event().wait()
+            return 1
+
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(ClassifierTimeoutError):
+            await bound.run(hang, 0.05)
+        assert asyncio.get_running_loop().time() - started < 1.0
+        assert entered.is_set()
+
+        async def healthy() -> int:
+            """Return immediately."""
+            return 3
+
+        assert await bound.run(healthy, 0.5) == 3
+
+    asyncio.run(scenario())
 
 
-def test_run_bounded_propagates_inspect_errors() -> None:
-    """Adapter exceptions surface after the worker finishes inside the budget."""
+def test_bounded_inspect_propagates_inspect_errors() -> None:
+    """Adapter exceptions surface after the coroutine finishes inside the budget."""
 
-    def boom() -> int:
-        """Fail immediately."""
-        raise RuntimeError("classifier unavailable")
+    async def scenario() -> None:
+        """Raise from a timely inspect."""
+        bound = BoundedInspect()
 
-    with pytest.raises(RuntimeError, match="classifier unavailable"):
-        run_bounded(boom, 0.5)
+        async def boom() -> int:
+            """Fail immediately."""
+            raise RuntimeError("classifier unavailable")
+
+        with pytest.raises(RuntimeError, match="classifier unavailable"):
+            await bound.run(boom, 0.5)
+
+    asyncio.run(scenario())
 
 
-def test_run_bounded_caps_inflight_workers_instead_of_leaking_threads() -> None:
-    """A full inflight cap fail-closes without starting another inspect thread."""
-    slots = threading.BoundedSemaphore(2)
-    block = threading.Event()
-    entered = threading.Semaphore(0)
-    started_inspects = 0
-    lock = threading.Lock()
+def test_repeated_timeouts_do_not_exhaust_later_inspects() -> None:
+    """Cancelling past the inflight cap still leaves capacity for a healthy inspect."""
 
-    def hang() -> int:
-        """Hold a slot until the test releases every occupant."""
-        nonlocal started_inspects
-        with lock:
-            started_inspects += 1
-        entered.release()
-        block.wait(2.0)
-        return 1
+    async def scenario() -> None:
+        """Time out more inspects than the cap, then run a healthy inspect."""
+        bound = BoundedInspect(max_inflight=2)
 
-    def occupy() -> None:
-        """Hold one cap slot for the duration of the blocking inspect."""
+        async def hang() -> int:
+            """Wait until cancelled."""
+            await asyncio.Event().wait()
+            return 1
+
+        for _ in range(6):
+            with pytest.raises(ClassifierTimeoutError):
+                await bound.run(hang, 0.03)
+
+        async def healthy() -> int:
+            """Return immediately."""
+            return 9
+
+        started = asyncio.get_running_loop().time()
+        assert await bound.run(healthy, 0.5) == 9
+        assert asyncio.get_running_loop().time() - started < 0.2
+
+    asyncio.run(scenario())
+
+
+def test_run_on_private_loop_executes_without_a_running_loop() -> None:
+    """Native callbacks create a private loop on the worker thread."""
+
+    async def inspect() -> int:
+        """Return a constant."""
+        return 4
+
+    assert run_on_private_loop(inspect()) == 4
+
+
+def test_run_on_private_loop_refuses_a_running_event_loop() -> None:
+    """A private loop is not nested onto the Python gateway loop."""
+
+    async def scenario() -> None:
+        """Call the native bridge helper from an already-running loop."""
+
+        async def inspect() -> int:
+            """Return a constant."""
+            return 1
+
+        coro = inspect()
         try:
-            run_bounded(hang, 1.0, slots=slots)
-        except ClassifierTimeoutError:
-            return
+            with pytest.raises(RuntimeError, match="already owns an event loop"):
+                run_on_private_loop(coro)
+        finally:
+            coro.close()
 
-    occupants = [threading.Thread(target=occupy) for _ in range(2)]
-    for occupant in occupants:
-        occupant.start()
-    assert entered.acquire(timeout=1.0)
-    assert entered.acquire(timeout=1.0)
-    started = time.monotonic()
-    with pytest.raises(ClassifierTimeoutError, match="capacity is exhausted"):
-        run_bounded(hang, 0.05, slots=slots)
-    assert time.monotonic() - started < 0.5
-    assert started_inspects == 2
-    block.set()
-    for occupant in occupants:
-        occupant.join(1.0)
-    assert run_bounded(lambda: 3, 0.5, slots=slots) == 3
+    asyncio.run(scenario())

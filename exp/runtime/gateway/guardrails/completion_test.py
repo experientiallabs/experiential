@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 from exp.common.models import ToolCall
-from exp.runtime.gateway.contracts import GatewayEvent, GatewayEventKind
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayEvent,
+    GatewayEventKind,
+    GatewayMessage,
+    GatewayRequest,
+)
 from exp.runtime.gateway.guardrails.completion import apply_text_replacement, completion_from_events
+from exp.runtime.openai_protocol.streaming import ResponsesSseEncoder, encode_responses_events
 
 
 def test_completion_from_events_projects_text_and_tool_calls() -> None:
@@ -86,3 +93,21 @@ def test_textless_and_refusal_replacements_keep_strictly_increasing_sequences() 
     assert refusal_rewritten[0].text_delta == "safe"
     assert [event.sequence_number for event in empty_rewritten] == [0, 1]
     assert empty_rewritten[0].text_delta == "safe"
+
+    frames = encode_responses_events(
+        ResponsesSseEncoder(
+            request_id="request-one",
+            model="public-model",
+            created_at=0.0,
+            request=GatewayRequest(
+                surface=GatewayApiSurface.RESPONSES,
+                messages=(GatewayMessage(role="user", content="hello"),),
+            ),
+        ),
+        refusal_rewritten,
+    )
+    body = "".join(frames)
+    assert "invalid_provider_stream" not in body
+    assert "safe" in body
+    assert "I cannot" not in body
+    assert "response.refusal" not in body

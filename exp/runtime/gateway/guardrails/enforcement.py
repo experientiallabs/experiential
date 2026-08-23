@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.gateway.guardrails.bounded import ClassifierTimeoutError, run_bounded
+from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
 from exp.runtime.gateway.guardrails.client import InternalClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
@@ -37,6 +37,7 @@ class GuardrailEngine:
         store: GuardrailPolicyStore,
         client: InternalClassifierClient,
         monotonic: Callable[[], float],
+        inspects: BoundedInspect | None = None,
     ) -> None:
         """Bind lookup, the internal client, and the deadline clock.
 
@@ -44,10 +45,13 @@ class GuardrailEngine:
             store: Identity-keyed policy lookup.
             client: Injected adapter seam that cannot use the public route.
             monotonic: Process-local clock in seconds.
+            inspects: Optional async inflight limiter. ``None`` uses the
+                default shared cap.
         """
         self._store = store
         self._client = client
         self._monotonic = monotonic
+        self._inspects = inspects or BoundedInspect()
         self.input_invocations = 0
         self.output_invocations = 0
         self.classifier_calls = 0
@@ -56,7 +60,7 @@ class GuardrailEngine:
         """Return the assigned policy, or ``None`` for unguarded traffic."""
         return self._store.policy_for(organization_id, identity_id)
 
-    def enforce_input(
+    async def enforce_input(
         self,
         *,
         policy: GuardrailPolicy,
@@ -82,7 +86,7 @@ class GuardrailEngine:
             raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
         current = request
         for check in policy.input_checks:
-            verdict = self._run_check(
+            verdict = await self._run_check(
                 policy=policy,
                 check=check,
                 inspect=lambda bound=check, payload=current: self._client.inspect_input(
@@ -96,7 +100,7 @@ class GuardrailEngine:
             current = self._apply_input(policy, check, current, verdict)
         return current
 
-    def enforce_output(
+    async def enforce_output(
         self,
         *,
         policy: GuardrailPolicy,
@@ -122,7 +126,7 @@ class GuardrailEngine:
             raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
         current = completion
         for check in policy.output_checks:
-            verdict = self._run_check(
+            verdict = await self._run_check(
                 policy=policy,
                 check=check,
                 inspect=lambda bound=check, payload=current: self._client.inspect_output(
@@ -136,12 +140,12 @@ class GuardrailEngine:
             current = self._apply_output(policy, check, current, verdict)
         return current
 
-    def _run_check(
+    async def _run_check(
         self,
         *,
         policy: GuardrailPolicy,
         check: GuardrailCheck,
-        inspect: Callable[[], ClassifierVerdict],
+        inspect: Callable[[], Awaitable[ClassifierVerdict]],
         deadline_monotonic: float,
     ) -> ClassifierVerdict | None:
         """Invoke one adapter under the tighter of check timeout and request deadline.
@@ -160,7 +164,7 @@ class GuardrailEngine:
         started = self._monotonic()
         try:
             self.classifier_calls += 1
-            verdict = run_bounded(inspect, timeout)
+            verdict = await self._inspects.run(inspect, timeout)
         except ClassifierTimeoutError:
             return self._uncertain(policy, check, GuardrailAction.ERROR)
         except Exception:  # noqa: BLE001 - classifier failures are fail-closed or skipped

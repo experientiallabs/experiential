@@ -285,7 +285,7 @@ def test_input_runs_after_continuation_and_once_per_request() -> None:
         class _Capture(ScriptedClassifier):
             """Record message contents seen by the input adapter."""
 
-            def inspect_input(
+            async def inspect_input(
                 self,
                 *,
                 request: GatewayRequest,
@@ -293,7 +293,7 @@ def test_input_runs_after_continuation_and_once_per_request() -> None:
             ) -> ClassifierVerdict:
                 """Capture contents, then allow."""
                 seen.append(tuple(message.content or "" for message in request.messages))
-                return super().inspect_input(request=request, check=check)
+                return await super().inspect_input(request=request, check=check)
 
         classifier = _Capture()
         provider = _RecordingProvider(lambda: _EventStream(_text_events("hello")))
@@ -624,7 +624,7 @@ def test_waterfall_reuses_one_transformed_request_and_keeps_provider_failover() 
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
             messages=(GatewayMessage(role="user", content="original"),),
         )
-        transformed = engine.enforce_input(
+        transformed = await engine.enforce_input(
             policy=policy,
             request=request,
             deadline_monotonic=_Clock().monotonic() + 30,
@@ -740,7 +740,7 @@ def test_protected_adapter_failure_is_terminal() -> None:
     class _Boom(ScriptedClassifier):
         """Raise on every input inspection."""
 
-        def inspect_input(
+        async def inspect_input(
             self,
             *,
             request: GatewayRequest,

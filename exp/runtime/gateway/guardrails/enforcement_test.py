@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
+from collections.abc import Coroutine
 
 import pytest
 
@@ -13,8 +15,13 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
-from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
-from exp.runtime.gateway.guardrails.client import DirectClassifierClient
+from exp.runtime.gateway.guardrails.bounded import BoundedInspect
+from exp.runtime.gateway.guardrails.classifiers import (
+    BoundedSyncClassifier,
+    ClassifierRegistry,
+    ScriptedClassifier,
+)
+from exp.runtime.gateway.guardrails.client import DirectClassifierClient, InspectingClassifier
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailAction,
@@ -45,13 +52,18 @@ class _Clock:
 class _RaisingClassifier(ScriptedClassifier):
     """Adapter that fails every inspection."""
 
-    def inspect_input(self, *, request: GatewayRequest, check: GuardrailCheck) -> ClassifierVerdict:
+    async def inspect_input(
+        self,
+        *,
+        request: GatewayRequest,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
         """Raise instead of returning a verdict."""
         del request, check
         self.input_calls += 1
         raise RuntimeError("classifier unavailable")
 
-    def inspect_output(
+    async def inspect_output(
         self,
         *,
         completion: GuardrailCompletion,
@@ -61,6 +73,82 @@ class _RaisingClassifier(ScriptedClassifier):
         del completion, check
         self.output_calls += 1
         raise RuntimeError("classifier unavailable")
+
+
+class _HungAsyncClassifier:
+    """Adapter that never returns unless the inspect is cancelled."""
+
+    def __init__(self) -> None:
+        """Start with empty call counts."""
+        self.input_calls = 0
+        self.output_calls = 0
+
+    async def inspect_input(
+        self,
+        *,
+        request: GatewayRequest,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Wait until cancelled."""
+        del request, check
+        self.input_calls += 1
+        await asyncio.Event().wait()
+        return ClassifierVerdict(flagged=False)
+
+    async def inspect_output(
+        self,
+        *,
+        completion: GuardrailCompletion,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Wait until cancelled."""
+        del completion, check
+        self.output_calls += 1
+        await asyncio.Event().wait()
+        return ClassifierVerdict(flagged=False)
+
+
+class _HungSyncClassifier:
+    """Leftover synchronous adapter that blocks until the test releases it."""
+
+    def __init__(self) -> None:
+        """Start with empty call counts and a closed gate."""
+        self.input_calls = 0
+        self.output_calls = 0
+        self._block = threading.Event()
+
+    def release(self) -> None:
+        """Unblock every waiting worker thread."""
+        self._block.set()
+
+    def inspect_input(
+        self,
+        *,
+        request: GatewayRequest,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Block the private executor thread."""
+        del request, check
+        self.input_calls += 1
+        self._block.wait(30.0)
+        return ClassifierVerdict(flagged=False)
+
+    def inspect_output(
+        self,
+        *,
+        completion: GuardrailCompletion,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Block the private executor thread."""
+        del completion, check
+        self.output_calls += 1
+        self._block.wait(30.0)
+        return ClassifierVerdict(flagged=False)
+
+
+def _awaited[T](coro: Coroutine[object, object, T]) -> T:
+    """Run one enforcement coroutine on a private loop."""
+    return asyncio.run(coro)
 
 
 def _check(
@@ -82,15 +170,15 @@ def _check(
     )
 
 
-def _engine(
+def _engine[C: InspectingClassifier](
     *,
-    classifier: ScriptedClassifier,
+    classifier: C,
     checks: tuple[GuardrailCheck, ...],
     protected: bool = False,
     clock: _Clock | None = None,
     max_request_bytes: int = 1_048_576,
     max_response_bytes: int = 1_048_576,
-) -> tuple[GuardrailEngine, ScriptedClassifier]:
+) -> tuple[GuardrailEngine, C]:
     """Compose one engine over a single identity policy."""
     policy = GuardrailPolicy(
         policy_id="member-policy",
@@ -129,10 +217,12 @@ def test_input_chain_runs_once_and_can_transform_the_request() -> None:
     policy = engine.policy_for("organization-one", "identity-one")
     assert policy is not None
 
-    result = engine.enforce_input(
-        policy=policy,
-        request=_request("original"),
-        deadline_monotonic=200.0,
+    result = _awaited(
+        engine.enforce_input(
+            policy=policy,
+            request=_request("original"),
+            deadline_monotonic=200.0,
+        )
     )
 
     assert result.messages == replacement
@@ -150,10 +240,12 @@ def test_input_block_is_terminal_and_content_free() -> None:
     assert policy is not None
 
     with pytest.raises(GuardrailRejected) as raised:
-        engine.enforce_input(
-            policy=policy,
-            request=_request("secret-prompt"),
-            deadline_monotonic=200.0,
+        _awaited(
+            engine.enforce_input(
+                policy=policy,
+                request=_request("secret-prompt"),
+                deadline_monotonic=200.0,
+            )
         )
 
     assert raised.value.failure.failure_class is GatewayFailureClass.GUARDRAIL
@@ -172,10 +264,12 @@ def test_protected_identity_fail_closes_on_adapter_error() -> None:
     assert policy is not None
 
     with pytest.raises(GuardrailRejected) as raised:
-        engine.enforce_input(
-            policy=policy,
-            request=_request("hello"),
-            deadline_monotonic=200.0,
+        _awaited(
+            engine.enforce_input(
+                policy=policy,
+                request=_request("hello"),
+                deadline_monotonic=200.0,
+            )
         )
 
     assert raised.value.failure.safe_details["action"] == "error"
@@ -192,10 +286,12 @@ def test_unprotected_identity_skips_a_failed_check() -> None:
     policy = engine.policy_for("organization-one", "identity-one")
     assert policy is not None
 
-    result = engine.enforce_input(
-        policy=policy,
-        request=_request("hello"),
-        deadline_monotonic=200.0,
+    result = _awaited(
+        engine.enforce_input(
+            policy=policy,
+            request=_request("hello"),
+            deadline_monotonic=200.0,
+        )
     )
 
     assert result.messages[0].content == "hello"
@@ -215,10 +311,12 @@ def test_expired_deadline_fail_closes_for_protected_identities() -> None:
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
-        engine.enforce_input(
-            policy=policy,
-            request=_request("hello"),
-            deadline_monotonic=200.0,
+        _awaited(
+            engine.enforce_input(
+                policy=policy,
+                request=_request("hello"),
+                deadline_monotonic=200.0,
+            )
         )
 
 
@@ -244,10 +342,12 @@ def test_output_modify_never_rewrites_tool_call_arguments() -> None:
     )
 
     with pytest.raises(GuardrailRejected) as raised:
-        engine.enforce_output(
-            policy=policy,
-            completion=completion,
-            deadline_monotonic=200.0,
+        _awaited(
+            engine.enforce_output(
+                policy=policy,
+                completion=completion,
+                deadline_monotonic=200.0,
+            )
         )
 
     assert raised.value.failure.safe_details["action"] == "block"
@@ -264,10 +364,12 @@ def test_oversized_payload_is_a_terminal_error() -> None:
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
-        engine.enforce_input(
-            policy=policy,
-            request=_request("too-large"),
-            deadline_monotonic=200.0,
+        _awaited(
+            engine.enforce_input(
+                policy=policy,
+                request=_request("too-large"),
+                deadline_monotonic=200.0,
+            )
         )
 
     assert classifier.input_calls == 0
@@ -275,21 +377,11 @@ def test_oversized_payload_is_a_terminal_error() -> None:
     assert engine.policy_for("organization-two", "identity-one") is None
 
 
-class _BlockingClassifier(ScriptedClassifier):
-    """Adapter that sleeps longer than any per-check timeout."""
-
-    def inspect_input(self, *, request: GatewayRequest, check: GuardrailCheck) -> ClassifierVerdict:
-        """Block the caller thread until after the check budget expires."""
-        del request, check
-        self.input_calls += 1
-        time.sleep(0.25)
-        return ClassifierVerdict(flagged=False)
-
-
 def test_blocking_classifier_times_out_without_waiting_for_return() -> None:
-    """A hung inspect fails closed at the check timeout, not after the sleep."""
-    engine, classifier = _engine(
-        classifier=_BlockingClassifier(),
+    """A hung inspect fails closed at the check timeout, not after the wait."""
+    hung = _HungAsyncClassifier()
+    engine, _classifier = _engine(
+        classifier=hung,
         checks=(_check("input-one", timeout_ms=50),),
         protected=True,
         clock=_Clock(),
@@ -299,25 +391,27 @@ def test_blocking_classifier_times_out_without_waiting_for_return() -> None:
 
     started = time.monotonic()
     with pytest.raises(GuardrailRejected) as raised:
-        engine.enforce_input(
-            policy=policy,
-            request=_request("hello"),
-            deadline_monotonic=200.0,
+        _awaited(
+            engine.enforce_input(
+                policy=policy,
+                request=_request("hello"),
+                deadline_monotonic=200.0,
+            )
         )
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
     assert raised.value.failure.safe_details["action"] == "error"
-    assert classifier.input_calls == 1
+    assert hung.input_calls == 1
 
 
 def test_blocking_classifier_leaves_the_event_loop_free() -> None:
-    """A hung inspect waiting off-thread still lets other tasks progress."""
+    """A hung inspect is cancelled on the loop without stalling other tasks."""
 
     async def scenario() -> None:
         """Run one timed-out inspect alongside a short sleep."""
         engine, _classifier = _engine(
-            classifier=_BlockingClassifier(),
+            classifier=_HungAsyncClassifier(),
             checks=(_check("input-one", timeout_ms=80),),
             protected=True,
             clock=_Clock(),
@@ -327,20 +421,127 @@ def test_blocking_classifier_leaves_the_event_loop_free() -> None:
         progressed = False
 
         async def marker() -> None:
-            """Flip after a delay shorter than the inspect sleep."""
+            """Flip after a delay shorter than the inspect hang."""
             nonlocal progressed
             await asyncio.sleep(0.02)
             progressed = True
 
         task = asyncio.create_task(marker())
         with pytest.raises(GuardrailRejected):
-            await asyncio.to_thread(
-                engine.enforce_input,
+            await engine.enforce_input(
                 policy=policy,
                 request=_request("hello"),
                 deadline_monotonic=200.0,
             )
         await task
         assert progressed
+
+    asyncio.run(scenario())
+
+
+def test_repeated_blocked_adapter_does_not_starve_a_healthy_adapter() -> None:
+    """Timeouts on one adapter leave another adapter free to succeed promptly."""
+
+    async def scenario() -> None:
+        """Fail a hung adapter past the inflight cap, then inspect a healthy one."""
+        hung = _HungAsyncClassifier()
+        healthy = ScriptedClassifier()
+        hung_policy = GuardrailPolicy(
+            policy_id="blocked-policy",
+            organization_id="organization-one",
+            identity_id="identity-blocked",
+            protected=True,
+            checks=(_check("blocked-input", adapter_id="blocked", timeout_ms=40),),
+        )
+        healthy_policy = GuardrailPolicy(
+            policy_id="healthy-policy",
+            organization_id="organization-one",
+            identity_id="identity-healthy",
+            checks=(_check("healthy-input", adapter_id="healthy", timeout_ms=200),),
+        )
+        engine = GuardrailEngine(
+            store=MappingGuardrailStore((hung_policy, healthy_policy)),
+            client=DirectClassifierClient(
+                ClassifierRegistry({"blocked": hung, "healthy": healthy})
+            ),
+            monotonic=time.monotonic,
+            inspects=BoundedInspect(max_inflight=4),
+        )
+
+        for _ in range(8):
+            with pytest.raises(GuardrailRejected):
+                await engine.enforce_input(
+                    policy=hung_policy,
+                    request=_request("hello"),
+                    deadline_monotonic=time.monotonic() + 30,
+                )
+
+        started = time.monotonic()
+        result = await engine.enforce_input(
+            policy=healthy_policy,
+            request=_request("hello"),
+            deadline_monotonic=time.monotonic() + 30,
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.messages[0].content == "hello"
+        assert healthy.input_calls == 1
+        assert hung.input_calls == 8
+        assert elapsed < 0.2
+
+    asyncio.run(scenario())
+
+
+def test_hung_sync_compat_adapter_cannot_starve_healthy_async_adapters() -> None:
+    """A blocked leftover sync wrapper keeps its private workers, not async slots."""
+
+    async def scenario() -> None:
+        """Time out a hung sync wrapper, then succeed on a healthy async adapter."""
+        hung_inner = _HungSyncClassifier()
+        hung = BoundedSyncClassifier(hung_inner, max_workers=2)
+        healthy = ScriptedClassifier()
+        hung_policy = GuardrailPolicy(
+            policy_id="sync-blocked-policy",
+            organization_id="organization-one",
+            identity_id="identity-sync",
+            protected=True,
+            checks=(_check("sync-input", adapter_id="sync-blocked", timeout_ms=40),),
+        )
+        healthy_policy = GuardrailPolicy(
+            policy_id="async-healthy-policy",
+            organization_id="organization-one",
+            identity_id="identity-async",
+            checks=(_check("async-input", adapter_id="async-healthy", timeout_ms=200),),
+        )
+        engine = GuardrailEngine(
+            store=MappingGuardrailStore((hung_policy, healthy_policy)),
+            client=DirectClassifierClient(
+                ClassifierRegistry({"sync-blocked": hung, "async-healthy": healthy})
+            ),
+            monotonic=time.monotonic,
+            inspects=BoundedInspect(max_inflight=2),
+        )
+        try:
+            for _ in range(4):
+                with pytest.raises(GuardrailRejected):
+                    await engine.enforce_input(
+                        policy=hung_policy,
+                        request=_request("hello"),
+                        deadline_monotonic=time.monotonic() + 30,
+                    )
+
+            started = time.monotonic()
+            result = await engine.enforce_input(
+                policy=healthy_policy,
+                request=_request("hello"),
+                deadline_monotonic=time.monotonic() + 30,
+            )
+            elapsed = time.monotonic() - started
+
+            assert result.messages[0].content == "hello"
+            assert healthy.input_calls == 1
+            assert elapsed < 0.2
+        finally:
+            hung_inner.release()
 
     asyncio.run(scenario())

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Awaitable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Protocol
@@ -24,8 +24,30 @@ class GuardrailRecursionError(RuntimeError):
     """A classifier attempted to re-enter the public gateway route."""
 
 
-class InternalClassifierClient(Protocol):
-    """Direct adapter transport that never uses a public gateway HTTP route."""
+class InspectingClassifier(Protocol):
+    """Replaceable async detector that never logs request or response content."""
+
+    def inspect_input(
+        self,
+        *,
+        request: GatewayRequest,
+        check: GuardrailCheck,
+    ) -> Awaitable[ClassifierVerdict]:
+        """Inspect one canonical request."""
+        ...
+
+    def inspect_output(
+        self,
+        *,
+        completion: GuardrailCompletion,
+        check: GuardrailCheck,
+    ) -> Awaitable[ClassifierVerdict]:
+        """Inspect one winning completion."""
+        ...
+
+
+class SyncInspectingClassifier(Protocol):
+    """Leftover synchronous detector used only through ``BoundedSyncClassifier``."""
 
     def inspect_input(
         self,
@@ -33,7 +55,7 @@ class InternalClassifierClient(Protocol):
         request: GatewayRequest,
         check: GuardrailCheck,
     ) -> ClassifierVerdict:
-        """Inspect one canonical request through the bound adapter."""
+        """Inspect one canonical request on the caller's thread."""
         ...
 
     def inspect_output(
@@ -42,6 +64,28 @@ class InternalClassifierClient(Protocol):
         completion: GuardrailCompletion,
         check: GuardrailCheck,
     ) -> ClassifierVerdict:
+        """Inspect one winning completion on the caller's thread."""
+        ...
+
+
+class InternalClassifierClient(Protocol):
+    """Direct adapter transport that never uses a public gateway HTTP route."""
+
+    def inspect_input(
+        self,
+        *,
+        request: GatewayRequest,
+        check: GuardrailCheck,
+    ) -> Awaitable[ClassifierVerdict]:
+        """Inspect one canonical request through the bound adapter."""
+        ...
+
+    def inspect_output(
+        self,
+        *,
+        completion: GuardrailCompletion,
+        check: GuardrailCheck,
+    ) -> Awaitable[ClassifierVerdict]:
         """Inspect one winning completion through the bound adapter."""
         ...
 
@@ -62,7 +106,7 @@ class DirectClassifierClient:
         """
         self._registry = registry
 
-    def inspect_input(
+    async def inspect_input(
         self,
         *,
         request: GatewayRequest,
@@ -70,12 +114,12 @@ class DirectClassifierClient:
     ) -> ClassifierVerdict:
         """Inspect one canonical request through the bound adapter."""
         with classification_scope():
-            return self._registry.require(check.adapter_id).inspect_input(
+            return await self._registry.require(check.adapter_id).inspect_input(
                 request=request,
                 check=check,
             )
 
-    def inspect_output(
+    async def inspect_output(
         self,
         *,
         completion: GuardrailCompletion,
@@ -83,7 +127,7 @@ class DirectClassifierClient:
     ) -> ClassifierVerdict:
         """Inspect one winning completion through the bound adapter."""
         with classification_scope():
-            return self._registry.require(check.adapter_id).inspect_output(
+            return await self._registry.require(check.adapter_id).inspect_output(
                 completion=completion,
                 check=check,
             )
@@ -94,28 +138,6 @@ class ClassifierLookup(Protocol):
 
     def require(self, adapter_id: str) -> InspectingClassifier:
         """Return the adapter or raise ``KeyError`` when it is not registered."""
-        ...
-
-
-class InspectingClassifier(Protocol):
-    """Replaceable detector that never logs request or response content."""
-
-    def inspect_input(
-        self,
-        *,
-        request: GatewayRequest,
-        check: GuardrailCheck,
-    ) -> ClassifierVerdict:
-        """Inspect one canonical request."""
-        ...
-
-    def inspect_output(
-        self,
-        *,
-        completion: GuardrailCompletion,
-        check: GuardrailCheck,
-    ) -> ClassifierVerdict:
-        """Inspect one winning completion."""
         ...
 
 

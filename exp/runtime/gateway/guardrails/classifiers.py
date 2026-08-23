@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 
 from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.gateway.guardrails.client import InspectingClassifier
+from exp.runtime.gateway.guardrails.client import (
+    InspectingClassifier,
+    SyncInspectingClassifier,
+    classification_scope,
+)
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailCheck,
     GuardrailCompletion,
 )
+
+DEFAULT_SYNC_COMPAT_WORKERS = 2
 
 
 class ClassifierRegistry:
@@ -72,7 +80,7 @@ class ScriptedClassifier:
         self._input = input_verdict or ClassifierVerdict(flagged=False)
         self._output = output_verdict or ClassifierVerdict(flagged=False)
 
-    def inspect_input(
+    async def inspect_input(
         self,
         *,
         request: GatewayRequest,
@@ -83,7 +91,7 @@ class ScriptedClassifier:
         self.input_calls += 1
         return self._input
 
-    def inspect_output(
+    async def inspect_output(
         self,
         *,
         completion: GuardrailCompletion,
@@ -118,7 +126,7 @@ class KeywordClassifier:
         self.input_calls = 0
         self.output_calls = 0
 
-    def inspect_input(
+    async def inspect_input(
         self,
         *,
         request: GatewayRequest,
@@ -135,7 +143,7 @@ class KeywordClassifier:
                 parts.append(call.arguments_json())
         return ClassifierVerdict(flagged=_contains_needle("\n".join(parts), self._needles))
 
-    def inspect_output(
+    async def inspect_output(
         self,
         *,
         completion: GuardrailCompletion,
@@ -146,6 +154,68 @@ class KeywordClassifier:
         self.output_calls += 1
         parts = [completion.text, *(call.arguments for call in completion.tool_calls)]
         return ClassifierVerdict(flagged=_contains_needle("\n".join(parts), self._needles))
+
+
+class BoundedSyncClassifier:
+    """Wrap a leftover synchronous adapter with a private executor.
+
+    Hung sync inspects occupy only this wrapper's workers. They cannot take
+    async inflight slots from healthy adapters, and they cannot share a
+    process-wide thread pool with other wrappers.
+    """
+
+    def __init__(
+        self,
+        inner: SyncInspectingClassifier,
+        *,
+        max_workers: int = DEFAULT_SYNC_COMPAT_WORKERS,
+    ) -> None:
+        """Bind one private executor around a synchronous adapter.
+
+        Args:
+            inner: Leftover synchronous detector.
+            max_workers: Maximum concurrent sync inspects for this wrapper.
+
+        Raises:
+            ValueError: ``max_workers`` is not a positive integer.
+        """
+        if max_workers < 1:
+            raise ValueError("max_workers must be a positive integer")
+        self._inner = inner
+        self._pool = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="exp-guardrail-sync",
+        )
+
+    async def inspect_input(
+        self,
+        *,
+        request: GatewayRequest,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Inspect one request on this wrapper's private executor."""
+
+        def call() -> ClassifierVerdict:
+            """Run the sync inspect under the recursion flag."""
+            with classification_scope():
+                return self._inner.inspect_input(request=request, check=check)
+
+        return await asyncio.get_running_loop().run_in_executor(self._pool, call)
+
+    async def inspect_output(
+        self,
+        *,
+        completion: GuardrailCompletion,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Inspect one completion on this wrapper's private executor."""
+
+        def call() -> ClassifierVerdict:
+            """Run the sync inspect under the recursion flag."""
+            with classification_scope():
+                return self._inner.inspect_output(completion=completion, check=check)
+
+        return await asyncio.get_running_loop().run_in_executor(self._pool, call)
 
 
 def _contains_needle(text: str, needles: tuple[str, ...]) -> bool:

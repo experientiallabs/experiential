@@ -61,13 +61,16 @@ failed check and continue the remaining chain.
 Input enforcement is on the request critical path after continuation expansion
 and before dispatch. Output enforcement for a protected identity delays the
 first visible byte until the winning completion is buffered and the output
-chain returns. Each inspect runs on a worker thread and is bounded by the tighter of the
-check timeout and the remaining request deadline. A hung adapter fails at
-that bound without blocking the asyncio event loop or waiting for the inspect
-to return. Timed-out workers keep their slot until they finish, so at most
-32 inspects can be live. Further calls fail closed instead of starting another
-thread. Request and response content are bounded by `max_request_bytes` and
-`max_response_bytes` on the policy.
+chain returns. Production adapters are async. The Python gateway awaits each
+inspect directly under `asyncio.timeout` and a per-loop concurrency cap. A
+hung adapter is cancelled at the tighter of the check timeout and the remaining
+request deadline, and cancellation releases that slot immediately. Native
+callbacks run the same coroutines on a private event loop so they never block
+the Python gateway loop. Leftover synchronous test adapters, when still
+needed, run only through a private bounded compatibility wrapper. Exhaustion
+of that wrapper cannot take async capacity from healthy adapters. Request and
+response content are bounded by `max_request_bytes` and `max_response_bytes`
+on the policy.
 
 ## Privacy
 
@@ -132,7 +135,8 @@ Protected streaming may add classifier latency before the first token.
   body. Native already ran the input chain before deciding to escalate, so a
   block never reaches python.
 - Classifiers must not call the public gateway. Recursion fails closed.
-- At most 32 classifier inspects can be in flight. Additional inspects fail
-  closed until a worker slot is free.
+- At most 32 async classifier inspects can be in flight on one event loop.
+  Additional inspects wait only until their remaining timeout, then fail
+  closed. Cancellation returns that slot immediately.
 - Oversized tool arguments count against the response byte bound and are
   blocked, not rewritten.

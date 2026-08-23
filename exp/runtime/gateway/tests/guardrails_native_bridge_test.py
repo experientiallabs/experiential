@@ -121,7 +121,7 @@ def test_native_input_runs_before_route_resolution(tmp_path: Path) -> None:
     class _OrderClassifier(ScriptedClassifier):
         """Record input inspection before any later admit step."""
 
-        def inspect_input(
+        async def inspect_input(
             self,
             *,
             request: GatewayRequest,
@@ -160,7 +160,7 @@ def test_native_input_block_never_resolves_a_route(tmp_path: Path) -> None:
     class _BlockClassifier(ScriptedClassifier):
         """Record a blocking input inspection."""
 
-        def inspect_input(
+        async def inspect_input(
             self,
             *,
             request: GatewayRequest,

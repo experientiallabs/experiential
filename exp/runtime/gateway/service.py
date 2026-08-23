@@ -344,8 +344,7 @@ class GatewayService:
             identity_id=authorization.identity_id,
         )
         if policy is not None and self._guardrails is not None:
-            execution_request = await asyncio.to_thread(
-                self._guardrails.enforce_input,
+            execution_request = await self._guardrails.enforce_input(
                 policy=policy,
                 request=execution_request,
                 deadline_monotonic=deadline,

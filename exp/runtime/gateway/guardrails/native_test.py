@@ -107,6 +107,25 @@ def test_unguarded_native_input_does_not_call_classifiers() -> None:
     assert policy is None
 
 
+def test_native_input_runs_the_async_chain_on_a_private_loop() -> None:
+    """The native callback awaits enforcement without a caller event loop."""
+    engine = _engine()
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hello"),),
+    )
+
+    rewritten, policy = enforce_native_input(
+        engine,
+        authorization=_authorization(),
+        request=request,
+        deadline_monotonic=200.0,
+    )
+
+    assert policy is not None
+    assert rewritten.messages[0].content == "hello"
+
+
 def test_native_output_payload_round_trips_tool_calls() -> None:
     """The JSON boundary carries tool-call arguments without rewriting them."""
     completion = parse_output_payload(

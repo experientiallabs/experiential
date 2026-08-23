@@ -9,6 +9,7 @@ route.
 """
 
 from exp.runtime.gateway.guardrails.classifiers import (
+    BoundedSyncClassifier,
     ClassifierRegistry,
     KeywordClassifier,
     ScriptedClassifier,
@@ -36,6 +37,7 @@ from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 
 __all__ = [
+    "BoundedSyncClassifier",
     "ClassifierRegistry",
     "ClassifierVerdict",
     "DirectClassifierClient",
