@@ -357,6 +357,9 @@ def read_masked_key_with_callback(
         while True:
             token = wait_for_callback(0.05)
             if token is not None:
+                # Do not leave partially entered secret bytes for the next shell or
+                # CLI prompt after callback-driven login takes ownership of the result.
+                termios.tcflush(fd, termios.TCIFLUSH)
                 return token
             readable, _, _ = select.select([fd], [], [], 0.05)
             if not readable:
