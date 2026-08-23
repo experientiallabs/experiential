@@ -27,14 +27,14 @@ pip install experiential
 exp
 ```
 
-Choose a public alias such as `support-agent`, capture the issued key, and send a request:
+Choose a public alias such as `opus-5`, capture the issued key, and send a request:
 
 ```bash
 export EXP_GATEWAY_KEY=...
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer $EXP_GATEWAY_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
+  -d '{"model":"opus-5","messages":[{"role":"user","content":"Help me"}]}'
 ```
 
 ## Setup / get started with the hosted gateway
