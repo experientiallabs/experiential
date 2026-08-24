@@ -26,19 +26,31 @@ jobs:
         run: uv sync --extra dev
       - name: Crate changes require a crate version bump
         if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          git fetch --no-tags --depth=1 origin "$GITHUB_BASE_REF"
-          if git diff --quiet "origin/$GITHUB_BASE_REF"...HEAD -- exp/runtime/gateway/native/; then
+          # Published wheels are immutable per version, so any change under the
+          # crate must move the crate version. GitHub's merge-base file list is
+          # authoritative and needs no local history (the checkout is shallow).
+          changed="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+            --paginate -q '.[].filename' | grep -c '^exp/runtime/gateway/native/' || true)"
+          if [ "${changed}" = "0" ]; then
             echo "crate untouched"
-          elif git diff "origin/$GITHUB_BASE_REF"...HEAD -- exp/runtime/gateway/native/Cargo.toml | grep -q '^+version = '; then
-            echo "crate changed and version bumped"
-          else
-            echo "exp/runtime/gateway/native/ changed without bumping the crate version;" >&2
-            echo "published wheels are immutable per version, so bump Cargo.toml and the" >&2
-            echo "crate pyproject together (the lockstep test keeps them and the" >&2
-            echo "dependency floor aligned)." >&2
-            exit 1
+            exit 0
           fi
+          head_version="$(grep -m1 '^version = ' exp/runtime/gateway/native/Cargo.toml)"
+          base_version="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/exp/runtime/gateway/native/Cargo.toml?ref=${GITHUB_BASE_REF}" \
+            -q .content | base64 -d | grep -m1 '^version = ')"
+          if [ "${head_version}" != "${base_version}" ]; then
+            echo "crate changed and version moved: ${base_version} -> ${head_version}"
+            exit 0
+          fi
+          echo "exp/runtime/gateway/native/ changed without moving the crate version" >&2
+          echo "(${head_version}); bump Cargo.toml and the crate pyproject together" >&2
+          echo "so the release can publish fresh wheels." >&2
+          exit 1
       - name: cargo fmt
         run: cargo fmt --check --manifest-path exp/runtime/gateway/native/Cargo.toml
       - name: cargo clippy
