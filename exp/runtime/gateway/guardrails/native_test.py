@@ -204,7 +204,8 @@ class _NativeCancelSwallow:
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
-            while not self._hold.is_set():
+            deadline = time.monotonic() + 5.0
+            while not self._hold.is_set() and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
             return ClassifierVerdict(flagged=False)
         return ClassifierVerdict(flagged=False)

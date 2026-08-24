@@ -82,17 +82,18 @@ the configured check timeouts, then capped by the remaining request deadline.
 Shared keep-alive on `http_json` removes connection setup from later inspects.
 It does not remove classifier inference latency.
 
-Production adapters are async. The Python gateway awaits each inspect as a
-task under `asyncio.wait` and a per-loop concurrency cap. A hung adapter is
-cancelled at the tighter of the check timeout and the remaining request
-deadline. The caller returns immediately and the inflight slot is released
-without waiting for cancellation to be acknowledged. An adapter that
-swallows cancellation is quarantined on that event loop until every
-abandoned inspect for that adapter finishes. Further calls to that adapter
-fail immediately and do not create another task. Other adapters keep their
-capacity. Native callbacks submit the same coroutines onto one shared daemon
-event loop so a Rust worker can return even when a quarantined task is still
-running. Leftover synchronous test adapters, when still needed, run only
+Production adapters are async. Each inspect runs on a bounded isolation
+worker with its own event loop, so a classifier that blocks before its first
+await cannot freeze the caller's timeout. The caller waits on a cross-thread
+future and returns at the tighter of the check timeout and the remaining
+request deadline. Isolation workers stay occupied until that invocation
+actually exits. An abandoned adapter is quarantined until every abandoned
+inspect for it finishes. Further calls to that adapter fail immediately and
+do not start another worker. Other adapters keep any remaining isolation
+workers. `http_json` still reuses one keep-alive client per isolation loop.
+Native callbacks submit enforcement onto one shared daemon loop so a Rust
+worker can return while an abandoned inspect still occupies an isolation
+worker. Leftover synchronous test adapters, when still needed, run only
 through a private bounded compatibility wrapper. Exhaustion of that wrapper
 cannot take async capacity from healthy adapters. Request bounds count the
 compact JSON request subject sent to classifiers, including tool definitions,
@@ -285,10 +286,11 @@ errors. Protected streaming may add classifier latency before the first token.
   body. Native already ran the input chain before deciding to escalate, so a
   block never reaches python.
 - Classifiers must not call the public gateway. Recursion fails closed.
-- At most 32 async classifier inspects can be in flight on one event loop.
-  Additional inspects wait only until their remaining timeout, then fail
-  closed. Cancellation returns that slot immediately. An adapter that
-  ignores cancellation stays quarantined on that loop until its abandoned
-  task finishes.
+- At most 32 isolation workers may run async classifier inspects for one
+  limiter. Additional inspects wait only until their remaining timeout, then
+  fail closed without starting another worker. A worker occupied by an
+  abandoned inspect is retained until that invocation exits. An adapter that
+  was abandoned stays quarantined until every abandoned inspect for it
+  finishes.
 - Oversized tool arguments count against the response byte bound and are
   blocked, not rewritten.

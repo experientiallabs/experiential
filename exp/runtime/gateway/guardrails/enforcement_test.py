@@ -110,6 +110,43 @@ class _HungAsyncClassifier:
         return ClassifierVerdict(flagged=False)
 
 
+class _BlockingBeforeAwaitClassifier:
+    """Adapter that blocks the inspect thread before its first await."""
+
+    def __init__(self) -> None:
+        """Start with empty call counts and a hold that never releases by default."""
+        self.input_calls = 0
+        self.output_calls = 0
+        self.entered = threading.Event()
+        self.hold = threading.Event()
+
+    async def inspect_input(
+        self,
+        *,
+        request: GatewayRequest,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Block before yielding so a shared event loop cannot time out."""
+        del request, check
+        self.input_calls += 1
+        self.entered.set()
+        self.hold.wait(timeout=5.0)
+        return ClassifierVerdict(flagged=False)
+
+    async def inspect_output(
+        self,
+        *,
+        completion: GuardrailCompletion,
+        check: GuardrailCheck,
+    ) -> ClassifierVerdict:
+        """Block before yielding on the output path."""
+        del completion, check
+        self.output_calls += 1
+        self.entered.set()
+        self.hold.wait(timeout=5.0)
+        return ClassifierVerdict(flagged=False)
+
+
 class _HungSyncClassifier:
     """Leftover synchronous adapter that blocks until the test releases it."""
 
@@ -132,7 +169,7 @@ class _HungSyncClassifier:
         """Block the private executor thread."""
         del request, check
         self.input_calls += 1
-        self._block.wait(30.0)
+        self._block.wait(timeout=5.0)
         return ClassifierVerdict(flagged=False)
 
     def inspect_output(
@@ -144,13 +181,20 @@ class _HungSyncClassifier:
         """Block the private executor thread."""
         del completion, check
         self.output_calls += 1
-        self._block.wait(30.0)
+        self._block.wait(timeout=5.0)
         return ClassifierVerdict(flagged=False)
 
 
 def _awaited[T](coro: Coroutine[object, object, T]) -> T:
     """Run one enforcement coroutine on a private loop."""
     return asyncio.run(coro)
+
+
+async def _wait_hold(hold: threading.Event, *, timeout: float = 5.0) -> None:
+    """Wait for a test to release an abandoned inspect, then give up."""
+    deadline = time.monotonic() + timeout
+    while not hold.is_set() and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
 
 
 def _check(
@@ -479,6 +523,37 @@ def test_blocking_classifier_leaves_the_event_loop_free() -> None:
     asyncio.run(scenario())
 
 
+def test_blocking_before_await_classifier_times_out_without_freezing_enforcement() -> None:
+    """A classifier that blocks before yielding still fail-closes at the check timeout."""
+    blocked = _BlockingBeforeAwaitClassifier()
+    engine, _classifier = _engine(
+        classifier=blocked,
+        checks=(_check("input-one", timeout_ms=50),),
+        protected=True,
+        clock=_Clock(),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(GuardrailRejected) as raised:
+            _awaited(
+                engine.enforce_input(
+                    policy=policy,
+                    request=_request("hello"),
+                    deadline_monotonic=200.0,
+                )
+            )
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0
+        assert raised.value.failure.safe_details["action"] == "error"
+        assert blocked.entered.wait(timeout=1.0)
+        assert blocked.input_calls == 1
+    finally:
+        blocked.hold.set()
+
+
 def test_repeated_blocked_adapter_does_not_starve_a_healthy_adapter() -> None:
     """Timeouts on one adapter leave another adapter free to succeed promptly."""
 
@@ -594,7 +669,7 @@ class _CancelSwallowingClassifier:
         """Start with an empty call count and a closed hold."""
         self.input_calls = 0
         self.output_calls = 0
-        self._hold = asyncio.Event()
+        self._hold = threading.Event()
 
     def release(self) -> None:
         """Allow every abandoned inspect to finish."""
@@ -612,7 +687,7 @@ class _CancelSwallowingClassifier:
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
-            await self._hold.wait()
+            await _wait_hold(self._hold)
             return ClassifierVerdict(flagged=False)
         return ClassifierVerdict(flagged=False)
 
@@ -628,7 +703,7 @@ class _CancelSwallowingClassifier:
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
-            await self._hold.wait()
+            await _wait_hold(self._hold)
             return ClassifierVerdict(flagged=False)
         return ClassifierVerdict(flagged=False)
 
@@ -695,7 +770,11 @@ def test_cancel_swallowing_adapter_fail_closes_without_starving_others() -> None
             assert healthy.input_calls == 1
         finally:
             rogue.release()
-            await asyncio.sleep(0)
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while inspects.detached_inspect_count() != 0:
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.02)
             assert inspects.detached_inspect_count() == 0
 
     asyncio.run(scenario())

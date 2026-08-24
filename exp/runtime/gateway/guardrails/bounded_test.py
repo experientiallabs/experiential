@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import Callable
 
+import httpx
 import pytest
 
 from exp.runtime.gateway.guardrails.bounded import (
@@ -14,6 +16,34 @@ from exp.runtime.gateway.guardrails.bounded import (
     _NativeCallbackRunner,
     run_on_native_loop,
 )
+from exp.runtime.gateway.guardrails.http_json import shared_http_json_client
+
+
+async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) -> None:
+    """Poll ``predicate`` without blocking the caller event loop."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.01)
+    assert predicate()
+
+
+async def _wait_hold(hold: threading.Event, *, timeout: float = 5.0) -> None:
+    """Wait for a test to release an abandoned inspect, then give up."""
+    deadline = time.monotonic() + timeout
+    while not hold.is_set() and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+
+
+def _block_until(hold: threading.Event, *, timeout: float = 5.0) -> None:
+    """Block one isolated inspect until the test releases it, or give up."""
+    hold.wait(timeout=timeout)
+
+
+def _wait_flag(flag: threading.Event, *, timeout: float = 1.0) -> None:
+    """Wait for a worker-thread flag without spinning on the caller."""
+    assert flag.wait(timeout=timeout)
 
 
 def test_bounded_inspect_returns_the_inspect_result() -> None:
@@ -32,13 +62,39 @@ def test_bounded_inspect_returns_the_inspect_result() -> None:
     asyncio.run(scenario())
 
 
+def test_isolation_workers_are_daemon_threads() -> None:
+    """Isolation workers must not keep the interpreter alive after shutdown."""
+
+    async def scenario() -> None:
+        """Inspect on a worker and assert the running thread is daemon."""
+        bound = BoundedInspect(max_inflight=1)
+        observed: list[bool] = []
+
+        async def inspect() -> int:
+            """Record the isolation thread daemon flag."""
+            observed.append(threading.current_thread().daemon)
+            return 1
+
+        assert await bound.run(inspect, 1.0, adapter_id="daemon") == 1
+        assert observed == [True]
+        workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("exp-guardrail-isolate")
+        ]
+        assert workers
+        assert all(thread.daemon for thread in workers)
+
+    asyncio.run(scenario())
+
+
 def test_bounded_inspect_cancels_a_hung_inspect_and_releases_the_slot() -> None:
     """A hung inspect times out, then a later inspect can take the same slot."""
 
     async def scenario() -> None:
         """Fill one slot with a never-returning inspect, then reuse it."""
         bound = BoundedInspect(max_inflight=1)
-        entered = asyncio.Event()
+        entered = threading.Event()
 
         async def hang() -> int:
             """Wait forever after marking entry."""
@@ -50,7 +106,8 @@ def test_bounded_inspect_cancels_a_hung_inspect_and_releases_the_slot() -> None:
         with pytest.raises(ClassifierTimeoutError):
             await bound.run(hang, 0.05, adapter_id="hung")
         assert asyncio.get_running_loop().time() - started < 1.0
-        assert entered.is_set()
+        _wait_flag(entered)
+        await _wait_until(lambda: bound.detached_inspect_count() == 0)
 
         async def healthy() -> int:
             """Return immediately."""
@@ -93,6 +150,7 @@ def test_repeated_timeouts_do_not_exhaust_later_inspects() -> None:
         for _ in range(6):
             with pytest.raises(ClassifierTimeoutError):
                 await bound.run(hang, 0.03, adapter_id="hung")
+            await _wait_until(lambda: bound.detached_inspect_count() == 0)
 
         async def healthy() -> int:
             """Return immediately."""
@@ -110,42 +168,48 @@ def test_suppressed_cancellation_quarantines_only_that_adapter() -> None:
 
     async def scenario() -> None:
         """Time out a cancel-swallowing inspect, retry it, then run a healthy inspect."""
-        bound = BoundedInspect(max_inflight=1)
-        hold = asyncio.Event()
+        bound = BoundedInspect(max_inflight=2)
+        hold = threading.Event()
 
         async def swallow() -> int:
             """Ignore cancellation and wait until the test releases the hold."""
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
-                await hold.wait()
+                await _wait_hold(hold)
                 return 1
             return 0
 
-        started = asyncio.get_running_loop().time()
-        with pytest.raises(ClassifierTimeoutError):
-            await bound.run(swallow, 0.05, adapter_id="rogue")
-        assert asyncio.get_running_loop().time() - started < 0.5
-        assert bound.detached_inspect_count() == 1
-        assert bound.quarantined_adapter_ids() == frozenset({"rogue"})
+        try:
+            started = asyncio.get_running_loop().time()
+            with pytest.raises(ClassifierTimeoutError):
+                await bound.run(swallow, 0.05, adapter_id="rogue")
+            assert asyncio.get_running_loop().time() - started < 0.5
+            await _wait_until(lambda: bound.detached_inspect_count() == 1)
+            assert bound.quarantined_adapter_ids() == frozenset({"rogue"})
 
-        started = asyncio.get_running_loop().time()
-        with pytest.raises(ClassifierTimeoutError, match="quarantined"):
-            await bound.run(swallow, 0.5, adapter_id="rogue")
-        assert asyncio.get_running_loop().time() - started < 0.2
-        assert bound.detached_inspect_count() == 1
+            started = asyncio.get_running_loop().time()
+            with pytest.raises(ClassifierTimeoutError, match="quarantined"):
+                await bound.run(swallow, 0.5, adapter_id="rogue")
+            assert asyncio.get_running_loop().time() - started < 0.2
+            assert bound.detached_inspect_count() == 1
 
-        async def healthy() -> int:
-            """Return immediately."""
-            return 4
+            async def healthy() -> int:
+                """Return immediately."""
+                return 4
 
-        started = asyncio.get_running_loop().time()
-        assert await bound.run(healthy, 0.5, adapter_id="healthy") == 4
-        assert asyncio.get_running_loop().time() - started < 0.2
-        assert bound.detached_inspect_count() == 1
-        hold.set()
-        await asyncio.sleep(0)
-        assert bound.detached_inspect_count() == 0
+            started = asyncio.get_running_loop().time()
+            assert await bound.run(healthy, 0.5, adapter_id="healthy") == 4
+            assert asyncio.get_running_loop().time() - started < 0.2
+            assert bound.detached_inspect_count() == 1
+        finally:
+            hold.set()
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while bound.detached_inspect_count() != 0:
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.01)
+            assert bound.detached_inspect_count() == 0
 
     asyncio.run(scenario())
 
@@ -156,16 +220,16 @@ def test_concurrent_timeouts_keep_quarantine_until_every_detached_task_finishes(
     async def scenario() -> None:
         """Time out two inspects on one adapter, then release them one at a time."""
         bound = BoundedInspect(max_inflight=2)
-        holds: list[asyncio.Event] = []
+        holds: list[threading.Event] = []
 
         async def swallow() -> int:
             """Ignore cancellation and wait on a per-inspect hold."""
-            hold = asyncio.Event()
+            hold = threading.Event()
             holds.append(hold)
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
-                await hold.wait()
+                await _wait_hold(hold)
                 return 1
             return 0
 
@@ -174,36 +238,36 @@ def test_concurrent_timeouts_keep_quarantine_until_every_detached_task_finishes(
             with pytest.raises(ClassifierTimeoutError):
                 await bound.run(swallow, 0.08, adapter_id="rogue")
 
-        await asyncio.gather(rogue(), rogue())
-        assert len(holds) == 2
-        assert bound.detached_inspect_count() == 2
-        assert bound.quarantined_adapter_ids() == frozenset({"rogue"})
+        try:
+            await asyncio.gather(rogue(), rogue())
+            await _wait_until(lambda: len(holds) == 2)
+            await _wait_until(lambda: bound.detached_inspect_count() == 2)
+            assert bound.quarantined_adapter_ids() == frozenset({"rogue"})
 
-        holds[0].set()
-        for _ in range(10):
-            if bound.detached_inspect_count() == 1:
-                break
-            await asyncio.sleep(0)
-        assert bound.detached_inspect_count() == 1
-        assert bound.quarantined_adapter_ids() == frozenset({"rogue"})
+            holds[0].set()
+            await _wait_until(lambda: bound.detached_inspect_count() == 1)
+            assert bound.quarantined_adapter_ids() == frozenset({"rogue"})
 
-        started = asyncio.get_running_loop().time()
-        with pytest.raises(ClassifierTimeoutError, match="quarantined"):
-            await bound.run(swallow, 0.5, adapter_id="rogue")
-        assert asyncio.get_running_loop().time() - started < 0.2
-        assert bound.detached_inspect_count() == 1
+            started = asyncio.get_running_loop().time()
+            with pytest.raises(ClassifierTimeoutError, match="quarantined"):
+                await bound.run(swallow, 0.5, adapter_id="rogue")
+            assert asyncio.get_running_loop().time() - started < 0.2
+            assert bound.detached_inspect_count() == 1
 
-        async def healthy() -> int:
-            """Return immediately."""
-            return 5
+            async def healthy() -> int:
+                """Return immediately."""
+                return 5
 
-        assert await bound.run(healthy, 0.5, adapter_id="healthy") == 5
-        holds[1].set()
-        for _ in range(10):
-            if bound.detached_inspect_count() == 0:
-                break
-            await asyncio.sleep(0)
-        assert bound.detached_inspect_count() == 0
+            assert await bound.run(healthy, 0.5, adapter_id="healthy") == 5
+        finally:
+            for hold in holds:
+                hold.set()
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while bound.detached_inspect_count() != 0:
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.01)
+            assert bound.detached_inspect_count() == 0
 
     asyncio.run(scenario())
 
@@ -214,7 +278,7 @@ def test_external_cancellation_propagates_and_releases_the_slot() -> None:
     async def scenario() -> None:
         """Cancel the waiting run, then reuse the slot on another adapter."""
         bound = BoundedInspect(max_inflight=1)
-        entered = asyncio.Event()
+        entered = threading.Event()
 
         async def hang() -> int:
             """Wait until cancelled."""
@@ -223,16 +287,231 @@ def test_external_cancellation_propagates_and_releases_the_slot() -> None:
             return 1
 
         task = asyncio.create_task(bound.run(hang, 5.0, adapter_id="hung"))
-        await entered.wait()
+        await asyncio.to_thread(entered.wait, 1.0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+        await _wait_until(lambda: bound.detached_inspect_count() == 0)
 
         async def healthy() -> int:
             """Return immediately."""
             return 2
 
         assert await bound.run(healthy, 0.5, adapter_id="healthy") == 2
+
+    asyncio.run(scenario())
+
+
+def test_blocking_before_first_await_times_out_without_freezing_the_caller_loop() -> None:
+    """Synchronous work before the first await cannot stall timeout enforcement."""
+
+    async def scenario() -> None:
+        """Time out a blocking inspect while another task on the caller still runs."""
+        bound = BoundedInspect(max_inflight=1)
+        entered = threading.Event()
+        hold = threading.Event()
+
+        async def block() -> int:
+            """Block the isolation worker before yielding."""
+            entered.set()
+            _block_until(hold)
+            return 1
+
+        progressed = False
+
+        async def marker() -> None:
+            """Flip after a delay shorter than the inspect hang."""
+            nonlocal progressed
+            await asyncio.sleep(0.02)
+            progressed = True
+
+        marker_task = asyncio.create_task(marker())
+        try:
+            started = asyncio.get_running_loop().time()
+            with pytest.raises(ClassifierTimeoutError):
+                await bound.run(block, 0.08, adapter_id="blocked")
+            assert asyncio.get_running_loop().time() - started < 0.5
+            await marker_task
+            assert progressed
+            _wait_flag(entered)
+            assert bound.detached_inspect_count() == 1
+            assert bound.isolation_worker_count() == 1
+            assert bound.quarantined_adapter_ids() == frozenset({"blocked"})
+        finally:
+            hold.set()
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while bound.detached_inspect_count() != 0:
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.01)
+            assert bound.detached_inspect_count() == 0
+
+    asyncio.run(scenario())
+
+
+def test_repeated_blocking_before_await_does_not_start_another_worker() -> None:
+    """A blocked adapter is quarantined instead of accumulating isolation workers."""
+
+    async def scenario() -> None:
+        """Time out one blocked inspect, then fail closed on the retry."""
+        bound = BoundedInspect(max_inflight=2)
+        entered = threading.Event()
+        hold = threading.Event()
+        calls = 0
+
+        async def block() -> int:
+            """Block before yielding and count admissions."""
+            nonlocal calls
+            calls += 1
+            entered.set()
+            _block_until(hold)
+            return 1
+
+        try:
+            with pytest.raises(ClassifierTimeoutError):
+                await bound.run(block, 0.08, adapter_id="blocked")
+            _wait_flag(entered)
+            assert calls == 1
+            assert bound.isolation_worker_count() == 1
+
+            started = asyncio.get_running_loop().time()
+            with pytest.raises(ClassifierTimeoutError, match="quarantined"):
+                await bound.run(block, 0.5, adapter_id="blocked")
+            assert asyncio.get_running_loop().time() - started < 0.2
+            assert calls == 1
+            assert bound.isolation_worker_count() == 1
+            hold.set()
+            await _wait_until(lambda: bound.detached_inspect_count() == 0)
+            assert await bound.run(block, 0.5, adapter_id="blocked") == 1
+            assert calls == 2
+        finally:
+            hold.set()
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while bound.detached_inspect_count() != 0:
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.01)
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_blocking_before_await_inspects_time_out_independently() -> None:
+    """Two blocked adapters each occupy one worker and leave a third free."""
+
+    async def scenario() -> None:
+        """Time out two blocked inspects, then succeed on a healthy adapter."""
+        bound = BoundedInspect(max_inflight=3)
+        holds = (threading.Event(), threading.Event())
+
+        async def block_one() -> int:
+            """Block the first isolation worker."""
+            holds[0].wait(timeout=5.0)
+            return 1
+
+        async def block_two() -> int:
+            """Block the second isolation worker."""
+            holds[1].wait(timeout=5.0)
+            return 2
+
+        async def rogue(adapter_id: str) -> None:
+            """Run one blocked inspect past its timeout."""
+            factory = block_one if adapter_id == "one" else block_two
+            with pytest.raises(ClassifierTimeoutError):
+                await bound.run(factory, 0.08, adapter_id=adapter_id)
+
+        try:
+            await asyncio.gather(rogue("one"), rogue("two"))
+            await _wait_until(lambda: bound.detached_inspect_count() == 2)
+            assert bound.isolation_worker_count() == 2
+            assert bound.quarantined_adapter_ids() == frozenset({"one", "two"})
+
+            async def healthy() -> int:
+                """Return immediately on the remaining worker."""
+                return 9
+
+            started = asyncio.get_running_loop().time()
+            assert await bound.run(healthy, 0.5, adapter_id="healthy") == 9
+            assert asyncio.get_running_loop().time() - started < 0.2
+        finally:
+            holds[0].set()
+            holds[1].set()
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while bound.detached_inspect_count() != 0:
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.01)
+            assert bound.detached_inspect_count() == 0
+
+    asyncio.run(scenario())
+
+
+def test_blocking_before_await_exhausts_isolation_capacity() -> None:
+    """A full isolation pool fails closed without starting another worker."""
+
+    async def scenario() -> None:
+        """Fill both workers with blocked inspects, then refuse a third."""
+        bound = BoundedInspect(max_inflight=2)
+        hold = threading.Event()
+        entered = threading.Semaphore(0)
+
+        async def block() -> int:
+            """Block after announcing that this inspect occupies a worker."""
+            entered.release()
+            _block_until(hold)
+            return 1
+
+        async def rogue(adapter_id: str) -> None:
+            """Occupy one isolation worker past its timeout."""
+            with pytest.raises(ClassifierTimeoutError):
+                await bound.run(block, 0.2, adapter_id=adapter_id)
+
+        first = asyncio.create_task(rogue("one"))
+        second = asyncio.create_task(rogue("two"))
+        try:
+            assert await asyncio.to_thread(entered.acquire, True, 1.0)
+            assert await asyncio.to_thread(entered.acquire, True, 1.0)
+            await _wait_until(lambda: bound.isolation_worker_count() == 2)
+            started_wait = asyncio.get_running_loop().time()
+            with pytest.raises(ClassifierTimeoutError):
+                await bound.run(block, 0.08, adapter_id="three")
+            assert asyncio.get_running_loop().time() - started_wait < 0.4
+            assert bound.isolation_worker_count() == 2
+            await first
+            await second
+        finally:
+            hold.set()
+            for task in (first, second):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while bound.detached_inspect_count() != 0:
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.01)
+            assert bound.detached_inspect_count() == 0
+
+    asyncio.run(scenario())
+
+
+def test_http_json_reuses_the_client_bound_to_the_isolation_loop() -> None:
+    """Keep-alive reuse stays on the worker loop that runs the inspect."""
+
+    async def scenario() -> None:
+        """Run two sequential inspects on one worker and compare client identity."""
+        bound = BoundedInspect(max_inflight=1)
+        clients: list[httpx.AsyncClient] = []
+
+        async def inspect() -> int:
+            """Capture the loop-local client used by this isolated inspect."""
+            clients.append(shared_http_json_client())
+            return 1
+
+        assert await bound.run(inspect, 1.0, adapter_id="http") == 1
+        assert await bound.run(inspect, 1.0, adapter_id="http") == 1
+        assert len(clients) == 2
+        assert clients[0] is clients[1]
+        assert clients[0] is not shared_http_json_client()
 
     asyncio.run(scenario())
 
@@ -257,7 +536,7 @@ def test_fresh_native_runner_shares_one_loop_across_concurrent_first_calls() -> 
         with lock:
             loop_ids.append(loop_id)
 
-    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -334,7 +613,7 @@ def test_run_on_native_loop_refuses_a_running_event_loop() -> None:
 
 def test_native_loop_returns_while_a_quarantined_adapter_still_runs() -> None:
     """The Rust worker is not blocked on an adapter that ignores cancellation."""
-    bound = BoundedInspect(max_inflight=1)
+    bound = BoundedInspect(max_inflight=2)
     hold = threading.Event()
     entries = 0
 
@@ -345,8 +624,7 @@ def test_native_loop_returns_while_a_quarantined_adapter_still_runs() -> None:
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
-            while not hold.is_set():
-                await asyncio.sleep(0.05)
+            await _wait_hold(hold)
             return 1
         return 0
 
@@ -371,6 +649,9 @@ def test_native_loop_returns_while_a_quarantined_adapter_still_runs() -> None:
         with pytest.raises(ClassifierTimeoutError):
             run_on_native_loop(rogue_once())
         assert time.monotonic() - started < 0.5
+        deadline = time.monotonic() + 1.0
+        while bound.detached_inspect_count() != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert bound.detached_inspect_count() == 1
         assert entries == 1
 
@@ -386,8 +667,39 @@ def test_native_loop_returns_while_a_quarantined_adapter_still_runs() -> None:
         assert time.monotonic() - started < 0.2
     finally:
         hold.set()
-        for _ in range(50):
-            if bound.detached_inspect_count() == 0:
-                break
+        deadline = time.monotonic() + 1.0
+        while bound.detached_inspect_count() != 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert bound.detached_inspect_count() == 0
+
+
+def test_native_callback_returns_when_inspect_blocks_before_first_await() -> None:
+    """A native worker returns at the timeout even if the inspect never yields."""
+    bound = BoundedInspect(max_inflight=1)
+    hold = threading.Event()
+    entered = threading.Event()
+
+    async def block() -> int:
+        """Block the isolation worker before the first await."""
+        entered.set()
+        _block_until(hold)
+        return 1
+
+    async def rogue() -> int:
+        """Run one blocking inspect through the native callback loop."""
+        return await bound.run(block, 0.08, adapter_id="blocked")
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(ClassifierTimeoutError):
+            run_on_native_loop(rogue())
+        assert time.monotonic() - started < 0.5
+        assert entered.wait(timeout=1.0)
+        assert bound.detached_inspect_count() == 1
+        assert bound.isolation_worker_count() == 1
+    finally:
+        hold.set()
+        deadline = time.monotonic() + 1.0
+        while bound.detached_inspect_count() != 0 and time.monotonic() < deadline:
             time.sleep(0.02)
         assert bound.detached_inspect_count() == 0

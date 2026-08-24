@@ -155,7 +155,7 @@ class _HungSyncClassifier:
         del request, check
         self.input_calls += 1
         self.started.set()
-        self._block.wait()
+        self._block.wait(timeout=5.0)
         self.finished.set()
         return ClassifierVerdict(flagged=False)
 
@@ -169,7 +169,7 @@ class _HungSyncClassifier:
         del completion, check
         self.output_calls += 1
         self.started.set()
-        self._block.wait()
+        self._block.wait(timeout=5.0)
         self.finished.set()
         return ClassifierVerdict(flagged=False)
 
@@ -190,23 +190,32 @@ def test_bounded_sync_classifier_rejects_overflow_instead_of_queueing() -> None:
         hung = _HungSyncClassifier()
         wrapper = BoundedSyncClassifier(hung, max_workers=1)
         first = asyncio.create_task(wrapper.inspect_input(request=_request(), check=_check()))
-        await asyncio.get_running_loop().run_in_executor(None, hung.started.wait)
-        assert wrapper.admitted_inspects() == 1
-        started = time.monotonic()
-        overflow = await asyncio.gather(
-            *[wrapper.inspect_input(request=_request(), check=_check()) for _ in range(20)],
-            return_exceptions=True,
-        )
-        elapsed = time.monotonic() - started
-        first.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await first
-        assert elapsed < 0.2
-        assert hung.input_calls == 1
-        assert wrapper.admitted_inspects() == 1
-        assert all(isinstance(item, SyncClassifierBusyError) for item in overflow)
-        hung.release()
-        await asyncio.get_running_loop().run_in_executor(None, hung.finished.wait)
+        try:
+            assert await asyncio.to_thread(hung.started.wait, 5.0)
+            assert wrapper.admitted_inspects() == 1
+            daemons = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("exp-guardrail-sync")
+            ]
+            assert daemons
+            assert all(thread.daemon for thread in daemons)
+            started = time.monotonic()
+            overflow = await asyncio.gather(
+                *[wrapper.inspect_input(request=_request(), check=_check()) for _ in range(20)],
+                return_exceptions=True,
+            )
+            elapsed = time.monotonic() - started
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert elapsed < 0.2
+            assert hung.input_calls == 1
+            assert wrapper.admitted_inspects() == 1
+            assert all(isinstance(item, SyncClassifierBusyError) for item in overflow)
+        finally:
+            hung.release()
+        assert await asyncio.to_thread(hung.finished.wait, 5.0)
         assert wrapper.admitted_inspects() == 0
         recovered = await wrapper.inspect_input(request=_request(), check=_check())
         assert recovered.flagged is False
@@ -223,24 +232,26 @@ def test_bounded_sync_classifier_times_out_promptly_under_bounded_inspect() -> N
         hung = _HungSyncClassifier()
         wrapper = BoundedSyncClassifier(hung, max_workers=1)
         inspects = BoundedInspect(max_inflight=8)
-        started = time.monotonic()
-        with pytest.raises(ClassifierTimeoutError):
-            await inspects.run(
-                lambda: wrapper.inspect_input(request=_request(), check=_check()),
-                0.05,
-                adapter_id="sync-blocked",
-            )
-        first_elapsed = time.monotonic() - started
-        await asyncio.get_running_loop().run_in_executor(None, hung.started.wait)
-        overflow_started = time.monotonic()
-        with pytest.raises(SyncClassifierBusyError):
-            await wrapper.inspect_input(request=_request(), check=_check())
-        overflow_elapsed = time.monotonic() - overflow_started
-        assert 0.04 <= first_elapsed < 0.3
-        assert overflow_elapsed < 0.2
-        assert hung.input_calls == 1
-        assert wrapper.admitted_inspects() == 1
-        hung.release()
-        await asyncio.get_running_loop().run_in_executor(None, hung.finished.wait)
+        try:
+            started = time.monotonic()
+            with pytest.raises(ClassifierTimeoutError):
+                await inspects.run(
+                    lambda: wrapper.inspect_input(request=_request(), check=_check()),
+                    0.05,
+                    adapter_id="sync-blocked",
+                )
+            first_elapsed = time.monotonic() - started
+            assert await asyncio.to_thread(hung.started.wait, 5.0)
+            overflow_started = time.monotonic()
+            with pytest.raises(SyncClassifierBusyError):
+                await wrapper.inspect_input(request=_request(), check=_check())
+            overflow_elapsed = time.monotonic() - overflow_started
+            assert 0.04 <= first_elapsed < 0.3
+            assert overflow_elapsed < 0.2
+            assert hung.input_calls == 1
+            assert wrapper.admitted_inspects() == 1
+        finally:
+            hung.release()
+        assert await asyncio.to_thread(hung.finished.wait, 5.0)
 
     asyncio.run(scenario())

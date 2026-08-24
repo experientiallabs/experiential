@@ -150,6 +150,9 @@ class GuardrailEngine:
     ) -> ClassifierVerdict | None:
         """Invoke one adapter under the tighter of check timeout and request deadline.
 
+        The inspect itself runs on an isolation worker. This caller only waits
+        until the remaining budget elapses.
+
         Returns:
             The verdict, or ``None`` when a non-protected check is skipped.
 

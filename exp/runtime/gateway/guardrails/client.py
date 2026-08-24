@@ -112,7 +112,11 @@ class DirectClassifierClient:
         request: GatewayRequest,
         check: GuardrailCheck,
     ) -> ClassifierVerdict:
-        """Inspect one canonical request through the bound adapter."""
+        """Inspect one canonical request through the bound adapter.
+
+        The await runs wherever the engine isolated this inspect, including an
+        isolation worker loop when a deadline is being enforced.
+        """
         with classification_scope():
             return await self._registry.require(check.adapter_id).inspect_input(
                 request=request,
@@ -125,7 +129,11 @@ class DirectClassifierClient:
         completion: GuardrailCompletion,
         check: GuardrailCheck,
     ) -> ClassifierVerdict:
-        """Inspect one winning completion through the bound adapter."""
+        """Inspect one winning completion through the bound adapter.
+
+        The await runs wherever the engine isolated this inspect, including an
+        isolation worker loop when a deadline is being enforced.
+        """
         with classification_scope():
             return await self._registry.require(check.adapter_id).inspect_output(
                 completion=completion,

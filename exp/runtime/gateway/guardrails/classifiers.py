@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import threading
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.client import (
@@ -163,16 +164,74 @@ class KeywordClassifier:
         return ClassifierVerdict(flagged=_contains_needle("\n".join(parts), self._needles))
 
 
+class _DaemonSyncPool:
+    """Fixed daemon workers for leftover synchronous classifier adapters."""
+
+    def __init__(self, max_workers: int) -> None:
+        """Start ``max_workers`` daemon threads and a hard-capped job queue.
+
+        Args:
+            max_workers: Exact worker count and maximum queued jobs.
+        """
+        self._jobs: queue.Queue[
+            tuple[Callable[[], ClassifierVerdict], Future[ClassifierVerdict]] | None
+        ] = queue.Queue(maxsize=max_workers)
+        self._threads = tuple(
+            threading.Thread(
+                target=self._run,
+                name=f"exp-guardrail-sync-{index}",
+                daemon=True,
+            )
+            for index in range(max_workers)
+        )
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, fn: Callable[[], ClassifierVerdict]) -> Future[ClassifierVerdict]:
+        """Run ``fn`` on one idle daemon worker without growing the queue.
+
+        Args:
+            fn: Synchronous inspect already admitted by the wrapper.
+
+        Returns:
+            A future that completes when ``fn`` returns.
+
+        Raises:
+            RuntimeError: The hard-capped queue is already full.
+        """
+        future: Future[ClassifierVerdict] = Future()
+        try:
+            self._jobs.put_nowait((fn, future))
+        except queue.Full as exc:
+            raise RuntimeError("sync classifier has no free worker") from exc
+        return future
+
+    def _run(self) -> None:
+        """Execute queued inspects until a stop sentinel arrives."""
+        while True:
+            item = self._jobs.get()
+            if item is None:
+                return
+            fn, future = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(fn())
+            except Exception as exc:  # noqa: BLE001 - copy whatever the inspect raised
+                future.set_exception(exc)
+
+
 class BoundedSyncClassifier:
     """Compatibility wrapper for leftover synchronous test adapters.
 
     Production transports implement the async inspect contract directly.
     This wrapper is only for leftover synchronous adapters. Hung sync
-    inspects occupy only this wrapper's private workers. They cannot take
-    async inflight slots from healthy adapters, and they cannot share a
-    process-wide thread pool with other wrappers. Admission is capped at
+    inspects occupy only this wrapper's private daemon workers. Those
+    threads cannot keep the interpreter alive after shutdown. They cannot
+    take async inflight slots from healthy adapters, and they cannot share
+    a process-wide pool with other wrappers. Admission is capped at
     ``max_workers``: a full wrapper fails immediately instead of queueing
-    another executor job that timeout cannot cancel.
+    another job that timeout cannot cancel.
     """
 
     def __init__(
@@ -181,7 +240,7 @@ class BoundedSyncClassifier:
         *,
         max_workers: int = DEFAULT_SYNC_COMPAT_WORKERS,
     ) -> None:
-        """Bind one private executor around a synchronous adapter.
+        """Bind one private daemon worker pool around a synchronous adapter.
 
         Args:
             inner: Leftover synchronous detector.
@@ -197,10 +256,7 @@ class BoundedSyncClassifier:
         self._slots = threading.BoundedSemaphore(max_workers)
         self._admitted = 0
         self._admitted_lock = threading.Lock()
-        self._pool = ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="exp-guardrail-sync",
-        )
+        self._pool = _DaemonSyncPool(max_workers)
 
     def admitted_inspects(self) -> int:
         """Return submitted sync inspects that have not finished."""
