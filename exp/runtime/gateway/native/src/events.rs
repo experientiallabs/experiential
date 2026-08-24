@@ -352,11 +352,14 @@ pub fn require_string(
         .ok_or_else(|| format!("{label} must be text"))
 }
 
-/// Fetch a required non-negative integer field from a provider JSON object.
+/// Fetch a required non-negative integer field from a provider JSON object,
+/// bounded like every parsed count so no downstream consumer can receive a
+/// value outside the persistable signed 64-bit range.
 pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
     object
         .get(key)
         .and_then(Value::as_u64)
+        .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
         .ok_or_else(|| format!("{label} must be a non-negative integer"))
 }
 
@@ -384,6 +387,32 @@ mod tests {
         assert!(openai_compatible_usage(
             &json!({"prompt_tokens": 1, "completion_tokens": 1, "prompt_tokens_details": 3})
         )
+        .is_err());
+    }
+
+    #[test]
+    fn parsed_counts_are_bounded_to_the_persistable_ledger_range() {
+        let at_bound = json!({"count": MAXIMUM_LEDGER_COUNT});
+        let over_bound = json!({"count": MAXIMUM_LEDGER_COUNT + 1});
+        let at_object = at_bound.as_object().expect("object");
+        let over_object = over_bound.as_object().expect("object");
+        // Exactly i64::MAX is persistable and accepted; one past it is a
+        // provider contract violation everywhere counts are parsed.
+        assert_eq!(
+            count_or_zero(at_object, "count", "count"),
+            Ok(MAXIMUM_LEDGER_COUNT)
+        );
+        assert!(count_or_zero(over_object, "count", "count").is_err());
+        assert_eq!(
+            require_u64(at_object, "count", "count"),
+            Ok(MAXIMUM_LEDGER_COUNT)
+        );
+        assert!(require_u64(over_object, "count", "count").is_err());
+        assert!(openai_usage(Some(&json!({
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "output_tokens_details": {"reasoning_tokens": MAXIMUM_LEDGER_COUNT + 1},
+        })))
         .is_err());
     }
 
