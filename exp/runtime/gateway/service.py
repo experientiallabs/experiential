@@ -52,6 +52,7 @@ from exp.runtime.gateway.guardrails.delivery import (
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.interfaces import AttemptLedger, GatewayClock, GatewayControlStore
 from exp.runtime.gateway.ledger import AttemptRejectedError
+from exp.runtime.gateway.messages import register_messages_routes
 from exp.runtime.gateway.routing import CatalogRouteResolver, GatewayRoute
 from exp.runtime.models.providers.errors import normalized_provider_failure
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
@@ -831,6 +832,7 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
             app_title=app_title,
         )
 
+    register_messages_routes(app, service)
     return app
 
 

@@ -46,10 +46,11 @@ GatewayTarget = Annotated[DirectTarget | ProjectTarget, Field(discriminator="kin
 
 
 class GatewayApiSurface(StrEnum):
-    """Public OpenAI-compatible endpoint family used by one canonical request."""
+    """Public endpoint family used by one canonical request."""
 
     CHAT_COMPLETIONS = "chat_completions"
     RESPONSES = "responses"
+    MESSAGES = "messages"
 
 
 class GatewayToolDefinition(ContractModel):

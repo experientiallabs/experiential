@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class GatewaySchemaError(RuntimeError):
@@ -529,6 +529,63 @@ _MIGRATION_9 = (
     "ALTER TABLE gateway_requests ADD COLUMN app_title TEXT",
 )
 
+# The v10 gateway_requests definition: identical columns, order, and
+# constraints to the v9 table, with the api_surface CHECK widened to admit
+# the Anthropic Messages surface. Only the CHECK expression changes, so the
+# on-disk record format is untouched.
+_GATEWAY_REQUESTS_V10_SQL = """CREATE TABLE gateway_requests (
+        request_id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        identity_id TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        alias_id TEXT NOT NULL,
+        alias_revision_id TEXT NOT NULL,
+        api_surface TEXT NOT NULL CHECK (
+            api_surface IN ('chat_completions', 'responses', 'messages')
+        ),
+        canonical_request_sha256 TEXT NOT NULL CHECK (length(canonical_request_sha256) = 64),
+        caller_operation_sha256 TEXT,
+        accepted_at TEXT NOT NULL,
+        deadline_at TEXT NOT NULL,
+        terminal_state TEXT CHECK (
+            terminal_state IS NULL OR terminal_state IN (
+                'completed', 'failed', 'cancelled', 'incomplete',
+                'expired_before_dispatch', 'unknown_after_crash'
+            )
+        ),
+        terminal_at TEXT,
+        content_retained INTEGER NOT NULL DEFAULT 0 CHECK (content_retained = 0),
+        app_referer TEXT,
+        app_title TEXT,
+        UNIQUE (organization_id, request_id),
+        FOREIGN KEY (organization_id, identity_id)
+            REFERENCES identities (organization_id, identity_id),
+        FOREIGN KEY (organization_id, key_id)
+            REFERENCES virtual_keys (organization_id, key_id),
+        FOREIGN KEY (organization_id, alias_id, alias_revision_id)
+            REFERENCES alias_revisions (organization_id, alias_id, revision_id)
+    ) STRICT"""
+
+_MIGRATION_10 = (
+    # SQLite cannot alter a CHECK constraint in place, and gateway_requests is
+    # the foreign-key parent of gateway_attempts, so the copy-and-rename
+    # rebuild used by migration 6 would trip immediate foreign keys inside
+    # this exclusive transaction. A CHECK-only change does not affect the
+    # on-disk record format, so the documented lightweight procedure rewrites
+    # the stored schema text in place instead.
+    "PRAGMA writable_schema = ON",
+    (
+        "UPDATE sqlite_master SET sql = '"
+        + _GATEWAY_REQUESTS_V10_SQL.replace("'", "''")
+        + "' WHERE type = 'table' AND name = 'gateway_requests'"
+    ),
+    "PRAGMA writable_schema = RESET",
+    # Real DDL bumps the schema cookie so every connection reparses the
+    # rewritten definition instead of trusting a cached schema.
+    "CREATE TABLE gateway_schema_refresh_v10 (noop INTEGER) STRICT",
+    "DROP TABLE gateway_schema_refresh_v10",
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -539,6 +596,7 @@ _MIGRATIONS = {
     7: _MIGRATION_7,
     8: _MIGRATION_8,
     9: _MIGRATION_9,
+    10: _MIGRATION_10,
 }
 
 

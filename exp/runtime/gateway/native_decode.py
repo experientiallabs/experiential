@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
@@ -36,9 +37,12 @@ def decode_native_body(
 
     Args:
         body: Raw request body text.
-        surface: Public surface, ``chat`` or ``responses``.
+        surface: Public surface, ``chat``, ``responses``, or ``messages``.
         idempotency_key: Optional raw ``Idempotency-Key`` header value.
+            Ignored on the Anthropic Messages surface, which defines no
+            idempotency header.
         client_request_id: Optional raw ``X-Client-Request-Id`` header value.
+            Ignored on the Anthropic Messages surface.
 
     Returns:
         The public alias and canonical request.
@@ -65,8 +69,10 @@ def decode_native_body(
                 message="Request body must be a JSON object. Re-encode the payload and resend.",
             )
         )
-    decoder = decode_responses if surface == "responses" else decode_chat
     try:
+        if surface == "messages":
+            return decode_messages(payload)
+        decoder = decode_responses if surface == "responses" else decode_chat
         return decoder(
             payload,
             idempotency_key=idempotency_key,

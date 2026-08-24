@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction
+
+if TYPE_CHECKING:
+    from exp.runtime.anthropic_protocol.encoding import MessagesSseEncoder
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayApiSurface,
@@ -29,7 +32,7 @@ def stream_encoder(
     request: GatewayRequest,
     authorization: AuthorizationSnapshot,
     created_at: float,
-) -> ChatSseEncoder | ResponsesSseEncoder:
+) -> ChatSseEncoder | ResponsesSseEncoder | MessagesSseEncoder:
     """Create the surface-specific stateful SSE encoder."""
     if request.surface == GatewayApiSurface.CHAT_COMPLETIONS:
         return ChatSseEncoder(
@@ -37,6 +40,16 @@ def stream_encoder(
             model=authorization.alias,
             created_at=int(created_at),
             include_usage=request.include_usage,
+        )
+    if request.surface == GatewayApiSurface.MESSAGES:
+        # Imported here to break the real package cycle: this module is
+        # imported by the openai_protocol package initializer, and the
+        # anthropic_protocol modules import openai_protocol errors and IDs.
+        from exp.runtime.anthropic_protocol.encoding import MessagesSseEncoder
+
+        return MessagesSseEncoder(
+            request_id=authorization.request_id,
+            model=authorization.alias,
         )
     return ResponsesSseEncoder(
         request_id=authorization.request_id,
@@ -78,6 +91,11 @@ def completed_body(
     events: tuple[GatewayEvent, ...],
 ) -> JsonObject:
     """Build one non-streaming public result from bounded normalized events."""
+    if request.surface == GatewayApiSurface.MESSAGES:
+        # Imported here to break the real package cycle (see stream_encoder).
+        from exp.runtime.anthropic_protocol.encoding import completed_messages_body
+
+        return completed_messages_body(request_id=request_id, model=model, events=events)
     if request.surface == GatewayApiSurface.RESPONSES:
         encoder = ResponsesSseEncoder(
             request_id=request_id,

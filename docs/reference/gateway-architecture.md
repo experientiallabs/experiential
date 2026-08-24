@@ -10,6 +10,8 @@ It serves:
 - `GET /v1/models/{model_id}`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
+- `POST /v1/messages` (the Anthropic Messages API; `POST /v1/messages/count_tokens` answers an
+  explicit Anthropic-shaped refusal because the gateway has no tokenizer authority)
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 
@@ -40,11 +42,14 @@ resolved provider client; native dialects are `openai_responses`,
 `anthropic_messages`, and `openai_compatible` (which also covers Azure and
 OpenRouter connections).
 
-The public surface is identical under either engine. An embedded python engine
-over the same authority, ledger, and routes listens on an internal loopback
-port, and the native engine forwards to it everything outside its fast path:
-`POST /v1/responses`, chat requests carrying `Idempotency-Key` or
-`X-Client-Request-Id` (replay semantics),
+The public surface is identical under either engine. An embedded python
+engine (a deprecated data plane, scheduled for removal; the python control
+plane stays) over the same authority, ledger, and routes listens on an
+internal loopback port, and the native engine forwards to it everything
+outside its fast path:
+chat and Responses requests carrying `Idempotency-Key` or
+`X-Client-Request-Id` (replay semantics; the Messages surface defines no
+idempotency header and never proxies for one),
 multi-deployment pools (the certified waterfall), providers without a native
 dialect, and unknown routes. Escalation happens
 before any ledger write, so each request is accounted exactly once by the
@@ -189,6 +194,20 @@ compatibility.
 Chat streaming emits valid completion chunks and one `[DONE]`. Responses streaming emits the
 created, in-progress, output, and exactly one terminal lifecycle. Provider tool-argument fragments
 are accumulated in original order and validated only at the complete-call boundary.
+
+`exp/runtime/anthropic_protocol` is the only Anthropic Messages wire implementation, serving
+`POST /v1/messages` for Anthropic SDK callers over the same canonical gateway request. Callers
+authenticate with `x-api-key` (the Anthropic SDK default) or a standard Bearer header; both carry
+the same virtual key, and every failure on this surface is rendered in the Anthropic error
+envelope `{"type": "error", "error": {...}}`. The decoder translates text, `tool_use`, and
+`tool_result` blocks faithfully, requires `max_tokens`, validates and drops `thinking` and
+`cache_control` (the gateway has no extended-thinking or prompt-caching channel), and rejects
+image and document blocks loudly because the surface is text-only. Streaming emits the Anthropic
+lifecycle (`message_start`, `ping`, content blocks, `message_delta` with the mapped stop reason
+and usage, `message_stop`, or one terminal `error` event); the non-streaming body is the
+Anthropic message object. Completed streams stop with `end_turn` (`tool_use` when tool calls are
+present) and token-limited streams with `max_tokens`. The Anthropic protocol defines no
+idempotency header, so this surface never joins the keyed replay stores.
 
 Commit-independent headers are available before streaming begins. Route-dependent headers are
 emitted only after an execution snapshot exists. Stable public IDs do not expose raw key,

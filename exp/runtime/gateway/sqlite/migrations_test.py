@@ -720,3 +720,96 @@ def test_newer_and_marker_only_schemas_refuse_without_deleting_state(tmp_path: P
     corrupt.chmod(0o600)
     with pytest.raises(GatewaySchemaError, match="corrupt"):
         initialize_database(corrupt)
+
+
+def test_v10_migration_widens_api_surface_and_preserves_rows(tmp_path: Path) -> None:
+    """The v10 rewrite admits the messages surface without touching v9 data.
+
+    A v9 database with one full request-and-attempt chain migrates in place:
+    the existing rows and the child foreign key survive, a ``messages``
+    request becomes insertable, and any other surface value stays rejected.
+    """
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = connect_database(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for version in range(1, 10):
+            for statement in migrations._MIGRATIONS[version]:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 9")
+        seed_statements = """
+            INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't');
+            INSERT INTO identities VALUES ('id', 'org', 'Identity', NULL, 1, 't', 't');
+            INSERT INTO virtual_keys (
+                key_id, organization_id, identity_id, prefix,
+                fingerprint_version, fingerprint_sha256, created_at
+            ) VALUES ('key', 'org', 'id', 'pfx', 1, '{fingerprint}', 't');
+            INSERT INTO catalog_snapshot_refs VALUES ('snap', 'org', '{digest}', 't');
+            INSERT INTO gateway_aliases (
+                alias_id, organization_id, alias_name, active_revision_id,
+                created_at, updated_at
+            ) VALUES ('alias', 'org', 'alias', NULL, 't', 't');
+            INSERT INTO alias_revisions (
+                revision_id, organization_id, alias_id, revision_number,
+                target_kind, pool_id, catalog_sha256, snapshot_ref, created_at
+            ) VALUES ('rev', 'org', 'alias', 1, 'direct', 'pool', '{digest}', 'snap', 't');
+            INSERT INTO gateway_requests (
+                request_id, organization_id, identity_id, key_id, alias_id,
+                alias_revision_id, api_surface, canonical_request_sha256,
+                accepted_at, deadline_at
+            ) VALUES (
+                'req-1', 'org', 'id', 'key', 'alias', 'rev', 'chat_completions',
+                '{digest}', 't', 't'
+            );
+            INSERT INTO gateway_attempts (
+                attempt_id, request_id, organization_id, attempt_ordinal,
+                route_depth, deployment_id, provider, exact_model_id, pool_id,
+                catalog_sha256, state, started_at, budget_period_start
+            ) VALUES (
+                'att-1', 'req-1', 'org', 0, 0, 'deploy', 'provider', 'exact',
+                'pool', '{digest}', 'completed', 't', '2026-08-01T00:00:00+00:00'
+            );
+            """.format(fingerprint="a" * 64, digest="b" * 64)
+        # executescript would commit the exclusive transaction implicitly, so
+        # the seed rows are inserted statement by statement instead.
+        for statement in seed_statements.split(";"):
+            if statement.strip():
+                connection.execute(statement)
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    backup = initialize_database(path)
+
+    assert backup is not None and backup.exists()
+    migrated = connect_database(path)
+    try:
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
+        surviving = migrated.execute(
+            "SELECT api_surface, app_referer FROM gateway_requests WHERE request_id = 'req-1'"
+        ).fetchone()
+        assert (surviving[0], surviving[1]) == ("chat_completions", None)
+        request_columns = (
+            "request_id, organization_id, identity_id, key_id, alias_id, "
+            "alias_revision_id, api_surface, canonical_request_sha256, accepted_at, deadline_at"
+        )
+        migrated.execute(
+            f"INSERT INTO gateway_requests ({request_columns}) "
+            "VALUES ('req-2', 'org', 'id', 'key', 'alias', 'rev', 'messages', ?, 't', 't')",
+            ("c" * 64,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            migrated.execute(
+                f"INSERT INTO gateway_requests ({request_columns}) "
+                "VALUES ('req-3', 'org', 'id', 'key', 'alias', 'rev', 'bogus', ?, 't', 't')",
+                ("d" * 64,),
+            )
+        # The child attempt still resolves its rewritten parent's foreign key.
+        migrated.execute("DELETE FROM gateway_attempts WHERE attempt_id = 'att-1'")
+        migrated.execute("DELETE FROM gateway_requests WHERE request_id = 'req-1'")
+    finally:
+        migrated.close()

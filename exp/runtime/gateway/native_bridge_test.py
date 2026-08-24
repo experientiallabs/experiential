@@ -1736,3 +1736,128 @@ def test_hosted_components_without_group_commit_writer_settle(
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
     assert report["totals"]["terminal_counts"] == [{"state": "completed", "attempts": 1}]
+
+
+def _messages_fixture_json() -> str:
+    """Return the Rust fixture-event JSON for the shared Messages stream."""
+    return json.dumps(
+        [
+            {"kind": "text_delta", "text": "Hel"},
+            {"kind": "text_delta", "text": "lo é"},
+            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
+            {"kind": "tool_arguments_delta", "index": 0, "text": '{"q": '},
+            {"kind": "tool_arguments_delta", "index": 0, "text": '"x"}'},
+            {
+                "kind": "tool_call_completed",
+                "index": 0,
+                "call_id": "call-1",
+                "name": "search",
+                "raw_arguments": '{"q": "x"}',
+            },
+            {"kind": "usage", "input_tokens": 10, "output_tokens": 4, "cached_input_tokens": 3},
+            {"kind": "completed"},
+        ]
+    )
+
+
+def test_rust_messages_sse_frames_match_python_and_the_committed_golden() -> None:
+    """Rust Messages SSE frames equal the python encoder and the golden fixture.
+
+    The committed golden frames are the durable contract: they outlive the
+    python encoder, which is deprecated and scheduled for removal with the
+    python data plane.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.anthropic_protocol.encoding_test import (
+        TOOL_STREAM_GOLDEN_FRAMES,
+        encode,
+        tool_stream_events,
+    )
+
+    actual = native.encode_messages_fixture("request-abc", "coding", _messages_fixture_json())
+    assert tuple(actual) == TOOL_STREAM_GOLDEN_FRAMES
+    assert tuple(actual) == encode(tool_stream_events())
+
+
+def test_rust_messages_failure_frames_match_python_encoder() -> None:
+    """A failed Messages terminal is one identical Anthropic error event."""
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.anthropic_protocol.encoding import MessagesSseEncoder
+
+    events = [
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=0, text_delta="oops"),
+        GatewayEvent(
+            kind=GatewayEventKind.FAILED,
+            sequence_number=1,
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+                safe_message="provider stream failed",
+            ),
+        ),
+    ]
+    encoder = MessagesSseEncoder(request_id="request-abc", model="coding")
+    expected = list(encoder.start())
+    for event in events:
+        expected.extend(encoder.feed(event))
+    fixture = json.dumps(
+        [
+            {"kind": "text_delta", "text": "oops"},
+            {"kind": "failed", "text": "provider stream failed"},
+        ]
+    )
+    actual = native.encode_messages_fixture("request-abc", "coding", fixture)
+    assert list(actual) == expected
+
+
+def test_rust_messages_completed_body_matches_python_and_the_committed_golden() -> None:
+    """The Rust non-streaming Anthropic message equals the python body."""
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.anthropic_protocol.encoding import completed_messages_body
+    from exp.runtime.anthropic_protocol.encoding_test import (
+        TOOL_STREAM_GOLDEN_BODY,
+        tool_stream_events,
+    )
+
+    actual = native.completed_messages_fixture("request-abc", "coding", _messages_fixture_json())
+    assert actual == TOOL_STREAM_GOLDEN_BODY
+    expected = completed_messages_body(
+        request_id="request-abc", model="coding", events=tool_stream_events()
+    )
+    assert actual == json.dumps(expected, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_rust_anthropic_error_translation_matches_python() -> None:
+    """The Rust Anthropic error envelope equals the python translation.
+
+    Every failure class is exercised through the shared public-error mapping,
+    plus one param-carrying protocol error to prove the param folding.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.anthropic_protocol.errors import anthropic_error_body
+
+    def _rust_translation(error: OpenAIProtocolError) -> JsonObject:
+        """Translate one OpenAI-shaped error through the Rust fixture."""
+        payload = json.dumps(
+            {
+                "status_code": error.status_code,
+                "code": error.detail.code,
+                "message": error.detail.message,
+                "error_type": error.detail.type,
+                "param": error.detail.param,
+                "retry_after_seconds": error.retry_after_seconds,
+            }
+        )
+        return cast("JsonObject", json.loads(native.anthropic_error_fixture(payload)))
+
+    for failure_class in GatewayFailureClass:
+        error = public_failure_error(
+            GatewayFailure(failure_class=failure_class, safe_message="parity probe message")
+        )
+        assert _rust_translation(error) == anthropic_error_body(error), failure_class
+    with_param = OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_parameter",
+        message="The parameter 'top_k' is not supported.",
+        param="top_k",
+    )
+    assert _rust_translation(with_param) == anthropic_error_body(with_param)

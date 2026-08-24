@@ -24,6 +24,7 @@ use crate::dialects::{
     Dialect, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
 };
 use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder};
+use crate::encode_messages::{anthropic_error_body, completed_messages_body, MessagesSseEncoder};
 use crate::encode_responses::{completed_responses_body, ResponsesEnvelope, ResponsesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{CompletedToolCall, Event, Usage};
@@ -186,6 +187,8 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         .route("/v1/models/{model_id}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses))
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(messages_count_tokens))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .route("/metrics.json", get(metrics_json))
@@ -2867,6 +2870,708 @@ async fn finish_stream_terminal(
     }
     for data in frames {
         if !send_bounded(sender, deadline, data).await {
+            return;
+        }
+    }
+}
+
+/// Anthropic-enveloped variant of `error_response` for the Messages surface,
+/// mirroring `anthropic_error_response` in the python engine.
+fn messages_error_response(error: &PublicError) -> Response {
+    let mut builder = Response::builder()
+        .status(
+            StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        )
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(wait) = error.retry_after_seconds {
+        builder = builder.header(header::RETRY_AFTER, wait.to_string());
+    }
+    builder
+        .body(Body::from(compact_json(&anthropic_error_body(error))))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Anthropic callers present `x-api-key` (their SDK default) or a standard
+/// Bearer header; both carry the same virtual key, mirroring the python
+/// engine's `presented_api_key`.
+fn messages_api_key(headers: &HeaderMap) -> Result<String, PublicError> {
+    if let Some(value) = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    bearer_key(headers).map_err(|_| {
+        PublicError::new(
+            401,
+            "invalid_key",
+            "A valid API key is required: send x-api-key or Authorization: Bearer.",
+            "authentication_error",
+        )
+    })
+}
+
+/// Refuse token counting in the caller's own envelope. Anthropic clients
+/// probe this endpoint; the gateway has no tokenizer authority to answer
+/// truthfully, so it refuses explicitly in Anthropic shape and clients fall
+/// back to their local estimate.
+async fn messages_count_tokens() -> Response {
+    messages_error_response(&PublicError::new(
+        404,
+        "route_not_served",
+        "count_tokens is not served by this gateway.",
+        "invalid_request_error",
+    ))
+}
+
+async fn messages(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    state.handled_requests.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let deadline = started + state.request_timeout;
+    let (parts, raw_body) = request.into_parts();
+    let headers = parts.headers;
+    let body = match read_body(raw_body).await {
+        Ok(body) => body,
+        Err(error) => return messages_error_response(&error),
+    };
+
+    let raw_key = match messages_api_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return messages_error_response(&error),
+    };
+    let authenticate = compact_json(&json!({"raw_key": raw_key}));
+    if let Err(error) = state.bridge.call("authenticate", authenticate).await {
+        return messages_error_response(&error);
+    }
+
+    // The Anthropic protocol defines no idempotency header, so this surface
+    // deliberately ignores `Idempotency-Key` and `X-Client-Request-Id` and
+    // never joins the keyed replay stores, matching the python engine.
+    let body_text = match String::from_utf8(body.to_vec()) {
+        Ok(text) => text,
+        Err(_) => return messages_error_response(&PublicError::invalid_json()),
+    };
+
+    let admit_argument = compact_json(&json!({
+        "raw_key": raw_key,
+        "body": body_text,
+        "surface": "messages",
+    }));
+    let admission_text = match state.bridge.call("admit", admit_argument).await {
+        Ok(text) => text,
+        Err(error) => return messages_error_response(&error),
+    };
+    let admission_value: Value = match serde_json::from_str(&admission_text) {
+        Ok(value) => value,
+        Err(_) => return messages_error_response(&PublicError::internal()),
+    };
+    if let Some(reason) = admission_value.get("escalate") {
+        METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
+        // No ledger row exists; the python engine owns this request end to end.
+        return proxy_to_python(
+            &state,
+            reqwest::Method::POST,
+            "/v1/messages",
+            &headers,
+            body,
+        )
+        .await;
+    }
+    let admission: Admission = match serde_json::from_value(admission_value.clone()) {
+        Ok(admission) => admission,
+        Err(_) => {
+            // The attempt is durably started; close it before failing so
+            // wire-contract drift cannot leak ledger rows.
+            let request_id = admission_value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let attempt_id = admission_value
+                .get("attempt_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !request_id.is_empty() && !attempt_id.is_empty() {
+                let mut guard = AttemptGuard::new(&state, request_id, attempt_id, started);
+                guard
+                    .settle(
+                        "failed",
+                        None,
+                        &[],
+                        Some(&Failure::new(
+                            FailureClass::Internal,
+                            "gateway admission wire contract failed",
+                        )),
+                    )
+                    .await;
+            }
+            return messages_error_response(&PublicError::internal());
+        }
+    };
+    let mut guard = AttemptGuard::new(
+        &state,
+        admission.request_id.clone(),
+        admission.attempt_id.clone(),
+        started,
+    );
+
+    let dialect = match Dialect::from_str(&admission.dialect) {
+        Some(dialect) => dialect,
+        None => {
+            guard
+                .settle(
+                    "failed",
+                    None,
+                    &[],
+                    Some(&Failure::new(
+                        FailureClass::Internal,
+                        "gateway engine does not support the resolved provider dialect",
+                    )),
+                )
+                .await;
+            return messages_error_response(&PublicError::internal());
+        }
+    };
+
+    // The connection's raw timeout bounds each transport phase (open, then
+    // every chunk read), exactly like the python streaming path.
+    let phase_timeout = Duration::from_secs_f64(admission.timeout_seconds.max(0.001));
+
+    // The bounded active-dispatch permit is awaited after admission, like the
+    // python executor: protocol and authority errors answer immediately even
+    // at capacity, and a queue-deadline expiry settles the started attempt.
+    let permit =
+        match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                guard
+                    .settle(
+                        "failed",
+                        None,
+                        &[],
+                        Some(&Failure::new(
+                            FailureClass::Cancelled,
+                            "gateway is draining and is not accepting new requests",
+                        )),
+                    )
+                    .await;
+                return messages_error_response(&PublicError::draining());
+            }
+            Err(_) => {
+                let failure = Failure::new(
+                    FailureClass::Timeout,
+                    "gateway execution queue deadline exceeded",
+                );
+                let error = failure.public_error();
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                return messages_error_response(&error);
+            }
+        };
+
+    // One bounded same-deployment retry at the open phase, mirroring the
+    // python executor's retry policy before any byte reaches the client.
+    let mut response = None;
+    for attempt in 0..2u8 {
+        let open_bound = remaining(deadline).min(phase_timeout);
+        match open_stream(
+            &state.http,
+            &admission.url,
+            &admission.headers,
+            &admission.idempotency_key,
+            &admission.upstream_payload,
+            open_bound,
+        )
+        .await
+        {
+            Ok(opened) => {
+                response = Some(opened);
+                break;
+            }
+            Err(transport) => {
+                if attempt == 0
+                    && transport.retryable_same_deployment
+                    && !remaining(deadline).is_zero()
+                {
+                    continue;
+                }
+                let failure = transport.failure;
+                let error = failure.public_error();
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                return messages_error_response(&error);
+            }
+        }
+    }
+    let response = match response {
+        Some(response) => response,
+        None => {
+            let failure = Failure::new(FailureClass::Internal, "provider dispatch failed");
+            guard.settle("failed", None, &[], Some(&failure)).await;
+            return messages_error_response(&PublicError::internal());
+        }
+    };
+
+    if admission.output_guardrail {
+        return guarded_messages(
+            admission,
+            guard,
+            dialect,
+            response,
+            deadline,
+            phase_timeout,
+            permit,
+        )
+        .await;
+    }
+    if admission.stream {
+        stream_messages(
+            admission,
+            guard,
+            dialect,
+            response,
+            deadline,
+            phase_timeout,
+            permit,
+        )
+        .await
+    } else {
+        completed_messages(
+            admission,
+            guard,
+            dialect,
+            response,
+            deadline,
+            phase_timeout,
+            permit,
+        )
+        .await
+    }
+}
+
+/// Settle and answer one aggregated non-streaming Messages outcome; shared by
+/// the plain and output-guarded paths.
+async fn completed_messages_from_events(
+    admission: Admission,
+    mut guard: AttemptGuard,
+    events: Vec<Event>,
+) -> Response {
+    let aggregated = match completed_messages_body(&admission.request_id, &admission.alias, &events)
+    {
+        Ok(aggregated) => aggregated,
+        Err(error) => {
+            guard
+                .settle(
+                    "failed",
+                    None,
+                    &[],
+                    Some(
+                        &Failure::new(
+                            FailureClass::MalformedResponse,
+                            "provider stream ended without a terminal event",
+                        )
+                        .boundary(),
+                    ),
+                )
+                .await;
+            return messages_error_response(&error);
+        }
+    };
+    if let Some(failure) = &aggregated.failure {
+        let failure = failure.clone().boundary();
+        let error = failure.public_error();
+        guard
+            .settle(
+                "failed",
+                aggregated.usage.as_ref(),
+                &aggregated.tool_names,
+                Some(&failure),
+            )
+            .await;
+        return messages_error_response(&error);
+    }
+    let outcome = if aggregated.incomplete {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    let settled = guard
+        .settle(
+            outcome,
+            aggregated.usage.as_ref(),
+            &aggregated.tool_names,
+            None,
+        )
+        .await;
+    if !settled {
+        // Success is only reported once the terminal accounting write landed.
+        return messages_error_response(&PublicError::internal());
+    }
+    let mut headers = commit_independent(&admission, None);
+    headers.extend(commit_dependent(&admission));
+    json_response(StatusCode::OK, &aggregated.body, &headers)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn completed_messages(
+    admission: Admission,
+    mut guard: AttemptGuard,
+    dialect: Dialect,
+    response: reqwest::Response,
+    deadline: Instant,
+    phase_timeout: Duration,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let _permit = permit;
+    let events =
+        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
+            Ok(events) => events,
+            Err(failure) => {
+                let failure = failure.boundary();
+                let error = collection_public_error(&failure);
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                return messages_error_response(&error);
+            }
+        };
+    completed_messages_from_events(admission, guard, events).await
+}
+
+fn encode_messages_sse(admission: &Admission, events: &[Event]) -> Result<Vec<u8>, PublicError> {
+    let mut encoder = MessagesSseEncoder::new(&admission.request_id, &admission.alias);
+    let mut body = Vec::new();
+    for frame in encoder.start()? {
+        body.extend_from_slice(frame.as_bytes());
+    }
+    for event in events {
+        for frame in encoder.feed(event)? {
+            body.extend_from_slice(frame.as_bytes());
+        }
+    }
+    Ok(body)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn guarded_messages(
+    admission: Admission,
+    mut guard: AttemptGuard,
+    dialect: Dialect,
+    response: reqwest::Response,
+    deadline: Instant,
+    phase_timeout: Duration,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let _permit = permit;
+    let collected =
+        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
+            Ok(events) => events,
+            Err(failure) => {
+                let failure = failure.boundary();
+                let error = collection_public_error(&failure);
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                return messages_error_response(&error);
+            }
+        };
+    let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
+        Ok(events) => events,
+        Err(failure) => {
+            guard.settle("failed", None, &[], Some(&failure)).await;
+            return messages_error_response(&failure.public_error());
+        }
+    };
+    if !admission.stream {
+        return completed_messages_from_events(admission, guard, events).await;
+    }
+    let aggregated = match completed_messages_body(&admission.request_id, &admission.alias, &events)
+    {
+        Ok(aggregated) => aggregated,
+        Err(error) => {
+            guard
+                .settle(
+                    "failed",
+                    None,
+                    &[],
+                    Some(
+                        &Failure::new(
+                            FailureClass::MalformedResponse,
+                            "provider stream ended without a terminal event",
+                        )
+                        .boundary(),
+                    ),
+                )
+                .await;
+            return messages_error_response(&error);
+        }
+    };
+    if let Some(failure) = &aggregated.failure {
+        let failure = failure.clone().boundary();
+        let error = failure.public_error();
+        guard
+            .settle(
+                "failed",
+                aggregated.usage.as_ref(),
+                &aggregated.tool_names,
+                Some(&failure),
+            )
+            .await;
+        return messages_error_response(&error);
+    }
+    let outcome = if aggregated.incomplete {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    if !guard
+        .settle(
+            outcome,
+            aggregated.usage.as_ref(),
+            &aggregated.tool_names,
+            None,
+        )
+        .await
+    {
+        return messages_error_response(&PublicError::internal());
+    }
+    let body = match encode_messages_sse(&admission, &events) {
+        Ok(body) => body,
+        Err(error) => return messages_error_response(&error),
+    };
+    let mut headers = commit_independent(&admission, None);
+    headers.extend(commit_dependent(&admission));
+    sse_body_response(&headers, body)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_messages(
+    admission: Admission,
+    guard: AttemptGuard,
+    dialect: Dialect,
+    response: reqwest::Response,
+    deadline: Instant,
+    phase_timeout: Duration,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let mut header_pairs = commit_independent(&admission, None);
+    header_pairs.extend(commit_dependent(&admission));
+    let request_id = admission.request_id.clone();
+    let alias = admission.alias.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let mut guard = guard;
+        let mut encoder = MessagesSseEncoder::new(&request_id, &alias);
+        let mut normalizer = Normalizer::new(dialect);
+        let mut decoder = SseDecoder::new();
+        let mut usage: Option<Usage> = None;
+        let mut tool_names: Vec<String> = Vec::new();
+        let mut terminal: Option<Event> = None;
+
+        macro_rules! fail_stream {
+            ($failure:expr) => {{
+                let failure = $failure.boundary();
+                emit_messages_failure(&sender, deadline, &mut encoder, &failure).await;
+                guard
+                    .settle("failed", usage.as_ref(), &tool_names, Some(&failure))
+                    .await;
+                return;
+            }};
+        }
+
+        let start_frames = match encoder.start() {
+            Ok(frames) => frames,
+            Err(_) => {
+                fail_stream!(Failure::new(
+                    FailureClass::Internal,
+                    "gateway could not encode the provider stream",
+                ))
+            }
+        };
+        for frame in start_frames {
+            if !send_bounded(&sender, deadline, Bytes::from(frame)).await {
+                guard.settle_cancelled(usage.as_ref(), &tool_names).await;
+                return;
+            }
+        }
+
+        let mut byte_stream = response.bytes_stream();
+        let mut first_byte_recorded = false;
+        'outer: loop {
+            let bound = remaining(deadline).min(phase_timeout);
+            let chunk = match tokio::time::timeout(bound, byte_stream.next()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(_))) => {
+                    fail_stream!(Failure::new(
+                        FailureClass::Transport,
+                        "provider transport failed; retry the request",
+                    ))
+                }
+                Ok(None) => break 'outer,
+                Err(_) => fail_stream!(stream_timeout_failure(deadline)),
+            };
+            if !first_byte_recorded {
+                METRICS
+                    .time_to_first_byte_ms
+                    .record(guard.started.elapsed());
+                first_byte_recorded = true;
+            }
+            let frames = match decoder.feed(&chunk) {
+                Ok(frames) => frames,
+                Err(message) => {
+                    fail_stream!(Failure::new(FailureClass::MalformedResponse, &message))
+                }
+            };
+            for frame in frames {
+                let events = match normalizer.feed(&frame) {
+                    Ok(events) => events,
+                    Err(failure) => fail_stream!(failure),
+                };
+                for event in events {
+                    track_event(&event, &mut usage, &mut tool_names);
+                    if event.is_terminal() {
+                        terminal = Some(event.clone());
+                        if !settle_stream_end(
+                            &mut guard,
+                            terminal.as_ref(),
+                            usage.as_ref(),
+                            &tool_names,
+                            false,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                    let encoded = match encoder.feed(&event) {
+                        Ok(encoded) => encoded,
+                        Err(_) => {
+                            fail_stream!(Failure::new(
+                                FailureClass::Internal,
+                                "gateway could not encode the provider stream",
+                            ))
+                        }
+                    };
+                    for data in encoded {
+                        if !send_bounded(&sender, deadline, Bytes::from(data)).await {
+                            settle_stream_end(
+                                &mut guard,
+                                terminal.as_ref(),
+                                usage.as_ref(),
+                                &tool_names,
+                                true,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                    if terminal.is_some() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Recover a final unterminated SSE frame at EOF (python decoder
+        // parity) before deciding the stream ended without a terminal.
+        if terminal.is_none() {
+            let tail = match decoder.finish() {
+                Ok(tail) => tail,
+                Err(message) => {
+                    fail_stream!(Failure::new(FailureClass::MalformedResponse, &message))
+                }
+            };
+            if let Some(frame) = tail {
+                let events = match normalizer.feed(&frame) {
+                    Ok(events) => events,
+                    Err(failure) => fail_stream!(failure),
+                };
+                for event in events {
+                    track_event(&event, &mut usage, &mut tool_names);
+                    if event.is_terminal() {
+                        terminal = Some(event.clone());
+                        if !settle_stream_end(
+                            &mut guard,
+                            terminal.as_ref(),
+                            usage.as_ref(),
+                            &tool_names,
+                            false,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                    let encoded = match encoder.feed(&event) {
+                        Ok(encoded) => encoded,
+                        Err(_) => {
+                            fail_stream!(Failure::new(
+                                FailureClass::Internal,
+                                "gateway could not encode the provider stream",
+                            ))
+                        }
+                    };
+                    for data in encoded {
+                        if !send_bounded(&sender, deadline, Bytes::from(data)).await {
+                            settle_stream_end(
+                                &mut guard,
+                                terminal.as_ref(),
+                                usage.as_ref(),
+                                &tool_names,
+                                true,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                    if terminal.is_some() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        if terminal.is_none() {
+            fail_stream!(Failure::new(
+                FailureClass::MalformedResponse,
+                "provider stream ended without a terminal event",
+            ));
+        }
+    });
+
+    let body = Body::from_stream(ReceiverStream::new(receiver));
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream");
+    for (name, value) in &header_pairs {
+        if let (Ok(name), Ok(value)) = (
+            header::HeaderName::try_from(name.as_str()),
+            HeaderValue::try_from(value.as_str()),
+        ) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(body)
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Emit the Messages encoder's sanitized failure lifecycle (one Anthropic
+/// `error` event) when the stream has not already reached a terminal.
+async fn emit_messages_failure(
+    sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    deadline: Instant,
+    encoder: &mut MessagesSseEncoder,
+    failure: &Failure,
+) {
+    if encoder.saw_terminal() {
+        return;
+    }
+    let frames = encoder
+        .feed(&Event::Failed(failure.clone()))
+        .unwrap_or_default();
+    for frame in frames {
+        if !send_bounded(sender, deadline, Bytes::from(frame)).await {
             return;
         }
     }

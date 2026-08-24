@@ -8,6 +8,7 @@
 mod bridge;
 mod dialects;
 mod encode;
+mod encode_messages;
 mod encode_responses;
 mod errors;
 mod events;
@@ -133,6 +134,61 @@ fn completed_responses_fixture(
     Ok(serde_json::to_string(&aggregated.body).unwrap_or_else(|_| "null".to_string()))
 }
 
+/// Encode one normalized event fixture through the Rust Anthropic Messages
+/// SSE encoder for byte parity tests. `events_json` is a list of simplified
+/// event objects.
+#[pyfunction]
+fn encode_messages_fixture(
+    request_id: &str,
+    model: &str,
+    events_json: &str,
+) -> PyResult<Vec<String>> {
+    let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
+    let mut encoder = encode_messages::MessagesSseEncoder::new(request_id, model);
+    let mut frames = encoder
+        .start()
+        .map_err(|error| PyValueError::new_err(error_payload(&error)))?;
+    for event in &events {
+        frames.extend(
+            encoder
+                .feed(event)
+                .map_err(|error| PyValueError::new_err(error_payload(&error)))?,
+        );
+    }
+    Ok(frames)
+}
+
+/// Build one non-streaming Anthropic message body fixture through the Rust
+/// aggregation for byte parity tests against `completed_messages_body`.
+#[pyfunction]
+fn completed_messages_fixture(
+    request_id: &str,
+    model: &str,
+    events_json: &str,
+) -> PyResult<String> {
+    let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
+    let aggregated = encode_messages::completed_messages_body(request_id, model, &events)
+        .map_err(|error| PyValueError::new_err(error_payload(&error)))?;
+    if let Some(failure) = aggregated.failure {
+        return Err(PyValueError::new_err(error_payload(
+            &failure.public_error(),
+        )));
+    }
+    Ok(serde_json::to_string(&aggregated.body).unwrap_or_else(|_| "null".to_string()))
+}
+
+/// Render one OpenAI-shaped public error as the Anthropic error envelope for
+/// translation parity tests against `anthropic_error_body`.
+#[pyfunction]
+fn anthropic_error_fixture(public_error_json: &str) -> PyResult<String> {
+    let error: errors::PublicError = serde_json::from_str(public_error_json)
+        .map_err(|error| PyValueError::new_err(format!("invalid public error: {error}")))?;
+    Ok(
+        serde_json::to_string(&encode_messages::anthropic_error_body(&error))
+            .unwrap_or_else(|_| "null".to_string()),
+    )
+}
+
 /// Map one failure class and safe message to the Rust public-error JSON for
 /// taxonomy parity tests against `public_failure_error`.
 #[pyfunction]
@@ -242,8 +298,11 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;
     module.add_function(wrap_pyfunction!(encode_chat_fixture, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_messages_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(encode_responses_fixture, module)?)?;
+    module.add_function(wrap_pyfunction!(completed_messages_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(completed_responses_fixture, module)?)?;
+    module.add_function(wrap_pyfunction!(anthropic_error_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
