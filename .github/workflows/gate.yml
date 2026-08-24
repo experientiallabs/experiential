@@ -24,6 +24,21 @@ jobs:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
         run: uv sync --extra dev
+      - name: Crate changes require a crate version bump
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "$GITHUB_BASE_REF"
+          if git diff --quiet "origin/$GITHUB_BASE_REF"...HEAD -- exp/runtime/gateway/native/; then
+            echo "crate untouched"
+          elif git diff "origin/$GITHUB_BASE_REF"...HEAD -- exp/runtime/gateway/native/Cargo.toml | grep -q '^+version = '; then
+            echo "crate changed and version bumped"
+          else
+            echo "exp/runtime/gateway/native/ changed without bumping the crate version;" >&2
+            echo "published wheels are immutable per version, so bump Cargo.toml and the" >&2
+            echo "crate pyproject together (the lockstep test keeps them and the" >&2
+            echo "dependency floor aligned)." >&2
+            exit 1
+          fi
       - name: cargo fmt
         run: cargo fmt --check --manifest-path exp/runtime/gateway/native/Cargo.toml
       - name: cargo clippy
