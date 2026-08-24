@@ -60,6 +60,7 @@ class MessagesSseEncoder:
         # encoder does.
         self._tool_identities: dict[int, tuple[str, str]] = {}
         self._tool_arguments: dict[int, str] = {}
+        self._tool_completed: set[int] = set()
         self._saw_tool_use = False
         self._refusal_seen = False
         self._usage: GatewayUsage | None = None
@@ -112,7 +113,7 @@ class MessagesSseEncoder:
         if event.kind == GatewayEventKind.TOOL_ARGUMENTS_DELTA:
             return self._tool_arguments_delta(event)
         if event.kind == GatewayEventKind.TOOL_CALL_COMPLETED:
-            return self._tool_completed(event)
+            return self._complete_tool(event)
         if event.kind == GatewayEventKind.USAGE:
             return ()
         return self._finish(event)
@@ -203,19 +204,28 @@ class MessagesSseEncoder:
             ),
         )
 
-    def _tool_completed(self, event: GatewayEvent) -> tuple[str, ...]:
-        """Verify accumulated raw arguments and close the tool_use block."""
+    def _complete_tool(self, event: GatewayEvent) -> tuple[str, ...]:
+        """Verify accumulated raw arguments and close the tool_use block.
+
+        Some upstream dialects (OpenAI-compatible streams) emit every tool
+        completion only at their terminal sentinel, after later text already
+        closed the tool_use block, so completion verifies against the
+        accumulated state rather than requiring the block to still be open.
+        """
         tool_index = _required_index(event)
         call = event.tool_call
         identity = self._tool_identities.get(tool_index)
-        if call is None or identity is None or self._open_tool_for != tool_index:
+        if call is None or identity is None or tool_index in self._tool_completed:
             raise self._state_error("Messages tool completion omitted its started tool call.")
         if (
             identity != (call.call_id, call.name)
             or self._tool_arguments[tool_index].encode() != call.arguments_json().encode()
         ):
             raise self._state_error("Messages tool completion changed streamed identity or bytes.")
-        return tuple(self._close_block())
+        self._tool_completed.add(tool_index)
+        if self._open_tool_for == tool_index:
+            return tuple(self._close_block())
+        return ()
 
     def _close_block(self) -> list[str]:
         """Emit ``content_block_stop`` for the currently open block, if any."""
@@ -303,24 +313,35 @@ def completed_messages_body(
         raise public_failure_error(refusal_failure())
     # Blocks preserve provider order, merging adjacent text deltas, so the
     # non-streaming content sequence equals the streaming block sequence.
-    content: list[JsonObject] = []
+    # Tool blocks anchor at their start position: some dialects (OpenAI-
+    # compatible streams) emit every tool completion only at their terminal
+    # sentinel, after later text.
+    slots: list[JsonObject | None] = []
+    tool_positions: dict[int, int] = {}
     saw_tool_use = False
     for event in events:
         if event.kind == GatewayEventKind.TEXT_DELTA and event.text_delta:
-            if content and content[-1]["type"] == "text":
-                content[-1]["text"] = str(content[-1]["text"]) + event.text_delta
+            last = slots[-1] if slots else None
+            if last is not None and last["type"] == "text":
+                last["text"] = str(last["text"]) + event.text_delta
             else:
-                content.append({"type": "text", "text": event.text_delta})
-        elif event.kind == GatewayEventKind.TOOL_CALL_COMPLETED and event.tool_call is not None:
+                slots.append({"type": "text", "text": event.text_delta})
+        elif event.kind == GatewayEventKind.TOOL_CALL_STARTED and event.tool_call_index is not None:
+            tool_positions[event.tool_call_index] = len(slots)
+            slots.append(None)
+        elif (
+            event.kind == GatewayEventKind.TOOL_CALL_COMPLETED
+            and event.tool_call is not None
+            and event.tool_call_index in tool_positions
+        ):
             saw_tool_use = True
-            content.append(
-                {
-                    "type": "tool_use",
-                    "id": event.tool_call.call_id,
-                    "name": event.tool_call.name,
-                    "input": event.tool_call.arguments,
-                }
-            )
+            slots[tool_positions[event.tool_call_index]] = {
+                "type": "tool_use",
+                "id": event.tool_call.call_id,
+                "name": event.tool_call.name,
+                "input": event.tool_call.arguments,
+            }
+    content = [slot for slot in slots if slot is not None]
     incomplete = any(event.kind == GatewayEventKind.INCOMPLETE for event in events)
     usage = next(
         (

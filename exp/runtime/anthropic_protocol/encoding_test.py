@@ -307,3 +307,87 @@ def test_completed_body_preserves_interleaved_block_order() -> None:
         {"type": "text", "text": "after the tool"},
     ]
     assert body["stop_reason"] == "tool_use"
+
+
+def test_deferred_tool_completion_streams_and_aggregates_consistently() -> None:
+    """OpenAI-compatible streams complete tools only at their terminal.
+
+    Text may therefore arrive between a tool's arguments and its completion.
+    The streaming encoder must accept the deferred completion after text
+    closed the block, and the aggregation must anchor the tool block at its
+    start position so both renderings order blocks identically.
+    """
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=1,
+            tool_call_index=0,
+            raw_arguments_delta="{}",
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=2, text_delta="after"),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=3,
+            tool_call_index=0,
+            tool_call=ToolCall(call_id="call-1", name="search", arguments={}, raw_arguments="{}"),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=4),
+    )
+    frames = encode(events)
+    names = [frame.split("\n", 1)[0].removeprefix("event: ") for frame in frames]
+    assert names == [
+        "message_start",
+        "ping",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    body = completed_messages_body(request_id="request-abc", model="coding", events=events)
+    assert body["content"] == [
+        {"type": "tool_use", "id": "call-1", "name": "search", "input": {}},
+        {"type": "text", "text": "after"},
+    ]
+
+
+def test_repeated_tool_completion_is_still_rejected() -> None:
+    """A second completion for the same tool stays an invalid provider stream."""
+    encoder = MessagesSseEncoder(request_id="request-abc", model="coding")
+    encoder.start()
+    encoder.feed(
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        )
+    )
+    encoder.feed(
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=1,
+            tool_call_index=0,
+            raw_arguments_delta="{}",
+        )
+    )
+    completion = GatewayEvent(
+        kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+        sequence_number=2,
+        tool_call_index=0,
+        tool_call=ToolCall(call_id="call-1", name="search", arguments={}, raw_arguments="{}"),
+    )
+    encoder.feed(completion)
+    with pytest.raises(OpenAIProtocolError, match="omitted its started tool call"):
+        encoder.feed(completion.model_copy(update={"sequence_number": 3}))

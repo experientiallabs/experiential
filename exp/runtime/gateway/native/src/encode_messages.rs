@@ -3,7 +3,7 @@
 //! `completed_messages_body`) and of the Anthropic error envelope in
 //! `exp.runtime.anthropic_protocol.errors`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Map, Value};
 
@@ -105,6 +105,7 @@ pub struct MessagesSseEncoder {
     open_tool_for: Option<u32>,
     tool_identities: HashMap<u32, (String, String)>,
     tool_arguments: HashMap<u32, String>,
+    tool_completed: HashSet<u32>,
     saw_tool_use: bool,
     refusal_seen: bool,
     usage: Option<Usage>,
@@ -122,6 +123,7 @@ impl MessagesSseEncoder {
             open_tool_for: None,
             tool_identities: HashMap::new(),
             tool_arguments: HashMap::new(),
+            tool_completed: HashSet::new(),
             saw_tool_use: false,
             refusal_seen: false,
             usage: None,
@@ -186,8 +188,13 @@ impl MessagesSseEncoder {
             } => self.tool_started(*index, call_id, name),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments_delta(*index, delta),
             Event::ToolCallCompleted { index, call } => {
+                // Some upstream dialects (OpenAI-compatible streams) emit
+                // every tool completion only at their terminal sentinel,
+                // after later text already closed the tool_use block, so
+                // completion verifies against the accumulated state rather
+                // than requiring the block to still be open.
                 let identity = self.tool_identities.get(index);
-                if identity.is_none() || self.open_tool_for != Some(*index) {
+                if identity.is_none() || self.tool_completed.contains(index) {
                     return Err(invalid_provider_stream(
                         "Messages tool completion omitted its started tool call.",
                     ));
@@ -200,7 +207,12 @@ impl MessagesSseEncoder {
                         "Messages tool completion changed streamed identity or bytes.",
                     ));
                 }
-                Ok(self.close_block())
+                self.tool_completed.insert(*index);
+                if self.open_tool_for == Some(*index) {
+                    Ok(self.close_block())
+                } else {
+                    Ok(Vec::new())
+                }
             }
             Event::Usage(usage) => {
                 if usage.has_token_counts() {
@@ -415,13 +427,17 @@ pub fn completed_messages_body(
     }
     // Blocks preserve provider order, merging adjacent text deltas, so the
     // non-streaming content sequence equals the streaming block sequence.
-    let mut content: Vec<Value> = Vec::new();
+    // Tool blocks anchor at their start position: some dialects (OpenAI-
+    // compatible streams) emit every tool completion only at their terminal
+    // sentinel, after later text.
+    let mut slots: Vec<Option<Value>> = Vec::new();
+    let mut tool_positions: HashMap<u32, usize> = HashMap::new();
     let mut saw_tool_use = false;
     for event in events {
         match event {
             Event::TextDelta(delta) if !delta.is_empty() => {
-                let appended = match content.last_mut() {
-                    Some(block) if block["type"] == json!("text") => {
+                let appended = match slots.last_mut() {
+                    Some(Some(block)) if block["type"] == json!("text") => {
                         if let Some(Value::String(text)) = block.get_mut("text") {
                             text.push_str(delta);
                             true
@@ -432,26 +448,34 @@ pub fn completed_messages_body(
                     _ => false,
                 };
                 if !appended {
-                    content.push(json!({"type": "text", "text": delta}));
+                    slots.push(Some(json!({"type": "text", "text": delta})));
                 }
             }
-            Event::ToolCallCompleted { call, .. } => {
-                saw_tool_use = true;
-                // The raw argument text was validated as one JSON object by the
-                // normalizer; preserve_order keeps its key order, matching the
-                // python engine's parsed-object serialization.
-                let input: Value = serde_json::from_str(&call.raw_arguments)
-                    .map_err(|_| PublicError::internal())?;
-                content.push(json!({
-                    "type": "tool_use",
-                    "id": call.call_id,
-                    "name": call.name,
-                    "input": input,
-                }));
+            Event::ToolCallStarted { index, .. } => {
+                tool_positions.insert(*index, slots.len());
+                slots.push(None);
+            }
+            Event::ToolCallCompleted { index, call } => {
+                if let Some(position) = tool_positions.get(index) {
+                    saw_tool_use = true;
+                    // The raw argument text was validated as one JSON object
+                    // by the normalizer; preserve_order keeps its key order,
+                    // matching the python engine's parsed-object
+                    // serialization.
+                    let input: Value = serde_json::from_str(&call.raw_arguments)
+                        .map_err(|_| PublicError::internal())?;
+                    slots[*position] = Some(json!({
+                        "type": "tool_use",
+                        "id": call.call_id,
+                        "name": call.name,
+                        "input": input,
+                    }));
+                }
             }
             _ => {}
         }
     }
+    let content: Vec<Value> = slots.into_iter().flatten().collect();
     let body = json!({
         "id": stable_public_id("msg", request_id),
         "type": "message",
@@ -559,6 +583,11 @@ mod tests {
     #[test]
     fn completed_body_preserves_interleaved_block_order() {
         let events = vec![
+            Event::ToolCallStarted {
+                index: 0,
+                call_id: "call-1".to_string(),
+                name: "search".to_string(),
+            },
             Event::ToolCallCompleted {
                 index: 0,
                 call: CompletedToolCall {
@@ -578,6 +607,50 @@ mod tests {
             aggregated.body["content"][1],
             json!({"type": "text", "text": "after the tool"})
         );
+    }
+
+    #[test]
+    fn deferred_tool_completion_keeps_the_started_block_position() {
+        // OpenAI-compatible streams complete every tool only at [DONE], so
+        // text may arrive between the tool's arguments and its completion.
+        let events = vec![
+            Event::ToolCallStarted {
+                index: 0,
+                call_id: "call-1".to_string(),
+                name: "search".to_string(),
+            },
+            Event::ToolArgumentsDelta {
+                index: 0,
+                delta: "{}".to_string(),
+            },
+            Event::TextDelta("after".to_string()),
+            Event::ToolCallCompleted {
+                index: 0,
+                call: CompletedToolCall {
+                    call_id: "call-1".to_string(),
+                    name: "search".to_string(),
+                    raw_arguments: "{}".to_string(),
+                },
+            },
+            Event::Completed,
+        ];
+        let aggregated =
+            completed_messages_body("request-abc", "coding", &events).expect("aggregates");
+        assert_eq!(aggregated.body["content"][0]["type"], json!("tool_use"));
+        assert_eq!(
+            aggregated.body["content"][1],
+            json!({"type": "text", "text": "after"})
+        );
+        let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+        let mut frames = encoder.start().expect("starts");
+        for event in &events {
+            frames.extend(
+                encoder
+                    .feed(event)
+                    .expect("streams the deferred completion"),
+            );
+        }
+        assert!(frames.last().expect("terminal").contains("message_stop"));
     }
 
     #[test]

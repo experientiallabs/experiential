@@ -1905,3 +1905,66 @@ def test_rust_messages_body_preserves_interleaved_block_order() -> None:
     assert actual == json.dumps(expected, separators=(",", ":"), ensure_ascii=False)
     assert json.loads(actual)["content"][0]["type"] == "tool_use"
     assert json.loads(actual)["content"][1] == {"type": "text", "text": "after"}
+
+
+def test_rust_messages_deferred_tool_completion_matches_python() -> None:
+    """Deferred completions (OpenAI-compatible [DONE] ordering) stay in parity.
+
+    Text arriving between a tool's arguments and its completion must stream
+    and aggregate identically on both engines, with the tool block anchored
+    at its start position.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.common.models.model import ToolCall
+    from exp.runtime.anthropic_protocol.encoding import (
+        MessagesSseEncoder,
+        completed_messages_body,
+    )
+
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=1,
+            tool_call_index=0,
+            raw_arguments_delta="{}",
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=2, text_delta="after"),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=3,
+            tool_call_index=0,
+            tool_call=ToolCall(call_id="call-1", name="search", arguments={}, raw_arguments="{}"),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=4),
+    )
+    fixture = json.dumps(
+        [
+            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
+            {"kind": "tool_arguments_delta", "index": 0, "text": "{}"},
+            {"kind": "text_delta", "text": "after"},
+            {
+                "kind": "tool_call_completed",
+                "index": 0,
+                "call_id": "call-1",
+                "name": "search",
+                "raw_arguments": "{}",
+            },
+            {"kind": "completed"},
+        ]
+    )
+    encoder = MessagesSseEncoder(request_id="request-abc", model="coding")
+    expected_frames = list(encoder.start())
+    for event in events:
+        expected_frames.extend(encoder.feed(event))
+    actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
+    assert list(actual_frames) == expected_frames
+    expected_body = completed_messages_body(request_id="request-abc", model="coding", events=events)
+    actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
+    assert actual_body == json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False)
