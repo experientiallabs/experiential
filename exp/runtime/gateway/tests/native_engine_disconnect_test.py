@@ -89,10 +89,7 @@ _DRIVER_SOURCE = textwrap.dedent(
         config = json.loads(sys.argv[1])
         components = load_gateway_components(
             Path(config["root"]),
-            environment={
-                "TEST_PROVIDER_KEY": os.environ["TEST_PROVIDER_KEY"],
-                "TEST_GEMINI_KEY": os.environ["TEST_GEMINI_KEY"],
-            },
+            environment={"TEST_PROVIDER_KEY": os.environ["TEST_PROVIDER_KEY"]},
         )
         control_plane = NativeControlPlane(
             components,
@@ -159,16 +156,16 @@ def _seed_escalating_alias(root: Path, manager: GatewayManagement) -> None:
 
     upsert_connection(
         root,
-        name="gemini-main",
-        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        name="bedrock-main",
+        connection=ConnectionConfig(provider="bedrock", region="us-east-1"),
         replace=False,
     )
     normalized, snapshot, _changed = upsert_singleton_deployment(
         root,
         deployment_alias="escalated",
-        connection_name="gemini-main",
-        provider_model="gemini-model-exact",
-        exact_model_id="gemini-revision-exact",
+        connection_name="bedrock-main",
+        provider_model="bedrock-model-exact",
+        exact_model_id="bedrock-revision-exact",
         revision=None,
         capabilities=ModelCapabilities(),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
@@ -354,7 +351,6 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     stderr_log = root / "driver-stderr.log"
     environment = dict(os.environ)
     environment["TEST_PROVIDER_KEY"] = "provider-secret-canary"
-    environment["TEST_GEMINI_KEY"] = "gemini-secret-canary"
     stderr_sink = stderr_log.open("wb")
     process = subprocess.Popen(  # noqa: S603 - the interpreter runs our generated driver.
         [sys.executable, str(driver), config],

@@ -37,8 +37,8 @@ with the same `streaming_requests` builders, and writes the same durable
 SQLite transactions, over the same hot-reloadable authority generations.
 Provider wire facts come from the public `gateway_wire_profile()` on each
 resolved provider client; native dialects are `openai_responses`,
-`anthropic_messages`, and `openai_compatible` (which also covers Azure and
-OpenRouter connections).
+`anthropic_messages`, `openai_compatible` (which also covers Azure and
+OpenRouter connections), and `gemini_generate_content`.
 
 The public surface is identical under either engine. An embedded python engine
 over the same authority, ledger, and routes listens on an internal loopback

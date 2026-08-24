@@ -62,6 +62,52 @@ impl Event {
     }
 }
 
+/// Render one event as the content-bearing JSON object used by dialect parity
+/// fixtures: the same field vocabulary the fixture-event parser accepts, plus
+/// the failure class and safe message for terminal failures.
+pub fn simplified_event(event: &Event) -> Value {
+    match event {
+        Event::TextDelta(text) => serde_json::json!({"kind": "text_delta", "text": text}),
+        Event::RefusalDelta(text) => serde_json::json!({"kind": "refusal_delta", "text": text}),
+        Event::ToolCallStarted {
+            index,
+            call_id,
+            name,
+        } => serde_json::json!({
+            "kind": "tool_call_started",
+            "index": index,
+            "call_id": call_id,
+            "name": name,
+        }),
+        Event::ToolArgumentsDelta { index, delta } => serde_json::json!({
+            "kind": "tool_arguments_delta",
+            "index": index,
+            "text": delta,
+        }),
+        Event::ToolCallCompleted { index, call } => serde_json::json!({
+            "kind": "tool_call_completed",
+            "index": index,
+            "call_id": call.call_id,
+            "name": call.name,
+            "raw_arguments": call.raw_arguments,
+        }),
+        Event::Usage(usage) => serde_json::json!({
+            "kind": "usage",
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+        }),
+        Event::Completed => serde_json::json!({"kind": "completed"}),
+        Event::Incomplete => serde_json::json!({"kind": "incomplete"}),
+        Event::Failed(failure) => serde_json::json!({
+            "kind": "failed",
+            "failure_class": failure.failure_class.as_str(),
+            "safe_message": failure.safe_message,
+        }),
+    }
+}
+
 /// Validate one raw tool-argument accumulation as a single JSON object.
 pub fn require_json_object_text(raw: &str) -> Result<(), String> {
     match serde_json::from_str::<Value>(raw) {
