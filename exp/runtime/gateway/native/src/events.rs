@@ -157,14 +157,21 @@ impl ToolAccumulator {
     }
 }
 
+/// Largest count the durable ledger can persist: usage lands in signed
+/// 64-bit SQLite INTEGER columns, so anything above `i64::MAX` could never
+/// settle and is treated as a provider contract violation at the parser.
+pub const MAXIMUM_LEDGER_COUNT: u64 = i64::MAX as u64;
+
 /// Read an optional non-negative count, mirroring `require_integer`: absent
 /// or null counts as zero because providers omit zero-valued usage fields,
-/// while a present non-integer value is a provider contract violation.
+/// while a present non-integer (or unpersistably large) value is a provider
+/// contract violation.
 pub fn count_or_zero(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
     match object.get(key) {
         None | Some(Value::Null) => Ok(0),
         Some(value) => value
             .as_u64()
+            .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
             .ok_or_else(|| format!("{label} must be a non-negative integer")),
     }
 }
@@ -187,6 +194,7 @@ fn optional_usage_detail(
         None | Some(Value::Null) => Ok(None),
         Some(value) => value
             .as_u64()
+            .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
             .map(Some)
             .ok_or_else(|| format!("{label} must be a non-negative integer")),
     }
@@ -295,9 +303,10 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
 
 /// Parse Bedrock `metadata.usage`, mirroring the python `_usage` normalizer:
 /// cache read and write legs fold into total input, cached input reports the
-/// read leg, and absent counts are zero (`require_integer` parity). A total
-/// beyond the representable count range is a provider contract violation and
-/// fails the stream rather than persisting a clamped or wrapped number.
+/// read leg, and absent counts are zero (`require_integer` parity). Legs and
+/// the folded total beyond the persistable ledger range are provider
+/// contract violations and fail the stream rather than reaching settlement
+/// as a value the ledger could never write.
 pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
     let usage = value
         .and_then(Value::as_object)
@@ -316,7 +325,8 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
     let input_tokens = fresh
         .checked_add(cache_read)
         .and_then(|total| total.checked_add(cache_write))
-        .ok_or_else(|| "Bedrock input token total overflows a 64-bit count".to_string())?;
+        .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
+        .ok_or_else(|| "Bedrock input token total overflows a persistable count".to_string())?;
     Ok(Usage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(count_or_zero(
@@ -367,6 +377,9 @@ mod tests {
     #[test]
     fn openai_compatible_usage_rejects_malformed_counts() {
         assert!(openai_compatible_usage(&json!({"prompt_tokens": "7"})).is_err());
+        assert!(
+            openai_compatible_usage(&json!({"prompt_tokens": MAXIMUM_LEDGER_COUNT + 1})).is_err()
+        );
         assert!(openai_compatible_usage(&json!([1])).is_err());
         assert!(openai_compatible_usage(
             &json!({"prompt_tokens": 1, "completion_tokens": 1, "prompt_tokens_details": 3})
@@ -385,10 +398,16 @@ mod tests {
         .expect("valid usage");
         assert_eq!(usage.input_tokens, Some(12));
         assert_eq!(usage.cached_input_tokens, Some(2));
-        // Individually valid legs whose sum is unrepresentable are a
+        // A leg beyond the persistable ledger range fails at the parser.
+        assert!(bedrock_usage(Some(&json!({
+            "inputTokens": MAXIMUM_LEDGER_COUNT + 1,
+            "outputTokens": 1,
+        })))
+        .is_err());
+        // Individually persistable legs whose folded total is not are a
         // provider contract violation, never a clamped or wrapped total.
         assert!(bedrock_usage(Some(&json!({
-            "inputTokens": u64::MAX,
+            "inputTokens": MAXIMUM_LEDGER_COUNT,
             "outputTokens": 1,
             "cacheReadInputTokens": 1,
         })))

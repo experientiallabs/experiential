@@ -11,6 +11,7 @@ use crate::errors::{Failure, FailureClass};
 use crate::events::{
     bedrock_usage, count_or_zero, gemini_usage, openai_compatible_usage, openai_usage,
     require_string, require_u64, simplified_event, Event, ToolAccumulator, Usage,
+    MAXIMUM_LEDGER_COUNT,
 };
 use crate::eventstream::EventStreamDecoder;
 use crate::sse::{SseDecoder, SseEvent};
@@ -533,8 +534,19 @@ impl Normalizer {
             }
             "message_stop" => {
                 events.extend(finish_open_tools(&mut self.tools)?);
+                // Individually persistable legs whose folded total is not
+                // are a provider contract violation, exactly like the
+                // Bedrock cache-leg fold.
+                let input_tokens = self
+                    .input_tokens
+                    .checked_add(self.cache_read)
+                    .and_then(|total| total.checked_add(self.cache_write))
+                    .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
+                    .ok_or_else(|| {
+                        malformed("Anthropic input token total overflows a persistable count")
+                    })?;
                 events.push(Event::Usage(Usage {
-                    input_tokens: Some(self.input_tokens + self.cache_read + self.cache_write),
+                    input_tokens: Some(input_tokens),
                     output_tokens: Some(self.output_tokens),
                     cached_input_tokens: Some(self.cache_read),
                     reasoning_tokens: None,
