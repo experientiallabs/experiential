@@ -75,8 +75,9 @@ uv run pytest -q
   World-model fidelity testing is a separately invoked common-evaluation mode with no authority
   over router fitting or runtime activation. Its reports contain measurements only and never carry
   an approval, denial, gate, threshold, or decision.
-- `exp` opens the branded home screen. Its `Default Gateway` choice starts the initialized
-  authenticated multi-alias gateway on loopback, while `exp --project PROJECT --root ROOT --port
+- `exp` opens the branded home screen. Its `Run Gateway` choice starts the initialized
+  authenticated multi-alias gateway on loopback, running first-time setup when no gateway exists,
+  while `exp --project PROJECT --root ROOT --port
   PORT [--ghost]` retains the single-project compatibility server. Both expose OpenAI Chat
   Completions, Responses, and Models routes. Public request and
   response types come

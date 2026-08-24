@@ -2,7 +2,7 @@
 
 ## Supported surface
 
-`exp` opens the default gateway home screen. Its `Default Gateway` choice starts an authenticated
+`exp` opens the gateway home screen. Its `Run Gateway` choice starts an authenticated
 multi-alias gateway on `127.0.0.1`.
 It serves:
 

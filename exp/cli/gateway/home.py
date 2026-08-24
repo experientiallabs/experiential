@@ -1,4 +1,4 @@
-"""Interactive home screen for the default Experiential gateway flow."""
+"""Interactive home screen for the Experiential gateway flow."""
 
 from __future__ import annotations
 
@@ -24,24 +24,14 @@ from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUn
 
 _MENU_OPTIONS = (
     PickerOption(
-        value="default",
-        label="Default Gateway",
-        detail="recommended happy path: setup if needed, then start",
-    ),
-    PickerOption(
         value="run",
         label="Run Gateway",
-        detail="start an already configured local gateway",
+        detail="set up if needed, then start",
     ),
     PickerOption(
         value="setup",
         label="Setup Gateway",
         detail="choose providers, a model, an alias, and a key",
-    ),
-    PickerOption(
-        value="status",
-        label="Gateway Status",
-        detail="show content-free local gateway counts",
     ),
     PickerOption(value="exit", label="Exit"),
 )
@@ -118,7 +108,7 @@ def default_gateway(
             output,
             title="What would you like to do?",
             options=_MENU_OPTIONS,
-            default="default",
+            default="run",
         )
         if selection.action in {PickerAction.BACK, PickerAction.CANCEL}:
             _render_exit(output)
@@ -127,22 +117,11 @@ def default_gateway(
             _render_exit(output)
             return
         choice = selection.values[0]
-        if choice == "default":
+        if choice == "run":
             if _start_from_menu(
                 output,
                 root=root,
                 port=port,
-                graceful_timeout=graceful_timeout,
-                engine=engine,
-                max_active_requests=max_active_requests,
-            ):
-                return
-        elif choice == "run":
-            if _start_from_menu(
-                output,
-                root=root,
-                port=port,
-                non_interactive=True,
                 graceful_timeout=graceful_timeout,
                 engine=engine,
                 max_active_requests=max_active_requests,
@@ -150,8 +129,6 @@ def default_gateway(
                 return
         elif choice == "setup":
             _setup_from_menu(output, root=root, port=port)
-        elif choice == "status":
-            _show_status(output, root=root)
         else:
             _render_exit(output)
             return
@@ -201,7 +178,6 @@ def _start_from_menu(
     *,
     root: Path,
     port: int,
-    non_interactive: bool = False,
     graceful_timeout: float,
     engine: str,
     max_active_requests: int,
@@ -215,7 +191,7 @@ def _start_from_menu(
         start_gateway(
             root=root,
             port=port,
-            non_interactive=non_interactive,
+            non_interactive=False,
             graceful_timeout=graceful_timeout,
             engine=engine,
             max_active_requests=max_active_requests,
@@ -279,24 +255,7 @@ def _setup_from_menu(console: Console, *, root: Path, port: int) -> None:
         return
     emit_setup_credentials(port=port, setup=setup, console=console)
     outcome = "reconfigured" if reconfigure else "configured"
-    console.print(f"[green]✓ Gateway {outcome}[/green] Choose Default Gateway to start it.")
-
-
-def _show_status(console: Console, *, root: Path) -> None:
-    """Render content-free gateway counts without creating local state."""
-    status = GatewayManagement(root).status()
-    if not status.initialized:
-        console.print("[yellow]Gateway not configured[/yellow]")
-        console.print("[dim]Choose Setup Gateway to create the default local gateway.[/dim]")
-        return
-    console.print("[green]✓ Gateway configured[/green]")
-    console.print(
-        "[dim]"
-        f"identities={status.active_identities} keys={status.active_keys} "
-        f"aliases={status.active_aliases} providers={status.active_provider_connections} "
-        f"grants={status.grants}"
-        "[/dim]"
-    )
+    console.print(f"[green]✓ Gateway {outcome}[/green] Choose Run Gateway to start it.")
 
 
 def _render_exit(console: Console) -> None:

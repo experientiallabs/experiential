@@ -1,4 +1,4 @@
-"""Tests for the branded default gateway home screen."""
+"""Tests for the branded gateway home screen."""
 
 from __future__ import annotations
 
@@ -17,25 +17,26 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 
-def test_home_screen_starts_with_brand_and_recommends_default_gateway(tmp_path: Path) -> None:
-    """The first interactive screen presents the green EXP brand and happy path first."""
-    console = ScriptedConsole("5\n")
+def test_home_screen_starts_with_brand_and_puts_run_gateway_first(tmp_path: Path) -> None:
+    """The first interactive screen puts the setup-aware run path first."""
+    console = ScriptedConsole("3\n")
 
     home.default_gateway(root=tmp_path, console=console)
 
     assert "exp" in console.output
     assert "Experiential gateway" in console.output
-    assert "Default Gateway" in console.output
-    assert "recommended happy path" in console.output
     assert "Run Gateway" in console.output
     assert "Setup Gateway" in console.output
+    assert "Gateway Status" not in console.output
+    assert "Default Gateway" not in console.output
+    assert console.output.index("Run Gateway") < console.output.index("Setup Gateway")
 
 
-def test_default_gateway_menu_starts_the_recommended_path(
+def test_run_gateway_menu_starts_with_setup_allowed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The focused default row starts an ordinary gateway with interactive setup allowed."""
+    """The first menu row starts an ordinary gateway with setup allowed."""
     calls: list[dict[str, object]] = []
 
     def start(**kwargs: object) -> None:
@@ -57,26 +58,6 @@ def test_default_gateway_menu_starts_the_recommended_path(
     ]
 
 
-def test_run_gateway_menu_uses_the_existing_configuration_only(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The explicit run row never opens first-run setup prompts."""
-    calls: list[dict[str, object]] = []
-
-    def start(**kwargs: object) -> None:
-        """Capture the gateway launch selected by the home screen."""
-        calls.append(kwargs)
-
-    monkeypatch.setattr(home, "start_gateway", start)
-    home.default_gateway(root=tmp_path, console=ScriptedConsole("2\n"))
-
-    assert calls[0]["root"] == tmp_path
-    assert calls[0]["non_interactive"] is True
-    assert calls[0]["engine"] == "auto"
-    assert calls[0]["max_active_requests"] == DEFAULT_MAX_ACTIVE_REQUESTS
-
-
 @pytest.mark.parametrize(
     ("policy", "ghost"),
     [("policy-a", False), (None, True)],
@@ -92,7 +73,7 @@ def test_project_only_gateway_options_validate_before_home_menu(
             root=tmp_path,
             policy=policy,
             ghost=ghost,
-            console=ScriptedConsole("5\n"),
+            console=ScriptedConsole("3\n"),
         )
 
 
@@ -109,13 +90,13 @@ def test_setup_gateway_returns_to_home_with_one_time_credentials(
             raw_key="exp_vk_test",
         ),
     )
-    console = ScriptedConsole("3\n5\n")
+    console = ScriptedConsole("2\n3\n")
 
     home.default_gateway(root=tmp_path, console=console)
 
     assert "export EXP_GATEWAY_URL=http://127.0.0.1:8000/v1" in console.output
     assert "export EXP_GATEWAY_KEY=exp_vk_test" in console.output
-    assert "Choose Default Gateway to start it." in console.output
+    assert "Choose Run Gateway to start it." in console.output
 
 
 def test_setup_gateway_warns_and_reconfigures_an_initialized_gateway(
@@ -136,7 +117,7 @@ def test_setup_gateway_warns_and_reconfigures_an_initialized_gateway(
         )
 
     monkeypatch.setattr("exp.cli.gateway.setup.interactive_gateway_setup", setup_gateway)
-    console = ScriptedConsole("3\ny\n5\n")
+    console = ScriptedConsole("2\ny\n3\n")
 
     home.default_gateway(root=tmp_path, console=console)
 
@@ -173,7 +154,7 @@ def test_setup_gateway_preserves_a_key_when_reconfiguration_outcome_is_unknown(
         )
 
     monkeypatch.setattr("exp.cli.gateway.setup.interactive_gateway_setup", setup_gateway)
-    console = ScriptedConsole("3\ny\n5\n")
+    console = ScriptedConsole("2\ny\n3\n")
 
     home.default_gateway(root=tmp_path, console=console)
 
@@ -197,7 +178,7 @@ def test_setup_gateway_declines_initialized_gateway_reconfiguration(
         raise AssertionError("setup should not run after a declined reconfiguration")
 
     monkeypatch.setattr("exp.cli.gateway.setup.interactive_gateway_setup", setup_gateway)
-    console = ScriptedConsole("3\n\n5\n")
+    console = ScriptedConsole("2\n\n3\n")
 
     home.default_gateway(root=tmp_path, console=console)
 
