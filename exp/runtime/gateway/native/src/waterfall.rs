@@ -471,13 +471,21 @@ impl AttemptGuard {
         }
         self.decided_settlement = Some(argument.clone());
         let delivered = deliver(&self.bridge, "settle", argument).await;
-        self.decided_settlement = None;
         if finalize {
+            // The control plane retained a failed terminal write verbatim,
+            // so its sweep (not the drop backstop) owns the retry.
+            self.decided_settlement = None;
             self.armed = false;
-        } else {
+        } else if delivered {
+            self.decided_settlement = None;
             self.attempt_id = None;
             self.opened = false;
         }
+        // A failed non-finalizing delivery keeps the decided settlement
+        // armed: the drop backstop re-delivers the ORIGINAL outcome verbatim
+        // instead of downgrading the pending provider failure to a
+        // cancellation, and the caller treats the failure as fatal so no
+        // successor is ever dispatched over an unsettled attempt.
         delivered
     }
 
