@@ -413,32 +413,43 @@ pub fn completed_messages_body(
             tool_names,
         });
     }
-    let text: String = events
-        .iter()
-        .filter_map(|event| match event {
-            Event::TextDelta(delta) => Some(delta.as_str()),
-            _ => None,
-        })
-        .collect();
+    // Blocks preserve provider order, merging adjacent text deltas, so the
+    // non-streaming content sequence equals the streaming block sequence.
     let mut content: Vec<Value> = Vec::new();
-    if !text.is_empty() {
-        content.push(json!({"type": "text", "text": text}));
-    }
     let mut saw_tool_use = false;
     for event in events {
-        if let Event::ToolCallCompleted { call, .. } = event {
-            saw_tool_use = true;
-            // The raw argument text was validated as one JSON object by the
-            // normalizer; preserve_order keeps its key order, matching the
-            // python engine's parsed-object serialization.
-            let input: Value =
-                serde_json::from_str(&call.raw_arguments).map_err(|_| PublicError::internal())?;
-            content.push(json!({
-                "type": "tool_use",
-                "id": call.call_id,
-                "name": call.name,
-                "input": input,
-            }));
+        match event {
+            Event::TextDelta(delta) if !delta.is_empty() => {
+                let appended = match content.last_mut() {
+                    Some(block) if block["type"] == json!("text") => {
+                        if let Some(Value::String(text)) = block.get_mut("text") {
+                            text.push_str(delta);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if !appended {
+                    content.push(json!({"type": "text", "text": delta}));
+                }
+            }
+            Event::ToolCallCompleted { call, .. } => {
+                saw_tool_use = true;
+                // The raw argument text was validated as one JSON object by the
+                // normalizer; preserve_order keeps its key order, matching the
+                // python engine's parsed-object serialization.
+                let input: Value = serde_json::from_str(&call.raw_arguments)
+                    .map_err(|_| PublicError::internal())?;
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": call.call_id,
+                    "name": call.name,
+                    "input": input,
+                }));
+            }
+            _ => {}
         }
     }
     let body = json!({
@@ -543,6 +554,30 @@ mod tests {
             "{\"b\":1,\"a\":2}"
         );
         assert_eq!(aggregated.tool_names, vec!["search".to_string()]);
+    }
+
+    #[test]
+    fn completed_body_preserves_interleaved_block_order() {
+        let events = vec![
+            Event::ToolCallCompleted {
+                index: 0,
+                call: CompletedToolCall {
+                    call_id: "call-1".to_string(),
+                    name: "search".to_string(),
+                    raw_arguments: "{}".to_string(),
+                },
+            },
+            Event::TextDelta("after ".to_string()),
+            Event::TextDelta("the tool".to_string()),
+            Event::Completed,
+        ];
+        let aggregated =
+            completed_messages_body("request-abc", "coding", &events).expect("aggregates");
+        assert_eq!(aggregated.body["content"][0]["type"], json!("tool_use"));
+        assert_eq!(
+            aggregated.body["content"][1],
+            json!({"type": "text", "text": "after the tool"})
+        );
     }
 
     #[test]

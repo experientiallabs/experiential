@@ -1861,3 +1861,47 @@ def test_rust_anthropic_error_translation_matches_python() -> None:
         param="top_k",
     )
     assert _rust_translation(with_param) == anthropic_error_body(with_param)
+
+
+def test_rust_messages_body_preserves_interleaved_block_order() -> None:
+    """Both engines keep provider block order in the non-streaming body."""
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.common.models.model import ToolCall
+    from exp.runtime.anthropic_protocol.encoding import completed_messages_body
+
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=1,
+            tool_call_index=0,
+            tool_call=ToolCall(call_id="call-1", name="search", arguments={}, raw_arguments="{}"),
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=2, text_delta="after"),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=3),
+    )
+    fixture = json.dumps(
+        [
+            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
+            {
+                "kind": "tool_call_completed",
+                "index": 0,
+                "call_id": "call-1",
+                "name": "search",
+                "raw_arguments": "{}",
+            },
+            {"kind": "text_delta", "text": "after"},
+            {"kind": "completed"},
+        ]
+    )
+    actual = native.completed_messages_fixture("request-abc", "coding", fixture)
+    expected = completed_messages_body(request_id="request-abc", model="coding", events=events)
+    assert actual == json.dumps(expected, separators=(",", ":"), ensure_ascii=False)
+    assert json.loads(actual)["content"][0]["type"] == "tool_use"
+    assert json.loads(actual)["content"][1] == {"type": "text", "text": "after"}

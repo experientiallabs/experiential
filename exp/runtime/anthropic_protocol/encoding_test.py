@@ -273,3 +273,37 @@ def test_usage_mapping_reports_cached_reads_out_of_the_input_total() -> None:
     assert messages_usage(None) == {"input_tokens": 0, "output_tokens": 0}
     plain = GatewayUsage(input_tokens=5, output_tokens=2)
     assert messages_usage(plain) == {"input_tokens": 5, "output_tokens": 2}
+
+
+def test_completed_body_preserves_interleaved_block_order() -> None:
+    """Content blocks keep provider order and merge only adjacent text."""
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=1,
+            tool_call_index=0,
+            raw_arguments_delta="{}",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=2,
+            tool_call_index=0,
+            tool_call=ToolCall(call_id="call-1", name="search", arguments={}, raw_arguments="{}"),
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=3, text_delta="after "),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=4, text_delta="the tool"),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=5),
+    )
+    body = completed_messages_body(request_id="request-abc", model="coding", events=events)
+    assert body["content"] == [
+        {"type": "tool_use", "id": "call-1", "name": "search", "input": {}},
+        {"type": "text", "text": "after the tool"},
+    ]
+    assert body["stop_reason"] == "tool_use"

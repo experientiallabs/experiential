@@ -301,21 +301,26 @@ def completed_messages_body(
     """
     if any(event.kind == GatewayEventKind.REFUSAL_DELTA for event in events):
         raise public_failure_error(refusal_failure())
-    text = "".join(
-        event.text_delta or "" for event in events if event.kind == GatewayEventKind.TEXT_DELTA
-    )
-    tool_calls = tuple(
-        event.tool_call
-        for event in events
-        if event.kind == GatewayEventKind.TOOL_CALL_COMPLETED and event.tool_call is not None
-    )
+    # Blocks preserve provider order, merging adjacent text deltas, so the
+    # non-streaming content sequence equals the streaming block sequence.
     content: list[JsonObject] = []
-    if text:
-        content.append({"type": "text", "text": text})
-    content.extend(
-        {"type": "tool_use", "id": call.call_id, "name": call.name, "input": call.arguments}
-        for call in tool_calls
-    )
+    saw_tool_use = False
+    for event in events:
+        if event.kind == GatewayEventKind.TEXT_DELTA and event.text_delta:
+            if content and content[-1]["type"] == "text":
+                content[-1]["text"] = str(content[-1]["text"]) + event.text_delta
+            else:
+                content.append({"type": "text", "text": event.text_delta})
+        elif event.kind == GatewayEventKind.TOOL_CALL_COMPLETED and event.tool_call is not None:
+            saw_tool_use = True
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": event.tool_call.call_id,
+                    "name": event.tool_call.name,
+                    "input": event.tool_call.arguments,
+                }
+            )
     incomplete = any(event.kind == GatewayEventKind.INCOMPLETE for event in events)
     usage = next(
         (
@@ -331,7 +336,7 @@ def completed_messages_body(
         "role": "assistant",
         "model": model,
         "content": content,
-        "stop_reason": _stop_reason(incomplete=incomplete, saw_tool_use=bool(tool_calls)),
+        "stop_reason": _stop_reason(incomplete=incomplete, saw_tool_use=saw_tool_use),
         "stop_sequence": None,
         "usage": messages_usage(usage),
     }

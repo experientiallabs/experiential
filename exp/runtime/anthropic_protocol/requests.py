@@ -93,7 +93,13 @@ class _ToolUseBlock(_WireModel):
 
 
 class _ToolResultBlock(_WireModel):
-    """One tool result the caller returns for a prior assistant tool call."""
+    """One tool result the caller returns for a prior assistant tool call.
+
+    ``is_error`` is accepted and dropped: neither the canonical gateway
+    message nor the OpenAI-family provider wire has a tool-error flag, so the
+    error state travels in the result text the model reads, exactly like the
+    OpenAI surfaces of this gateway.
+    """
 
     type: Literal["tool_result"]
     tool_use_id: str = Field(min_length=1, max_length=256)
