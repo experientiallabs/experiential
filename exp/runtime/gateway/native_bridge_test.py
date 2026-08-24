@@ -96,6 +96,7 @@ def _claim_scope(
     raw_key: str,
     body: str,
     *,
+    surface: str = "chat",
     idempotency_key: str | None = None,
     client_request_id: str | None = None,
 ) -> JsonObject:
@@ -104,6 +105,7 @@ def _claim_scope(
         {
             "raw_key": raw_key,
             "body": body,
+            "surface": surface,
             "idempotency_key": idempotency_key,
             "client_request_id": client_request_id,
         }
@@ -739,6 +741,26 @@ def test_admit_escalates_host_ineligible_route_before_accounting(tmp_path: Path)
     assert [request.idempotency_key for request in seen_requests] == ["shared-replay"]
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 0
+
+
+def test_claim_scope_supports_the_responses_surface(tmp_path: Path) -> None:
+    """A keyed Responses request claims a surface-scoped native replay key."""
+    control, raw_key = _control_plane(tmp_path)
+    body = json.dumps({"model": "coding", "input": "keyed responses"})
+    scope = _claim_scope(
+        control,
+        raw_key,
+        body,
+        surface="responses",
+        idempotency_key="responses-op",
+    )
+    assert "escalate" not in scope
+    assert scope["surface"] == "responses"
+    assert scope["caller_operation_sha256"] == hashlib.sha256(b"responses-op").hexdigest()
+    # The surface is part of the key, so a chat operation with the same
+    # caller operation never collides with the Responses scope.
+    chat_scope = _claim_scope(control, raw_key, _chat_body(), idempotency_key="responses-op")
+    assert chat_scope["surface"] == "chat_completions"
 
 
 def test_claim_scope_validates_headers_with_python_parity(tmp_path: Path) -> None:

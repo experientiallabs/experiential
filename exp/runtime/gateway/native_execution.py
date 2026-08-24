@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -35,6 +36,9 @@ from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.lifecycle import LocalGatewayComponents
 
 # The frozen native retry policy, mirroring `GatewayExecutor`'s defaults.
 MAXIMUM_TOTAL_ATTEMPTS = 8
@@ -257,3 +261,51 @@ def deployment_wire_entry(
         "upstream_payload": upstream_payload,
         "idempotency_key": deployment_operation_key(route, deployment),
     }
+
+
+def native_serving_blockers(components: LocalGatewayComponents) -> tuple[str, ...]:
+    """Name every granted alias the native engine cannot serve, with reasons.
+
+    The rust-only launch runs this before binding the public socket: every
+    deployment reachable from a granted alias revision (direct pools and
+    project candidates alike live in the alias's catalog snapshot) must
+    resolve to a provider client with a native wire dialect, since no python
+    fallback engine exists to serve an escalated request.
+
+    Args:
+        components: Loaded local gateway components.
+
+    Returns:
+        One display-safe blocker per unservable alias, in sorted alias order.
+    """
+    state = components.reloader.state
+    blockers: list[str] = []
+    for alias, revision_id, catalog_sha256 in sorted(state.authorities):
+        runtime_catalog = state.runtime_catalogs.get((revision_id, catalog_sha256))
+        normalized = state.normalized_catalogs.get((revision_id, catalog_sha256))
+        if runtime_catalog is None or normalized is None:
+            blockers.append(f"{alias}: the authorized catalog snapshot is not loaded")
+            continue
+        reasons: list[str] = []
+        for deployment in normalized.deployments:
+            try:
+                resolved = runtime_catalog.resolve(deployment.source_alias)
+            except Exception:  # noqa: BLE001 - name the deployment, not the internals.
+                reasons.append(f"deployment {deployment.deployment_id!r} does not resolve")
+                continue
+            client = resolved.client
+            if not isinstance(client, ProviderHttpClient):
+                reasons.append(f"provider {deployment.provider!r} has no native wire profile")
+                continue
+            try:
+                client.gateway_wire_profile()
+            except ProviderCapabilityError as exc:
+                if exc.capability != "native_data_plane":
+                    raise
+                reasons.append(
+                    f"provider {deployment.provider!r} has no native dialect implementation"
+                )
+        if reasons:
+            unique = ", ".join(dict.fromkeys(reasons))
+            blockers.append(f"{alias}: {unique}")
+    return tuple(blockers)

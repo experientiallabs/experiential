@@ -1,7 +1,8 @@
 """Integration tests for the native engine's certified deployment waterfall.
 
-One live ``exp_gateway_native`` serving subprocess runs over a seeded root
-whose granted alias is a certified two-deployment pool. Two loopback mock
+One live ``exp_gateway_native`` serving subprocess runs rust-only (no
+fallback engine configured) over a seeded root whose granted alias is a
+certified two-deployment pool. Two loopback mock
 providers stand in for the ordered deployments; the first deployment's
 behavior is selected by the request prompt so each test drives one waterfall
 shape: persistent 500s (same-deployment redial then failover), one transient
@@ -18,7 +19,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import socket
 import sqlite3
 import subprocess
 import sys
@@ -84,7 +84,6 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "port": port,
                             "max_active_requests": 8,
                             "request_timeout_seconds": config["request_timeout_seconds"],
-                            "fallback_port": config["fallback_port"],
                             "graceful_timeout_seconds": 2.0,
                         }
                     ),
@@ -241,13 +240,6 @@ class _ServingEngine:
         return f"http://{_HOST}:{self.port}"
 
 
-def _closed_port() -> int:
-    """Return an ephemeral port with no listener behind it."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind((_HOST, 0))
-        return probe.getsockname()[1]
-
-
 def _chat_payload(prompt: str, *, stream: bool = False) -> JsonObject:
     """Return one Chat Completions body targeting the certified pool alias."""
     payload: JsonObject = {
@@ -309,7 +301,6 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         {
             "root": str(root),
             "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
-            "fallback_port": _closed_port(),
         }
     )
     stderr_log = root / "driver-stderr.log"
@@ -433,6 +424,68 @@ def test_disconnect_mid_flood_settles_cancelled(engine: _ServingEngine) -> None:
     assert [state for _, _, state in rows] == ["cancelled"]
 
 
+def test_unknown_routes_answer_the_native_openai_envelope(
+    engine: _ServingEngine,
+) -> None:
+    """Without a fallback engine, an unknown route is a native 404 envelope."""
+    response = httpx.post(
+        f"{engine.base}/v1/nonexistent",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"probe": True},
+        timeout=10.0,
+    )
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["code"] == "unknown_route"
+    assert "/v1/chat/completions" in error["message"]
+
+
+def _keyed_post(
+    engine: _ServingEngine,
+    path: str,
+    operation: str,
+    payload: JsonObject,
+) -> httpx.Response:
+    """Send one keyed POST carrying the shared Idempotency-Key header."""
+    return httpx.post(
+        f"{engine.base}{path}",
+        headers={
+            "authorization": f"Bearer {engine.raw_key}",
+            "idempotency-key": operation,
+        },
+        json=payload,
+        timeout=30.0,
+    )
+
+
+def test_keyed_chat_replays_the_owner_response_exactly(engine: _ServingEngine) -> None:
+    """A repeated keyed chat operation replays the stored bytes, not a redial."""
+    payload = _chat_payload("keyed chat")
+    first = _keyed_post(engine, "/v1/chat/completions", "keyed-chat-op", payload)
+    assert first.status_code == 200
+    duplicate = _keyed_post(engine, "/v1/chat/completions", "keyed-chat-op", payload)
+    assert duplicate.status_code == 200
+    assert duplicate.content == first.content
+    assert duplicate.headers["x-request-id"] == first.headers["x-request-id"]
+    rows = _attempt_rows(engine, first.headers["x-request-id"])
+    assert rows == [(0, 0, "completed")]
+
+
+def test_keyed_responses_replays_the_owner_response_exactly(
+    engine: _ServingEngine,
+) -> None:
+    """Keyed Responses runs the replay protocol natively, no fallback engine."""
+    payload: JsonObject = {"model": "coding", "input": "keyed responses"}
+    first = _keyed_post(engine, "/v1/responses", "keyed-responses-op", payload)
+    assert first.status_code == 200
+    assert first.json()["output"][0]["content"][0]["text"] == "from-primary"
+    duplicate = _keyed_post(engine, "/v1/responses", "keyed-responses-op", payload)
+    assert duplicate.status_code == 200
+    assert duplicate.content == first.content
+    rows = _attempt_rows(engine, first.headers["x-request-id"])
+    assert rows == [(0, 0, "completed")]
+
+
 def test_persistent_primary_failure_fails_over_to_the_second_deployment(
     engine: _ServingEngine,
 ) -> None:
@@ -501,7 +554,7 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
-    assert report["totals"]["requests"] == 6
+    assert report["totals"]["requests"] == 8
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
@@ -509,4 +562,4 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
     assert open_attempts == 0
-    assert terminal_attempts == total_attempts == 10
+    assert terminal_attempts == total_attempts == 12

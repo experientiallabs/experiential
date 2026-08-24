@@ -1,4 +1,4 @@
-"""Process host for the native gateway with an internal ASGI fallback."""
+"""Process host for the native gateway data plane."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ class NativeGatewayServerError(RuntimeError):
 
 
 def serve_native_gateway(
-    fallback_app: AsgiApplication,
+    fallback_app: AsgiApplication | None,
     control_plane: NativeServerControlPlane,
     *,
     host: str,
@@ -45,10 +45,16 @@ def serve_native_gateway(
     graceful_timeout_seconds: float = 10.0,
     native_usage_enabled: bool = True,
 ) -> None:
-    """Serve Rust publicly and proxy unsupported routes to an internal ASGI app.
+    """Serve the native data plane, optionally with an internal ASGI fallback.
 
     Args:
-        fallback_app: Python ASGI application for unsupported and escalated routes.
+        fallback_app: Optional python ASGI application for escalated routes.
+            ``None`` serves rust-only: unknown routes answer a native 404 and
+            an escalation disposition is an internal error, so callers must
+            validate native servability at startup. Passing an app is
+            deprecated and scheduled for removal once the native engine has
+            soaked in production; it exists only for hosted callers still
+            migrating off the python data plane.
         control_plane: Shared authority and accounting callbacks.
         host: Public listener host.
         port: Public listener port.
@@ -65,6 +71,24 @@ def serve_native_gateway(
         native = importlib.import_module("exp_gateway_native")
     except ModuleNotFoundError as exc:
         raise NativeGatewayServerError("the exp_gateway_native extension is not installed") from exc
+
+    config: dict[str, object] = {
+        "host": host,
+        "port": port,
+        "max_active_requests": max_active_requests,
+        "request_timeout_seconds": control_plane.request_timeout_seconds,
+        "graceful_timeout_seconds": graceful_timeout_seconds,
+        "native_usage_enabled": native_usage_enabled,
+    }
+    if fallback_app is None:
+        try:
+            native.serve(cast("NativeControlPlane", control_plane), json.dumps(config))
+        except KeyboardInterrupt:
+            # The native server drains on SIGINT before returning control to Python.
+            pass
+        except RuntimeError as exc:
+            raise NativeGatewayServerError(f"the native gateway failed: {exc}") from exc
+        return
 
     fallback_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     fallback_socket.bind((_LOOPBACK_HOST, 0))
@@ -90,20 +114,9 @@ def serve_native_gateway(
             fallback_socket.close()
             raise NativeGatewayServerError("the embedded Python fallback failed to start")
         time.sleep(0.05)
-    config = json.dumps(
-        {
-            "host": host,
-            "port": port,
-            "max_active_requests": max_active_requests,
-            "request_timeout_seconds": control_plane.request_timeout_seconds,
-            "fallback_port": fallback_port,
-            "graceful_timeout_seconds": graceful_timeout_seconds,
-            "native_usage_enabled": native_usage_enabled,
-        },
-        separators=(",", ":"),
-    )
+    config["fallback_port"] = fallback_port
     try:
-        native.serve(cast("NativeControlPlane", control_plane), config)
+        native.serve(cast("NativeControlPlane", control_plane), json.dumps(config))
     except KeyboardInterrupt:
         # The native server drains on SIGINT before returning control to Python.
         pass
