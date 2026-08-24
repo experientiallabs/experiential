@@ -13,6 +13,7 @@ import pytest
 from exp.runtime.gateway.guardrails.bounded import (
     BoundedInspect,
     ClassifierTimeoutError,
+    _IsolationWorker,
     _NativeCallbackRunner,
     run_on_native_loop,
 )
@@ -298,6 +299,81 @@ def test_external_cancellation_propagates_and_releases_the_slot() -> None:
             return 2
 
         assert await bound.run(healthy, 0.5, adapter_id="healthy") == 2
+
+    asyncio.run(scenario())
+
+
+def test_delayed_cancel_does_not_cancel_the_next_inspect_on_a_reused_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late cancel for one inspect cannot hit the next inspect on the same worker."""
+
+    async def scenario() -> None:
+        """Complete and reuse a worker before the first inspect's cancel runs."""
+        bound = BoundedInspect(max_inflight=1)
+        first_entered = threading.Event()
+        first_hold = threading.Event()
+        second_entered = threading.Event()
+        second_hold = threading.Event()
+        delay_cancel = threading.Event()
+        original_request_cancel = _IsolationWorker.request_cancel
+
+        def delayed_request_cancel(self: _IsolationWorker, generation: int) -> None:
+            """Hold cancellation until the test reuses the worker."""
+
+            def enqueue() -> None:
+                """Forward the original cancel after the reuse gate opens."""
+                if not delay_cancel.wait(timeout=5.0):
+                    return
+                original_request_cancel(self, generation)
+
+            threading.Thread(
+                target=enqueue,
+                name="exp-test-delay-cancel",
+                daemon=True,
+            ).start()
+
+        monkeypatch.setattr(_IsolationWorker, "request_cancel", delayed_request_cancel)
+
+        async def first() -> int:
+            """Finish after timeout without waiting for cancellation."""
+            first_entered.set()
+            await _wait_hold(first_hold)
+            return 1
+
+        async def second() -> int:
+            """Stay live while the delayed first-inspect cancel is released."""
+            second_entered.set()
+            await _wait_hold(second_hold)
+            return 2
+
+        second_task: asyncio.Task[int] | None = None
+        try:
+            with pytest.raises(ClassifierTimeoutError):
+                await bound.run(first, 0.08, adapter_id="first")
+            _wait_flag(first_entered)
+            first_hold.set()
+            await _wait_until(lambda: bound.detached_inspect_count() == 0)
+            second_task = asyncio.create_task(bound.run(second, 2.0, adapter_id="second"))
+            assert await asyncio.to_thread(second_entered.wait, 1.0)
+            delay_cancel.set()
+            await asyncio.sleep(0.05)
+            second_hold.set()
+            assert await second_task == 2
+            assert bound.isolation_worker_count() == 1
+        finally:
+            first_hold.set()
+            second_hold.set()
+            delay_cancel.set()
+            if second_task is not None and not second_task.done():
+                second_task.cancel()
+                await asyncio.gather(second_task, return_exceptions=True)
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while bound.detached_inspect_count() != 0:
+                if asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(0.01)
+            assert bound.detached_inspect_count() == 0
 
     asyncio.run(scenario())
 

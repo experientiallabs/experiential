@@ -40,6 +40,9 @@ class _IsolationWorker:
         """
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._generation = 0
+        self._active_generation = 0
+        self._pending_cancels: set[int] = set()
         self._task: asyncio.Task[object] | None = None
         self._thread = threading.Thread(
             target=self._run_forever,
@@ -53,23 +56,27 @@ class _IsolationWorker:
         if loop is None or not loop.is_running() or not self._thread.is_alive():
             raise RuntimeError("classifier isolation loop failed to start")
 
-    def submit[T](self, fn: Callable[[], Coroutine[object, object, T]]) -> Future[T]:
-        """Schedule ``fn`` on this worker and return a cross-thread future.
+    def submit[T](self, fn: Callable[[], Coroutine[object, object, T]]) -> tuple[Future[T], int]:
+        """Schedule ``fn`` on this worker and return its future plus generation.
 
         Args:
             fn: Zero-argument coroutine factory for one inspect.
 
         Returns:
-            A future that completes when the isolated inspect exits.
+            A future that completes when the isolated inspect exits, and the
+            generation that ``request_cancel`` must name.
         """
         loop = self._loop
         if loop is None:
             raise RuntimeError("classifier isolation loop is not running")
+        self._generation += 1
+        generation = self._generation
         result: Future[T] = Future()
 
         def start() -> None:
             """Create the inspect task on the worker loop."""
             if result.cancelled():
+                self._pending_cancels.discard(generation)
                 return
             try:
                 task = loop.create_task(fn())
@@ -77,6 +84,10 @@ class _IsolationWorker:
                 result.set_exception(exc)
                 return
             self._task = task
+            self._active_generation = generation
+            if generation in self._pending_cancels:
+                self._pending_cancels.discard(generation)
+                task.cancel()
 
             def finish(done: asyncio.Task[T]) -> None:
                 """Copy the inspect outcome onto the cross-thread future."""
@@ -94,19 +105,32 @@ class _IsolationWorker:
             task.add_done_callback(finish)
 
         loop.call_soon_threadsafe(start)
-        return result
+        return result, generation
 
-    def request_cancel(self) -> None:
-        """Queue cancellation for the running inspect without waiting."""
+    def request_cancel(self, generation: int) -> None:
+        """Queue cancellation for one submitted inspect without waiting.
+
+        Args:
+            generation: Inspect generation returned by ``submit``. A delayed
+                callback is a no-op when this worker already started a later
+                inspect.
+        """
         loop = self._loop
         if loop is None:
             return
 
         def cancel() -> None:
-            """Cancel the live inspect if it is still running."""
-            task = self._task
-            if task is not None and not task.done():
-                task.cancel()
+            """Cancel only the inspect that still owns ``generation``."""
+            if self._active_generation == generation:
+                self._pending_cancels.discard(generation)
+                task = self._task
+                if task is not None and not task.done():
+                    task.cancel()
+                return
+            if generation < self._active_generation:
+                self._pending_cancels.discard(generation)
+                return
+            self._pending_cancels.add(generation)
 
         loop.call_soon_threadsafe(cancel)
 
@@ -317,13 +341,19 @@ class BoundedInspect:
             if not tasks:
                 del self._abandoned[adapter_id]
 
-    def _abandon(self, adapter_id: str, worker: _IsolationWorker, task: Future[object]) -> None:
+    def _abandon(
+        self,
+        adapter_id: str,
+        worker: _IsolationWorker,
+        task: Future[object],
+        generation: int,
+    ) -> None:
         """Stop waiting, keep the worker, and quarantine until ``task`` exits."""
         if task.done():
             _absorb_abandoned(task)
             return
         self._track_abandoned(adapter_id, task)
-        worker.request_cancel()
+        worker.request_cancel(generation)
 
     async def _await_isolated[T](self, task: Future[T], timeout: float) -> T:
         """Wait for ``task`` on the caller loop without cancelling it.
@@ -401,7 +431,7 @@ class BoundedInspect:
             """Run the inspect on this isolation worker."""
             return await fn()
 
-        pending = worker.submit(isolated)
+        pending, generation = worker.submit(isolated)
         pending.add_done_callback(
             lambda done: self._reclaim(adapter_id, worker, cast(Future[object], done))
         )
@@ -410,10 +440,10 @@ class BoundedInspect:
         except ClassifierTimeoutError:
             if pending.done():
                 return _isolated_result(pending)
-            self._abandon(adapter_id, worker, cast(Future[object], pending))
+            self._abandon(adapter_id, worker, cast(Future[object], pending), generation)
             raise
         except asyncio.CancelledError:
-            self._abandon(adapter_id, worker, cast(Future[object], pending))
+            self._abandon(adapter_id, worker, cast(Future[object], pending), generation)
             raise
 
     def _reclaim(
