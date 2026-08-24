@@ -417,9 +417,10 @@ class BedrockClient:
 
         The signature covers the exact UTF-8 bytes of ``body``, so the caller
         must send those bytes verbatim. Signatures carry AWS's short clock
-        window (about five minutes of skew): the native engine's immediate
-        bounded open retry reuses them safely, while any later retry is a
-        fresh admission that signs again.
+        window (about five minutes of skew): the native engine signs at
+        dispatch time, after its bounded permit and immediately before the
+        provider POST, so its immediate bounded open retry reuses the result
+        within milliseconds and any later retry signs again.
 
         Args:
             url: Exact endpoint the data plane will POST to.
@@ -552,7 +553,7 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
 
         Bedrock authenticates with per-request SigV4 signatures over the exact
         body bytes, so the profile carries no static credential headers and
-        instead marks the request body for admission-time signing through
+        instead marks the request body for dispatch-time signing through
         :meth:`sign_gateway_dispatch`.
         """
         return GatewayWireProfile(

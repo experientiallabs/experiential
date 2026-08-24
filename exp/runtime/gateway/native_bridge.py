@@ -62,8 +62,9 @@ from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncW
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
 from exp.runtime.gateway.native_dispatch import (
     NativeDialectUnavailableError,
+    dispatch_signature_headers,
+    frozen_dispatch,
     resolve_wire_profile,
-    signed_dispatch,
 )
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.native_responses import (
@@ -87,7 +88,7 @@ from exp.runtime.models.providers import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
-from exp.runtime.models.providers.protocol import NativeWireClient
+from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
@@ -118,6 +119,9 @@ class _InflightAttempt:
     # successful terminal; chat attempts carry ``None``.
     continuation: ContinuationContext | None = field(default=None)
     policy: GuardrailPolicy | None = field(default=None)
+    # Body-signing dialects only: the resolved client that signs the frozen
+    # body at dispatch time through the ``sign_dispatch`` callback.
+    signer: GatewayDispatchSigner | None = field(default=None)
 
 
 class NativeBridgeError(Exception):
@@ -394,9 +398,7 @@ class NativeControlPlane:
             require_gateway_provider(deployment.provider)
             preflight_gateway_request(provider_request, deployment.gateway.capabilities)
             upstream_payload = dialect_stream_payload(profile, provider_request)
-            upstream_body, dispatch_headers = signed_dispatch(
-                profile, wire_client, upstream_payload
-            )
+            upstream_body, dispatch_signer = frozen_dispatch(profile, wire_client, upstream_payload)
             maximum_cost = maximum_attempt_cost_micro_usd(request, deployment)
             attempt_id = self._write_ledger.start_attempt(
                 snapshot=route.snapshot,
@@ -447,6 +449,7 @@ class NativeControlPlane:
                 deadline_monotonic=deadline,
                 continuation=continuation_context,
                 policy=policy,
+                signer=dispatch_signer,
             )
         response: JsonObject = {
             "request_id": authorization.request_id,
@@ -461,7 +464,7 @@ class NativeControlPlane:
             "route_reason": route.route_reason,
             "dialect": profile.dialect,
             "url": profile.url,
-            "headers": dispatch_headers,
+            "headers": dict(profile.headers),
             "model_id": profile.model_id,
             "timeout_seconds": profile.timeout_seconds,
             # A signed dispatch carries only the frozen body string; shipping
@@ -476,6 +479,38 @@ class NativeControlPlane:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(request)
         return json.dumps(response, separators=(",", ":"))
+
+    def sign_dispatch(self, argument: str) -> str:
+        """Sign one frozen dispatch body immediately before the provider POST.
+
+        The data plane calls this after it acquires its bounded dispatch
+        permit, so queue time can never age a signature toward AWS's short
+        clock window; the immediate bounded open retry reuses the result
+        within milliseconds.
+
+        Args:
+            argument: JSON object with ``request_id``, the exact ``url``, and
+                the exact frozen ``body`` string the data plane will send.
+
+        Returns:
+            JSON object with the ``headers`` to send verbatim.
+
+        Raises:
+            NativeBridgeError: The attempt is unknown, carries no signer, or
+                credential resolution failed.
+        """
+        data = json.loads(argument)
+        with self._lock:
+            entry = self._inflight.get(str(data.get("request_id") or ""))
+        try:
+            headers = dispatch_signature_headers(
+                entry.signer if entry is not None else None,
+                url=str(data["url"]),
+                body=str(data["body"]),
+            )
+        except OpenAIProtocolError as exc:
+            raise NativeBridgeError(exc) from exc
+        return json.dumps({"headers": headers}, separators=(",", ":"))
 
     def enforce_output(self, argument: str) -> str:
         """Run one output-chain callback for a native buffered completion."""

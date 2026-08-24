@@ -6,10 +6,14 @@ client here, then freezes the dispatch for body-signing dialects.
 Most dialects send static credential headers and let the data plane serialize
 the upstream payload itself. Body-signing dialects (Bedrock SigV4) compute
 their headers over the exact serialized body bytes, so the control plane
-freezes one canonical serialization here, signs it through the resolved
-client, and hands both to the data plane, which must send the body verbatim:
-re-serializing JSON on the other side of the boundary could reorder or
-reformat bytes and invalidate the signature.
+freezes one canonical serialization at admission and retains the resolved
+signer. The data plane must send the frozen bytes verbatim: re-serializing
+JSON on the other side of the boundary could reorder or reformat bytes and
+invalidate the signature. Signing itself happens at dispatch time, through
+the ``sign_dispatch`` boundary callback the data plane invokes after it
+acquires its bounded dispatch permit and immediately before the provider
+POST, so time spent queued can never age a signature toward AWS's short
+clock window.
 """
 
 from __future__ import annotations
@@ -22,12 +26,14 @@ from exp.common.core.artifacts import JsonObject
 
 # The executor's identity check is the authoritative pre-dispatch invariant;
 # the native path must enforce the same one, so the private helper is shared.
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.execution import _require_deployment_identity  # noqa: PLC2701
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.runtime.openai_protocol.errors import public_failure_error
 
 
 class NativeDialectUnavailableError(RuntimeError):
@@ -84,16 +90,12 @@ def resolve_wire_profile(
     return profile, client
 
 
-def signed_dispatch(
+def frozen_dispatch(
     profile: GatewayWireProfile,
     client: NativeWireClient | None,
     upstream_payload: JsonObject,
-) -> tuple[str | None, dict[str, str]]:
-    """Freeze and sign the dispatch body for body-signing dialects.
-
-    Signatures expire within AWS's short clock window: the data plane's
-    immediate bounded open retry reuses them safely, and any later retry
-    arrives as a fresh admission that signs again.
+) -> tuple[str | None, GatewayDispatchSigner | None]:
+    """Freeze the dispatch body for body-signing dialects.
 
     Args:
         profile: Resolved wire profile for the dispatch.
@@ -101,18 +103,61 @@ def signed_dispatch(
         upstream_payload: Payload built by the shared dialect builders.
 
     Returns:
-        The exact signed body string (``None`` for dialects whose payload the
-        data plane serializes itself) and the dispatch headers.
+        The exact frozen body string plus the signer the control plane
+        retains for the dispatch-time ``sign_dispatch`` callback, or
+        ``(None, None)`` for dialects whose payload the data plane serializes
+        itself.
 
     Raises:
         GatewayRoutingError: The dialect requires body signing but the
             resolved client cannot sign.
     """
     if not profile.signs_request_body:
-        return None, dict(profile.headers)
+        return None, None
     if not isinstance(client, GatewayDispatchSigner):
         raise GatewayRoutingError("resolved gateway deployment cannot sign its dispatch body")
     body = json.dumps(upstream_payload, separators=(",", ":"), ensure_ascii=False)
-    headers = dict(profile.headers)
-    headers.update(client.sign_gateway_dispatch(url=profile.url, body=body))
-    return body, headers
+    return body, client
+
+
+def dispatch_signature_headers(
+    signer: GatewayDispatchSigner | None,
+    *,
+    url: str,
+    body: str,
+) -> dict[str, str]:
+    """Sign one frozen dispatch body for the data plane, failing sanitized.
+
+    Args:
+        signer: Signer retained at admission, or ``None`` when the attempt is
+            unknown or its dialect does not sign bodies.
+        url: Exact endpoint the data plane will POST to.
+        body: Exact frozen body string the data plane will send.
+
+    Returns:
+        Per-request headers covering the exact body bytes.
+
+    Raises:
+        OpenAIProtocolError: No signer is available for the attempt, or
+            credential resolution failed; the error is already sanitized for
+            the public boundary.
+    """
+    if signer is None:
+        raise public_failure_error(
+            GatewayFailure(
+                failure_class=GatewayFailureClass.INTERNAL,
+                safe_message="gateway dispatch signing is unavailable for this attempt",
+            )
+        )
+    try:
+        return dict(signer.sign_gateway_dispatch(url=url, body=body))
+    except Exception as exc:  # noqa: BLE001 - the boundary sanitizes every failure.
+        raise public_failure_error(
+            GatewayFailure(
+                failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+                safe_message=(
+                    "provider authentication failed; ask the gateway operator to "
+                    "verify the provider connection credential"
+                ),
+            )
+        ) from exc

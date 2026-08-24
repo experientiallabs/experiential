@@ -7,9 +7,10 @@ from collections.abc import Mapping
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.native_dispatch import signed_dispatch
+from exp.runtime.gateway.native_dispatch import dispatch_signature_headers, frozen_dispatch
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
 class _Signer:
@@ -30,31 +31,33 @@ class _Signer:
         return {"Authorization": "AWS4-HMAC-SHA256 test", "X-Amz-Date": "20260824T000000Z"}
 
 
-def test_unsigned_dialects_pass_profile_headers_and_no_frozen_body() -> None:
+def test_unsigned_dialects_freeze_nothing_and_retain_no_signer() -> None:
     """Dialects without body signing keep the data plane's own serialization."""
     profile = GatewayWireProfile(
         dialect="openai_compatible",
         url="https://example.invalid/v1/chat/completions",
         headers={"authorization": "Bearer k"},
     )
-    body, headers = signed_dispatch(profile, None, {"model": "m"})
+    body, signer = frozen_dispatch(profile, None, {"model": "m"})
     assert body is None
-    assert headers == {"authorization": "Bearer k"}
+    assert signer is None
 
 
-def test_signing_dialect_freezes_the_exact_body_it_signs() -> None:
-    """The returned body string is byte-identical to what the signer covered."""
+def test_signing_dialect_freezes_the_exact_body_the_signer_later_covers() -> None:
+    """The frozen body string is byte-identical to what signing covers."""
     profile = GatewayWireProfile(
         dialect="bedrock_converse_stream",
         url="https://bedrock-runtime.us-east-1.amazonaws.com/model/m/converse-stream",
         headers={},
         signs_request_body=True,
     )
-    signer = _Signer(profile)
+    client = _Signer(profile)
     payload: JsonObject = {"messages": [{"role": "user", "content": [{"text": "Zürich"}]}]}
-    body, headers = signed_dispatch(profile, signer, payload)
+    body, signer = frozen_dispatch(profile, client, payload)
     assert body == '{"messages":[{"role":"user","content":[{"text":"Zürich"}]}]}'
-    assert signer.signed == [(profile.url, body)]
+    assert signer is client
+    headers = dispatch_signature_headers(signer, url=profile.url, body=body)
+    assert client.signed == [(profile.url, body)]
     assert headers["Authorization"] == "AWS4-HMAC-SHA256 test"
     assert headers["X-Amz-Date"] == "20260824T000000Z"
 
@@ -67,4 +70,10 @@ def test_signing_dialect_without_a_signer_fails_closed() -> None:
         signs_request_body=True,
     )
     with pytest.raises(GatewayRoutingError, match="cannot sign"):
-        signed_dispatch(profile, None, {"messages": []})
+        frozen_dispatch(profile, None, {"messages": []})
+
+
+def test_dispatch_signing_without_a_retained_signer_is_sanitized() -> None:
+    """Signing an unknown or unsigned attempt raises the public boundary error."""
+    with pytest.raises(OpenAIProtocolError):
+        dispatch_signature_headers(None, url="https://example.invalid", body="{}")

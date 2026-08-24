@@ -460,14 +460,29 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
     assert body == json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     assert "modelId" not in payload
     assert payload["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
-    headers = admission["headers"]
-    assert isinstance(headers, dict)
+    # Admission carries no signature: the data plane signs at dispatch time,
+    # after its bounded permit, so queue wait cannot age the signature.
+    assert admission["headers"] == {}
+    signed = json.loads(
+        control.sign_dispatch(
+            json.dumps(
+                {"request_id": admission["request_id"], "url": admission["url"], "body": body}
+            )
+        )
+    )
+    headers = signed["headers"]
     assert headers["X-Amz-Security-Token"] == "session-token-canary"
     authorization = headers["Authorization"]
     assert isinstance(authorization, str)
     assert authorization.startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")
     assert "/us-east-1/bedrock/aws4_request" in authorization
     assert "sigv4-secret-canary" not in json.dumps(admission)
+    assert "sigv4-secret-canary" not in json.dumps(signed)
+    # Attempts without a retained signer fail closed and sanitized.
+    with pytest.raises(NativeBridgeError):
+        control.sign_dispatch(
+            json.dumps({"request_id": "unknown", "url": admission["url"], "body": body})
+        )
     # The attempt is durably started, exactly like other native admissions.
     settled = control.settle(
         json.dumps(
