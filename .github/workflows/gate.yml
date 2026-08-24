@@ -33,8 +33,12 @@ jobs:
           # Published wheels are immutable per version, so any change under the
           # crate must move the crate version. GitHub's merge-base file list is
           # authoritative and needs no local history (the checkout is shallow).
-          changed="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
-            --paginate -q '.[].filename' | grep -c '^exp/runtime/gateway/native/' || true)"
+          files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+            --paginate -q '.[].filename')" || {
+            echo "could not list the pull request's files; failing closed" >&2
+            exit 1
+          }
+          changed="$(printf '%s\n' "${files}" | grep -c '^exp/runtime/gateway/native/' || true)"
           if [ "${changed}" = "0" ]; then
             echo "crate untouched"
             exit 0
