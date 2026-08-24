@@ -294,9 +294,10 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
 }
 
 /// Parse Bedrock `metadata.usage`, mirroring the python `_usage` normalizer:
-/// cache read and write legs fold into total input (saturating so
-/// individually valid legs cannot wrap), cached input reports the read leg,
-/// and absent counts are zero (`require_integer` parity).
+/// cache read and write legs fold into total input, cached input reports the
+/// read leg, and absent counts are zero (`require_integer` parity). A total
+/// beyond the representable count range is a provider contract violation and
+/// fails the stream rather than persisting a clamped or wrapped number.
 pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
     let usage = value
         .and_then(Value::as_object)
@@ -312,8 +313,12 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         "cacheWriteInputTokens",
         "Bedrock cacheWriteInputTokens",
     )?;
+    let input_tokens = fresh
+        .checked_add(cache_read)
+        .and_then(|total| total.checked_add(cache_write))
+        .ok_or_else(|| "Bedrock input token total overflows a 64-bit count".to_string())?;
     Ok(Usage {
-        input_tokens: Some(fresh.saturating_add(cache_read).saturating_add(cache_write)),
+        input_tokens: Some(input_tokens),
         output_tokens: Some(count_or_zero(
             usage,
             "outputTokens",
@@ -367,6 +372,29 @@ mod tests {
             &json!({"prompt_tokens": 1, "completion_tokens": 1, "prompt_tokens_details": 3})
         )
         .is_err());
+    }
+
+    #[test]
+    fn bedrock_usage_folds_cache_legs_and_rejects_unrepresentable_totals() {
+        let usage = bedrock_usage(Some(&json!({
+            "inputTokens": 9,
+            "outputTokens": 4,
+            "cacheReadInputTokens": 2,
+            "cacheWriteInputTokens": 1,
+        })))
+        .expect("valid usage");
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.cached_input_tokens, Some(2));
+        // Individually valid legs whose sum is unrepresentable are a
+        // provider contract violation, never a clamped or wrapped total.
+        assert!(bedrock_usage(Some(&json!({
+            "inputTokens": u64::MAX,
+            "outputTokens": 1,
+            "cacheReadInputTokens": 1,
+        })))
+        .is_err());
+        assert!(bedrock_usage(Some(&json!(null))).is_err());
+        assert!(bedrock_usage(None).is_err());
     }
 
     #[test]
