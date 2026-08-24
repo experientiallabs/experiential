@@ -1009,35 +1009,11 @@ def _installed_release_driver() -> None:
                 self._send_sse_frames(frames)
                 return
             if "cancellation-input-canary-P9" in prompt:
-                first = cast(
-                    tuple[dict[str, object], ...],
-                    (
-                        {
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": cancellation_response_canary},
-                                    "finish_reason": None,
-                                }
-                            ]
-                        },
-                    ),
-                )
-                terminal = cast(
-                    tuple[dict[str, object], ...],
-                    (
-                        {
-                            "choices": [],
-                            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
-                        },
-                    ),
-                )
-                self._send_sse_frames(
-                    first,
-                    trailing=terminal,
-                    pause_seconds=1.0,
-                    done=True,
-                )
+                # A stream that never terminates: the client disconnects
+                # after the first frame, so the only way this attempt can
+                # settle is the gateway's own cancellation path (a terminal
+                # would otherwise win even after the disconnect).
+                self._send_unterminated_flood(cancellation_response_canary)
                 return
             raise AssertionError(f"unexpected primary gateway request {ordinal}")
 
@@ -1080,6 +1056,36 @@ def _installed_release_driver() -> None:
                     self.wfile.write(remainder)
                 except BrokenPipeError:
                     pass
+
+        def _send_unterminated_flood(self, canary: str) -> None:
+            """Stream one canary frame, then flood until the gateway hangs up.
+
+            The stream never carries a terminal event, so the serving attempt
+            can only settle through the gateway's cancellation handling once
+            the public client disconnects and the flood's writes fail.
+
+            Args:
+                canary: Content text for the first streamed delta.
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            first = {"choices": [{"index": 0, "delta": {"content": canary}, "finish_reason": None}]}
+            padding = {
+                "choices": [{"index": 0, "delta": {"content": "x" * 512}, "finish_reason": None}]
+            }
+            try:
+                self.wfile.write(f"data: {json.dumps(first, separators=(',', ':'))}\n\n".encode())
+                self.wfile.flush()
+                block = f"data: {json.dumps(padding, separators=(',', ':'))}\n\n".encode()
+                while True:
+                    self.wfile.write(block)
+                    self.wfile.flush()
+                    time.sleep(0.02)
+            except OSError:
+                # The gateway dropped the upstream connection after the
+                # public client disconnected; that is the expected outcome.
+                return
 
         def _send_retryable_failure(self) -> None:
             """Return one content-free retryable provider failure."""

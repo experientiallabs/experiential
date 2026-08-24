@@ -154,11 +154,18 @@ impl FailureClass {
     }
 }
 
-/// One sanitized provider failure, the Rust mirror of `GatewayFailure`.
+/// One sanitized provider failure, the Rust mirror of `GatewayFailure`,
+/// including the executor's per-failure retry classification: whether the
+/// same deployment may be redialed and whether a later certified deployment
+/// may serve the request instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
     pub failure_class: FailureClass,
     pub safe_message: String,
+    #[serde(default)]
+    pub retryable_same_deployment: bool,
+    #[serde(default)]
+    pub failover_eligible: bool,
 }
 
 impl Failure {
@@ -166,7 +173,16 @@ impl Failure {
         Self {
             failure_class,
             safe_message: safe_message.to_string(),
+            retryable_same_deployment: false,
+            failover_eligible: false,
         }
+    }
+
+    /// Attach the python taxonomy's retry classification to this failure.
+    pub fn with_retry(mut self, retryable_same_deployment: bool, failover_eligible: bool) -> Self {
+        self.retryable_same_deployment = retryable_same_deployment;
+        self.failover_eligible = failover_eligible;
+        self
     }
 
     /// Coerce this failure to its boundary form: the python engine replaces
@@ -182,6 +198,7 @@ impl Failure {
                     FailureClass::MalformedResponse,
                     "provider returned a malformed response; retry the request",
                 )
+                .with_retry(self.retryable_same_deployment, self.failover_eligible)
             }
             _ => self,
         }

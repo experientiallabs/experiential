@@ -111,6 +111,46 @@ def _claim_scope(
     return json.loads(control.claim_scope(argument))
 
 
+def _start_first(control: NativeControlPlane, admission: JsonObject) -> JsonObject:
+    """Reserve the first physical dispatch for one admitted request."""
+    return json.loads(
+        control.start_attempt(
+            json.dumps({"request_id": admission["request_id"], "attempt_ordinal": 0})
+        )
+    )
+
+
+def _flatten_started(control: NativeControlPlane, admission: JsonObject) -> JsonObject:
+    """Reserve the first dispatch and flatten its wire entry into the admission."""
+    started = _start_first(control, admission)
+    route = admission["route"]
+    assert isinstance(route, list)
+    depth = started["route_depth"]
+    assert isinstance(depth, int)
+    wire = route[depth]
+    assert isinstance(wire, dict)
+    return {**admission, **wire, **started}
+
+
+def _admit_started(
+    control: NativeControlPlane,
+    raw_key: str,
+    body: str,
+    *,
+    idempotency_key: str | None = None,
+    client_request_id: str | None = None,
+) -> JsonObject:
+    """Admit one request, reserve its first dispatch, and flatten the wire view."""
+    admission = _admit(
+        control,
+        raw_key,
+        body,
+        idempotency_key=idempotency_key,
+        client_request_id=client_request_id,
+    )
+    return _flatten_started(control, admission)
+
+
 def test_bridge_error_payload_is_openai_shaped() -> None:
     """The boundary error carries the exact public error representation."""
     error = NativeBridgeError(
@@ -139,7 +179,11 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     control, raw_key = _control_plane(tmp_path)
     assert control.authenticate(json.dumps({"raw_key": raw_key})) == "{}"
 
-    admission = _admit(control, raw_key, _chat_body())
+    admission = _admit_started(control, raw_key, _chat_body())
+    assert admission["maximum_total_attempts"] == 8
+    assert admission["maximum_same_deployment_attempts"] == 2
+    assert admission["refusal_failover"] is False
+    assert admission["route_depth"] == 0
     assert admission["dialect"] == "openai_compatible"
     url = admission["url"]
     assert isinstance(url, str) and url.endswith("/chat/completions")
@@ -193,7 +237,7 @@ def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> No
     """The default local composition retains durable route provenance."""
     control, raw_key = _control_plane(tmp_path)
 
-    admission = _admit(control, raw_key, _chat_body())
+    admission = _admit_started(control, raw_key, _chat_body())
 
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
     with sqlite3.connect(ledger.database_path) as connection:
@@ -226,7 +270,7 @@ def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None
 def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     """A lost terminal write latches readiness but stays settleable on retry."""
     control, raw_key = _control_plane(tmp_path)
-    admission = _admit(control, raw_key, _chat_body())
+    admission = _admit_started(control, raw_key, _chat_body())
     settlement = json.dumps(
         {
             "request_id": admission["request_id"],
@@ -265,7 +309,7 @@ def test_bridge_writes_route_through_the_group_commit_writer(tmp_path: Path) -> 
         mock.patch.object(ledger, "finish_attempt", direct_writes),
         mock.patch.object(ledger, "finish_request", direct_writes),
     ):
-        admission = _admit(control, raw_key, _chat_body())
+        admission = _admit_started(control, raw_key, _chat_body())
         assert (
             control.settle(
                 json.dumps(
@@ -293,7 +337,7 @@ def test_closed_writer_makes_settle_raise_and_keeps_the_entry_retryable(
     """A settle against a closed group-commit writer raises the sanitized
     boundary error and retains the exact settlement for later replay."""
     control, raw_key = _control_plane(tmp_path)
-    admission = _admit(control, raw_key, _chat_body())
+    admission = _admit_started(control, raw_key, _chat_body())
     writer = control._components.write_ledger  # noqa: SLF001 - shutdown-ordering fault injection.
     assert writer is not None
     writer.close()
@@ -309,8 +353,8 @@ def test_closed_writer_makes_settle_raise_and_keeps_the_entry_retryable(
     )
     with pytest.raises(NativeBridgeError):
         control.settle(settlement)
-    with control._lock:  # noqa: SLF001 - registry state assertion.
-        entry = control._inflight[str(admission["request_id"])]  # noqa: SLF001
+    entry = control._accounting.entry(str(admission["request_id"]))  # noqa: SLF001
+    assert entry is not None
     assert entry.pending_settlement is not None
     assert entry.pending_settlement["outcome"] == "completed"
 
@@ -319,7 +363,7 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
     """A retained settlement lands its completed outcome and usage, never a
     downgraded cancellation."""
     control, raw_key = _control_plane(tmp_path)
-    admission = _admit(control, raw_key, _chat_body())
+    admission = _admit_started(control, raw_key, _chat_body())
     settlement = json.dumps(
         {
             "request_id": admission["request_id"],
@@ -338,9 +382,8 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
     ):
         with pytest.raises(NativeBridgeError):
             control.settle(settlement)
-    control._sweep_expired()  # noqa: SLF001 - the timer normally drives this.
-    with control._lock:  # noqa: SLF001 - registry state assertion.
-        assert admission["request_id"] not in control._inflight  # noqa: SLF001
+    control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
+    assert control._accounting.entry(str(admission["request_id"])) is None  # noqa: SLF001
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
     assert report["totals"]["input_tokens"] == 9
@@ -350,14 +393,12 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
 def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path) -> None:
     """An admitted request the data plane never settles is closed by the sweep."""
     control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
-    abandoned = _admit(control, raw_key, _chat_body())
+    abandoned = _admit_started(control, raw_key, _chat_body())
     time.sleep(0.05)
-    with mock.patch("exp.runtime.gateway.native_bridge._SWEEP_GRACE_SECONDS", 0.0):
+    with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
         second = _admit(control, raw_key, _chat_body())
-    with control._lock:  # noqa: SLF001 - registry state assertion.
-        inflight = dict(control._inflight)  # noqa: SLF001
-    assert abandoned["request_id"] not in inflight
-    assert second["request_id"] in inflight
+    assert control._accounting.entry(str(abandoned["request_id"])) is None  # noqa: SLF001
+    assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 2
 
@@ -421,6 +462,229 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
     assert "escalate" in scope
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 0
+
+
+def _configured_pool_gateway(
+    root: Path,
+    *,
+    refusal_failover: bool = False,
+    base_urls: tuple[str, str] = ("http://127.0.0.1:9/v1", "http://127.0.0.1:10/v1"),
+) -> tuple[GatewayManagement, str]:
+    """Create one certified two-deployment pool alias, grant, and key.
+
+    Args:
+        root: Gateway root to initialize.
+        refusal_failover: Whether the alias revision opts into refusal failover.
+        base_urls: One provider endpoint per ordered deployment.
+
+    Returns:
+        The management handle and the issued raw key.
+    """
+    from datetime import UTC, datetime
+
+    from exp.common.models import (
+        GatewayDeploymentCapabilities,
+        GatewayEquivalenceCertification,
+        GatewayTokenPrices,
+        ModelCapabilities,
+    )
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_certified_pool,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    manager = GatewayManagement(root)
+    manager.initialize()
+    normalized = None
+    snapshot = None
+    for alias, base_url in zip(("alpha", "beta"), base_urls, strict=True):
+        upsert_connection(
+            root,
+            name=f"{alias}-provider",
+            connection=ConnectionConfig(
+                provider="openai-compatible",
+                base_url=base_url,
+                api_key_env="TEST_PROVIDER_KEY",
+            ),
+            replace=False,
+        )
+        normalized, snapshot, _changed = upsert_singleton_deployment(
+            root,
+            deployment_alias=alias,
+            connection_name=f"{alias}-provider",
+            provider_model=f"{alias}-model-exact",
+            exact_model_id="model-revision-exact",
+            revision=None,
+            capabilities=ModelCapabilities(),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            prices=GatewayTokenPrices(),
+            pricing_source=None,
+            replace=False,
+        )
+    assert normalized is not None
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-pool",
+        provenance="operator-reviewed deployment manifests",
+        evidence_sha256="a" * 64,
+        certified_at=datetime(2026, 8, 18, tzinfo=UTC),
+    )
+    normalized, snapshot, _changed = upsert_certified_pool(
+        root,
+        pool_id="coding",
+        exact_model_id="model-revision-exact",
+        deployment_aliases=("alpha", "beta"),
+        certification=certification,
+        expected_catalog_sha256=normalized.identity_sha256(),
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-pool-one",
+        pool_id="coding",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+        refusal_failover=refusal_failover,
+    )
+    manager.create_identity(identity_id="default", display_name="Default")
+    manager.add_grant(identity_id="default", alias_id="coding")
+    issued = manager.issue_key(identity_id="default", key_id="key-one")
+    return manager, issued.raw_key
+
+
+def _pool_control_plane(
+    root: Path,
+    *,
+    refusal_failover: bool = False,
+) -> tuple[NativeControlPlane, str]:
+    """Load the native control plane over one certified two-deployment pool."""
+    _manager, raw_key = _configured_pool_gateway(root, refusal_failover=refusal_failover)
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    return NativeControlPlane(components), raw_key
+
+
+def test_admit_returns_the_full_ordered_route_without_starting_attempts(
+    tmp_path: Path,
+) -> None:
+    """A certified pool admits natively with one wire entry per deployment.
+
+    Admission accepts the request but writes no attempt row; each physical
+    dispatch is reserved by ``start_attempt``, and the per-attempt rows carry
+    the dispatch ordinal and deployment position.
+    """
+    control, raw_key = _pool_control_plane(tmp_path, refusal_failover=True)
+    admission = _admit(control, raw_key, _chat_body())
+    assert "escalate" not in admission
+    assert admission["maximum_total_attempts"] == 8
+    assert admission["maximum_same_deployment_attempts"] == 2
+    assert admission["refusal_failover"] is True
+    route = admission["route"]
+    assert isinstance(route, list) and len(route) == 2
+    first, second = route
+    assert isinstance(first, dict) and isinstance(second, dict)
+    assert first["model_id"] == "alpha-model-exact"
+    assert second["model_id"] == "beta-model-exact"
+    assert first["url"] != second["url"]
+    assert first["idempotency_key"] != second["idempotency_key"]
+    assert first["upstream_payload"] != second["upstream_payload"]
+
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
+
+    started = _start_first(control, admission)
+    assert started["route_depth"] == 0
+    with sqlite3.connect(ledger.database_path) as connection:
+        rows = connection.execute(
+            "select attempt_ordinal, route_depth, state from gateway_attempts"
+        ).fetchall()
+    assert rows == [(0, 0, "dispatched")]
+
+
+def test_pool_failover_records_ordinals_depths_and_one_finalize(tmp_path: Path) -> None:
+    """A failed first deployment advances; the ledger shows both dispatches."""
+    control, raw_key = _pool_control_plane(tmp_path)
+    admission = _admit(control, raw_key, _chat_body())
+    first = _start_first(control, admission)
+    assert first["route_depth"] == 0
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "attempt_id": first["attempt_id"],
+                    "outcome": "failed",
+                    "usage": None,
+                    "tool_names": [],
+                    "failure": {
+                        "failure_class": "provider_internal",
+                        "safe_message": "provider service failed; retry after a short delay",
+                    },
+                    "finalize": False,
+                    "opened": False,
+                }
+            )
+        )
+        == "{}"
+    )
+    second = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": {
+                        "failure_class": "provider_internal",
+                        "safe_message": "provider service failed; retry after a short delay",
+                        "retryable_same_deployment": False,
+                        "failover_eligible": True,
+                    },
+                }
+            )
+        )
+    )
+    assert second["route_depth"] == 1
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "attempt_id": second["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 5, "output_tokens": 3},
+                    "tool_names": [],
+                    "failure": None,
+                    "finalize": True,
+                    "opened": True,
+                }
+            )
+        )
+        == "{}"
+    )
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        rows = connection.execute(
+            "select attempt_ordinal, route_depth, state"
+            " from gateway_attempts order by attempt_ordinal"
+        ).fetchall()
+    assert rows == [(0, 0, "failed"), (1, 1, "completed")]
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
+    assert report["totals"]["input_tokens"] == 5
+
+
+def test_pool_claim_scope_resolves_natively(tmp_path: Path) -> None:
+    """A keyed request against a certified pool claims a native replay scope."""
+    control, raw_key = _pool_control_plane(tmp_path)
+    scope = _claim_scope(control, raw_key, _chat_body(), idempotency_key="pool-op")
+    assert "escalate" not in scope
+    assert scope["surface"] == "chat_completions"
 
 
 def test_claim_scope_matches_the_python_replay_key(tmp_path: Path) -> None:
@@ -510,7 +774,7 @@ def test_keyed_admissions_enforce_the_durable_ledger_idempotency_rows(
     python engine does: a different body conflicts and an identical body
     reports the replay unavailable, never a second provider dispatch."""
     control, raw_key = _control_plane(tmp_path)
-    admission = _admit(control, raw_key, _chat_body(), idempotency_key="durable-op")
+    admission = _admit_started(control, raw_key, _chat_body(), idempotency_key="durable-op")
     control.settle(
         json.dumps(
             {
@@ -558,15 +822,18 @@ def test_budget_rejection_uses_host_error_factory(tmp_path: Path) -> None:
             error_type="insufficient_quota",
         )
     )
-    control._budget_error_factory = lambda key: customized  # noqa: SLF001
+    control._accounting._budget_error_factory = lambda key: customized  # noqa: SLF001
+    admission = _admit(control, raw_key, _chat_body())
     with mock.patch.object(
         control._write_ledger,  # noqa: SLF001
         "start_attempt",
         side_effect=BudgetReservationRejected(scope_kind=BudgetScopeKind.TEAM, reason="blocked"),
     ):
         with pytest.raises(NativeBridgeError) as excinfo:
-            _admit(control, raw_key, _chat_body())
+            _start_first(control, admission)
     assert excinfo.value is customized
+    # The rejected request is finalized with no attempt row remaining open.
+    assert control._accounting.entry(str(admission["request_id"])) is None  # noqa: SLF001
 
 
 def test_authenticate_rejects_an_invalid_key(tmp_path: Path) -> None:
@@ -649,7 +916,7 @@ def test_metrics_snapshot_merges_the_injected_data_plane_registry(tmp_path: Path
 def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) -> None:
     """A sweep that lands a retained settlement moves the recovery counter."""
     control, raw_key = _control_plane(tmp_path)
-    admission = _admit(control, raw_key, _chat_body())
+    admission = _admit_started(control, raw_key, _chat_body())
     settlement = json.dumps(
         {
             "request_id": admission["request_id"],
@@ -668,7 +935,7 @@ def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) 
     ):
         with pytest.raises(NativeBridgeError):
             control.settle(settlement)
-    control._sweep_expired()  # noqa: SLF001 - the timer normally drives this.
+    control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
 
     snapshot = control.metrics_snapshot()
 
@@ -684,8 +951,8 @@ def test_metrics_snapshot_counts_a_swept_abandoned_attempt(tmp_path: Path) -> No
     control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
     _admit(control, raw_key, _chat_body())
     time.sleep(0.05)
-    with mock.patch("exp.runtime.gateway.native_bridge._SWEEP_GRACE_SECONDS", 0.0):
-        control._sweep_expired()  # noqa: SLF001 - the timer normally drives this.
+    with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
+        control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
 
     snapshot = control.metrics_snapshot()
 
@@ -892,7 +1159,7 @@ def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
     def admit_old() -> None:
         """Admit one request racing the activation swap."""
         try:
-            outcomes.append(_admit(control, raw_key, _chat_body()))
+            outcomes.append(_admit_started(control, raw_key, _chat_body()))
         except BaseException as exc:  # noqa: BLE001 - the test asserts no error.
             errors.append(exc)
 
@@ -911,7 +1178,7 @@ def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
     pinned = outcomes[0]
     assert pinned["alias_revision_id"] == "revision-one"
     assert pinned["model_id"] == "provider-model-exact"
-    fresh = _admit(control, raw_key, _chat_body())
+    fresh = _admit_started(control, raw_key, _chat_body())
     assert fresh["alias_revision_id"] == "revision-two"
     assert fresh["model_id"] == "provider-model-next"
     for admission in (pinned, fresh):
@@ -936,7 +1203,7 @@ def test_admission_authorized_at_the_swap_instant_stays_pinned_to_its_revision(
 
 def _settle_one_completed_chat(control: NativeControlPlane, raw_key: str) -> None:
     """Admit and settle one completed chat request for the presented key."""
-    admission = _admit(control, raw_key, _chat_body())
+    admission = _admit_started(control, raw_key, _chat_body())
     settled = control.settle(
         json.dumps(
             {
@@ -1040,8 +1307,12 @@ def _admitted_request_id(admission: JsonObject) -> str:
 
 
 def _payload_messages(admission: JsonObject) -> list[JsonObject]:
-    """Narrow one admission's upstream payload to its message list."""
-    payload = admission["upstream_payload"]
+    """Narrow one admission's first wire entry to its payload message list."""
+    route = admission["route"]
+    assert isinstance(route, list)
+    wire = route[0]
+    assert isinstance(wire, dict)
+    payload = wire["upstream_payload"]
     assert isinstance(payload, dict)
     messages = payload["messages"]
     assert isinstance(messages, list)
@@ -1256,7 +1527,7 @@ def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path)
 
     control, raw_key = _control_plane(tmp_path)
     body = _responses_body(with_tools=True)
-    admission = _admit_responses(control, raw_key, body)
+    admission = _flatten_started(control, _admit_responses(control, raw_key, body))
     assert "escalate" not in admission
     assert admission["surface"] == "responses"
     assert admission["dialect"] == "openai_compatible"
@@ -1522,7 +1793,7 @@ def test_project_alias_embedding_failure_serves_the_frozen_baseline_natively(
     body = json.dumps(
         {"model": "coding", "messages": [{"role": "user", "content": "project-prompt-canary"}]}
     )
-    admission = _admit(control, raw_key, body)
+    admission = _admit_started(control, raw_key, body)
     assert "escalate" not in admission
     assert admission["route_reason"] == "learned_router"
     assert admission["model_id"] == "baseline-model"
@@ -1609,7 +1880,7 @@ def test_project_alias_native_selection_matches_the_python_resolver(tmp_path: Pa
     try:
         base_url = f"http://127.0.0.1:{server.server_port}/v1"
         _manager, control, raw_key = _project_control_plane(tmp_path, base_url=base_url)
-        admission = _admit(control, raw_key, _chat_body())
+        admission = _admit_started(control, raw_key, _chat_body())
         assert "escalate" not in admission
         assert admission["route_reason"] == "learned_router"
 
@@ -1662,6 +1933,7 @@ def test_admit_persists_caller_app_identity_for_attribution(tmp_path: Path) -> N
             )
         )
     )
+    admission = _flatten_started(control, admission)
 
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
     with sqlite3.connect(ledger.database_path) as connection:
@@ -1719,7 +1991,7 @@ def test_hosted_components_without_group_commit_writer_settle(
         cast("NativeGatewayComponents", hosted),
         request_timeout_seconds=120.0,
     )
-    admission = _admit(control, raw_key, _chat_body())
+    admission = _admit_started(control, raw_key, _chat_body())
     settled = control.settle(
         json.dumps(
             {
