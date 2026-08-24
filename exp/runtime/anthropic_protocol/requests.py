@@ -95,10 +95,11 @@ class _ToolUseBlock(_WireModel):
 class _ToolResultBlock(_WireModel):
     """One tool result the caller returns for a prior assistant tool call.
 
-    ``is_error`` is accepted and dropped: neither the canonical gateway
-    message nor the OpenAI-family provider wire has a tool-error flag, so the
-    error state travels in the result text the model reads, exactly like the
-    OpenAI surfaces of this gateway.
+    ``is_error`` is carried on the canonical tool message
+    (``GatewayMessage.tool_is_error``) so the Anthropic upstream dialect can
+    round-trip it losslessly; the OpenAI-family wire formats have no
+    tool-error flag, so on those routes the error state travels in the
+    result text the model reads.
     """
 
     type: Literal["tool_result"]
@@ -399,6 +400,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     role="tool",
                     content=_tool_result_text(block),
                     tool_call_id=block.tool_use_id,
+                    tool_is_error=block.is_error,
                 )
             )
     flush()

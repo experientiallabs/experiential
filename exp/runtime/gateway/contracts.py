@@ -84,6 +84,18 @@ class GatewayMessage(ContractModel):
     content: str | None = None
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
     tool_calls: tuple[ToolCall, ...] = ()
+    tool_is_error: bool = Field(default=False, exclude=True)
+    """Whether this tool result reports a failed tool invocation.
+
+    Only the Anthropic Messages surface can express it (``tool_result.is_error``),
+    and only the Anthropic upstream dialect can emit it back, so an
+    Anthropic-to-Anthropic round trip is lossless. The OpenAI-family wire
+    formats have no tool-error flag; their builders ignore this field and the
+    error state travels in the result text the model reads. Like
+    ``ToolCall.raw_arguments``, the field is deliberately excluded from model
+    serialization so request digests, replay identity, and immutable
+    artifacts are unaffected by it.
+    """
 
     @model_validator(mode="after")
     def _require_role_coherence(self) -> GatewayMessage:
@@ -103,6 +115,8 @@ class GatewayMessage(ContractModel):
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only for tool messages")
+        if self.role != "tool" and self.tool_is_error:
+            raise ValueError("tool_is_error is valid only for tool messages")
         return self
 
 

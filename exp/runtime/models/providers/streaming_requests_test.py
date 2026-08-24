@@ -1,5 +1,7 @@
 """Tests for launch-provider streaming request payload translation."""
 
+from typing import cast
+
 import pytest
 
 from exp.runtime.gateway.contracts import (
@@ -131,3 +133,27 @@ def test_anthropic_messages_stream_payload_omits_absent_top_p() -> None:
 
     assert "top_p" not in payload
     assert "temperature" not in payload
+
+
+def test_anthropic_messages_stream_payload_round_trips_tool_error_state() -> None:
+    """A failed tool result keeps is_error on the Anthropic wire only when set."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="tool", content="boom", tool_call_id="call-1", tool_is_error=True),
+            GatewayMessage(role="tool", content="fine", tool_call_id="call-2"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("exact-model", request)
+    messages = cast("list[dict[str, object]]", payload["messages"])
+    blocks = cast("list[dict[str, object]]", messages[0]["content"])
+    assert blocks[0] == {
+        "type": "tool_result",
+        "tool_use_id": "call-1",
+        "content": "boom",
+        "is_error": True,
+    }
+    # An ordinary result stays byte-identical to the pre-existing payload shape.
+    assert blocks[1] == {"type": "tool_result", "tool_use_id": "call-2", "content": "fine"}

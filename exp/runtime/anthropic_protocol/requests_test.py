@@ -256,3 +256,35 @@ def test_invalid_json_shape_errors_carry_a_dotted_field_path() -> None:
     with pytest.raises(OpenAIProtocolError) as excinfo:
         decode_messages(_body(messages=[]))
     assert excinfo.value.detail.param == "messages"
+
+
+def test_tool_result_error_state_is_preserved_on_the_canonical_message() -> None:
+    """is_error travels on the canonical tool message without touching digests."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": "boom",
+                            "is_error": True,
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tool = decoded.request.messages[0]
+    assert tool.role == "tool"
+    assert tool.tool_is_error is True
+    plain = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-1"}]}
+            ]
+        )
+    )
+    assert plain.request.messages[0].tool_is_error is False

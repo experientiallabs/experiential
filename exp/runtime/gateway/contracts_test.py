@@ -146,3 +146,59 @@ def test_project_authorization_precedes_route_bound_execution() -> None:
     assert authorization.surface is GatewayApiSurface.RESPONSES
     assert authorization.caller_operation_sha256 == "c" * 64
     assert execution.authorization == authorization
+
+
+def test_tool_error_marker_never_reaches_serialization_or_request_digests() -> None:
+    """tool_is_error is authority-visible only, like ToolCall.raw_arguments.
+
+    The canonical request digest anchors replay identity and immutable
+    artifacts, so a request carrying the marker must serialize and digest
+    byte-identically to the same request without it, and to requests decoded
+    before the field existed.
+    """
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.openai_protocol.requests import decode_chat
+
+    def request(*, tool_is_error: bool) -> GatewayRequest:
+        """Build one tool-continuation request with the marker toggled."""
+        return GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(
+                GatewayMessage(
+                    role="tool",
+                    content="boom",
+                    tool_call_id="call-1",
+                    tool_is_error=tool_is_error,
+                ),
+            ),
+        )
+
+    flagged = request(tool_is_error=True)
+    plain = request(tool_is_error=False)
+    assert flagged.model_dump(mode="json") == plain.model_dump(mode="json")
+    assert "tool_is_error" not in flagged.messages[0].model_dump(mode="json")
+    assert sha256_json(flagged) == sha256_json(plain)
+
+    # OpenAI callers cannot express the marker; decode_chat never sets it.
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "search", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "boom"},
+            ],
+        }
+    )
+    assert chat.request.messages[-1].tool_is_error is False
+
+    with pytest.raises(ValidationError, match="tool_is_error is valid only for tool messages"):
+        GatewayMessage(role="user", content="hi", tool_is_error=True)

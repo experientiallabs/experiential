@@ -260,16 +260,16 @@ def _responses_items(message: GatewayMessage) -> list[JsonObject]:
 def _anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
     """Translate one non-instruction gateway message to Anthropic content blocks."""
     if message.role == "tool":
-        return (
-            "user",
-            [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": message.tool_call_id or "",
-                    "content": message.content or "",
-                }
-            ],
-        )
+        result: JsonObject = {
+            "type": "tool_result",
+            "tool_use_id": message.tool_call_id or "",
+            "content": message.content or "",
+        }
+        # Only the Anthropic wire can express a failed tool invocation; the
+        # marker is emitted solely when set so existing payloads are unchanged.
+        if message.tool_is_error:
+            result["is_error"] = True
+        return ("user", [result])
     if message.role == "user":
         return "user", [{"type": "text", "text": message.content or ""}]
     if message.role != "assistant":
