@@ -1068,24 +1068,24 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
             }
         };
 
-    // Body-signing dialects sign after the permit so queue time cannot age
-    // the signature; failures settle the attempt like any dispatch failure.
-    let headers = match dispatch_headers(&state.bridge, &admission).await {
-        Ok(headers) => headers,
-        Err(error) => {
-            let failure = Failure::new(
-                FailureClass::ProviderAuthentication,
-                "provider dispatch signing failed",
-            );
-            guard.settle("failed", None, &[], Some(&failure)).await;
-            return error_response(&error);
-        }
-    };
-
     // One bounded same-deployment retry at the open phase, mirroring the
     // python executor's retry policy before any byte reaches the client.
+    // Body-signing dialects sign immediately before every attempt so neither
+    // queue time nor a spent first attempt can age the signature; signing
+    // failures settle the attempt like any dispatch failure.
     let mut response = None;
     for attempt in 0..2u8 {
+        let headers = match dispatch_headers(&state.bridge, &admission).await {
+            Ok(headers) => headers,
+            Err(error) => {
+                let failure = Failure::new(
+                    FailureClass::ProviderAuthentication,
+                    "provider dispatch signing failed",
+                );
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                return error_response(&error);
+            }
+        };
         let open_bound = remaining(deadline).min(phase_timeout);
         match open_stream(
             &state.http,
@@ -1177,12 +1177,12 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
     }
 }
 
-/// Resolve the dispatch headers for one admitted attempt. Body-signing
-/// dialects are signed here, after the bounded dispatch permit and
-/// immediately before the provider POST, so time spent queued can never age
-/// a SigV4 signature toward AWS's short clock window; the immediate bounded
-/// open retry reuses the result within milliseconds. Other dialects use the
-/// admission headers unchanged.
+/// Resolve the dispatch headers for one open attempt. Body-signing dialects
+/// are signed here, after the bounded dispatch permit and immediately before
+/// each provider POST (the bounded open retry signs afresh too, since a
+/// first attempt can consume minutes before a retryable timeout), so neither
+/// queue time nor a spent attempt can age a SigV4 signature toward AWS's
+/// short clock window. Other dialects use the admission headers unchanged.
 async fn dispatch_headers(
     bridge: &Bridge,
     admission: &Admission,
@@ -2198,24 +2198,24 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
             }
         };
 
-    // Body-signing dialects sign after the permit so queue time cannot age
-    // the signature; failures settle the attempt like any dispatch failure.
-    let headers = match dispatch_headers(&state.bridge, &admission).await {
-        Ok(headers) => headers,
-        Err(error) => {
-            let failure = Failure::new(
-                FailureClass::ProviderAuthentication,
-                "provider dispatch signing failed",
-            );
-            guard.settle("failed", None, &[], Some(&failure)).await;
-            return error_response(&error);
-        }
-    };
-
     // One bounded same-deployment retry at the open phase, mirroring the
     // python executor's retry policy before any byte reaches the client.
+    // Body-signing dialects sign immediately before every attempt so neither
+    // queue time nor a spent first attempt can age the signature; signing
+    // failures settle the attempt like any dispatch failure.
     let mut response = None;
     for attempt in 0..2u8 {
+        let headers = match dispatch_headers(&state.bridge, &admission).await {
+            Ok(headers) => headers,
+            Err(error) => {
+                let failure = Failure::new(
+                    FailureClass::ProviderAuthentication,
+                    "provider dispatch signing failed",
+                );
+                guard.settle("failed", None, &[], Some(&failure)).await;
+                return error_response(&error);
+            }
+        };
         let open_bound = remaining(deadline).min(phase_timeout);
         match open_stream(
             &state.http,
