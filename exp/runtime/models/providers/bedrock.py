@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol, cast
+from urllib.parse import quote
 
 from pydantic import JsonValue
 
@@ -16,17 +17,16 @@ from exp.common.models import (
     AssistantAction,
     Embedding,
     ModelFinishReason,
-    ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
     ToolCall,
-    ToolChoice,
     Usage,
 )
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.async_transport import RequestDeadline
-from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY
+from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, GatewayWireProfile
+from exp.runtime.models.providers.bedrock_requests import converse_request
 from exp.runtime.models.providers.bedrock_streaming import (
     BedrockEventStream,
     BedrockProviderStream,
@@ -107,6 +107,9 @@ class _BotoSession(Protocol):
     def client(self, service_name: str, *, region_name: str, config: object) -> object:
         """Construct one AWS service client."""
 
+    def get_credentials(self) -> _ResolvableCredentials | None:
+        """Return resolvable AWS credentials from the standard chain, when any."""
+
 
 class _Boto3Module(Protocol):
     """Lazy boto3 module surface used only at request time."""
@@ -166,6 +169,60 @@ def create_bedrock_runtime_client(*, region_name: str) -> BedrockRuntime:
             ),
         )
     return cast("BedrockRuntime", client)
+
+
+class _FrozenCredentials(Protocol):
+    """Frozen AWS credential triple read once per signing call."""
+
+    access_key: str
+    secret_key: str
+    token: str | None
+
+
+class _ResolvableCredentials(Protocol):
+    """Chain-resolved AWS credentials that can be frozen for one signature."""
+
+    def get_frozen_credentials(self) -> _FrozenCredentials:
+        """Return an immutable credential snapshot."""
+
+
+class _AwsRequest(Protocol):
+    """Botocore AWSRequest surface holding the headers SigV4 signing adds."""
+
+    headers: Mapping[str, str]
+
+
+class _AwsRequestFactory(Protocol):
+    """Constructs one botocore AWSRequest for signing."""
+
+    def __call__(
+        self,
+        *,
+        method: str,
+        url: str,
+        data: bytes,
+        headers: Mapping[str, str],
+    ) -> _AwsRequest:
+        """Return one unsigned AWS request."""
+
+
+class _SigV4Signer(Protocol):
+    """Botocore SigV4 signer surface used for native-dispatch signing."""
+
+    def add_auth(self, request: _AwsRequest) -> None:
+        """Sign one AWS request in place."""
+
+
+class _SigV4SignerFactory(Protocol):
+    """Constructs one botocore SigV4 signer bound to a credential and region."""
+
+    def __call__(
+        self,
+        credentials: _FrozenCredentials,
+        service_name: str,
+        region_name: str,
+    ) -> _SigV4Signer:
+        """Return one bound signer."""
 
 
 class BedrockClient:
@@ -300,6 +357,73 @@ class BedrockClient:
             return session_region
         raise BedrockRegionError(NO_REGION_ERROR)
 
+    @property
+    def model_id(self) -> str:
+        """Return the exact Bedrock model or inference-profile identifier."""
+        return self._model.model_id
+
+    def converse_stream_url(self) -> str:
+        """Return the regional ConverseStream REST endpoint for this model.
+
+        The model identifier is percent-encoded the way botocore serializes
+        its greedy ``modelId`` label (``/`` and ``~`` stay raw), so the signed
+        path matches what boto3 itself would put on the wire.
+
+        Returns:
+            The full ``converse-stream`` URL for the resolved region.
+
+        Raises:
+            BedrockRegionError: No region could be resolved.
+        """
+        region = self._region_name()
+        encoded_model = quote(self._model.model_id, safe="/~")
+        return (
+            f"https://bedrock-runtime.{region}.amazonaws.com/model/{encoded_model}/converse-stream"
+        )
+
+    def sign_gateway_dispatch(self, *, url: str, body: str) -> Mapping[str, str]:
+        """Compute SigV4 headers for one frozen native-dispatch request body.
+
+        The signature covers the exact UTF-8 bytes of ``body``, so the caller
+        must send those bytes verbatim. Signatures carry AWS's short clock
+        window (about five minutes of skew): the native engine's immediate
+        bounded open retry reuses them safely, while any later retry is a
+        fresh admission that signs again.
+
+        Args:
+            url: Exact endpoint the data plane will POST to.
+            body: Exact pre-serialized JSON body the data plane will send.
+
+        Returns:
+            Headers to send verbatim: ``Authorization``, ``X-Amz-Date``, the
+            session token when present, and the content type that was signed.
+
+        Raises:
+            BedrockRegionError: No region could be resolved.
+            ProviderTransportError: No AWS credentials resolve from the chain.
+            RuntimeError: ``boto3`` or ``botocore`` is not installed.
+        """
+        region = self._region_name()
+        auth_factory, request_factory = _import_botocore_signing()
+        raw_credentials = _import_boto3().Session().get_credentials()
+        if raw_credentials is None:
+            raise ProviderTransportError(
+                "Bedrock has no AWS credentials. Configure the standard chain "
+                "(environment keys, a profile, or an instance role)."
+            )
+        frozen = raw_credentials.get_frozen_credentials()
+        request = request_factory(
+            method="POST",
+            url=url,
+            data=body.encode("utf-8"),
+            headers={
+                "content-type": "application/json",
+                "accept": "application/vnd.amazon.eventstream",
+            },
+        )
+        auth_factory(frozen, "bedrock", region).add_auth(request)
+        return {str(name): str(value) for name, value in dict(request.headers).items()}
+
     def _call_with_retry(
         self,
         operation: Callable[[], Mapping[str, object]],
@@ -398,6 +522,35 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
             release=self._permits.release,
         )
 
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the native ConverseStream wire profile for this connection.
+
+        Bedrock authenticates with per-request SigV4 signatures over the exact
+        body bytes, so the profile carries no static credential headers and
+        instead marks the request body for admission-time signing through
+        :meth:`sign_gateway_dispatch`.
+        """
+        return GatewayWireProfile(
+            dialect="bedrock_converse_stream",
+            url=self._bedrock_client.converse_stream_url(),
+            headers={},
+            model_id=self._bedrock_client.model_id,
+            timeout_seconds=READ_TIMEOUT_SECONDS,
+            signs_request_body=True,
+        )
+
+    def sign_gateway_dispatch(self, *, url: str, body: str) -> Mapping[str, str]:
+        """Sign one frozen native-dispatch body through the wrapped client.
+
+        Args:
+            url: Exact endpoint the data plane will POST to.
+            body: Exact pre-serialized JSON body the data plane will send.
+
+        Returns:
+            SigV4 headers the data plane sends verbatim.
+        """
+        return self._bedrock_client.sign_gateway_dispatch(url=url, body=body)
+
     def _release_stream_open_permit(self, task: asyncio.Task[BedrockEventStream]) -> None:
         """Close an abandoned response before releasing its blocking-worker admission."""
         if task.cancelled() or task.exception() is not None:
@@ -436,6 +589,16 @@ def _import_botocore_config() -> type[object]:
     except ImportError as exc:
         raise RuntimeError("Bedrock requires botocore; install experiential") from exc
     return Config
+
+
+def _import_botocore_signing() -> tuple[_SigV4SignerFactory, _AwsRequestFactory]:
+    """Import botocore SigV4 primitives only when signing a native dispatch."""
+    try:
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+    except ImportError as exc:
+        raise RuntimeError("Bedrock requires botocore; install experiential") from exc
+    return cast("_SigV4SignerFactory", SigV4Auth), cast("_AwsRequestFactory", AWSRequest)
 
 
 def _as_transport_error(exc: Exception) -> ProviderTransportError:
@@ -500,69 +663,6 @@ _COMPLETED_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "tool_use"})
 _LENGTH_STOP_REASONS = frozenset({"max_tokens"})
 
 
-def converse_request(model_id: str, request: ModelRequest) -> JsonObject:
-    """Translate one EXP request into a Bedrock Converse payload.
-
-    Args:
-        model_id: Exact foundation-model or inference-profile ID sent on the wire.
-        request: Typed EXP request.
-
-    Returns:
-        Keyword arguments accepted by ``bedrock-runtime`` Converse.
-
-    Raises:
-        ValueError: A message cannot be represented without dropping tool context.
-    """
-    system: list[JsonObject] = []
-    messages: list[JsonObject] = []
-
-    def push(role: str, content: list[JsonObject]) -> None:
-        """Append or merge one Converse message while preserving adjacent same-role blocks."""
-        if messages and messages[-1]["role"] == role:
-            existing = cast("list[JsonObject]", messages[-1]["content"])
-            existing.extend(content)
-            return
-        messages.append({"role": role, "content": content})
-
-    for message in request.messages:
-        if message.role == "system":
-            if message.content is None:
-                raise ValueError("system messages need text content")
-            system.append({"text": message.content})
-            continue
-        if message.role == "tool":
-            push(
-                "user",
-                [
-                    {
-                        "toolResult": {
-                            "toolUseId": message.tool_call_id or "",
-                            "content": [{"text": message.content or ""}],
-                        }
-                    }
-                ],
-            )
-            continue
-        push(
-            "assistant" if message.role == "assistant" else "user",
-            _message_blocks(message),
-        )
-
-    payload: JsonObject = {
-        "modelId": model_id,
-        "messages": messages,
-    }
-    inference = _inference_config(request)
-    if inference:
-        payload["inferenceConfig"] = inference
-    if system:
-        payload["system"] = system
-    tool_config = _tool_config(request)
-    if tool_config is not None:
-        payload["toolConfig"] = tool_config
-    return payload
-
-
 def converse_response(
     payload: Mapping[str, object],
     *,
@@ -619,66 +719,6 @@ def converse_response(
         latency_seconds=latency_seconds,
         hit_length_limit=finish_reason is ModelFinishReason.LENGTH,
     )
-
-
-def _message_blocks(message: ModelMessage) -> list[JsonObject]:
-    """Convert one user or assistant message into Converse content blocks."""
-    if message.role == "user" and message.assistant_action is not None:
-        raise ValueError("user messages cannot carry assistant actions")
-    if message.role == "user" and message.content is None:
-        raise ValueError("user messages need text content")
-    blocks: list[JsonObject] = []
-    action = message.assistant_action
-    text = message.content if message.content is not None else action.content if action else None
-    if text:
-        blocks.append({"text": text})
-    if action is not None:
-        for call in action.tool_calls:
-            blocks.append(
-                {
-                    "toolUse": {
-                        "toolUseId": call.call_id,
-                        "name": call.name,
-                        "input": dict(call.arguments),
-                    }
-                }
-            )
-    if not blocks:
-        raise ValueError(f"{message.role} messages need text or a tool call")
-    return blocks
-
-
-def _inference_config(request: ModelRequest) -> JsonObject:
-    """Return Converse inference controls without inventing omitted sampling fields."""
-    inference: JsonObject = {}
-    if request.maximum_output_tokens is not None:
-        inference["maxTokens"] = request.maximum_output_tokens
-    if request.temperature is not None:
-        inference["temperature"] = request.temperature
-    return inference
-
-
-def _tool_config(request: ModelRequest) -> JsonObject | None:
-    """Return Converse tool configuration, or omit it when tools are disabled."""
-    if request.tool_choice == "none" or not request.tools:
-        return None
-    config: JsonObject = {
-        "tools": [
-            {
-                "toolSpec": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": {"json": tool.input_schema},
-                }
-            }
-            for tool in request.tools
-        ]
-    }
-    if request.tool_choice == "required":
-        config["toolChoice"] = {"any": {}}
-    elif isinstance(request.tool_choice, ToolChoice):
-        config["toolChoice"] = {"tool": {"name": request.tool_choice.name}}
-    return config
 
 
 def _tool_use(value: JsonValue, index: int) -> ToolCall:

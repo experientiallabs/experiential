@@ -73,7 +73,7 @@ class GatewayWireProfile:
 
     dialect: str
     """Wire dialect: openai_responses, anthropic_messages, openai_compatible,
-    or gemini_generate_content."""
+    gemini_generate_content, or bedrock_converse_stream."""
 
     url: str
     """Full endpoint URL, including provider-specific query parameters."""
@@ -95,6 +95,12 @@ class GatewayWireProfile:
 
     token_limit_key: str = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
+
+    signs_request_body: bool = False
+    """Whether dispatch headers are computed per request over the exact
+    serialized body bytes (SigV4). When true the admission response carries a
+    pre-serialized body the data plane must send verbatim, and the resolved
+    client exposes ``sign_gateway_dispatch``."""
 
 
 class ProviderHttpClient(abc.ABC):

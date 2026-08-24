@@ -21,7 +21,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::bridge::Bridge;
 use crate::dialects::{
-    Dialect, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
+    Dialect, FrameDecoder, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
 };
 use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder};
 use crate::encode_responses::{completed_responses_body, ResponsesEnvelope, ResponsesSseEncoder};
@@ -30,7 +30,6 @@ use crate::events::{CompletedToolCall, Event, Usage};
 use crate::guardrails;
 use crate::metrics::{classify_escalation, METRICS};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey, ReplayStore};
-use crate::sse::SseDecoder;
 use crate::upstream::open_stream;
 
 /// Largest accepted request body on every native-served or proxied route.
@@ -140,6 +139,11 @@ struct Admission {
     headers: HashMap<String, String>,
     timeout_seconds: f64,
     upstream_payload: Value,
+    /// Exact pre-serialized body for body-signing dialects (Bedrock SigV4).
+    /// When present it is sent verbatim: the signature covers these exact
+    /// bytes, so re-serializing `upstream_payload` here could invalidate it.
+    #[serde(default)]
+    upstream_body: Option<String>,
     idempotency_key: String,
     exact_model_id: String,
     provider: String,
@@ -1071,6 +1075,7 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
             &admission.headers,
             &admission.idempotency_key,
             &admission.upstream_payload,
+            admission.upstream_body.as_deref(),
             open_bound,
         )
         .await
@@ -1222,7 +1227,7 @@ async fn collect_events(
     request_started: Instant,
 ) -> Result<Vec<Event>, Failure> {
     let mut normalizer = Normalizer::new(dialect);
-    let mut decoder = SseDecoder::new();
+    let mut decoder = FrameDecoder::new(dialect);
     let mut events = Vec::new();
     let mut retained_bytes = 0usize;
     let mut retain = |events: &mut Vec<Event>, event: Event| -> Result<(), Failure> {
@@ -1694,7 +1699,7 @@ async fn stream_response(
         let mut lease = lease;
         let mut encoder = ChatSseEncoder::new(&request_id, &alias, created_at, include_usage);
         let mut normalizer = Normalizer::new(dialect);
-        let mut decoder = SseDecoder::new();
+        let mut decoder = FrameDecoder::new(dialect);
         let mut usage: Option<Usage> = None;
         let mut tool_names: Vec<String> = Vec::new();
         let mut terminal: Option<Event> = None;
@@ -2156,6 +2161,7 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
             &admission.headers,
             &admission.idempotency_key,
             &admission.upstream_payload,
+            admission.upstream_body.as_deref(),
             open_bound,
         )
         .await
@@ -2566,7 +2572,7 @@ async fn stream_responses(
         let mut guard = guard;
         let mut encoder = ResponsesSseEncoder::new(&request_id, &alias, created_at, envelope);
         let mut normalizer = Normalizer::new(dialect);
-        let mut decoder = SseDecoder::new();
+        let mut decoder = FrameDecoder::new(dialect);
         let mut usage: Option<Usage> = None;
         let mut tool_names: Vec<String> = Vec::new();
         let mut terminal: Option<Event> = None;

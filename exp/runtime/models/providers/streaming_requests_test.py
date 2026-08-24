@@ -8,10 +8,12 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.bedrock_requests import converse_request
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.streaming_requests import (
     anthropic_messages_stream_payload,
+    bedrock_converse_stream_payload,
     dialect_stream_payload,
     gemini_generate_content_stream_payload,
     openai_compatible_stream_payload,
@@ -163,3 +165,34 @@ def test_dialect_dispatch_builds_the_gemini_payload() -> None:
     payload = dialect_stream_payload(profile, _chat_request())
 
     assert payload["contents"] == [{"role": "user", "parts": [{"text": "hello"}]}]
+
+
+def test_bedrock_stream_payload_matches_the_provider_builder_without_model_id() -> None:
+    """The bedrock dialect body is the shared Converse payload with the
+    ``modelId`` routing key removed: on the REST route the model travels in
+    the URL path, not the body."""
+    request = _chat_request(temperature=0.2)
+    payload = bedrock_converse_stream_payload("us.anthropic.claude-sonnet-4-5", request)
+
+    expected = converse_request("us.anthropic.claude-sonnet-4-5", model_request(request))
+    expected.pop("modelId")
+    assert payload == expected
+    assert "modelId" not in payload
+    assert payload["messages"] == [{"role": "user", "content": [{"text": "hello"}]}]
+    inference = payload["inferenceConfig"]
+    assert isinstance(inference, dict)
+    assert inference["temperature"] == 0.2
+
+
+def test_dialect_dispatch_builds_the_bedrock_payload() -> None:
+    """The shared dialect dispatch routes bedrock_converse_stream correctly."""
+    profile = GatewayWireProfile(
+        dialect="bedrock_converse_stream",
+        url="https://bedrock-runtime.us-east-1.amazonaws.com/model/m/converse-stream",
+        model_id="us.anthropic.claude-sonnet-4-5",
+        signs_request_body=True,
+    )
+    payload = dialect_stream_payload(profile, _chat_request())
+
+    assert "modelId" not in payload
+    assert payload["messages"] == [{"role": "user", "content": [{"text": "hello"}]}]

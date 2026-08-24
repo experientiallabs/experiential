@@ -362,10 +362,89 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path
     assert report["totals"]["requests"] == 2
 
 
-def test_admit_escalates_native_unsupported_providers_before_accounting(
+def test_admit_escalates_multi_deployment_pools_before_accounting(
     tmp_path: Path,
 ) -> None:
-    """A provider without a native dialect escalates with no ledger rows."""
+    """A certified multi-deployment pool escalates with no ledger rows.
+
+    Every granted provider now has a native dialect; the certified waterfall
+    is the remaining python-engine surface, so a pool alias is the
+    escalated-by-construction route.
+    """
+    from datetime import UTC, datetime
+
+    from exp.common.models import (
+        GatewayDeploymentCapabilities,
+        GatewayEquivalenceCertification,
+        GatewayTokenPrices,
+        ModelCapabilities,
+    )
+    from exp.runtime.gateway.catalog_authority import (
+        upsert_certified_pool,
+        upsert_singleton_deployment,
+    )
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    for deployment_alias, provider_model in (
+        ("pool-a", "pool-model-a"),
+        ("pool-b", "pool-model-b"),
+    ):
+        normalized, _snapshot_path, _changed = upsert_singleton_deployment(
+            tmp_path,
+            deployment_alias=deployment_alias,
+            connection_name="provider-main",
+            provider_model=provider_model,
+            exact_model_id="pool-revision-exact",
+            revision=None,
+            capabilities=ModelCapabilities(),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            prices=GatewayTokenPrices(),
+            pricing_source=None,
+            replace=False,
+        )
+    normalized, snapshot, _changed = upsert_certified_pool(
+        tmp_path,
+        pool_id="pooled",
+        exact_model_id="pool-revision-exact",
+        deployment_aliases=("pool-a", "pool-b"),
+        certification=GatewayEquivalenceCertification(
+            certification_id="certification-pooled",
+            provenance="operator-reviewed deployment manifests",
+            evidence_sha256="a" * 64,
+            certified_at=datetime(2026, 8, 24, tzinfo=UTC),
+        ),
+        expected_catalog_sha256=normalized.identity_sha256(),
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="pooled",
+        alias_name="pooled",
+        revision_id="revision-pooled",
+        pool_id="pooled",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="pooled")
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components)
+    admission = _admit(control, raw_key, _chat_body(model="pooled"))
+    assert "escalate" in admission
+    assert "request_id" not in admission
+    scope = _claim_scope(control, raw_key, _chat_body(model="pooled"), idempotency_key="op-1")
+    assert "escalate" in scope
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 0
+
+
+def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Bedrock alias admits natively: the wire config carries the exact
+    pre-serialized Converse body and SigV4 headers computed over it."""
     from exp.common.models import (
         GatewayDeploymentCapabilities,
         GatewayTokenPrices,
@@ -377,6 +456,10 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
         upsert_singleton_deployment,
     )
 
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sigv4-secret-canary")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-token-canary")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
     manager, raw_key = _configured_gateway(tmp_path)
     upsert_connection(
         tmp_path,
@@ -388,7 +471,7 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
         tmp_path,
         deployment_alias="bed",
         connection_name="bedrock-main",
-        provider_model="bedrock-model-exact",
+        provider_model="us.anthropic.claude-sonnet-4-5",
         exact_model_id="bedrock-revision-exact",
         revision=None,
         capabilities=ModelCapabilities(),
@@ -412,12 +495,43 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
     )
     control = NativeControlPlane(components)
     admission = _admit(control, raw_key, _chat_body(model="bed"))
-    assert "escalate" in admission
-    assert "request_id" not in admission
-    scope = _claim_scope(control, raw_key, _chat_body(model="bed"), idempotency_key="op-1")
-    assert "escalate" in scope
+    assert admission["dialect"] == "bedrock_converse_stream"
+    assert admission["url"] == (
+        "https://bedrock-runtime.us-east-1.amazonaws.com/model/"
+        "us.anthropic.claude-sonnet-4-5/converse-stream"
+    )
+    body = admission["upstream_body"]
+    assert isinstance(body, str)
+    payload = admission["upstream_payload"]
+    assert isinstance(payload, dict)
+    # The frozen body is the exact compact serialization of the payload the
+    # shared builders produced; the SigV4 signature covers these bytes.
+    assert body == json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    assert "modelId" not in payload
+    headers = admission["headers"]
+    assert isinstance(headers, dict)
+    assert headers["X-Amz-Security-Token"] == "session-token-canary"
+    authorization = headers["Authorization"]
+    assert isinstance(authorization, str)
+    assert authorization.startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")
+    assert "/us-east-1/bedrock/aws4_request" in authorization
+    assert "sigv4-secret-canary" not in json.dumps(admission)
+    # The attempt is durably started, exactly like other native admissions.
+    settled = control.settle(
+        json.dumps(
+            {
+                "request_id": admission["request_id"],
+                "attempt_id": admission["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+            }
+        )
+    )
+    assert settled == "{}"
     report = json.loads(control.usage_json("{}"))
-    assert report["totals"]["requests"] == 0
+    assert report["totals"]["requests"] == 1
 
 
 def test_claim_scope_matches_the_python_replay_key(tmp_path: Path) -> None:

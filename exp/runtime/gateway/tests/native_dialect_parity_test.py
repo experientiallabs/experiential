@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+import zlib
+from collections.abc import AsyncIterator, Iterator, Sequence
 
 import httpx
 import pytest
@@ -30,6 +31,7 @@ from exp.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
     RequestDeadline,
 )
+from exp.runtime.models.providers.bedrock_streaming import BedrockProviderStream
 from exp.runtime.models.providers.gemini import GeminiClient
 from exp.runtime.models.providers.transport import RetryPolicy
 
@@ -317,3 +319,200 @@ def test_python_gemini_mapper_matches_the_same_goldens() -> None:
     assert refusal[0]["kind"] == "failed"
     assert refusal[0]["failure_class"] == "refusal"
     assert refusal[0]["safe_message"] == "provider refused the request"
+
+
+def _eventstream_message(name: str, payload: JsonObject, *, exception: bool = False) -> bytes:
+    """Encode one AWS event-stream message the way Bedrock frames its stream.
+
+    Args:
+        name: Event-type (or exception-type) header value.
+        payload: JSON payload object.
+        exception: Whether to frame the message as a service exception.
+
+    Returns:
+        One complete binary event-stream message with valid checksums.
+    """
+    headers = [
+        (":message-type", "exception" if exception else "event"),
+        (":exception-type" if exception else ":event-type", name),
+    ]
+    block = b""
+    for header_name, value in headers:
+        block += bytes([len(header_name)]) + header_name.encode()
+        block += bytes([7]) + len(value).to_bytes(2, "big") + value.encode()
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    total = 12 + len(block) + len(body) + 4
+    prelude = total.to_bytes(4, "big") + len(block).to_bytes(4, "big")
+    message = prelude + zlib.crc32(prelude).to_bytes(4, "big") + block + body
+    return message + zlib.crc32(message).to_bytes(4, "big")
+
+
+BEDROCK_GOLDEN_ENVELOPES: tuple[tuple[str, JsonObject], ...] = (
+    ("messageStart", {"role": "assistant"}),
+    ("contentBlockDelta", {"contentBlockIndex": 0, "delta": {"text": "Hel"}}),
+    ("contentBlockDelta", {"contentBlockIndex": 0, "delta": {"text": "lo"}}),
+    ("contentBlockStop", {"contentBlockIndex": 0}),
+    (
+        "contentBlockStart",
+        {
+            "contentBlockIndex": 1,
+            "start": {"toolUse": {"toolUseId": "call-1", "name": "lookup"}},
+        },
+    ),
+    ("contentBlockDelta", {"contentBlockIndex": 1, "delta": {"toolUse": {"input": '{"city":'}}}),
+    (
+        "contentBlockDelta",
+        {"contentBlockIndex": 1, "delta": {"toolUse": {"input": '"Zürich"}'}}},
+    ),
+    ("contentBlockStop", {"contentBlockIndex": 1}),
+    ("messageStop", {"stopReason": "tool_use"}),
+    (
+        "metadata",
+        {
+            "usage": {
+                "inputTokens": 9,
+                "outputTokens": 4,
+                "cacheReadInputTokens": 2,
+                "cacheWriteInputTokens": 1,
+            },
+            "metrics": {"latencyMs": 12},
+        },
+    ),
+)
+
+BEDROCK_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
+    {"kind": "text_delta", "text": "Hel"},
+    {"kind": "text_delta", "text": "lo"},
+    {"kind": "tool_call_started", "index": 1, "call_id": "call-1", "name": "lookup"},
+    {"kind": "tool_arguments_delta", "index": 1, "text": '{"city":'},
+    {"kind": "tool_arguments_delta", "index": 1, "text": '"Zürich"}'},
+    {
+        "kind": "tool_call_completed",
+        "index": 1,
+        "call_id": "call-1",
+        "name": "lookup",
+        "raw_arguments": '{"city":"Zürich"}',
+    },
+    {
+        "kind": "usage",
+        "input_tokens": 12,
+        "output_tokens": 4,
+        "cached_input_tokens": 2,
+        "reasoning_tokens": None,
+    },
+    {"kind": "completed"},
+)
+
+BEDROCK_REFUSAL_ENVELOPES: tuple[tuple[str, JsonObject], ...] = (
+    ("messageStop", {"stopReason": "guardrail_intervened"}),
+    ("metadata", {"usage": {"inputTokens": 3, "outputTokens": 0}}),
+)
+
+
+class _ScriptedEventStream:
+    """Expose scripted synchronous Bedrock envelopes for the python mapper."""
+
+    def __init__(self, events: Sequence[JsonObject]) -> None:
+        """Store decoded provider envelopes in wire order."""
+        self._events = iter(tuple(events))
+
+    def __iter__(self) -> Iterator[JsonObject]:
+        """Return this one-pass synchronous iterator."""
+        return self
+
+    def __next__(self) -> JsonObject:
+        """Return the next scripted provider envelope."""
+        return next(self._events)
+
+    def close(self) -> None:
+        """Scripted closure needs no bookkeeping."""
+
+
+def _python_bedrock_events(envelopes: Sequence[tuple[str, JsonObject]]) -> list[JsonObject]:
+    """Run decoded envelopes through the deprecated python Bedrock mapper.
+
+    Args:
+        envelopes: Ordered (event name, payload) pairs, the decoded form of
+            the same messages the binary fixture frames for the Rust side.
+
+    Returns:
+        Simplified canonical events in the shared fixture shape.
+    """
+
+    async def scenario() -> list[JsonObject]:
+        """Consume one scripted Bedrock EventStream."""
+        upstream = _ScriptedEventStream([{name: payload} for name, payload in envelopes])
+        stream = BedrockProviderStream(
+            upstream,
+            deadline=RequestDeadline.after(10),
+            release=lambda: None,
+        )
+        return [_simplified(event) async for event in stream]
+
+    return asyncio.run(scenario())
+
+
+def test_native_bedrock_normalizer_matches_the_golden_fixture() -> None:
+    """The Rust event-stream decoder and normalizer reproduce the goldens."""
+    chunks = [_eventstream_message(name, payload) for name, payload in BEDROCK_GOLDEN_ENVELOPES]
+    result = _native_normalized("bedrock_converse_stream", chunks)
+    assert result["failure"] is None
+    assert result["events"] == list(BEDROCK_GOLDEN_EVENTS)
+
+    refusal_chunks = [
+        _eventstream_message(name, payload) for name, payload in BEDROCK_REFUSAL_ENVELOPES
+    ]
+    refusal = _native_normalized("bedrock_converse_stream", refusal_chunks)
+    assert refusal["failure"] is None
+    assert refusal["events"] == [
+        {
+            "kind": "usage",
+            "input_tokens": 3,
+            "output_tokens": 0,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": None,
+        },
+        {
+            "kind": "failed",
+            "failure_class": "refusal",
+            "safe_message": "provider refused the request",
+        },
+    ]
+
+    throttled = _native_normalized(
+        "bedrock_converse_stream",
+        [_eventstream_message("throttlingException", {"message": "x"}, exception=True)],
+    )
+    assert throttled["failure"] is None
+    assert throttled["events"] == [
+        {
+            "kind": "failed",
+            "failure_class": "throttled",
+            "safe_message": "provider throttled the request",
+        }
+    ]
+
+
+def test_native_bedrock_normalizer_fails_corrupt_and_truncated_frames() -> None:
+    """Checksum corruption and mid-message truncation fail as malformed."""
+    good = _eventstream_message("messageStart", {"role": "assistant"})
+    corrupt = good[:-1] + bytes([good[-1] ^ 0xFF])
+    result = _native_normalized("bedrock_converse_stream", [corrupt])
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "malformed_response"
+
+    truncated = _native_normalized("bedrock_converse_stream", [good[: len(good) - 3]])
+    failure = truncated["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "malformed_response"
+
+
+def test_python_bedrock_mapper_matches_the_same_goldens() -> None:
+    """The deprecated python mapper agrees with the committed goldens."""
+    assert _python_bedrock_events(BEDROCK_GOLDEN_ENVELOPES) == list(BEDROCK_GOLDEN_EVENTS)
+    refusal = _python_bedrock_events(BEDROCK_REFUSAL_ENVELOPES)
+    assert refusal[0]["kind"] == "usage"
+    assert refusal[1]["kind"] == "failed"
+    assert refusal[1]["failure_class"] == "refusal"
+    assert refusal[1]["safe_message"] == "provider refused the request"

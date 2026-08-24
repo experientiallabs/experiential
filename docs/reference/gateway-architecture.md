@@ -38,15 +38,23 @@ SQLite transactions, over the same hot-reloadable authority generations.
 Provider wire facts come from the public `gateway_wire_profile()` on each
 resolved provider client; native dialects are `openai_responses`,
 `anthropic_messages`, `openai_compatible` (which also covers Azure and
-OpenRouter connections), and `gemini_generate_content`.
+OpenRouter connections), `gemini_generate_content`, and
+`bedrock_converse_stream`, so every granted provider has a native dialect.
+Bedrock streams the AWS binary event-stream framing rather than SSE, and it
+authenticates with per-request SigV4 signatures: admission freezes the exact
+serialized Converse body, signs it python-side through the resolved client
+(credentials never cross the boundary), and the data plane sends the frozen
+bytes verbatim. Signatures carry AWS's short clock window, so the engine's
+immediate bounded open retry reuses them and any later retry is a fresh
+admission that signs again.
 
 The public surface is identical under either engine. An embedded python engine
 over the same authority, ledger, and routes listens on an internal loopback
 port, and the native engine forwards to it everything outside its fast path:
 `POST /v1/responses`, chat requests carrying `Idempotency-Key` or
 `X-Client-Request-Id` (replay semantics),
-multi-deployment pools (the certified waterfall), providers without a native
-dialect, and unknown routes. Escalation happens
+multi-deployment pools (the certified waterfall), providers whose resolved
+client exposes no native wire profile, and unknown routes. Escalation happens
 before any ledger write, so each request is accounted exactly once by the
 engine that serves it. Shutdown drains admitted work on both engines within
 `--graceful-timeout`.

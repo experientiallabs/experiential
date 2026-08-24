@@ -92,12 +92,17 @@ pub fn transport_failure(status: Option<u16>) -> TransportFailure {
 /// Open one streaming POST and return the response on HTTP success. The
 /// timeout bounds only the request/response-header phase; body-read pacing is
 /// bounded per chunk by the caller, mirroring the python transport split.
+///
+/// `raw_body` carries the exact pre-serialized body for body-signing dialects
+/// (Bedrock SigV4): its signature covers those exact bytes, so it is sent
+/// verbatim with the signed headers instead of re-serializing `payload`.
 pub async fn open_stream(
     client: &reqwest::Client,
     url: &str,
     headers: &HashMap<String, String>,
     idempotency_key: &str,
     payload: &Value,
+    raw_body: Option<&str>,
     phase_timeout: Duration,
 ) -> Result<reqwest::Response, TransportFailure> {
     let mut request = client.post(url);
@@ -108,7 +113,10 @@ pub async fn open_stream(
         request = request.header(name, value);
     }
     request = request.header("Idempotency-Key", idempotency_key);
-    let send = request.json(payload).send();
+    let send = match raw_body {
+        Some(body) => request.body(body.to_string()).send(),
+        None => request.json(payload).send(),
+    };
     let response = match tokio::time::timeout(phase_timeout, send).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Protocol
+from collections.abc import Mapping
+from typing import Protocol, runtime_checkable
 
 from exp.common.models import ModelClient, ModelRequest, ModelResponse
 from exp.common.models.catalog import GatewayDeploymentCapabilities
@@ -13,6 +14,7 @@ from exp.runtime.models.providers.async_transport import (
     RequestDeadline,
     run_then_close_pooled_client,
 )
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.transport import RetryPolicy
 
@@ -167,6 +169,30 @@ class BoundedSyncModelClientAdapter:
         """Release admission only after the underlying blocking call actually stops."""
         del task
         self._permits.release()
+
+
+@runtime_checkable
+class NativeWireClient(Protocol):
+    """A resolved provider client that can describe its native wire dispatch.
+
+    The runtime check is structural: every HTTP provider client inherits a
+    default that fails closed with a capability error, and non-HTTP clients
+    that implement the method (such as the bounded Bedrock adapter) satisfy
+    it too, so the native control plane probes one seam for every provider.
+    """
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the dialect, endpoint, headers, and timing facts for dispatch."""
+        ...
+
+
+@runtime_checkable
+class GatewayDispatchSigner(Protocol):
+    """A resolved client that signs one frozen dispatch body per request."""
+
+    def sign_gateway_dispatch(self, *, url: str, body: str) -> Mapping[str, str]:
+        """Return per-request headers covering the exact body bytes."""
+        ...
 
 
 def preflight_gateway_request(

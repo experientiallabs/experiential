@@ -11,6 +11,7 @@ mod encode;
 mod encode_responses;
 mod errors;
 mod events;
+mod eventstream;
 mod guardrails;
 mod memory;
 mod metrics;
@@ -148,7 +149,7 @@ fn normalize_stream_fixture(dialect: &str, chunks_json: &str) -> PyResult<String
     let chunks: Vec<String> = serde_json::from_str(chunks_json)
         .map_err(|error| PyValueError::new_err(format!("invalid chunks: {error}")))?;
     let mut normalizer = dialects::Normalizer::new(dialect);
-    let mut decoder = sse::SseDecoder::new();
+    let mut decoder = dialects::FrameDecoder::new(dialect);
     let mut simplified: Vec<serde_json::Value> = Vec::new();
     let mut failure: Option<errors::Failure> = None;
     'chunks: for chunk in &chunks {

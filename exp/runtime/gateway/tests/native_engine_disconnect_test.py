@@ -134,43 +134,57 @@ _DRIVER_SOURCE = textwrap.dedent(
 def _seed_escalating_alias(root: Path, manager: GatewayManagement) -> None:
     """Grant one alias the native path can never serve.
 
-    The provider has no native dialect, so admission escalates it to the
-    embedded python engine regardless of which public surfaces later become
-    native (Responses and project aliases already did). The dead-fallback
-    test needs a route that is escalated by construction.
+    Every granted provider now has a native dialect, so the escalated-by-
+    construction route is a certified multi-deployment pool: admission hands
+    those to the embedded python engine's waterfall. The dead-fallback test
+    needs a route that is escalated by construction.
 
     Args:
         root: Seeded gateway root.
         manager: Management handle over the same root.
     """
+    from datetime import UTC, datetime
+
     from exp.common.models import (
         GatewayDeploymentCapabilities,
+        GatewayEquivalenceCertification,
         GatewayTokenPrices,
         ModelCapabilities,
     )
     from exp.runtime.gateway.catalog_authority import (
-        ConnectionConfig,
-        upsert_connection,
+        upsert_certified_pool,
         upsert_singleton_deployment,
     )
 
-    upsert_connection(
+    for deployment_alias, provider_model in (
+        ("escalated-a", "pool-model-a"),
+        ("escalated-b", "pool-model-b"),
+    ):
+        normalized, _snapshot_path, _changed = upsert_singleton_deployment(
+            root,
+            deployment_alias=deployment_alias,
+            connection_name="provider-main",
+            provider_model=provider_model,
+            exact_model_id="pool-revision-exact",
+            revision=None,
+            capabilities=ModelCapabilities(),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            prices=GatewayTokenPrices(),
+            pricing_source=None,
+            replace=False,
+        )
+    normalized, snapshot, _changed = upsert_certified_pool(
         root,
-        name="bedrock-main",
-        connection=ConnectionConfig(provider="bedrock", region="us-east-1"),
-        replace=False,
-    )
-    normalized, snapshot, _changed = upsert_singleton_deployment(
-        root,
-        deployment_alias="escalated",
-        connection_name="bedrock-main",
-        provider_model="bedrock-model-exact",
-        exact_model_id="bedrock-revision-exact",
-        revision=None,
-        capabilities=ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
-        prices=GatewayTokenPrices(),
-        pricing_source=None,
+        pool_id="escalated",
+        exact_model_id="pool-revision-exact",
+        deployment_aliases=("escalated-a", "escalated-b"),
+        certification=GatewayEquivalenceCertification(
+            certification_id="certification-escalated",
+            provenance="operator-reviewed deployment manifests",
+            evidence_sha256="a" * 64,
+            certified_at=datetime(2026, 8, 24, tzinfo=UTC),
+        ),
+        expected_catalog_sha256=normalized.identity_sha256(),
         replace=False,
     )
     manager.activate_direct_alias(

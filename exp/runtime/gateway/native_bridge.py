@@ -16,8 +16,8 @@ string so the boundary stays narrow and typed on both sides.
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
 the caller, mirroring ``GatewayService`` error mapping. Requests the native
-path cannot serve (multi-deployment pools, providers without a native
-dialect) are answered with an ``{"escalate": reason}`` admission
+path cannot serve (multi-deployment pools, resolved clients exposing no
+native wire profile) are answered with an ``{"escalate": reason}`` admission
 disposition before any ledger write; the data plane replays those against the
 embedded python engine, which performs its own full authorization and
 accounting, so nothing is double-counted.
@@ -29,7 +29,7 @@ import json
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
@@ -51,13 +51,7 @@ from exp.runtime.gateway.discovery import (
     public_model_object,
     require_granted_authority,
 )
-
-# The executor's identity check is the authoritative pre-dispatch invariant;
-# the native path must enforce the same one, so the private helper is shared.
-from exp.runtime.gateway.execution import (
-    GatewayExecutionError,
-    _require_deployment_identity,  # noqa: PLC2701
-)
+from exp.runtime.gateway.execution import GatewayExecutionError
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy, GuardrailRejected
@@ -66,6 +60,11 @@ from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
+from exp.runtime.gateway.native_dispatch import (
+    NativeDialectUnavailableError,
+    resolve_wire_profile,
+    signed_dispatch,
+)
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
@@ -86,8 +85,9 @@ from exp.runtime.models.providers import (
     preflight_gateway_request,
     require_gateway_provider,
 )
-from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
@@ -102,10 +102,6 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 _SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
 _SWEEP_BATCH = 16
-
-
-class _NativeDialectUnavailableError(RuntimeError):
-    """The resolved provider has no native dialect; python must serve it."""
 
 
 @dataclass
@@ -368,10 +364,11 @@ class NativeControlPlane:
         probe_failure: Exception | None = None
         route: GatewayRoute | None = None
         profile: GatewayWireProfile | None = None
+        wire_client: NativeWireClient | None = None
         try:
             route = self._resolve_route(authorization, request)
-            profile = self._wire_profile(route)
-        except _NativeDialectUnavailableError as exc:
+            profile, wire_client = self._wire_profile(route)
+        except NativeDialectUnavailableError as exc:
             return _escalation(str(exc))
         except Exception as exc:  # noqa: BLE001 - recorded after acceptance below.
             probe_failure = exc
@@ -397,6 +394,9 @@ class NativeControlPlane:
             require_gateway_provider(deployment.provider)
             preflight_gateway_request(provider_request, deployment.gateway.capabilities)
             upstream_payload = dialect_stream_payload(profile, provider_request)
+            upstream_body, dispatch_headers = signed_dispatch(
+                profile, wire_client, upstream_payload
+            )
             maximum_cost = maximum_attempt_cost_micro_usd(request, deployment)
             attempt_id = self._write_ledger.start_attempt(
                 snapshot=route.snapshot,
@@ -461,10 +461,11 @@ class NativeControlPlane:
             "route_reason": route.route_reason,
             "dialect": profile.dialect,
             "url": profile.url,
-            "headers": dict(profile.headers),
+            "headers": dispatch_headers,
             "model_id": profile.model_id,
             "timeout_seconds": profile.timeout_seconds,
             "upstream_payload": upstream_payload,
+            "upstream_body": upstream_body,
             "idempotency_key": deployment_operation_key(route),
             "output_guardrail": bool(policy is not None and policy.output_checks),
         }
@@ -545,7 +546,7 @@ class NativeControlPlane:
         try:
             route = self._components.routes.resolve_direct(authorization)
             self._wire_profile(route)
-        except _NativeDialectUnavailableError as exc:
+        except NativeDialectUnavailableError as exc:
             return _escalation(str(exc))
         except Exception:  # noqa: BLE001 - the owner's admission records this failure.
             route = None
@@ -847,51 +848,9 @@ class NativeControlPlane:
             episode_namespace=episode,
         )
 
-    def _wire_profile(self, route: GatewayRoute) -> GatewayWireProfile:
-        """Resolve one deployment's public wire profile for the data plane.
-
-        Args:
-            route: Resolved single-deployment route.
-
-        Returns:
-            The dialect, endpoint, headers, and timing facts for dispatch,
-            with the model identity filled from the resolved snapshot when
-            the profile leaves it empty.
-
-        Raises:
-            _NativeDialectUnavailableError: The provider has no native-dialect
-                implementation; the python engine serves the request.
-            GatewayRoutingError: The resolved client cannot stream or the
-                authorized catalog is not loaded.
-            ValueError: The resolved client drifts from the frozen deployment.
-        """
-        authorization = route.snapshot.authorization
-        catalog = self._components.runtime_catalogs.get(
-            (authorization.alias_revision_id, authorization.catalog_sha256)
-        )
-        if catalog is None:
-            raise GatewayRoutingError("runtime catalog is not loaded for the authorized revision")
-        deployment = route.deployment
-        resolved = catalog.resolve(deployment.source_alias)
-        _require_deployment_identity(deployment, resolved)
-        client = resolved.client
-        if getattr(client, "stream", None) is None:
-            raise GatewayRoutingError("resolved gateway deployment has no streaming capability")
-        if not isinstance(client, ProviderHttpClient):
-            raise _NativeDialectUnavailableError(
-                f"provider {deployment.provider!r} has no native wire profile"
-            )
-        try:
-            profile = client.gateway_wire_profile()
-        except ProviderCapabilityError as exc:
-            if exc.capability != "native_data_plane":
-                raise
-            raise _NativeDialectUnavailableError(
-                f"provider {deployment.provider!r} has no native dialect implementation"
-            ) from exc
-        if not profile.model_id:
-            profile = replace(profile, model_id=resolved.snapshot.model_id)
-        return profile
+    def _wire_profile(self, route: GatewayRoute) -> tuple[GatewayWireProfile, NativeWireClient]:
+        """Resolve one route's wire profile and client through the shared seam."""
+        return resolve_wire_profile(self._components.runtime_catalogs, route)
 
     def _sweep_loop(self) -> None:
         """Run the settlement sweep on a timer for the process lifetime."""

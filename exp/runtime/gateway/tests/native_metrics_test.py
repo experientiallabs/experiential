@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -28,12 +29,12 @@ import pytest
 
 from exp.common.models import (
     GatewayDeploymentCapabilities,
+    GatewayEquivalenceCertification,
     GatewayTokenPrices,
     ModelCapabilities,
 )
 from exp.runtime.gateway.catalog_authority import (
-    ConnectionConfig,
-    upsert_connection,
+    upsert_certified_pool,
     upsert_singleton_deployment,
 )
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
@@ -125,25 +126,42 @@ def _unused_port() -> int:
         return probe.getsockname()[1]
 
 
-def _activate_dialectless_alias(root: Path, manager: GatewayManagement) -> None:
-    """Grant one alias on a provider without a native dialect, so it escalates."""
-    upsert_connection(
+def _activate_escalating_alias(root: Path, manager: GatewayManagement) -> None:
+    """Grant one certified multi-deployment pool alias, so admission escalates.
+
+    Every granted provider now has a native dialect; the multi-deployment
+    waterfall is the remaining surface the python engine owns, so it is the
+    escalated-by-construction route.
+    """
+    for deployment_alias, provider_model in (
+        ("escalated-a", "pool-model-a"),
+        ("escalated-b", "pool-model-b"),
+    ):
+        normalized, _snapshot_path, _changed = upsert_singleton_deployment(
+            root,
+            deployment_alias=deployment_alias,
+            connection_name="provider-main",
+            provider_model=provider_model,
+            exact_model_id="pool-revision-exact",
+            revision=None,
+            capabilities=ModelCapabilities(),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            prices=GatewayTokenPrices(),
+            pricing_source=None,
+            replace=False,
+        )
+    normalized, snapshot, _changed = upsert_certified_pool(
         root,
-        name="bedrock-main",
-        connection=ConnectionConfig(provider="bedrock", region="us-east-1"),
-        replace=False,
-    )
-    normalized, snapshot, _changed = upsert_singleton_deployment(
-        root,
-        deployment_alias="gem",
-        connection_name="bedrock-main",
-        provider_model="bedrock-model-exact",
-        exact_model_id="bedrock-revision-exact",
-        revision=None,
-        capabilities=ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
-        prices=GatewayTokenPrices(),
-        pricing_source=None,
+        pool_id="gem",
+        exact_model_id="pool-revision-exact",
+        deployment_aliases=("escalated-a", "escalated-b"),
+        certification=GatewayEquivalenceCertification(
+            certification_id="certification-escalated",
+            provenance="operator-reviewed deployment manifests",
+            evidence_sha256="a" * 64,
+            certified_at=datetime(2026, 8, 24, tzinfo=UTC),
+        ),
+        expected_catalog_sha256=normalized.identity_sha256(),
         replace=False,
     )
     manager.activate_direct_alias(
@@ -186,7 +204,7 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
         tmp_path,
         base_url=f"http://127.0.0.1:{provider_port}/v1",
     )
-    _activate_dialectless_alias(tmp_path, manager)
+    _activate_escalating_alias(tmp_path, manager)
     child = subprocess.Popen(  # noqa: S603 - fixed argv built from this test.
         [
             sys.executable,
@@ -240,7 +258,7 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
             "failed": 0,
             "cancelled": 0,
         }
-        assert data_plane["escalated_requests"]["provider_dialect"] == 1
+        assert data_plane["escalated_requests"]["deployment_pool"] == 1
         assert data_plane["proxied_requests"] == 1
         assert data_plane["fallback_engine_unavailable"] == 1
         assert data_plane["active_requests"] == 0
@@ -268,7 +286,7 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
         text = exposition.text
         assert 'exp_gateway_requests_total{outcome="completed"} 3' in text
         assert "exp_gateway_served_requests_total 3" in text
-        assert 'exp_gateway_escalated_requests_total{kind="provider_dialect"} 1' in text
+        assert 'exp_gateway_escalated_requests_total{kind="deployment_pool"} 1' in text
         assert "exp_gateway_fallback_engine_unavailable_total 1" in text
         assert 'exp_gateway_time_to_first_byte_ms_bucket{le="+Inf"} 3' in text
         assert "exp_gateway_accounting_healthy 1" in text
