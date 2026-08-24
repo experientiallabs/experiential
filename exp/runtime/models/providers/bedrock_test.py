@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from exp.common.models import (
-    AssistantAction,
     BillingSource,
     ConnectionConfig,
     EmbeddingClient,
@@ -23,10 +22,7 @@ from exp.common.models import (
     ModelRequest,
     ModelRoles,
     ModelSnapshot,
-    ToolCall,
-    ToolChoice,
 )
-from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.async_transport import RequestDeadline
 from exp.runtime.models.providers.bedrock import (
     AWS_DEFAULT_REGION_ENV,
@@ -106,39 +102,6 @@ def _snapshot(model_id: str = "us.anthropic.claude-sonnet-4-5") -> ModelSnapshot
 def _request() -> ModelRequest:
     """Build one user completion request."""
     return ModelRequest(messages=(ModelMessage(role="user", content="Hello"),))
-
-
-def _tool_transcript_request() -> ModelRequest:
-    """Build a visible transcript containing an earlier tool call and result."""
-    return ModelRequest(
-        messages=(
-            ModelMessage(role="system", content="You are precise."),
-            ModelMessage(role="user", content="Create a ticket."),
-            ModelMessage(
-                role="assistant",
-                assistant_action=AssistantAction(
-                    tool_calls=(
-                        ToolCall(
-                            call_id="call-old",
-                            name="create_ticket",
-                            arguments={"priority": "normal"},
-                        ),
-                    )
-                ),
-            ),
-            ModelMessage(role="tool", content="created", tool_call_id="call-old"),
-        ),
-        tools=(
-            ToolSchema(
-                name="create_ticket",
-                description="Create one support ticket.",
-                input_schema={"type": "object"},
-            ),
-        ),
-        tool_choice=ToolChoice(name="create_ticket"),
-        temperature=0.1,
-        maximum_output_tokens=256,
-    )
 
 
 def test_complete_sends_the_exact_model_id_and_preserves_cache_usage() -> None:

@@ -40,7 +40,10 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.lifecycle_test import (
+    _activate_certified_pool_alias,
+    _configured_gateway,
+)
 from exp.runtime.gateway.management import GatewayManagement
 
 pytest.importorskip("exp_gateway_native")
@@ -134,7 +137,7 @@ _DRIVER_SOURCE = textwrap.dedent(
 def _seed_escalating_alias(root: Path, manager: GatewayManagement) -> None:
     """Grant one alias the native path can never serve.
 
-    Every granted provider now has a native dialect, so the escalated-by-
+    Every granted provider has a native dialect, so the escalated-by-
     construction route is a certified multi-deployment pool: admission hands
     those to the embedded python engine's waterfall. The dead-fallback test
     needs a route that is escalated by construction.
@@ -143,59 +146,7 @@ def _seed_escalating_alias(root: Path, manager: GatewayManagement) -> None:
         root: Seeded gateway root.
         manager: Management handle over the same root.
     """
-    from datetime import UTC, datetime
-
-    from exp.common.models import (
-        GatewayDeploymentCapabilities,
-        GatewayEquivalenceCertification,
-        GatewayTokenPrices,
-        ModelCapabilities,
-    )
-    from exp.runtime.gateway.catalog_authority import (
-        upsert_certified_pool,
-        upsert_singleton_deployment,
-    )
-
-    for deployment_alias, provider_model in (
-        ("escalated-a", "pool-model-a"),
-        ("escalated-b", "pool-model-b"),
-    ):
-        normalized, _snapshot_path, _changed = upsert_singleton_deployment(
-            root,
-            deployment_alias=deployment_alias,
-            connection_name="provider-main",
-            provider_model=provider_model,
-            exact_model_id="pool-revision-exact",
-            revision=None,
-            capabilities=ModelCapabilities(),
-            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
-            prices=GatewayTokenPrices(),
-            pricing_source=None,
-            replace=False,
-        )
-    normalized, snapshot, _changed = upsert_certified_pool(
-        root,
-        pool_id="escalated",
-        exact_model_id="pool-revision-exact",
-        deployment_aliases=("escalated-a", "escalated-b"),
-        certification=GatewayEquivalenceCertification(
-            certification_id="certification-escalated",
-            provenance="operator-reviewed deployment manifests",
-            evidence_sha256="a" * 64,
-            certified_at=datetime(2026, 8, 24, tzinfo=UTC),
-        ),
-        expected_catalog_sha256=normalized.identity_sha256(),
-        replace=False,
-    )
-    manager.activate_direct_alias(
-        alias_id="escalated",
-        alias_name="escalated",
-        revision_id="revision-escalated",
-        pool_id="escalated",
-        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-        catalog_sha256=normalized.identity_sha256(),
-    )
-    manager.add_grant(identity_id="default", alias_id="escalated")
+    _activate_certified_pool_alias(root, manager, alias="escalated")
 
 
 def _sse_frame(payload: object) -> bytes:

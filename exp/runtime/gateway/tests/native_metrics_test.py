@@ -19,7 +19,6 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -27,17 +26,10 @@ from threading import Thread
 import httpx
 import pytest
 
-from exp.common.models import (
-    GatewayDeploymentCapabilities,
-    GatewayEquivalenceCertification,
-    GatewayTokenPrices,
-    ModelCapabilities,
+from exp.runtime.gateway.lifecycle_test import (
+    _activate_certified_pool_alias,
+    _configured_gateway,
 )
-from exp.runtime.gateway.catalog_authority import (
-    upsert_certified_pool,
-    upsert_singleton_deployment,
-)
-from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_metrics_text import METRICS_CONTENT_TYPE
 
@@ -127,52 +119,8 @@ def _unused_port() -> int:
 
 
 def _activate_escalating_alias(root: Path, manager: GatewayManagement) -> None:
-    """Grant one certified multi-deployment pool alias, so admission escalates.
-
-    Every granted provider now has a native dialect; the multi-deployment
-    waterfall is the remaining surface the python engine owns, so it is the
-    escalated-by-construction route.
-    """
-    for deployment_alias, provider_model in (
-        ("escalated-a", "pool-model-a"),
-        ("escalated-b", "pool-model-b"),
-    ):
-        normalized, _snapshot_path, _changed = upsert_singleton_deployment(
-            root,
-            deployment_alias=deployment_alias,
-            connection_name="provider-main",
-            provider_model=provider_model,
-            exact_model_id="pool-revision-exact",
-            revision=None,
-            capabilities=ModelCapabilities(),
-            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
-            prices=GatewayTokenPrices(),
-            pricing_source=None,
-            replace=False,
-        )
-    normalized, snapshot, _changed = upsert_certified_pool(
-        root,
-        pool_id="gem",
-        exact_model_id="pool-revision-exact",
-        deployment_aliases=("escalated-a", "escalated-b"),
-        certification=GatewayEquivalenceCertification(
-            certification_id="certification-escalated",
-            provenance="operator-reviewed deployment manifests",
-            evidence_sha256="a" * 64,
-            certified_at=datetime(2026, 8, 24, tzinfo=UTC),
-        ),
-        expected_catalog_sha256=normalized.identity_sha256(),
-        replace=False,
-    )
-    manager.activate_direct_alias(
-        alias_id="gem",
-        alias_name="gem",
-        revision_id="revision-gem",
-        pool_id="gem",
-        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-        catalog_sha256=normalized.identity_sha256(),
-    )
-    manager.add_grant(identity_id="default", alias_id="gem")
+    """Grant one certified multi-deployment pool alias, so admission escalates."""
+    _activate_certified_pool_alias(root, manager, alias="gem")
 
 
 def _wait_live(port: int, child: subprocess.Popen[bytes]) -> None:

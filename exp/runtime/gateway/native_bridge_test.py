@@ -33,7 +33,10 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.discovery import listing_metadata_by_alias
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import _ReadyControlStore, load_gateway_components
-from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.lifecycle_test import (
+    _activate_certified_pool_alias,
+    _configured_gateway,
+)
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
@@ -371,60 +374,8 @@ def test_admit_escalates_multi_deployment_pools_before_accounting(
     is the remaining python-engine surface, so a pool alias is the
     escalated-by-construction route.
     """
-    from datetime import UTC, datetime
-
-    from exp.common.models import (
-        GatewayDeploymentCapabilities,
-        GatewayEquivalenceCertification,
-        GatewayTokenPrices,
-        ModelCapabilities,
-    )
-    from exp.runtime.gateway.catalog_authority import (
-        upsert_certified_pool,
-        upsert_singleton_deployment,
-    )
-
     manager, raw_key = _configured_gateway(tmp_path)
-    for deployment_alias, provider_model in (
-        ("pool-a", "pool-model-a"),
-        ("pool-b", "pool-model-b"),
-    ):
-        normalized, _snapshot_path, _changed = upsert_singleton_deployment(
-            tmp_path,
-            deployment_alias=deployment_alias,
-            connection_name="provider-main",
-            provider_model=provider_model,
-            exact_model_id="pool-revision-exact",
-            revision=None,
-            capabilities=ModelCapabilities(),
-            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
-            prices=GatewayTokenPrices(),
-            pricing_source=None,
-            replace=False,
-        )
-    normalized, snapshot, _changed = upsert_certified_pool(
-        tmp_path,
-        pool_id="pooled",
-        exact_model_id="pool-revision-exact",
-        deployment_aliases=("pool-a", "pool-b"),
-        certification=GatewayEquivalenceCertification(
-            certification_id="certification-pooled",
-            provenance="operator-reviewed deployment manifests",
-            evidence_sha256="a" * 64,
-            certified_at=datetime(2026, 8, 24, tzinfo=UTC),
-        ),
-        expected_catalog_sha256=normalized.identity_sha256(),
-        replace=False,
-    )
-    manager.activate_direct_alias(
-        alias_id="pooled",
-        alias_name="pooled",
-        revision_id="revision-pooled",
-        pool_id="pooled",
-        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-        catalog_sha256=normalized.identity_sha256(),
-    )
-    manager.add_grant(identity_id="default", alias_id="pooled")
+    _activate_certified_pool_alias(tmp_path, manager, alias="pooled")
     components = load_gateway_components(
         tmp_path,
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
@@ -502,12 +453,13 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
     )
     body = admission["upstream_body"]
     assert isinstance(body, str)
-    payload = admission["upstream_payload"]
-    assert isinstance(payload, dict)
-    # The frozen body is the exact compact serialization of the payload the
-    # shared builders produced; the SigV4 signature covers these bytes.
+    # The frozen body is the only body channel for a signed dispatch; the
+    # structured payload is not shipped twice across the boundary.
+    assert admission["upstream_payload"] is None
+    payload = json.loads(body)
     assert body == json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     assert "modelId" not in payload
+    assert payload["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
     headers = admission["headers"]
     assert isinstance(headers, dict)
     assert headers["X-Amz-Security-Token"] == "session-token-canary"

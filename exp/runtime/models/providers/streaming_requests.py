@@ -10,7 +10,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
-from exp.runtime.models.providers.bedrock_requests import converse_request
+from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderResponseError
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -217,15 +217,15 @@ def gemini_generate_content_stream_payload(model_id: str, request: GatewayReques
 def bedrock_converse_stream_payload(model_id: str, request: GatewayRequest) -> JsonObject:
     """Translate one canonical request to the native ConverseStream REST body.
 
-    The payload is built by the exact converter the Bedrock provider client
+    The body is built by the exact converter the Bedrock provider client
     uses (canonical request through the shared model adapter, then the shared
-    Converse builder), so both engines send one identical body. On the REST
-    route the model travels in the URL path, so the boto-style ``modelId``
-    routing key is removed from the body; streaming is selected by the
-    ``converse-stream`` route itself.
+    Converse body builder), so both engines send one identical document. On
+    the REST route the model travels in the URL path, never the body, and
+    streaming is selected by the ``converse-stream`` route itself.
 
     Args:
-        model_id: Exact Bedrock model or inference-profile identifier.
+        model_id: Exact Bedrock model or inference-profile identifier; it
+            travels in the wire profile URL and keeps the dispatch signature.
         request: Canonical gateway request.
 
     Returns:
@@ -235,12 +235,11 @@ def bedrock_converse_stream_payload(model_id: str, request: GatewayRequest) -> J
         ProviderResponseError: A message cannot be represented without
             dropping tool context.
     """
+    del model_id
     try:
-        payload = converse_request(model_id, gateway_model_request(request))
+        return converse_body(gateway_model_request(request))
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc
-    payload.pop("modelId", None)
-    return payload
 
 
 def openai_compatible_stream_payload(

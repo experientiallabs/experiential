@@ -16,14 +16,33 @@ from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 
 
 def converse_request(model_id: str, request: ModelRequest) -> JsonObject:
-    """Translate one EXP request into a Bedrock Converse payload.
+    """Translate one EXP request into boto Converse keyword arguments.
 
     Args:
-        model_id: Exact foundation-model or inference-profile ID sent on the wire.
+        model_id: Exact foundation-model or inference-profile ID sent as the
+            boto ``modelId`` routing key.
         request: Typed EXP request.
 
     Returns:
         Keyword arguments accepted by ``bedrock-runtime`` Converse.
+
+    Raises:
+        ValueError: A message cannot be represented without dropping tool context.
+    """
+    return {"modelId": model_id, **converse_body(request)}
+
+
+def converse_body(request: ModelRequest) -> JsonObject:
+    """Translate one EXP request into the Converse wire document.
+
+    The body carries no routing key: boto callers splice ``modelId`` beside it
+    and the ConverseStream REST route carries the model in the URL path.
+
+    Args:
+        request: Typed EXP request.
+
+    Returns:
+        The native Converse request document.
 
     Raises:
         ValueError: A message cannot be represented without dropping tool context.
@@ -63,10 +82,7 @@ def converse_request(model_id: str, request: ModelRequest) -> JsonObject:
             _message_blocks(message),
         )
 
-    payload: JsonObject = {
-        "modelId": model_id,
-        "messages": messages,
-    }
+    payload: JsonObject = {"messages": messages}
     inference = _inference_config(request)
     if inference:
         payload["inferenceConfig"] = inference

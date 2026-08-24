@@ -1379,6 +1379,65 @@ def _configured_gateway(
     return manager, issued.raw_key
 
 
+def _activate_certified_pool_alias(
+    root: Path,
+    manager: GatewayManagement,
+    *,
+    alias: str,
+) -> None:
+    """Grant one certified two-deployment pool alias on ``provider-main``.
+
+    Every granted provider has a native dialect, so a certified
+    multi-deployment pool is the escalated-by-construction route the native
+    engine hands to the embedded python engine's waterfall. Shared by the
+    native bridge, metrics, and dead-fallback tests.
+
+    Args:
+        root: Seeded gateway root that already holds ``provider-main``.
+        manager: Management handle over the same root.
+        alias: Public alias, pool ID, and deployment-alias prefix.
+    """
+    normalized = None
+    for suffix in ("a", "b"):
+        normalized, _snapshot_path, _changed = upsert_singleton_deployment(
+            root,
+            deployment_alias=f"{alias}-{suffix}",
+            connection_name="provider-main",
+            provider_model=f"{alias}-model-{suffix}",
+            exact_model_id=f"{alias}-revision-exact",
+            revision=None,
+            capabilities=ModelCapabilities(),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            prices=GatewayTokenPrices(),
+            pricing_source=None,
+            replace=False,
+        )
+    assert normalized is not None
+    normalized, snapshot, _changed = upsert_certified_pool(
+        root,
+        pool_id=alias,
+        exact_model_id=f"{alias}-revision-exact",
+        deployment_aliases=(f"{alias}-a", f"{alias}-b"),
+        certification=GatewayEquivalenceCertification(
+            certification_id=f"certification-{alias}",
+            provenance="operator-reviewed deployment manifests",
+            evidence_sha256="a" * 64,
+            certified_at=datetime(2026, 8, 24, tzinfo=UTC),
+        ),
+        expected_catalog_sha256=normalized.identity_sha256(),
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id=alias,
+        alias_name=alias,
+        revision_id=f"revision-{alias}",
+        pool_id=alias,
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id=alias)
+
+
 def _configured_project_pool(
     root: Path,
     *,

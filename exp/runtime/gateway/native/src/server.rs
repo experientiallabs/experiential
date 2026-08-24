@@ -138,10 +138,14 @@ struct Admission {
     url: String,
     headers: HashMap<String, String>,
     timeout_seconds: f64,
+    /// Structured payload the data plane serializes itself; null for
+    /// body-signing dialects, whose admission carries `upstream_body`.
+    #[serde(default)]
     upstream_payload: Value,
     /// Exact pre-serialized body for body-signing dialects (Bedrock SigV4).
     /// When present it is sent verbatim: the signature covers these exact
-    /// bytes, so re-serializing `upstream_payload` here could invalidate it.
+    /// bytes, so re-serializing a structured payload here could invalidate
+    /// it.
     #[serde(default)]
     upstream_body: Option<String>,
     idempotency_key: String,
@@ -565,7 +569,7 @@ fn latin1_header(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// Re-encode one latin-1 decoded header value to its original bytes.
-fn latin1_bytes(value: &str) -> Vec<u8> {
+pub(crate) fn latin1_bytes(value: &str) -> Vec<u8> {
     value
         .chars()
         .map(|character| {

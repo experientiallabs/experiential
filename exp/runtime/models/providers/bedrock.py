@@ -252,6 +252,8 @@ class BedrockClient:
         self._runtime_factory = runtime_factory
         self._retry_policy = retry_policy
         self._client: BedrockRuntime | None = None
+        self._region: str | None = None
+        self._signing_credentials: _ResolvableCredentials | None = None
         self._lock = threading.Lock()
 
     def complete(self, request: ModelRequest) -> ModelResponse:
@@ -346,16 +348,45 @@ class BedrockClient:
             return self._client
 
     def _region_name(self) -> str:
-        """Resolve the region used for this client without catalog-time metadata probes."""
+        """Resolve the region used for this client without catalog-time metadata probes.
+
+        The first successful resolution is cached: the catalog identity is
+        frozen for the client's lifetime, and re-reading the boto session
+        chain (shared-config files) on every dispatch would be wasted work.
+        An unresolvable region is never cached, so fixing the environment
+        takes effect on the next call.
+        """
+        cached = self._region
+        if cached is not None:
+            return cached
         region = resolve_bedrock_region(self._configured_region, self._environment)
-        if region:
-            return region
-        if self._runtime_factory is not None:
+        if not region and self._runtime_factory is None:
+            region = _boto_session_region()
+        if not region:
             raise BedrockRegionError(NO_REGION_ERROR)
-        session_region = _boto_session_region()
-        if session_region:
-            return session_region
-        raise BedrockRegionError(NO_REGION_ERROR)
+        self._region = region
+        return region
+
+    def _resolved_signing_credentials(self) -> _ResolvableCredentials:
+        """Resolve the AWS credential chain once and reuse it per signature.
+
+        The returned botocore credential object refreshes itself (roles,
+        SSO), so caching it avoids re-reading the chain per request while
+        every signature still freezes a current snapshot.
+
+        Raises:
+            ProviderTransportError: No AWS credentials resolve from the chain.
+        """
+        with self._lock:
+            if self._signing_credentials is None:
+                self._signing_credentials = _import_boto3().Session().get_credentials()
+            credentials = self._signing_credentials
+        if credentials is None:
+            raise ProviderTransportError(
+                "Bedrock has no AWS credentials. Configure the standard chain "
+                "(environment keys, a profile, or an instance role)."
+            )
+        return credentials
 
     @property
     def model_id(self) -> str:
@@ -405,13 +436,7 @@ class BedrockClient:
         """
         region = self._region_name()
         auth_factory, request_factory = _import_botocore_signing()
-        raw_credentials = _import_boto3().Session().get_credentials()
-        if raw_credentials is None:
-            raise ProviderTransportError(
-                "Bedrock has no AWS credentials. Configure the standard chain "
-                "(environment keys, a profile, or an instance role)."
-            )
-        frozen = raw_credentials.get_frozen_credentials()
+        frozen = self._resolved_signing_credentials().get_frozen_credentials()
         request = request_factory(
             method="POST",
             url=url,

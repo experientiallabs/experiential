@@ -1,4 +1,7 @@
-"""Admission-time dispatch freezing for body-signing native dialects.
+"""Admission-time wire-profile resolution and dispatch freezing.
+
+The native control plane resolves each admitted route's wire profile and
+client here, then freezes the dispatch for body-signing dialects.
 
 Most dialects send static credential headers and let the data plane serialize
 the upstream payload itself. Body-signing dialects (Bedrock SigV4) compute
@@ -14,7 +17,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Protocol
 
 from exp.common.core.artifacts import JsonObject
 
@@ -25,22 +27,15 @@ from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
-from exp.runtime.models.registry import ResolvedModel
+from exp.runtime.models.registry import RuntimeModelCatalog
 
 
 class NativeDialectUnavailableError(RuntimeError):
     """The resolved provider has no native dialect; python must serve it."""
 
 
-class _RuntimeCatalog(Protocol):
-    """Loaded runtime catalog surface the wire resolver needs."""
-
-    def resolve(self, alias: str) -> ResolvedModel:
-        """Return the resolved deployment client for one source alias."""
-
-
 def resolve_wire_profile(
-    runtime_catalogs: Mapping[tuple[str, str], _RuntimeCatalog],
+    runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog],
     route: GatewayRoute,
 ) -> tuple[GatewayWireProfile, NativeWireClient]:
     """Resolve one deployment's public wire profile for the data plane.

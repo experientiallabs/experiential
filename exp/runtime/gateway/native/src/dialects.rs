@@ -9,8 +9,8 @@ use serde_json::{Map, Value};
 
 use crate::errors::{Failure, FailureClass};
 use crate::events::{
-    count_or_zero, openai_compatible_usage, openai_usage, require_string, require_u64, Event,
-    ToolAccumulator, Usage,
+    bedrock_usage, count_or_zero, gemini_usage, openai_compatible_usage, openai_usage,
+    require_string, require_u64, simplified_event, Event, ToolAccumulator, Usage,
 };
 use crate::eventstream::EventStreamDecoder;
 use crate::sse::{SseDecoder, SseEvent};
@@ -50,7 +50,10 @@ impl FrameDecoder {
     pub fn new(dialect: Dialect) -> Self {
         match dialect {
             Dialect::BedrockConverseStream => FrameDecoder::EventStream(EventStreamDecoder::new()),
-            _ => FrameDecoder::Sse(SseDecoder::new()),
+            Dialect::OpenAiResponses
+            | Dialect::AnthropicMessages
+            | Dialect::OpenAiCompatible
+            | Dialect::GeminiGenerateContent => FrameDecoder::Sse(SseDecoder::new()),
         }
     }
 
@@ -795,13 +798,12 @@ impl Normalizer {
             Some(Value::String(id)) if !id.is_empty() => id.clone(),
             _ => format!("gemini-call-{index}"),
         };
-        let arguments = match call.get("args") {
-            None => Value::Object(Map::new()),
-            Some(Value::Object(map)) => Value::Object(map.clone()),
+        let raw_arguments = match call.get("args") {
+            None => "{}".to_string(),
+            Some(arguments @ Value::Object(_)) => serde_json::to_string(arguments)
+                .map_err(|_| malformed("Gemini functionCall args must be an object"))?,
             Some(_) => return Err(malformed("Gemini functionCall args must be an object")),
         };
-        let raw_arguments = serde_json::to_string(&arguments)
-            .map_err(|_| malformed("Gemini functionCall args must be an object"))?;
         self.reserve_tool_bytes(raw_arguments.len())?;
         let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
         tool.raw_arguments = raw_arguments.clone();
@@ -956,10 +958,9 @@ impl Normalizer {
         let payload = parse_object(&frame.data)?;
         let index = require_u64(&payload, "contentBlockIndex", "Bedrock contentBlockIndex")
             .map_err(|message| malformed(&message))? as u32;
-        let Some(mut tool) = self.tools.remove(&index) else {
+        let Some(tool) = self.tools.remove(&index) else {
             return Ok(Vec::new());
         };
-        tool.completed = true;
         let call = tool.complete().map_err(|message| malformed(&message))?;
         Ok(vec![Event::ToolCallCompleted { index, call }])
     }
@@ -967,32 +968,8 @@ impl Normalizer {
     /// Flush Bedrock usage and, once the stop reason is retained, terminate.
     fn bedrock_metadata(&mut self, frame: &SseEvent) -> Result<Vec<Event>, Failure> {
         let payload = parse_object(&frame.data)?;
-        let usage = payload
-            .get("usage")
-            .and_then(Value::as_object)
-            .ok_or_else(|| malformed("Bedrock metadata.usage must be an object"))?;
-        let fresh = count_or_zero(usage, "inputTokens", "Bedrock inputTokens")
-            .map_err(|message| malformed(&message))?;
-        let cache_read = count_or_zero(
-            usage,
-            "cacheReadInputTokens",
-            "Bedrock cacheReadInputTokens",
-        )
-        .map_err(|message| malformed(&message))?;
-        let cache_write = count_or_zero(
-            usage,
-            "cacheWriteInputTokens",
-            "Bedrock cacheWriteInputTokens",
-        )
-        .map_err(|message| malformed(&message))?;
-        let output_tokens = count_or_zero(usage, "outputTokens", "Bedrock outputTokens")
-            .map_err(|message| malformed(&message))?;
-        let mut events = vec![Event::Usage(Usage {
-            input_tokens: Some(fresh + cache_read + cache_write),
-            output_tokens: Some(output_tokens),
-            cached_input_tokens: Some(cache_read),
-            reasoning_tokens: None,
-        })];
+        let usage = bedrock_usage(payload.get("usage")).map_err(|message| malformed(&message))?;
+        let mut events = vec![Event::Usage(usage)];
         if let Some(reason) = self.stop_reason.take() {
             events.push(self.bedrock_terminal(&reason));
         }
@@ -1020,87 +997,55 @@ impl Normalizer {
     }
 }
 
-/// Parse Gemini `usageMetadata`, mirroring the python `_usage` normalizer:
-/// cached tokens are an input subset, absent counts are zero (`require_integer`
-/// parity), and `thoughtsTokenCount` stays unknown when omitted.
-fn gemini_usage(value: &Value) -> Result<Usage, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "Gemini usageMetadata must be an object".to_string())?;
-    let reasoning_tokens = match object.get("thoughtsTokenCount") {
-        None | Some(Value::Null) => None,
-        Some(_) => Some(count_or_zero(
-            object,
-            "thoughtsTokenCount",
-            "Gemini thoughtsTokenCount",
-        )?),
-    };
-    Ok(Usage {
-        input_tokens: Some(count_or_zero(
-            object,
-            "promptTokenCount",
-            "Gemini promptTokenCount",
-        )?),
-        output_tokens: Some(count_or_zero(
-            object,
-            "candidatesTokenCount",
-            "Gemini candidatesTokenCount",
-        )?),
-        cached_input_tokens: Some(count_or_zero(
-            object,
-            "cachedContentTokenCount",
-            "Gemini cachedContentTokenCount",
-        )?),
-        reasoning_tokens,
-    })
+/// Drain one raw provider byte stream through the dialect's frame decoder and
+/// normalizer, mirroring the server's collection order, and return simplified
+/// canonical events plus the failure that ended the stream (when one did).
+/// Shared by the parity-fixture entry point and the golden-fixture tests so
+/// exactly one drive loop mirrors the server.
+pub fn drain_stream_fixture(dialect: Dialect, chunks: &[Vec<u8>]) -> (Vec<Value>, Option<Failure>) {
+    let mut normalizer = Normalizer::new(dialect);
+    let mut decoder = FrameDecoder::new(dialect);
+    let mut simplified = Vec::new();
+    for chunk in chunks {
+        let frames = match decoder.feed(chunk) {
+            Ok(frames) => frames,
+            Err(message) => return (simplified, Some(malformed(&message))),
+        };
+        for frame in frames {
+            match normalizer.feed(&frame) {
+                Ok(events) => simplified.extend(events.iter().map(simplified_event)),
+                Err(failure) => return (simplified, Some(failure)),
+            }
+            if normalizer.saw_terminal() {
+                return (simplified, None);
+            }
+        }
+    }
+    match decoder.finish() {
+        Ok(Some(frame)) => match normalizer.feed(&frame) {
+            Ok(events) => simplified.extend(events.iter().map(simplified_event)),
+            Err(failure) => return (simplified, Some(failure)),
+        },
+        Ok(None) => {}
+        Err(message) => return (simplified, Some(malformed(&message))),
+    }
+    if normalizer.saw_terminal() {
+        return (simplified, None);
+    }
+    match normalizer.stream_ended() {
+        Ok(()) => (simplified, None),
+        Err(failure) => (simplified, Some(failure)),
+    }
 }
 
 #[cfg(test)]
 mod gemini_tests {
     use super::*;
-    use crate::events::simplified_event;
-    use crate::sse::SseDecoder;
     use serde_json::json;
 
-    /// Drain one raw SSE byte stream through the decoder and normalizer the
-    /// way the server's collection loop does, returning simplified events and
-    /// the failure that ended the stream, when one did.
     fn run_stream(dialect: Dialect, chunks: &[&[u8]]) -> (Vec<Value>, Option<Failure>) {
-        let mut normalizer = Normalizer::new(dialect);
-        let mut decoder = SseDecoder::new();
-        let mut simplified = Vec::new();
-        for chunk in chunks {
-            let frames = match decoder.feed(chunk) {
-                Ok(frames) => frames,
-                Err(message) => return (simplified, Some(malformed(&message))),
-            };
-            for frame in frames {
-                match normalizer.feed(&frame) {
-                    Ok(events) => {
-                        simplified.extend(events.iter().map(simplified_event));
-                    }
-                    Err(failure) => return (simplified, Some(failure)),
-                }
-                if normalizer.saw_terminal() {
-                    return (simplified, None);
-                }
-            }
-        }
-        match decoder.finish() {
-            Ok(Some(frame)) => match normalizer.feed(&frame) {
-                Ok(events) => simplified.extend(events.iter().map(simplified_event)),
-                Err(failure) => return (simplified, Some(failure)),
-            },
-            Ok(None) => {}
-            Err(message) => return (simplified, Some(malformed(&message))),
-        }
-        if normalizer.saw_terminal() {
-            return (simplified, None);
-        }
-        match normalizer.stream_ended() {
-            Ok(()) => (simplified, None),
-            Err(failure) => (simplified, Some(failure)),
-        }
+        let owned: Vec<Vec<u8>> = chunks.iter().map(|chunk| chunk.to_vec()).collect();
+        drain_stream_fixture(dialect, &owned)
     }
 
     fn sse(payload: &Value) -> Vec<u8> {
@@ -1320,46 +1265,11 @@ mod gemini_tests {
 #[cfg(test)]
 mod bedrock_tests {
     use super::*;
-    use crate::events::simplified_event;
     use crate::eventstream::encode_message;
     use serde_json::json;
 
-    /// Drain one raw event-stream byte stream through the frame decoder and
-    /// normalizer the way the server's collection loop does.
     fn run_stream(chunks: &[Vec<u8>]) -> (Vec<Value>, Option<Failure>) {
-        let mut normalizer = Normalizer::new(Dialect::BedrockConverseStream);
-        let mut decoder = FrameDecoder::new(Dialect::BedrockConverseStream);
-        let mut simplified = Vec::new();
-        for chunk in chunks {
-            let frames = match decoder.feed(chunk) {
-                Ok(frames) => frames,
-                Err(message) => return (simplified, Some(malformed(&message))),
-            };
-            for frame in frames {
-                match normalizer.feed(&frame) {
-                    Ok(events) => simplified.extend(events.iter().map(simplified_event)),
-                    Err(failure) => return (simplified, Some(failure)),
-                }
-                if normalizer.saw_terminal() {
-                    return (simplified, None);
-                }
-            }
-        }
-        match decoder.finish() {
-            Ok(Some(frame)) => match normalizer.feed(&frame) {
-                Ok(events) => simplified.extend(events.iter().map(simplified_event)),
-                Err(failure) => return (simplified, Some(failure)),
-            },
-            Ok(None) => {}
-            Err(message) => return (simplified, Some(malformed(&message))),
-        }
-        if normalizer.saw_terminal() {
-            return (simplified, None);
-        }
-        match normalizer.stream_ended() {
-            Ok(()) => (simplified, None),
-            Err(failure) => (simplified, Some(failure)),
-        }
+        drain_stream_fixture(Dialect::BedrockConverseStream, chunks)
     }
 
     fn event(name: &str, payload: &Value) -> Vec<u8> {

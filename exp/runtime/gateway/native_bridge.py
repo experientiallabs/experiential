@@ -367,7 +367,7 @@ class NativeControlPlane:
         wire_client: NativeWireClient | None = None
         try:
             route = self._resolve_route(authorization, request)
-            profile, wire_client = self._wire_profile(route)
+            profile, wire_client = resolve_wire_profile(self._components.runtime_catalogs, route)
         except NativeDialectUnavailableError as exc:
             return _escalation(str(exc))
         except Exception as exc:  # noqa: BLE001 - recorded after acceptance below.
@@ -464,7 +464,10 @@ class NativeControlPlane:
             "headers": dispatch_headers,
             "model_id": profile.model_id,
             "timeout_seconds": profile.timeout_seconds,
-            "upstream_payload": upstream_payload,
+            # A signed dispatch carries only the frozen body string; shipping
+            # the structured payload too would double the boundary bytes for
+            # a value the data plane must not re-serialize anyway.
+            "upstream_payload": None if upstream_body is not None else upstream_payload,
             "upstream_body": upstream_body,
             "idempotency_key": deployment_operation_key(route),
             "output_guardrail": bool(policy is not None and policy.output_checks),
@@ -545,7 +548,7 @@ class NativeControlPlane:
             return _escalation("project-backed aliases use learned selection on the python engine")
         try:
             route = self._components.routes.resolve_direct(authorization)
-            self._wire_profile(route)
+            resolve_wire_profile(self._components.runtime_catalogs, route)
         except NativeDialectUnavailableError as exc:
             return _escalation(str(exc))
         except Exception:  # noqa: BLE001 - the owner's admission records this failure.
@@ -847,10 +850,6 @@ class NativeControlPlane:
             request=request,
             episode_namespace=episode,
         )
-
-    def _wire_profile(self, route: GatewayRoute) -> tuple[GatewayWireProfile, NativeWireClient]:
-        """Resolve one route's wire profile and client through the shared seam."""
-        return resolve_wire_profile(self._components.runtime_catalogs, route)
 
     def _sweep_loop(self) -> None:
         """Run the settlement sweep on a timer for the process lifetime."""

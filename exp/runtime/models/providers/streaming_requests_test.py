@@ -8,7 +8,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.bedrock_requests import converse_request
+from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.streaming_requests import (
@@ -174,9 +174,7 @@ def test_bedrock_stream_payload_matches_the_provider_builder_without_model_id() 
     request = _chat_request(temperature=0.2)
     payload = bedrock_converse_stream_payload("us.anthropic.claude-sonnet-4-5", request)
 
-    expected = converse_request("us.anthropic.claude-sonnet-4-5", model_request(request))
-    expected.pop("modelId")
-    assert payload == expected
+    assert payload == converse_body(model_request(request))
     assert "modelId" not in payload
     assert payload["messages"] == [{"role": "user", "content": [{"text": "hello"}]}]
     inference = payload["inferenceConfig"]

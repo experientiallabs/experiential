@@ -148,53 +148,11 @@ fn normalize_stream_fixture(dialect: &str, chunks_json: &str) -> PyResult<String
         .ok_or_else(|| PyValueError::new_err(format!("unknown dialect: {dialect}")))?;
     let chunks: Vec<String> = serde_json::from_str(chunks_json)
         .map_err(|error| PyValueError::new_err(format!("invalid chunks: {error}")))?;
-    let mut normalizer = dialects::Normalizer::new(dialect);
-    let mut decoder = dialects::FrameDecoder::new(dialect);
-    let mut simplified: Vec<serde_json::Value> = Vec::new();
-    let mut failure: Option<errors::Failure> = None;
-    'chunks: for chunk in &chunks {
-        let bytes = latin1_chunk_bytes(chunk);
-        let frames = match decoder.feed(&bytes) {
-            Ok(frames) => frames,
-            Err(message) => {
-                failure = Some(errors::Failure::new(
-                    errors::FailureClass::MalformedResponse,
-                    &message,
-                ));
-                break 'chunks;
-            }
-        };
-        for frame in frames {
-            match normalizer.feed(&frame) {
-                Ok(events) => simplified.extend(events.iter().map(events::simplified_event)),
-                Err(ended) => {
-                    failure = Some(ended);
-                    break 'chunks;
-                }
-            }
-            if normalizer.saw_terminal() {
-                break 'chunks;
-            }
-        }
-    }
-    if failure.is_none() && !normalizer.saw_terminal() {
-        match decoder.finish() {
-            Ok(Some(frame)) => match normalizer.feed(&frame) {
-                Ok(events) => simplified.extend(events.iter().map(events::simplified_event)),
-                Err(ended) => failure = Some(ended),
-            },
-            Ok(None) => {}
-            Err(message) => {
-                failure = Some(errors::Failure::new(
-                    errors::FailureClass::MalformedResponse,
-                    &message,
-                ));
-            }
-        }
-        if failure.is_none() && !normalizer.saw_terminal() {
-            failure = normalizer.stream_ended().err();
-        }
-    }
+    let bytes: Vec<Vec<u8>> = chunks
+        .iter()
+        .map(|chunk| server::latin1_bytes(chunk))
+        .collect();
+    let (simplified, failure) = dialects::drain_stream_fixture(dialect, &bytes);
     let body = serde_json::json!({
         "events": simplified,
         "failure": failure.map(|failure| serde_json::json!({
@@ -203,21 +161,6 @@ fn normalize_stream_fixture(dialect: &str, chunks_json: &str) -> PyResult<String
         })),
     });
     Ok(body.to_string())
-}
-
-/// Decode one latin-1 fixture chunk string back to its raw bytes.
-fn latin1_chunk_bytes(chunk: &str) -> Vec<u8> {
-    chunk
-        .chars()
-        .map(|character| {
-            let code = character as u32;
-            if code < 256 {
-                code as u8
-            } else {
-                b'?'
-            }
-        })
-        .collect()
 }
 
 /// Map one failure class and safe message to the Rust public-error JSON for

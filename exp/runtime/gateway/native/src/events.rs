@@ -258,6 +258,72 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
     })
 }
 
+/// Parse Gemini `usageMetadata`, mirroring the python `_usage` normalizer:
+/// cached tokens are an input subset, absent counts are zero (`require_integer`
+/// parity), and `thoughtsTokenCount` stays unknown when omitted.
+pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Gemini usageMetadata must be an object".to_string())?;
+    let reasoning_tokens = match object.get("thoughtsTokenCount") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(count_or_zero(
+            object,
+            "thoughtsTokenCount",
+            "Gemini thoughtsTokenCount",
+        )?),
+    };
+    Ok(Usage {
+        input_tokens: Some(count_or_zero(
+            object,
+            "promptTokenCount",
+            "Gemini promptTokenCount",
+        )?),
+        output_tokens: Some(count_or_zero(
+            object,
+            "candidatesTokenCount",
+            "Gemini candidatesTokenCount",
+        )?),
+        cached_input_tokens: Some(count_or_zero(
+            object,
+            "cachedContentTokenCount",
+            "Gemini cachedContentTokenCount",
+        )?),
+        reasoning_tokens,
+    })
+}
+
+/// Parse Bedrock `metadata.usage`, mirroring the python `_usage` normalizer:
+/// cache read and write legs fold into total input (saturating so
+/// individually valid legs cannot wrap), cached input reports the read leg,
+/// and absent counts are zero (`require_integer` parity).
+pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
+    let usage = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Bedrock metadata.usage must be an object".to_string())?;
+    let fresh = count_or_zero(usage, "inputTokens", "Bedrock inputTokens")?;
+    let cache_read = count_or_zero(
+        usage,
+        "cacheReadInputTokens",
+        "Bedrock cacheReadInputTokens",
+    )?;
+    let cache_write = count_or_zero(
+        usage,
+        "cacheWriteInputTokens",
+        "Bedrock cacheWriteInputTokens",
+    )?;
+    Ok(Usage {
+        input_tokens: Some(fresh.saturating_add(cache_read).saturating_add(cache_write)),
+        output_tokens: Some(count_or_zero(
+            usage,
+            "outputTokens",
+            "Bedrock outputTokens",
+        )?),
+        cached_input_tokens: Some(cache_read),
+        reasoning_tokens: None,
+    })
+}
+
 /// Fetch a required string field from a provider JSON object.
 pub fn require_string(
     object: &Map<String, Value>,
