@@ -29,16 +29,12 @@ def _absorb_abandoned(task: Future[object]) -> None:
 class _IsolationWorker:
     """One daemon thread that owns a private event loop for isolated inspects."""
 
-    def __init__(self, *, start_timeout: float = _WORKER_START_TIMEOUT_SECONDS) -> None:
-        """Start the worker loop before returning.
-
-        Args:
-            start_timeout: Seconds to wait for the daemon loop to become ready.
-
-        Raises:
-            RuntimeError: The worker loop did not start in time.
-        """
+    def __init__(self) -> None:
+        """Start the worker thread without waiting for its loop."""
         self._ready = threading.Event()
+        self._start_lock = threading.Lock()
+        self._start_error: BaseException | None = None
+        self._started_callbacks: list[Callable[[BaseException | None], None]] = []
         self._loop: asyncio.AbstractEventLoop | None = None
         self._generation = 0
         self._active_generation = 0
@@ -50,11 +46,6 @@ class _IsolationWorker:
             daemon=True,
         )
         self._thread.start()
-        if not self._ready.wait(timeout=start_timeout):
-            raise RuntimeError("classifier isolation loop failed to start")
-        loop = self._loop
-        if loop is None or not loop.is_running() or not self._thread.is_alive():
-            raise RuntimeError("classifier isolation loop failed to start")
 
     def submit[T](self, fn: Callable[[], Coroutine[object, object, T]]) -> tuple[Future[T], int]:
         """Schedule ``fn`` on this worker and return its future plus generation.
@@ -134,17 +125,101 @@ class _IsolationWorker:
 
         loop.call_soon_threadsafe(cancel)
 
+    def on_started(self, callback: Callable[[BaseException | None], None]) -> None:
+        """Invoke ``callback`` once this worker has started or failed.
+
+        Args:
+            callback: Receives ``None`` on success or the startup error.
+                Already-started workers invoke it immediately on this thread.
+        """
+        with self._start_lock:
+            if not self._ready.is_set():
+                self._started_callbacks.append(callback)
+                return
+            error = self._start_error
+        callback(error)
+
+    def attach_ready_waiter(self) -> asyncio.Future[None]:
+        """Return a future that completes when this worker starts or fails.
+
+        Returns:
+            A future bound to the caller event loop. It is already done when
+            the worker has started, so a zero-timeout wait can still succeed.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+
+        def done(error: BaseException | None) -> None:
+            """Complete ``future`` on the caller loop."""
+
+            def complete() -> None:
+                """Copy the startup outcome onto ``future``."""
+                if future.done():
+                    return
+                if error is not None:
+                    future.set_exception(error)
+                    return
+                future.set_result(None)
+
+            try:
+                if loop is asyncio.get_running_loop():
+                    complete()
+                    return
+            except RuntimeError:
+                pass
+            try:
+                loop.call_soon_threadsafe(complete)
+            except RuntimeError:
+                return
+
+        self.on_started(done)
+        return future
+
+    def assert_running(self) -> None:
+        """Raise when this worker's loop is not available for inspects.
+
+        Raises:
+            RuntimeError: Startup failed or the daemon loop is not running.
+        """
+        loop = self._loop
+        if (
+            self._start_error is not None
+            or loop is None
+            or not loop.is_running()
+            or not self._thread.is_alive()
+        ):
+            raise RuntimeError("classifier isolation loop failed to start")
+
+    def _announce_running(self) -> None:
+        """Mark startup complete after the daemon loop is actually running."""
+        self._signal_started(None)
+
+    def _signal_started(self, error: BaseException | None) -> None:
+        """Unblock waiters exactly once with ``error`` or success."""
+        with self._start_lock:
+            if self._ready.is_set():
+                return
+            self._start_error = error
+            self._ready.set()
+            callbacks = list(self._started_callbacks)
+            self._started_callbacks.clear()
+        for callback in callbacks:
+            callback(error)
+
     def _run_forever(self) -> None:
         """Own one event loop for the life of this worker."""
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             self._loop = loop
-        except Exception:  # noqa: BLE001 - startup failure must unblock the constructor
-            self._ready.set()
+            loop.call_soon(self._announce_running)
+            loop.run_forever()
+        except BaseException as exc:  # noqa: BLE001 - startup failure must unblock waiters
+            self._signal_started(exc)
             raise
-        self._ready.set()
-        loop.run_forever()
+        finally:
+            if not self._ready.is_set():
+                self._signal_started(RuntimeError("classifier isolation loop failed to start"))
 
 
 class _IsolationPool:
@@ -179,10 +254,13 @@ class _IsolationPool:
 
         Raises:
             asyncio.CancelledError: The caller task was cancelled while waiting.
+            RuntimeError: A reserved isolation worker failed to start.
         """
-        worker = self._try_take()
-        if worker is not None:
-            return worker
+        idle, reserved = self._claim()
+        if idle is not None:
+            return idle
+        if reserved:
+            return await self._start_reserved_worker(timeout)
         if timeout <= 0:
             return None
         loop = asyncio.get_running_loop()
@@ -198,7 +276,7 @@ class _IsolationPool:
                 reserved = False
                 self._waiters.append(waiter)
         if reserved:
-            return self._start_reserved_worker()
+            return await self._start_reserved_worker(timeout)
         handle = loop.call_later(timeout, self._expire, waiter)
         try:
             return await waiter
@@ -223,16 +301,16 @@ class _IsolationPool:
                 return
             self._idle.append(worker)
 
-    def _try_take(self) -> _IsolationWorker | None:
+    def _claim(self) -> tuple[_IsolationWorker | None, bool]:
         """Take an idle worker or reserve capacity to start one."""
         with self._lock:
             worker = self._take_idle()
             if worker is not None:
-                return worker
+                return worker, False
             if self._created >= self._size:
-                return None
+                return None, False
             self._created += 1
-        return self._start_reserved_worker()
+            return None, True
 
     def _take_idle(self) -> _IsolationWorker | None:
         """Pop one idle worker. The caller must hold ``_lock``."""
@@ -240,14 +318,100 @@ class _IsolationPool:
             return None
         return self._idle.pop()
 
-    def _start_reserved_worker(self) -> _IsolationWorker:
-        """Start a worker after ``_created`` has already been incremented."""
+    async def _start_reserved_worker(self, timeout: float) -> _IsolationWorker | None:
+        """Start a reserved worker without blocking the caller event loop.
+
+        Args:
+            timeout: Remaining seconds the caller can wait for startup.
+
+        Returns:
+            The running worker, or ``None`` when ``timeout`` elapses first.
+
+        Raises:
+            asyncio.CancelledError: The caller task was cancelled while waiting.
+            RuntimeError: The reserved worker failed to start.
+        """
         try:
-            return _IsolationWorker()
-        except BaseException:
+            worker = _IsolationWorker()
+        except BaseException:  # noqa: BLE001 - thread start failure must restore pool capacity
             with self._lock:
                 self._created -= 1
             raise
+        ready = worker.attach_ready_waiter()
+        start_wait = min(max(0.0, timeout), _WORKER_START_TIMEOUT_SECONDS)
+        try:
+            await asyncio.wait_for(asyncio.shield(ready), timeout=start_wait)
+        except TimeoutError:
+            return self._adopt_or_defer(worker, ready)
+        except asyncio.CancelledError:
+            taken = self._adopt_or_defer(worker, ready)
+            if taken is not None:
+                self.release(taken)
+            raise
+        except Exception:  # noqa: BLE001 - startup errors must restore pool capacity
+            with self._lock:
+                self._created -= 1
+            raise
+        try:
+            worker.assert_running()
+        except RuntimeError:
+            with self._lock:
+                self._created -= 1
+            raise
+        return worker
+
+    def _adopt_or_defer(
+        self,
+        worker: _IsolationWorker,
+        ready: asyncio.Future[None],
+    ) -> _IsolationWorker | None:
+        """Take ``worker`` if it is already up, otherwise park it when it is.
+
+        Args:
+            worker: Isolation worker whose startup is still in flight.
+            ready: Caller-loop future attached to that startup.
+
+        Returns:
+            ``worker`` when it is already running, otherwise ``None``.
+        """
+        if ready.done():
+            if ready.cancelled() or ready.exception() is not None:
+                with self._lock:
+                    self._created -= 1
+                return None
+            try:
+                worker.assert_running()
+            except RuntimeError:
+                with self._lock:
+                    self._created -= 1
+                return None
+            return worker
+
+        def park(error: BaseException | None) -> None:
+            """Release or drop the worker once startup finishes."""
+            self._finish_late_start(worker, error)
+
+        worker.on_started(park)
+        return None
+
+    def _finish_late_start(self, worker: _IsolationWorker, error: BaseException | None) -> None:
+        """Park a worker that became ready after its acquirer timed out.
+
+        Args:
+            worker: Isolation worker whose startup finished late.
+            error: Startup failure, or ``None`` on success.
+        """
+        if error is not None:
+            with self._lock:
+                self._created -= 1
+            return
+        try:
+            worker.assert_running()
+        except RuntimeError:
+            with self._lock:
+                self._created -= 1
+            return
+        self.release(worker)
 
     def _expire(self, waiter: asyncio.Future[_IsolationWorker | None]) -> None:
         """Complete a timed-out acquire with ``None``."""

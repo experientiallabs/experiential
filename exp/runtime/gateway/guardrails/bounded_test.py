@@ -89,6 +89,119 @@ def test_isolation_workers_are_daemon_threads() -> None:
     asyncio.run(scenario())
 
 
+def _delay_isolation_worker_start(
+    monkeypatch: pytest.MonkeyPatch,
+    release_start: threading.Event,
+    started_thread: threading.Event,
+) -> None:
+    """Hold isolation-loop startup until ``release_start`` is set."""
+    original_run_forever = _IsolationWorker._run_forever
+
+    def delayed_run_forever(self: _IsolationWorker) -> None:
+        """Wait for the test gate, then own the isolation loop."""
+        started_thread.set()
+        if not release_start.wait(timeout=5.0):
+            self._signal_started(RuntimeError("isolation worker start was not released"))
+            return
+        original_run_forever(self)
+
+    monkeypatch.setattr(_IsolationWorker, "_run_forever", delayed_run_forever)
+
+
+async def _timeout_while_isolation_start_is_held(bound: BoundedInspect) -> int:
+    """Time out one inspect and count caller-loop ticks during the wait."""
+    ticks = 0
+
+    async def ticker() -> None:
+        """Advance while isolation-worker startup is blocked."""
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    async def inspect() -> int:
+        """Return immediately if a worker is ever admitted."""
+        return 1
+
+    tick_task = asyncio.create_task(ticker())
+    try:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(ClassifierTimeoutError):
+            await bound.run(inspect, 0.08, adapter_id="start")
+        assert asyncio.get_running_loop().time() - started < 0.5
+        return ticks
+    finally:
+        tick_task.cancel()
+        await asyncio.gather(tick_task, return_exceptions=True)
+
+
+def test_delayed_isolation_worker_start_does_not_block_the_caller_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow isolation-worker start must not stall the Python gateway loop."""
+    release_start = threading.Event()
+    started_thread = threading.Event()
+    _delay_isolation_worker_start(monkeypatch, release_start, started_thread)
+
+    async def scenario() -> None:
+        """Time out startup, then reuse the late-started worker."""
+        bound = BoundedInspect(max_inflight=1)
+
+        async def inspect() -> int:
+            """Return a constant once a worker is running."""
+            return 7
+
+        try:
+            ticks = await _timeout_while_isolation_start_is_held(bound)
+            assert ticks >= 2
+            _wait_flag(started_thread)
+            assert bound.isolation_worker_count() == 1
+            assert bound.quarantined_adapter_ids() == frozenset()
+        finally:
+            release_start.set()
+        assert await bound.run(inspect, 1.0, adapter_id="later") == 7
+        assert bound.isolation_worker_count() == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_start.set()
+
+
+def test_delayed_isolation_worker_start_does_not_block_the_native_callback_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow isolation-worker start must not stall native guardrail callbacks."""
+    release_start = threading.Event()
+    started_thread = threading.Event()
+    _delay_isolation_worker_start(monkeypatch, release_start, started_thread)
+    bound = BoundedInspect(max_inflight=1)
+
+    async def timed_out_start() -> int:
+        """Run the delayed-start timeout on the native callback loop."""
+        return await _timeout_while_isolation_start_is_held(bound)
+
+    async def later() -> int:
+        """Use the parked worker after startup is released."""
+
+        async def inspect() -> int:
+            """Return a constant once a worker is running."""
+            return 9
+
+        return await bound.run(inspect, 1.0, adapter_id="later")
+
+    try:
+        ticks = run_on_native_loop(timed_out_start())
+        assert ticks >= 2
+        _wait_flag(started_thread)
+        assert bound.isolation_worker_count() == 1
+        assert bound.quarantined_adapter_ids() == frozenset()
+    finally:
+        release_start.set()
+    assert run_on_native_loop(later()) == 9
+    assert bound.isolation_worker_count() == 1
+
+
 def test_bounded_inspect_cancels_a_hung_inspect_and_releases_the_slot() -> None:
     """A hung inspect times out, then a later inspect can take the same slot."""
 
