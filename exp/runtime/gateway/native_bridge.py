@@ -97,7 +97,10 @@ from exp.runtime.models.providers import (
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
-from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
+from exp.runtime.models.providers.streaming_requests import (
+    dialect_stream_payload,
+    route_generation_parameter_requests,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.state import (
@@ -332,6 +335,7 @@ class NativeControlPlane:
 
         # Admission accepts the request and returns the full ordered route;
         # no attempt row exists until the data plane's first `start_attempt`.
+        public_request = request
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         accepted = False
         try:
@@ -339,13 +343,24 @@ class NativeControlPlane:
             accepted = True
             if probe_failure is not None or route is None or resolved_wires is None:
                 raise probe_failure or GatewayRoutingError("authorized route did not resolve")
+            public_request, provider_request = route_generation_parameter_requests(
+                tuple(profile for profile, _client in resolved_wires),
+                request,
+            )
+            provider_request = provider_request.model_copy(
+                update={"stream": True, "include_usage": True}
+            )
             wire_route: list[JsonObject] = []
             signers: list[GatewayDispatchSigner | None] = []
             for deployment, (profile, client) in zip(
                 route.deployments, resolved_wires, strict=True
             ):
                 require_gateway_provider(deployment.provider)
-                preflight_gateway_request(provider_request, deployment.gateway.capabilities)
+                preflight_gateway_request(
+                    provider_request,
+                    deployment.gateway.capabilities,
+                    model_capabilities=deployment.capabilities,
+                )
                 upstream_payload = dialect_stream_payload(profile, provider_request)
                 upstream_body, dispatch_signer = frozen_dispatch(profile, client, upstream_payload)
                 wire_route.append(
@@ -395,6 +410,7 @@ class NativeControlPlane:
             "exact_model_id": route.snapshot.exact_model_id,
             "route_reason": route.route_reason,
             "route": wire_route,
+            "ignored_parameters": list(public_request.ignored_parameters),
             "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
             "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
             "refusal_failover": authorization.refusal_failover,
@@ -402,7 +418,7 @@ class NativeControlPlane:
         }
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
-            response["envelope"] = responses_envelope(request)
+            response["envelope"] = responses_envelope(public_request)
         return json.dumps(response, separators=(",", ":"))
 
     def sign_dispatch(self, argument: str) -> str:

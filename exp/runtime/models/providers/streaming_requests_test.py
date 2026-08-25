@@ -19,6 +19,7 @@ from exp.runtime.models.providers.streaming_requests import (
     gemini_generate_content_stream_payload,
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
+    route_generation_parameter_requests,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request
 
@@ -212,6 +213,228 @@ def test_openai_responses_stream_payload_forwards_reasoning_with_route_capabilit
     )
 
     assert payload["reasoning"] == {"effort": "high"}
+
+
+def test_openai_responses_stream_payload_forwards_reasoning_summary() -> None:
+    """A native reasoning route receives the current Responses summary selector."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_summary="detailed",
+        reasoning_summary_parameters=("reasoning.generate_summary",),
+    )
+
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+
+    assert payload["reasoning"] == {"summary": "detailed"}
+
+
+def test_route_shaping_omits_reasoning_summary_outside_native_responses() -> None:
+    """A fallback without summary output support removes and discloses the exact aliases."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_summary="concise",
+        reasoning_summary_parameters=(
+            "reasoning.generate_summary",
+            "reasoning.summary",
+        ),
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_responses",
+            url="https://openai.test",
+            supports_reasoning=True,
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://fallback.test",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        ),
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert public_request.ignored_parameters == (
+        "reasoning.generate_summary",
+        "reasoning.summary",
+    )
+    assert public_request.reasoning_summary == "concise"
+    assert provider_request.reasoning_summary is None
+
+
+def test_route_generation_controls_use_the_whole_waterfall_intersection() -> None:
+    """One incompatible fallback removes safe optional controls before any dispatch."""
+    request = _chat_request(temperature=0.2, top_p=0.8).model_copy(
+        update={
+            "top_k": 20,
+            "logprobs": True,
+            "top_logprobs": 5,
+            "reasoning_effort": "high",
+        }
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://first.test",
+            supports_temperature=True,
+            supports_top_p=True,
+            supports_top_k=True,
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        ),
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://fallback.test",
+            supports_temperature=False,
+            supports_top_p=False,
+            supports_top_k=False,
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert public_request.ignored_parameters == (
+        "temperature",
+        "top_p",
+        "top_k",
+        "logprobs",
+        "top_logprobs",
+    )
+    assert provider_request.temperature is None
+    assert provider_request.top_p is None
+    assert provider_request.top_k is None
+    assert provider_request.logprobs is None
+    assert provider_request.top_logprobs is None
+    assert provider_request.reasoning_effort == "high"
+
+
+def test_route_shaping_omits_tool_controls_when_no_tools_exist() -> None:
+    """No-op tool selectors never reach providers that reject them without schemas."""
+    request = _chat_request().model_copy(
+        update={"tool_choice": "none", "parallel_tool_calls": False}
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(
+        (GatewayWireProfile(dialect="openai_compatible", url="https://provider.test"),),
+        request,
+    )
+
+    assert public_request.ignored_parameters == ("tool_choice", "parallel_tool_calls")
+    assert provider_request.tool_choice is None
+    assert provider_request.parallel_tool_calls is None
+
+
+def test_route_shaping_omits_out_of_range_provider_controls() -> None:
+    """Portable public ranges never become provider-side range errors."""
+    request = _chat_request(temperature=1.5).model_copy(update={"top_k": 101})
+
+    public_request, provider_request = route_generation_parameter_requests(
+        (
+            GatewayWireProfile(
+                dialect="gemini_generate_content",
+                url="https://provider.test",
+                maximum_temperature=1.0,
+                supports_top_k=True,
+                maximum_top_k=100,
+            ),
+        ),
+        request,
+    )
+
+    assert public_request.ignored_parameters == ("temperature", "top_k")
+    assert provider_request.temperature is None
+    assert provider_request.top_k is None
+
+
+def test_responses_logprob_shaping_discloses_only_the_caller_field() -> None:
+    """A synthetic canonical logprobs flag never leaks into ignored-field disclosure."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        logprobs=True,
+        top_logprobs=5,
+        ignored_parameters=("top_logprobs",),
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(
+        (GatewayWireProfile(dialect="openai_responses", url="https://provider.test"),),
+        request,
+    )
+
+    assert public_request.ignored_parameters == ("top_logprobs",)
+    assert provider_request.logprobs is None
+    assert provider_request.top_logprobs is None
+
+
+def test_route_shaping_omits_temperature_outside_any_provider_range() -> None:
+    """A cross-provider route never forwards a value one wire rejects by range."""
+    request = _chat_request(temperature=1.5)
+    profiles = (
+        GatewayWireProfile(dialect="openai_responses", url="https://openai.test"),
+        GatewayWireProfile(
+            dialect="bedrock_converse_stream",
+            url="https://bedrock.test",
+            maximum_temperature=1.0,
+        ),
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert public_request.ignored_parameters == ("temperature",)
+    assert provider_request.temperature is None
+
+
+def test_reasoning_effort_uses_each_provider_native_wire_shape() -> None:
+    """The same public control translates without leaking an OpenAI field across providers."""
+    request = _chat_request().model_copy(update={"reasoning_effort": "xhigh"})
+
+    openrouter = dialect_stream_payload(
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://openrouter.test",
+            model_id="anthropic/claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        ),
+        request,
+    )
+    anthropic = dialect_stream_payload(
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://anthropic.test",
+            model_id="claude-sonnet-4-6",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+        request,
+    )
+    gemini = dialect_stream_payload(
+        GatewayWireProfile(
+            dialect="gemini_generate_content",
+            url="https://gemini.test",
+            model_id="gemini-3.7-flash",
+            supports_reasoning=True,
+            reasoning_wire_format="gemini_thinking",
+        ),
+        request.model_copy(update={"reasoning_effort": "minimal"}),
+    )
+
+    assert openrouter["reasoning"] == {"effort": "xhigh"}
+    assert "reasoning_effort" not in openrouter
+    assert anthropic["thinking"] == {"type": "adaptive"}
+    assert anthropic["output_config"] == {"effort": "high"}
+    assert "reasoning" not in anthropic
+    generation = cast("dict[str, object]", gemini["generationConfig"])
+    assert generation["thinkingConfig"] == {"thinkingLevel": "LOW"}
 
 
 @pytest.mark.parametrize(

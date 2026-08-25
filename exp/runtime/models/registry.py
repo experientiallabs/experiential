@@ -374,7 +374,7 @@ class RuntimeModelCatalog:
                     "supports_logprobs": _supports_flag(capabilities, "supports_logprobs"),
                 }
             )
-        if provider in {"openrouter", "openai-compatible"}:
+        if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
             http_kwargs.update(
                 {
                     "supports_reasoning": capabilities.supports_reasoning,

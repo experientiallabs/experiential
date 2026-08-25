@@ -209,6 +209,7 @@ impl MessagesSseEncoder {
                 self.refusal_seen = true;
                 Ok(Vec::new())
             }
+            Event::ReasoningSummaryDelta { .. } => Ok(Vec::new()),
             Event::ToolCallStarted {
                 index,
                 call_id,

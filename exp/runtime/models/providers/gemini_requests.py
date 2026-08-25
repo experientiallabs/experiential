@@ -14,6 +14,7 @@ from typing import Literal
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
+from exp.runtime.models.providers.reasoning_compat import gemini_thinking_level
 
 
 def gemini_model_path(model_id: str) -> str:
@@ -36,6 +37,8 @@ def gemini_generate_request(
     supports_top_p: bool = True,
     supports_top_k: bool = False,
     supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Convert a EXP request into Gemini's native generateContent payload.
 
@@ -52,7 +55,6 @@ def gemini_generate_request(
     Raises:
         ValueError: A visible request message cannot preserve its tool linkage on Gemini's wire.
     """
-    del model_id
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
     tool_names: dict[str, str] = {}
@@ -88,6 +90,11 @@ def gemini_generate_request(
         generation["topP"] = request.top_p
     if request.top_k is not None and supports_top_k:
         generation["topK"] = request.top_k
+    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    if supports_reasoning and effective_reasoning_effort is not None:
+        generation["thinkingConfig"] = {
+            "thinkingLevel": gemini_thinking_level(model_id, effective_reasoning_effort).upper()
+        }
     # The normalized gateway response has no logprob representation. Keep the
     # route flag for shared capability plumbing, but ignore these controls so
     # provider output is never requested and then silently discarded.

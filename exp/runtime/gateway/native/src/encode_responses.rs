@@ -1,7 +1,7 @@
 //! Public Responses encoding, the Rust mirror of `ResponsesSseEncoder` and
 //! the Responses branch of `completed_body`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -26,6 +26,10 @@ fn default_tools() -> Value {
     Value::Array(Vec::new())
 }
 
+fn default_reasoning() -> Value {
+    json!({"effort": Value::Null, "summary": Value::Null})
+}
+
 /// Request-reflecting envelope fields built by the control plane from the
 /// canonical execution request, embedded verbatim in every response object.
 #[derive(Debug, Clone, Deserialize)]
@@ -38,6 +42,10 @@ pub struct ResponsesEnvelope {
     pub temperature: Value,
     #[serde(default)]
     pub top_p: Value,
+    #[serde(default = "default_reasoning")]
+    pub reasoning: Value,
+    #[serde(default)]
+    pub ignored_parameters: Vec<String>,
     #[serde(default = "default_tool_choice")]
     pub tool_choice: Value,
     #[serde(default = "default_tools")]
@@ -55,6 +63,8 @@ impl Default for ResponsesEnvelope {
             parallel_tool_calls: true,
             temperature: Value::Null,
             top_p: Value::Null,
+            reasoning: default_reasoning(),
+            ignored_parameters: Vec::new(),
             tool_choice: default_tool_choice(),
             tools: default_tools(),
             max_output_tokens: Value::Null,
@@ -87,9 +97,37 @@ impl ToolState {
     }
 }
 
+/// One accumulated reasoning item with provider-indexed summary parts.
+struct ReasoningState {
+    item_id: String,
+    output_index: usize,
+    parts: BTreeMap<u32, String>,
+}
+
+impl ReasoningState {
+    fn item(&self, completed: bool) -> Value {
+        let summary: Vec<Value> = if completed {
+            self.parts
+                .values()
+                .map(|text| json!({"type": "summary_text", "text": text}))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        json!({
+            "id": self.item_id,
+            "type": "reasoning",
+            "summary": summary,
+            "status": if completed { "completed" } else { "in_progress" },
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
 enum OutputSlot {
     Message,
     Tool(u32),
+    Reasoning(u32),
 }
 
 /// Incremental Responses lifecycle encoder with one monotonic terminal event,
@@ -105,6 +143,7 @@ pub struct ResponsesSseEncoder {
     sequence: u64,
     output_order: Vec<OutputSlot>,
     tools: HashMap<u32, ToolState>,
+    reasoning: HashMap<u32, ReasoningState>,
     message_output_index: Option<usize>,
     text: String,
     refusal: String,
@@ -131,6 +170,7 @@ impl ResponsesSseEncoder {
             sequence: 0,
             output_order: Vec::new(),
             tools: HashMap::new(),
+            reasoning: HashMap::new(),
             message_output_index: None,
             text: String::new(),
             refusal: String::new(),
@@ -174,6 +214,11 @@ impl ResponsesSseEncoder {
         match event {
             Event::TextDelta(delta) => self.content_delta(true, delta),
             Event::RefusalDelta(delta) => self.content_delta(false, delta),
+            Event::ReasoningSummaryDelta {
+                output_index,
+                summary_index,
+                delta,
+            } => self.reasoning_summary_delta(*output_index, *summary_index, delta),
             Event::ToolCallStarted {
                 index,
                 call_id,
@@ -279,6 +324,71 @@ impl ResponsesSseEncoder {
             }),
         ));
         index
+    }
+
+    /// Start one reasoning item/summary part as needed and emit its text delta.
+    fn reasoning_summary_delta(
+        &mut self,
+        provider_output_index: u32,
+        summary_index: u32,
+        delta: &str,
+    ) -> Result<Vec<String>, PublicError> {
+        let mut frames = Vec::new();
+        if !self.reasoning.contains_key(&provider_output_index) {
+            let state = ReasoningState {
+                item_id: stable_public_id(
+                    "rs",
+                    &format!("{}:{}", self.response_id, provider_output_index),
+                ),
+                output_index: self.output_order.len(),
+                parts: BTreeMap::new(),
+            };
+            let frame = self.event(
+                "response.output_item.added",
+                json!({
+                    "output_index": state.output_index,
+                    "item": state.item(false),
+                }),
+            );
+            self.reasoning.insert(provider_output_index, state);
+            self.output_order
+                .push(OutputSlot::Reasoning(provider_output_index));
+            frames.push(frame);
+        }
+        let (item_id, output_index, new_part) = {
+            let state = self
+                .reasoning
+                .get_mut(&provider_output_index)
+                .expect("reasoning state just ensured");
+            let new_part = !state.parts.contains_key(&summary_index);
+            state
+                .parts
+                .entry(summary_index)
+                .or_default()
+                .push_str(delta);
+            (state.item_id.clone(), state.output_index, new_part)
+        };
+        if new_part {
+            frames.push(self.event(
+                "response.reasoning_summary_part.added",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": summary_index,
+                    "part": {"type": "summary_text", "text": ""},
+                }),
+            ));
+        }
+        frames.push(self.event(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "delta": delta,
+            }),
+        ));
+        Ok(frames)
     }
 
     /// Emit one stable function-call output item start.
@@ -396,17 +506,16 @@ impl ResponsesSseEncoder {
 
     /// Close open items and emit exactly one Responses terminal lifecycle event.
     fn finish(&mut self, status: &str, failure: Option<&Failure>) -> Vec<String> {
-        let mut frames = self.close_message();
-        let open_tools: Vec<u32> = self
-            .output_order
-            .iter()
-            .filter_map(|slot| match slot {
-                OutputSlot::Tool(index) if !self.tools[index].done => Some(*index),
-                _ => None,
-            })
-            .collect();
-        for index in open_tools {
-            frames.extend(self.close_tool(index));
+        let mut frames = Vec::new();
+        for slot in self.output_order.clone() {
+            match slot {
+                OutputSlot::Message => frames.extend(self.close_message()),
+                OutputSlot::Tool(index) if !self.tools[&index].done => {
+                    frames.extend(self.close_tool(index));
+                }
+                OutputSlot::Reasoning(index) => frames.extend(self.close_reasoning(index)),
+                OutputSlot::Tool(_) => {}
+            }
         }
         self.terminal = true;
         let event_name = format!("response.{status}");
@@ -415,6 +524,48 @@ impl ResponsesSseEncoder {
             json!({"response": self.response(status, failure)}),
         );
         frames.push(frame);
+        frames
+    }
+
+    /// Complete every summary part and its containing reasoning item.
+    fn close_reasoning(&mut self, provider_output_index: u32) -> Vec<String> {
+        let (item_id, output_index, parts, item) = {
+            let state = match self.reasoning.get(&provider_output_index) {
+                Some(state) => state,
+                None => return Vec::new(),
+            };
+            (
+                state.item_id.clone(),
+                state.output_index,
+                state.parts.clone(),
+                state.item(true),
+            )
+        };
+        let mut frames = Vec::new();
+        for (summary_index, text) in parts {
+            frames.push(self.event(
+                "response.reasoning_summary_text.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": summary_index,
+                    "text": text,
+                }),
+            ));
+            frames.push(self.event(
+                "response.reasoning_summary_part.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "summary_index": summary_index,
+                    "part": {"type": "summary_text", "text": text},
+                }),
+            ));
+        }
+        frames.push(self.event(
+            "response.output_item.done",
+            json!({"output_index": output_index, "item": item}),
+        ));
         frames
     }
 
@@ -510,6 +661,7 @@ impl ResponsesSseEncoder {
             .map(|slot| match slot {
                 OutputSlot::Message => self.message_item(completed),
                 OutputSlot::Tool(index) => self.tools[index].item(completed),
+                OutputSlot::Reasoning(index) => self.reasoning[index].item(completed),
             })
             .collect();
         let error = if status == "failed" {
@@ -522,7 +674,7 @@ impl ResponsesSseEncoder {
         } else {
             Value::Null
         };
-        json!({
+        let mut response = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
@@ -541,12 +693,23 @@ impl ResponsesSseEncoder {
             "parallel_tool_calls": self.envelope.parallel_tool_calls,
             "temperature": self.envelope.temperature,
             "top_p": self.envelope.top_p,
+            "reasoning": self.envelope.reasoning,
             "tool_choice": self.envelope.tool_choice,
             "tools": self.envelope.tools,
             "max_output_tokens": self.envelope.max_output_tokens,
             "previous_response_id": self.envelope.previous_response_id,
             "usage": if completed { responses_usage(self.usage.as_ref()) } else { Value::Null },
-        })
+        });
+        if !self.envelope.ignored_parameters.is_empty() {
+            response
+                .as_object_mut()
+                .expect("response envelope is an object")
+                .insert(
+                    "x-experiential-ignored-parameters".to_string(),
+                    json!(self.envelope.ignored_parameters),
+                );
+        }
+        response
     }
 
     /// Assign one monotonic sequence number and frame a named SSE event.
@@ -700,4 +863,34 @@ pub fn completed_responses_body(
         refusal,
         tool_calls,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignored_generation_controls_are_disclosed_by_responses_encoder() {
+        let envelope = ResponsesEnvelope {
+            ignored_parameters: vec!["top_k".to_string()],
+            ..ResponsesEnvelope::default()
+        };
+        let mut encoder =
+            ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000.0, envelope.clone());
+        let frames = encoder.start().expect("stream start must encode");
+        assert!(frames[0].contains("\"x-experiential-ignored-parameters\":[\"top_k\"]"));
+
+        let completed = completed_responses_body(
+            "request-1",
+            "coding",
+            1_700_000_000.0,
+            envelope,
+            &[Event::Completed],
+        )
+        .expect("completed body must encode");
+        assert_eq!(
+            completed.body["x-experiential-ignored-parameters"],
+            json!(["top_k"])
+        );
+    }
 }

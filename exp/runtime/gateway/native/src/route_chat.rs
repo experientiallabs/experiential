@@ -18,7 +18,7 @@ use crate::admission::{
     acquire_permit, apply_output_guardrail, commit_dependent, commit_independent, new_guard,
     wire_drift_response, Admission,
 };
-use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder};
+use crate::encode::{chat_data, compact_json, completed_chat_body_with_ignored, ChatSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::{classify_escalation, METRICS};
@@ -334,11 +334,16 @@ async fn settled_chat_response(
         }
         return sse_body_response(&headers, body);
     }
-    let aggregated =
-        match completed_chat_body(&admission.request_id, &admission.alias, created_at, &events) {
-            Ok(aggregated) => aggregated,
-            Err(error) => return error_response(&error),
-        };
+    let aggregated = match completed_chat_body_with_ignored(
+        &admission.request_id,
+        &admission.alias,
+        created_at,
+        &events,
+        &admission.ignored_parameters,
+    ) {
+        Ok(aggregated) => aggregated,
+        Err(error) => return error_response(&error),
+    };
     if let Some(failure) = &aggregated.failure {
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
@@ -367,11 +372,12 @@ fn encode_chat_sse(
     created_at: i64,
     events: &[Event],
 ) -> Result<Vec<u8>, PublicError> {
-    let mut encoder = ChatSseEncoder::new(
+    let mut encoder = ChatSseEncoder::new_with_ignored(
         &admission.request_id,
         &admission.alias,
         created_at,
         admission.include_usage,
+        admission.ignored_parameters.clone(),
     );
     let mut body = Vec::new();
     for frame in encoder.start().map_err(|_| PublicError::internal())? {
@@ -401,31 +407,36 @@ async fn respond_from_chat_events(
     stream_body: bool,
 ) -> Response {
     let refusal_completed = complete_visible_refusal(&mut events);
-    let aggregated =
-        match completed_chat_body(&admission.request_id, &admission.alias, created_at, &events) {
-            Ok(aggregated) => aggregated,
-            Err(error) => {
-                guard
-                    .settle(
-                        "failed",
-                        usage.as_ref(),
-                        &tool_names,
-                        Some(
-                            &Failure::new(
-                                FailureClass::MalformedResponse,
-                                "provider stream ended without a terminal event",
-                            )
-                            .boundary(),
-                        ),
-                        true,
-                    )
-                    .await;
-                if let Some(mut owner) = lease.take() {
-                    owner.abandon().await;
-                }
-                return error_response(&error);
+    let aggregated = match completed_chat_body_with_ignored(
+        &admission.request_id,
+        &admission.alias,
+        created_at,
+        &events,
+        &admission.ignored_parameters,
+    ) {
+        Ok(aggregated) => aggregated,
+        Err(error) => {
+            guard
+                .settle(
+                    "failed",
+                    usage.as_ref(),
+                    &tool_names,
+                    Some(
+                        &Failure::new(
+                            FailureClass::MalformedResponse,
+                            "provider stream ended without a terminal event",
+                        )
+                        .boundary(),
+                    ),
+                    true,
+                )
+                .await;
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
             }
-        };
+            return error_response(&error);
+        }
+    };
     if let Some(failure) = &aggregated.failure {
         let failure = failure.clone().boundary();
         let error = failure.public_error();
@@ -667,7 +678,13 @@ async fn stream_response(
         let mut guard = guard;
         let mut lease = lease;
         let mut committed = committed;
-        let mut encoder = ChatSseEncoder::new(&request_id, &alias, created_at, include_usage);
+        let mut encoder = ChatSseEncoder::new_with_ignored(
+            &request_id,
+            &alias,
+            created_at,
+            include_usage,
+            admission.ignored_parameters.clone(),
+        );
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
         let mut visible_refusal = committed.visible_refusal;

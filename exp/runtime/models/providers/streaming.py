@@ -38,6 +38,12 @@ from exp.runtime.models.providers.errors import (
     require_string,
 )
 from exp.runtime.models.providers.stream_attempts import StreamAttemptController
+from exp.runtime.models.providers.streaming_events import (
+    SEMANTIC_EVENT_KINDS,
+    TERMINAL_EVENT_KINDS,
+    OpenAIReasoningSummaryParser,
+    provider_refusal_failure,
+)
 from exp.runtime.models.providers.streaming_requests import (
     anthropic_messages_stream_payload,
     openai_compatible_stream_payload,
@@ -51,17 +57,6 @@ from exp.runtime.models.providers.transport import ProviderTransportError, Retry
 
 _MAXIMUM_SSE_EVENT_BYTES = 4_000_000
 _CANCELLATION_BOUND_SECONDS = 1.0
-_SEMANTIC_KINDS = {
-    GatewayEventKind.TEXT_DELTA,
-    GatewayEventKind.REFUSAL_DELTA,
-    GatewayEventKind.TOOL_CALL_STARTED,
-    GatewayEventKind.TOOL_ARGUMENTS_DELTA,
-}
-_TERMINAL_KINDS = {
-    GatewayEventKind.COMPLETED,
-    GatewayEventKind.INCOMPLETE,
-    GatewayEventKind.FAILED,
-}
 
 
 @dataclass(frozen=True)
@@ -311,9 +306,9 @@ class NormalizedProviderStream:
                 failure=normalized_provider_failure(exc),
             )
         self._last_sequence = event.sequence_number
-        if event.kind in _SEMANTIC_KINDS:
+        if event.kind in SEMANTIC_EVENT_KINDS:
             self._committed = True
-        if event.kind in _TERMINAL_KINDS:
+        if event.kind in TERMINAL_EVENT_KINDS:
             self._done = True
             await self._close()
         return event
@@ -399,9 +394,10 @@ async def start_anthropic_messages_stream(
     supports_top_p: bool = True,
     supports_top_k: bool = False,
     supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> NormalizedProviderStream:
     """Open and normalize one native Anthropic Messages stream.
-
     Args:
         transport: Async provider transport supporting incremental responses.
         url: Native Messages endpoint.
@@ -411,7 +407,6 @@ async def start_anthropic_messages_stream(
         deadline: Immutable request-wide deadline.
         idempotency_key: Stable identity reused by safe opening retries.
         retry_policy: Same-endpoint retry bounds before response commitment.
-        timeout_seconds: Per-phase timeout ceiling.
     """
     payload = anthropic_messages_stream_payload(
         model_id,
@@ -420,6 +415,8 @@ async def start_anthropic_messages_stream(
         supports_top_p=supports_top_p,
         supports_top_k=supports_top_k,
         supports_logprobs=supports_logprobs,
+        supports_reasoning=supports_reasoning,
+        reasoning_effort=reasoning_effort,
     )
     return await _start_stream(
         transport,
@@ -451,10 +448,10 @@ async def start_openai_compatible_stream(
     supports_top_k: bool = False,
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
+    reasoning_wire_format: str = "reasoning_effort",
     reasoning_effort: str | None = None,
 ) -> NormalizedProviderStream:
     """Open and normalize one generic OpenAI-compatible Chat stream.
-
     Args:
         transport: Async provider transport supporting incremental responses.
         url: Chat Completions endpoint.
@@ -476,6 +473,7 @@ async def start_openai_compatible_stream(
         supports_top_k=supports_top_k,
         supports_logprobs=supports_logprobs,
         supports_reasoning=supports_reasoning,
+        reasoning_wire_format=reasoning_wire_format,
         reasoning_effort=reasoning_effort,
     )
     return await _start_stream(
@@ -540,12 +538,20 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
     """Map native Responses lifecycle events to provider-neutral events."""
     factory = _EventFactory()
     tools: dict[int, _ToolAccumulator] = {}
+    reasoning_summaries = OpenAIReasoningSummaryParser()
     refusal_seen = False
     async for frame in sse.events():
         if frame.data == "[DONE]":
             raise ProviderResponseError("OpenAI Responses stream ended before a terminal event")
         payload = _json_object(frame.data)
         event_type = payload.get("type") or frame.event
+        summary_consumed, summary_event = reasoning_summaries.consume(
+            event_type, payload, create=factory.create
+        )
+        if summary_consumed:
+            if summary_event is not None:
+                yield summary_event
+            continue
         if event_type == "response.output_text.delta":
             delta = _optional_string(payload.get("delta"), "OpenAI text delta")
             if delta:
@@ -636,7 +642,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                 if refusal_seen:
                     yield factory.create(
                         GatewayEventKind.FAILED,
-                        failure=_provider_refusal_failure(),
+                        failure=provider_refusal_failure(),
                     )
                 else:
                     yield factory.create(GatewayEventKind.COMPLETED)
@@ -650,7 +656,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
             elif reason in {"content_filter", "safety"}:
                 yield factory.create(
                     GatewayEventKind.FAILED,
-                    failure=_provider_refusal_failure(),
+                    failure=provider_refusal_failure(),
                 )
             else:
                 yield factory.create(
@@ -785,7 +791,7 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
             if refusal_seen or stop_reason == "refusal":
                 yield factory.create(
                     GatewayEventKind.FAILED,
-                    failure=_provider_refusal_failure(),
+                    failure=provider_refusal_failure(),
                 )
             else:
                 terminal = (
@@ -828,7 +834,7 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
             if refusal_seen or finish_reason in {"content_filter", "safety"}:
                 yield factory.create(
                     GatewayEventKind.FAILED,
-                    failure=_provider_refusal_failure(),
+                    failure=provider_refusal_failure(),
                 )
             else:
                 terminal = (
@@ -927,15 +933,6 @@ async def _finish_open_tools(
                 tool_call_index=index,
                 tool_call=tool.complete(),
             )
-
-
-def _provider_refusal_failure() -> GatewayFailure:
-    """Return the shared sanitized terminal classification for provider refusals."""
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.REFUSAL,
-        safe_message="provider refused the request",
-        safe_details={"signal": "content_policy"},
-    )
 
 
 def _json_object(raw: str) -> JsonObject:

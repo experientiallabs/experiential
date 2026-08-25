@@ -158,7 +158,7 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
             "temperature": 0.4,
             "reasoning": {
                 "effort": "high",
-                "generate_summary": "detailed",
+                "generate_summary": "concise",
                 "summary": "concise",
             },
             "text": {
@@ -184,18 +184,32 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
         "tool",
     )
     assert request.previous_response_id == "resp_previous"
-    # Summary selectors are accepted for compatibility and intentionally do not
-    # enter the canonical request because the response contract cannot return them.
     assert request.reasoning_effort == "high"
-    assert request.ignored_parameters == (
+    assert request.reasoning_summary == "concise"
+    assert request.reasoning_summary_parameters == (
         "reasoning.generate_summary",
         "reasoning.summary",
     )
+    assert request.ignored_parameters == ()
     assert request.messages[2].tool_calls[0].raw_arguments == '{"city":"Paris"}'
     assert request.parallel_tool_calls is False
     assert request.maximum_output_tokens == 321
     assert request.structured_text is not None
     assert request.client_request_id == "operation-two"
+
+
+def test_responses_decoder_rejects_conflicting_reasoning_summary_aliases() -> None:
+    """Current and deprecated summary selectors cannot request different outputs."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": "hello",
+                "reasoning": {"summary": "concise", "generate_summary": "detailed"},
+            }
+        )
+
+    assert captured.value.detail.code == "invalid_parameter"
 
 
 @pytest.mark.parametrize(

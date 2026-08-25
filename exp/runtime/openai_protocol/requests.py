@@ -276,14 +276,24 @@ class _ResponseText(_WireModel):
 class _ResponseReasoning(_WireModel):
     """Responses reasoning controls accepted at the public boundary.
 
-    The gateway preserves ``effort`` for route capability shaping. The
-    ``summary`` selectors are accepted for client compatibility but ignored
-    because the normalized response contract has no reasoning-summary channel.
+    The deprecated ``generate_summary`` alias is normalized to the current
+    ``summary`` field before route capability shaping.
     """
 
     effort: ReasoningEffort | None = None
     generate_summary: Literal["auto", "concise", "detailed"] | None = None
     summary: Literal["auto", "concise", "detailed"] | None = None
+
+    @model_validator(mode="after")
+    def _require_matching_summary_aliases(self) -> _ResponseReasoning:
+        """Reject two aliases that request different summary behavior."""
+        if (
+            self.generate_summary is not None
+            and self.summary is not None
+            and self.generate_summary != self.summary
+        ):
+            raise ValueError("reasoning summary and generate_summary must match")
+        return self
 
 
 class _ResponsesRequest(_WireModel):
@@ -419,11 +429,26 @@ def decode_responses(
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
-            logprobs=(request.top_logprobs is not None),
+            logprobs=(True if request.top_logprobs is not None else None),
             top_logprobs=request.top_logprobs,
-            # Summary selectors are compatibility-only. The canonical gateway
-            # contract carries effort but has no normalized summary channel.
             reasoning_effort=(request.reasoning.effort if request.reasoning is not None else None),
+            reasoning_summary=(
+                request.reasoning.summary or request.reasoning.generate_summary
+                if request.reasoning is not None
+                else None
+            ),
+            reasoning_summary_parameters=(
+                tuple(
+                    path
+                    for path, value in (
+                        ("reasoning.generate_summary", request.reasoning.generate_summary),
+                        ("reasoning.summary", request.reasoning.summary),
+                    )
+                    if value is not None
+                )
+                if request.reasoning is not None
+                else ()
+            ),
             stream=request.stream,
             previous_response_id=request.previous_response_id,
             metadata=request.metadata,
@@ -454,11 +479,6 @@ def _ignored_responses_parameters(request: _ResponsesRequest) -> tuple[str, ...]
     ignored: list[str] = []
     if request.top_logprobs is not None:
         ignored.append("top_logprobs")
-    if request.reasoning is not None:
-        if request.reasoning.generate_summary is not None:
-            ignored.append("reasoning.generate_summary")
-        if request.reasoning.summary is not None:
-            ignored.append("reasoning.summary")
     return tuple(ignored)
 
 

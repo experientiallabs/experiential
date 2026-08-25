@@ -33,6 +33,7 @@ from exp.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
+from exp.runtime.models.providers.reasoning_compat import anthropic_reasoning_effort
 from exp.runtime.models.providers.streaming import (
     NormalizedProviderStream,
     start_anthropic_messages_stream,
@@ -50,6 +51,8 @@ def anthropic_messages_request(
     supports_temperature: bool = True,
     supports_top_p: bool = True,
     supports_top_k: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Convert one EXP request into native Anthropic Messages JSON.
 
@@ -97,6 +100,12 @@ def anthropic_messages_request(
         payload["top_p"] = request.top_p
     if request.top_k is not None and supports_top_k:
         payload["top_k"] = request.top_k
+    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    if supports_reasoning and effective_reasoning_effort is not None:
+        payload["thinking"] = {"type": "adaptive"}
+        payload["output_config"] = {
+            "effort": anthropic_reasoning_effort(model_id, effective_reasoning_effort)
+        }
     return payload
 
 
@@ -176,6 +185,8 @@ class AnthropicClient(ProviderHttpClient):
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_logprobs: bool = False,
+        supports_reasoning: bool = False,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Create an Anthropic client with explicit generation capability gates."""
         super().__init__(
@@ -190,6 +201,8 @@ class AnthropicClient(ProviderHttpClient):
         self._supports_top_p = supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_logprobs = supports_logprobs
+        self._supports_reasoning = supports_reasoning
+        self._reasoning_effort = reasoning_effort
 
     async def stream(
         self,
@@ -229,6 +242,8 @@ class AnthropicClient(ProviderHttpClient):
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_effort=self._reasoning_effort,
         )
 
     def _headers(self) -> dict[str, str]:
@@ -248,9 +263,13 @@ class AnthropicClient(ProviderHttpClient):
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
             supports_temperature=self._supports_temperature,
+            maximum_temperature=1.0,
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_wire_format="anthropic_adaptive",
+            reasoning_effort=self._reasoning_effort,
         )
 
     def _completion_path(self) -> str:
@@ -265,6 +284,8 @@ class AnthropicClient(ProviderHttpClient):
             supports_temperature=self._supports_temperature,
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_effort=self._reasoning_effort,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:

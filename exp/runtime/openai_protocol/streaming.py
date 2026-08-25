@@ -83,6 +83,8 @@ class ChatSseEncoder:
             return (self._chunk(delta={"content": event.text_delta}),)
         if event.kind == GatewayEventKind.REFUSAL_DELTA:
             return (self._chunk(delta={"refusal": event.text_delta}),)
+        if event.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
+            return ()
         if event.kind == GatewayEventKind.TOOL_CALL_STARTED:
             index = _required_index(event)
             identity = (_required_text(event.tool_call_id), _required_text(event.tool_name))
@@ -241,6 +243,29 @@ class _ResponseToolState:
         }
 
 
+class _ResponseReasoningState:
+    """Accumulated reasoning-summary item with stable public output identity."""
+
+    def __init__(self, *, item_id: str, output_index: int) -> None:
+        """Initialize one reasoning item with no summary parts."""
+        self.item_id = item_id
+        self.output_index = output_index
+        self.parts: dict[int, str] = {}
+
+    def item(self, *, completed: bool) -> JsonObject:
+        """Return the current official Responses reasoning item."""
+        return {
+            "id": self.item_id,
+            "type": "reasoning",
+            "summary": (
+                [{"type": "summary_text", "text": text} for _, text in sorted(self.parts.items())]
+                if completed
+                else []
+            ),
+            "status": "completed" if completed else "in_progress",
+        }
+
+
 class ResponsesSseEncoder:
     """Incremental Responses lifecycle encoder with one monotonic terminal event."""
 
@@ -263,6 +288,7 @@ class ResponsesSseEncoder:
         self._sequence = 0
         self._output_order: list[tuple[str, int]] = []
         self._tools: dict[int, _ResponseToolState] = {}
+        self._reasoning: dict[int, _ResponseReasoningState] = {}
         self._message_output_index: int | None = None
         self._message_id = stable_public_id("msg", request_id)
         self._text = ""
@@ -291,6 +317,8 @@ class ResponsesSseEncoder:
             return self._content_delta("text", _required_text(event.text_delta))
         if event.kind == GatewayEventKind.REFUSAL_DELTA:
             return self._content_delta("refusal", _required_text(event.text_delta))
+        if event.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
+            return self._reasoning_summary_delta(event)
         if event.kind == GatewayEventKind.TOOL_CALL_STARTED:
             return self._tool_started(event)
         if event.kind == GatewayEventKind.TOOL_ARGUMENTS_DELTA:
@@ -403,6 +431,58 @@ class ResponsesSseEncoder:
             ),
         )
 
+    def _reasoning_summary_delta(self, event: GatewayEvent) -> tuple[str, ...]:
+        """Start one reasoning item/part as needed and emit its summary delta."""
+        provider_output_index = event.reasoning_summary_output_index
+        summary_index = event.reasoning_summary_index
+        if provider_output_index is None or summary_index is None:
+            raise self._state_error("Responses reasoning delta omitted its indices.")
+        frames: list[str] = []
+        state = self._reasoning.get(provider_output_index)
+        if state is None:
+            state = _ResponseReasoningState(
+                item_id=stable_public_id("rs", f"{self.response_id}:{provider_output_index}"),
+                output_index=len(self._output_order),
+            )
+            self._reasoning[provider_output_index] = state
+            self._output_order.append(("reasoning", provider_output_index))
+            frames.append(
+                self._event(
+                    "response.output_item.added",
+                    {
+                        "output_index": state.output_index,
+                        "item": state.item(completed=False),
+                    },
+                )
+            )
+        if summary_index not in state.parts:
+            state.parts[summary_index] = ""
+            frames.append(
+                self._event(
+                    "response.reasoning_summary_part.added",
+                    {
+                        "item_id": state.item_id,
+                        "output_index": state.output_index,
+                        "summary_index": summary_index,
+                        "part": {"type": "summary_text", "text": ""},
+                    },
+                )
+            )
+        delta = _required_text(event.text_delta)
+        state.parts[summary_index] += delta
+        frames.append(
+            self._event(
+                "response.reasoning_summary_text.delta",
+                {
+                    "item_id": state.item_id,
+                    "output_index": state.output_index,
+                    "summary_index": summary_index,
+                    "delta": delta,
+                },
+            )
+        )
+        return tuple(frames)
+
     def _tool_arguments(self, event: GatewayEvent) -> tuple[str, ...]:
         """Append and emit one raw provider-order function argument fragment."""
         state = self._tool_state(event)
@@ -459,9 +539,13 @@ class ResponsesSseEncoder:
 
     def _finish(self, event: GatewayEvent) -> tuple[str, ...]:
         """Close open items and emit exactly one Responses terminal lifecycle event."""
-        frames = list(self._close_message())
+        frames: list[str] = []
         for kind, index in self._output_order:
-            if kind == "tool" and not self._tools[index].done:
+            if kind == "message":
+                frames.extend(self._close_message())
+            elif kind == "reasoning":
+                frames.extend(self._close_reasoning(self._reasoning[index]))
+            elif not self._tools[index].done:
                 frames.extend(self._close_tool(self._tools[index]))
         self._terminal = True
         status = {
@@ -471,6 +555,43 @@ class ResponsesSseEncoder:
         }[event.kind]
         event_name = f"response.{status}"
         frames.append(self._event(event_name, {"response": self._response(status, event.failure)}))
+        return tuple(frames)
+
+    def _close_reasoning(self, state: _ResponseReasoningState) -> tuple[str, ...]:
+        """Complete every summary part and its containing reasoning item."""
+        frames: list[str] = []
+        for summary_index, text in sorted(state.parts.items()):
+            frames.extend(
+                (
+                    self._event(
+                        "response.reasoning_summary_text.done",
+                        {
+                            "item_id": state.item_id,
+                            "output_index": state.output_index,
+                            "summary_index": summary_index,
+                            "text": text,
+                        },
+                    ),
+                    self._event(
+                        "response.reasoning_summary_part.done",
+                        {
+                            "item_id": state.item_id,
+                            "output_index": state.output_index,
+                            "summary_index": summary_index,
+                            "part": {"type": "summary_text", "text": text},
+                        },
+                    ),
+                )
+            )
+        frames.append(
+            self._event(
+                "response.output_item.done",
+                {
+                    "output_index": state.output_index,
+                    "item": state.item(completed=True),
+                },
+            )
+        )
         return tuple(frames)
 
     def _close_message(self) -> tuple[str, ...]:
@@ -562,6 +683,8 @@ class ResponsesSseEncoder:
             output.append(
                 self._message_item(completed=status != "in_progress")
                 if kind == "message"
+                else self._reasoning[index].item(completed=status != "in_progress")
+                if kind == "reasoning"
                 else self._tools[index].item(completed=status != "in_progress")
             )
         payload: JsonObject = {
@@ -590,6 +713,10 @@ class ResponsesSseEncoder:
             "parallel_tool_calls": self.request.parallel_tool_calls is not False,
             "temperature": self.request.temperature,
             "top_p": self.request.top_p,
+            "reasoning": {
+                "effort": self.request.reasoning_effort,
+                "summary": self.request.reasoning_summary,
+            },
             "tool_choice": _responses_tool_choice(self.request),
             "tools": [
                 {

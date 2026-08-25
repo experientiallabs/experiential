@@ -39,6 +39,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRetryableResponseError,
 )
 from exp.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
+from exp.runtime.models.providers.reasoning_compat import openai_reasoning_effort
 from exp.runtime.models.providers.streaming import (
     NormalizedProviderStream,
     start_openai_responses_stream,
@@ -130,7 +131,9 @@ def openai_responses_request(
     del supports_logprobs
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
-        payload["reasoning"] = {"effort": effective_reasoning_effort}
+        payload["reasoning"] = {
+            "effort": openai_reasoning_effort(model_id, effective_reasoning_effort)
+        }
     if request.maximum_output_tokens is not None:
         payload["max_output_tokens"] = request.maximum_output_tokens
     return payload
@@ -316,6 +319,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
             supports_reasoning=self._supports_reasoning,
+            reasoning_wire_format="openai_responses",
             reasoning_effort=self._reasoning_effort,
         )
 

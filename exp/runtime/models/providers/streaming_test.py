@@ -232,6 +232,30 @@ def test_openai_responses_stream_preserves_raw_tools_usage_and_commitment() -> N
                     "arguments": raw_arguments,
                 }
             ),
+            _sse(
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 1,
+                    "summary_index": 0,
+                    "delta": "Checked ",
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 1,
+                    "summary_index": 0,
+                    "delta": "the tool.",
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.reasoning_summary_text.done",
+                    "output_index": 1,
+                    "summary_index": 0,
+                    "text": "Checked the tool.",
+                }
+            ),
             _sse({"type": "response.output_text.delta", "delta": "done"}),
             _sse(
                 {
@@ -285,6 +309,8 @@ def test_openai_responses_stream_preserves_raw_tools_usage_and_commitment() -> N
         GatewayEventKind.TOOL_ARGUMENTS_DELTA,
         GatewayEventKind.TOOL_ARGUMENTS_DELTA,
         GatewayEventKind.TOOL_CALL_COMPLETED,
+        GatewayEventKind.REASONING_SUMMARY_DELTA,
+        GatewayEventKind.REASONING_SUMMARY_DELTA,
         GatewayEventKind.TEXT_DELTA,
         GatewayEventKind.USAGE,
         GatewayEventKind.COMPLETED,
@@ -292,9 +318,12 @@ def test_openai_responses_stream_preserves_raw_tools_usage_and_commitment() -> N
     assert events[3].tool_call is not None
     assert events[3].tool_call_index == 0
     assert events[3].tool_call.arguments_json() == raw_arguments
-    assert events[5].usage is not None
-    assert events[5].usage.cached_input_tokens == 4
-    assert events[5].usage.reasoning_tokens == 3
+    assert events[4].reasoning_summary_output_index == 1
+    assert events[4].reasoning_summary_index == 0
+    assert "".join(event.text_delta or "" for event in events[4:6]) == "Checked the tool."
+    assert events[7].usage is not None
+    assert events[7].usage.cached_input_tokens == 4
+    assert events[7].usage.reasoning_tokens == 3
     assert observed_payloads[0]["stream"] is True
     assert observed_payloads[0]["store"] is False
     assert observed_payloads[0]["instructions"] == "Be precise."

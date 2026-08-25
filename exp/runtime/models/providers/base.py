@@ -7,7 +7,7 @@ import asyncio
 import time
 from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import ClassVar, Literal
 from uuid import uuid4
 
 from exp.common.core.artifacts import JsonObject
@@ -35,6 +35,16 @@ from exp.runtime.models.providers.transport import (
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_RETRY_POLICY = RetryPolicy()
 DEFAULT_MAXIMUM_OUTPUT_TOKENS = 4096
+
+ReasoningWireFormat = Literal[
+    "none",
+    "openai_responses",
+    "reasoning_effort",
+    "reasoning",
+    "anthropic_adaptive",
+    "gemini_thinking",
+]
+"""Provider-wire representation for one normalized reasoning-effort control."""
 
 COMPLETION_SECONDS_PER_OUTPUT_TOKEN = 0.03
 """Per-token completion allowance, a conservative approximately 33 tokens per second."""
@@ -90,11 +100,17 @@ class GatewayWireProfile:
     supports_temperature: bool = True
     """Whether the exact model accepts explicit sampling temperature."""
 
+    maximum_temperature: float = 2.0
+    """Largest temperature value accepted by this provider wire."""
+
     supports_top_p: bool | None = None
     """Whether the exact route accepts nucleus sampling; ``None`` follows temperature support."""
 
     supports_top_k: bool = False
     """Whether the exact route accepts top-k sampling."""
+
+    maximum_top_k: int = 100
+    """Largest portable top-k value accepted by the provider wire."""
 
     supports_logprobs: bool = False
     """Provider metadata for logprob support.
@@ -104,6 +120,9 @@ class GatewayWireProfile:
 
     supports_reasoning: bool = False
     """Whether this exact route accepts the reasoning parameter on its wire dialect."""
+
+    reasoning_wire_format: ReasoningWireFormat = "none"
+    """Exact provider field used to carry normalized reasoning effort."""
 
     reasoning_effort: str | None = None
     """Optional catalog-pinned reasoning effort."""

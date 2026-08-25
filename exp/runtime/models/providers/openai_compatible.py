@@ -30,6 +30,7 @@ from exp.runtime.models.providers.base import (
     DEFAULT_TIMEOUT_SECONDS,
     GatewayWireProfile,
     ProviderHttpClient,
+    ReasoningWireFormat,
 )
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
@@ -40,6 +41,7 @@ from exp.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
+from exp.runtime.models.providers.reasoning_compat import openai_reasoning_effort
 from exp.runtime.models.providers.streaming import (
     NormalizedProviderStream,
     start_openai_compatible_stream,
@@ -66,6 +68,7 @@ def openai_compatible_request(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    reasoning_wire_format: ReasoningWireFormat = "reasoning_effort",
 ) -> JsonObject:
     """Convert a EXP request into one non-streaming Chat Completions payload.
 
@@ -82,8 +85,9 @@ def openai_compatible_request(
         supports_logprobs: Reserved route capability retained for contract parity. Chat
             logprob controls are currently ignored because the normalized gateway response
             cannot return provider logprob details.
-        supports_reasoning: Whether this exact model accepts ``reasoning_effort``.
+        supports_reasoning: Whether this exact model accepts a reasoning control.
         reasoning_effort: Optional catalog-pinned reasoning effort.
+        reasoning_wire_format: Provider field used for normalized reasoning effort.
 
     Returns:
         A JSON object for ``/chat/completions``.
@@ -132,7 +136,12 @@ def openai_compatible_request(
         payload[token_limit_key] = request.maximum_output_tokens
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
-        payload["reasoning_effort"] = effective_reasoning_effort
+        if reasoning_wire_format == "reasoning":
+            payload["reasoning"] = {"effort": effective_reasoning_effort}
+        elif reasoning_wire_format == "reasoning_effort":
+            payload["reasoning_effort"] = openai_reasoning_effort(
+                model_id, effective_reasoning_effort
+            )
     return payload
 
 
@@ -251,6 +260,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
     """Calls one explicit OpenAI-compatible connection without cross-provider failover."""
 
     token_limit_key: ClassVar[str] = "max_tokens"
+    reasoning_wire_format: ClassVar[ReasoningWireFormat] = "reasoning_effort"
 
     def __init__(
         self,
@@ -325,6 +335,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             supports_logprobs=self._supports_logprobs,
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
+            reasoning_wire_format=self.reasoning_wire_format,
         )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
@@ -340,6 +351,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
             supports_reasoning=self._supports_reasoning,
+            reasoning_wire_format=self.reasoning_wire_format,
             reasoning_effort=self._reasoning_effort,
             token_limit_key=self.token_limit_key,
         )
@@ -360,6 +372,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             supports_logprobs=self._supports_logprobs,
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
+            reasoning_wire_format=self.reasoning_wire_format,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
@@ -376,6 +389,7 @@ class OpenRouterClient(OpenAICompatibleClient):
         "HTTP-Referer": OPENROUTER_REFERER,
         "X-Title": OPENROUTER_TITLE,
     }
+    reasoning_wire_format: ClassVar[ReasoningWireFormat] = "reasoning"
 
 
 def _openai_message(message: ModelMessage) -> JsonObject:

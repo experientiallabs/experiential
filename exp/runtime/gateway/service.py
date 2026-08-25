@@ -369,6 +369,7 @@ class GatewayService:
                 episode_namespace=episode,
             )
             stream = await self._executor.start(route=route, request=execution_request)
+            execution_request = stream.public_request
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
                 await abandoned_write_outcome(accept)

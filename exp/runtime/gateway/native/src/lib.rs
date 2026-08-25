@@ -263,6 +263,17 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
         let event = match kind {
             "text_delta" => events::Event::TextDelta(text),
             "refusal_delta" => events::Event::RefusalDelta(text),
+            "reasoning_summary_delta" => events::Event::ReasoningSummaryDelta {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                summary_index: object
+                    .get("summary_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                delta: text,
+            },
             "tool_call_started" => events::Event::ToolCallStarted {
                 index,
                 call_id: object
