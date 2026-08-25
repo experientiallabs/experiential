@@ -49,6 +49,10 @@ CHAT_MANIFEST = CompatibilityManifest(
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
             "structured_output",
         ),
+        _field("reasoning_effort", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
+        _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
+        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
@@ -58,16 +62,13 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "function_call",
                 "functions",
                 "logit_bias",
-                "logprobs",
                 "modalities",
                 "n",
                 "prediction",
                 "presence_penalty",
-                "reasoning_effort",
                 "seed",
                 "service_tier",
                 "store",
-                "top_logprobs",
                 "user",
                 "verbosity",
                 "web_search_options",
@@ -89,6 +90,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "previous_response_id",
                 "max_output_tokens",
                 "temperature",
+                "top_p",
                 "stream",
             )
         ),
@@ -100,6 +102,9 @@ RESPONSES_MANIFEST = CompatibilityManifest(
             "parallel_tool_calls",
         ),
         _field("text", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "structured_output"),
+        _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
+        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
@@ -109,12 +114,9 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "include",
                 "max_tool_calls",
                 "prompt",
-                "reasoning",
                 "service_tier",
                 "store",
                 "stream_options",
-                "top_logprobs",
-                "top_p",
                 "truncation",
                 "user",
             )

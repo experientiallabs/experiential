@@ -11,7 +11,6 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
-from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.streaming_requests import (
     anthropic_messages_stream_payload,
@@ -69,6 +68,68 @@ def test_openai_compatible_stream_payload_omits_absent_top_p() -> None:
     assert "temperature" not in payload
 
 
+def test_openai_compatible_stream_payload_omits_unproven_controls() -> None:
+    """Unknown compatible routes drop top-k and logprobs instead of guessing wire support."""
+    request = _chat_request().model_copy(update={"top_k": 40, "logprobs": True, "top_logprobs": 5})
+    payload = openai_compatible_stream_payload("exact-model", request)
+    assert "top_k" not in payload
+    assert "logprobs" not in payload
+    assert "top_logprobs" not in payload
+
+
+def test_openai_compatible_stream_payload_forwards_explicit_controls() -> None:
+    """A route with explicit capability evidence receives its optional controls."""
+    request = _chat_request().model_copy(update={"top_k": 40, "logprobs": True, "top_logprobs": 5})
+    payload = openai_compatible_stream_payload(
+        "exact-model",
+        request,
+        supports_top_k=True,
+        supports_logprobs=True,
+    )
+    assert payload["top_k"] == 40
+    assert payload["logprobs"] is True
+    assert payload["top_logprobs"] == 5
+
+
+def test_anthropic_stream_payload_omits_logprobs_even_when_flagged() -> None:
+    """Anthropic's native Messages lane never receives an OpenAI logprob field."""
+    request = _chat_request().model_copy(update={"logprobs": True, "top_logprobs": 5})
+    payload = anthropic_messages_stream_payload(
+        "claude-sonnet-5",
+        request,
+        supports_logprobs=True,
+    )
+    assert "logprobs" not in payload
+    assert "top_logprobs" not in payload
+
+
+def test_openai_compatible_stream_payload_omits_reasoning_without_route_capability() -> None:
+    """A compatible route never receives a reasoning field without explicit capability proof."""
+    request = _chat_request().model_copy(update={"reasoning_effort": "high"})
+
+    payload = openai_compatible_stream_payload(
+        "cloud-opus-5",
+        request,
+        reasoning_effort="medium",
+    )
+
+    assert "reasoning_effort" not in payload
+
+
+def test_openai_compatible_stream_payload_forwards_reasoning_with_route_capability() -> None:
+    """A compatible route receives the requested effort only when its row opts in."""
+    request = _chat_request().model_copy(update={"reasoning_effort": "high"})
+
+    payload = openai_compatible_stream_payload(
+        "reasoning-model",
+        request,
+        supports_reasoning=True,
+        reasoning_effort="medium",
+    )
+
+    assert payload["reasoning_effort"] == "high"
+
+
 def test_openai_compatible_stream_payload_honors_token_limit_key() -> None:
     """The output-token ceiling lands on the configured wire field only."""
     request = _chat_request().model_copy(update={"maximum_output_tokens": 64})
@@ -90,6 +151,7 @@ def test_openai_responses_stream_payload_forwards_top_p_when_sampling_is_open() 
         "exact-model",
         _chat_request(top_p=1.0, temperature=0.2),
         supports_temperature=True,
+        supports_reasoning=False,
         reasoning_effort=None,
     )
 
@@ -98,16 +160,16 @@ def test_openai_responses_stream_payload_forwards_top_p_when_sampling_is_open() 
     assert payload["top_p"] == 1.0
 
 
-def test_openai_responses_stream_payload_rejects_top_p_when_sampling_is_pinned() -> None:
-    """Pinned-sampling Responses models fail closed instead of dropping caller top_p."""
-    with pytest.raises(ProviderCapabilityError, match="top_p") as captured:
-        openai_responses_stream_payload(
-            "exact-model",
-            _chat_request(top_p=1.0),
-            supports_temperature=False,
-            reasoning_effort="xhigh",
-        )
-    assert captured.value.capability == "top_p"
+def test_openai_responses_stream_payload_omits_top_p_when_sampling_is_pinned() -> None:
+    """Pinned-sampling Responses models omit caller top_p instead of failing the request."""
+    payload = openai_responses_stream_payload(
+        "exact-model",
+        _chat_request(top_p=1.0),
+        supports_temperature=False,
+        supports_reasoning=True,
+        reasoning_effort="xhigh",
+    )
+    assert "top_p" not in payload
 
 
 def test_openai_responses_stream_payload_omits_absent_top_p() -> None:
@@ -116,10 +178,61 @@ def test_openai_responses_stream_payload_omits_absent_top_p() -> None:
         "exact-model",
         _chat_request(),
         supports_temperature=True,
+        supports_reasoning=False,
         reasoning_effort=None,
     )
 
     assert "top_p" not in payload
+
+
+def test_openai_responses_stream_payload_omits_reasoning_without_route_capability() -> None:
+    """An unsupported native route drops a caller reasoning request before upstream dispatch."""
+    request = _chat_request().model_copy(update={"reasoning_effort": "high"})
+
+    payload = openai_responses_stream_payload(
+        "cloud-opus-5",
+        request,
+        supports_temperature=True,
+        reasoning_effort="medium",
+    )
+
+    assert "reasoning" not in payload
+
+
+def test_openai_responses_stream_payload_forwards_reasoning_with_route_capability() -> None:
+    """A verified native Responses route receives the caller's requested effort."""
+    request = _chat_request().model_copy(update={"reasoning_effort": "high"})
+
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        request,
+        supports_temperature=False,
+        supports_reasoning=True,
+        reasoning_effort="medium",
+    )
+
+    assert payload["reasoning"] == {"effort": "high"}
+
+
+@pytest.mark.parametrize(
+    "profile",
+    (
+        GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"),
+        GatewayWireProfile(dialect="gemini_generate_content", url="https://gemini.test"),
+        GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test"),
+        GatewayWireProfile(dialect="openai_compatible", url="https://compatible.test"),
+    ),
+)
+def test_non_native_reasoning_profiles_never_emit_openai_reasoning_fields(
+    profile: GatewayWireProfile,
+) -> None:
+    """Every non-Responses provider path drops OpenAI reasoning controls by default."""
+    request = _chat_request().model_copy(update={"reasoning_effort": "high"})
+
+    payload = dialect_stream_payload(profile, request)
+
+    assert "reasoning" not in payload
+    assert "reasoning_effort" not in payload
 
 
 def test_anthropic_messages_stream_payload_forwards_top_p() -> None:
@@ -179,6 +292,19 @@ def test_gemini_stream_payload_matches_the_provider_client_builder() -> None:
     assert generation["temperature"] == 0.3
     # Streaming is selected by the streamGenerateContent route, not the body.
     assert "stream" not in payload
+
+
+def test_gemini_generation_forwards_top_p_and_top_k_only_when_declared() -> None:
+    """Gemini's camel-case sampling names are gated independently."""
+    request = _chat_request().model_copy(update={"top_p": 0.8, "top_k": 20})
+    payload = gemini_generate_content_stream_payload(
+        "gemini-2.5-pro",
+        request,
+        supports_top_k=True,
+    )
+    generation = payload["generationConfig"]
+    assert generation["topP"] == 0.8
+    assert generation["topK"] == 20
 
 
 def test_dialect_dispatch_builds_the_gemini_payload() -> None:

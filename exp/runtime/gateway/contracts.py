@@ -13,7 +13,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelId,
     ExactModelPoolId,
 )
-from exp.common.models.model import ToolCall
+from exp.common.models.model import ReasoningEffort, ToolCall
 
 GatewayAliasName = ArtifactId
 OrganizationId = ArtifactId
@@ -133,6 +133,10 @@ class GatewayRequest(ContractModel):
     stop: tuple[str, ...] = ()
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
+    top_k: int | None = Field(default=None, gt=0)
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    reasoning_effort: ReasoningEffort | None = None
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)

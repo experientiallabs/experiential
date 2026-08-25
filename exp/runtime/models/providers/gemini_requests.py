@@ -28,7 +28,15 @@ def gemini_model_path(model_id: str) -> str:
     return model_id.removeprefix("models/")
 
 
-def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
+def gemini_generate_request(
+    model_id: str,
+    request: ModelRequest,
+    *,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+) -> JsonObject:
     """Convert a EXP request into Gemini's native generateContent payload.
 
     Args:
@@ -74,8 +82,16 @@ def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
     if request.tool_choice is not None:
         payload["toolConfig"] = {"functionCallingConfig": _gemini_tool_choice(request.tool_choice)}
     generation: JsonObject = {}
-    if request.temperature is not None:
+    if request.temperature is not None and supports_temperature:
         generation["temperature"] = request.temperature
+    if request.top_p is not None and supports_top_p:
+        generation["topP"] = request.top_p
+    if request.top_k is not None and supports_top_k:
+        generation["topK"] = request.top_k
+    if (request.logprobs is True or request.top_logprobs is not None) and supports_logprobs:
+        generation["responseLogprobs"] = True
+        if request.top_logprobs is not None:
+            generation["logprobs"] = request.top_logprobs
     if request.maximum_output_tokens is not None:
         generation["maxOutputTokens"] = request.maximum_output_tokens
     else:

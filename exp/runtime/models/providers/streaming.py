@@ -342,7 +342,11 @@ async def start_openai_responses_stream(
     retry_policy: RetryPolicy,
     timeout_seconds: float,
     supports_temperature: bool,
-    reasoning_effort: str | None,
+    supports_top_p: bool | None = None,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> NormalizedProviderStream:
     """Open and normalize one native OpenAI Responses stream.
 
@@ -356,16 +360,15 @@ async def start_openai_responses_stream(
         idempotency_key: Stable identity reused by safe opening retries.
         retry_policy: Same-endpoint retry bounds before response commitment.
         timeout_seconds: Per-phase timeout ceiling.
-        supports_temperature: Whether this model accepts explicit temperature.
-        reasoning_effort: Optional catalog-pinned reasoning effort.
-
-    Returns:
-        A true upstream normalized stream.
     """
     payload = openai_responses_stream_payload(
         model_id,
         request,
         supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+        supports_top_k=supports_top_k,
+        supports_logprobs=supports_logprobs,
+        supports_reasoning=supports_reasoning,
         reasoning_effort=reasoning_effort,
     )
     return await _start_stream(
@@ -392,6 +395,10 @@ async def start_anthropic_messages_stream(
     idempotency_key: str,
     retry_policy: RetryPolicy,
     timeout_seconds: float,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
 ) -> NormalizedProviderStream:
     """Open and normalize one native Anthropic Messages stream.
 
@@ -405,11 +412,15 @@ async def start_anthropic_messages_stream(
         idempotency_key: Stable identity reused by safe opening retries.
         retry_policy: Same-endpoint retry bounds before response commitment.
         timeout_seconds: Per-phase timeout ceiling.
-
-    Returns:
-        A true upstream normalized stream.
     """
-    payload = anthropic_messages_stream_payload(model_id, request)
+    payload = anthropic_messages_stream_payload(
+        model_id,
+        request,
+        supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+        supports_top_k=supports_top_k,
+        supports_logprobs=supports_logprobs,
+    )
     return await _start_stream(
         transport,
         url,
@@ -435,6 +446,12 @@ async def start_openai_compatible_stream(
     retry_policy: RetryPolicy,
     timeout_seconds: float,
     token_limit_key: str = "max_tokens",
+    supports_temperature: bool = True,
+    supports_top_p: bool | None = None,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> NormalizedProviderStream:
     """Open and normalize one generic OpenAI-compatible Chat stream.
 
@@ -449,11 +466,18 @@ async def start_openai_compatible_stream(
         retry_policy: Same-endpoint retry bounds before response commitment.
         timeout_seconds: Per-phase timeout ceiling.
         token_limit_key: Wire field carrying the output-token ceiling.
-
-    Returns:
-        A true upstream normalized stream.
     """
-    payload = openai_compatible_stream_payload(model_id, request, token_limit_key=token_limit_key)
+    payload = openai_compatible_stream_payload(
+        model_id,
+        request,
+        token_limit_key=token_limit_key,
+        supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+        supports_top_k=supports_top_k,
+        supports_logprobs=supports_logprobs,
+        supports_reasoning=supports_reasoning,
+        reasoning_effort=reasoning_effort,
+    )
     return await _start_stream(
         transport,
         url,

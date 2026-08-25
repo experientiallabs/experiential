@@ -166,6 +166,12 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
             if known is not None and known.supports_temperature is not None
             else True
         ),
+        supports_top_p=(
+            known.supports_temperature
+            if known is not None and known.supports_temperature is not None
+            else True
+        ),
+        supports_reasoning=(known is not None and known.supports_reasoning_effort),
         reasoning_effort=(
             DEFAULT_REASONING_EFFORT
             if known is not None and known.supports_reasoning_effort

@@ -90,6 +90,18 @@ class GatewayWireProfile:
     supports_temperature: bool = True
     """Whether the exact model accepts explicit sampling temperature."""
 
+    supports_top_p: bool | None = None
+    """Whether the exact route accepts nucleus sampling; ``None`` follows temperature support."""
+
+    supports_top_k: bool = False
+    """Whether the exact route accepts top-k sampling."""
+
+    supports_logprobs: bool = False
+    """Whether the exact route accepts logprob controls."""
+
+    supports_reasoning: bool = False
+    """Whether this exact route accepts the reasoning parameter on its wire dialect."""
+
     reasoning_effort: str | None = None
     """Optional catalog-pinned reasoning effort."""
 

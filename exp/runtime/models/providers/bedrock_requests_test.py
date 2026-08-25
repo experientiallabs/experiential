@@ -71,6 +71,18 @@ def test_converse_request_preserves_tool_ids_and_named_choice() -> None:
     assert result_payload["toolUseId"] == "call-old"
 
 
+def test_converse_request_gates_top_p_and_model_specific_top_k() -> None:
+    """Bedrock keeps top-p standard and puts certified top-k in the model extension map."""
+    request = _tool_transcript_request().model_copy(update={"top_p": 0.8, "top_k": 20})
+    payload = converse_request(
+        "us.anthropic.claude-sonnet-4-5",
+        request,
+        supports_top_k=True,
+    )
+    assert payload["inferenceConfig"]["topP"] == 0.8
+    assert payload["additionalModelRequestFields"] == {"top_k": 20}
+
+
 def test_converse_request_omits_tools_when_choice_is_none() -> None:
     """A ``none`` tool choice drops the tool configuration entirely."""
     request = ModelRequest(

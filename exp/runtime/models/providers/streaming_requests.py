@@ -41,18 +41,69 @@ def dialect_stream_payload(
             profile.model_id,
             provider_request,
             supports_temperature=profile.supports_temperature,
+            supports_top_p=(
+                profile.supports_temperature
+                if profile.supports_top_p is None
+                else profile.supports_top_p
+            ),
+            supports_top_k=profile.supports_top_k,
+            supports_logprobs=profile.supports_logprobs,
+            supports_reasoning=profile.supports_reasoning,
             reasoning_effort=profile.reasoning_effort,
         )
     if profile.dialect == "anthropic_messages":
-        return anthropic_messages_stream_payload(profile.model_id, provider_request)
+        return anthropic_messages_stream_payload(
+            profile.model_id,
+            provider_request,
+            supports_temperature=profile.supports_temperature,
+            supports_top_p=(
+                profile.supports_temperature
+                if profile.supports_top_p is None
+                else profile.supports_top_p
+            ),
+            supports_top_k=profile.supports_top_k,
+            supports_logprobs=profile.supports_logprobs,
+        )
     if profile.dialect == "gemini_generate_content":
-        return gemini_generate_content_stream_payload(profile.model_id, provider_request)
+        return gemini_generate_content_stream_payload(
+            profile.model_id,
+            provider_request,
+            supports_temperature=profile.supports_temperature,
+            supports_top_p=(
+                profile.supports_temperature
+                if profile.supports_top_p is None
+                else profile.supports_top_p
+            ),
+            supports_top_k=profile.supports_top_k,
+            supports_logprobs=profile.supports_logprobs,
+        )
     if profile.dialect == "bedrock_converse_stream":
-        return bedrock_converse_stream_payload(profile.model_id, provider_request)
+        return bedrock_converse_stream_payload(
+            profile.model_id,
+            provider_request,
+            supports_temperature=profile.supports_temperature,
+            supports_top_p=(
+                profile.supports_temperature
+                if profile.supports_top_p is None
+                else profile.supports_top_p
+            ),
+            supports_top_k=profile.supports_top_k,
+            supports_logprobs=profile.supports_logprobs,
+        )
     return openai_compatible_stream_payload(
         profile.model_id,
         provider_request,
         token_limit_key=profile.token_limit_key,
+        supports_temperature=profile.supports_temperature,
+        supports_top_p=(
+            profile.supports_temperature
+            if profile.supports_top_p is None
+            else profile.supports_top_p
+        ),
+        supports_top_k=profile.supports_top_k,
+        supports_logprobs=profile.supports_logprobs,
+        supports_reasoning=profile.supports_reasoning,
+        reasoning_effort=profile.reasoning_effort,
     )
 
 
@@ -61,7 +112,11 @@ def openai_responses_stream_payload(
     request: GatewayRequest,
     *,
     supports_temperature: bool,
-    reasoning_effort: str | None,
+    supports_top_p: bool | None = None,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Responses JSON.
 
@@ -69,14 +124,14 @@ def openai_responses_stream_payload(
         model_id: Exact OpenAI model identifier.
         request: Canonical gateway request.
         supports_temperature: Whether this exact model accepts explicit temperature.
+        supports_reasoning: Whether this exact model accepts the reasoning parameter.
         reasoning_effort: Optional catalog-pinned reasoning effort.
 
     Returns:
         Native Responses request with storage disabled and streaming enabled.
 
     Raises:
-        ProviderCapabilityError: The request uses unsupported stop sequences, or sets
-            ``top_p`` on a model that pins sampling.
+        ProviderCapabilityError: The request uses unsupported stop sequences.
         ProviderResponseError: An instruction message has no text.
     """
     if request.stop:
@@ -115,16 +170,29 @@ def openai_responses_stream_payload(
         payload["max_output_tokens"] = request.maximum_output_tokens
     if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
-    if request.top_p is not None:
-        if not supports_temperature:
-            raise ProviderCapabilityError(capability="top_p")
+    top_p_supported = supports_temperature if supports_top_p is None else supports_top_p
+    if request.top_p is not None and top_p_supported:
         payload["top_p"] = request.top_p
-    if reasoning_effort is not None:
-        payload["reasoning"] = {"effort": reasoning_effort}
+    # Native OpenAI Responses has no top-k request field. Never trust a
+    # mistaken route declaration to send this extension to the API.
+    del supports_top_k
+    if request.top_logprobs is not None and supports_logprobs:
+        payload["top_logprobs"] = request.top_logprobs
+    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    if supports_reasoning and effective_reasoning_effort is not None:
+        payload["reasoning"] = {"effort": effective_reasoning_effort}
     return payload
 
 
-def anthropic_messages_stream_payload(model_id: str, request: GatewayRequest) -> JsonObject:
+def anthropic_messages_stream_payload(
+    model_id: str,
+    request: GatewayRequest,
+    *,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+) -> JsonObject:
     """Translate one canonical request to native streaming Messages JSON.
 
     Args:
@@ -138,6 +206,10 @@ def anthropic_messages_stream_payload(model_id: str, request: GatewayRequest) ->
         ProviderCapabilityError: Structured text is requested on this adapter.
         ProviderResponseError: Instruction or message content is malformed.
     """
+    # Anthropic Messages has no compatible logprob request/response surface in
+    # this adapter. Keep the shared route signature for capability plumbing,
+    # but never put an OpenAI-shaped field on the Anthropic wire.
+    del supports_logprobs
     if request.structured_text is not None:
         raise ProviderCapabilityError(capability="structured_text")
     system_parts: list[str] = []
@@ -179,16 +251,26 @@ def anthropic_messages_stream_payload(model_id: str, request: GatewayRequest) ->
         else:
             mapping = {"auto": "auto", "none": "none", "required": "any"}
             payload["tool_choice"] = {"type": mapping[request.tool_choice]}
-    if request.temperature is not None:
+    if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
-    if request.top_p is not None:
+    if request.top_p is not None and supports_top_p:
         payload["top_p"] = request.top_p
+    if request.top_k is not None and supports_top_k:
+        payload["top_k"] = request.top_k
     if request.stop:
         payload["stop_sequences"] = list(request.stop)
     return payload
 
 
-def gemini_generate_content_stream_payload(model_id: str, request: GatewayRequest) -> JsonObject:
+def gemini_generate_content_stream_payload(
+    model_id: str,
+    request: GatewayRequest,
+    *,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+) -> JsonObject:
     """Translate one canonical request to the native streamGenerateContent JSON.
 
     The payload is built by the exact converter the Gemini provider client
@@ -209,12 +291,27 @@ def gemini_generate_content_stream_payload(model_id: str, request: GatewayReques
             Gemini's wire.
     """
     try:
-        return gemini_generate_request(model_id, gateway_model_request(request))
+        return gemini_generate_request(
+            model_id,
+            gateway_model_request(request),
+            supports_temperature=supports_temperature,
+            supports_top_p=supports_top_p,
+            supports_top_k=supports_top_k,
+            supports_logprobs=supports_logprobs,
+        )
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc
 
 
-def bedrock_converse_stream_payload(model_id: str, request: GatewayRequest) -> JsonObject:
+def bedrock_converse_stream_payload(
+    model_id: str,
+    request: GatewayRequest,
+    *,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+) -> JsonObject:
     """Translate one canonical request to the native ConverseStream REST body.
 
     The body is built by the exact converter the Bedrock provider client
@@ -237,7 +334,13 @@ def bedrock_converse_stream_payload(model_id: str, request: GatewayRequest) -> J
     """
     del model_id
     try:
-        return converse_body(gateway_model_request(request))
+        return converse_body(
+            gateway_model_request(request),
+            supports_temperature=supports_temperature,
+            supports_top_p=supports_top_p,
+            supports_top_k=supports_top_k,
+            supports_logprobs=supports_logprobs,
+        )
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc
 
@@ -247,6 +350,12 @@ def openai_compatible_stream_payload(
     request: GatewayRequest,
     *,
     token_limit_key: str = "max_tokens",
+    supports_temperature: bool = True,
+    supports_top_p: bool | None = None,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -256,6 +365,9 @@ def openai_compatible_stream_payload(
         token_limit_key: Wire field carrying the output-token ceiling. Azure OpenAI
             reasoning deployments reject ``max_tokens`` and require
             ``max_completion_tokens``.
+        supports_temperature: Whether this exact model accepts explicit sampling controls.
+        supports_reasoning: Whether this exact model accepts ``reasoning_effort``.
+        reasoning_effort: Optional catalog-pinned reasoning effort.
 
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
@@ -280,12 +392,22 @@ def openai_compatible_stream_payload(
         payload["response_format"] = {"type": "json_schema", "json_schema": schema}
     if request.maximum_output_tokens is not None:
         payload[token_limit_key] = request.maximum_output_tokens
-    if request.temperature is not None:
+    if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
-    if request.top_p is not None:
+    top_p_supported = supports_temperature if supports_top_p is None else supports_top_p
+    if request.top_p is not None and top_p_supported:
         payload["top_p"] = request.top_p
+    if request.top_k is not None and supports_top_k:
+        payload["top_k"] = request.top_k
+    if request.logprobs is not None and supports_logprobs:
+        payload["logprobs"] = request.logprobs
+    if request.top_logprobs is not None and supports_logprobs:
+        payload["top_logprobs"] = request.top_logprobs
     if request.stop:
         payload["stop"] = list(request.stop)
+    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    if supports_reasoning and effective_reasoning_effort is not None:
+        payload["reasoning_effort"] = effective_reasoning_effort
     return payload
 
 

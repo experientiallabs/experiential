@@ -117,6 +117,12 @@ class AzureClient(OpenAICompatibleClient):
         transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        supports_temperature: bool = True,
+        supports_top_p: bool | None = None,
+        supports_top_k: bool = False,
+        supports_logprobs: bool = False,
+        supports_reasoning: bool = False,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Create a client bound to one endpoint, key, API version, and deployment.
 
@@ -144,6 +150,12 @@ class AzureClient(OpenAICompatibleClient):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            supports_temperature=supports_temperature,
+            supports_top_p=supports_top_p,
+            supports_top_k=supports_top_k,
+            supports_logprobs=supports_logprobs,
+            supports_reasoning=supports_reasoning,
+            reasoning_effort=reasoning_effort,
         )
         self._api_version = api_version
 
