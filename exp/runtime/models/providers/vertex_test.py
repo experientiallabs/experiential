@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -16,6 +19,10 @@ from exp.common.models import (
     ModelRecord,
 )
 from exp.common.models.setup import ProviderConnection
+from exp.runtime.models.providers.async_transport import (
+    ProviderDeadlineExceeded,
+    RequestDeadline,
+)
 from exp.runtime.models.providers.openai_compatible_test import _request, _snapshot
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.providers.vertex import (
@@ -316,6 +323,52 @@ def test_setup_accepts_a_complete_vertex_connection() -> None:
             provider="vertex",
             api_key_env="VERTEX_SERVICE_ACCOUNT_JSON",
         )
+
+
+def test_vertex_token_refresh_is_bounded_by_the_request_deadline() -> None:
+    """A hung token mint surfaces the runtime's deadline error instead of outliving it."""
+
+    def stalled_provider() -> str:
+        """Simulate a token endpoint that answers far too late."""
+        time.sleep(0.5)
+        return "too-late-token"
+
+    client = VertexClient(
+        model=_snapshot("vertex", "gemini-2.5-pro"),
+        api_key='{"placeholder": true}',
+        base_url=_BASE_URL,
+        transport=ScriptedJsonTransport(),
+        token_provider=stalled_provider,
+    )
+
+    async def scenario() -> float:
+        """Time how quickly the deadline error reaches the caller inside the loop."""
+        started = time.monotonic()
+        with pytest.raises(ProviderDeadlineExceeded, match="token refresh"):
+            await client.complete_async(_request(), deadline=RequestDeadline.after(0.05))
+        return time.monotonic() - started
+
+    # asyncio.run itself may wait for the orphaned worker thread at loop shutdown; the
+    # bound under test is how quickly the caller inside the loop sees the deadline error.
+    assert asyncio.run(scenario()) < 0.4
+
+
+def test_vertex_token_refresh_fails_fast_on_an_already_spent_deadline() -> None:
+    """No token mint starts once the request-wide budget is exhausted."""
+    provider = _StatefulTokenProvider("unused-token")
+    client = VertexClient(
+        model=_snapshot("vertex", "gemini-2.5-pro"),
+        api_key='{"placeholder": true}',
+        base_url=_BASE_URL,
+        transport=ScriptedJsonTransport(),
+        token_provider=provider,
+    )
+    spent = RequestDeadline.after(10.0, now_monotonic=0.0)
+
+    with pytest.raises(ProviderDeadlineExceeded):
+        asyncio.run(client.complete_async(_request(), deadline=spent))
+
+    assert provider.calls == 0
 
 
 def test_vertex_error_status_surfaces_after_bounded_retries() -> None:

@@ -21,12 +21,14 @@ from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
+    ProviderDeadlineExceeded,
     RequestDeadline,
 )
 from exp.runtime.models.providers.base import (
     DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT_SECONDS,
     ProviderHttpClient,
+    completion_timeout_seconds,
 )
 from exp.runtime.models.providers.gemini import (
     gemini_generate_request,
@@ -213,9 +215,12 @@ class VertexClient(ProviderHttpClient):
         Returns:
             The typed completed response with observed request economics.
         """
-        await asyncio.to_thread(self._token_provider)
+        request_deadline = deadline or RequestDeadline.after(
+            completion_timeout_seconds(self._timeout_seconds, request.maximum_output_tokens)
+        )
+        await self._warm_bearer_token(request_deadline)
         return await super().complete_async(
-            request, deadline=deadline, idempotency_key=idempotency_key
+            request, deadline=request_deadline, idempotency_key=idempotency_key
         )
 
     async def stream(
@@ -237,8 +242,7 @@ class VertexClient(ProviderHttpClient):
         Returns:
             A cancellable provider-neutral event stream.
         """
-        # Token minting is one blocking HTTPS call; keep it off the gateway event loop.
-        bearer_token = await asyncio.to_thread(self._token_provider)
+        bearer_token = await self._warm_bearer_token(deadline)
         return await start_gemini_generate_stream(
             self._transport,
             f"{self._base_url}/{self._stream_path()}",
@@ -256,6 +260,31 @@ class VertexClient(ProviderHttpClient):
             retry_policy=retry_policy or self._retry_policy,
             timeout_seconds=self._timeout_seconds,
         )
+
+    async def _warm_bearer_token(self, deadline: RequestDeadline) -> str:
+        """Mint or read the bearer token off the event loop, bounded by the request deadline.
+
+        Token minting is one blocking HTTPS call to Google's token endpoint. It runs on a
+        worker thread so the gateway event loop stays responsive, and the wait is bounded by
+        the smaller of the remaining request budget and the per-attempt timeout floor.
+
+        Args:
+            deadline: Immutable request-wide deadline shared with the provider dispatch.
+
+        Returns:
+            A currently valid bearer token.
+
+        Raises:
+            ProviderDeadlineExceeded: The deadline expired before a token was available.
+        """
+        timeout_seconds = deadline.attempt_timeout(self._timeout_seconds)
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                return await asyncio.to_thread(self._token_provider)
+        except TimeoutError as exc:
+            raise ProviderDeadlineExceeded(
+                "Vertex token refresh exhausted the provider request deadline"
+            ) from exc
 
     def _headers(self) -> dict[str, str]:
         """Build native Vertex headers carrying the provider's current bearer token.
