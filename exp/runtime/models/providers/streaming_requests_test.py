@@ -77,8 +77,8 @@ def test_openai_compatible_stream_payload_omits_unproven_controls() -> None:
     assert "top_logprobs" not in payload
 
 
-def test_openai_compatible_stream_payload_forwards_explicit_controls() -> None:
-    """A route with explicit capability evidence receives its optional controls."""
+def test_openai_compatible_stream_payload_ignores_logprobs_even_when_flagged() -> None:
+    """Logprob controls stay off the wire until normalized output can preserve them."""
     request = _chat_request().model_copy(update={"top_k": 40, "logprobs": True, "top_logprobs": 5})
     payload = openai_compatible_stream_payload(
         "exact-model",
@@ -87,8 +87,8 @@ def test_openai_compatible_stream_payload_forwards_explicit_controls() -> None:
         supports_logprobs=True,
     )
     assert payload["top_k"] == 40
-    assert payload["logprobs"] is True
-    assert payload["top_logprobs"] == 5
+    assert "logprobs" not in payload
+    assert "top_logprobs" not in payload
 
 
 def test_anthropic_stream_payload_omits_logprobs_even_when_flagged() -> None:
@@ -302,9 +302,23 @@ def test_gemini_generation_forwards_top_p_and_top_k_only_when_declared() -> None
         request,
         supports_top_k=True,
     )
-    generation = payload["generationConfig"]
+    generation = cast("dict[str, object]", payload["generationConfig"])
+    assert isinstance(generation, dict)
     assert generation["topP"] == 0.8
     assert generation["topK"] == 20
+
+
+def test_openai_responses_stream_payload_ignores_logprobs_even_when_flagged() -> None:
+    """Responses logprob controls are accepted but not sent without output projection."""
+    request = _chat_request().model_copy(update={"top_logprobs": 5})
+    payload = openai_responses_stream_payload(
+        "exact-model",
+        request,
+        supports_temperature=True,
+        supports_logprobs=True,
+    )
+
+    assert "top_logprobs" not in payload
 
 
 def test_dialect_dispatch_builds_the_gemini_payload() -> None:

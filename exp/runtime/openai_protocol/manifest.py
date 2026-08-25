@@ -51,8 +51,8 @@ CHAT_MANIFEST = CompatibilityManifest(
         ),
         _field("reasoning_effort", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
-        _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
-        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
+        _field("logprobs", CompatibilityDisposition.IGNORED),
+        _field("top_logprobs", CompatibilityDisposition.IGNORED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
@@ -104,7 +104,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         _field("text", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "structured_output"),
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
-        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
+        _field("top_logprobs", CompatibilityDisposition.IGNORED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)

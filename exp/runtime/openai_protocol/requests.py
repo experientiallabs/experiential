@@ -270,7 +270,12 @@ class _ResponseText(_WireModel):
 
 
 class _ResponseReasoning(_WireModel):
-    """Responses reasoning controls preserved until route capability shaping."""
+    """Responses reasoning controls accepted at the public boundary.
+
+    The gateway preserves ``effort`` for route capability shaping. The
+    ``summary`` selectors are accepted for client compatibility but ignored
+    because the normalized response contract has no reasoning-summary channel.
+    """
 
     effort: ReasoningEffort | None = None
     generate_summary: Literal["auto", "concise", "detailed"] | None = None
@@ -404,6 +409,8 @@ def decode_responses(
             top_k=request.top_k,
             logprobs=(request.top_logprobs is not None),
             top_logprobs=request.top_logprobs,
+            # Summary selectors are compatibility-only. The canonical gateway
+            # contract carries effort but has no normalized summary channel.
             reasoning_effort=(request.reasoning.effort if request.reasoning is not None else None),
             stream=request.stream,
             previous_response_id=request.previous_response_id,

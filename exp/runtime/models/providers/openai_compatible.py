@@ -79,8 +79,9 @@ def openai_compatible_request(
         supports_top_p: Whether this exact model accepts nucleus sampling. ``None`` follows
             ``supports_temperature`` for older catalog records.
         supports_top_k: Whether this exact route accepts top-k sampling.
-        supports_logprobs: Whether this exact route accepts Chat logprob controls. The
-            normalized gateway response currently leaves response logprobs null.
+        supports_logprobs: Reserved route capability retained for contract parity. Chat
+            logprob controls are currently ignored because the normalized gateway response
+            cannot return provider logprob details.
         supports_reasoning: Whether this exact model accepts ``reasoning_effort``.
         reasoning_effort: Optional catalog-pinned reasoning effort.
 
@@ -123,10 +124,10 @@ def openai_compatible_request(
         payload["top_p"] = request.top_p
     if request.top_k is not None and supports_top_k:
         payload["top_k"] = request.top_k
-    if request.logprobs is not None and supports_logprobs:
-        payload["logprobs"] = request.logprobs
-    if request.top_logprobs is not None and supports_logprobs:
-        payload["top_logprobs"] = request.top_logprobs
+    # The public compatibility manifest accepts logprob controls, but the
+    # normalized response has no probability representation. Ignore them
+    # consistently instead of forwarding a request whose result is discarded.
+    del supports_logprobs
     if request.maximum_output_tokens is not None:
         payload[token_limit_key] = request.maximum_output_tokens
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
