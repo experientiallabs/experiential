@@ -24,6 +24,7 @@ from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_bridge_test import _admit, _chat_body, _control_plane
+from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.routing import GatewayRoute
 
 
@@ -140,10 +141,12 @@ def test_native_input_runs_before_route_resolution(tmp_path: Path) -> None:
             self,
             authorization: AuthorizationSnapshot,
             request: GatewayRequest,
+            *,
+            continuation: ContinuationContext | None = None,
         ) -> GatewayRoute:
             """Mark resolve, then delegate."""
             order.append("resolve")
-            return super()._resolve_route(authorization, request)
+            return super()._resolve_route(authorization, request, continuation=continuation)
 
     engine = _engine(_OrderClassifier())
     control, raw_key = _native_with_engine(tmp_path, engine, plane_cls=_OrderedPlane)
@@ -179,10 +182,12 @@ def test_native_input_block_never_resolves_a_route(tmp_path: Path) -> None:
             self,
             authorization: AuthorizationSnapshot,
             request: GatewayRequest,
+            *,
+            continuation: ContinuationContext | None = None,
         ) -> GatewayRoute:
             """Mark resolve, then delegate."""
             order.append("resolve")
-            return super()._resolve_route(authorization, request)
+            return super()._resolve_route(authorization, request, continuation=continuation)
 
     engine = _engine(_BlockClassifier())
     control, issued = _native_with_engine(tmp_path, engine, plane_cls=_OrderedPlane)

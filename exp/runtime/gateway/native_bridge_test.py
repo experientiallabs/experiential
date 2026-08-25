@@ -2049,6 +2049,83 @@ def test_project_alias_native_selection_matches_the_python_resolver(tmp_path: Pa
         thread.join(timeout=2)
 
 
+def test_responses_continuation_reuses_the_original_selection_episode(
+    tmp_path: Path,
+) -> None:
+    """A continued Responses request joins its first turn's selection episode.
+
+    The continuation carries the original episode key, so learned selection
+    replays the journaled decision instead of re-running request-time
+    embedding for a fresh episode.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    embed_calls: list[str] = []
+
+    class EmbeddingHandler(BaseHTTPRequestHandler):
+        """Serve deterministic embeddings and count every embed request."""
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            """Suppress nondeterministic loopback server logs."""
+            del format, args
+
+        def do_POST(self) -> None:
+            """Return one fixed embedding vector and record the call."""
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length))
+            embed_calls.append(self.path)
+            body = json.dumps(
+                {
+                    "data": [{"embedding": [1.0, 0.0], "index": 0}],
+                    "model": str(payload["model"]),
+                    "usage": {"prompt_tokens": 3, "total_tokens": 3},
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), EmbeddingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_port}/v1"
+        _manager, control, raw_key = _project_control_plane(tmp_path, base_url=base_url)
+        first = _admit_responses(control, raw_key, _responses_body())
+        assert "escalate" not in first
+        first_embeds = len(embed_calls)
+        assert first_embeds >= 1
+        assert (
+            control.remember(
+                json.dumps(
+                    {
+                        "request_id": first["request_id"],
+                        "text": "The answer is 42.",
+                        "refusal": False,
+                        "tool_calls": [],
+                    }
+                )
+            )
+            == "{}"
+        )
+        second = _admit_responses(
+            control,
+            raw_key,
+            _responses_body(
+                previous_response_id=stable_public_id("resp", _admitted_request_id(first))
+            ),
+        )
+        assert "escalate" not in second
+        assert len(embed_calls) == first_embeds
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_admit_persists_caller_app_identity_for_attribution(tmp_path: Path) -> None:
     """The native admit path forwards caller HTTP-Referer/X-Title to durable attribution."""
     control, raw_key = _control_plane(tmp_path)

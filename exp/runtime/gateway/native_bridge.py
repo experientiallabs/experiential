@@ -314,7 +314,11 @@ class NativeControlPlane:
         route: GatewayRoute | None = None
         resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
         try:
-            route = self._resolve_route(authorization, request)
+            route = self._resolve_route(
+                authorization,
+                request,
+                continuation=continuation_context,
+            )
             resolved_wires = resolve_route_profiles(self._components.runtime_catalogs, route)
         except NativeDialectUnavailableError as exc:
             return _escalation(str(exc))
@@ -804,28 +808,41 @@ class NativeControlPlane:
         self,
         authorization: AuthorizationSnapshot,
         request: GatewayRequest,
+        *,
+        continuation: ContinuationContext | None = None,
     ) -> GatewayRoute:
         """Resolve one direct or project route without an event loop.
 
         Direct pools resolve entirely inside frozen in-memory catalogs.
         Project targets run frozen learned selection synchronously on this
         worker thread through the shared selection seam and episode identity
-        derivation, so there is exactly one policy execution path.
-        Request-time embedding failure falls back
-        to the frozen conservative baseline inside the shared runtime, and
-        neither path mutates policy or evidence.
+        derivation, so there is exactly one policy execution path. A
+        Responses continuation carries its original turn's episode key, so a
+        continued request joins the same selection episode instead of
+        re-running request-time embedding for a fresh one. Request-time
+        embedding failure falls back to the frozen conservative baseline
+        inside the shared runtime, and neither path mutates policy or
+        evidence.
         """
         if isinstance(authorization.target, DirectTarget):
             return self._components.routes.resolve_direct(authorization)
-        episode = episode_namespace(
-            namespace=ProtocolNamespace(
-                organization_id=authorization.organization_id,
-                identity_id=authorization.identity_id,
-                alias_revision_id=authorization.alias_revision_id,
-            ),
-            caller_episode_key=request.idempotency_key or request.client_request_id,
-            request_id=authorization.request_id,
-        )
+        if continuation is not None:
+            episode = (
+                authorization.organization_id,
+                authorization.identity_id,
+                authorization.alias_revision_id,
+                continuation.episode_key,
+            )
+        else:
+            episode = episode_namespace(
+                namespace=ProtocolNamespace(
+                    organization_id=authorization.organization_id,
+                    identity_id=authorization.identity_id,
+                    alias_revision_id=authorization.alias_revision_id,
+                ),
+                caller_episode_key=request.idempotency_key or request.client_request_id,
+                request_id=authorization.request_id,
+            )
         return self._components.routes.resolve_project_blocking(
             authorization=authorization,
             request=request,
