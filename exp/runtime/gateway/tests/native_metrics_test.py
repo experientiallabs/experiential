@@ -54,7 +54,6 @@ components = load_gateway_components(
     Path(sys.argv[1]),
     environment={
         "TEST_PROVIDER_KEY": "provider-secret-canary",
-        "TEST_GEMINI_KEY": "gemini-secret-canary",
     },
 )
 control = NativeControlPlane(
@@ -130,16 +129,16 @@ def _activate_dialectless_alias(root: Path, manager: GatewayManagement) -> None:
     """Grant one alias on a provider without a native dialect, so it escalates."""
     upsert_connection(
         root,
-        name="gemini-main",
-        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        name="bedrock-main",
+        connection=ConnectionConfig(provider="bedrock", region="us-east-1"),
         replace=False,
     )
     normalized, snapshot, _changed = upsert_singleton_deployment(
         root,
         deployment_alias="gem",
-        connection_name="gemini-main",
-        provider_model="gemini-model-exact",
-        exact_model_id="gemini-revision-exact",
+        connection_name="bedrock-main",
+        provider_model="bedrock-model-exact",
+        exact_model_id="bedrock-revision-exact",
         revision=None,
         capabilities=ModelCapabilities(),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),

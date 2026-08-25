@@ -11,6 +11,8 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderResponseError
+from exp.runtime.models.providers.gemini_requests import gemini_generate_request
+from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -42,6 +44,8 @@ def dialect_stream_payload(
         )
     if profile.dialect == "anthropic_messages":
         return anthropic_messages_stream_payload(profile.model_id, provider_request)
+    if profile.dialect == "gemini_generate_content":
+        return gemini_generate_content_stream_payload(profile.model_id, provider_request)
     return openai_compatible_stream_payload(
         profile.model_id,
         provider_request,
@@ -179,6 +183,32 @@ def anthropic_messages_stream_payload(model_id: str, request: GatewayRequest) ->
     if request.stop:
         payload["stop_sequences"] = list(request.stop)
     return payload
+
+
+def gemini_generate_content_stream_payload(model_id: str, request: GatewayRequest) -> JsonObject:
+    """Translate one canonical request to the native streamGenerateContent JSON.
+
+    The payload is built by the exact converter the Gemini provider client
+    uses (canonical request through the shared model adapter, then the native
+    generateContent builder), so both engines send one identical body. Gemini
+    streaming needs no body-level stream flag: streaming is selected by the
+    ``streamGenerateContent`` route in the wire profile URL.
+
+    Args:
+        model_id: Exact Gemini model identifier; travels in the route path.
+        request: Canonical gateway request.
+
+    Returns:
+        Native generation request for the SSE streaming route.
+
+    Raises:
+        ProviderResponseError: A message cannot preserve its tool linkage on
+            Gemini's wire.
+    """
+    try:
+        return gemini_generate_request(model_id, gateway_model_request(request))
+    except ValueError as exc:
+        raise ProviderResponseError(str(exc)) from exc
 
 
 def openai_compatible_stream_payload(

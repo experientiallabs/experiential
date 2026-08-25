@@ -14,12 +14,13 @@ use crate::events::{
 };
 use crate::sse::SseEvent;
 
-/// The three upstream dialects this PoC speaks.
+/// The upstream dialects the native engine speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     OpenAiResponses,
     AnthropicMessages,
     OpenAiCompatible,
+    GeminiGenerateContent,
 }
 
 impl Dialect {
@@ -28,6 +29,7 @@ impl Dialect {
             "openai_responses" => Some(Dialect::OpenAiResponses),
             "anthropic_messages" => Some(Dialect::AnthropicMessages),
             "openai_compatible" => Some(Dialect::OpenAiCompatible),
+            "gemini_generate_content" => Some(Dialect::GeminiGenerateContent),
             _ => None,
         }
     }
@@ -100,9 +102,13 @@ pub struct Normalizer {
     cache_read: u64,
     cache_write: u64,
     stop_reason: Option<String>,
-    // OpenAI-compatible accumulation.
+    // OpenAI-compatible and Gemini accumulation.
     usage: Option<Usage>,
     finish_reason: Option<String>,
+    // Gemini accumulation: whole function calls arrive in one part, so the
+    // provider supplies no tool index; assignment order mirrors the python
+    // mapper's local counter.
+    gemini_tool_index: u32,
 }
 
 impl Normalizer {
@@ -120,6 +126,7 @@ impl Normalizer {
             stop_reason: None,
             usage: None,
             finish_reason: None,
+            gemini_tool_index: 0,
         }
     }
 
@@ -135,6 +142,22 @@ impl Normalizer {
         Ok(())
     }
 
+    /// Whether a terminal event already ended the stream.
+    pub fn saw_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    /// Fail if the stream ended without ever producing a terminal event.
+    pub fn stream_ended(&self) -> Result<(), Failure> {
+        if self.terminal {
+            return Ok(());
+        }
+        Err(Failure::new(
+            FailureClass::MalformedResponse,
+            "provider stream ended without a terminal event",
+        ))
+    }
+
     /// Feed one decoded SSE frame; a terminal event ends the stream.
     pub fn feed(&mut self, frame: &SseEvent) -> Result<Vec<Event>, Failure> {
         if self.terminal {
@@ -144,6 +167,7 @@ impl Normalizer {
             Dialect::OpenAiResponses => self.feed_openai_responses(frame),
             Dialect::AnthropicMessages => self.feed_anthropic(frame),
             Dialect::OpenAiCompatible => self.feed_openai_compatible(frame),
+            Dialect::GeminiGenerateContent => self.feed_gemini(frame),
         }?;
         if events.iter().any(Event::is_terminal) {
             self.terminal = true;
@@ -633,5 +657,436 @@ impl Normalizer {
             }
         }
         Ok(events)
+    }
+
+    /// Normalize one Gemini `streamGenerateContent` SSE frame, mirroring the
+    /// `_gemini_events` mapper: reasoning parts are skipped, whole function
+    /// calls expand to start/arguments/completed, and the terminal candidate
+    /// flushes the latest usage before its finish reason maps to the shared
+    /// completion, incomplete, refusal, or provider-internal outcome.
+    fn feed_gemini(&mut self, frame: &SseEvent) -> Result<Vec<Event>, Failure> {
+        let payload = parse_object(&frame.data)?;
+        if let Some(raw_usage) = payload.get("usageMetadata") {
+            if !raw_usage.is_null() {
+                self.usage = Some(gemini_usage(raw_usage).map_err(|message| malformed(&message))?);
+            }
+        }
+        let candidates = payload
+            .get("candidates")
+            .and_then(Value::as_array)
+            .ok_or_else(|| malformed("Gemini candidates must be an array"))?;
+        let mut events = Vec::new();
+        if candidates.is_empty() {
+            return Ok(events);
+        }
+        if candidates.len() != 1 {
+            return Err(malformed("Gemini stream must contain one candidate"));
+        }
+        let candidate = candidates[0]
+            .as_object()
+            .ok_or_else(|| malformed("Gemini candidate must be an object"))?;
+        match candidate.get("content") {
+            None | Some(Value::Null) => {}
+            Some(content) => {
+                let parts = content
+                    .as_object()
+                    .ok_or_else(|| malformed("Gemini candidate content must be an object"))?
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| malformed("Gemini candidate parts must be an array"))?;
+                for raw_part in parts {
+                    let part = raw_part
+                        .as_object()
+                        .ok_or_else(|| malformed("Gemini candidate part must be an object"))?;
+                    // Reasoning parts (thought text and thought signatures)
+                    // are not gateway-visible output.
+                    if part.get("thought") == Some(&Value::Bool(true)) {
+                        continue;
+                    }
+                    if let Some(call) = part.get("functionCall") {
+                        if !call.is_null() {
+                            events.extend(self.gemini_tool_events(call)?);
+                            continue;
+                        }
+                    }
+                    match part.get("text") {
+                        Some(Value::String(text)) => {
+                            if !text.is_empty() {
+                                events.push(Event::TextDelta(text.clone()));
+                            }
+                        }
+                        // A part with neither visible text nor a function call
+                        // (for example a bare thought signature) carries no
+                        // gateway-visible output.
+                        None | Some(Value::Null) => {}
+                        Some(_) => return Err(malformed("Gemini text part must be text")),
+                    }
+                }
+            }
+        }
+        let finish_reason = match candidate.get("finishReason") {
+            None | Some(Value::Null) => return Ok(events),
+            Some(Value::String(reason)) => reason.clone(),
+            Some(_) => return Err(malformed("Gemini finishReason must be text")),
+        };
+        if let Some(usage) = self.usage.take() {
+            events.push(Event::Usage(usage));
+        }
+        match finish_reason.as_str() {
+            "STOP" | "FINISH_REASON_UNSPECIFIED" => events.push(Event::Completed),
+            "MAX_TOKENS" => events.push(Event::Incomplete),
+            // The python mapper's refusal signal table: safety, copyright,
+            // and sensitive-information stops are content-free refusals.
+            "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION" | "SPII" => {
+                events.push(Event::Failed(refusal_failure()));
+            }
+            _ => {
+                events.push(Event::Failed(Failure::new(
+                    FailureClass::ProviderInternal,
+                    "provider ended the stream unexpectedly",
+                )));
+            }
+        }
+        Ok(events)
+    }
+
+    /// Expand one complete Gemini function call into the canonical tool-call
+    /// lifecycle, assigning the deterministic local call-ID fallback and the
+    /// canonical compact JSON argument text the python mapper produces.
+    fn gemini_tool_events(&mut self, value: &Value) -> Result<Vec<Event>, Failure> {
+        let call = value
+            .as_object()
+            .ok_or_else(|| malformed("Gemini functionCall must be an object"))?;
+        let name = require_string(call, "name", "Gemini functionCall name")
+            .map_err(|message| malformed(&message))?;
+        let index = self.gemini_tool_index;
+        self.gemini_tool_index += 1;
+        let call_id = match call.get("id") {
+            Some(Value::String(id)) if !id.is_empty() => id.clone(),
+            _ => format!("gemini-call-{index}"),
+        };
+        let arguments = match call.get("args") {
+            None => Value::Object(Map::new()),
+            Some(Value::Object(map)) => Value::Object(map.clone()),
+            Some(_) => return Err(malformed("Gemini functionCall args must be an object")),
+        };
+        let raw_arguments = serde_json::to_string(&arguments)
+            .map_err(|_| malformed("Gemini functionCall args must be an object"))?;
+        self.reserve_tool_bytes(raw_arguments.len())?;
+        let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
+        tool.raw_arguments = raw_arguments.clone();
+        let completed = tool.complete().map_err(|message| malformed(&message))?;
+        Ok(vec![
+            Event::ToolCallStarted {
+                index,
+                call_id,
+                name,
+            },
+            Event::ToolArgumentsDelta {
+                index,
+                delta: raw_arguments,
+            },
+            Event::ToolCallCompleted {
+                index,
+                call: completed,
+            },
+        ])
+    }
+}
+
+/// Parse Gemini `usageMetadata`, mirroring the python `_usage` normalizer:
+/// cached tokens are an input subset, absent counts are zero (`require_integer`
+/// parity), and `thoughtsTokenCount` stays unknown when omitted.
+fn gemini_usage(value: &Value) -> Result<Usage, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Gemini usageMetadata must be an object".to_string())?;
+    let reasoning_tokens = match object.get("thoughtsTokenCount") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(count_or_zero(
+            object,
+            "thoughtsTokenCount",
+            "Gemini thoughtsTokenCount",
+        )?),
+    };
+    Ok(Usage {
+        input_tokens: Some(count_or_zero(
+            object,
+            "promptTokenCount",
+            "Gemini promptTokenCount",
+        )?),
+        output_tokens: Some(count_or_zero(
+            object,
+            "candidatesTokenCount",
+            "Gemini candidatesTokenCount",
+        )?),
+        cached_input_tokens: Some(count_or_zero(
+            object,
+            "cachedContentTokenCount",
+            "Gemini cachedContentTokenCount",
+        )?),
+        reasoning_tokens,
+    })
+}
+
+#[cfg(test)]
+mod gemini_tests {
+    use super::*;
+    use crate::events::simplified_event;
+    use crate::sse::SseDecoder;
+    use serde_json::json;
+
+    /// Drain one raw SSE byte stream through the decoder and normalizer the
+    /// way the server's collection loop does, returning simplified events and
+    /// the failure that ended the stream, when one did.
+    fn run_stream(dialect: Dialect, chunks: &[&[u8]]) -> (Vec<Value>, Option<Failure>) {
+        let mut normalizer = Normalizer::new(dialect);
+        let mut decoder = SseDecoder::new();
+        let mut simplified = Vec::new();
+        for chunk in chunks {
+            let frames = match decoder.feed(chunk) {
+                Ok(frames) => frames,
+                Err(message) => return (simplified, Some(malformed(&message))),
+            };
+            for frame in frames {
+                match normalizer.feed(&frame) {
+                    Ok(events) => {
+                        simplified.extend(events.iter().map(simplified_event));
+                    }
+                    Err(failure) => return (simplified, Some(failure)),
+                }
+                if normalizer.saw_terminal() {
+                    return (simplified, None);
+                }
+            }
+        }
+        match decoder.finish() {
+            Ok(Some(frame)) => match normalizer.feed(&frame) {
+                Ok(events) => simplified.extend(events.iter().map(simplified_event)),
+                Err(failure) => return (simplified, Some(failure)),
+            },
+            Ok(None) => {}
+            Err(message) => return (simplified, Some(malformed(&message))),
+        }
+        if normalizer.saw_terminal() {
+            return (simplified, None);
+        }
+        match normalizer.stream_ended() {
+            Ok(()) => (simplified, None),
+            Err(failure) => (simplified, Some(failure)),
+        }
+    }
+
+    fn sse(payload: &Value) -> Vec<u8> {
+        format!("data: {payload}\n\n").into_bytes()
+    }
+
+    #[test]
+    fn gemini_golden_stream_normalizes_text_tools_usage_and_completion() {
+        // Golden fixture: raw provider bytes in, exact canonical events out.
+        // `native_dialect_parity_test.py` holds the python-mapper comparison.
+        let chunks = [
+            sse(&json!({"candidates": [{"content": {"parts": [{"text": "Hel"}]}}]})),
+            sse(&json!({"candidates": [{"content": {"parts": [
+                {"thought": true, "text": "hidden reasoning"},
+                {"text": "lo"},
+            ]}}]})),
+            sse(&json!({"candidates": [{"content": {"parts": [{
+                "functionCall": {
+                    "id": "call-1",
+                    "name": "lookup",
+                    "args": {"city": "Zürich", "count": 2},
+                }
+            }]}}]})),
+            sse(&json!({
+                "candidates": [{"finishReason": "STOP"}],
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 5,
+                    "cachedContentTokenCount": 2,
+                    "thoughtsTokenCount": 3,
+                },
+            })),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        let raw_arguments = "{\"city\":\"Zürich\",\"count\":2}";
+        assert_eq!(
+            events,
+            vec![
+                json!({"kind": "text_delta", "text": "Hel"}),
+                json!({"kind": "text_delta", "text": "lo"}),
+                json!({"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "lookup"}),
+                json!({"kind": "tool_arguments_delta", "index": 0, "text": raw_arguments}),
+                json!({
+                    "kind": "tool_call_completed",
+                    "index": 0,
+                    "call_id": "call-1",
+                    "name": "lookup",
+                    "raw_arguments": raw_arguments,
+                }),
+                json!({
+                    "kind": "usage",
+                    "input_tokens": 11,
+                    "output_tokens": 5,
+                    "cached_input_tokens": 2,
+                    "reasoning_tokens": 3,
+                }),
+                json!({"kind": "completed"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn gemini_missing_call_id_uses_the_deterministic_local_fallback() {
+        let chunks = [
+            sse(&json!({"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "first", "args": {}}},
+                {"functionCall": {"name": "second"}},
+            ]}}]})),
+            sse(&json!({
+                "candidates": [{"finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+            })),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events[0],
+            json!({"kind": "tool_call_started", "index": 0, "call_id": "gemini-call-0", "name": "first"})
+        );
+        assert_eq!(events[1]["text"], "{}");
+        assert_eq!(
+            events[3],
+            json!({"kind": "tool_call_started", "index": 1, "call_id": "gemini-call-1", "name": "second"})
+        );
+        // Absent usage counts are zero (require_integer parity), and an
+        // omitted thoughtsTokenCount stays unknown.
+        assert_eq!(
+            events[6],
+            json!({
+                "kind": "usage",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": null,
+            })
+        );
+        assert_eq!(events[7], json!({"kind": "completed"}));
+    }
+
+    #[test]
+    fn gemini_safety_finish_maps_to_a_content_free_refusal() {
+        for reason in [
+            "SAFETY",
+            "PROHIBITED_CONTENT",
+            "BLOCKLIST",
+            "RECITATION",
+            "SPII",
+        ] {
+            let chunks = [sse(&json!({"candidates": [{"finishReason": reason}]}))];
+            let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+            let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+            assert!(failure.is_none());
+            assert_eq!(
+                events,
+                vec![json!({
+                    "kind": "failed",
+                    "failure_class": "refusal",
+                    "safe_message": "provider refused the request",
+                })]
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_max_tokens_is_incomplete_and_unknown_reasons_fail() {
+        let incomplete = [sse(
+            &json!({"candidates": [{"finishReason": "MAX_TOKENS"}]}),
+        )];
+        let refs: Vec<&[u8]> = incomplete.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(events, vec![json!({"kind": "incomplete"})]);
+
+        let unknown = [sse(
+            &json!({"candidates": [{"finishReason": "MALFUNCTION"}]}),
+        )];
+        let refs: Vec<&[u8]> = unknown.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![json!({
+                "kind": "failed",
+                "failure_class": "provider_internal",
+                "safe_message": "provider ended the stream unexpectedly",
+            })]
+        );
+    }
+
+    #[test]
+    fn gemini_malformed_frames_fail_the_stream() {
+        // A non-text text part fails, exactly like the python mapper.
+        let bad_text = [sse(
+            &json!({"candidates": [{"content": {"parts": [{"text": 5}]}}]}),
+        )];
+        let refs: Vec<&[u8]> = bad_text.iter().map(Vec::as_slice).collect();
+        let (_, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert_eq!(
+            failure.expect("must fail").failure_class,
+            FailureClass::MalformedResponse
+        );
+
+        // Null function-call args fail (python: args must decode to a dict).
+        let bad_args = [sse(&json!({"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "x", "args": null}}
+        ]}}]}))];
+        let refs: Vec<&[u8]> = bad_args.iter().map(Vec::as_slice).collect();
+        let (_, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert_eq!(
+            failure.expect("must fail").failure_class,
+            FailureClass::MalformedResponse
+        );
+
+        // Two candidates in one frame fail.
+        let two = [sse(&json!({"candidates": [{}, {}]}))];
+        let refs: Vec<&[u8]> = two.iter().map(Vec::as_slice).collect();
+        let (_, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert_eq!(
+            failure.expect("must fail").failure_class,
+            FailureClass::MalformedResponse
+        );
+
+        // A stream that closes without a terminal candidate fails.
+        let unterminated = [sse(
+            &json!({"candidates": [{"content": {"parts": [{"text": "a"}]}}]}),
+        )];
+        let refs: Vec<&[u8]> = unterminated.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert_eq!(events, vec![json!({"kind": "text_delta", "text": "a"})]);
+        assert_eq!(
+            failure.expect("must fail").failure_class,
+            FailureClass::MalformedResponse
+        );
+    }
+
+    #[test]
+    fn gemini_frames_after_the_terminal_candidate_are_ignored() {
+        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+        let terminal = crate::sse::SseEvent {
+            event: None,
+            data: json!({"candidates": [{"finishReason": "STOP"}]}).to_string(),
+        };
+        let trailing = crate::sse::SseEvent {
+            event: None,
+            data: json!({"candidates": [{"content": {"parts": [{"text": "late"}]}}]}).to_string(),
+        };
+        let events = normalizer.feed(&terminal).expect("terminal frame");
+        assert!(events.iter().any(Event::is_terminal));
+        assert!(normalizer.saw_terminal());
+        assert!(normalizer.feed(&trailing).expect("ignored").is_empty());
     }
 }

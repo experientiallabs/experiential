@@ -72,7 +72,8 @@ class GatewayWireProfile:
     """
 
     dialect: str
-    """Wire dialect: openai_responses, anthropic_messages, or openai_compatible."""
+    """Wire dialect: openai_responses, anthropic_messages, openai_compatible,
+    or gemini_generate_content."""
 
     url: str
     """Full endpoint URL, including provider-specific query parameters."""

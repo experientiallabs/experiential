@@ -9,12 +9,17 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.streaming_requests import (
     anthropic_messages_stream_payload,
+    dialect_stream_payload,
+    gemini_generate_content_stream_payload,
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
 )
+from exp.runtime.openai_protocol.model_adapter import model_request
 
 
 def _chat_request(
@@ -157,3 +162,30 @@ def test_anthropic_messages_stream_payload_round_trips_tool_error_state() -> Non
     }
     # An ordinary result stays byte-identical to the pre-existing payload shape.
     assert blocks[1] == {"type": "tool_result", "tool_use_id": "call-2", "content": "fine"}
+
+
+def test_gemini_stream_payload_matches_the_provider_client_builder() -> None:
+    """The gemini dialect payload is the exact generateContent body the python
+    provider client sends, built through the same shared converter."""
+    request = _chat_request(temperature=0.3)
+    payload = gemini_generate_content_stream_payload("gemini-2.5-pro", request)
+
+    assert payload == gemini_generate_request("gemini-2.5-pro", model_request(request))
+    assert payload["contents"] == [{"role": "user", "parts": [{"text": "hello"}]}]
+    generation = payload["generationConfig"]
+    assert isinstance(generation, dict)
+    assert generation["temperature"] == 0.3
+    # Streaming is selected by the streamGenerateContent route, not the body.
+    assert "stream" not in payload
+
+
+def test_dialect_dispatch_builds_the_gemini_payload() -> None:
+    """The shared dialect dispatch routes gemini_generate_content correctly."""
+    profile = GatewayWireProfile(
+        dialect="gemini_generate_content",
+        url="https://example.invalid/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+        model_id="gemini-2.5-pro",
+    )
+    payload = dialect_stream_payload(profile, _chat_request())
+
+    assert payload["contents"] == [{"role": "user", "parts": [{"text": "hello"}]}]

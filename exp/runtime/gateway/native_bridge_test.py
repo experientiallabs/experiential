@@ -423,16 +423,16 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
     manager, raw_key = _configured_gateway(tmp_path)
     upsert_connection(
         tmp_path,
-        name="gemini-main",
-        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        name="bedrock-main",
+        connection=ConnectionConfig(provider="bedrock", region="us-east-1"),
         replace=False,
     )
     normalized, snapshot, _changed = upsert_singleton_deployment(
         tmp_path,
-        deployment_alias="gem",
-        connection_name="gemini-main",
-        provider_model="gemini-model-exact",
-        exact_model_id="gemini-revision-exact",
+        deployment_alias="bed",
+        connection_name="bedrock-main",
+        provider_model="bedrock-model-exact",
+        exact_model_id="bedrock-revision-exact",
         revision=None,
         capabilities=ModelCapabilities(),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
@@ -441,26 +441,23 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
         replace=False,
     )
     manager.activate_direct_alias(
-        alias_id="gem",
-        alias_name="gem",
-        revision_id="revision-gem",
-        pool_id="gem",
+        alias_id="bed",
+        alias_name="bed",
+        revision_id="revision-bed",
+        pool_id="bed",
         snapshot_ref=f"catalog-snapshots/{snapshot.name}",
         catalog_sha256=normalized.identity_sha256(),
     )
-    manager.add_grant(identity_id="default", alias_id="gem")
+    manager.add_grant(identity_id="default", alias_id="bed")
     components = load_gateway_components(
         tmp_path,
-        environment={
-            "TEST_PROVIDER_KEY": "provider-secret-canary",
-            "TEST_GEMINI_KEY": "gemini-secret-canary",
-        },
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
     )
     control = NativeControlPlane(components)
-    admission = _admit(control, raw_key, _chat_body(model="gem"))
+    admission = _admit(control, raw_key, _chat_body(model="bed"))
     assert "escalate" in admission
     assert "request_id" not in admission
-    scope = _claim_scope(control, raw_key, _chat_body(model="gem"), idempotency_key="op-1")
+    scope = _claim_scope(control, raw_key, _chat_body(model="bed"), idempotency_key="op-1")
     assert "escalate" in scope
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 0

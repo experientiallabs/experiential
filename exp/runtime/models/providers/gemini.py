@@ -1,9 +1,8 @@
-"""Native Gemini conversion for non-streaming generation and embeddings."""
+"""Native Gemini client for generation, streaming dispatch, and embeddings."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal
 
 from pydantic import JsonValue
 
@@ -11,20 +10,15 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     AssistantAction,
     Embedding,
-    ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
     ToolCall,
-    ToolChoice,
     Usage,
 )
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.async_transport import RequestDeadline
-from exp.runtime.models.providers.base import (
-    DEFAULT_MAXIMUM_OUTPUT_TOKENS,
-    ProviderHttpClient,
-)
+from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
@@ -34,6 +28,10 @@ from exp.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
+from exp.runtime.models.providers.gemini_requests import (
+    gemini_generate_request,
+    gemini_model_path,
+)
 from exp.runtime.models.providers.gemini_streaming import start_gemini_generate_stream
 from exp.runtime.models.providers.openai_compatible import normalize_embedding_vector
 from exp.runtime.models.providers.streaming import NormalizedProviderStream
@@ -41,58 +39,6 @@ from exp.runtime.models.providers.transport import RetryPolicy
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-
-
-def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
-    """Convert a EXP request into Gemini's native generateContent payload.
-
-    Args:
-        model_id: Gemini model identifier selected by the catalog.
-        request: Typed visible messages, tools, and sampling parameters.
-
-    Returns:
-        A non-streaming native payload for the generateContent endpoint.
-
-    Raises:
-        ValueError: A visible request message cannot preserve its tool linkage on Gemini's wire.
-    """
-    system_parts: list[JsonObject] = []
-    contents: list[JsonObject] = []
-    tool_names: dict[str, str] = {}
-    for message in request.messages:
-        if message.role == "system":
-            if message.content is None:
-                raise ValueError("system messages need text content")
-            system_parts.append({"text": message.content})
-            continue
-        contents.append(_gemini_content(message, tool_names))
-    payload: JsonObject = {"contents": contents}
-    if system_parts:
-        payload["systemInstruction"] = {"parts": system_parts}
-    if request.tools:
-        payload["tools"] = [
-            {
-                "functionDeclarations": [
-                    {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parametersJsonSchema": tool.input_schema,
-                    }
-                    for tool in request.tools
-                ]
-            }
-        ]
-    if request.tool_choice is not None:
-        payload["toolConfig"] = {"functionCallingConfig": _gemini_tool_choice(request.tool_choice)}
-    generation: JsonObject = {}
-    if request.temperature is not None:
-        generation["temperature"] = request.temperature
-    if request.maximum_output_tokens is not None:
-        generation["maxOutputTokens"] = request.maximum_output_tokens
-    else:
-        generation["maxOutputTokens"] = DEFAULT_MAXIMUM_OUTPUT_TOKENS
-    payload["generationConfig"] = generation
-    return payload
 
 
 def gemini_generate_response(
@@ -172,7 +118,7 @@ class GeminiClient(ProviderHttpClient):
         Returns:
             A cancellable provider-neutral event stream.
         """
-        model_id = _path_model_id(self._model.model_id)
+        model_id = gemini_model_path(self._model.model_id)
         return await start_gemini_generate_stream(
             self._transport,
             f"{self._base_url}/models/{model_id}:streamGenerateContent?alt=sse",
@@ -192,9 +138,20 @@ class GeminiClient(ProviderHttpClient):
         """Build native Gemini headers using the goog API key scheme."""
         return {"x-goog-api-key": self._api_key, "content-type": "application/json"}
 
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the native streamGenerateContent wire profile for this connection."""
+        model_id = gemini_model_path(self._model.model_id)
+        return GatewayWireProfile(
+            dialect="gemini_generate_content",
+            url=f"{self._base_url}/models/{model_id}:streamGenerateContent?alt=sse",
+            headers=self._headers(),
+            model_id=self._model.model_id,
+            timeout_seconds=self._timeout_seconds,
+        )
+
     def _completion_path(self) -> str:
         """Return the model-scoped native generateContent route."""
-        return f"models/{_path_model_id(self._model.model_id)}:generateContent"
+        return f"models/{gemini_model_path(self._model.model_id)}:generateContent"
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native generateContent payload."""
@@ -220,9 +177,9 @@ class GeminiClient(ProviderHttpClient):
         """
         if not texts:
             return ()
-        model_name = f"models/{_path_model_id(self._model.model_id)}"
+        model_name = f"models/{gemini_model_path(self._model.model_id)}"
         response = self._post(
-            f"models/{_path_model_id(self._model.model_id)}:batchEmbedContents",
+            f"models/{gemini_model_path(self._model.model_id)}:batchEmbedContents",
             {
                 "requests": [
                     {"model": model_name, "content": {"parts": [{"text": text}]}} for text in texts
@@ -245,58 +202,6 @@ class GeminiClient(ProviderHttpClient):
             )
             for index, value in enumerate(values)
         )
-
-
-def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonObject:
-    """Map a EXP history item to Gemini user or model content parts."""
-    if message.role == "tool":
-        tool_name = tool_names.get(message.tool_call_id or "")
-        if tool_name is None:
-            raise ValueError("Gemini tool result has no preceding tool-call name")
-        return {
-            "role": "user",
-            "parts": [
-                {
-                    "functionResponse": {
-                        "name": tool_name,
-                        "response": {"content": message.content or ""},
-                    }
-                }
-            ],
-        }
-    if message.role == "user":
-        if message.content is None:
-            raise ValueError("user messages need text content")
-        return {"role": "user", "parts": [{"text": message.content}]}
-    if message.role != "assistant":
-        raise ValueError(f"unsupported Gemini message role {message.role!r}")
-    action = message.assistant_action
-    text = message.content if message.content is not None else action.content if action else None
-    parts: list[JsonObject] = []
-    if text is not None:
-        parts.append({"text": text})
-    if action is not None:
-        for call in action.tool_calls:
-            tool_names[call.call_id] = call.name
-            parts.append({"functionCall": {"name": call.name, "args": call.arguments}})
-    if not parts:
-        raise ValueError("assistant messages need text or tool calls")
-    return {"role": "model", "parts": parts}
-
-
-def _gemini_tool_choice(
-    choice: Literal["auto", "none", "required"] | ToolChoice,
-) -> JsonObject:
-    """Map closed EXP tool-choice values to native Gemini function configuration."""
-    if choice == "auto":
-        return {"mode": "AUTO"}
-    if choice == "none":
-        return {"mode": "NONE"}
-    if choice == "required":
-        return {"mode": "ANY"}
-    if isinstance(choice, ToolChoice):
-        return {"mode": "ANY", "allowedFunctionNames": [choice.name]}
-    raise ValueError("unsupported Gemini tool choice")
 
 
 def _gemini_tool_call(value: JsonValue, index: int) -> ToolCall:
@@ -329,11 +234,6 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
             usage.get("cachedContentTokenCount"), "Gemini cachedContentTokenCount"
         ),
     )
-
-
-def _path_model_id(model_id: str) -> str:
-    """Remove the optional wire prefix before placing a model in a Gemini path."""
-    return model_id.removeprefix("models/")
 
 
 def _gemini_refusal_signal(value: object) -> ProviderRefusalSignal | None:

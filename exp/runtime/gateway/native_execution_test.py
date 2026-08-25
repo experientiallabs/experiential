@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
@@ -167,8 +169,18 @@ def test_caller_invalid_request_never_advances() -> None:
     assert candidate is None
 
 
-def test_native_serving_blockers_name_dialectless_providers(tmp_path: Path) -> None:
-    """Rust-only startup validation names every alias the engine cannot serve."""
+def test_native_serving_blockers_name_dialectless_providers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rust-only startup validation names every alias the engine cannot serve.
+
+    Every currently supported provider implements a native dialect, so the
+    "no native dialect implementation" branch is exercised by patching a real
+    client's ``gateway_wire_profile`` back to the unimplemented base
+    behavior, rather than by a provider connection string this registry can
+    still resolve.
+    """
     from exp.common.models import (
         GatewayDeploymentCapabilities,
         GatewayTokenPrices,
@@ -182,6 +194,14 @@ def test_native_serving_blockers_name_dialectless_providers(tmp_path: Path) -> N
     from exp.runtime.gateway.lifecycle import load_gateway_components
     from exp.runtime.gateway.lifecycle_test import _configured_gateway
     from exp.runtime.gateway.native_execution import native_serving_blockers
+    from exp.runtime.models.providers.errors import ProviderCapabilityError
+    from exp.runtime.models.providers.gemini import GeminiClient
+
+    def _no_native_dialect(self: GeminiClient) -> object:
+        del self
+        raise ProviderCapabilityError(capability="native_data_plane")
+
+    monkeypatch.setattr(GeminiClient, "gateway_wire_profile", _no_native_dialect)
 
     manager, _raw_key = _configured_gateway(tmp_path)
     upsert_connection(
