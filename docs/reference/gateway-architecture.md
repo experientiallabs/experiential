@@ -19,28 +19,24 @@ It serves:
 this same gateway application. It does not create a router HTTP server. Gateway startup and readiness
 perform no provider request. Only an authorized model request may cross the provider boundary.
 
-## Data-plane engines
+## The data plane
 
-The native (Rust) engine is the supported data plane; the python data plane
-is deprecated and scheduled for removal once the native engine has soaked in
-production. The default `exp` flow resolves `--engine auto` (the default) to
-the native engine when the `exp_gateway_native` extension is built, and
-otherwise prints the reason and serves through the deprecated python engine.
-`--engine rust` and `--engine python` force one engine.
+The gateway has exactly one data plane: a native Rust HTTP server compiled as
+a PyO3 extension (`exp_gateway_native`). Every launch path serves through it,
+and a missing compiled extension fails the launch with the exact build
+command rather than falling back.
 
-The native engine is a Rust HTTP server compiled as a PyO3 extension. It owns
-the public socket and the Chat Completions and Responses fast paths: upstream
-dispatch, provider stream normalization, the certified deployment waterfall,
-and public SSE encoding run off the GIL, with JSON-string callbacks into
-python per request (authenticate, admit, `start_attempt` per physical
-dispatch, settle, and `enforce_output` only when admission sets
+The native engine owns the public socket and every serving fast path:
+upstream dispatch, provider stream normalization, the certified deployment
+waterfall, and public SSE encoding run off the GIL, with JSON-string
+callbacks into python per request (authenticate, admit, `start_attempt` per
+physical dispatch, settle, and `enforce_output` only when admission sets
 `output_guardrail`). Unguarded traffic never calls that output callback.
-Everything protocol- and authority-shaped stays in the shared
-python code: admission decodes the raw body with the same `decode_chat`,
-enforces the same deployment-identity invariant, builds every deployment's
-upstream payload with the same `streaming_requests` builders, and writes the
-same durable SQLite transactions, over the same hot-reloadable authority
-generations.
+Everything protocol- and authority-shaped stays in python: admission decodes
+the raw body with `decode_chat`, enforces the deployment-identity invariant,
+builds every deployment's upstream payload with the `streaming_requests`
+builders, and writes durable SQLite transactions over hot-reloadable
+authority generations.
 Provider wire facts come from the public `gateway_wire_profile()` on each
 resolved provider client; native dialects are `openai_responses`,
 `anthropic_messages`, `openai_compatible` (which also covers Azure and
@@ -68,59 +64,19 @@ enables refusal failover, refusal deltas are withheld in a bounded in-memory
 buffer so a refusal-only terminal can advance to the next deployment; mixed
 output or buffer overflow commits and flushes.
 
-The public surface is identical under either engine, and `--engine rust` is
-rust-only: no embedded python engine runs, unknown routes answer a native 404
-in the OpenAI error envelope, keyed Chat Completions and keyed Responses run
-the replay protocol natively (the Messages surface defines no idempotency
-header and never joins either replay store), and `/usage` plus `/usage.json`
-are served natively. Startup validates that every granted alias is natively
-servable (every pool deployment resolves to a provider client with a native
-dialect) and fails with the offending aliases named otherwise. Hosted
-compositions may still pass an internal ASGI fallback to
-`serve_native_gateway` while they finish migrating off the python data plane;
-that seam is deprecated and scheduled for removal once the native engine has
-soaked in production. Shutdown drains admitted work within
-`--graceful-timeout`.
+Unknown routes answer a native 404 in the OpenAI error envelope, keyed Chat
+Completions and keyed Responses run the replay protocol natively (the
+Messages surface defines no idempotency header and never joins either replay
+store), and `/usage` plus `/usage.json` are served natively. Startup
+validates that every granted alias is natively servable (every pool
+deployment resolves to a provider client with a native dialect) and fails
+with the offending aliases named otherwise. Shutdown drains admitted work
+within `--graceful-timeout`.
 
 Identity-scoped guardrails are optional and default-off. Policies are keyed by
 organization and identity. See `docs/reference/gateway-guardrails.md` for
 policy lookup, the internal classifier seam, and the input and output
 enforcement order.
-
-## Embeddable worker composition
-
-Platform workers use the public `create_gateway_runtime` seam. The worker supplies storage,
-provider, secret, project-selection, clock, readiness, and usage implementations, then owns the
-returned lifecycle handle:
-
-```python
-runtime = exp.create_gateway_runtime(
-    config=exp.GatewayRuntimeConfig(graceful_timeout_seconds=10),
-    authority=authority,
-    ledger=ledger,
-    routes=routes,
-    executor=executor,
-    clock=clock,
-    readiness=readiness,
-    usage=usage,
-    replay=replay,
-    continuations=continuations,
-)
-
-app = runtime.app
-# Serve app with the platform's ASGI worker, including ASGI lifespan.
-```
-
-The factory performs no filesystem, SQLite, environment, lock, or server access. A worker may use
-any `SecretResolver` while constructing its provider executor and any `ProjectTargetResolver`
-while constructing its catalog route resolver. The composed application always mounts the same
-`create_gateway_app` data plane used by the local CLI. The lifecycle exposes explicit preflight,
-readiness, bounded drain, and shutdown operations in addition to its ASGI lifespan.
-
-An ASGI host that drives application lifespan owns preflight and shutdown automatically. A host
-that does not drive lifespan calls `runtime.preflight()` before admission and
-`runtime.shutdown()` during teardown. Shutdown is idempotent across those paths: one runtime starts
-one bounded drain and one terminal flush, then remains permanently not ready.
 
 ## Authority and management
 

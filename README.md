@@ -53,19 +53,19 @@ collects four prompts:
 
 ## Using the API
 
-Create a local gateway programmatically:
+Start the local gateway with `exp` (or `exp run`); the compiled native data plane
+serves every route on loopback. From Python, load a fitted project router as an
+official OpenAI client backed by its own private gateway:
 
 ```python
-import uvicorn
+import exp
 
-from exp.runtime.gateway.lifecycle import load_local_gateway
-
-gateway = load_local_gateway()
-uvicorn.run(gateway.app, lifespan="on")
+with exp.load_router("my-project") as client:
+    response = client.chat.completions.create(
+        model="my-project",
+        messages=[{"role": "user", "content": "hello"}],
+    )
 ```
-
-For hosted workers with their own storage and provider services, use the lower-level
-`exp.create_gateway_runtime(...)` composition API.
 
 ## Optimize from Traffic
 

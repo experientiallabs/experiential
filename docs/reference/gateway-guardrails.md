@@ -26,10 +26,9 @@ path: no classifier call, no stream buffering, and no extra native callback.
 The native data plane follows the same order. Input enforcement runs after
 Responses continuation expansion and before route resolution, provider
 preflight, ledger acceptance, and attempt start. A block never reaches routing.
-When native later escalates, the embedded python engine re-inspects the
-original public body. When admission sets `output_guardrail`, Rust buffers the
-completion and calls `enforce_output` once. Unguarded admissions omit that flag
-and never invoke the callback.
+When admission sets `output_guardrail`, Rust buffers the completion and calls
+`enforce_output` once. Unguarded admissions omit that flag and never invoke
+the callback.
 
 ## Classifier adapters
 
@@ -281,10 +280,6 @@ errors. Protected streaming may add classifier latency before the first token.
 ## Limitations
 
 - Guardrails do not change routing policy, budgets, or catalog snapshots.
-- Native multi-deployment pools still escalate to the python engine, which
-  owns waterfall accounting and runs input enforcement on the original public
-  body. Native already ran the input chain before deciding to escalate, so a
-  block never reaches python.
 - Classifiers must not call the public gateway. Recursion fails closed.
 - At most 32 isolation workers may run async classifier inspects for one
   limiter. Additional inspects wait only until their remaining timeout, then
