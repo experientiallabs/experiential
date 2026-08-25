@@ -18,7 +18,6 @@ from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot
-from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
     ProviderDeadlineExceeded,
@@ -27,6 +26,7 @@ from exp.runtime.models.providers.async_transport import (
 from exp.runtime.models.providers.base import (
     DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT_SECONDS,
+    GatewayWireProfile,
     ProviderHttpClient,
     completion_timeout_seconds,
 )
@@ -34,10 +34,7 @@ from exp.runtime.models.providers.gemini import (
     gemini_generate_request,
     gemini_generate_response,
 )
-from exp.runtime.models.providers.gemini_streaming import start_gemini_generate_stream
-from exp.runtime.models.providers.streaming import NormalizedProviderStream
 from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
-from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 VERTEX_TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 """OAuth scope requested for every Vertex access token."""
@@ -223,41 +220,20 @@ class VertexClient(ProviderHttpClient):
             request, deadline=request_deadline, idempotency_key=idempotency_key
         )
 
-    async def stream(
-        self,
-        request: GatewayRequest,
-        *,
-        deadline: RequestDeadline,
-        idempotency_key: str,
-        retry_policy: RetryPolicy | None = None,
-    ) -> NormalizedProviderStream:
-        """Start one native Vertex SSE stream under the gateway deadline.
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the native streamGenerateContent wire profile for this connection.
 
-        Args:
-            request: Canonical streaming gateway request.
-            deadline: Immutable request-wide deadline.
-            idempotency_key: Stable identity for this deployment operation.
-            retry_policy: Optional caller-owned physical dispatch limit.
-
-        Returns:
-            A cancellable provider-neutral event stream.
+        Vertex serves the shared Gemini dialect, so the native data plane builds and
+        parses the wire traffic itself; this profile carries the publisher-scoped SSE
+        endpoint and a currently valid bearer token. The token read may block for one
+        roughly-hourly mint; profile resolution runs on the bridge's blocking-callback
+        thread, never on an event loop.
         """
-        bearer_token = await self._warm_bearer_token(deadline)
-        return await start_gemini_generate_stream(
-            self._transport,
-            f"{self._base_url}/{self._stream_path()}",
-            headers={
-                "authorization": f"Bearer {bearer_token}",
-                "content-type": "application/json",
-            },
-            payload=gemini_generate_request(
-                self._model.model_id,
-                gateway_model_request(request),
-            ),
-            request=request,
-            deadline=deadline,
-            idempotency_key=idempotency_key,
-            retry_policy=retry_policy or self._retry_policy,
+        return GatewayWireProfile(
+            dialect="gemini_generate_content",
+            url=f"{self._base_url}/{self._stream_path()}",
+            headers=self._headers(),
+            model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
         )
 

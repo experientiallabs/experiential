@@ -187,6 +187,33 @@ def test_vertex_stream_path_targets_the_sse_route() -> None:
     assert path == "publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
 
 
+def test_vertex_wire_profile_serves_the_gemini_dialect_with_a_bearer_token() -> None:
+    """The native data plane dispatches Vertex through the shared Gemini dialect.
+
+    The profile names the publisher-scoped SSE endpoint on the project-and-location
+    root and carries the connection's current OAuth bearer token, so the compiled
+    engine can stream Vertex without any Vertex-specific dialect code.
+    """
+    client = VertexClient(
+        model=_snapshot("vertex", "publishers/google/models/gemini-2.5-flash"),
+        api_key='{"placeholder": true}',
+        base_url=_BASE_URL,
+        transport=ScriptedJsonTransport(),
+        token_provider=lambda: "fixture-bearer-token",
+    )
+
+    profile = client.gateway_wire_profile()
+
+    assert profile.dialect == "gemini_generate_content"
+    assert profile.url == (
+        f"{_BASE_URL}/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+    )
+    assert profile.headers["authorization"] == "Bearer fixture-bearer-token"
+    assert profile.headers["content-type"] == "application/json"
+    assert profile.model_id == "publishers/google/models/gemini-2.5-flash"
+    assert not profile.signs_request_body
+
+
 def test_vertex_model_id_strips_resource_path_spellings() -> None:
     """Catalog spellings with resource prefixes collapse onto the bare publisher model."""
     assert _vertex_model_id("gemini-2.5-pro") == "gemini-2.5-pro"

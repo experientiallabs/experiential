@@ -231,7 +231,7 @@ class ProviderHttpClient(abc.ABC):
 
         Raises:
             ProviderCapabilityError: This provider has no native-dialect
-                implementation; the request belongs on the Python engine.
+                implementation, so the gateway cannot serve its routes.
         """
         raise ProviderCapabilityError(capability="native_data_plane")
 
