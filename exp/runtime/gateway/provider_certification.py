@@ -96,26 +96,22 @@ _PROVIDER_API_SURFACES = {
     "openai-compatible": "chat.completions SSE",
     "openrouter": "chat.completions SSE",
 }
-_GEMINI_EVIDENCE = ("exp/runtime/models/providers/gemini_streaming_test.py",)
-_BEDROCK_EVIDENCE = ("exp/runtime/models/providers/bedrock_streaming_test.py",)
+_GEMINI_EVIDENCE = ("exp/runtime/gateway/tests/native_dialect_parity_test.py",)
+_BEDROCK_EVIDENCE = ("exp/runtime/gateway/tests/native_dialect_parity_test.py",)
 _OPENAI_EVIDENCE = (
-    "exp/runtime/models/providers/native_test.py",
-    "exp/runtime/models/providers/streaming_test.py",
+    "exp/runtime/models/providers/tests/native_test.py",
+    "exp/runtime/gateway/tests/native_dialect_parity_test.py",
 )
 _ANTHROPIC_EVIDENCE = (
-    "exp/runtime/models/providers/native_test.py",
-    "exp/runtime/models/providers/streaming_test.py",
-    "exp/runtime/models/providers/streaming_test.py::"
-    "test_anthropic_text_stream_emits_text_usage_and_completion",
+    "exp/runtime/models/providers/tests/native_test.py",
+    "exp/runtime/gateway/native_bridge_test.py::"
+    "test_rust_messages_sse_frames_match_the_committed_golden",
 )
 _OPENAI_COMPATIBLE_EVIDENCE = (
     "exp/runtime/models/providers/openai_compatible_test.py",
-    "exp/runtime/models/providers/streaming_test.py",
+    "exp/runtime/gateway/tests/native_dialect_parity_test.py",
 )
-_COMPATIBLE_EVIDENCE = (
-    "exp/runtime/models/providers/later_provider_streaming_test.py",
-    "exp/runtime/models/providers/streaming_test.py",
-)
+_COMPATIBLE_EVIDENCE = ("exp/runtime/gateway/tests/native_dialect_parity_test.py",)
 
 
 def _cell(

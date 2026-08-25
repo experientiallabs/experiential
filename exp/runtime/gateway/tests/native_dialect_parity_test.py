@@ -1,39 +1,23 @@
-"""Cross-engine provider-dialect parity over committed golden stream fixtures.
+"""Provider-dialect parity over committed golden stream fixtures.
 
 The golden fixtures are the contract: raw provider stream bytes in, the exact
 canonical event sequence out. The native (Rust) normalizer is checked against
-the goldens through ``normalize_stream_fixture``; the python event mappers
-(deprecated, scheduled for removal with the python data plane) are checked
-against the same goldens as a secondary assertion while they still serve
-traffic.
+the goldens through ``normalize_stream_fixture``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import zlib
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import Sequence
 
-import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import BillingSource, ModelSnapshot
 from exp.runtime.gateway.contracts import (
-    GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
-    GatewayMessage,
-    GatewayRequest,
 )
-from exp.runtime.models.providers.async_transport import (
-    HttpxAsyncJsonTransport,
-    RequestDeadline,
-)
-from exp.runtime.models.providers.bedrock_streaming import BedrockProviderStream
-from exp.runtime.models.providers.gemini import GeminiClient
-from exp.runtime.models.providers.transport import RetryPolicy
 
 
 def _sse(payload: JsonObject) -> bytes:
@@ -211,68 +195,6 @@ def _simplified(event: GatewayEvent) -> JsonObject:
     }
 
 
-class _ChunkStream(httpx.AsyncByteStream):
-    """Yield exact provider stream chunks for the python mapper."""
-
-    def __init__(self, chunks: Sequence[bytes]) -> None:
-        """Store response chunks in provider order."""
-        self._chunks = tuple(chunks)
-
-    async def __aiter__(self) -> AsyncIterator[bytes]:
-        """Yield every configured chunk once."""
-        for chunk in self._chunks:
-            yield chunk
-
-    async def aclose(self) -> None:
-        """Provider response closure needs no bookkeeping here."""
-
-
-def _python_gemini_events(chunks: Sequence[bytes]) -> list[JsonObject]:
-    """Run raw chunks through the deprecated python Gemini stream mapper.
-
-    Args:
-        chunks: Raw provider SSE bytes in arrival order.
-
-    Returns:
-        Simplified canonical events in the shared fixture shape.
-    """
-
-    async def scenario() -> list[JsonObject]:
-        """Consume one scripted native Gemini streaming response."""
-
-        def handler(_request: httpx.Request) -> httpx.Response:
-            """Return the scripted SSE response."""
-            return httpx.Response(200, stream=_ChunkStream(chunks))
-
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-            client = GeminiClient(
-                model=ModelSnapshot(
-                    provider="gemini",
-                    model_id="gemini-2.5-pro",
-                    billing_source=BillingSource.CUSTOMER_MANAGED,
-                    capabilities_sha256="a" * 64,
-                    connection_sha256="b" * 64,
-                ),
-                api_key="fixture-key",
-                base_url="https://gemini.test/v1beta",
-                transport=HttpxAsyncJsonTransport(http_client),
-            )
-            stream = await client.stream(
-                GatewayRequest(
-                    surface=GatewayApiSurface.CHAT_COMPLETIONS,
-                    messages=(GatewayMessage(role="user", content="hello"),),
-                    stream=True,
-                    include_usage=True,
-                ),
-                deadline=RequestDeadline.after(10),
-                idempotency_key="parity-operation",
-                retry_policy=RetryPolicy(1, 0, 0),
-            )
-            return [_simplified(event) async for event in stream]
-
-    return asyncio.run(scenario())
-
-
 def test_native_gemini_normalizer_matches_the_golden_fixture() -> None:
     """The Rust normalizer reproduces the committed canonical event sequence."""
     result = _native_normalized("gemini_generate_content", GEMINI_GOLDEN_CHUNKS)
@@ -301,24 +223,6 @@ def test_native_gemini_normalizer_fails_streams_without_a_terminal() -> None:
     failure = result["failure"]
     assert isinstance(failure, dict)
     assert failure["failure_class"] == "malformed_response"
-
-
-def test_python_gemini_mapper_matches_the_same_goldens() -> None:
-    """The deprecated python mapper agrees with the committed goldens."""
-    events = _python_gemini_events(GEMINI_GOLDEN_CHUNKS)
-    # Known python-mapper quirk: it omits tool_call_index on
-    # TOOL_CALL_COMPLETED (its consumers key on the started and delta
-    # events). The golden carries the index, so align that one field.
-    assert events[4]["kind"] == "tool_call_completed"
-    assert events[4]["index"] is None
-    events[4]["index"] = 0
-    assert events == list(GEMINI_GOLDEN_EVENTS)
-    assert _python_gemini_events(GEMINI_INCOMPLETE_CHUNKS) == list(GEMINI_INCOMPLETE_EVENTS)
-    refusal = _python_gemini_events(GEMINI_REFUSAL_CHUNKS)
-    assert len(refusal) == 1
-    assert refusal[0]["kind"] == "failed"
-    assert refusal[0]["failure_class"] == "refusal"
-    assert refusal[0]["safe_message"] == "provider refused the request"
 
 
 def _eventstream_message(name: str, payload: JsonObject, *, exception: bool = False) -> bytes:
@@ -409,49 +313,6 @@ BEDROCK_REFUSAL_ENVELOPES: tuple[tuple[str, JsonObject], ...] = (
 )
 
 
-class _ScriptedEventStream:
-    """Expose scripted synchronous Bedrock envelopes for the python mapper."""
-
-    def __init__(self, events: Sequence[JsonObject]) -> None:
-        """Store decoded provider envelopes in wire order."""
-        self._events = iter(tuple(events))
-
-    def __iter__(self) -> Iterator[JsonObject]:
-        """Return this one-pass synchronous iterator."""
-        return self
-
-    def __next__(self) -> JsonObject:
-        """Return the next scripted provider envelope."""
-        return next(self._events)
-
-    def close(self) -> None:
-        """Scripted closure needs no bookkeeping."""
-
-
-def _python_bedrock_events(envelopes: Sequence[tuple[str, JsonObject]]) -> list[JsonObject]:
-    """Run decoded envelopes through the deprecated python Bedrock mapper.
-
-    Args:
-        envelopes: Ordered (event name, payload) pairs, the decoded form of
-            the same messages the binary fixture frames for the Rust side.
-
-    Returns:
-        Simplified canonical events in the shared fixture shape.
-    """
-
-    async def scenario() -> list[JsonObject]:
-        """Consume one scripted Bedrock EventStream."""
-        upstream = _ScriptedEventStream([{name: payload} for name, payload in envelopes])
-        stream = BedrockProviderStream(
-            upstream,
-            deadline=RequestDeadline.after(10),
-            release=lambda: None,
-        )
-        return [_simplified(event) async for event in stream]
-
-    return asyncio.run(scenario())
-
-
 def test_native_bedrock_normalizer_matches_the_golden_fixture() -> None:
     """The Rust event-stream decoder and normalizer reproduce the goldens."""
     chunks = [_eventstream_message(name, payload) for name, payload in BEDROCK_GOLDEN_ENVELOPES]
@@ -506,13 +367,3 @@ def test_native_bedrock_normalizer_fails_corrupt_and_truncated_frames() -> None:
     failure = truncated["failure"]
     assert isinstance(failure, dict)
     assert failure["failure_class"] == "malformed_response"
-
-
-def test_python_bedrock_mapper_matches_the_same_goldens() -> None:
-    """The deprecated python mapper agrees with the committed goldens."""
-    assert _python_bedrock_events(BEDROCK_GOLDEN_ENVELOPES) == list(BEDROCK_GOLDEN_EVENTS)
-    refusal = _python_bedrock_events(BEDROCK_REFUSAL_ENVELOPES)
-    assert refusal[0]["kind"] == "usage"
-    assert refusal[1]["kind"] == "failed"
-    assert refusal[1]["failure_class"] == "refusal"
-    assert refusal[1]["safe_message"] == "provider refused the request"

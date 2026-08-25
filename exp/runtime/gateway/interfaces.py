@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Protocol
 
@@ -115,23 +114,6 @@ class AttemptLedger(Protocol):
         failure: GatewayFailure,
     ) -> None:
         """Terminalize accepted work that failed before a provider dispatch existed."""
-        ...
-
-
-class ProviderStream(Protocol):
-    """True provider stream yielding normalized events in provider order."""
-
-    @property
-    def committed(self) -> bool:
-        """Return whether an outward semantic event has committed this provider route."""
-        ...
-
-    def __aiter__(self) -> AsyncIterator[GatewayEvent]:
-        """Iterate normalized provider events until one terminal event."""
-        ...
-
-    async def cancel(self) -> None:
-        """Cancel active upstream work within the adapter's declared bound."""
         ...
 
 

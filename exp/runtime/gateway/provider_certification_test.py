@@ -76,12 +76,12 @@ def test_gemini_raw_argument_limit_is_explicit_while_bedrock_is_certified() -> N
 
 
 def test_anthropic_text_stream_cell_names_exact_native_fixture() -> None:
-    """Anthropic text certification is bound to native text lifecycle evidence."""
+    """Anthropic text certification is bound to native golden-fixture evidence."""
     cells = {(cell.provider, cell.capability): cell for cell in PROVIDER_CERTIFICATION_MATRIX.cells}
     cell = cells[("anthropic", ProviderCapability.TEXT_STREAM)]
 
     assert cell.result is ProviderCertificationResult.PROVIDER_FIXTURE_PASS
     assert (
-        "exp/runtime/models/providers/streaming_test.py::"
-        "test_anthropic_text_stream_emits_text_usage_and_completion"
+        "exp/runtime/gateway/native_bridge_test.py::"
+        "test_rust_messages_sse_frames_match_the_committed_golden"
     ) in cell.evidence

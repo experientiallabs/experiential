@@ -23,7 +23,6 @@ from exp.runtime.models.providers.openai_compatible import (
 )
 from exp.runtime.models.providers.protocol import (
     AsyncCompletedModelClient,
-    AsyncGatewayProvider,
     BoundedSyncModelClientAdapter,
     SyncModelClientAdapter,
     preflight_gateway_request,
@@ -42,7 +41,6 @@ from exp.runtime.models.providers.tinker_sampling import (
 __all__ = [
     "AnthropicClient",
     "AsyncCompletedModelClient",
-    "AsyncGatewayProvider",
     "AsyncJsonHttpTransport",
     "AzureClient",
     "BedrockClient",

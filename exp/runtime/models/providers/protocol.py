@@ -9,14 +9,12 @@ from typing import Protocol, runtime_checkable
 from exp.common.models import ModelClient, ModelRequest, ModelResponse
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.gateway.interfaces import ProviderStream
 from exp.runtime.models.providers.async_transport import (
     RequestDeadline,
     run_then_close_pooled_client,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
-from exp.runtime.models.providers.transport import RetryPolicy
 
 
 class AsyncCompletedModelClient(Protocol):
@@ -30,21 +28,6 @@ class AsyncCompletedModelClient(Protocol):
         idempotency_key: str | None = None,
     ) -> ModelResponse:
         """Complete one request under an absolute deadline and stable attempt identity."""
-        ...
-
-
-class AsyncGatewayProvider(Protocol):
-    """Gateway-native provider that yields normalized events in provider order."""
-
-    async def stream(
-        self,
-        request: GatewayRequest,
-        *,
-        deadline: RequestDeadline,
-        idempotency_key: str,
-        retry_policy: RetryPolicy | None = None,
-    ) -> ProviderStream:
-        """Start one cancellable stream with an optional caller-owned retry bound."""
         ...
 
 

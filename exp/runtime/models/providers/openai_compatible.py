@@ -20,8 +20,6 @@ from exp.common.models import (
     ToolCall,
     Usage,
 )
-from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.models.providers.async_transport import RequestDeadline
 from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
@@ -32,11 +30,6 @@ from exp.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
-from exp.runtime.models.providers.streaming import (
-    NormalizedProviderStream,
-    start_openai_compatible_stream,
-)
-from exp.runtime.models.providers.transport import RetryPolicy
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_REFERER = "https://github.com/experientiallabs/experiential"
@@ -218,43 +211,6 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
     """Calls one explicit OpenAI-compatible connection without cross-provider failover."""
 
     token_limit_key: ClassVar[str] = "max_tokens"
-
-    async def stream(
-        self,
-        request: GatewayRequest,
-        *,
-        deadline: RequestDeadline,
-        idempotency_key: str,
-        retry_policy: RetryPolicy | None = None,
-    ) -> NormalizedProviderStream:
-        """Start one true Chat Completions stream under the gateway deadline.
-
-        Args:
-            request: Canonical streaming gateway request.
-            deadline: Immutable request-wide deadline.
-            idempotency_key: Stable identity for safe pre-commit opening retries.
-            retry_policy: Optional caller-owned physical dispatch limit.
-
-        Returns:
-            A cancellable provider-neutral event stream.
-
-        Raises:
-            ValueError: The canonical request did not ask for streaming.
-        """
-        if not request.stream:
-            raise ValueError("gateway provider stream requires request.stream")
-        return await start_openai_compatible_stream(
-            self._transport,
-            f"{self._base_url}/{self._request_path(self._completion_path())}",
-            headers=self._headers(),
-            request=request,
-            model_id=self._model.model_id,
-            deadline=deadline,
-            idempotency_key=idempotency_key,
-            retry_policy=retry_policy or self._retry_policy,
-            timeout_seconds=self._timeout_seconds,
-            token_limit_key=self.token_limit_key,
-        )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
         """Return the Chat Completions wire profile for this connection."""
