@@ -19,6 +19,7 @@ mod replay;
 mod server;
 mod sse;
 mod upstream;
+mod waterfall;
 
 use std::sync::Arc;
 
@@ -31,11 +32,11 @@ use crate::server::ServeConfig;
 /// Serve the gateway data plane until shutdown (SIGINT or SIGTERM).
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
-/// `settle`, `remember`, `enforce_output`, `models`, `model_detail`,
-/// `usage_json`, `usage_page`, `metrics_json`, `metrics_text`, and
-/// `readiness`, each taking and returning one JSON string. `config_json`
-/// carries host, port, and concurrency bounds. `enforce_output` is called
-/// only when admission sets `output_guardrail`.
+/// `start_attempt`, `settle`, `abandon`, `remember`, `enforce_output`,
+/// `models`, `model_detail`, `usage_json`, `usage_page`, `metrics_json`,
+/// `metrics_text`, and `readiness`, each taking and returning one JSON
+/// string. `config_json` carries host, port, and concurrency bounds.
+/// `enforce_output` is called only when admission sets `output_guardrail`.
 #[pyfunction]
 fn serve(py: Python<'_>, control_plane: Py<PyAny>, config_json: &str) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
