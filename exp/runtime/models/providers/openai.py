@@ -69,8 +69,9 @@ def openai_responses_request(
         supports_top_p: Catalog declaration for nucleus sampling. ``None`` follows
             ``supports_temperature`` for older catalog records.
         supports_top_k: Whether this route accepts top-k sampling. Native OpenAI does not.
-        supports_logprobs: Whether this route accepts top-logprob controls. The normalized
-            gateway response does not currently expose provider logprob details.
+        supports_logprobs: Reserved route capability retained for contract parity. Responses
+            logprob controls are currently ignored because the normalized gateway response
+            cannot return provider logprob details.
         supports_reasoning: Catalog declaration that this exact model accepts the Responses
             ``reasoning`` object. Unsupported routes omit it before dispatch.
         reasoning_effort: Optional catalog-pinned reasoning-effort level sent verbatim.
@@ -123,8 +124,10 @@ def openai_responses_request(
     # parameter in the signature so route capability plumbing stays uniform,
     # but never let a mistaken catalog flag put this extension on the wire.
     del supports_top_k
-    if request.top_logprobs is not None and supports_logprobs:
-        payload["top_logprobs"] = request.top_logprobs
+    # The public compatibility manifest accepts top_logprobs, but Responses
+    # output normalization has no probability representation. Ignore it rather
+    # than forwarding a request whose result the gateway cannot return.
+    del supports_logprobs
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
         payload["reasoning"] = {"effort": effective_reasoning_effort}

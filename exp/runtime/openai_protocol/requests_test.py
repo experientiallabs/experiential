@@ -156,7 +156,11 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
             "parallel_tool_calls": False,
             "max_output_tokens": 321,
             "temperature": 0.4,
-            "reasoning": {"effort": "high", "summary": "concise"},
+            "reasoning": {
+                "effort": "high",
+                "generate_summary": "detailed",
+                "summary": "concise",
+            },
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -180,6 +184,8 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
         "tool",
     )
     assert request.previous_response_id == "resp_previous"
+    # Summary selectors are accepted for compatibility and intentionally do not
+    # enter the canonical request because the response contract cannot return them.
     assert request.reasoning_effort == "high"
     assert request.messages[2].tool_calls[0].raw_arguments == '{"city":"Paris"}'
     assert request.parallel_tool_calls is False

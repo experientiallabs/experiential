@@ -97,7 +97,10 @@ class GatewayWireProfile:
     """Whether the exact route accepts top-k sampling."""
 
     supports_logprobs: bool = False
-    """Whether the exact route accepts logprob controls."""
+    """Provider metadata for logprob support.
+
+    Dispatch stays disabled until normalized output projection exists.
+    """
 
     supports_reasoning: bool = False
     """Whether this exact route accepts the reasoning parameter on its wire dialect."""

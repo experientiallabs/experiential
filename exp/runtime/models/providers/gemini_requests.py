@@ -88,10 +88,10 @@ def gemini_generate_request(
         generation["topP"] = request.top_p
     if request.top_k is not None and supports_top_k:
         generation["topK"] = request.top_k
-    if (request.logprobs is True or request.top_logprobs is not None) and supports_logprobs:
-        generation["responseLogprobs"] = True
-        if request.top_logprobs is not None:
-            generation["logprobs"] = request.top_logprobs
+    # The normalized gateway response has no logprob representation. Keep the
+    # route flag for shared capability plumbing, but ignore these controls so
+    # provider output is never requested and then silently discarded.
+    del supports_logprobs
     if request.maximum_output_tokens is not None:
         generation["maxOutputTokens"] = request.maximum_output_tokens
     else:

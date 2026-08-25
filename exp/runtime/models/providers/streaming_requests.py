@@ -176,8 +176,9 @@ def openai_responses_stream_payload(
     # Native OpenAI Responses has no top-k request field. Never trust a
     # mistaken route declaration to send this extension to the API.
     del supports_top_k
-    if request.top_logprobs is not None and supports_logprobs:
-        payload["top_logprobs"] = request.top_logprobs
+    # Responses output normalization has no probability representation. Keep
+    # the shared capability argument, but ignore logprob controls before send.
+    del supports_logprobs
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
         payload["reasoning"] = {"effort": effective_reasoning_effort}
@@ -399,10 +400,9 @@ def openai_compatible_stream_payload(
         payload["top_p"] = request.top_p
     if request.top_k is not None and supports_top_k:
         payload["top_k"] = request.top_k
-    if request.logprobs is not None and supports_logprobs:
-        payload["logprobs"] = request.logprobs
-    if request.top_logprobs is not None and supports_logprobs:
-        payload["top_logprobs"] = request.top_logprobs
+    # Compatible streaming responses also normalize logprobs to null, so an
+    # accepted public control is intentionally ignored until projection exists.
+    del supports_logprobs
     if request.stop:
         payload["stop"] = list(request.stop)
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort

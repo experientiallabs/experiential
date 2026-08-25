@@ -340,9 +340,11 @@ class ModelCapabilities(ContractModel):
     older catalog did not carry an explicit declaration; runtime clients fall back to the broad
     temperature capability for ``top_p`` and omit the less portable controls. Reasoning models
     that pin their sampling reject temperature and nucleus sampling, so clients omit both when
-    the route says they are unsupported. ``supports_reasoning`` is an explicit wire capability,
-    not an inference from ``reasoning_effort``. ``reasoning_effort`` pins an explicit
-    reasoning-effort level only when that capability is true.
+    the route says they are unsupported. ``supports_logprobs`` remains provider metadata, but
+    logprob request fields are currently compatibility-only because normalized responses do not
+    expose their values. ``supports_reasoning`` is an explicit wire capability, not an inference
+    from ``reasoning_effort``. ``reasoning_effort`` pins an explicit reasoning-effort level only
+    when that capability is true.
     """
 
     supports_tools: bool | None = None
@@ -433,8 +435,10 @@ class ModelRequest(ContractModel):
         temperature: Optional sampling temperature.
         top_p: Optional nucleus-sampling probability mass in ``[0, 1]``.
         top_k: Optional maximum number of candidate tokens considered during sampling.
-        logprobs: Optional request for token log probabilities when a route can return them.
-        top_logprobs: Optional number of alternate token probabilities to request.
+        logprobs: Optional compatibility request for token log probabilities. It is currently
+            accepted and ignored until normalized responses can return them.
+        top_logprobs: Optional compatibility count for alternate token probabilities; currently
+            accepted and ignored with ``logprobs``.
         reasoning_effort: Optional caller-selected reasoning effort, preserved only on routes that
             explicitly declare support.
         maximum_output_tokens: Optional upper bound for generated tokens.

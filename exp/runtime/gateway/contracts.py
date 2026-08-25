@@ -374,11 +374,17 @@ class ExecutionSnapshot(ContractModel):
 
 
 class CompatibilityDisposition(StrEnum):
-    """How one installed public request field is handled by the gateway."""
+    """How one installed public request field is handled by the gateway.
+
+    ``IGNORED`` keeps a compatibility field valid at the public boundary while
+    deliberately omitting it from provider dispatch when the normalized gateway
+    response cannot preserve its result.
+    """
 
     SUPPORTED = "supported"
     CONDITIONALLY_SUPPORTED = "conditionally_supported"
     METADATA_ONLY = "metadata_only"
+    IGNORED = "ignored"
     UNSUPPORTED = "unsupported"
 
 
