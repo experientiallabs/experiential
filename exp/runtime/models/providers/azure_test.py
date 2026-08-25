@@ -85,6 +85,28 @@ def test_azure_payloads_carry_max_completion_tokens() -> None:
     assert "max_tokens" not in payload
 
 
+def test_azure_model_contract_can_select_legacy_max_tokens() -> None:
+    """Foundry models outside the OpenAI family use their declared Chat token field."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint=_ENDPOINT,
+        api_key=_SECRET,
+        api_version="v1",
+        transport=transport,
+        chat_max_tokens_field="max_tokens",
+    )
+
+    client.complete(_request())
+
+    _url, _headers, payload = transport.requests[0]
+    assert payload["max_tokens"] == 128
+    assert "max_completion_tokens" not in payload
+    assert client.gateway_wire_profile().token_limit_key == "max_tokens"
+
+
 def test_classic_route_puts_the_exact_deployment_in_the_path() -> None:
     """Dated Azure OpenAI versions keep the deployment in the URL and the body."""
     transport = ScriptedJsonTransport(

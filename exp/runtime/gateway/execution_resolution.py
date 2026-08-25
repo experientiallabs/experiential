@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 from exp.common.core.artifacts import stable_id
@@ -64,22 +64,82 @@ def _resolved_wire_profile(
     runtime_model: ResolvedModel,
 ) -> GatewayWireProfile:
     """Return a native profile or a conservative Python-stream compatibility view."""
+    capabilities = runtime_model.capabilities
     if isinstance(runtime_model.client, NativeWireClient):
-        return runtime_model.client.gateway_wire_profile()
+        profile = runtime_model.client.gateway_wire_profile()
+        output_limits = tuple(
+            limit
+            for limit in (
+                profile.maximum_output_tokens,
+                capabilities.maximum_output_tokens,
+            )
+            if limit is not None
+        )
+        return replace(
+            profile,
+            model_id=profile.model_id or runtime_model.snapshot.model_id,
+            minimum_temperature=(
+                max(profile.minimum_temperature, capabilities.minimum_temperature)
+                if capabilities.minimum_temperature is not None
+                else profile.minimum_temperature
+            ),
+            maximum_temperature=(
+                min(profile.maximum_temperature, capabilities.maximum_temperature)
+                if capabilities.maximum_temperature is not None
+                else profile.maximum_temperature
+            ),
+            minimum_top_p=(
+                max(profile.minimum_top_p, capabilities.minimum_top_p)
+                if capabilities.minimum_top_p is not None
+                else profile.minimum_top_p
+            ),
+            maximum_top_p=(
+                min(profile.maximum_top_p, capabilities.maximum_top_p)
+                if capabilities.maximum_top_p is not None
+                else profile.maximum_top_p
+            ),
+            minimum_top_k=(
+                capabilities.minimum_top_k
+                if capabilities.minimum_top_k is not None
+                else profile.minimum_top_k
+            ),
+            maximum_top_k=(
+                min(profile.maximum_top_k, capabilities.maximum_top_k)
+                if profile.maximum_top_k is not None and capabilities.maximum_top_k is not None
+                else capabilities.maximum_top_k
+                if capabilities.maximum_top_k is not None
+                else profile.maximum_top_k
+            ),
+            sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+            token_limit_key=capabilities.chat_max_tokens_field or profile.token_limit_key,
+            maximum_output_tokens=min(output_limits) if output_limits else None,
+        )
     # Python still supports injected/custom streaming clients that predate the
     # native protocol. Rust admission separately requires a real native profile.
-    capabilities = runtime_model.capabilities
     return GatewayWireProfile(
         dialect="python_stream",
         url="",
         model_id=deployment.provider_model,
         supports_temperature=capabilities.supports_temperature,
+        minimum_temperature=(
+            0.0 if capabilities.minimum_temperature is None else capabilities.minimum_temperature
+        ),
+        maximum_temperature=(
+            2.0 if capabilities.maximum_temperature is None else capabilities.maximum_temperature
+        ),
         supports_top_p=capabilities.supports_top_p,
+        minimum_top_p=0.0 if capabilities.minimum_top_p is None else capabilities.minimum_top_p,
+        maximum_top_p=1.0 if capabilities.maximum_top_p is None else capabilities.maximum_top_p,
         supports_top_k=capabilities.supports_top_k is True,
+        minimum_top_k=1 if capabilities.minimum_top_k is None else capabilities.minimum_top_k,
+        maximum_top_k=capabilities.maximum_top_k,
         supports_logprobs=capabilities.supports_logprobs is True,
         supports_reasoning=capabilities.supports_reasoning,
         reasoning_wire_format="reasoning_effort" if capabilities.supports_reasoning else "none",
         reasoning_effort=capabilities.reasoning_effort,
+        sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+        token_limit_key=capabilities.chat_max_tokens_field or "max_tokens",
+        maximum_output_tokens=capabilities.maximum_output_tokens,
     )
 
 

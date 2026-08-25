@@ -23,7 +23,8 @@ from exp.common.tasks import ToolSchema
 ModelAlias = ArtifactId
 _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 
-ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+ChatMaxTokensField = Literal["max_tokens", "max_completion_tokens"]
 
 DEFAULT_REASONING_EFFORT: Final[ReasoningEffort] = "medium"
 """Reasoning effort pinned by default for models known to accept the parameter.
@@ -341,10 +342,10 @@ class ModelCapabilities(ContractModel):
     temperature capability for ``top_p`` and omit the less portable controls. Reasoning models
     that pin their sampling reject temperature and nucleus sampling, so clients omit both when
     the route says they are unsupported. ``supports_logprobs`` remains provider metadata, but
-    logprob request fields are currently compatibility-only because normalized responses do not
-    expose their values. ``supports_reasoning`` is an explicit wire capability, not an inference
-    from ``reasoning_effort``. ``reasoning_effort`` pins an explicit reasoning-effort level only
-    when that capability is true.
+    public logprob requests fail locally until normalized responses can expose their values.
+    ``supports_reasoning`` is an explicit wire capability, not an inference from
+    ``reasoning_effort``. ``reasoning_effort`` pins an explicit reasoning-effort level only when
+    that capability is true.
     """
 
     supports_tools: bool | None = None
@@ -357,6 +358,15 @@ class ModelCapabilities(ContractModel):
     supports_logprobs: bool | None = None
     supports_reasoning: bool = False
     reasoning_effort: ReasoningEffort | None = None
+    sampling_requires_reasoning_none: bool = False
+    """Whether temperature and top-p are valid only with ``reasoning_effort='none'``."""
+    chat_max_tokens_field: ChatMaxTokensField | None = None
+    minimum_temperature: float | None = Field(default=None, ge=0, le=2)
+    maximum_temperature: float | None = Field(default=None, ge=0, le=2)
+    minimum_top_p: float | None = Field(default=None, ge=0, le=1)
+    maximum_top_p: float | None = Field(default=None, ge=0, le=1)
+    minimum_top_k: int | None = Field(default=None, ge=0)
+    maximum_top_k: int | None = Field(default=None, ge=0)
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
@@ -387,6 +397,21 @@ class ModelCapabilities(ContractModel):
             raise ValueError("model token prices must be finite")
         return value
 
+    @model_validator(mode="after")
+    def _require_ordered_generation_ranges(self) -> ModelCapabilities:
+        """Reject inverted per-model generation-control ranges."""
+        ranges = (
+            ("temperature", self.minimum_temperature, self.maximum_temperature),
+            ("top_p", self.minimum_top_p, self.maximum_top_p),
+            ("top_k", self.minimum_top_k, self.maximum_top_k),
+        )
+        for name, minimum, maximum in ranges:
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ValueError(f"minimum_{name} cannot exceed maximum_{name}")
+        if self.sampling_requires_reasoning_none and not self.supports_reasoning:
+            raise ValueError("conditional sampling requires reasoning support")
+        return self
+
     def identity_sha256(self) -> Sha256:
         """Hash capabilities that identify the provider model protocol.
 
@@ -410,6 +435,14 @@ class ModelCapabilities(ContractModel):
             "supports_logprobs",
             "supports_reasoning",
             "reasoning_effort",
+            "sampling_requires_reasoning_none",
+            "chat_max_tokens_field",
+            "minimum_temperature",
+            "maximum_temperature",
+            "minimum_top_p",
+            "maximum_top_p",
+            "minimum_top_k",
+            "maximum_top_k",
             "input_cost_per_million_tokens_usd",
             "output_cost_per_million_tokens_usd",
             "cached_input_cost_per_million_tokens_usd",
@@ -435,10 +468,10 @@ class ModelRequest(ContractModel):
         temperature: Optional sampling temperature.
         top_p: Optional nucleus-sampling probability mass in ``[0, 1]``.
         top_k: Optional maximum number of candidate tokens considered during sampling.
-        logprobs: Optional compatibility request for token log probabilities. It is currently
-            accepted and ignored until normalized responses can return them.
-        top_logprobs: Optional compatibility count for alternate token probabilities; currently
-            accepted and ignored with ``logprobs``.
+        logprobs: Optional request for token log probabilities. Gateway serving rejects a true
+            request until normalized responses can return them losslessly.
+        top_logprobs: Optional count for alternate token probabilities, subject to the same
+            lossless-response requirement as ``logprobs``.
         reasoning_effort: Optional caller-selected reasoning effort, preserved only on routes that
             explicitly declare support.
         maximum_output_tokens: Optional upper bound for generated tokens.
@@ -449,7 +482,7 @@ class ModelRequest(ContractModel):
     tool_choice: Literal["auto", "none", "required"] | ToolChoice | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
-    top_k: int | None = Field(default=None, gt=0)
+    top_k: int | None = Field(default=None, ge=0)
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None

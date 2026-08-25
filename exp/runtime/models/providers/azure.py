@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import ClassVar
 from urllib.parse import urlsplit
 
-from exp.common.models import ModelSnapshot
+from exp.common.models import ChatMaxTokensField, ModelSnapshot
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
@@ -101,11 +101,11 @@ def _azure_base_url(endpoint: str, *, deployment: str, api_version: str) -> str:
 class AzureClient(OpenAICompatibleClient):
     """Calls one explicit Azure connection without streaming, failover, or guessed deployments.
 
-    Azure OpenAI reasoning deployments reject the legacy ``max_tokens`` field, so every
-    Azure payload carries the output-token ceiling as ``max_completion_tokens``.
+    OpenAI reasoning deployments use ``max_completion_tokens`` while Azure-hosted
+    third-party models retain ``max_tokens``. The catalog supplies the exact field.
     """
 
-    token_limit_key: ClassVar[str] = "max_completion_tokens"
+    token_limit_key: ClassVar[ChatMaxTokensField] = "max_completion_tokens"
 
     def __init__(
         self,
@@ -123,6 +123,8 @@ class AzureClient(OpenAICompatibleClient):
         supports_logprobs: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
+        chat_max_tokens_field: ChatMaxTokensField | None = None,
+        sampling_requires_reasoning_none: bool = False,
     ) -> None:
         """Create a client bound to one endpoint, key, API version, and deployment.
 
@@ -156,6 +158,8 @@ class AzureClient(OpenAICompatibleClient):
             supports_logprobs=supports_logprobs,
             supports_reasoning=supports_reasoning,
             reasoning_effort=reasoning_effort,
+            chat_max_tokens_field=chat_max_tokens_field,
+            sampling_requires_reasoning_none=sampling_requires_reasoning_none,
         )
         self._api_version = api_version
 

@@ -31,7 +31,7 @@ from exp.common.models import (
     serves_role,
 )
 
-_NO_REASONING_EFFORT = "none"
+_NO_REASONING_EFFORT = "__unset_reasoning_effort__"
 _REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
 _COMPLETION_PRICE_FIELDS = (
     ("input_cost_per_million_tokens_usd", "Input cost per million tokens in USD"),
@@ -474,7 +474,7 @@ def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
         options=[
             PickerOption(
                 value=_NO_REASONING_EFFORT,
-                label="none",
+                label="unset",
                 detail="never send the reasoning parameter",
             ),
             *(PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS),

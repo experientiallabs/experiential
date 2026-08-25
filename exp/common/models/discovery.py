@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.models.known_models import KnownModel, canonical_model_id, known_model_metadata
-from exp.common.models.model import DEFAULT_REASONING_EFFORT, ModelCapabilities
+from exp.common.models.model import DEFAULT_REASONING_EFFORT, ModelCapabilities, ReasoningEffort
 
 _ALIAS_SEPARATOR_PATTERN = re.compile(r"[^a-z0-9]+")
 _MAXIMUM_ALIAS_LENGTH = 128
@@ -55,6 +56,20 @@ class DiscoveredModel(ContractModel):
     supports_embeddings: bool | None = None
     supports_tools: bool | None = None
     supports_structured_output: bool | None = None
+    supports_temperature: bool | None = None
+    supports_top_p: bool | None = None
+    supports_top_k: bool | None = None
+    supports_logprobs: bool | None = None
+    supports_reasoning: bool | None = None
+    reasoning_effort: ReasoningEffort | None = None
+    sampling_requires_reasoning_none: bool | None = None
+    chat_max_tokens_field: Literal["max_tokens", "max_completion_tokens"] | None = None
+    minimum_temperature: float | None = Field(default=None, ge=0, le=2)
+    maximum_temperature: float | None = Field(default=None, ge=0, le=2)
+    minimum_top_p: float | None = Field(default=None, ge=0, le=1)
+    maximum_top_p: float | None = Field(default=None, ge=0, le=1)
+    minimum_top_k: int | None = Field(default=None, ge=0)
+    maximum_top_k: int | None = Field(default=None, ge=0)
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
@@ -144,6 +159,28 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
         discovered.cache_write_cost_per_million_tokens_usd,
         known.cache_write_cost_per_million_tokens_usd if known else None,
     )
+    supports_temperature = (
+        discovered.supports_temperature
+        if discovered.supports_temperature is not None
+        else known.supports_temperature
+        if known is not None and known.supports_temperature is not None
+        else True
+    )
+    supports_top_p = (
+        discovered.supports_top_p
+        if discovered.supports_top_p is not None
+        else known.supports_top_p
+        if known is not None and known.supports_top_p is not None
+        else supports_temperature
+    )
+    supports_top_k = _proven(
+        discovered.supports_top_k,
+        known.supports_top_k if known else None,
+    )
+    supports_reasoning = _proven(
+        discovered.supports_reasoning,
+        known.supports_reasoning_effort if known else None,
+    )
     capabilities = ModelCapabilities(
         supports_tools=_proven(
             discovered.supports_tools,
@@ -161,20 +198,66 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
             discovered.supports_completions,
             known.supports_completions if known else None,
         ),
-        supports_temperature=(
-            known.supports_temperature
-            if known is not None and known.supports_temperature is not None
-            else True
+        supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+        supports_top_k=supports_top_k,
+        supports_logprobs=_proven(
+            discovered.supports_logprobs,
+            known.supports_logprobs if known else None,
         ),
-        supports_top_p=(
-            known.supports_temperature
-            if known is not None and known.supports_temperature is not None
-            else True
-        ),
-        supports_reasoning=(known is not None and known.supports_reasoning_effort),
+        supports_reasoning=supports_reasoning,
         reasoning_effort=(
-            DEFAULT_REASONING_EFFORT
-            if known is not None and known.supports_reasoning_effort
+            discovered.reasoning_effort
+            or (known.reasoning_effort if known is not None else None)
+            or DEFAULT_REASONING_EFFORT
+            if supports_reasoning
+            else None
+        ),
+        sampling_requires_reasoning_none=(
+            discovered.sampling_requires_reasoning_none
+            if discovered.sampling_requires_reasoning_none is not None
+            else known.sampling_requires_reasoning_none
+            if known is not None
+            else False
+        ),
+        chat_max_tokens_field=(
+            discovered.chat_max_tokens_field
+            or (known.chat_max_tokens_field if known is not None else None)
+        ),
+        minimum_temperature=(
+            _first_value(
+                discovered.minimum_temperature,
+                known.minimum_temperature if known else None,
+            )
+            if supports_temperature
+            else None
+        ),
+        maximum_temperature=(
+            _first_value(
+                discovered.maximum_temperature,
+                known.maximum_temperature if known else None,
+            )
+            if supports_temperature
+            else None
+        ),
+        minimum_top_p=(
+            _first_value(discovered.minimum_top_p, known.minimum_top_p if known else None)
+            if supports_top_p
+            else None
+        ),
+        maximum_top_p=(
+            _first_value(discovered.maximum_top_p, known.maximum_top_p if known else None)
+            if supports_top_p
+            else None
+        ),
+        minimum_top_k=(
+            _first_value(discovered.minimum_top_k, known.minimum_top_k if known else None)
+            if supports_top_k
+            else None
+        ),
+        maximum_top_k=(
+            _first_value(discovered.maximum_top_k, known.maximum_top_k if known else None)
+            if supports_top_k
             else None
         ),
         context_window_tokens=discovered.context_window_tokens
@@ -250,6 +333,11 @@ def _priced_completion_model(capabilities: ModelCapabilities) -> bool:
 
 def _first_price(published: float | None, known: float | None) -> float | None:
     """Prefer the provider-published price over EXP's maintained price."""
+    return published if published is not None else known
+
+
+def _first_value[T](published: T | None, known: T | None) -> T | None:
+    """Prefer a provider-published protocol value over maintained metadata."""
     return published if published is not None else known
 
 

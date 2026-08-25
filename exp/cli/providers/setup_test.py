@@ -848,7 +848,7 @@ def test_back_from_the_model_screen_reselects_providers_without_losing_answers(
 
     console, catalog = _setup(
         root,
-        "2\n\nb\n3\n\n1\n\n1\n\n1\n1,2\n\n\n1\ny\n",
+        "2\n\nb\n3\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
         monkeypatch=monkeypatch,
         lister=lister,
     )

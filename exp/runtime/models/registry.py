@@ -255,6 +255,7 @@ class RuntimeModelCatalog:
                 supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
                 supports_reasoning=capabilities.supports_reasoning,
                 reasoning_effort=capabilities.reasoning_effort,
+                sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
             )
             return ResolvedModel(
                 alias,
@@ -289,6 +290,8 @@ class RuntimeModelCatalog:
                 supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
                 supports_reasoning=capabilities.supports_reasoning,
                 reasoning_effort=capabilities.reasoning_effort,
+                chat_max_tokens_field=capabilities.chat_max_tokens_field,
+                sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
             )
             return ResolvedModel(
                 alias,
@@ -342,12 +345,18 @@ class RuntimeModelCatalog:
                     "supports_logprobs": _supports_flag(capabilities, "supports_logprobs"),
                 }
             )
+        if provider in {"openrouter", "openai-compatible"}:
+            http_kwargs["chat_max_tokens_field"] = capabilities.chat_max_tokens_field
         if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
             http_kwargs.update(
                 {
                     "supports_reasoning": capabilities.supports_reasoning,
                     "reasoning_effort": capabilities.reasoning_effort,
                 }
+            )
+        if provider in {"openrouter", "openai-compatible"}:
+            http_kwargs["sampling_requires_reasoning_none"] = (
+                capabilities.sampling_requires_reasoning_none
             )
         http_client = factory(**http_kwargs)
         embedding_client = (

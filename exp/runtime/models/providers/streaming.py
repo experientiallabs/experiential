@@ -12,7 +12,7 @@ from typing import cast
 from pydantic import JsonValue, ValidationError
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import ToolCall
+from exp.common.models import ChatMaxTokensField, ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -342,6 +342,7 @@ async def start_openai_responses_stream(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    sampling_requires_reasoning_none: bool = False,
 ) -> NormalizedProviderStream:
     """Open and normalize one native OpenAI Responses stream.
 
@@ -365,6 +366,7 @@ async def start_openai_responses_stream(
         supports_logprobs=supports_logprobs,
         supports_reasoning=supports_reasoning,
         reasoning_effort=reasoning_effort,
+        sampling_requires_reasoning_none=sampling_requires_reasoning_none,
     )
     return await _start_stream(
         transport,
@@ -442,7 +444,7 @@ async def start_openai_compatible_stream(
     idempotency_key: str,
     retry_policy: RetryPolicy,
     timeout_seconds: float,
-    token_limit_key: str = "max_tokens",
+    token_limit_key: ChatMaxTokensField = "max_tokens",
     supports_temperature: bool = True,
     supports_top_p: bool | None = None,
     supports_top_k: bool = False,
@@ -450,6 +452,7 @@ async def start_openai_compatible_stream(
     supports_reasoning: bool = False,
     reasoning_wire_format: str = "reasoning_effort",
     reasoning_effort: str | None = None,
+    sampling_requires_reasoning_none: bool = False,
 ) -> NormalizedProviderStream:
     """Open and normalize one generic OpenAI-compatible Chat stream.
     Args:
@@ -475,6 +478,7 @@ async def start_openai_compatible_stream(
         supports_reasoning=supports_reasoning,
         reasoning_wire_format=reasoning_wire_format,
         reasoning_effort=reasoning_effort,
+        sampling_requires_reasoning_none=sampling_requires_reasoning_none,
     )
     return await _start_stream(
         transport,

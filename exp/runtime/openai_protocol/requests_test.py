@@ -90,6 +90,7 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
     assert isinstance(request.tool_choice, GatewayNamedToolChoice)
     assert request.tool_choice.name == "weather"
     assert request.maximum_output_tokens == 123
+    assert request.maximum_output_tokens_parameter == "max_completion_tokens"
     assert request.stop == ("END", "STOP")
     assert request.temperature == 0.2
     assert request.top_p == 1.0
@@ -117,6 +118,7 @@ def test_chat_legacy_max_tokens_reaches_native_responses_as_max_output_tokens() 
     )
 
     assert decoded.request.maximum_output_tokens == 256
+    assert decoded.request.maximum_output_tokens_parameter == "max_tokens"
     payload = openai_responses_stream_payload(
         "gpt-fixture",
         decoded.request,
@@ -194,6 +196,7 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
     assert request.messages[2].tool_calls[0].raw_arguments == '{"city":"Paris"}'
     assert request.parallel_tool_calls is False
     assert request.maximum_output_tokens == 321
+    assert request.maximum_output_tokens_parameter == "max_output_tokens"
     assert request.structured_text is not None
     assert request.client_request_id == "operation-two"
 
@@ -549,19 +552,32 @@ def test_responses_decoder_preserves_top_p() -> None:
     assert decoded.request.top_p == 1
 
 
-def test_chat_decoder_preserves_logprob_controls() -> None:
-    """Chat logprob controls remain visible until route capability shaping."""
-    decoded = decode_chat(
-        {
-            "model": "coding",
-            "messages": [{"role": "user", "content": "hello"}],
-            "logprobs": True,
-            "top_logprobs": 5,
-        }
-    )
-    assert decoded.request.logprobs is True
-    assert decoded.request.top_logprobs == 5
-    assert decoded.request.ignored_parameters == ("logprobs", "top_logprobs")
+def test_chat_decoder_rejects_unprojectable_top_logprobs() -> None:
+    """Alternate-token probability output is rejected at the public boundary."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hello"}],
+                "logprobs": True,
+                "top_logprobs": 5,
+            }
+        )
+    assert raised.value.detail.code == "unsupported_parameter"
+    assert raised.value.detail.param == "top_logprobs"
+
+
+def test_chat_decoder_preserves_logprobs_for_route_validation() -> None:
+    """The route gate distinguishes a semantic true request from a false no-op."""
+    for value in (True, False):
+        decoded = decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hello"}],
+                "logprobs": value,
+            }
+        )
+        assert decoded.request.logprobs is value
 
 
 def test_chat_decoder_preserves_gateway_top_k_extension() -> None:

@@ -191,7 +191,7 @@ class GeminiClient(ProviderHttpClient):
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
             supports_temperature=self._supports_temperature,
-            maximum_temperature=1.0,
+            maximum_temperature=2.0,
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,

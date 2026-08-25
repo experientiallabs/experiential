@@ -97,7 +97,7 @@ from exp.runtime.models.providers import (
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
-    UnsupportedReasoningEffortError,
+    ProviderParameterError,
     normalized_provider_failure,
 )
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
@@ -377,7 +377,7 @@ class NativeControlPlane:
                     )
                 )
                 signers.append(dispatch_signer)
-        except UnsupportedReasoningEffortError as exc:
+        except ProviderParameterError as exc:
             failure = normalized_provider_failure(exc)
             self._accounting.finish_request_quietly(authorization, failure)
             raise NativeBridgeError(public_failure_error(failure)) from exc

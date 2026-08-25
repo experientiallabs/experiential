@@ -39,7 +39,10 @@ from exp.runtime.models.providers.errors import (
     ProviderRetryableResponseError,
 )
 from exp.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
-from exp.runtime.models.providers.reasoning_compat import openai_reasoning_effort
+from exp.runtime.models.providers.reasoning_compat import (
+    openai_reasoning_effort,
+    require_sampling_reasoning_compatibility,
+)
 from exp.runtime.models.providers.streaming import (
     NormalizedProviderStream,
     start_openai_responses_stream,
@@ -59,6 +62,7 @@ def openai_responses_request(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    sampling_requires_reasoning_none: bool = False,
 ) -> JsonObject:
     """Convert one EXP request into OpenAI's native Responses API shape.
 
@@ -116,6 +120,13 @@ def openai_responses_request(
             if not isinstance(request.tool_choice, str)
             else request.tool_choice
         )
+    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    require_sampling_reasoning_compatibility(
+        reasoning_effort=effective_reasoning_effort,
+        sampling_requires_reasoning_none=sampling_requires_reasoning_none,
+        temperature_requested=request.temperature is not None,
+        top_p_requested=request.top_p is not None,
+    )
     if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
     top_p_supported = supports_temperature if supports_top_p is None else supports_top_p
@@ -129,7 +140,6 @@ def openai_responses_request(
     # output normalization has no probability representation. Ignore it rather
     # than forwarding a request whose result the gateway cannot return.
     del supports_logprobs
-    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
         payload["reasoning"] = {
             "effort": openai_reasoning_effort(model_id, effective_reasoning_effort)
@@ -232,6 +242,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
         supports_logprobs: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
+        sampling_requires_reasoning_none: bool = False,
     ) -> None:
         """Create a direct OpenAI client with one explicitly resolved credential.
 
@@ -263,6 +274,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
         self._supports_logprobs = supports_logprobs
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
+        self._sampling_requires_reasoning_none = sampling_requires_reasoning_none
 
     async def stream(
         self,
@@ -304,6 +316,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             supports_logprobs=self._supports_logprobs,
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
+            sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
         )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
@@ -321,6 +334,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format="openai_responses",
             reasoning_effort=self._reasoning_effort,
+            sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
         )
 
     def _completion_path(self) -> str:
@@ -338,6 +352,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             supports_logprobs=self._supports_logprobs,
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
+            sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:

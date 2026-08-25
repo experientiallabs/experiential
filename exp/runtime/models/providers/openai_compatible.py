@@ -12,6 +12,7 @@ from pydantic import JsonValue
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     AssistantAction,
+    ChatMaxTokensField,
     Embedding,
     ModelMessage,
     ModelRequest,
@@ -41,7 +42,10 @@ from exp.runtime.models.providers.errors import (
     require_object,
     require_string,
 )
-from exp.runtime.models.providers.reasoning_compat import openai_reasoning_effort
+from exp.runtime.models.providers.reasoning_compat import (
+    openai_reasoning_effort,
+    require_sampling_reasoning_compatibility,
+)
 from exp.runtime.models.providers.streaming import (
     NormalizedProviderStream,
     start_openai_compatible_stream,
@@ -61,7 +65,7 @@ def openai_compatible_request(
     model_id: str,
     request: ModelRequest,
     *,
-    token_limit_key: str = "max_tokens",
+    token_limit_key: ChatMaxTokensField = "max_tokens",
     supports_temperature: bool = True,
     supports_top_p: bool | None = None,
     supports_top_k: bool = False,
@@ -69,6 +73,7 @@ def openai_compatible_request(
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
     reasoning_wire_format: ReasoningWireFormat = "reasoning_effort",
+    sampling_requires_reasoning_none: bool = False,
 ) -> JsonObject:
     """Convert a EXP request into one non-streaming Chat Completions payload.
 
@@ -121,6 +126,13 @@ def openai_compatible_request(
             if not isinstance(request.tool_choice, str)
             else request.tool_choice
         )
+    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    require_sampling_reasoning_compatibility(
+        reasoning_effort=effective_reasoning_effort,
+        sampling_requires_reasoning_none=sampling_requires_reasoning_none,
+        temperature_requested=request.temperature is not None,
+        top_p_requested=request.top_p is not None,
+    )
     if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
     top_p_supported = supports_temperature if supports_top_p is None else supports_top_p
@@ -134,7 +146,6 @@ def openai_compatible_request(
     del supports_logprobs
     if request.maximum_output_tokens is not None:
         payload[token_limit_key] = request.maximum_output_tokens
-    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
         if reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
@@ -259,7 +270,7 @@ class OpenAIEmbeddingMixin(ProviderHttpClient):
 class OpenAICompatibleClient(OpenAIEmbeddingMixin):
     """Calls one explicit OpenAI-compatible connection without cross-provider failover."""
 
-    token_limit_key: ClassVar[str] = "max_tokens"
+    token_limit_key: ClassVar[ChatMaxTokensField] = "max_tokens"
     reasoning_wire_format: ClassVar[ReasoningWireFormat] = "reasoning_effort"
 
     def __init__(
@@ -277,6 +288,8 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         supports_logprobs: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
+        chat_max_tokens_field: ChatMaxTokensField | None = None,
+        sampling_requires_reasoning_none: bool = False,
     ) -> None:
         """Create one compatible client with explicit model wire capabilities."""
         super().__init__(
@@ -293,6 +306,8 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._supports_logprobs = supports_logprobs
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
+        self._token_limit_key: ChatMaxTokensField = chat_max_tokens_field or self.token_limit_key
+        self._sampling_requires_reasoning_none = sampling_requires_reasoning_none
 
     async def stream(
         self,
@@ -328,7 +343,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             idempotency_key=idempotency_key,
             retry_policy=retry_policy or self._retry_policy,
             timeout_seconds=self._timeout_seconds,
-            token_limit_key=self.token_limit_key,
+            token_limit_key=self._token_limit_key,
             supports_temperature=self._supports_temperature,
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
@@ -336,6 +351,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
             reasoning_wire_format=self.reasoning_wire_format,
+            sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
         )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
@@ -353,7 +369,8 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format=self.reasoning_wire_format,
             reasoning_effort=self._reasoning_effort,
-            token_limit_key=self.token_limit_key,
+            token_limit_key=self._token_limit_key,
+            sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
         )
 
     def _completion_path(self) -> str:
@@ -365,7 +382,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         return openai_compatible_request(
             self._model.model_id,
             request,
-            token_limit_key=self.token_limit_key,
+            token_limit_key=self._token_limit_key,
             supports_temperature=self._supports_temperature,
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
@@ -373,6 +390,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
             reasoning_wire_format=self.reasoning_wire_format,
+            sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
