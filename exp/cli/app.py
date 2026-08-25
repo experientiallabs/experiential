@@ -79,20 +79,11 @@ def root_callback(
         min=0.1,
         help="Seconds to drain admitted gateway work during shutdown.",
     ),
-    engine: str = typer.Option(
-        "auto",
-        "--engine",
-        help=(
-            "Data-plane engine: 'auto' (rust when built, otherwise python), 'rust' "
-            "(native data plane with an embedded python engine for Responses, "
-            "replay, and project aliases), or 'python' (uvicorn only)."
-        ),
-    ),
     max_active_requests: int = typer.Option(
         DEFAULT_MAX_ACTIVE_REQUESTS,
         "--max-active-requests",
         min=1,
-        help="Rust engine only: maximum concurrently admitted requests.",
+        help="Maximum concurrently admitted requests.",
     ),
 ) -> None:
     """Open the default gateway home screen when no subcommand was selected.
@@ -108,8 +99,7 @@ def root_callback(
         json_output: Whether startup output must be JSON only.
         check: Whether to validate readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
-        engine: Data-plane engine selection.
-        max_active_requests: Rust engine concurrent-admission bound.
+        max_active_requests: Concurrent-admission bound for the data plane.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -123,7 +113,6 @@ def root_callback(
         json_output=json_output,
         check=check,
         graceful_timeout=graceful_timeout,
-        engine=engine,
         max_active_requests=max_active_requests,
     )
 

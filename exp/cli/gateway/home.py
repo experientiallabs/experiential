@@ -48,7 +48,6 @@ def default_gateway(
     json_output: bool = False,
     check: bool = False,
     graceful_timeout: float = DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
-    engine: str = "auto",
     max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS,
     console: Console | None = None,
 ) -> None:
@@ -64,8 +63,7 @@ def default_gateway(
         json_output: Whether startup output must be JSON only.
         check: Whether to validate readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
-        engine: Data-plane engine selection.
-        max_active_requests: Rust engine concurrent-admission bound.
+        max_active_requests: Concurrent-admission bound for the data plane.
         console: Optional console used by tests or embedding callers.
 
     Raises:
@@ -82,7 +80,6 @@ def default_gateway(
             non_interactive=non_interactive,
             json_output=json_output,
             check=check,
-            engine=engine,
             max_active_requests=max_active_requests,
             provided_console=provided_console,
         )
@@ -97,7 +94,6 @@ def default_gateway(
             json_output=json_output,
             check=check,
             graceful_timeout=graceful_timeout,
-            engine=engine,
             max_active_requests=max_active_requests,
         )
         return
@@ -123,7 +119,6 @@ def default_gateway(
                 root=root,
                 port=port,
                 graceful_timeout=graceful_timeout,
-                engine=engine,
                 max_active_requests=max_active_requests,
             ):
                 return
@@ -140,7 +135,6 @@ def _requires_direct_start(
     non_interactive: bool,
     json_output: bool,
     check: bool,
-    engine: str,
     max_active_requests: int,
     provided_console: bool,
 ) -> bool:
@@ -151,7 +145,6 @@ def _requires_direct_start(
             or non_interactive
             or json_output
             or check
-            or engine != "auto"
             or max_active_requests != DEFAULT_MAX_ACTIVE_REQUESTS
         )
     return (
@@ -159,7 +152,6 @@ def _requires_direct_start(
         or non_interactive
         or json_output
         or check
-        or engine != "auto"
         or max_active_requests != DEFAULT_MAX_ACTIVE_REQUESTS
         or not sys.stdin.isatty()
         or not sys.stdout.isatty()
@@ -179,7 +171,6 @@ def _start_from_menu(
     root: Path,
     port: int,
     graceful_timeout: float,
-    engine: str,
     max_active_requests: int,
 ) -> bool:
     """Start a gateway selected from the home screen.
@@ -193,7 +184,6 @@ def _start_from_menu(
             port=port,
             non_interactive=False,
             graceful_timeout=graceful_timeout,
-            engine=engine,
             max_active_requests=max_active_requests,
         )
     except typer.Abort:

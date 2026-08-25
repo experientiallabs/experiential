@@ -52,7 +52,6 @@ def test_run_gateway_menu_starts_with_setup_allowed(
             "port": 8000,
             "non_interactive": False,
             "graceful_timeout": 10.0,
-            "engine": "auto",
             "max_active_requests": DEFAULT_MAX_ACTIVE_REQUESTS,
         }
     ]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import sys
 from pathlib import Path
@@ -31,7 +30,6 @@ _EXP_WORDMARK = "\n".join(
         "╚══════╝╚═╝  ╚═╝╚═╝     ",
     )
 )
-_MAX_ACTIVE_REQUESTS_DEFAULT = DEFAULT_MAX_ACTIVE_REQUESTS
 
 
 def run(
@@ -71,21 +69,11 @@ def run(
         min=0.1,
         help="Seconds to drain admitted gateway work during shutdown.",
     ),
-    engine: str = typer.Option(
-        "auto",
-        "--engine",
-        help=(
-            "Data-plane engine: 'auto' (rust when built, otherwise python), 'rust' "
-            "(the native data plane, serving every route itself), or 'python' "
-            "(deprecated fallback, scheduled for removal once the native engine "
-            "has soaked in production)."
-        ),
-    ),
     max_active_requests: int = typer.Option(
         DEFAULT_MAX_ACTIVE_REQUESTS,
         "--max-active-requests",
         min=1,
-        help="Rust engine only: maximum concurrently admitted requests.",
+        help="Maximum concurrently admitted requests.",
     ),
 ) -> None:
     """Start the local gateway directly, optionally with one project-backed alias.
@@ -100,8 +88,7 @@ def run(
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
-        engine: Data-plane engine: ``auto``, ``rust``, or ``python``.
-        max_active_requests: Rust engine concurrent-admission bound.
+        max_active_requests: Concurrent-admission bound for the data plane.
 
     Raises:
         typer.BadParameter: The selected project form or activation is invalid.
@@ -116,7 +103,6 @@ def run(
         json_output=json_output,
         check=check,
         graceful_timeout=graceful_timeout,
-        engine=engine,
         max_active_requests=max_active_requests,
     )
 
@@ -132,7 +118,6 @@ def start_gateway(
     json_output: bool = False,
     check: bool = False,
     graceful_timeout: float = DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
-    engine: str = "auto",
     max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS,
 ) -> None:
     """Start the local gateway, optionally materializing one project-backed alias.
@@ -147,49 +132,17 @@ def start_gateway(
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
-        engine: Data-plane engine: ``auto``, ``rust``, or ``python``.
-        max_active_requests: Rust engine concurrent-admission bound.
+        max_active_requests: Concurrent-admission bound for the data plane.
 
     Raises:
-        typer.BadParameter: The selected project form or activation is invalid.
+        typer.BadParameter: The selected project form or activation is invalid,
+            or the native gateway extension is not installed.
     """
-    if engine not in {"auto", "rust", "python"}:
-        raise typer.BadParameter("--engine must be 'auto', 'rust', or 'python'")
-    if policy is not None or ghost:
-        if project is None:
-            raise typer.BadParameter("--policy and --ghost require --project")
-    if engine == "rust" and project is not None:
-        raise typer.BadParameter(
-            "--engine rust serves the default multi-alias gateway; the "
-            "single-project compatibility launch requires the python engine"
-        )
-    if project is None and engine != "python":
-        blocker = _rust_engine_blocker(root)
-        if blocker is None:
-            _run_rust_gateway(
-                root=root,
-                port=port,
-                json_output=json_output,
-                check=check,
-                max_active_requests=max_active_requests,
-                graceful_timeout=graceful_timeout,
-            )
-            return
-        if engine == "rust":
-            if blocker == _NOT_INITIALIZED_BLOCKER:
-                _gateway_not_initialized(json_output=json_output)
-            raise typer.BadParameter(blocker)
-        if not json_output:
-            _console.print(
-                f"[yellow]rust engine unavailable ({blocker}); using the deprecated "
-                "python engine[/yellow]"
-            )
-    if max_active_requests != _MAX_ACTIVE_REQUESTS_DEFAULT:
-        typer.echo(
-            "--max-active-requests applies only to the rust engine; the python "
-            "engine keeps its own executor bound",
-            err=True,
-        )
+    if (policy is not None or ghost) and project is None:
+        raise typer.BadParameter("--policy and --ghost require --project")
+    blocker = _native_engine_blocker()
+    if blocker is not None:
+        raise typer.BadParameter(blocker)
     _run_gateway(
         project=project,
         root=root,
@@ -200,7 +153,26 @@ def start_gateway(
         json_output=json_output,
         check=check,
         graceful_timeout=graceful_timeout,
+        max_active_requests=max_active_requests,
     )
+
+
+def _native_engine_blocker() -> str | None:
+    """Return why the native data plane cannot run at all, or ``None``.
+
+    Returns:
+        A display-safe reason with the exact build command when the compiled
+        extension is missing, or ``None`` when the gateway can serve.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("exp_gateway_native") is None:
+        return (
+            "the exp_gateway_native extension is not built; run 'just native' "
+            "(uv run maturin develop --uv --release "
+            "--manifest-path exp/runtime/gateway/native/Cargo.toml)"
+        )
+    return None
 
 
 def _run_gateway(
@@ -214,21 +186,53 @@ def _run_gateway(
     json_output: bool,
     check: bool,
     graceful_timeout: float,
+    max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS,
 ) -> None:
-    """Validate and optionally serve the normal gateway application."""
+    """Validate, optionally set up, and serve the native gateway.
+
+    The composition proves at startup exactly what serving requires: loading
+    the granted aliases builds each alias's credential-free route proof and
+    fails with actionable per-alias reasons when none is available, and
+    native-servability validation confirms every pool deployment resolves to
+    a provider client with a native wire dialect.
+
+    Args:
+        project: Optional project identifier and endpoint alias.
+        root: Local artifact and model-catalog root.
+        policy: Exact policy for an ambiguous project.
+        port: Local loopback TCP port.
+        ghost: Compatibility marker for project traffic, which always uses gateway accounting.
+        non_interactive: Whether first-run gateway prompts are forbidden.
+        json_output: Whether startup output is one versioned JSON receipt.
+        check: Whether to validate gateway readiness without binding.
+        graceful_timeout: Gateway shutdown drain bound in seconds.
+        max_active_requests: Concurrent-admission bound for the data plane.
+
+    Raises:
+        typer.BadParameter: Setup, alias loading, native servability, or the
+            loopback bind failed.
+    """
     if not json_output:
         _emit_exp_wordmark()
 
-    import uvicorn
+    import importlib
+    import socket
 
     from exp.cli.gateway.compatibility import prepare_project_gateway
     from exp.cli.gateway.setup import interactive_gateway_setup
     from exp.optimize.router.activation import verify_automatic_router_policy
+    from exp.runtime.gateway.guardrails.config import load_guardrail_engine
     from exp.runtime.gateway.lifecycle import (
         gateway_instance_lock,
-        load_local_gateway,
+        load_gateway_components,
     )
     from exp.runtime.gateway.management import GatewayManagement
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
+    from exp.runtime.gateway.native_execution import native_serving_blockers
+    from exp.runtime.gateway.native_server import (
+        NativeGatewayServerError,
+        serve_native_gateway,
+    )
     from exp.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
 
     setup = None
@@ -257,25 +261,43 @@ def _run_gateway(
                     root,
                     verifier=verify_automatic_router_policy,
                 )
-                runtime = load_local_gateway(
+                components = load_gateway_components(
                     root,
-                    graceful_timeout_seconds=graceful_timeout,
                     project_repository=project_repository,
                     only_aliases=(
                         None if compatibility is None else frozenset({compatibility.alias})
                     ),
                 )
-                asyncio.run(runtime.service.preflight())
+                blockers = native_serving_blockers(components)
+                if blockers:
+                    details = "; ".join(blockers)
+                    raise typer.BadParameter(
+                        "the native engine cannot serve every granted alias: "
+                        f"{details}. Fix the provider configuration and rerun 'exp'."
+                    )
+                # Loaded directly (rather than through native_server's own
+                # import) so this composition can wire the content-free
+                # metrics snapshot into the control plane before the process
+                # host ever starts.
+                exp_gateway_native = importlib.import_module("exp_gateway_native")
+                guardrails = load_guardrail_engine(root)
+                control_plane = NativeControlPlane(
+                    components,
+                    data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
+                    guardrails=guardrails,
+                )
                 receipt = {
                     "schema_version": 1,
                     "operation": "gateway.check" if check else "gateway.run",
                     "status": "ready",
                     "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
                     "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage",
-                    "reconciled_expired_requests": runtime.reconciled_expired_requests,
-                    "reconciled_unknown_attempts": runtime.reconciled_unknown_attempts,
+                    "reconciled_expired_requests": control_plane.reconciled_expired_requests,
+                    "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
                     "launch_mode": "gateway" if compatibility is None else "project_alias",
-                    "unavailable_aliases": _unavailable_alias_entries(runtime.unavailable_aliases),
+                    "unavailable_aliases": _unavailable_alias_entries(
+                        components.unavailable_aliases
+                    ),
                 }
                 if compatibility is not None:
                     receipt.update(
@@ -296,166 +318,33 @@ def _run_gateway(
                         compatibility=compatibility,
                         ghost=ghost,
                     )
-                    _emit_unavailable_aliases(runtime.unavailable_aliases)
+                    _emit_unavailable_aliases(components.unavailable_aliases)
                 if check:
                     return
-                uvicorn.run(runtime.app, host=_LOOPBACK_HOST, port=port)
+
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    try:
+                        probe.bind((_LOOPBACK_HOST, port))
+                    except OSError as exc:
+                        raise typer.BadParameter(
+                            f"port {port} is unavailable on {_LOOPBACK_HOST}: {exc}"
+                        ) from exc
+
+                try:
+                    serve_native_gateway(
+                        control_plane,
+                        host=_LOOPBACK_HOST,
+                        port=port,
+                        max_active_requests=max_active_requests,
+                        graceful_timeout_seconds=graceful_timeout,
+                    )
+                except NativeGatewayServerError as exc:
+                    raise typer.BadParameter(str(exc)) from exc
     except typer.BadParameter:
         if setup is not None:
             _emit_setup_recovery(setup=setup)
         raise
-
-
-_NOT_INITIALIZED_BLOCKER = "the gateway is not initialized yet"
-
-
-def _rust_engine_blocker(root: Path) -> str | None:
-    """Return why the rust data plane cannot serve this root, or ``None``.
-
-    Args:
-        root: Local artifact and model-catalog root.
-
-    Returns:
-        A display-safe reason to use the python engine, or ``None`` when the
-        rust engine can serve every granted active alias.
-    """
-    import importlib.util
-
-    from exp.runtime.gateway.management import GatewayManagement
-
-    if importlib.util.find_spec("exp_gateway_native") is None:
-        return (
-            "the exp_gateway_native extension is not built; run 'just native' "
-            "(uv run maturin develop --uv --release "
-            "--manifest-path exp/runtime/gateway/native/Cargo.toml)"
-        )
-    manager = GatewayManagement(root)
-    if not manager.initialized:
-        return _NOT_INITIALIZED_BLOCKER
-    return None
-
-
-def _run_rust_gateway(
-    *,
-    root: Path,
-    port: int,
-    json_output: bool,
-    check: bool,
-    max_active_requests: int,
-    graceful_timeout: float,
-) -> None:
-    """Serve the rust data plane; it owns the public socket and every route.
-
-    Startup validates that every granted alias is natively servable (all pool
-    deployments resolve to a provider client with a native dialect); a
-    blocker fails the launch with the offending aliases named, since no
-    embedded python engine exists to serve an escalated request.
-
-    Args:
-        root: Local artifact and model-catalog root.
-        port: Local loopback TCP port.
-        json_output: Whether startup output is one versioned JSON receipt.
-        check: Whether to validate gateway readiness without binding.
-        max_active_requests: Concurrent-admission bound for the data plane.
-        graceful_timeout: Gateway shutdown drain bound in seconds.
-
-    Raises:
-        typer.BadParameter: The extension module is missing, an alias is not
-            natively servable, or the gateway configuration cannot form one
-            ready route.
-    """
-    if not json_output:
-        _emit_exp_wordmark()
-
-    import importlib
-    import socket
-
-    from exp.optimize.router.activation import verify_automatic_router_policy
-    from exp.runtime.gateway.guardrails.config import load_guardrail_engine
-    from exp.runtime.gateway.lifecycle import (
-        gateway_instance_lock,
-        load_gateway_components,
-    )
-    from exp.runtime.gateway.management import GatewayManagement
-    from exp.runtime.gateway.native_bridge import NativeControlPlane
-    from exp.runtime.gateway.native_execution import native_serving_blockers
-    from exp.runtime.gateway.native_server import (
-        NativeGatewayServerError,
-        serve_native_gateway,
-    )
-    from exp.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
-
-    manager = GatewayManagement(root)
-    if not manager.initialized:
-        _gateway_not_initialized(json_output=json_output)
-    with usage_error(ValueError):
-        with gateway_instance_lock(root, port=port):
-            project_repository = LocalArtifactProjectActivationRepository(
-                root,
-                verifier=verify_automatic_router_policy,
-            )
-            components = load_gateway_components(root, project_repository=project_repository)
-            blockers = native_serving_blockers(components)
-            if blockers:
-                details = "; ".join(blockers)
-                raise typer.BadParameter(
-                    "the native engine cannot serve every granted alias: "
-                    f"{details}. Fix the provider configuration or serve with "
-                    "'--engine python' (deprecated, scheduled for removal once "
-                    "the native engine has soaked in production)."
-                )
-            # Loaded directly (rather than through native_server's own import)
-            # so this composition can wire the content-free metrics snapshot
-            # into the control plane before the process host ever starts.
-            exp_gateway_native = importlib.import_module("exp_gateway_native")
-            guardrails = load_guardrail_engine(root)
-            control_plane = NativeControlPlane(
-                components,
-                data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
-                guardrails=guardrails,
-            )
-            receipt = {
-                "schema_version": 1,
-                "operation": "gateway.check" if check else "gateway.run",
-                "status": "ready",
-                "engine": "rust",
-                "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
-                "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage",
-                "reconciled_expired_requests": control_plane.reconciled_expired_requests,
-                "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
-                "launch_mode": "gateway",
-                "unavailable_aliases": _unavailable_alias_entries(components.unavailable_aliases),
-            }
-            if json_output:
-                typer.echo(json.dumps(receipt, separators=(",", ":")))
-            elif not check:
-                _console.print(
-                    f"[green]Gateway ready (rust engine)[/green] http://{_LOOPBACK_HOST}:{port}/v1",
-                    markup=True,
-                )
-                _emit_unavailable_aliases(components.unavailable_aliases)
-            if check:
-                return
-
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                try:
-                    probe.bind((_LOOPBACK_HOST, port))
-                except OSError as exc:
-                    raise typer.BadParameter(
-                        f"port {port} is unavailable on {_LOOPBACK_HOST}: {exc}"
-                    ) from exc
-
-            try:
-                serve_native_gateway(
-                    control_plane,
-                    host=_LOOPBACK_HOST,
-                    port=port,
-                    max_active_requests=max_active_requests,
-                    graceful_timeout_seconds=graceful_timeout,
-                )
-            except NativeGatewayServerError as exc:
-                raise typer.BadParameter(str(exc)) from exc
 
 
 def _unavailable_alias_entries(

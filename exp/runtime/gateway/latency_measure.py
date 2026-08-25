@@ -486,7 +486,7 @@ def start_gateway_process(
     root: Path,
     port: int,
     credential: str,
-) -> tuple[subprocess.Popen[str], str]:
+) -> subprocess.Popen[str]:
     """Launch the product gateway on loopback and wait until it is ready.
 
     Args:
@@ -495,7 +495,7 @@ def start_gateway_process(
         credential: Mock upstream credential placed in the child environment.
 
     Returns:
-        Live process and the resolved data-plane engine name.
+        Live gateway process.
 
     Raises:
         RuntimeError: The process exits or does not become ready in time.
@@ -520,8 +520,6 @@ def start_gateway_process(
             str(port),
             "--non-interactive",
             "--json",
-            "--engine",
-            "auto",
             "--graceful-timeout",
             "2",
         ],
@@ -545,11 +543,10 @@ def start_gateway_process(
             timeout_s=GATEWAY_START_TIMEOUT_S,
             label="gateway",
         )
-        engine = _wait_for_engine_receipt(lines)
     except Exception:
         stop_gateway_process(process)
         raise
-    return process, engine
+    return process
 
 
 def stop_gateway_process(process: subprocess.Popen[str]) -> None:
@@ -613,54 +610,3 @@ def wait_for_http_ok(
             pass
         time.sleep(0.05)
     raise RuntimeError(f"{label} did not become ready: {url}")
-
-
-def _wait_for_engine_receipt(lines: list[str], *, timeout_s: float = 2.0) -> str:
-    """Wait until the launch receipt is pumped, then return its engine.
-
-    HTTP readiness can succeed before the stdout pump thread appends the JSON
-    receipt. The rust engine prints ``engine: rust`` before it binds; the python
-    engine prints a ready receipt without an engine field.
-
-    Args:
-        lines: Captured gateway stdout lines from the pump thread.
-        timeout_s: Bound for waiting on the receipt after readiness.
-
-    Returns:
-        ``rust`` or ``python`` when a ready receipt is pumped, otherwise
-        ``unknown``. An unobserved receipt is never guessed as python.
-    """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        engine = _engine_from_output(lines)
-        if engine is not None:
-            return engine
-        time.sleep(0.02)
-    return _engine_from_output(lines) or "unknown"
-
-
-def _engine_from_output(lines: list[str]) -> str | None:
-    """Read the launch receipt engine when the JSON line is already pumped.
-
-    Args:
-        lines: Captured gateway stdout lines.
-
-    Returns:
-        ``rust`` or ``python`` when a ready receipt is present, otherwise
-        ``None`` so callers can wait for the pump thread.
-    """
-    for line in lines:
-        text = line.strip()
-        if not text.startswith("{"):
-            continue
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict) or payload.get("status") != "ready":
-            continue
-        engine = payload.get("engine")
-        if engine == "rust":
-            return "rust"
-        return "python"
-    return None

@@ -471,7 +471,7 @@ def run_latency_report(
     try:
         raw_key = configure_gateway(work_root, provider_base_url=mock.base_url)
         port = unused_loopback_port()
-        process, engine = start_gateway_process(
+        process = start_gateway_process(
             root=work_root,
             port=port,
             credential=mock_credential,
@@ -507,7 +507,7 @@ def run_latency_report(
                 python_version=platform.python_version(),
                 platform_name=platform.platform(),
                 runner_name=os.environ.get("RUNNER_NAME") or platform.node() or "unknown",
-                gateway_engine=engine,
+                gateway_engine="rust",
                 runner_os=os.environ.get("RUNNER_OS") or platform.system() or "unknown",
                 cpu_count=os.cpu_count() or 0,
                 cpu_model=runner_cpu_model(),

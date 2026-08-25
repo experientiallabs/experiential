@@ -40,7 +40,6 @@ def test_run_command_starts_the_gateway_directly(
             bool,
             bool,
             float,
-            str,
             int,
         ]
     ] = []
@@ -56,7 +55,6 @@ def test_run_command_starts_the_gateway_directly(
         json_output: bool,
         check: bool,
         graceful_timeout: float,
-        engine: str,
         max_active_requests: int,
     ) -> None:
         """Capture the shared launcher arguments without starting a server."""
@@ -71,7 +69,6 @@ def test_run_command_starts_the_gateway_directly(
                 json_output,
                 check,
                 graceful_timeout,
-                engine,
                 max_active_requests,
             )
         )
@@ -94,8 +91,6 @@ def test_run_command_starts_the_gateway_directly(
             "--check",
             "--graceful-timeout",
             "4.5",
-            "--engine",
-            "python",
             "--max-active-requests",
             "7",
         ],
@@ -113,18 +108,17 @@ def test_run_command_starts_the_gateway_directly(
             True,
             True,
             4.5,
-            "python",
             7,
         )
     ]
 
 
 @pytest.mark.parametrize("ghost", [False, True])
-def test_project_option_launches_the_normal_gateway_on_loopback(
+def test_project_option_launches_the_native_gateway_on_loopback(
     monkeypatch: pytest.MonkeyPatch,
     ghost: bool,
 ) -> None:
-    """Both project compatibility modes launch the ordinary gateway application.
+    """Both project compatibility modes launch the ordinary native gateway.
 
     Args:
         monkeypatch: Scoped replacements for runtime and server boundaries.
@@ -133,7 +127,7 @@ def test_project_option_launches_the_normal_gateway_on_loopback(
     prepared: list[tuple[str, Path, str | None]] = []
     loaded: list[tuple[Path, frozenset[str] | None]] = []
     served: list[tuple[object, str, int]] = []
-    application = object()
+    control_planes: list[object] = []
 
     def prepare(project: str, root: Path, *, policy_id: str | None) -> ProjectGatewayCompatibility:
         """Return one already materialized project-backed gateway alias.
@@ -156,36 +150,42 @@ def test_project_option_launches_the_normal_gateway_on_loopback(
             changed=True,
         )
 
-    async def preflight() -> None:
-        """Complete the gateway preflight without provider work."""
+    components = SimpleNamespace(
+        reconciled_expired_requests=0,
+        reconciled_unknown_attempts=0,
+        unavailable_aliases=(),
+    )
 
-    def load_gateway(
+    def load_components(
         root: Path,
         *,
-        graceful_timeout_seconds: float,
         project_repository: object,
         only_aliases: frozenset[str] | None,
     ) -> object:
-        """Capture the one shared lifecycle composition.
+        """Capture the one shared engine-neutral component load.
 
         Args:
             root: Gateway and artifact root.
-            graceful_timeout_seconds: Requested shutdown drain bound.
             project_repository: Injected immutable project activation repository.
             only_aliases: Optional compatibility alias filter.
 
         Returns:
-            Gateway runtime fixture passed to the normal server.
+            Component fixture consumed by the native control plane.
         """
-        del graceful_timeout_seconds, project_repository
+        del project_repository
         loaded.append((root, only_aliases))
-        return SimpleNamespace(
-            app=application,
-            service=SimpleNamespace(preflight=preflight),
+        return components
+
+    def control_plane_factory(value: object, **_kwargs: object) -> object:
+        """Capture the composed control plane over the loaded components."""
+        assert value is components
+        plane = SimpleNamespace(
+            components=value,
             reconciled_expired_requests=0,
             reconciled_unknown_attempts=0,
-            unavailable_aliases=(),
         )
+        control_planes.append(plane)
+        return plane
 
     @contextmanager
     def instance_lock(root: Path, *, port: int) -> Iterator[None]:
@@ -202,20 +202,32 @@ def test_project_option_launches_the_normal_gateway_on_loopback(
         assert port == 8123
         yield
 
-    def serve(value: object, *, host: str, port: int) -> None:
-        """Capture the application and loopback bind without starting a server.
+    def serve(value: object, *, host: str, port: int, **_kwargs: object) -> None:
+        """Capture the control plane and loopback bind without serving.
 
         Args:
-            value: Composed ASGI application.
+            value: Composed native control plane.
             host: Required loopback host.
             port: Requested local port.
         """
         served.append((value, host, port))
 
     monkeypatch.setattr("exp.cli.gateway.compatibility.prepare_project_gateway", prepare)
-    monkeypatch.setattr("exp.runtime.gateway.lifecycle.load_local_gateway", load_gateway)
+    monkeypatch.setattr("exp.runtime.gateway.lifecycle.load_gateway_components", load_components)
     monkeypatch.setattr("exp.runtime.gateway.lifecycle.gateway_instance_lock", instance_lock)
-    monkeypatch.setattr("uvicorn.run", serve)
+    monkeypatch.setattr(
+        "exp.runtime.gateway.native_execution.native_serving_blockers",
+        lambda _components: (),
+    )
+    monkeypatch.setattr(
+        "exp.runtime.gateway.guardrails.config.load_guardrail_engine",
+        lambda _root: None,
+    )
+    monkeypatch.setattr(
+        "exp.runtime.gateway.native_bridge.NativeControlPlane",
+        control_plane_factory,
+    )
+    monkeypatch.setattr("exp.runtime.gateway.native_server.serve_native_gateway", serve)
 
     arguments = [
         "--project",
@@ -235,13 +247,14 @@ def test_project_option_launches_the_normal_gateway_on_loopback(
     assert result.exit_code == 0, result.output
     assert prepared == [("project-a", Path("/tmp/local-exp"), "policy-a")]
     assert loaded == [(Path("/tmp/local-exp"), frozenset({"project-a"}))]
-    assert served == [(application, "127.0.0.1", 8123)]
+    assert served == [(control_planes[0], "127.0.0.1", 8123)]
     receipt = json.loads(result.stdout)
     assert receipt["launch_mode"] == "project_alias"
     assert receipt["base_url"] == "http://127.0.0.1:8123/v1"
     assert receipt["project_alias"] == "project-a"
     assert receipt["gateway_accounting"] == "enabled"
     assert "--host" not in CliRunner().invoke(app, ["--help"]).output
+    assert "--engine" not in CliRunner().invoke(app, ["--help"]).output
 
 
 def test_noninteractive_default_gateway_returns_stable_empty_state_json(tmp_path: Path) -> None:
@@ -280,8 +293,8 @@ def test_emit_unavailable_aliases_warns_with_alias_and_reason(
     assert "missing MISSING_PROVIDER_KEY" in output
 
 
-def test_engine_rust_without_the_extension_is_an_actionable_error(tmp_path: Path) -> None:
-    """An explicit rust engine without the built extension names the build step."""
+def test_missing_extension_is_an_actionable_error(tmp_path: Path) -> None:
+    """A launch without the built extension names the exact build step."""
     import importlib.util
 
     real_find_spec = importlib.util.find_spec
@@ -292,25 +305,16 @@ def test_engine_rust_without_the_extension_is_an_actionable_error(tmp_path: Path
         return real_find_spec(name, package)
 
     with mock.patch.object(importlib.util, "find_spec", side_effect=missing_extension):
-        result = CliRunner().invoke(app, ["--root", str(tmp_path), "--engine", "rust"])
+        result = CliRunner().invoke(app, ["--root", str(tmp_path)])
     assert result.exit_code == 2
     assert "exp_gateway_native" in result.output
 
 
-def test_engine_auto_falls_back_to_python_on_an_uninitialized_root(tmp_path: Path) -> None:
-    """The default auto engine keeps the python empty-state contract."""
-    result = CliRunner().invoke(
-        app,
-        ["--root", str(tmp_path), "--non-interactive", "--json"],
-    )
+def test_engine_flag_is_gone(tmp_path: Path) -> None:
+    """The retired --engine flag is a usage error, not a silent no-op."""
+    result = CliRunner().invoke(app, ["--root", str(tmp_path), "--engine", "rust"])
     assert result.exit_code == 2
-    assert json.loads(result.stdout)["error"]["code"] == "gateway_not_initialized"
-
-
-def test_engine_rejects_unknown_values(tmp_path: Path) -> None:
-    """An unknown engine name is a usage error."""
-    result = CliRunner().invoke(app, ["--root", str(tmp_path), "--engine", "zig"])
-    assert result.exit_code == 2
+    assert "--engine" in result.output
 
 
 def test_first_run_delivers_credentials_before_readiness_failure(
@@ -333,15 +337,14 @@ def test_first_run_delivers_credentials_before_readiness_failure(
         assert root == tmp_path
         return setup_result
 
-    def load_gateway(
+    def load_components(
         root: Path,
         *,
-        graceful_timeout_seconds: float,
         project_repository: object,
         only_aliases: frozenset[str] | None,
     ) -> object:
         """Fail readiness only after confirming that setup credentials were printed."""
-        del root, graceful_timeout_seconds, project_repository, only_aliases
+        del root, project_repository, only_aliases
         transcript = output.getvalue()
         assert transcript.index(f"export EXP_GATEWAY_KEY={raw_key}") < len(transcript)
         raise ValueError(
@@ -359,7 +362,7 @@ def test_first_run_delivers_credentials_before_readiness_failure(
 
     monkeypatch.setattr(run_app, "_console", console)
     monkeypatch.setattr("exp.cli.gateway.setup.interactive_gateway_setup", interactive_setup)
-    monkeypatch.setattr("exp.runtime.gateway.lifecycle.load_local_gateway", load_gateway)
+    monkeypatch.setattr("exp.runtime.gateway.lifecycle.load_gateway_components", load_components)
     monkeypatch.setattr("exp.runtime.gateway.lifecycle.gateway_instance_lock", instance_lock)
     monkeypatch.setattr(run_app.sys, "stdin", SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr(run_app.sys, "stdout", SimpleNamespace(isatty=lambda: True))
