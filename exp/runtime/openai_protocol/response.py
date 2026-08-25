@@ -40,6 +40,7 @@ def stream_encoder(
             model=authorization.alias,
             created_at=int(created_at),
             include_usage=request.include_usage,
+            ignored_parameters=request.ignored_parameters,
         )
     if request.surface == GatewayApiSurface.MESSAGES:
         # Imported here to break the real package cycle: this module is
@@ -172,6 +173,7 @@ def completed_body(
             }
         ],
         "usage": chat_usage(usage),
+        **_ignored_parameters_extension(request),
     }
 
 
@@ -194,6 +196,13 @@ def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
         "prompt_tokens_details": details or None,
         "completion_tokens_details": output_details or None,
     }
+
+
+def _ignored_parameters_extension(request: GatewayRequest) -> JsonObject:
+    """Expose accepted-but-ignored controls so compatibility behavior is never silent."""
+    if not request.ignored_parameters:
+        return {}
+    return {"x-experiential-ignored-parameters": list(request.ignored_parameters)}
 
 
 def assistant_message(events: tuple[GatewayEvent, ...]) -> GatewayMessage | None:

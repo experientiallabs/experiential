@@ -148,6 +148,8 @@ class GatewayRequest(ContractModel):
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
+    ignored_parameters: tuple[str, ...] = Field(default=(), exclude=True)
+    """Public compatibility fields accepted but intentionally omitted from provider dispatch."""
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=512)
     client_request_id: str | None = Field(default=None, min_length=1, max_length=512)
 
