@@ -5,6 +5,7 @@
 //! bounded callbacks. The fixture functions expose the Rust SSE encoder and
 //! failure taxonomy for byte-level parity tests against the Python engine.
 
+mod admission;
 mod bridge;
 mod dialects;
 mod encode;
@@ -16,8 +17,15 @@ mod eventstream;
 mod guardrails;
 mod memory;
 mod metrics;
+mod proxy;
+mod relay;
 mod replay;
+mod respond;
+mod route_chat;
+mod route_messages;
+mod route_responses;
 mod server;
+mod settlement;
 mod sse;
 mod upstream;
 mod waterfall;
@@ -208,7 +216,7 @@ fn normalize_stream_fixture(dialect: &str, chunks_json: &str) -> PyResult<String
         .map_err(|error| PyValueError::new_err(format!("invalid chunks: {error}")))?;
     let bytes: Vec<Vec<u8>> = chunks
         .iter()
-        .map(|chunk| server::latin1_bytes(chunk))
+        .map(|chunk| respond::latin1_bytes(chunk))
         .collect();
     let (simplified, failure) = dialects::drain_stream_fixture(dialect, &bytes);
     let body = serde_json::json!({

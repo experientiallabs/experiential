@@ -18,6 +18,7 @@ HAND_AUTHORED_SUFFIXES = {
     ".md",
     ".mjs",
     ".py",
+    ".rs",
     ".rst",
     ".sh",
     ".toml",
