@@ -30,7 +30,21 @@ class KnownModel:
     supports_tools: bool = False
     supports_structured_output: bool = False
     supports_temperature: bool | None = None
+    supports_top_p: bool | None = None
+    supports_top_k: bool | None = None
+    supports_logprobs: bool | None = None
     supports_reasoning_effort: bool = False
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = (
+        None
+    )
+    sampling_requires_reasoning_none: bool = False
+    chat_max_tokens_field: Literal["max_tokens", "max_completion_tokens"] | None = None
+    minimum_temperature: float | None = None
+    maximum_temperature: float | None = None
+    minimum_top_p: float | None = None
+    maximum_top_p: float | None = None
+    minimum_top_k: int | None = None
+    maximum_top_k: int | None = None
     context_window_tokens: int | None = None
     maximum_output_tokens: int | None = None
     input_cost_per_million_tokens_usd: float | None = None
@@ -48,8 +62,21 @@ def _chat(
     context_window_tokens: int | None = None,
     maximum_output_tokens: int | None = None,
     supports_temperature: bool | None = True,
+    supports_top_p: bool | None = None,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
     supports_structured_output: bool = True,
     supports_reasoning_effort: bool = False,
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+    | None = None,
+    sampling_requires_reasoning_none: bool = False,
+    chat_max_tokens_field: Literal["max_tokens", "max_completion_tokens"] | None = None,
+    minimum_temperature: float = 0.0,
+    maximum_temperature: float = 2.0,
+    minimum_top_p: float = 0.0,
+    maximum_top_p: float = 1.0,
+    minimum_top_k: int = 1,
+    maximum_top_k: int | None = None,
 ) -> KnownModel:
     """Describe one documented chat model with its verified protocol capabilities.
 
@@ -61,25 +88,100 @@ def _chat(
         context_window_tokens: Documented context window, when the provider publishes one.
         maximum_output_tokens: Documented output ceiling, when the provider publishes one.
         supports_temperature: Whether the model accepts an explicit temperature parameter.
+        supports_top_p: Whether the model accepts nucleus sampling; ``None`` follows temperature.
+        supports_top_k: Whether the model accepts top-k sampling.
+        supports_logprobs: Whether the provider publishes lossless log probabilities.
         supports_structured_output: Whether the model supports structured outputs.
         supports_reasoning_effort: Whether the model accepts an explicit reasoning-effort
             parameter on the OpenAI Responses API.
+        reasoning_effort: Valid default effort for this exact model.
+        sampling_requires_reasoning_none: Whether sampling controls require exact effort none.
+        chat_max_tokens_field: Exact Chat Completions output-limit field, when applicable.
+        minimum_temperature: Smallest accepted temperature.
+        maximum_temperature: Largest accepted temperature.
+        minimum_top_p: Smallest accepted top-p value.
+        maximum_top_p: Largest accepted top-p value.
+        minimum_top_k: Smallest accepted top-k value.
+        maximum_top_k: Largest accepted top-k value, when documented.
 
     Returns:
         The verified metadata record for the model.
     """
+    resolved_top_p = supports_temperature if supports_top_p is None else supports_top_p
     return KnownModel(
         supports_completions=True,
         supports_tools=True,
         supports_structured_output=supports_structured_output,
         supports_temperature=supports_temperature,
+        supports_top_p=resolved_top_p,
+        supports_top_k=supports_top_k,
+        supports_logprobs=supports_logprobs,
         supports_reasoning_effort=supports_reasoning_effort,
+        reasoning_effort=(reasoning_effort or "medium" if supports_reasoning_effort else None),
+        sampling_requires_reasoning_none=sampling_requires_reasoning_none,
+        chat_max_tokens_field=chat_max_tokens_field,
+        minimum_temperature=minimum_temperature if supports_temperature else None,
+        maximum_temperature=maximum_temperature if supports_temperature else None,
+        minimum_top_p=minimum_top_p if resolved_top_p else None,
+        maximum_top_p=maximum_top_p if resolved_top_p else None,
+        minimum_top_k=minimum_top_k if supports_top_k else None,
+        maximum_top_k=maximum_top_k if supports_top_k else None,
         context_window_tokens=context_window_tokens,
         maximum_output_tokens=maximum_output_tokens,
         input_cost_per_million_tokens_usd=input_usd,
         output_cost_per_million_tokens_usd=output_usd,
         cached_input_cost_per_million_tokens_usd=cached_input_usd,
         cache_write_cost_per_million_tokens_usd=cache_write_usd,
+    )
+
+
+def _anthropic_chat(
+    *,
+    input_usd: float,
+    output_usd: float,
+    cached_input_usd: float | None = None,
+    cache_write_usd: float | None = None,
+    context_window_tokens: int | None = None,
+    maximum_output_tokens: int | None = None,
+    adaptive_reasoning: bool = False,
+) -> KnownModel:
+    """Describe one native Anthropic Messages model's exact generation controls."""
+    return _chat(
+        input_usd=input_usd,
+        output_usd=output_usd,
+        cached_input_usd=cached_input_usd,
+        cache_write_usd=cache_write_usd,
+        context_window_tokens=context_window_tokens,
+        maximum_output_tokens=maximum_output_tokens,
+        supports_top_k=not adaptive_reasoning,
+        supports_reasoning_effort=adaptive_reasoning,
+        minimum_temperature=1.0 if adaptive_reasoning else 0.0,
+        maximum_temperature=1.0,
+        minimum_top_p=0.99 if adaptive_reasoning else 0.0,
+        minimum_top_k=0,
+    )
+
+
+def _gemini_chat(
+    *,
+    input_usd: float,
+    output_usd: float,
+    cached_input_usd: float | None = None,
+    cache_write_usd: float | None = None,
+    context_window_tokens: int | None = None,
+    maximum_output_tokens: int | None = None,
+) -> KnownModel:
+    """Describe one native Gemini model with thinking and top-k controls."""
+    return _chat(
+        input_usd=input_usd,
+        output_usd=output_usd,
+        cached_input_usd=cached_input_usd,
+        cache_write_usd=cache_write_usd,
+        context_window_tokens=context_window_tokens,
+        maximum_output_tokens=maximum_output_tokens,
+        supports_top_k=True,
+        supports_reasoning_effort=True,
+        minimum_top_k=1,
     )
 
 
@@ -218,8 +320,9 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         output_usd=10.0,
         context_window_tokens=400_000,
         maximum_output_tokens=128_000,
-        supports_temperature=False,
+        supports_temperature=True,
         supports_reasoning_effort=True,
+        sampling_requires_reasoning_none=True,
     ),
     "gpt-5": _chat(
         input_usd=1.25,
@@ -259,6 +362,7 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
         maximum_output_tokens=272_000,
         supports_temperature=False,
         supports_reasoning_effort=True,
+        reasoning_effort="high",
     ),
     "gpt-4.1": _chat(
         input_usd=2.0,
@@ -383,39 +487,43 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
 }
 
 _ANTHROPIC_MODELS: dict[str, KnownModel] = {
-    "claude-fable-5": _chat(
+    "claude-fable-5": _anthropic_chat(
         input_usd=10.0,
         cached_input_usd=1.0,
         cache_write_usd=12.5,
         output_usd=50.0,
         context_window_tokens=1_000_000,
         maximum_output_tokens=128_000,
+        adaptive_reasoning=True,
     ),
-    "claude-mythos-5": _chat(
+    "claude-mythos-5": _anthropic_chat(
         input_usd=10.0,
         cached_input_usd=1.0,
         cache_write_usd=12.5,
         output_usd=50.0,
         context_window_tokens=1_000_000,
         maximum_output_tokens=128_000,
+        adaptive_reasoning=True,
     ),
-    "claude-opus-5": _chat(
+    "claude-opus-5": _anthropic_chat(
         input_usd=5.0,
         cached_input_usd=0.5,
         cache_write_usd=6.25,
         output_usd=25.0,
         context_window_tokens=1_000_000,
         maximum_output_tokens=128_000,
+        adaptive_reasoning=True,
     ),
-    "claude-sonnet-5": _chat(
+    "claude-sonnet-5": _anthropic_chat(
         input_usd=2.0,
         cached_input_usd=0.2,
         cache_write_usd=2.5,
         output_usd=10.0,
         context_window_tokens=1_000_000,
         maximum_output_tokens=128_000,
+        adaptive_reasoning=True,
     ),
-    "claude-haiku-4-5": _chat(
+    "claude-haiku-4-5": _anthropic_chat(
         input_usd=1.0,
         cached_input_usd=0.1,
         cache_write_usd=1.25,
@@ -423,28 +531,44 @@ _ANTHROPIC_MODELS: dict[str, KnownModel] = {
         context_window_tokens=200_000,
         maximum_output_tokens=64_000,
     ),
-    "claude-opus-4-8": _chat(
+    "claude-opus-4-8": _anthropic_chat(
+        input_usd=5.0,
+        cached_input_usd=0.5,
+        cache_write_usd=6.25,
+        output_usd=25.0,
+        adaptive_reasoning=True,
+    ),
+    "claude-opus-4-7": _anthropic_chat(
+        input_usd=5.0,
+        cached_input_usd=0.5,
+        cache_write_usd=6.25,
+        output_usd=25.0,
+        adaptive_reasoning=True,
+    ),
+    "claude-opus-4-6": _anthropic_chat(
+        input_usd=5.0,
+        cached_input_usd=0.5,
+        cache_write_usd=6.25,
+        output_usd=25.0,
+        adaptive_reasoning=True,
+    ),
+    "claude-opus-4-5": _anthropic_chat(
         input_usd=5.0, cached_input_usd=0.5, cache_write_usd=6.25, output_usd=25.0
     ),
-    "claude-opus-4-7": _chat(
-        input_usd=5.0, cached_input_usd=0.5, cache_write_usd=6.25, output_usd=25.0
+    "claude-sonnet-4-6": _anthropic_chat(
+        input_usd=3.0,
+        cached_input_usd=0.3,
+        cache_write_usd=3.75,
+        output_usd=15.0,
+        adaptive_reasoning=True,
     ),
-    "claude-opus-4-6": _chat(
-        input_usd=5.0, cached_input_usd=0.5, cache_write_usd=6.25, output_usd=25.0
-    ),
-    "claude-opus-4-5": _chat(
-        input_usd=5.0, cached_input_usd=0.5, cache_write_usd=6.25, output_usd=25.0
-    ),
-    "claude-sonnet-4-6": _chat(
-        input_usd=3.0, cached_input_usd=0.3, cache_write_usd=3.75, output_usd=15.0
-    ),
-    "claude-sonnet-4-5": _chat(
+    "claude-sonnet-4-5": _anthropic_chat(
         input_usd=3.0, cached_input_usd=0.3, cache_write_usd=3.75, output_usd=15.0
     ),
 }
 
 _GEMINI_MODELS: dict[str, KnownModel] = {
-    "gemini-3.6-flash": _chat(
+    "gemini-3.6-flash": _gemini_chat(
         input_usd=1.5,
         cached_input_usd=0.15,
         cache_write_usd=0.0,
@@ -452,7 +576,7 @@ _GEMINI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=1_048_576,
         maximum_output_tokens=65_536,
     ),
-    "gemini-3.5-flash": _chat(
+    "gemini-3.5-flash": _gemini_chat(
         input_usd=1.5,
         cached_input_usd=0.15,
         cache_write_usd=0.0,
@@ -460,7 +584,7 @@ _GEMINI_MODELS: dict[str, KnownModel] = {
         context_window_tokens=1_048_576,
         maximum_output_tokens=65_536,
     ),
-    "gemini-3.5-flash-lite": _chat(
+    "gemini-3.5-flash-lite": _gemini_chat(
         input_usd=0.3,
         cached_input_usd=0.03,
         cache_write_usd=0.0,

@@ -110,9 +110,13 @@ def test_invalid_json_and_unknown_fields_answer_anthropic_shaped_400s() -> None:
     )
     assert invalid.status_code == 400
     assert invalid.json()["error"]["type"] == "invalid_request_error"
-    unknown = client.post("/v1/messages", json={**_BODY, "top_k": 4}, headers={"x-api-key": "key"})
+    unknown = client.post(
+        "/v1/messages",
+        json={**_BODY, "unsupported_extension": 4},
+        headers={"x-api-key": "key"},
+    )
     assert unknown.status_code == 400
-    assert "top_k" in unknown.json()["error"]["message"]
+    assert "unsupported_extension" in unknown.json()["error"]["message"]
 
 
 def test_boundary_failures_translate_with_retry_after() -> None:

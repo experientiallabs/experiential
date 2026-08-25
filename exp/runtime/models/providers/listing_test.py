@@ -141,6 +141,19 @@ def test_openai_compatible_listing_reads_validated_exp_gateway_metadata() -> Non
                         "supports_completions": True,
                         "supports_tools": True,
                         "supports_structured_output": True,
+                        "supports_temperature": True,
+                        "supports_top_p": True,
+                        "supports_top_k": True,
+                        "supports_reasoning": True,
+                        "reasoning_effort": "low",
+                        "sampling_requires_reasoning_none": True,
+                        "chat_max_tokens_field": "max_completion_tokens",
+                        "minimum_temperature": 0.0,
+                        "maximum_temperature": 2.0,
+                        "minimum_top_p": 0.0,
+                        "maximum_top_p": 1.0,
+                        "minimum_top_k": 1,
+                        "maximum_top_k": 100,
                         "maximum_output_tokens": 16_000,
                         "pricing": {
                             "input_micro_usd_per_million_tokens": 1_250_000,
@@ -167,6 +180,14 @@ def test_openai_compatible_listing_reads_validated_exp_gateway_metadata() -> Non
     assert model.supports_completions is True
     assert model.supports_tools is True
     assert model.supports_structured_output is True
+    assert model.supports_temperature is True
+    assert model.supports_top_p is True
+    assert model.supports_top_k is True
+    assert model.supports_reasoning is True
+    assert model.reasoning_effort == "low"
+    assert model.sampling_requires_reasoning_none is True
+    assert model.chat_max_tokens_field == "max_completion_tokens"
+    assert model.maximum_top_k == 100
     assert model.maximum_output_tokens == 16_000
     assert model.context_window_tokens is None
     assert model.input_cost_per_million_tokens_usd == pytest.approx(1.25)
@@ -174,6 +195,7 @@ def test_openai_compatible_listing_reads_validated_exp_gateway_metadata() -> Non
     assert model.cached_input_cost_per_million_tokens_usd == pytest.approx(0.125)
     assert model.cache_write_cost_per_million_tokens_usd is None
     resolved = resolve_discovered_model(model)
+    assert resolved.capabilities.reasoning_effort == "low"
     assert served_roles(resolved.capabilities) == (SetupRole.WORLD_MODEL, SetupRole.JUDGE)
 
 
@@ -249,7 +271,15 @@ def test_openrouter_listing_reads_capabilities_limits_and_prices() -> None:
                         "id": "openai/gpt-5.1",
                         "name": "OpenAI: GPT-5.1",
                         "context_length": 400000,
-                        "supported_parameters": ["tools", "structured_outputs"],
+                        "supported_parameters": [
+                            "tools",
+                            "structured_outputs",
+                            "temperature",
+                            "top_p",
+                            "top_k",
+                            "reasoning",
+                            "logprobs",
+                        ],
                         "top_provider": {"max_completion_tokens": 128000},
                         "pricing": {
                             "prompt": "0.00000125",
@@ -272,6 +302,15 @@ def test_openrouter_listing_reads_capabilities_limits_and_prices() -> None:
     assert model.model == "openai/gpt-5.1"
     assert model.supports_tools is True
     assert model.supports_structured_output is True
+    assert model.supports_temperature is True
+    assert model.supports_top_p is True
+    assert model.supports_top_k is True
+    assert model.supports_reasoning is True
+    assert model.supports_logprobs is True
+    assert model.chat_max_tokens_field == "max_tokens"
+    assert model.maximum_temperature == 2.0
+    assert model.maximum_top_p == 1.0
+    assert model.minimum_top_k == 1
     assert model.context_window_tokens == 400000
     assert model.maximum_output_tokens == 128000
     assert model.input_cost_per_million_tokens_usd == pytest.approx(1.25)
@@ -292,6 +331,11 @@ def test_gemini_listing_follows_pages_and_drops_the_resource_prefix() -> None:
                         "supportedGenerationMethods": ["generateContent"],
                         "inputTokenLimit": 1048576,
                         "outputTokenLimit": 65536,
+                        "temperature": 1.0,
+                        "maxTemperature": 2.0,
+                        "topP": 0.95,
+                        "topK": 40,
+                        "thinking": True,
                     }
                 ],
                 "nextPageToken": "page-2",
@@ -317,6 +361,11 @@ def test_gemini_listing_follows_pages_and_drops_the_resource_prefix() -> None:
     assert [model.model for model in models] == ["gemini-3-pro-preview", "gemini-embedding-001"]
     assert models[0].supports_completions is True
     assert models[0].maximum_output_tokens == 65536
+    assert models[0].supports_temperature is True
+    assert models[0].supports_top_p is True
+    assert models[0].supports_top_k is True
+    assert models[0].supports_reasoning is True
+    assert models[0].maximum_temperature == 2.0
     assert models[1].supports_embeddings is True
     assert transport.requests[0].headers["x-goog-api-key"] == "secret-key"
     assert transport.requests[1].url.endswith("&pageToken=page-2")

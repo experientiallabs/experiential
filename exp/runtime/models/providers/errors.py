@@ -65,7 +65,17 @@ class ProviderCapabilityError(ValueError):
         self.capability = capability
 
 
-class UnsupportedReasoningEffortError(ValueError):
+class ProviderParameterError(ValueError):
+    """A public parameter cannot be preserved by the resolved model route."""
+
+    def __init__(self, *, message: str, param: str, code: str) -> None:
+        """Create one sanitized, field-specific pre-dispatch rejection."""
+        super().__init__(message)
+        self.param = param
+        self.code = code
+
+
+class UnsupportedReasoningEffortError(ProviderParameterError):
     """An explicit reasoning effort cannot be preserved by one model route."""
 
     def __init__(
@@ -93,8 +103,7 @@ class UnsupportedReasoningEffortError(ValueError):
                 f"The parameter {param!r} is not supported by this model route. "
                 "Remove the field or choose a different model."
             )
-        super().__init__(message)
-        self.param = param
+        super().__init__(message=message, param=param, code="unsupported_parameter")
 
 
 def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
@@ -129,12 +138,12 @@ def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
             safe_message="provider refused the request; revise the request content and retry",
             safe_details={"signal": exception.signal.value},
         )
-    if isinstance(exception, UnsupportedReasoningEffortError):
+    if isinstance(exception, ProviderParameterError):
         return GatewayFailure(
             failure_class=GatewayFailureClass.INVALID_REQUEST,
             safe_message=str(exception),
             safe_details={
-                "code": "unsupported_parameter",
+                "code": exception.code,
                 "param": exception.param,
             },
         )

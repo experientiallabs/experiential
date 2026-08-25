@@ -24,6 +24,7 @@ from exp.common.models import (
 from exp.runtime.models.providers.base import (
     DEFAULT_TIMEOUT_SECONDS,
     MAXIMUM_COMPLETION_TIMEOUT_SECONDS,
+    GatewayWireProfile,
     ProviderHttpClient,
     completion_timeout_seconds,
 )
@@ -137,6 +138,77 @@ def test_rejects_a_nonpositive_timeout() -> None:
             base_url="https://echo.test",
             timeout_seconds=0,
         )
+
+
+def test_gateway_wire_profile_rejects_malformed_generation_contracts() -> None:
+    """Operator metadata cannot create an incoherent admission contract."""
+    constructors = (
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            minimum_temperature=1.0,
+            maximum_temperature=0.5,
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            minimum_top_p=0.8,
+            maximum_top_p=0.2,
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            minimum_top_k=10,
+            maximum_top_k=5,
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            maximum_temperature=float("nan"),
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            minimum_temperature=-0.1,
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            maximum_top_p=1.1,
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            maximum_output_tokens=0,
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            minimum_temperature=True,
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            maximum_output_tokens=True,
+        ),
+        lambda: GatewayWireProfile(
+            dialect="not_implemented",
+            url="https://provider.test/v1/chat/completions",
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            reasoning_effort="high",
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            sampling_requires_reasoning_none=True,
+        ),
+    )
+    for constructor in constructors:
+        with pytest.raises(ValueError):
+            constructor()
 
 
 def test_complete_posts_bearer_headers_and_class_defaults_to_the_completion_route() -> None:

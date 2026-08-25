@@ -88,10 +88,9 @@ class GatewayMessage(ContractModel):
     """Whether this tool result reports a failed tool invocation.
 
     Only the Anthropic Messages surface can express it (``tool_result.is_error``),
-    and only the Anthropic upstream dialect can emit it back, so an
-    Anthropic-to-Anthropic round trip is lossless. The OpenAI-family wire
-    formats have no tool-error flag; their builders ignore this field and the
-    error state travels in the result text the model reads. Like
+    and only the Anthropic upstream dialect can emit it back, so route
+    admission requires every waterfall rung to use that dialect. OpenAI-family
+    wires cannot represent the flag and are rejected instead of dropping it. Like
     ``ToolCall.raw_arguments``, the field is deliberately excluded from model
     serialization so request digests, replay identity, and immutable
     artifacts are unaffected by it.
@@ -130,10 +129,14 @@ class GatewayRequest(ContractModel):
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
     maximum_output_tokens: int | None = Field(default=None, gt=0)
+    maximum_output_tokens_parameter: (
+        Literal["max_tokens", "max_completion_tokens", "max_output_tokens"] | None
+    ) = Field(default=None, exclude=True)
+    """Exact caller field normalized into ``maximum_output_tokens``."""
     stop: tuple[str, ...] = ()
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
-    top_k: int | None = Field(default=None, gt=0)
+    top_k: int | None = Field(default=None, ge=0)
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
@@ -215,6 +218,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("include_usage is valid only for streaming requests")
         if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("reasoning_summary is valid only for Responses requests")
+        if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
+            raise ValueError("maximum output parameter requires a maximum output value")
         if self.reasoning_summary_parameters and self.reasoning_summary is None:
             raise ValueError("reasoning summary parameter paths require a summary selector")
         if len(set(self.reasoning_summary_parameters)) != len(self.reasoning_summary_parameters):

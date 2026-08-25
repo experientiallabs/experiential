@@ -7,11 +7,16 @@ import pytest
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
+    GatewayNamedToolChoice,
     GatewayRequest,
+    GatewayToolDefinition,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
-from exp.runtime.models.providers.errors import UnsupportedReasoningEffortError
+from exp.runtime.models.providers.errors import (
+    ProviderParameterError,
+    UnsupportedReasoningEffortError,
+)
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.streaming_requests import (
     anthropic_messages_stream_payload,
@@ -235,8 +240,8 @@ def test_openai_responses_stream_payload_forwards_reasoning_summary() -> None:
     assert payload["reasoning"] == {"summary": "detailed"}
 
 
-def test_route_shaping_omits_reasoning_summary_outside_native_responses() -> None:
-    """A fallback without summary output support removes and discloses the exact aliases."""
+def test_route_rejects_reasoning_summary_outside_native_responses() -> None:
+    """A fallback without summary output support rejects the exact caller alias."""
     request = GatewayRequest(
         surface=GatewayApiSurface.RESPONSES,
         messages=(GatewayMessage(role="user", content="hello"),),
@@ -251,6 +256,7 @@ def test_route_shaping_omits_reasoning_summary_outside_native_responses() -> Non
             dialect="openai_responses",
             url="https://openai.test",
             supports_reasoning=True,
+            reasoning_wire_format="openai_responses",
         ),
         GatewayWireProfile(
             dialect="openai_compatible",
@@ -260,26 +266,22 @@ def test_route_shaping_omits_reasoning_summary_outside_native_responses() -> Non
         ),
     )
 
-    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(profiles, request)
 
-    assert public_request.ignored_parameters == (
-        "reasoning.generate_summary",
-        "reasoning.summary",
-    )
-    assert public_request.reasoning_summary == "concise"
-    assert provider_request.reasoning_summary is None
+    assert raised.value.code == "unsupported_parameter"
+    assert raised.value.param == "reasoning.generate_summary"
 
 
-def test_route_generation_controls_use_the_whole_waterfall_intersection() -> None:
-    """One incompatible fallback removes safe optional controls before any dispatch."""
-    request = _chat_request(temperature=0.2, top_p=0.8).model_copy(
-        update={
-            "top_k": 20,
-            "logprobs": True,
-            "top_logprobs": 5,
-            "reasoning_effort": "high",
-        }
-    )
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("temperature", 0.2), ("top_p", 0.8), ("top_k", 20)],
+)
+def test_route_generation_controls_use_the_whole_waterfall_intersection(
+    field: str, value: float | int
+) -> None:
+    """One incompatible fallback rejects an explicit semantic control before dispatch."""
+    request = _chat_request().model_copy(update={field: value})
     profiles = (
         GatewayWireProfile(
             dialect="openai_compatible",
@@ -303,21 +305,11 @@ def test_route_generation_controls_use_the_whole_waterfall_intersection() -> Non
         ),
     )
 
-    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(profiles, request)
 
-    assert public_request.ignored_parameters == (
-        "temperature",
-        "top_p",
-        "top_k",
-        "logprobs",
-        "top_logprobs",
-    )
-    assert provider_request.temperature is None
-    assert provider_request.top_p is None
-    assert provider_request.top_k is None
-    assert provider_request.logprobs is None
-    assert provider_request.top_logprobs is None
-    assert provider_request.reasoning_effort == "high"
+    assert raised.value.code == "unsupported_parameter"
+    assert raised.value.param == field
 
 
 def test_route_rejects_effort_not_preserved_by_the_whole_waterfall() -> None:
@@ -372,6 +364,72 @@ def test_route_rejects_effort_when_reasoning_is_unsupported() -> None:
     assert "not supported by this model route" in str(raised.value)
 
 
+def test_route_rejects_an_unsupported_configured_effort_without_clamping() -> None:
+    """An invalid operator pin fails locally even when the caller omits effort."""
+    with pytest.raises(UnsupportedReasoningEffortError) as raised:
+        route_generation_parameter_requests(
+            (
+                GatewayWireProfile(
+                    dialect="openai_responses",
+                    url="https://provider.test",
+                    model_id="gpt-5.6-sol",
+                    supports_reasoning=True,
+                    reasoning_wire_format="openai_responses",
+                    reasoning_effort="minimal",
+                ),
+            ),
+            _chat_request(),
+        )
+
+    assert raised.value.param == "reasoning_effort"
+    assert "Supported values: 'low', 'medium', 'high', 'xhigh'" in str(raised.value)
+
+
+def test_route_rejects_inconsistent_configured_efforts_across_fallbacks() -> None:
+    """A fallback cannot silently change an operator-pinned reasoning level."""
+    profiles = (
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://first.test",
+            model_id="claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+            reasoning_effort="high",
+        ),
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://fallback.test",
+            model_id="claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+            reasoning_effort="medium",
+        ),
+    )
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(profiles, _chat_request())
+
+    assert raised.value.code == "invalid_parameter"
+    assert "gateway operator must align" in str(raised.value)
+
+
+def test_route_accepts_anthropic_max_effort_without_translation() -> None:
+    """The provider's documented max level is preserved exactly."""
+    request = _chat_request().model_copy(update={"reasoning_effort": "max"})
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://provider.test",
+        model_id="claude-opus-5",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+    )
+
+    public_request, provider_request = route_generation_parameter_requests((profile,), request)
+
+    assert public_request.reasoning_effort == "max"
+    assert provider_request.reasoning_effort == "max"
+
+
 def test_route_shaping_omits_tool_controls_when_no_tools_exist() -> None:
     """No-op tool selectors never reach providers that reject them without schemas."""
     request = _chat_request().model_copy(
@@ -388,30 +446,112 @@ def test_route_shaping_omits_tool_controls_when_no_tools_exist() -> None:
     assert provider_request.parallel_tool_calls is None
 
 
-def test_route_shaping_omits_out_of_range_provider_controls() -> None:
-    """Portable public ranges never become provider-side range errors."""
-    request = _chat_request(temperature=1.5).model_copy(update={"top_k": 101})
-
-    public_request, provider_request = route_generation_parameter_requests(
-        (
-            GatewayWireProfile(
-                dialect="gemini_generate_content",
-                url="https://provider.test",
-                maximum_temperature=1.0,
-                supports_top_k=True,
-                maximum_top_k=100,
-            ),
-        ),
-        request,
+def test_route_rejects_semantic_tool_selectors_without_a_matching_schema() -> None:
+    """Required and named choices cannot be reduced to harmless no-ops."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://provider.test",
     )
+    with pytest.raises(ProviderParameterError) as required:
+        route_generation_parameter_requests(
+            (profile,),
+            _chat_request().model_copy(update={"tool_choice": "required"}),
+        )
+    assert required.value.code == "invalid_parameter"
+    assert required.value.param == "tool_choice"
 
-    assert public_request.ignored_parameters == ("temperature", "top_k")
-    assert provider_request.temperature is None
-    assert provider_request.top_k is None
+    with pytest.raises(ProviderParameterError) as named:
+        route_generation_parameter_requests(
+            (profile,),
+            _chat_request().model_copy(
+                update={
+                    "tools": (GatewayToolDefinition(name="search", parameters={"type": "object"}),),
+                    "tool_choice": GatewayNamedToolChoice(name="missing"),
+                }
+            ),
+        )
+    assert named.value.code == "invalid_parameter"
+    assert named.value.param == "tool_choice"
 
 
-def test_responses_logprob_shaping_discloses_only_the_caller_field() -> None:
-    """A synthetic canonical logprobs flag never leaks into ignored-field disclosure."""
+def test_route_rejects_out_of_range_provider_controls() -> None:
+    """Provider-specific ranges produce a local field-specific error."""
+    request = _chat_request(temperature=1.5)
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (
+                GatewayWireProfile(
+                    dialect="gemini_generate_content",
+                    url="https://provider.test",
+                    maximum_temperature=1.0,
+                    supports_top_k=True,
+                    maximum_top_k=100,
+                ),
+            ),
+            request,
+        )
+
+    assert raised.value.code == "invalid_parameter"
+    assert raised.value.param == "temperature"
+    assert "between 0.0 and 1.0" in str(raised.value)
+
+
+def test_conditional_sampling_requires_explicit_none_reasoning() -> None:
+    """GPT-5.1 sampling is accepted only when the caller selects exact no-reasoning mode."""
+    profile = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://provider.test",
+        model_id="gpt-5.1",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        reasoning_effort="medium",
+        supports_top_p=True,
+        sampling_requires_reasoning_none=True,
+    )
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((profile,), _chat_request(temperature=0.2))
+
+    assert raised.value.code == "unsupported_parameter"
+    assert raised.value.param == "temperature"
+
+    request = _chat_request(temperature=0.2, top_p=0.9).model_copy(
+        update={"reasoning_effort": "none"}
+    )
+    public_request, provider_request = route_generation_parameter_requests((profile,), request)
+
+    assert public_request.temperature == 0.2
+    assert provider_request.reasoning_effort == "none"
+
+
+def test_payload_builder_rejects_conditional_sampling_without_admission() -> None:
+    """Direct provider use retains the same local guard as gateway admission."""
+    with pytest.raises(ProviderParameterError, match="reasoning_effort is 'none'"):
+        openai_responses_stream_payload(
+            "gpt-5.1",
+            _chat_request(temperature=0.2).model_copy(update={"reasoning_effort": "medium"}),
+            supports_temperature=True,
+            supports_reasoning=True,
+            sampling_requires_reasoning_none=True,
+        )
+
+
+def test_route_rejects_stop_before_native_responses_dispatch() -> None:
+    """Chat stop sequences never reach a Responses deployment that lacks the field."""
+    request = _chat_request().model_copy(update={"stop": ("DONE",)})
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (GatewayWireProfile(dialect="openai_responses", url="https://provider.test"),),
+            request,
+        )
+
+    assert raised.value.code == "unsupported_parameter"
+    assert raised.value.param == "stop"
+
+
+def test_responses_logprob_request_is_rejected_instead_of_ignored() -> None:
+    """A requested probability result cannot disappear during normalization."""
     request = GatewayRequest(
         surface=GatewayApiSurface.RESPONSES,
         messages=(GatewayMessage(role="user", content="hello"),),
@@ -420,18 +560,31 @@ def test_responses_logprob_shaping_discloses_only_the_caller_field() -> None:
         ignored_parameters=("top_logprobs",),
     )
 
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (GatewayWireProfile(dialect="openai_responses", url="https://provider.test"),),
+            request,
+        )
+
+    assert raised.value.code == "unsupported_parameter"
+    assert raised.value.param == "top_logprobs"
+
+
+def test_false_logprobs_is_disclosed_and_removed_as_a_noop() -> None:
+    """An explicit false selector is harmless but never leaks to brittle providers."""
+    request = _chat_request().model_copy(update={"logprobs": False})
+
     public_request, provider_request = route_generation_parameter_requests(
-        (GatewayWireProfile(dialect="openai_responses", url="https://provider.test"),),
+        (GatewayWireProfile(dialect="openai_compatible", url="https://provider.test"),),
         request,
     )
 
-    assert public_request.ignored_parameters == ("top_logprobs",)
+    assert public_request.ignored_parameters == ("logprobs",)
     assert provider_request.logprobs is None
-    assert provider_request.top_logprobs is None
 
 
-def test_route_shaping_omits_temperature_outside_any_provider_range() -> None:
-    """A cross-provider route never forwards a value one wire rejects by range."""
+def test_route_rejects_temperature_outside_any_provider_range() -> None:
+    """A cross-provider route rejects a value one wire cannot preserve."""
     request = _chat_request(temperature=1.5)
     profiles = (
         GatewayWireProfile(dialect="openai_responses", url="https://openai.test"),
@@ -442,15 +595,67 @@ def test_route_shaping_omits_temperature_outside_any_provider_range() -> None:
         ),
     )
 
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(profiles, request)
+
+    assert raised.value.code == "invalid_parameter"
+    assert raised.value.param == "temperature"
+
+
+def test_route_rejects_output_ceiling_above_smallest_waterfall_limit() -> None:
+    """A caller token ceiling is checked against every known deployment limit."""
+    request = _chat_request().model_copy(
+        update={
+            "maximum_output_tokens": 65_000,
+            "maximum_output_tokens_parameter": "max_completion_tokens",
+        }
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://first.test",
+            maximum_output_tokens=128_000,
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://fallback.test",
+            maximum_output_tokens=64_000,
+        ),
+    )
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(profiles, request)
+
+    assert raised.value.code == "invalid_parameter"
+    assert raised.value.param == "max_completion_tokens"
+    assert "maximum of 64000" in str(raised.value)
+
+
+def test_route_supplies_anthropic_required_max_tokens_within_every_rung_limit() -> None:
+    """An omitted public limit becomes one safe route-wide Anthropic default."""
+    request = _chat_request()
+    profiles = (
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://anthropic.test",
+            maximum_output_tokens=8_192,
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://fallback.test",
+            maximum_output_tokens=2_048,
+        ),
+    )
+
     public_request, provider_request = route_generation_parameter_requests(profiles, request)
 
-    assert public_request.ignored_parameters == ("temperature",)
-    assert provider_request.temperature is None
+    assert public_request.maximum_output_tokens is None
+    assert provider_request.maximum_output_tokens == 2_048
 
 
 def test_reasoning_effort_uses_each_provider_native_wire_shape() -> None:
     """The same public control translates without leaking an OpenAI field across providers."""
-    request = _chat_request().model_copy(update={"reasoning_effort": "xhigh"})
+    request = _chat_request().model_copy(update={"reasoning_effort": "high"})
 
     openrouter = dialect_stream_payload(
         GatewayWireProfile(
@@ -480,16 +685,16 @@ def test_reasoning_effort_uses_each_provider_native_wire_shape() -> None:
             supports_reasoning=True,
             reasoning_wire_format="gemini_thinking",
         ),
-        request.model_copy(update={"reasoning_effort": "minimal"}),
+        request,
     )
 
-    assert openrouter["reasoning"] == {"effort": "xhigh"}
+    assert openrouter["reasoning"] == {"effort": "high"}
     assert "reasoning_effort" not in openrouter
     assert anthropic["thinking"] == {"type": "adaptive"}
     assert anthropic["output_config"] == {"effort": "high"}
     assert "reasoning" not in anthropic
     generation = cast("dict[str, object]", gemini["generationConfig"])
-    assert generation["thinkingConfig"] == {"thinkingLevel": "LOW"}
+    assert generation["thinkingConfig"] == {"thinkingLevel": "HIGH"}
 
 
 @pytest.mark.parametrize(
@@ -555,6 +760,38 @@ def test_anthropic_messages_stream_payload_round_trips_tool_error_state() -> Non
     }
     # An ordinary result stays byte-identical to the pre-existing payload shape.
     assert blocks[1] == {"type": "tool_result", "tool_use_id": "call-2", "content": "fine"}
+
+
+def test_tool_error_state_requires_an_anthropic_only_waterfall() -> None:
+    """A fallback cannot discard Anthropic tool-result error semantics."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="tool", content="boom", tool_call_id="call-1", tool_is_error=True),
+        ),
+    )
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+    )
+
+    public_request, provider_request = route_generation_parameter_requests((anthropic,), request)
+    assert public_request.messages[0].tool_is_error is True
+    assert provider_request.messages[0].tool_is_error is True
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (
+                anthropic,
+                GatewayWireProfile(
+                    dialect="openai_compatible",
+                    url="https://fallback.test",
+                ),
+            ),
+            request,
+        )
+
+    assert raised.value.param == "messages.content.is_error"
 
 
 def test_gemini_stream_payload_matches_the_provider_client_builder() -> None:

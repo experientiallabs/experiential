@@ -1,12 +1,12 @@
 """Decode Anthropic Messages bodies into canonical serving requests.
 
 The decoder is strict and lossless for supported content: text, ``tool_use``,
-and ``tool_result`` blocks translate faithfully; ``thinking``,
-``redacted_thinking``, and ``cache_control`` annotations are validated and
-dropped (this gateway has no extended-thinking or prompt-caching channel);
-``image`` and ``document`` blocks are rejected loudly because the serving
-surface is text-only. Unknown or unsupported fields are rejected with a
-field-specific error, never silently dropped. Errors raise
+and ``tool_result`` blocks translate faithfully; ``cache_control`` annotations
+are validated and dropped because they do not change model semantics;
+``thinking``, ``redacted_thinking``, ``image``, and ``document`` blocks are
+rejected loudly because the serving surface cannot preserve them. Unknown or
+unsupported fields are rejected with a field-specific error, never silently
+dropped. Errors raise
 :class:`OpenAIProtocolError` so the shared boundary stays single-authority;
 the HTTP layer renders them in the Anthropic envelope.
 """
@@ -39,6 +39,8 @@ from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 
 _REJECTED_BLOCK_HINTS = {
+    "thinking": "thinking history blocks are not supported by this gateway",
+    "redacted_thinking": "redacted thinking blocks are not supported by this gateway",
     "image": "image blocks are not supported: this gateway surface is text-only",
     "document": "document blocks are not supported: this gateway surface is text-only",
     "server_tool_use": "server tools are not supported by this gateway",
@@ -68,7 +70,7 @@ class _TextBlock(_WireModel):
 
 
 class _ThinkingBlock(_WireModel):
-    """Extended-thinking history block, accepted and dropped by policy."""
+    """Extended-thinking history block recognized for a targeted rejection."""
 
     type: Literal["thinking"]
     thinking: str = ""
@@ -76,7 +78,7 @@ class _ThinkingBlock(_WireModel):
 
 
 class _RedactedThinkingBlock(_WireModel):
-    """Redacted extended-thinking history block, accepted and dropped by policy."""
+    """Redacted-thinking history block recognized for a targeted rejection."""
 
     type: Literal["redacted_thinking"]
     data: str = ""
@@ -147,7 +149,7 @@ class _Metadata(_WireModel):
 
 
 class _ThinkingConfig(_WireModel):
-    """Extended-thinking configuration, accepted and dropped by policy."""
+    """Extended-thinking configuration retained only for closed wire validation."""
 
     type: Literal["enabled", "disabled"]
     budget_tokens: int | None = Field(default=None, gt=0)
@@ -162,6 +164,7 @@ class _MessagesRequest(_WireModel):
     system: str | tuple[_TextBlock, ...] | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
+    top_k: int | None = Field(default=None, ge=0)
     stop_sequences: tuple[str, ...] | None = None
     stream: bool = False
     tools: tuple[_Tool, ...] = ()
@@ -205,9 +208,11 @@ def decode_messages(payload: JsonObject) -> DecodedGatewayRequest:
             tool_choice=_gateway_tool_choice(request.tool_choice),
             parallel_tool_calls=parallel_tool_calls,
             maximum_output_tokens=request.max_tokens,
+            maximum_output_tokens_parameter="max_tokens",
             stop=_stop_sequences(request.stop_sequences),
             temperature=request.temperature,
             top_p=request.top_p,
+            top_k=request.top_k,
             stream=request.stream,
             include_usage=request.stream,
             metadata=_gateway_metadata(request.metadata),
@@ -370,8 +375,10 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
         if isinstance(block, _TextBlock):
             text_parts.append(block.text)
         elif isinstance(block, (_ThinkingBlock, _RedactedThinkingBlock)):
-            # Dropped by policy: this gateway has no extended-thinking channel.
-            continue
+            raise invalid_field(
+                f"{param}.content.{block_index}",
+                "thinking history blocks are not supported by this gateway.",
+            )
         elif isinstance(block, _ToolUseBlock):
             if message.role != "assistant":
                 raise invalid_field(

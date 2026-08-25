@@ -384,7 +384,7 @@ def test_unverified_router_candidates_and_incumbent_can_be_retained() -> None:
 
 def test_each_completion_role_asks_its_effort_directly_after_its_model_screen() -> None:
     """Every completion role gets its own effort screen, so one alias can differ per role."""
-    console = ScriptedConsole("1\n5\n1\n2\n1\n1,2\n\n3\n\n2\n")
+    console = ScriptedConsole("1\n6\n1\n3\n1\n1,2\n\n\n\n2\n")
 
     roles = assign_roles(
         (_CHAT, _OTHER_CHAT, _EMBEDDER),

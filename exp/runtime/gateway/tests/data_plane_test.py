@@ -1797,6 +1797,9 @@ def test_model_discovery_publishes_the_revision_direct_pool_not_a_name_match() -
             "supports_completions": True,
             "supports_tools": True,
             "supports_structured_output": True,
+            "supports_temperature": True,
+            "supports_reasoning": False,
+            "sampling_requires_reasoning_none": False,
             "maximum_output_tokens": 16_000,
             "pricing": {
                 "input_micro_usd_per_million_tokens": 1_250_000,

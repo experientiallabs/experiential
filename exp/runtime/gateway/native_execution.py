@@ -13,7 +13,7 @@ boundary encoding; this module owns the frozen semantics.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
@@ -24,10 +24,10 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
-
-# The executor's identity check is the authoritative pre-dispatch invariant;
-# the native path must enforce the same one, so the private helper is shared.
-from exp.runtime.gateway.execution import _require_deployment_identity  # noqa: PLC2701
+from exp.runtime.gateway.execution_resolution import (
+    _require_deployment_identity,
+    _resolved_wire_profile,
+)
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_responses import ContinuationContext
@@ -227,15 +227,15 @@ def resolve_route_profiles(
                 f"provider {deployment.provider!r} has no native wire profile"
             )
         try:
-            profile = client.gateway_wire_profile()
+            # Apply the exact catalog contract used by the Python executor.
+            # Python freezes provider payload bytes; Rust dispatches them.
+            profile = _resolved_wire_profile(deployment, resolved)
         except ProviderCapabilityError as exc:
             if exc.capability != "native_data_plane":
                 raise
             raise NativeDialectUnavailableError(
                 f"provider {deployment.provider!r} has no native dialect implementation"
             ) from exc
-        if not profile.model_id:
-            profile = replace(profile, model_id=resolved.snapshot.model_id)
         resolved_wires.append((profile, client))
     return tuple(resolved_wires)
 

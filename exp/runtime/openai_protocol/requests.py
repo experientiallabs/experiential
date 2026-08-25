@@ -199,7 +199,7 @@ class _ChatRequest(_WireModel):
     stop: str | tuple[str, ...] | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
-    top_k: int | None = Field(default=None, gt=0)
+    top_k: int | None = Field(default=None, ge=0)
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
@@ -309,7 +309,7 @@ class _ResponsesRequest(_WireModel):
     max_output_tokens: int | None = Field(default=None, gt=0)
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
-    top_k: int | None = Field(default=None, gt=0)
+    top_k: int | None = Field(default=None, ge=0)
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning: _ResponseReasoning | None = None
     text: _ResponseText | None = None
@@ -367,6 +367,13 @@ def decode_chat(
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=_chat_structured_text(request.response_format),
             maximum_output_tokens=maximum,
+            maximum_output_tokens_parameter=(
+                "max_completion_tokens"
+                if request.max_completion_tokens is not None
+                else "max_tokens"
+                if request.max_tokens is not None
+                else None
+            ),
             stop=stop,
             temperature=request.temperature,
             top_p=request.top_p,
@@ -426,6 +433,9 @@ def decode_responses(
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=_responses_structured_text(request.text),
             maximum_output_tokens=request.max_output_tokens,
+            maximum_output_tokens_parameter=(
+                "max_output_tokens" if request.max_output_tokens is not None else None
+            ),
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
@@ -462,24 +472,6 @@ def decode_responses(
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
-
-
-def _ignored_chat_parameters(request: _ChatRequest) -> tuple[str, ...]:
-    """Name accepted Chat controls that the current response contract cannot return."""
-    ignored: list[str] = []
-    if request.logprobs is not None:
-        ignored.append("logprobs")
-    if request.top_logprobs is not None:
-        ignored.append("top_logprobs")
-    return tuple(ignored)
-
-
-def _ignored_responses_parameters(request: _ResponsesRequest) -> tuple[str, ...]:
-    """Name accepted Responses controls that the current response contract cannot return."""
-    ignored: list[str] = []
-    if request.top_logprobs is not None:
-        ignored.append("top_logprobs")
-    return tuple(ignored)
 
 
 def _drop_opencode_cache_control(payload: JsonObject) -> JsonObject:

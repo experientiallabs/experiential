@@ -30,7 +30,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "messages",
                 "max_tokens",
                 "max_completion_tokens",
-                "stop",
                 "temperature",
                 "top_p",
                 "stream",
@@ -38,6 +37,7 @@ CHAT_MANIFEST = CompatibilityManifest(
             )
         ),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
+        _field("stop", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "stop_sequences"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field(
             "parallel_tool_calls",
@@ -51,8 +51,8 @@ CHAT_MANIFEST = CompatibilityManifest(
         ),
         _field("reasoning_effort", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
-        _field("logprobs", CompatibilityDisposition.IGNORED),
-        _field("top_logprobs", CompatibilityDisposition.IGNORED),
+        _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
+        _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
         # gateway-side, never forwarded to the model: `safety_identifier` is the
@@ -110,7 +110,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         _field("text", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "structured_output"),
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
-        _field("top_logprobs", CompatibilityDisposition.IGNORED),
+        _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec), same handling as the
         # Chat surface: accepted and recorded gateway-side, never forwarded.

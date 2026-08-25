@@ -111,6 +111,14 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "supports_logprobs": None,
         "supports_reasoning": False,
         "reasoning_effort": None,
+        "sampling_requires_reasoning_none": False,
+        "chat_max_tokens_field": None,
+        "minimum_temperature": None,
+        "maximum_temperature": None,
+        "minimum_top_p": None,
+        "maximum_top_p": None,
+        "minimum_top_k": None,
+        "maximum_top_k": None,
         "context_window_tokens": None,
         "maximum_output_tokens": None,
         "input_cost_per_million_tokens_usd": None,
@@ -287,3 +295,13 @@ def test_unknown_support_flags_change_the_frozen_capability_identity_digest() ->
         ModelCapabilities(supports_tools=True).identity_sha256()
         != ModelCapabilities().identity_sha256()
     )
+
+
+def test_generation_parameter_contract_rejects_inverted_ranges() -> None:
+    """Catalog metadata cannot publish an empty numeric parameter interval."""
+    with pytest.raises(ValidationError, match="minimum_temperature"):
+        ModelCapabilities(minimum_temperature=1.0, maximum_temperature=0.5)
+    with pytest.raises(ValidationError, match="minimum_top_k"):
+        ModelCapabilities(minimum_top_k=10, maximum_top_k=5)
+    with pytest.raises(ValidationError, match="conditional sampling requires reasoning support"):
+        ModelCapabilities(sampling_requires_reasoning_none=True)
