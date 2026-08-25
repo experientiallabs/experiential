@@ -59,13 +59,10 @@ def _snapshot() -> JsonObject:
                 "host_policy": 0,
                 "other": 0,
             },
-            "proxied_requests": 4,
-            "fallback_engine_unavailable": 1,
             "open_retries": 2,
             "settlement_retries": 1,
             "settlement_give_ups": 0,
             "active_requests": 1,
-            "active_proxies": 0,
             "time_to_first_byte_ms": _histogram([2, 1] + [0] * 13, 120007.5, 4),
             "request_duration_ms": empty,
             "permit_wait_ms": empty,
@@ -130,12 +127,6 @@ exp_gateway_escalated_requests_total{kind="other"} 0
 # HELP exp_gateway_served_requests_total Requests admitted and served natively.
 # TYPE exp_gateway_served_requests_total counter
 exp_gateway_served_requests_total 7
-# HELP exp_gateway_proxied_requests_total Requests relayed to the embedded python engine.
-# TYPE exp_gateway_proxied_requests_total counter
-exp_gateway_proxied_requests_total 4
-# HELP exp_gateway_fallback_engine_unavailable_total Exhausted relays to the embedded engine.
-# TYPE exp_gateway_fallback_engine_unavailable_total counter
-exp_gateway_fallback_engine_unavailable_total 1
 # HELP exp_gateway_open_retries_total Same-deployment retries at the upstream open phase.
 # TYPE exp_gateway_open_retries_total counter
 exp_gateway_open_retries_total 2
@@ -148,9 +139,6 @@ exp_gateway_settlement_give_ups_total 0
 # HELP exp_gateway_active_requests Natively served requests currently in the data plane.
 # TYPE exp_gateway_active_requests gauge
 exp_gateway_active_requests 1
-# HELP exp_gateway_active_proxies Proxied requests currently in the relay.
-# TYPE exp_gateway_active_proxies gauge
-exp_gateway_active_proxies 0
 # HELP exp_gateway_time_to_first_byte_ms Milliseconds from admission to the first upstream byte.
 # TYPE exp_gateway_time_to_first_byte_ms histogram
 exp_gateway_time_to_first_byte_ms_bucket{le="1"} 2

@@ -25,10 +25,9 @@ use crate::encode_messages::{anthropic_error_body, completed_messages_body, Mess
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::{classify_escalation, METRICS};
-use crate::proxy::{no_fallback_escalation_error, proxy_to_python};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
-    bearer_key, complete_visible_refusal, json_response, read_body, send_bounded,
+    bearer_key, complete_visible_refusal, escalation_error, json_response, read_body, send_bounded,
     settle_stream_end, sse_body_response,
 };
 use crate::server::AppState;
@@ -133,16 +132,9 @@ pub(crate) async fn messages(
     };
     if let Some(reason) = admission_value.get("escalate") {
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-        // No ledger row exists; the python engine owns this request end to end.
-        return proxy_to_python(
-            &state,
-            reqwest::Method::POST,
-            "/v1/messages",
-            &headers,
-            body,
-            no_fallback_escalation_error(),
-        )
-        .await;
+        // No ledger row exists; startup validation guarantees native
+        // servability, so an escalation disposition fails closed here.
+        return messages_error_response(&escalation_error());
     }
     let admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,

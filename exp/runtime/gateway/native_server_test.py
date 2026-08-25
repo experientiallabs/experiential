@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from types import SimpleNamespace
 from typing import cast
 from unittest import mock
@@ -17,42 +16,21 @@ from exp.runtime.gateway.native_server import (
 )
 
 
-class _FallbackServer:
-    """Small Uvicorn stand-in that exposes startup and observes shutdown."""
-
-    last: _FallbackServer | None = None
-
-    def __init__(self, _config: object) -> None:
-        """Record the latest server and initialize lifecycle flags."""
-        self.started = False
-        self.should_exit = False
-        _FallbackServer.last = self
-
-    def run(self, *, sockets: list[object]) -> None:
-        """Mark started and remain alive until the host requests shutdown."""
-        assert len(sockets) == 1
-        self.started = True
-        while not self.should_exit:
-            time.sleep(0.001)
-
-
-def test_host_passes_public_and_fallback_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Rust owns the public listener while Python receives an allocated loopback port."""
+def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The host serializes the exact serve configuration for the extension."""
     captured: dict[str, object] = {}
 
-    def serve(control_plane: object, config_json: str) -> None:
+    def serve(control_plane: object, config_json: str, shutdown: object) -> None:
         """Capture the extension boundary call."""
         captured["control_plane"] = control_plane
         captured["config"] = json.loads(config_json)
+        captured["shutdown"] = shutdown
 
     native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
-    monkeypatch.setattr(native_server.uvicorn, "Server", _FallbackServer)
     control = SimpleNamespace(request_timeout_seconds=37.0)
-    fallback_app = mock.Mock()
 
     serve_native_gateway(
-        fallback_app,
         control,
         host="0.0.0.0",
         port=8080,
@@ -62,6 +40,7 @@ def test_host_passes_public_and_fallback_configuration(monkeypatch: pytest.Monke
     )
 
     assert captured["control_plane"] is control
+    assert captured["shutdown"] is None
     config = cast("dict[str, object]", captured["config"])
     assert config["host"] == "0.0.0.0"
     assert config["port"] == 8080
@@ -69,71 +48,71 @@ def test_host_passes_public_and_fallback_configuration(monkeypatch: pytest.Monke
     assert config["request_timeout_seconds"] == 37.0
     assert config["graceful_timeout_seconds"] == 45.0
     assert config["native_usage_enabled"] is False
-    assert isinstance(config["fallback_port"], int)
-    assert _FallbackServer.last is not None and _FallbackServer.last.should_exit
 
 
-def test_rust_only_host_omits_the_fallback_engine(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without a fallback app, no python server starts and no port is passed."""
+def test_host_forwards_an_embedder_owned_shutdown_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provided stop handle reaches the extension beside the configuration."""
     captured: dict[str, object] = {}
 
-    def serve(control_plane: object, config_json: str) -> None:
+    def serve(control_plane: object, config_json: str, shutdown: object) -> None:
         """Capture the extension boundary call."""
-        captured["control_plane"] = control_plane
-        captured["config"] = json.loads(config_json)
+        del control_plane, config_json
+        captured["shutdown"] = shutdown
 
     native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
-    server_factory = mock.Mock(side_effect=AssertionError("rust-only must not start uvicorn"))
-    monkeypatch.setattr(native_server.uvicorn, "Server", server_factory)
+    handle = object()
 
     serve_native_gateway(
-        None,
         SimpleNamespace(request_timeout_seconds=12.0),
         host="127.0.0.1",
         port=8080,
-        max_active_requests=5,
-        graceful_timeout_seconds=3.0,
+        shutdown=cast("native_server.ShutdownHandle", handle),
     )
 
-    server_factory.assert_not_called()
-    config = cast("dict[str, object]", captured["config"])
-    assert "fallback_port" not in config
-    assert config["request_timeout_seconds"] == 12.0
-    assert config["native_usage_enabled"] is True
+    assert captured["shutdown"] is handle
 
 
-def test_host_maps_native_runtime_failures_and_stops_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A native bind or runtime failure closes the embedded Python server."""
+def test_host_maps_native_runtime_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A native bind or runtime failure surfaces as the typed host error."""
     native = SimpleNamespace(serve=mock.Mock(side_effect=RuntimeError("bind failed")))
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
-    monkeypatch.setattr(native_server.uvicorn, "Server", _FallbackServer)
 
     with pytest.raises(NativeGatewayServerError, match="bind failed"):
         serve_native_gateway(
-            mock.Mock(),
             SimpleNamespace(request_timeout_seconds=10.0),
             host="127.0.0.1",
             port=8080,
         )
-    assert _FallbackServer.last is not None and _FallbackServer.last.should_exit
 
 
 def test_host_treats_native_keyboard_interrupt_as_clean_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A native SIGINT drain returns normally and stops the fallback server."""
+    """A native SIGINT drain returns normally."""
     native = SimpleNamespace(serve=mock.Mock(side_effect=KeyboardInterrupt))
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
-    monkeypatch.setattr(native_server.uvicorn, "Server", _FallbackServer)
 
     serve_native_gateway(
-        mock.Mock(),
         SimpleNamespace(request_timeout_seconds=10.0),
         host="127.0.0.1",
         port=8080,
     )
 
-    assert _FallbackServer.last is not None and _FallbackServer.last.should_exit
+
+def test_host_requires_the_extension(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing extension raises the typed host error with the module name."""
+
+    def missing(_name: str) -> object:
+        """Simulate an absent compiled extension."""
+        raise ModuleNotFoundError("exp_gateway_native")
+
+    monkeypatch.setattr(native_server.importlib, "import_module", missing)
+    with pytest.raises(NativeGatewayServerError, match="not installed"):
+        serve_native_gateway(
+            SimpleNamespace(request_timeout_seconds=10.0),
+            host="127.0.0.1",
+            port=8080,
+        )

@@ -5,16 +5,17 @@ These tests exercise three reviewed-but-untested behaviors of the compiled
 
 1. A client disconnect mid non-streaming request settles the admitted attempt
    through the ``AttemptGuard`` drop backstop.
-2. A dead python fallback engine degrades only escalated routes; the native
-   chat path and readiness stay healthy.
+2. An escalated admission fails closed as the shared internal error while
+   the native chat path and readiness stay healthy.
 3. A connected client that stops reading a stream cannot pin the gateway past
    the request deadline; ``send_bounded`` settles the attempt.
 
 ``exp_gateway_native.serve`` blocks its caller and stops only on SIGINT or
 SIGTERM, so one shared serving subprocess (a small generated driver that
 composes ``NativeControlPlane`` over a seeded root) hosts every scenario. Its
-host policy deliberately escalates Responses requests so the dead-fallback
-case exercises the proxy boundary even though Responses is natively supported.
+host policy deliberately escalates Responses requests and one alias so the
+fail-closed escalation boundary is exercised even though every route shape is
+natively supported.
 Each test observes settlement deltas through the content-free ``/usage.json``
 report, and the subprocess is stopped with SIGTERM at module teardown.
 """
@@ -82,7 +83,7 @@ _DRIVER_SOURCE = textwrap.dedent(
         Every granted provider now has a native dialect and every route
         shape resolves natively, so this hosted policy is the only
         construction-independent escalation lever left for exercising the
-        fallback boundary.
+        fail-closed escalation boundary.
         """
         if request.surface == GatewayApiSurface.RESPONSES:
             return False
@@ -123,7 +124,6 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "port": port,
                             "max_active_requests": 8,
                             "request_timeout_seconds": config["request_timeout_seconds"],
-                            "fallback_port": config["fallback_port"],
                             "graceful_timeout_seconds": 2.0,
                         }
                     ),
@@ -237,13 +237,6 @@ class _ServingEngine:
         return f"http://{_HOST}:{self.port}"
 
 
-def _closed_port() -> int:
-    """Return an ephemeral port with no listener behind it."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind((_HOST, 0))
-        return probe.getsockname()[1]
-
-
 def _chat_payload(prompt: str, *, stream: bool = False) -> bytes:
     """Return one raw Chat Completions body targeting the seeded alias."""
     payload: JsonObject = {
@@ -296,9 +289,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     """Serve one shared native engine subprocess over a seeded root.
 
     The gateway root holds a single direct alias against a local SSE mock
-    upstream, and the serve config points ``fallback_port`` at a closed
-    ephemeral port so the dead-fallback scenario needs no extra process. The
-    subprocess is stopped with SIGTERM and must exit cleanly.
+    upstream. The subprocess is stopped with SIGTERM and must exit cleanly.
 
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
@@ -318,7 +309,6 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         {
             "root": str(root),
             "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
-            "fallback_port": _closed_port(),
         }
     )
     stderr_log = root / "driver-stderr.log"
@@ -412,19 +402,16 @@ def test_client_disconnect_mid_nonstreaming_request_settles_cancelled(
     assert settled, "disconnected attempt was not settled by the drop backstop"
 
 
-def test_dead_fallback_engine_degrades_only_escalated_routes(
+def test_escalated_routes_fail_closed_without_hurting_chat(
     engine: _ServingEngine,
 ) -> None:
-    """A closed fallback port fails escalated routes without hurting chat.
+    """An escalated admission fails closed while native chat keeps serving.
 
-    ``/health/ready`` intentionally reports only the native control plane's
-    health and does not cover the fallback host: the CLI owns the embedded
-    python engine's thread and its liveness, so a dead fallback degrades the
-    escalated surfaces to an explicit 502 while readiness stays green. The
-    probe uses the ``escalated`` alias, which the driver's host policy
-    rejects by name: every route shape now resolves natively, so a hosted
-    policy is the only construction-independent way left to force
-    escalation for a single-deployment chat surface.
+    The probe uses the ``escalated`` alias, which the driver's host policy
+    rejects by name: every route shape resolves natively, so a hosted policy
+    is the only construction-independent way left to force escalation for a
+    single-deployment chat surface. With no python engine anywhere the
+    escalation answers the shared internal error while readiness stays green.
     """
     headers = {"authorization": f"Bearer {engine.raw_key}"}
     escalated = httpx.post(
@@ -433,8 +420,8 @@ def test_dead_fallback_engine_degrades_only_escalated_routes(
         json={"model": "escalated", "messages": [{"role": "user", "content": "hi"}]},
         timeout=10.0,
     )
-    assert escalated.status_code == 502
-    assert escalated.json()["error"]["code"] == "fallback_engine_unavailable"
+    assert escalated.status_code == 500
+    assert escalated.json()["error"]["code"] == "internal_error"
 
     chat = httpx.post(
         f"{engine.base}/v1/chat/completions",

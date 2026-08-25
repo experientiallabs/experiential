@@ -448,7 +448,6 @@ def _run_rust_gateway(
 
             try:
                 serve_native_gateway(
-                    None,
                     control_plane,
                     host=_LOOPBACK_HOST,
                     port=port,

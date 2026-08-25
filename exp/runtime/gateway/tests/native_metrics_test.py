@@ -1,13 +1,12 @@
 """End-to-end native-engine observability over real sockets and a mock provider.
 
 The native engine serves in a child process (its shutdown path is the real
-SIGTERM drain), a loopback HTTP server plays the provider, and the fallback
-port is deliberately dead. Plain and replay-keyed chat is served natively; an
-alias on a provider without a native dialect escalates, and its relay against
-the dead fallback also exercises the fallback-unavailable signal. The test
-asserts the ``/metrics.json`` snapshot moved for served, escalated, and
-proxied traffic, that the same snapshot serves at ``/metrics`` in the
-Prometheus text format, and that both bodies stay content-free.
+SIGTERM drain) and a loopback HTTP server plays the provider. Plain and
+replay-keyed chat is served natively; a host-policy-rejected alias escalates
+and fails closed as the shared internal error. The test asserts the
+``/metrics.json`` snapshot moved for served and escalated traffic, that the
+same snapshot serves at ``/metrics`` in the Prometheus text format, and that
+both bodies stay content-free.
 """
 
 from __future__ import annotations
@@ -66,7 +65,6 @@ config = json.dumps(
     {
         "host": "127.0.0.1",
         "port": int(sys.argv[2]),
-        "fallback_port": int(sys.argv[3]),
         "request_timeout_seconds": 30.0,
         "graceful_timeout_seconds": 1.0,
     }
@@ -149,11 +147,10 @@ def _wait_live(port: int, child: subprocess.Popen[bytes]) -> None:
 def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
     tmp_path: Path,
 ) -> None:
-    """Served, replay-keyed, escalated, and fallback-failed traffic all land."""
+    """Served, replay-keyed, and escalated traffic all land in the snapshot."""
     pytest.importorskip("exp_gateway_native")
     provider_port = _unused_port()
     gateway_port = _unused_port()
-    dead_fallback_port = _unused_port()
     provider = ThreadingHTTPServer(("127.0.0.1", provider_port), _LoopbackProvider)
     provider_thread = Thread(target=provider.serve_forever, daemon=True)
     provider_thread.start()
@@ -169,7 +166,6 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
             _CHILD_SOURCE,
             str(tmp_path),
             str(gateway_port),
-            str(dead_fallback_port),
         ],
         env=dict(os.environ),
     )
@@ -194,16 +190,16 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
         )
         assert keyed.status_code == 200
         # The child's host policy rejects this alias by name, so it always
-        # escalates; the dead fallback makes the relay fail with the only
-        # signal a dead embedded engine produces.
+        # escalates; with no python engine anywhere the escalation fails
+        # closed as the shared internal error.
         escalated = httpx.post(
             f"{base}/v1/chat/completions",
             headers=headers,
             json={"model": "gem", "messages": [{"role": "user", "content": prompt_canary}]},
             timeout=10,
         )
-        assert escalated.status_code == 502
-        assert escalated.json()["error"]["code"] == "fallback_engine_unavailable"
+        assert escalated.status_code == 500
+        assert escalated.json()["error"]["code"] == "internal_error"
 
         snapshot = httpx.get(f"{base}/metrics.json", timeout=10)
         assert snapshot.status_code == 200
@@ -217,10 +213,7 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
             "cancelled": 0,
         }
         assert data_plane["escalated_requests"]["host_policy"] == 1
-        assert data_plane["proxied_requests"] == 1
-        assert data_plane["fallback_engine_unavailable"] == 1
         assert data_plane["active_requests"] == 0
-        assert data_plane["active_proxies"] == 0
         assert data_plane["time_to_first_byte_ms"]["count"] == 3
         assert data_plane["request_duration_ms"]["count"] == 3
         assert data_plane["permit_wait_ms"]["count"] == 3
@@ -245,7 +238,6 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
         assert 'exp_gateway_requests_total{outcome="completed"} 3' in text
         assert "exp_gateway_served_requests_total 3" in text
         assert 'exp_gateway_escalated_requests_total{kind="host_policy"} 1' in text
-        assert "exp_gateway_fallback_engine_unavailable_total 1" in text
         assert 'exp_gateway_time_to_first_byte_ms_bucket{le="+Inf"} 3' in text
         assert "exp_gateway_accounting_healthy 1" in text
         for forbidden in ("coding", "gem", raw_key, prompt_canary, "provider-secret-canary"):

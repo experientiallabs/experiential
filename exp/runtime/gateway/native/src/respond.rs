@@ -19,14 +19,39 @@ use crate::relay::remaining;
 use crate::replay::{CachedResponse, OwnerLease};
 use crate::settlement::AttemptGuard;
 
-/// Largest accepted request body on every native-served or proxied route.
-/// Bounded so one client cannot hold unbounded gateway memory; far above any
-/// real chat history (the python engine imposes no explicit cap).
+/// Largest accepted request body on every native-served route. Bounded so
+/// one client cannot hold unbounded gateway memory; far above any real chat
+/// history.
 pub(crate) const MAXIMUM_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Largest SSE capture retained for keyed-stream replay, matching the python
-/// engine's `_STREAM_REPLAY_CAPTURE_BYTES`.
+/// Largest SSE capture retained for keyed-stream replay.
 pub(crate) const STREAM_REPLAY_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The native 404 for a route the gateway does not serve, in the OpenAI
+/// error envelope.
+pub(crate) fn unknown_route_error() -> PublicError {
+    PublicError::new(
+        404,
+        "unknown_route",
+        "Unknown route. The gateway serves /v1/models, /v1/chat/completions, \
+         /v1/responses, /v1/messages, /v1/messages/count_tokens, /health/live, \
+         /health/ready, /metrics, /metrics.json, /usage, and /usage.json.",
+        "invalid_request_error",
+    )
+}
+
+/// The answer to an escalation disposition: startup validation guarantees
+/// every granted alias is natively servable, so reaching this is an internal
+/// error rather than a degraded route.
+pub(crate) fn escalation_error() -> PublicError {
+    PublicError::new(
+        500,
+        "internal_error",
+        "The gateway cannot serve this request natively. Ask the gateway \
+         operator to inspect the server logs.",
+        "api_error",
+    )
+}
 
 pub(crate) fn error_response(error: &PublicError) -> Response {
     let mut builder = Response::builder()

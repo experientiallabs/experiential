@@ -127,13 +127,10 @@ pub struct Metrics {
     escalated_provider_dialect: AtomicU64,
     escalated_host_policy: AtomicU64,
     escalated_other: AtomicU64,
-    proxied_requests: AtomicU64,
-    fallback_engine_unavailable: AtomicU64,
     open_retries: AtomicU64,
     settlement_retries: AtomicU64,
     settlement_give_ups: AtomicU64,
     active_requests: AtomicU64,
-    active_proxies: AtomicU64,
     pub time_to_first_byte_ms: Histogram,
     pub request_duration_ms: Histogram,
     pub permit_wait_ms: Histogram,
@@ -157,13 +154,10 @@ impl Metrics {
             escalated_provider_dialect: AtomicU64::new(0),
             escalated_host_policy: AtomicU64::new(0),
             escalated_other: AtomicU64::new(0),
-            proxied_requests: AtomicU64::new(0),
-            fallback_engine_unavailable: AtomicU64::new(0),
             open_retries: AtomicU64::new(0),
             settlement_retries: AtomicU64::new(0),
             settlement_give_ups: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
-            active_proxies: AtomicU64::new(0),
             time_to_first_byte_ms: Histogram::new(),
             request_duration_ms: Histogram::new(),
             permit_wait_ms: Histogram::new(),
@@ -203,18 +197,6 @@ impl Metrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count one request relayed to the embedded python engine.
-    pub fn record_proxied(&self) {
-        self.proxied_requests.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Count one exhausted attempt to reach the embedded python engine. This
-    /// is also the only signal a dead embedded engine produces.
-    pub fn record_fallback_unavailable(&self) {
-        self.fallback_engine_unavailable
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Count one same-deployment retry at the upstream open phase.
     pub fn record_open_retry(&self) {
         self.open_retries.fetch_add(1, Ordering::Relaxed);
@@ -240,16 +222,6 @@ impl Metrics {
         self.active_requests.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Track one proxied request entering the relay.
-    pub fn enter_proxy(&self) {
-        self.active_proxies.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Track one proxied request leaving the relay.
-    pub fn exit_proxy(&self) {
-        self.active_proxies.fetch_sub(1, Ordering::Relaxed);
-    }
-
     /// Snapshot the whole registry as one JSON object.
     pub fn snapshot(&self) -> Value {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
@@ -268,13 +240,10 @@ impl Metrics {
                 "host_policy": load(&self.escalated_host_policy),
                 "other": load(&self.escalated_other),
             },
-            "proxied_requests": load(&self.proxied_requests),
-            "fallback_engine_unavailable": load(&self.fallback_engine_unavailable),
             "open_retries": load(&self.open_retries),
             "settlement_retries": load(&self.settlement_retries),
             "settlement_give_ups": load(&self.settlement_give_ups),
             "active_requests": load(&self.active_requests),
-            "active_proxies": load(&self.active_proxies),
             "time_to_first_byte_ms": self.time_to_first_byte_ms.snapshot(),
             "request_duration_ms": self.request_duration_ms.snapshot(),
             "permit_wait_ms": self.permit_wait_ms.snapshot(),
@@ -303,13 +272,10 @@ mod tests {
         metrics.record_outcome("failed", false);
         metrics.record_outcome("failed", true);
         metrics.record_escalation(EscalationKind::ProjectAlias);
-        metrics.record_proxied();
-        metrics.record_fallback_unavailable();
         metrics.record_open_retry();
         metrics.record_settlement_retry();
         metrics.record_settlement_give_up();
         metrics.enter_request();
-        metrics.enter_proxy();
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot["served_requests"], 2);
         assert_eq!(snapshot["requests"]["completed"], 1);
@@ -318,18 +284,13 @@ mod tests {
         assert_eq!(snapshot["requests"]["cancelled"], 1);
         assert_eq!(snapshot["escalated_requests"]["project_alias"], 1);
         assert_eq!(snapshot["escalated_requests"]["other"], 0);
-        assert_eq!(snapshot["proxied_requests"], 1);
-        assert_eq!(snapshot["fallback_engine_unavailable"], 1);
         assert_eq!(snapshot["open_retries"], 1);
         assert_eq!(snapshot["settlement_retries"], 1);
         assert_eq!(snapshot["settlement_give_ups"], 1);
         assert_eq!(snapshot["active_requests"], 1);
-        assert_eq!(snapshot["active_proxies"], 1);
         metrics.exit_request();
-        metrics.exit_proxy();
         let drained = metrics.snapshot();
         assert_eq!(drained["active_requests"], 0);
-        assert_eq!(drained["active_proxies"], 0);
     }
 
     #[test]
@@ -397,13 +358,10 @@ mod tests {
                 "requests",
                 "served_requests",
                 "escalated_requests",
-                "proxied_requests",
-                "fallback_engine_unavailable",
                 "open_retries",
                 "settlement_retries",
                 "settlement_give_ups",
                 "active_requests",
-                "active_proxies",
                 "time_to_first_byte_ms",
                 "request_duration_ms",
                 "permit_wait_ms",

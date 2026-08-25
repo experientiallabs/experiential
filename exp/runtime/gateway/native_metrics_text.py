@@ -22,11 +22,6 @@ _PREFIX = "exp_gateway_"
 
 _DATA_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
     ("served_requests", "Requests admitted and served natively."),
-    ("proxied_requests", "Requests relayed to the embedded python engine."),
-    (
-        "fallback_engine_unavailable",
-        "Exhausted relays to the embedded engine.",
-    ),
     ("open_retries", "Same-deployment retries at the upstream open phase."),
     ("settlement_retries", "Settlement deliveries retried after a failed write."),
     ("settlement_give_ups", "Settlements whose bounded retries were all exhausted."),
@@ -34,7 +29,6 @@ _DATA_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
 
 _DATA_PLANE_GAUGES: tuple[tuple[str, str], ...] = (
     ("active_requests", "Natively served requests currently in the data plane."),
-    ("active_proxies", "Proxied requests currently in the relay."),
 )
 
 _HISTOGRAMS: tuple[tuple[str, str], ...] = (

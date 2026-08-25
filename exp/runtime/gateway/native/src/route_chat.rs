@@ -22,13 +22,12 @@ use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::{classify_escalation, METRICS};
-use crate::proxy::{no_fallback_escalation_error, proxy_to_python};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, capture_frame, complete_visible_refusal, error_response,
-    finish_stream_terminal, json_response, latin1_header, read_body, send_bounded,
-    settle_stream_end, sse_body_response,
+    escalation_error, finish_stream_terminal, json_response, latin1_header, read_body,
+    send_bounded, settle_stream_end, sse_body_response,
 };
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
@@ -88,17 +87,9 @@ pub(crate) async fn chat(
         };
         if let Some(reason) = scope_value.get("escalate") {
             METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-            // No replay claim exists; the python engine owns this request
-            // end to end, including its own replay store.
-            return proxy_to_python(
-                &state,
-                reqwest::Method::POST,
-                "/v1/chat/completions",
-                &headers,
-                body,
-                no_fallback_escalation_error(),
-            )
-            .await;
+            // No replay claim exists; startup validation guarantees native
+            // servability, so an escalation disposition fails closed here.
+            return error_response(&escalation_error());
         }
         let key: ReplayKey = match serde_json::from_value(scope_value) {
             Ok(key) => key,
@@ -142,19 +133,12 @@ pub(crate) async fn chat(
     };
     if let Some(reason) = admission_value.get("escalate") {
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-        // No ledger row exists; the python engine owns this request end to end.
+        // No ledger row exists; startup validation guarantees native
+        // servability, so an escalation disposition fails closed here.
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
-        return proxy_to_python(
-            &state,
-            reqwest::Method::POST,
-            "/v1/chat/completions",
-            &headers,
-            body,
-            no_fallback_escalation_error(),
-        )
-        .await;
+        return error_response(&escalation_error());
     }
     let admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,

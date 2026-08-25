@@ -2,7 +2,7 @@
 //! shared application state, router construction with graceful shutdown, and
 //! the small control-plane-backed routes (health, models, usage, metrics).
 //! The chat, Responses, and Messages surfaces live in their `route_*`
-//! modules; proxying to the python fallback engine lives in `proxy`.
+//! modules; unknown routes answer the native 404 in the OpenAI envelope.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -22,9 +22,8 @@ use tokio::sync::Semaphore;
 use crate::bridge::Bridge;
 use crate::encode::compact_json;
 use crate::errors::PublicError;
-use crate::proxy::proxy_fallback;
 use crate::replay::ReplayStore;
-use crate::respond::{bearer_key, error_response, json_response};
+use crate::respond::{bearer_key, error_response, json_response, unknown_route_error};
 use crate::route_chat::chat;
 use crate::route_messages::{messages, messages_count_tokens};
 use crate::route_responses::responses;
@@ -40,15 +39,6 @@ pub struct ServeConfig {
     pub request_timeout_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
-    /// Loopback port of the embedded python engine serving escalated
-    /// requests. Absent in rust-only mode: startup validation guarantees
-    /// every granted alias is natively servable, unknown routes answer a
-    /// native 404, and an escalation disposition is an internal error. The
-    /// optional fallback exists for hosted callers still migrating off the
-    /// python data plane and is scheduled for removal once the native engine
-    /// has soaked in production.
-    #[serde(default)]
-    pub fallback_port: Option<u16>,
     #[serde(default = "default_native_usage_enabled")]
     pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
@@ -82,40 +72,36 @@ pub(crate) struct AppState {
     pub(crate) http: reqwest::Client,
     pub(crate) permits: Arc<Semaphore>,
     pub(crate) request_timeout: Duration,
-    /// Base URL of the embedded python fallback engine, when one exists.
-    pub(crate) fallback_base: Option<String>,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pub(crate) pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
     /// allocator once per burst when this advances and the plane is idle.
     pub(crate) handled_requests: Arc<AtomicUsize>,
-    /// Proxied requests still relaying to or from the python engine. Proxy
-    /// traffic holds no active-request permit, so the reclaim loop needs
-    /// this separate in-flight signal to avoid trimming under proxy load.
-    pub(crate) active_proxies: Arc<AtomicUsize>,
     /// Bounded in-process keyed-response replay, the native mirror of the
     /// python engine's `BoundedReplayStore`.
     pub(crate) replays: Arc<ReplayStore>,
 }
 
 /// Run the data plane until shutdown; returns after graceful stop.
-pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String> {
+///
+/// `shutdown` optionally carries an embedder-owned stop signal beside the
+/// process signals, so a host can stop the plane without sending SIGINT.
+pub async fn run(
+    bridge: Arc<Bridge>,
+    config: ServeConfig,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), String> {
     let http = crate::upstream::build_client()?;
     let pending_settlements = Arc::new(AtomicUsize::new(0));
     let max_active_requests = config.max_active_requests.max(1);
     let handled_requests = Arc::new(AtomicUsize::new(0));
-    let active_proxies = Arc::new(AtomicUsize::new(0));
     let state = AppState {
         bridge,
         http,
         permits: Arc::new(Semaphore::new(max_active_requests)),
         request_timeout: Duration::from_secs_f64(config.request_timeout_seconds),
-        fallback_base: config
-            .fallback_port
-            .map(|port| format!("http://127.0.0.1:{port}")),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
-        active_proxies: active_proxies.clone(),
         replays: Arc::new(ReplayStore::new()),
     };
     tokio::spawn(crate::memory::reclaim_when_idle(
@@ -123,7 +109,6 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         max_active_requests,
         handled_requests,
         pending_settlements.clone(),
-        active_proxies,
     ));
     let app = Router::new()
         .route("/v1/models", get(models))
@@ -137,12 +122,12 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         .route("/metrics.json", get(metrics_json))
         .route("/metrics", get(metrics_text));
     let app = if config.native_usage_enabled {
-        app.route("/usage.json", get(usage_json).fallback(proxy_fallback))
-            .route("/usage", get(usage_page).fallback(proxy_fallback))
+        app.route("/usage.json", get(usage_json))
+            .route("/usage", get(usage_page))
     } else {
         app
     };
-    let app = app.fallback(proxy_fallback).with_state(state);
+    let app = app.fallback(unknown_route).with_state(state);
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
         .map_err(|error| format!("failed to bind {}:{}: {error}", config.host, config.port))?
@@ -151,13 +136,14 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
             let _ = stream.set_nodelay(true);
         });
     let graceful = Duration::from_secs_f64(config.graceful_timeout_seconds.max(0.1));
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-    // A signal starts the graceful drain above; the arm below bounds it, so a
-    // stuck stream cannot hold shutdown past the configured timeout.
+    let server =
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_requested(shutdown.clone()));
+    // A stop request starts the graceful drain above; the arm below bounds
+    // it, so a stuck stream cannot hold shutdown past the configured timeout.
     let outcome = tokio::select! {
         outcome = server => outcome.map_err(|error| format!("gateway server failed: {error}")),
         _ = async {
-            shutdown_signal().await;
+            shutdown_requested(shutdown).await;
             tokio::time::sleep(graceful).await;
         } => Ok(()),
     };
@@ -168,6 +154,28 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     outcome
+}
+
+/// Resolve on SIGINT, SIGTERM, or an embedder-owned stop request.
+async fn shutdown_requested(receiver: Option<tokio::sync::watch::Receiver<bool>>) {
+    match receiver {
+        Some(mut receiver) => {
+            let requested = async move {
+                while !*receiver.borrow() {
+                    if receiver.changed().await.is_err() {
+                        // A dropped sender never requests a stop; wait on the
+                        // process signals alone.
+                        std::future::pending::<()>().await;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = shutdown_signal() => {}
+                _ = requested => {}
+            }
+        }
+        None => shutdown_signal().await,
+    }
 }
 
 /// Resolve on SIGINT or SIGTERM, the process-manager stop signals.
@@ -191,6 +199,12 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// Answer any route the native plane does not own with the shared 404.
+async fn unknown_route(State(state): State<AppState>) -> Response {
+    state.handled_requests.fetch_add(1, Ordering::Relaxed);
+    error_response(&unknown_route_error())
 }
 
 async fn health_live() -> Response {

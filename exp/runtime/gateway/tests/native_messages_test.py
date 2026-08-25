@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import textwrap
@@ -86,7 +85,6 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "port": port,
                             "max_active_requests": 8,
                             "request_timeout_seconds": config["request_timeout_seconds"],
-                            "fallback_port": config["fallback_port"],
                             "graceful_timeout_seconds": 2.0,
                         }
                     ),
@@ -221,13 +219,6 @@ class _ServingEngine:
         return f"http://{_HOST}:{self.port}"
 
 
-def _closed_port() -> int:
-    """Return an ephemeral port with no listener behind it."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind((_HOST, 0))
-        return probe.getsockname()[1]
-
-
 def _messages_body(prompt: str, *, stream: bool = False, tools: bool = False) -> JsonObject:
     """Return one Anthropic Messages body targeting the seeded alias."""
     payload: JsonObject = {
@@ -266,7 +257,6 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         {
             "root": str(root),
             "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
-            "fallback_port": _closed_port(),
         }
     )
     stderr_log = root / "driver-stderr.log"

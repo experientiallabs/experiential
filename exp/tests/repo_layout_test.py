@@ -178,4 +178,6 @@ def test_native_crate_versions_stay_in_lockstep() -> None:
     floor = next(
         requirement for requirement in dependencies if requirement.startswith("exp-gateway-native")
     )
-    assert floor == f"exp-gateway-native>={wheel_version},<0.2"
+    major, minor, _patch = wheel_version.split(".")
+    ceiling = f"{major}.{int(minor) + 1}"
+    assert floor == f"exp-gateway-native>={wheel_version},<{ceiling}"

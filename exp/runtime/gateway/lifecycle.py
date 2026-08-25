@@ -425,8 +425,7 @@ class LocalGatewayComponents:
         """Return whether the shared group-commit writer can still land writes.
 
         The native bridge's readiness callback reads this composition health
-        surface; per-settlement durable losses latch separately inside the
-        bridge's own accounting registry.
+        surface; per-settlement losses latch in the bridge's own registry.
         """
         return not self.write_ledger.closed
 

@@ -100,13 +100,12 @@ components = load_gateway_components(
 )
 control = _RewritingControlPlane(
     NativeControlPlane(components),
-    f"http://127.0.0.1:{sys.argv[4]}",
+    f"http://127.0.0.1:{sys.argv[3]}",
 )
 config = json.dumps(
     {
         "host": "127.0.0.1",
         "port": int(sys.argv[2]),
-        "fallback_port": int(sys.argv[3]),
         "request_timeout_seconds": 30.0,
         "graceful_timeout_seconds": 1.0,
     }
@@ -216,7 +215,6 @@ def test_open_retry_signs_every_physical_attempt(tmp_path: Path) -> None:
     pytest.importorskip("exp_gateway_native")
     upstream_port = _unused_port()
     gateway_port = _unused_port()
-    dead_fallback_port = _unused_port()
     _FlakyBedrockUpstream.seen_authorizations = []
     upstream = ThreadingHTTPServer(("127.0.0.1", upstream_port), _FlakyBedrockUpstream)
     upstream_thread = Thread(target=upstream.serve_forever, daemon=True)
@@ -230,7 +228,6 @@ def test_open_retry_signs_every_physical_attempt(tmp_path: Path) -> None:
             _CHILD_SOURCE,
             str(tmp_path),
             str(gateway_port),
-            str(dead_fallback_port),
             str(upstream_port),
         ],
         env=dict(os.environ),

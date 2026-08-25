@@ -17,7 +17,6 @@ mod eventstream;
 mod guardrails;
 mod memory;
 mod metrics;
-mod proxy;
 mod relay;
 mod replay;
 mod respond;
@@ -30,7 +29,7 @@ mod sse;
 mod upstream;
 mod waterfall;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -38,7 +37,49 @@ use pyo3::prelude::*;
 use crate::bridge::Bridge;
 use crate::server::ServeConfig;
 
-/// Serve the gateway data plane until shutdown (SIGINT or SIGTERM).
+/// Embedder-owned stop signal for one `serve` call.
+///
+/// Created with `shutdown_handle()` and passed to `serve`, whose server then
+/// stops gracefully on either a process signal or `request_shutdown`. This
+/// lets a host that runs the data plane on a background thread stop it
+/// programmatically, since threads cannot receive SIGINT.
+#[pyclass]
+pub struct ShutdownHandle {
+    sender: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    receiver: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
+}
+
+#[pymethods]
+impl ShutdownHandle {
+    /// Request one graceful stop; later calls are no-ops.
+    fn request_shutdown(&self) {
+        if let Ok(guard) = self.sender.lock() {
+            if let Some(sender) = guard.as_ref() {
+                let _ = sender.send(true);
+            }
+        }
+    }
+}
+
+impl ShutdownHandle {
+    /// Take the receiver half exactly once for the serving runtime.
+    fn take_receiver(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.receiver.lock().ok().and_then(|mut guard| guard.take())
+    }
+}
+
+/// Create one stop handle to pass to `serve`.
+#[pyfunction]
+fn shutdown_handle() -> ShutdownHandle {
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    ShutdownHandle {
+        sender: Mutex::new(Some(sender)),
+        receiver: Mutex::new(Some(receiver)),
+    }
+}
+
+/// Serve the gateway data plane until shutdown (SIGINT, SIGTERM, or an
+/// optional embedder-owned `ShutdownHandle`).
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
 /// `start_attempt`, `sign_dispatch`, `settle`, `abandon`, `remember`,
@@ -48,16 +89,23 @@ use crate::server::ServeConfig;
 /// concurrency bounds. `enforce_output` is called only when admission sets
 /// `output_guardrail`.
 #[pyfunction]
-fn serve(py: Python<'_>, control_plane: Py<PyAny>, config_json: &str) -> PyResult<()> {
+#[pyo3(signature = (control_plane, config_json, shutdown=None))]
+fn serve(
+    py: Python<'_>,
+    control_plane: Py<PyAny>,
+    config_json: &str,
+    shutdown: Option<&ShutdownHandle>,
+) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
     let bridge = Arc::new(Bridge::new(control_plane, config.callback_permits));
+    let stop = shutdown.and_then(ShutdownHandle::take_receiver);
     let outcome = py.detach(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| format!("tokio runtime construction failed: {error}"))?;
-        runtime.block_on(server::run(bridge, config))
+        runtime.block_on(server::run(bridge, config, stop))
     });
     outcome.map_err(PyRuntimeError::new_err)
 }
@@ -335,6 +383,8 @@ fn error_payload(error: &errors::PublicError) -> String {
 /// The exp_gateway_native extension module.
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<ShutdownHandle>()?;
+    module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;
     module.add_function(wrap_pyfunction!(encode_chat_fixture, module)?)?;
