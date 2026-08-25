@@ -359,7 +359,7 @@ class RuntimeModelCatalog:
             raise ModelConnectionError(
                 f"OpenAI-compatible alias {alias!r} needs connection.base_url"
             )
-        http_kwargs = {
+        http_kwargs: dict[str, object] = {
             "model": snapshot,
             "api_key": api_key,
             "base_url": base_url,

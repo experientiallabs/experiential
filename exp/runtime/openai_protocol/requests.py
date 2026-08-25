@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Collection
 from typing import Literal, cast
 
 from openai.types.chat.completion_create_params import CompletionCreateParams
@@ -559,7 +560,7 @@ def _validate_official(
     adapter: TypeAdapter[object],
     payload: JsonObject,
     *,
-    extension_fields: frozenset[str] = frozenset(),
+    extension_fields: Collection[str] = frozenset(),
 ) -> None:
     """Run the installed official SDK request schema before gateway narrowing."""
     try:

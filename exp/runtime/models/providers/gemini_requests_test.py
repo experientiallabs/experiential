@@ -1,5 +1,7 @@
 """Tests for the shared native Gemini generateContent payload builders."""
 
+from typing import cast
+
 import pytest
 
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
@@ -58,7 +60,7 @@ def test_gemini_generate_request_omits_unproven_top_k_and_logprobs() -> None:
         logprobs=True,
     )
     payload = gemini_generate_request("gemini-2.5-pro", request)
-    generation = payload["generationConfig"]
+    generation = cast("dict[str, object]", payload["generationConfig"])
     assert generation["topP"] == 0.8
     assert "topK" not in generation
     assert "responseLogprobs" not in generation
