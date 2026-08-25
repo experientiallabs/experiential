@@ -20,7 +20,16 @@ from exp.common.models.catalog import (
 from exp.common.models.model import BillingSource, ModelCapabilities, ReasoningEffort
 
 SETUP_PROVIDERS = frozenset(
-    {"anthropic", "azure", "bedrock", "gemini", "openai", "openai-compatible", "openrouter"}
+    {
+        "anthropic",
+        "azure",
+        "bedrock",
+        "gemini",
+        "openai",
+        "openai-compatible",
+        "openrouter",
+        "vertex",
+    }
 )
 
 
@@ -61,6 +70,17 @@ class ProviderConnection(ContractModel):
                 raise ValueError("bedrock does not accept base_url")
             if self.api_version is not None:
                 raise ValueError("api_version is only accepted for provider='azure'")
+        elif self.provider == "vertex":
+            if self.base_url is None:
+                raise ValueError("vertex requires an explicit project-and-location base_url")
+            if self.api_key_env is None:
+                raise ValueError(
+                    "vertex requires api_key_env naming the service-account JSON credential"
+                )
+            if self.api_version is not None:
+                raise ValueError("api_version is only accepted for provider='azure'")
+            if self.region is not None:
+                raise ValueError("region is only accepted for provider='bedrock'")
         else:
             if self.api_key_env is None:
                 raise ValueError(f"{self.provider} requires api_key_env")

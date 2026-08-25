@@ -23,6 +23,9 @@ dependencies = [
     # Bedrock uses the official AWS runtime client. Imports stay lazy inside the Bedrock adapter.
     "boto3>=1.35,<2",
     "botocore>=1.35,<2",
+    # Vertex mints OAuth tokens from service-account JSON through Google's official credential
+    # library. Imports stay lazy inside the Vertex adapter, mirroring the Bedrock boundary.
+    "google-auth>=2.35,<3",
 ]
 
 [project.optional-dependencies]

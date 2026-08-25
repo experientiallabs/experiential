@@ -61,6 +61,7 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 | Experiential Cloud | `openai-compatible` (picker `experiential-cloud`) | `EXPLABS_API_KEY` plus the hosted Platform `/v1` origin | `https://api.experientiallabs.ai/v1` or `EXP_GATEWAY_URL` |
 | Azure OpenAI / Foundry | `azure` | `api_key_env` plus explicit resource endpoint and `api_version` | Endpoint and API version |
 | Amazon Bedrock | `bedrock` | AWS credential chain. No `api_key_env` | Optional catalog `region` |
+| Vertex AI | `vertex` | `api_key_env` holding service-account JSON | Project-and-location `base_url` |
 | Tinker sampling | `tinker` | `api_key_env` | Official Tinker origin |
 
 Native fixed-origin providers reject a custom `base_url`. Use `openai-compatible` for a trusted
@@ -196,6 +197,38 @@ model = "amazon.titan-embed-text-v2:0"
 [models.titan.capabilities]
 supports_embeddings = true
 input_cost_per_million_tokens_usd = 0
+```
+
+## Vertex AI
+
+Use `provider = "vertex"` for Google-published models served from a Google Cloud project.
+The connection needs two values: `base_url` naming the project-and-location root, and
+`api_key_env` naming an environment variable whose value is the full service-account JSON key
+file contents. The runtime mints short-lived OAuth bearer tokens from that credential; the
+JSON itself never travels on the wire, and the endpoint host is pinned to HTTPS
+`*.aiplatform.googleapis.com` so the token can never be sent to an operator-chosen host.
+Requests use the same `generateContent` wire protocol as the Gemini provider on
+`publishers/google/models/` routes.
+
+Vertex is catalog-and-API configuration only: the interactive `exp config providers` picker
+does not offer it. Like Azure and Bedrock, provider names do not imply protocol support or
+prices, so every Vertex alias declares explicit capabilities. Embeddings are not supported on
+Vertex connections; use a `gemini` connection for Gemini embeddings.
+
+```toml
+[connections.vertex]
+provider = "vertex"
+base_url = "https://us-central1-aiplatform.googleapis.com/v1/projects/PROJECT/locations/us-central1"
+api_key_env = "VERTEX_SERVICE_ACCOUNT_JSON"
+
+[models.gemini-pro]
+connection = "vertex"
+model = "gemini-2.5-pro"
+[models.gemini-pro.capabilities]
+supports_completions = true
+supports_tools = true
+input_cost_per_million_tokens_usd = 0
+output_cost_per_million_tokens_usd = 0
 ```
 
 ## Errors
