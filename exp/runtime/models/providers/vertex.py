@@ -9,9 +9,11 @@ tokens minted from a service-account JSON credential instead of a static API key
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot
@@ -45,7 +47,12 @@ class VertexCredentialError(ValueError):
 
 
 class VertexTokenProvider(Protocol):
-    """Returns a currently valid OAuth bearer token for one Vertex connection."""
+    """Returns a currently valid OAuth bearer token for one Vertex connection.
+
+    The runtime may call the provider more than once per request (an off-loop warm mint
+    followed by header construction), so implementations return a cached token until it
+    expires instead of minting on every call.
+    """
 
     def __call__(self) -> str:
         """Return a non-empty bearer token that authorizes the next request."""
@@ -176,6 +183,7 @@ class VertexClient(ProviderHttpClient):
             token_provider: Optional deterministic bearer-token seam for tests and callers
                 that own credential refresh themselves.
         """
+        _require_vertex_host(base_url)
         super().__init__(
             model=model,
             api_key=api_key,
@@ -185,6 +193,28 @@ class VertexClient(ProviderHttpClient):
             timeout_seconds=timeout_seconds,
         )
         self._token_provider = token_provider or ServiceAccountTokenProvider(api_key)
+
+    async def complete_async(
+        self,
+        request: ModelRequest,
+        *,
+        deadline: RequestDeadline | None = None,
+        idempotency_key: str | None = None,
+    ) -> ModelResponse:
+        """Warm the bearer token off the event loop, then run the shared completion flow.
+
+        Args:
+            request: Visible messages, tool schemas, and sampling controls to send.
+            deadline: Optional request-wide deadline supplied by gateway execution.
+            idempotency_key: Optional stable caller or gateway attempt identity.
+
+        Returns:
+            The typed completed response with observed request economics.
+        """
+        await asyncio.to_thread(self._token_provider)
+        return await super().complete_async(
+            request, deadline=deadline, idempotency_key=idempotency_key
+        )
 
     async def stream(
         self,
@@ -205,10 +235,15 @@ class VertexClient(ProviderHttpClient):
         Returns:
             A cancellable provider-neutral event stream.
         """
+        # Token minting is one blocking HTTPS call; keep it off the gateway event loop.
+        bearer_token = await asyncio.to_thread(self._token_provider)
         return await start_gemini_generate_stream(
             self._transport,
             f"{self._base_url}/{self._stream_path()}",
-            headers=self._headers(),
+            headers={
+                "authorization": f"Bearer {bearer_token}",
+                "content-type": "application/json",
+            },
             payload=gemini_generate_request(
                 self._model.model_id,
                 gateway_model_request(request),
@@ -221,7 +256,11 @@ class VertexClient(ProviderHttpClient):
         )
 
     def _headers(self) -> dict[str, str]:
-        """Build native Vertex headers carrying a freshly validated OAuth bearer token."""
+        """Build native Vertex headers carrying the provider's current bearer token.
+
+        The async entry points warm the provider off the event loop first, so this call
+        returns the cached token without blocking in the ordinary case.
+        """
         return {
             "authorization": f"Bearer {self._token_provider()}",
             "content-type": "application/json",
@@ -244,6 +283,29 @@ class VertexClient(ProviderHttpClient):
         """Convert one completed generateContent payload into the shared response contract."""
         return gemini_generate_response(
             payload, configured_model=self._model, latency_seconds=latency_seconds
+        )
+
+
+def _require_vertex_host(base_url: str) -> None:
+    """Refuse endpoint roots that would receive the OAuth token on a non-Vertex host.
+
+    Catalog validation enforces the same rule with a configuration-time message; this
+    check makes the guarantee hold for every direct construction of the client.
+
+    Args:
+        base_url: Candidate project-and-location endpoint root.
+
+    Raises:
+        ValueError: The URL is not an HTTPS Vertex AI service host.
+    """
+    parts = urlsplit(base_url)
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not (
+        host == "aiplatform.googleapis.com" or host.endswith("-aiplatform.googleapis.com")
+    ):
+        raise ValueError(
+            "Vertex clients only send OAuth tokens to HTTPS *.aiplatform.googleapis.com "
+            f"hosts; got {base_url!r}"
         )
 
 

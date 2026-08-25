@@ -133,6 +133,19 @@ class ConnectionConfig(ContractModel):
                     "https://us-central1-aiplatform.googleapis.com/v1/projects/PROJECT/"
                     "locations/us-central1"
                 )
+            # The runtime attaches a cloud-platform OAuth token to every request, so the
+            # endpoint host is pinned to Vertex AI service hosts and never operator-chosen.
+            vertex_parts = urlsplit(self.base_url)
+            vertex_host = (vertex_parts.hostname or "").lower()
+            if vertex_parts.scheme != "https" or not (
+                vertex_host == "aiplatform.googleapis.com"
+                or vertex_host.endswith("-aiplatform.googleapis.com")
+            ):
+                raise ValueError(
+                    "vertex base_url must use an HTTPS Vertex AI host such as "
+                    "https://us-central1-aiplatform.googleapis.com; OAuth tokens are never "
+                    "sent to other hosts"
+                )
             if self.api_key_env is None:
                 raise ValueError(
                     "vertex requires api_key_env naming the environment variable that holds "
