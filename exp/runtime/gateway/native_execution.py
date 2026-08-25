@@ -309,7 +309,7 @@ def native_serving_blockers(components: LocalGatewayComponents) -> tuple[str, ..
                 reasons.append(f"deployment {deployment.deployment_id!r} does not resolve")
                 continue
             client = resolved.client
-            if not isinstance(client, ProviderHttpClient):
+            if not isinstance(client, NativeWireClient):
                 reasons.append(f"provider {deployment.provider!r} has no native wire profile")
                 continue
             try:
