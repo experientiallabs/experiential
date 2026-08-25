@@ -391,3 +391,165 @@ def test_repeated_tool_completion_is_still_rejected() -> None:
     encoder.feed(completion)
     with pytest.raises(OpenAIProtocolError, match="omitted its started tool call"):
         encoder.feed(completion.model_copy(update={"sequence_number": 3}))
+
+
+def interleaved_parallel_tool_events() -> tuple[GatewayEvent, ...]:
+    """Return one legal interleaved parallel-tool stream (A, B, A again)."""
+    return (
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-a",
+            tool_name="alpha",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=1,
+            tool_call_index=0,
+            raw_arguments_delta='{"a": ',
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=2,
+            tool_call_index=1,
+            tool_call_id="call-b",
+            tool_name="beta",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=3,
+            tool_call_index=1,
+            raw_arguments_delta='{"b": 2}',
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=4,
+            tool_call_index=0,
+            raw_arguments_delta="1}",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=5,
+            tool_call_index=0,
+            tool_call=ToolCall(
+                call_id="call-a", name="alpha", arguments={"a": 1}, raw_arguments='{"a": 1}'
+            ),
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=6,
+            tool_call_index=1,
+            tool_call=ToolCall(
+                call_id="call-b", name="beta", arguments={"b": 2}, raw_arguments='{"b": 2}'
+            ),
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.USAGE,
+            sequence_number=7,
+            usage=GatewayUsage(input_tokens=6, output_tokens=3),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=8),
+    )
+
+
+# The committed golden lifecycle for `interleaved_parallel_tool_events`: tool
+# A streams live through the interleaving; tool B's fragment buffers and
+# flushes as one delta after A's block closes.
+INTERLEAVED_GOLDEN_FRAMES = (
+    _MESSAGE_START,
+    _PING,
+    "event: content_block_start\n"
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use",'
+    '"id":"call-a","name":"alpha","input":{}}}\n\n',
+    "event: content_block_delta\n"
+    'data: {"type":"content_block_delta","index":0,'
+    '"delta":{"type":"input_json_delta","partial_json":"{\\"a\\": "}}\n\n',
+    "event: content_block_delta\n"
+    'data: {"type":"content_block_delta","index":0,'
+    '"delta":{"type":"input_json_delta","partial_json":"1}"}}\n\n',
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+    "event: content_block_start\n"
+    'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use",'
+    '"id":"call-b","name":"beta","input":{}}}\n\n',
+    "event: content_block_delta\n"
+    'data: {"type":"content_block_delta","index":1,'
+    '"delta":{"type":"input_json_delta","partial_json":"{\\"b\\": 2}"}}\n\n',
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+    "event: message_delta\n"
+    'data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},'
+    '"usage":{"input_tokens":6,"output_tokens":3}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+)
+
+# The committed golden non-streaming body for the same stream.
+INTERLEAVED_GOLDEN_BODY = (
+    '{"id":"msg_ff596a02add1b410b6dc664a47e25b3e","type":"message","role":"assistant",'
+    '"model":"coding","content":[{"type":"tool_use","id":"call-a","name":"alpha",'
+    '"input":{"a":1}},{"type":"tool_use","id":"call-b","name":"beta","input":{"b":2}}],'
+    '"stop_reason":"tool_use","stop_sequence":null,'
+    '"usage":{"input_tokens":6,"output_tokens":3}}'
+)
+
+
+def test_interleaved_parallel_tools_match_the_committed_golden_frames() -> None:
+    """Interleaved parallel tool calls stream one strictly sequential lifecycle."""
+    assert encode(interleaved_parallel_tool_events()) == INTERLEAVED_GOLDEN_FRAMES
+
+
+def test_interleaved_parallel_tools_aggregate_to_the_committed_golden_body() -> None:
+    """Interleaved argument deltas aggregate per tool in start order."""
+    body = completed_messages_body(
+        request_id="request-abc", model="coding", events=interleaved_parallel_tool_events()
+    )
+    assert json.dumps(body, separators=(",", ":"), ensure_ascii=False) == INTERLEAVED_GOLDEN_BODY
+
+
+def test_text_behind_an_open_tool_buffers_until_the_tool_closes() -> None:
+    """Later text stays behind an open tool block and flushes in start order."""
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=1, text_delta="while "),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=2,
+            tool_call_index=0,
+            raw_arguments_delta="{}",
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=3, text_delta="running"),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=4,
+            tool_call_index=0,
+            tool_call=ToolCall(call_id="call-1", name="search", arguments={}, raw_arguments="{}"),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=5),
+    )
+    frames = encode(events)
+    names = [frame.split("\n", 1)[0].removeprefix("event: ") for frame in frames]
+    assert names == [
+        "message_start",
+        "ping",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    # The buffered text flushes as one delta after the tool block closes.
+    text_delta = json.loads(frames[6].split("data: ", 1)[1])
+    assert text_delta["delta"] == {"type": "text_delta", "text": "while running"}
+    body = completed_messages_body(request_id="request-abc", model="coding", events=events)
+    assert body["content"] == [
+        {"type": "tool_use", "id": "call-1", "name": "search", "input": {}},
+        {"type": "text", "text": "while running"},
+    ]

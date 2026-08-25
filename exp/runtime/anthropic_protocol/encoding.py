@@ -12,6 +12,7 @@ parity).
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from typing import Literal
 
 from exp.common.core.artifacts import JsonObject
@@ -28,6 +29,28 @@ from exp.runtime.openai_protocol.streaming import stable_public_id
 
 _REFUSAL_MESSAGE = "provider refused the request"
 
+# Content buffered for blocks behind the open one is bounded like the rest of
+# the gateway's retained provider output (64 MiB), so a pathological stream
+# cannot grow encoder memory without limit.
+_MAXIMUM_BUFFERED_BLOCK_BYTES = 64 * 1024 * 1024
+
+
+@dataclass
+class _PendingBlock:
+    """One scheduled content block, buffered until it can stream in order.
+
+    Anthropic SSE streams content blocks strictly sequentially and a closed
+    index cannot reopen, while the canonical stream may legally interleave
+    parallel tool calls and trailing text. Blocks are therefore scheduled in
+    start order: the earliest block streams live, later blocks accumulate
+    their content in ``pending`` until every earlier block has closed.
+    """
+
+    kind: Literal["text", "tool"]
+    tool_index: int | None = None
+    pending: str = ""
+    anthropic_index: int | None = field(default=None)
+
 
 def refusal_failure() -> GatewayFailure:
     """Return the sanitized failure for provider refusals on this surface.
@@ -43,7 +66,14 @@ def refusal_failure() -> GatewayFailure:
 
 
 class MessagesSseEncoder:
-    """Stateful Anthropic Messages encoder with one open block and one terminal."""
+    """Stateful Anthropic Messages encoder with one open block and one terminal.
+
+    Blocks are scheduled in start order (see :class:`_PendingBlock`): the
+    earliest block streams live while content for later blocks buffers within
+    a bounded budget, so interleaved parallel tool calls and deferred
+    completions encode as a valid strictly sequential Anthropic lifecycle
+    with the same block order as the non-streaming aggregation.
+    """
 
     def __init__(self, *, request_id: str, model: str) -> None:
         """Initialize one response stream identity and empty block state."""
@@ -51,10 +81,13 @@ class MessagesSseEncoder:
         self.model = model
         self._started = False
         self._terminal = False
+        self._draining = False
         self._last_provider_sequence = -1
         self._next_block_index = 0
-        self._open_block: int | None = None
-        self._open_tool_for: int | None = None
+        self._blocks: list[_PendingBlock] = []
+        self._open_position: int | None = None
+        self._next_unopened = 0
+        self._buffered_bytes = 0
         # Started tool identity and accumulated raw argument text by gateway
         # tool index, so completion can verify streamed bytes like the Chat
         # encoder does.
@@ -124,37 +157,18 @@ class MessagesSseEncoder:
         return self._terminal
 
     def _text_delta(self, delta: str) -> tuple[str, ...]:
-        """Open the text block as needed and emit one text delta."""
-        frames: list[str] = []
-        if self._open_tool_for is not None or self._open_block is None:
-            frames.extend(self._close_block())
-            index = self._next_block_index
-            self._next_block_index += 1
-            self._open_block = index
-            frames.append(
-                _event(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-            )
-        frames.append(
-            _event(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": self._open_block,
-                    "delta": {"type": "text_delta", "text": delta},
-                },
-            )
-        )
+        """Schedule one text delta on the last text block, buffering as needed."""
+        target = self._blocks[-1] if self._blocks and self._blocks[-1].kind == "text" else None
+        if target is None:
+            target = _PendingBlock(kind="text")
+            self._blocks.append(target)
+        self._buffer(target, delta)
+        frames = self._advance()
+        self._flush_open(frames)
         return tuple(frames)
 
     def _tool_started(self, event: GatewayEvent) -> tuple[str, ...]:
-        """Close the open block and start one tool_use block."""
+        """Schedule one tool_use block at its start position."""
         tool_index = _required_index(event)
         if tool_index in self._tool_identities:
             raise self._state_error("A Messages tool-call index was started twice.")
@@ -162,55 +176,33 @@ class MessagesSseEncoder:
         self._tool_identities[tool_index] = identity
         self._tool_arguments[tool_index] = ""
         self._saw_tool_use = True
-        frames = list(self._close_block())
-        index = self._next_block_index
-        self._next_block_index += 1
-        self._open_block = index
-        self._open_tool_for = tool_index
-        frames.append(
-            _event(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": identity[0],
-                        "name": identity[1],
-                        "input": {},
-                    },
-                },
-            )
-        )
-        return tuple(frames)
+        self._blocks.append(_PendingBlock(kind="tool", tool_index=tool_index))
+        return tuple(self._advance())
 
     def _tool_arguments_delta(self, event: GatewayEvent) -> tuple[str, ...]:
-        """Emit one raw provider-order argument fragment for the open tool."""
+        """Schedule one raw argument fragment, buffering behind earlier blocks."""
         tool_index = _required_index(event)
-        if self._open_tool_for != tool_index or self._open_block is None:
+        if tool_index not in self._tool_identities:
             raise self._state_error("Messages tool arguments arrived before tool-call start.")
+        if tool_index in self._tool_completed:
+            raise self._state_error("Messages tool arguments arrived after completion.")
         delta = event.raw_arguments_delta
         if delta is None:
             raise self._state_error("Messages tool argument delta omitted its raw fragment.")
         self._tool_arguments[tool_index] += delta
-        return (
-            _event(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": self._open_block,
-                    "delta": {"type": "input_json_delta", "partial_json": delta},
-                },
-            ),
-        )
+        block = next(block for block in self._blocks if block.tool_index == tool_index)
+        self._buffer(block, delta)
+        frames = self._advance()
+        self._flush_open(frames)
+        return tuple(frames)
 
     def _complete_tool(self, event: GatewayEvent) -> tuple[str, ...]:
-        """Verify accumulated raw arguments and close the tool_use block.
+        """Verify accumulated raw arguments and mark the tool closable.
 
         Some upstream dialects (OpenAI-compatible streams) emit every tool
-        completion only at their terminal sentinel, after later text already
-        closed the tool_use block, so completion verifies against the
-        accumulated state rather than requiring the block to still be open.
+        completion only at their terminal sentinel, and parallel tool calls
+        may interleave, so completion verifies against the accumulated state
+        and the scheduler closes the block once it is the open one.
         """
         tool_index = _required_index(event)
         call = event.tool_call
@@ -223,21 +215,99 @@ class MessagesSseEncoder:
         ):
             raise self._state_error("Messages tool completion changed streamed identity or bytes.")
         self._tool_completed.add(tool_index)
-        if self._open_tool_for == tool_index:
-            return tuple(self._close_block())
-        return ()
+        return tuple(self._advance())
 
-    def _close_block(self) -> list[str]:
-        """Emit ``content_block_stop`` for the currently open block, if any."""
-        if self._open_block is None:
-            return []
-        frame = _event(
-            "content_block_stop",
-            {"type": "content_block_stop", "index": self._open_block},
+    def _buffer(self, block: _PendingBlock, delta: str) -> None:
+        """Retain one content fragment for its block within the bounded budget."""
+        self._buffered_bytes += len(delta.encode())
+        if self._buffered_bytes > _MAXIMUM_BUFFERED_BLOCK_BYTES:
+            raise self._state_error(
+                "Messages stream buffered blocks exceeded the gateway response limit."
+            )
+        block.pending += delta
+
+    def _advance(self) -> list[str]:
+        """Close and open blocks in start order as far as the stream allows.
+
+        A text block closes once a later block exists (or at drain); a tool
+        block closes only after its verified completion. Opening a block
+        assigns the next sequential Anthropic index and flushes its buffered
+        content as one delta.
+        """
+        frames: list[str] = []
+        while True:
+            if self._open_position is not None:
+                block = self._blocks[self._open_position]
+                last = self._open_position == len(self._blocks) - 1
+                closable = (
+                    self._draining
+                    or (block.kind == "text" and not last)
+                    or (block.kind == "tool" and block.tool_index in self._tool_completed)
+                )
+                if not closable:
+                    return frames
+                frames.append(
+                    _event(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": block.anthropic_index},
+                    )
+                )
+                self._open_position = None
+                continue
+            if self._next_unopened >= len(self._blocks):
+                return frames
+            block = self._blocks[self._next_unopened]
+            self._open_position = self._next_unopened
+            self._next_unopened += 1
+            block.anthropic_index = self._next_block_index
+            self._next_block_index += 1
+            if block.kind == "text":
+                content_block: JsonObject = {"type": "text", "text": ""}
+            else:
+                assert block.tool_index is not None
+                identity = self._tool_identities[block.tool_index]
+                content_block = {
+                    "type": "tool_use",
+                    "id": identity[0],
+                    "name": identity[1],
+                    "input": {},
+                }
+            frames.append(
+                _event(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block.anthropic_index,
+                        "content_block": content_block,
+                    },
+                )
+            )
+            self._flush_open(frames)
+
+    def _flush_open(self, frames: list[str]) -> None:
+        """Emit the open block's buffered content as one delta, if any."""
+        if self._open_position is None:
+            return
+        block = self._blocks[self._open_position]
+        if not block.pending:
+            return
+        delta: JsonObject = (
+            {"type": "text_delta", "text": block.pending}
+            if block.kind == "text"
+            else {"type": "input_json_delta", "partial_json": block.pending}
         )
-        self._open_block = None
-        self._open_tool_for = None
-        return [frame]
+        frames.append(
+            _event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block.anthropic_index,
+                    "delta": delta,
+                },
+            )
+        )
+        self._buffered_bytes -= len(block.pending.encode())
+        block.pending = ""
 
     def _finish(self, event: GatewayEvent) -> tuple[str, ...]:
         """Emit exactly one terminal: message_delta and message_stop, or error."""
@@ -250,7 +320,8 @@ class MessagesSseEncoder:
             return (_error_event(failure),)
         if self._refusal_seen:
             return (_error_event(refusal_failure()),)
-        frames = list(self._close_block())
+        self._draining = True
+        frames = self._advance()
         stop_reason = _stop_reason(
             incomplete=event.kind == GatewayEventKind.INCOMPLETE,
             saw_tool_use=self._saw_tool_use,

@@ -2317,3 +2317,55 @@ def test_rust_messages_deferred_tool_completion_matches_python() -> None:
     expected_body = completed_messages_body(request_id="request-abc", model="coding", events=events)
     actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
     assert actual_body == json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_rust_messages_interleaved_parallel_tools_match_python_and_golden() -> None:
+    """Interleaved parallel tool calls stay in byte parity across engines.
+
+    The canonical stream may legally interleave tool A arguments, tool B
+    start, and more tool A arguments; both encoders must schedule blocks in
+    start order, streaming the open block live and buffering the rest.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.anthropic_protocol.encoding import completed_messages_body
+    from exp.runtime.anthropic_protocol.encoding_test import (
+        INTERLEAVED_GOLDEN_BODY,
+        INTERLEAVED_GOLDEN_FRAMES,
+        encode,
+        interleaved_parallel_tool_events,
+    )
+
+    fixture = json.dumps(
+        [
+            {"kind": "tool_call_started", "index": 0, "call_id": "call-a", "name": "alpha"},
+            {"kind": "tool_arguments_delta", "index": 0, "text": '{"a": '},
+            {"kind": "tool_call_started", "index": 1, "call_id": "call-b", "name": "beta"},
+            {"kind": "tool_arguments_delta", "index": 1, "text": '{"b": 2}'},
+            {"kind": "tool_arguments_delta", "index": 0, "text": "1}"},
+            {
+                "kind": "tool_call_completed",
+                "index": 0,
+                "call_id": "call-a",
+                "name": "alpha",
+                "raw_arguments": '{"a": 1}',
+            },
+            {
+                "kind": "tool_call_completed",
+                "index": 1,
+                "call_id": "call-b",
+                "name": "beta",
+                "raw_arguments": '{"b": 2}',
+            },
+            {"kind": "usage", "input_tokens": 6, "output_tokens": 3},
+            {"kind": "completed"},
+        ]
+    )
+    actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
+    assert tuple(actual_frames) == INTERLEAVED_GOLDEN_FRAMES
+    assert tuple(actual_frames) == encode(interleaved_parallel_tool_events())
+    actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
+    assert actual_body == INTERLEAVED_GOLDEN_BODY
+    expected_body = completed_messages_body(
+        request_id="request-abc", model="coding", events=interleaved_parallel_tool_events()
+    )
+    assert actual_body == json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False)

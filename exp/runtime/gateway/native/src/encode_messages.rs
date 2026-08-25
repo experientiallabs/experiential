@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Map, Value};
 
+use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::{compact_json, stable_public_id};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
@@ -93,16 +94,40 @@ fn error_frame(failure: &Failure) -> String {
     event_frame("error", &anthropic_error_body(&failure.public_error()))
 }
 
+/// One scheduled content block, buffered until it can stream in order.
+///
+/// Anthropic SSE streams content blocks strictly sequentially and a closed
+/// index cannot reopen, while the canonical stream may legally interleave
+/// parallel tool calls and trailing text. Blocks are therefore scheduled in
+/// start order: the earliest block streams live, later blocks accumulate
+/// their content in `pending` until every earlier block has closed.
+struct PendingBlock {
+    /// `None` for a text block, or the gateway tool-call index.
+    tool_index: Option<u32>,
+    pending: String,
+    anthropic_index: Option<u32>,
+}
+
 /// Stateful Anthropic Messages SSE encoder with one open block and one
 /// terminal, emitting byte-identical frames to the python encoder.
+///
+/// Blocks are scheduled in start order (see [`PendingBlock`]): the earliest
+/// block streams live while content for later blocks buffers within the
+/// gateway's bounded retained-output budget, so interleaved parallel tool
+/// calls and deferred completions encode as a valid strictly sequential
+/// Anthropic lifecycle with the same block order as the non-streaming
+/// aggregation.
 pub struct MessagesSseEncoder {
     message_id: String,
     model: String,
     started: bool,
     terminal: bool,
+    draining: bool,
     next_block_index: u32,
-    open_block: Option<u32>,
-    open_tool_for: Option<u32>,
+    blocks: Vec<PendingBlock>,
+    open_position: Option<usize>,
+    next_unopened: usize,
+    buffered_bytes: usize,
     tool_identities: HashMap<u32, (String, String)>,
     tool_arguments: HashMap<u32, String>,
     tool_completed: HashSet<u32>,
@@ -118,9 +143,12 @@ impl MessagesSseEncoder {
             model: model.to_string(),
             started: false,
             terminal: false,
+            draining: false,
             next_block_index: 0,
-            open_block: None,
-            open_tool_for: None,
+            blocks: Vec::new(),
+            open_position: None,
+            next_unopened: 0,
+            buffered_bytes: 0,
             tool_identities: HashMap::new(),
             tool_arguments: HashMap::new(),
             tool_completed: HashSet::new(),
@@ -174,7 +202,7 @@ impl MessagesSseEncoder {
             ));
         }
         match event {
-            Event::TextDelta(text) => Ok(self.text_delta(text)),
+            Event::TextDelta(text) => self.text_delta(text),
             Event::RefusalDelta(_) => {
                 // There is no Anthropic refusal block; the refusal is
                 // reported as one sanitized terminal error instead.
@@ -189,10 +217,10 @@ impl MessagesSseEncoder {
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments_delta(*index, delta),
             Event::ToolCallCompleted { index, call } => {
                 // Some upstream dialects (OpenAI-compatible streams) emit
-                // every tool completion only at their terminal sentinel,
-                // after later text already closed the tool_use block, so
-                // completion verifies against the accumulated state rather
-                // than requiring the block to still be open.
+                // every tool completion only at their terminal sentinel, and
+                // parallel tool calls may interleave, so completion verifies
+                // against the accumulated state and the scheduler closes the
+                // block once it is the open one.
                 let identity = self.tool_identities.get(index);
                 if identity.is_none() || self.tool_completed.contains(index) {
                     return Err(invalid_provider_stream(
@@ -208,11 +236,7 @@ impl MessagesSseEncoder {
                     ));
                 }
                 self.tool_completed.insert(*index);
-                if self.open_tool_for == Some(*index) {
-                    Ok(self.close_block())
-                } else {
-                    Ok(Vec::new())
-                }
+                Ok(self.advance())
             }
             Event::Usage(usage) => {
                 if usage.has_token_counts() {
@@ -225,7 +249,8 @@ impl MessagesSseEncoder {
                 if self.refusal_seen {
                     return Ok(vec![error_frame(&refusal_failure())]);
                 }
-                let mut frames = self.close_block();
+                self.draining = true;
+                let mut frames = self.advance();
                 frames.push(event_frame(
                     "message_delta",
                     &json!({
@@ -253,35 +278,27 @@ impl MessagesSseEncoder {
         }
     }
 
-    /// Open the text block as needed and emit one text delta.
-    fn text_delta(&mut self, delta: &str) -> Vec<String> {
-        let mut frames = Vec::new();
-        if self.open_tool_for.is_some() || self.open_block.is_none() {
-            frames.extend(self.close_block());
-            let index = self.next_block_index;
-            self.next_block_index += 1;
-            self.open_block = Some(index);
-            frames.push(event_frame(
-                "content_block_start",
-                &json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "text", "text": ""},
-                }),
-            ));
+    /// Schedule one text delta on the last text block, buffering as needed.
+    fn text_delta(&mut self, delta: &str) -> Result<Vec<String>, PublicError> {
+        let needs_new_block = match self.blocks.last() {
+            Some(block) => block.tool_index.is_some(),
+            None => true,
+        };
+        if needs_new_block {
+            self.blocks.push(PendingBlock {
+                tool_index: None,
+                pending: String::new(),
+                anthropic_index: None,
+            });
         }
-        frames.push(event_frame(
-            "content_block_delta",
-            &json!({
-                "type": "content_block_delta",
-                "index": self.open_block,
-                "delta": {"type": "text_delta", "text": delta},
-            }),
-        ));
-        frames
+        let position = self.blocks.len() - 1;
+        self.buffer(position, delta)?;
+        let mut frames = self.advance();
+        self.flush_open(&mut frames);
+        Ok(frames)
     }
 
-    /// Close the open block and start one tool_use block.
+    /// Schedule one tool_use block at its start position.
     fn tool_started(
         &mut self,
         tool_index: u32,
@@ -297,63 +314,144 @@ impl MessagesSseEncoder {
             .insert(tool_index, (call_id.to_string(), name.to_string()));
         self.tool_arguments.insert(tool_index, String::new());
         self.saw_tool_use = true;
-        let mut frames = self.close_block();
-        let index = self.next_block_index;
-        self.next_block_index += 1;
-        self.open_block = Some(index);
-        self.open_tool_for = Some(tool_index);
-        frames.push(event_frame(
-            "content_block_start",
-            &json!({
-                "type": "content_block_start",
-                "index": index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": call_id,
-                    "name": name,
-                    "input": {},
-                },
-            }),
-        ));
-        Ok(frames)
+        self.blocks.push(PendingBlock {
+            tool_index: Some(tool_index),
+            pending: String::new(),
+            anthropic_index: None,
+        });
+        Ok(self.advance())
     }
 
-    /// Emit one raw provider-order argument fragment for the open tool.
+    /// Schedule one raw argument fragment, buffering behind earlier blocks.
     fn tool_arguments_delta(
         &mut self,
         tool_index: u32,
         delta: &str,
     ) -> Result<Vec<String>, PublicError> {
-        if self.open_tool_for != Some(tool_index) || self.open_block.is_none() {
+        if !self.tool_identities.contains_key(&tool_index) {
             return Err(invalid_provider_stream(
                 "Messages tool arguments arrived before tool-call start.",
             ));
         }
-        let accumulated = self
-            .tool_arguments
+        if self.tool_completed.contains(&tool_index) {
+            return Err(invalid_provider_stream(
+                "Messages tool arguments arrived after completion.",
+            ));
+        }
+        self.tool_arguments
             .get_mut(&tool_index)
-            .expect("open tool has accumulated arguments");
-        accumulated.push_str(delta);
-        Ok(vec![event_frame(
+            .expect("started tool has accumulated arguments")
+            .push_str(delta);
+        let position = self
+            .blocks
+            .iter()
+            .position(|block| block.tool_index == Some(tool_index))
+            .expect("started tool has a scheduled block");
+        self.buffer(position, delta)?;
+        let mut frames = self.advance();
+        self.flush_open(&mut frames);
+        Ok(frames)
+    }
+
+    /// Retain one content fragment for its block within the bounded budget.
+    fn buffer(&mut self, position: usize, delta: &str) -> Result<(), PublicError> {
+        self.buffered_bytes = self.buffered_bytes.saturating_add(delta.len());
+        if self.buffered_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
+            return Err(invalid_provider_stream(
+                "Messages stream buffered blocks exceeded the gateway response limit.",
+            ));
+        }
+        self.blocks[position].pending.push_str(delta);
+        Ok(())
+    }
+
+    /// Close and open blocks in start order as far as the stream allows.
+    ///
+    /// A text block closes once a later block exists (or at drain); a tool
+    /// block closes only after its verified completion. Opening a block
+    /// assigns the next sequential Anthropic index and flushes its buffered
+    /// content as one delta.
+    fn advance(&mut self) -> Vec<String> {
+        let mut frames = Vec::new();
+        loop {
+            if let Some(position) = self.open_position {
+                let block = &self.blocks[position];
+                let last = position == self.blocks.len() - 1;
+                let closable = self.draining
+                    || match block.tool_index {
+                        None => !last,
+                        Some(tool_index) => self.tool_completed.contains(&tool_index),
+                    };
+                if !closable {
+                    return frames;
+                }
+                frames.push(event_frame(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": block.anthropic_index}),
+                ));
+                self.open_position = None;
+                continue;
+            }
+            if self.next_unopened >= self.blocks.len() {
+                return frames;
+            }
+            let position = self.next_unopened;
+            self.open_position = Some(position);
+            self.next_unopened += 1;
+            let anthropic_index = self.next_block_index;
+            self.next_block_index += 1;
+            let block = &mut self.blocks[position];
+            block.anthropic_index = Some(anthropic_index);
+            let content_block = match block.tool_index {
+                None => json!({"type": "text", "text": ""}),
+                Some(tool_index) => {
+                    let identity = self
+                        .tool_identities
+                        .get(&tool_index)
+                        .expect("scheduled tool has an identity");
+                    json!({
+                        "type": "tool_use",
+                        "id": identity.0,
+                        "name": identity.1,
+                        "input": {},
+                    })
+                }
+            };
+            frames.push(event_frame(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": anthropic_index,
+                    "content_block": content_block,
+                }),
+            ));
+            self.flush_open(&mut frames);
+        }
+    }
+
+    /// Emit the open block's buffered content as one delta, if any.
+    fn flush_open(&mut self, frames: &mut Vec<String>) {
+        let Some(position) = self.open_position else {
+            return;
+        };
+        let block = &mut self.blocks[position];
+        if block.pending.is_empty() {
+            return;
+        }
+        let delta = match block.tool_index {
+            None => json!({"type": "text_delta", "text": block.pending}),
+            Some(_) => json!({"type": "input_json_delta", "partial_json": block.pending}),
+        };
+        frames.push(event_frame(
             "content_block_delta",
             &json!({
                 "type": "content_block_delta",
-                "index": self.open_block,
-                "delta": {"type": "input_json_delta", "partial_json": delta},
+                "index": block.anthropic_index,
+                "delta": delta,
             }),
-        )])
-    }
-
-    /// Emit `content_block_stop` for the currently open block, if any.
-    fn close_block(&mut self) -> Vec<String> {
-        let Some(index) = self.open_block.take() else {
-            return Vec::new();
-        };
-        self.open_tool_for = None;
-        vec![event_frame(
-            "content_block_stop",
-            &json!({"type": "content_block_stop", "index": index}),
-        )]
+        ));
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(block.pending.len());
+        block.pending.clear();
     }
 }
 
@@ -651,6 +749,92 @@ mod tests {
             );
         }
         assert!(frames.last().expect("terminal").contains("message_stop"));
+    }
+
+    #[test]
+    fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
+        // Tool A streams live through the interleaving; tool B's fragment
+        // buffers and flushes as one delta after A's block closes.
+        let events = vec![
+            Event::ToolCallStarted {
+                index: 0,
+                call_id: "call-a".to_string(),
+                name: "alpha".to_string(),
+            },
+            Event::ToolArgumentsDelta {
+                index: 0,
+                delta: "{\"a\": ".to_string(),
+            },
+            Event::ToolCallStarted {
+                index: 1,
+                call_id: "call-b".to_string(),
+                name: "beta".to_string(),
+            },
+            Event::ToolArgumentsDelta {
+                index: 1,
+                delta: "{\"b\": 2}".to_string(),
+            },
+            Event::ToolArgumentsDelta {
+                index: 0,
+                delta: "1}".to_string(),
+            },
+            Event::ToolCallCompleted {
+                index: 0,
+                call: CompletedToolCall {
+                    call_id: "call-a".to_string(),
+                    name: "alpha".to_string(),
+                    raw_arguments: "{\"a\": 1}".to_string(),
+                },
+            },
+            Event::ToolCallCompleted {
+                index: 1,
+                call: CompletedToolCall {
+                    call_id: "call-b".to_string(),
+                    name: "beta".to_string(),
+                    raw_arguments: "{\"b\": 2}".to_string(),
+                },
+            },
+            Event::Completed,
+        ];
+        let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+        let mut frames = encoder.start().expect("starts");
+        for event in &events {
+            frames.extend(encoder.feed(event).expect("streams the interleaving"));
+        }
+        let names: Vec<&str> = frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .lines()
+                    .next()
+                    .and_then(|line| line.strip_prefix("event: "))
+                    .expect("named frame")
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "ping",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        // The buffered tool-B fragment flushes as one input_json_delta on
+        // Anthropic block index 1 after block 0 closes.
+        assert!(frames[7].contains("\"index\":1"));
+        assert!(frames[7].contains("{\\\"b\\\": 2}"));
+        let aggregated =
+            completed_messages_body("request-abc", "coding", &events).expect("aggregates");
+        assert_eq!(aggregated.body["content"][0]["id"], json!("call-a"));
+        assert_eq!(aggregated.body["content"][1]["id"], json!("call-b"));
     }
 
     #[test]
