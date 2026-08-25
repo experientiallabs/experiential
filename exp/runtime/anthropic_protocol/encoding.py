@@ -43,7 +43,13 @@ def refusal_failure() -> GatewayFailure:
 
 
 class MessagesSseEncoder:
-    """Stateful Anthropic Messages encoder with one open block and one terminal."""
+    """Stateful Anthropic Messages encoder with concurrent blocks and one terminal.
+
+    OpenAI-compatible providers interleave parallel tool calls, so each
+    started tool keeps its own content block open until its completion (or
+    the terminal) stops it, and argument fragments always target the block
+    the tool started.
+    """
 
     def __init__(self, *, request_id: str, model: str) -> None:
         """Initialize one response stream identity and empty block state."""
@@ -53,8 +59,10 @@ class MessagesSseEncoder:
         self._terminal = False
         self._last_provider_sequence = -1
         self._next_block_index = 0
-        self._open_block: int | None = None
-        self._open_tool_for: int | None = None
+        self._open_text_block: int | None = None
+        # Content block index by gateway tool index; a tool block stays open
+        # from its start until its completion (or the terminal) stops it.
+        self._tool_blocks: dict[int, int] = {}
         # Started tool identity and accumulated raw argument text by gateway
         # tool index, so completion can verify streamed bytes like the Chat
         # encoder does.
@@ -126,11 +134,10 @@ class MessagesSseEncoder:
     def _text_delta(self, delta: str) -> tuple[str, ...]:
         """Open the text block as needed and emit one text delta."""
         frames: list[str] = []
-        if self._open_tool_for is not None or self._open_block is None:
-            frames.extend(self._close_block())
+        if self._open_text_block is None:
             index = self._next_block_index
             self._next_block_index += 1
-            self._open_block = index
+            self._open_text_block = index
             frames.append(
                 _event(
                     "content_block_start",
@@ -146,7 +153,7 @@ class MessagesSseEncoder:
                 "content_block_delta",
                 {
                     "type": "content_block_delta",
-                    "index": self._open_block,
+                    "index": self._open_text_block,
                     "delta": {"type": "text_delta", "text": delta},
                 },
             )
@@ -154,7 +161,7 @@ class MessagesSseEncoder:
         return tuple(frames)
 
     def _tool_started(self, event: GatewayEvent) -> tuple[str, ...]:
-        """Close the open block and start one tool_use block."""
+        """Close the open text block and start one tool_use block."""
         tool_index = _required_index(event)
         if tool_index in self._tool_identities:
             raise self._state_error("A Messages tool-call index was started twice.")
@@ -162,11 +169,10 @@ class MessagesSseEncoder:
         self._tool_identities[tool_index] = identity
         self._tool_arguments[tool_index] = ""
         self._saw_tool_use = True
-        frames = list(self._close_block())
+        frames = list(self._close_text_block())
         index = self._next_block_index
         self._next_block_index += 1
-        self._open_block = index
-        self._open_tool_for = tool_index
+        self._tool_blocks[tool_index] = index
         frames.append(
             _event(
                 "content_block_start",
@@ -185,10 +191,17 @@ class MessagesSseEncoder:
         return tuple(frames)
 
     def _tool_arguments_delta(self, event: GatewayEvent) -> tuple[str, ...]:
-        """Emit one raw provider-order argument fragment for the open tool."""
+        """Emit one raw provider-order argument fragment for its tool block.
+
+        Parallel tool calls interleave fragments, so the fragment targets the
+        block index its tool started, whether or not a later block opened in
+        between.
+        """
         tool_index = _required_index(event)
-        if self._open_tool_for != tool_index or self._open_block is None:
+        if tool_index not in self._tool_identities:
             raise self._state_error("Messages tool arguments arrived before tool-call start.")
+        if tool_index in self._tool_completed:
+            raise self._state_error("Messages tool arguments arrived after tool completion.")
         delta = event.raw_arguments_delta
         if delta is None:
             raise self._state_error("Messages tool argument delta omitted its raw fragment.")
@@ -198,19 +211,19 @@ class MessagesSseEncoder:
                 "content_block_delta",
                 {
                     "type": "content_block_delta",
-                    "index": self._open_block,
+                    "index": self._tool_blocks[tool_index],
                     "delta": {"type": "input_json_delta", "partial_json": delta},
                 },
             ),
         )
 
     def _complete_tool(self, event: GatewayEvent) -> tuple[str, ...]:
-        """Verify accumulated raw arguments and close the tool_use block.
+        """Verify accumulated raw arguments and stop the tool_use block.
 
         Some upstream dialects (OpenAI-compatible streams) emit every tool
-        completion only at their terminal sentinel, after later text already
-        closed the tool_use block, so completion verifies against the
-        accumulated state rather than requiring the block to still be open.
+        completion only at their terminal sentinel, after later blocks
+        opened, so completion verifies against the accumulated state and
+        stops the block the tool started.
         """
         tool_index = _required_index(event)
         call = event.tool_call
@@ -223,21 +236,28 @@ class MessagesSseEncoder:
         ):
             raise self._state_error("Messages tool completion changed streamed identity or bytes.")
         self._tool_completed.add(tool_index)
-        if self._open_tool_for == tool_index:
-            return tuple(self._close_block())
-        return ()
+        return (_stop_frame(self._tool_blocks[tool_index]),)
 
-    def _close_block(self) -> list[str]:
-        """Emit ``content_block_stop`` for the currently open block, if any."""
-        if self._open_block is None:
+    def _close_text_block(self) -> list[str]:
+        """Emit ``content_block_stop`` for the open text block, if any."""
+        if self._open_text_block is None:
             return []
-        frame = _event(
-            "content_block_stop",
-            {"type": "content_block_stop", "index": self._open_block},
-        )
-        self._open_block = None
-        self._open_tool_for = None
+        frame = _stop_frame(self._open_text_block)
+        self._open_text_block = None
         return [frame]
+
+    def _close_open_blocks(self) -> list[str]:
+        """Stop every still-open block in ascending block-index order."""
+        indexes = sorted(
+            ([] if self._open_text_block is None else [self._open_text_block])
+            + [
+                block
+                for tool_index, block in self._tool_blocks.items()
+                if tool_index not in self._tool_completed
+            ]
+        )
+        self._open_text_block = None
+        return [_stop_frame(index) for index in indexes]
 
     def _finish(self, event: GatewayEvent) -> tuple[str, ...]:
         """Emit exactly one terminal: message_delta and message_stop, or error."""
@@ -250,7 +270,7 @@ class MessagesSseEncoder:
             return (_error_event(failure),)
         if self._refusal_seen:
             return (_error_event(refusal_failure()),)
-        frames = list(self._close_block())
+        frames = self._close_open_blocks()
         stop_reason = _stop_reason(
             incomplete=event.kind == GatewayEventKind.INCOMPLETE,
             saw_tool_use=self._saw_tool_use,
@@ -405,6 +425,11 @@ def _event(name: str, payload: JsonObject) -> str:
     """Frame one named, compact, UTF-8-preserving Anthropic SSE event."""
     encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     return f"event: {name}\ndata: {encoded}\n\n"
+
+
+def _stop_frame(index: int) -> str:
+    """Frame one ``content_block_stop`` event for a block index."""
+    return _event("content_block_stop", {"type": "content_block_stop", "index": index})
 
 
 def _required_index(event: GatewayEvent) -> int:

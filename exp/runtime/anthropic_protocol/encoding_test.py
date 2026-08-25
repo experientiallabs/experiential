@@ -313,9 +313,10 @@ def test_deferred_tool_completion_streams_and_aggregates_consistently() -> None:
     """OpenAI-compatible streams complete tools only at their terminal.
 
     Text may therefore arrive between a tool's arguments and its completion.
-    The streaming encoder must accept the deferred completion after text
-    closed the block, and the aggregation must anchor the tool block at its
-    start position so both renderings order blocks identically.
+    The streaming encoder keeps the tool block open across the text block and
+    stops it at the deferred completion, and the aggregation must anchor the
+    tool block at its start position so both renderings order blocks
+    identically.
     """
     events = (
         GatewayEvent(
@@ -347,9 +348,9 @@ def test_deferred_tool_completion_streams_and_aggregates_consistently() -> None:
         "ping",
         "content_block_start",
         "content_block_delta",
-        "content_block_stop",
         "content_block_start",
         "content_block_delta",
+        "content_block_stop",
         "content_block_stop",
         "message_delta",
         "message_stop",
@@ -358,6 +359,90 @@ def test_deferred_tool_completion_streams_and_aggregates_consistently() -> None:
     assert body["content"] == [
         {"type": "tool_use", "id": "call-1", "name": "search", "input": {}},
         {"type": "text", "text": "after"},
+    ]
+
+
+def test_parallel_tool_deltas_interleave_across_open_blocks() -> None:
+    """Interleaved parallel tool fragments target each tool's own block.
+
+    Providers stream parallel tool calls concurrently, so a fragment for an
+    earlier tool may arrive after a later tool started. Each fragment must
+    land on the block its tool opened and each completion must stop that
+    same block.
+    """
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=1,
+            tool_call_index=0,
+            raw_arguments_delta='{"q": ',
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=2,
+            tool_call_index=1,
+            tool_call_id="call-2",
+            tool_name="fetch",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=3,
+            tool_call_index=1,
+            raw_arguments_delta='{"u": "y"}',
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=4,
+            tool_call_index=0,
+            raw_arguments_delta='"x"}',
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=5,
+            tool_call_index=0,
+            tool_call=ToolCall(
+                call_id="call-1",
+                name="search",
+                arguments={"q": "x"},
+                raw_arguments='{"q": "x"}',
+            ),
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=6,
+            tool_call_index=1,
+            tool_call=ToolCall(
+                call_id="call-2",
+                name="fetch",
+                arguments={"u": "y"},
+                raw_arguments='{"u": "y"}',
+            ),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=7),
+    )
+    frames = encode(events)
+    payloads = [
+        json.loads(frame.split("data: ", 1)[1]) for frame in frames if "content_block" in frame
+    ]
+    deltas = [
+        (payload["index"], payload["delta"]["partial_json"])
+        for payload in payloads
+        if payload["type"] == "content_block_delta"
+    ]
+    assert deltas == [(0, '{"q": '), (1, '{"u": "y"}'), (0, '"x"}')]
+    stops = [payload["index"] for payload in payloads if payload["type"] == "content_block_stop"]
+    assert stops == [0, 1]
+    body = completed_messages_body(request_id="request-abc", model="coding", events=events)
+    assert body["content"] == [
+        {"type": "tool_use", "id": "call-1", "name": "search", "input": {"q": "x"}},
+        {"type": "tool_use", "id": "call-2", "name": "fetch", "input": {"u": "y"}},
     ]
 
 

@@ -2317,3 +2317,109 @@ def test_rust_messages_deferred_tool_completion_matches_python() -> None:
     expected_body = completed_messages_body(request_id="request-abc", model="coding", events=events)
     actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
     assert actual_body == json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_rust_messages_parallel_tool_deltas_match_python() -> None:
+    """Interleaved parallel tool fragments stay in parity across engines.
+
+    A fragment for an earlier tool arriving after a later tool started must
+    stream to the earlier tool's block on both engines, and both bodies must
+    aggregate the two tool_use blocks in start order.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.common.models.model import ToolCall
+    from exp.runtime.anthropic_protocol.encoding import (
+        MessagesSseEncoder,
+        completed_messages_body,
+    )
+
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=1,
+            tool_call_index=0,
+            raw_arguments_delta='{"q": ',
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=2,
+            tool_call_index=1,
+            tool_call_id="call-2",
+            tool_name="fetch",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=3,
+            tool_call_index=1,
+            raw_arguments_delta='{"u": "y"}',
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=4,
+            tool_call_index=0,
+            raw_arguments_delta='"x"}',
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=5,
+            tool_call_index=0,
+            tool_call=ToolCall(
+                call_id="call-1",
+                name="search",
+                arguments={"q": "x"},
+                raw_arguments='{"q": "x"}',
+            ),
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=6,
+            tool_call_index=1,
+            tool_call=ToolCall(
+                call_id="call-2",
+                name="fetch",
+                arguments={"u": "y"},
+                raw_arguments='{"u": "y"}',
+            ),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=7),
+    )
+    fixture = json.dumps(
+        [
+            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
+            {"kind": "tool_arguments_delta", "index": 0, "text": '{"q": '},
+            {"kind": "tool_call_started", "index": 1, "call_id": "call-2", "name": "fetch"},
+            {"kind": "tool_arguments_delta", "index": 1, "text": '{"u": "y"}'},
+            {"kind": "tool_arguments_delta", "index": 0, "text": '"x"}'},
+            {
+                "kind": "tool_call_completed",
+                "index": 0,
+                "call_id": "call-1",
+                "name": "search",
+                "raw_arguments": '{"q": "x"}',
+            },
+            {
+                "kind": "tool_call_completed",
+                "index": 1,
+                "call_id": "call-2",
+                "name": "fetch",
+                "raw_arguments": '{"u": "y"}',
+            },
+            {"kind": "completed"},
+        ]
+    )
+    encoder = MessagesSseEncoder(request_id="request-abc", model="coding")
+    expected_frames = list(encoder.start())
+    for event in events:
+        expected_frames.extend(encoder.feed(event))
+    actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
+    assert list(actual_frames) == expected_frames
+    expected_body = completed_messages_body(request_id="request-abc", model="coding", events=events)
+    actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
+    assert actual_body == json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False)
