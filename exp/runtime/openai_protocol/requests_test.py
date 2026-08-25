@@ -187,6 +187,10 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
     # Summary selectors are accepted for compatibility and intentionally do not
     # enter the canonical request because the response contract cannot return them.
     assert request.reasoning_effort == "high"
+    assert request.ignored_parameters == (
+        "reasoning.generate_summary",
+        "reasoning.summary",
+    )
     assert request.messages[2].tool_calls[0].raw_arguments == '{"city":"Paris"}'
     assert request.parallel_tool_calls is False
     assert request.maximum_output_tokens == 321
@@ -543,6 +547,7 @@ def test_chat_decoder_preserves_logprob_controls() -> None:
     )
     assert decoded.request.logprobs is True
     assert decoded.request.top_logprobs == 5
+    assert decoded.request.ignored_parameters == ("logprobs", "top_logprobs")
 
 
 def test_chat_decoder_preserves_gateway_top_k_extension() -> None:

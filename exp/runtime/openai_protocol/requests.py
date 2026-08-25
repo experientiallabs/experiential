@@ -361,6 +361,7 @@ def decode_chat(
                 request.stream_options is not None and request.stream_options.include_usage
             ),
             metadata=request.metadata,
+            ignored_parameters=_ignored_chat_parameters(request),
             idempotency_key=operation if idempotency_key is not None else None,
             client_request_id=operation if client_request_id is not None else None,
         )
@@ -415,12 +416,36 @@ def decode_responses(
             stream=request.stream,
             previous_response_id=request.previous_response_id,
             metadata=request.metadata,
+            ignored_parameters=_ignored_responses_parameters(request),
             idempotency_key=operation if idempotency_key is not None else None,
             client_request_id=operation if client_request_id is not None else None,
         )
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
+
+
+def _ignored_chat_parameters(request: _ChatRequest) -> tuple[str, ...]:
+    """Name accepted Chat controls that the current response contract cannot return."""
+    ignored: list[str] = []
+    if request.logprobs is not None:
+        ignored.append("logprobs")
+    if request.top_logprobs is not None:
+        ignored.append("top_logprobs")
+    return tuple(ignored)
+
+
+def _ignored_responses_parameters(request: _ResponsesRequest) -> tuple[str, ...]:
+    """Name accepted Responses controls that the current response contract cannot return."""
+    ignored: list[str] = []
+    if request.top_logprobs is not None:
+        ignored.append("top_logprobs")
+    if request.reasoning is not None:
+        if request.reasoning.generate_summary is not None:
+            ignored.append("reasoning.generate_summary")
+        if request.reasoning.summary is not None:
+            ignored.append("reasoning.summary")
+    return tuple(ignored)
 
 
 def _drop_opencode_cache_control(payload: JsonObject) -> JsonObject:

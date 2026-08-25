@@ -123,6 +123,21 @@ def test_chat_sse_preserves_raw_arguments_stable_ids_usage_and_one_terminal() ->
         encoder.feed(GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=7))
 
 
+def test_chat_sse_exposes_ignored_compatibility_parameters() -> None:
+    """Accepted lossy controls are visible to clients instead of being silently dropped."""
+    encoder = ChatSseEncoder(
+        request_id="request-ignored",
+        model="coding",
+        created_at=123,
+        include_usage=False,
+        ignored_parameters=("logprobs",),
+    )
+
+    payload = _chat_payload(encoder.start()[0])
+
+    assert payload["x-experiential-ignored-parameters"] == ["logprobs"]
+
+
 def test_responses_sse_emits_full_lifecycle_monotonic_sequence_and_exact_arguments() -> None:
     """Responses emits created through completed with exact raw tool bytes and one terminal."""
     request = GatewayRequest(
@@ -159,6 +174,27 @@ def test_responses_sse_emits_full_lifecycle_monotonic_sequence_and_exact_argumen
 
     with pytest.raises(OpenAIProtocolError, match="after its terminal"):
         encoder.feed(GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=7))
+
+
+def test_responses_sse_exposes_ignored_compatibility_parameters() -> None:
+    """Responses advertises accepted lossy controls in every response envelope."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="weather"),),
+        stream=True,
+        ignored_parameters=("reasoning.summary",),
+    )
+    encoder = ResponsesSseEncoder(
+        request_id="request-ignored",
+        model="coding",
+        created_at=123.0,
+        request=request,
+    )
+
+    payload = _responses_payload(encoder.start()[0])
+    response = cast(JsonObject, payload["response"])
+
+    assert response["x-experiential-ignored-parameters"] == ["reasoning.summary"]
 
 
 def test_responses_failure_closes_visible_content_then_emits_one_failed_terminal() -> None:

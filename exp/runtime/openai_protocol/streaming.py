@@ -42,12 +42,14 @@ class ChatSseEncoder:
         model: str,
         created_at: int,
         include_usage: bool,
+        ignored_parameters: tuple[str, ...] = (),
     ) -> None:
         """Initialize one response stream identity and empty event state."""
         self.completion_id = stable_public_id("chatcmpl", request_id)
         self.model = model
         self.created_at = created_at
         self.include_usage = include_usage
+        self.ignored_parameters = ignored_parameters
         self._started = False
         self._terminal = False
         self._last_provider_sequence = -1
@@ -178,6 +180,8 @@ class ChatSseEncoder:
                 }
             ],
         }
+        if self.ignored_parameters:
+            payload["x-experiential-ignored-parameters"] = list(self.ignored_parameters)
         return _chat_data(payload)
 
     def _usage_chunk(self, usage: GatewayUsage) -> str:
@@ -601,6 +605,8 @@ class ResponsesSseEncoder:
             "previous_response_id": self.request.previous_response_id,
             "usage": _responses_usage(self._usage) if status != "in_progress" else None,
         }
+        if self.request.ignored_parameters:
+            payload["x-experiential-ignored-parameters"] = list(self.request.ignored_parameters)
         return payload
 
     def _event(self, event_type: str, fields: JsonObject) -> str:
