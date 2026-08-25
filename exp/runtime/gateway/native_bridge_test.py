@@ -1,4 +1,4 @@
-"""Tests for the native-engine control plane and Rust/Python parity fixtures."""
+"""Tests for the native-engine control plane and its committed golden fixtures."""
 
 from __future__ import annotations
 
@@ -776,7 +776,7 @@ def test_pool_claim_scope_resolves_natively(tmp_path: Path) -> None:
 
 def test_claim_scope_matches_the_python_replay_key(tmp_path: Path) -> None:
     """The scope carries the same hashed caller operation and canonical digest
-    the python engine computes for its replay key."""
+    the shared decoder computes for the replay key."""
     control, raw_key = _control_plane(tmp_path)
     scope = _claim_scope(control, raw_key, _chat_body(), idempotency_key="operation-one")
     assert scope["surface"] == "chat_completions"
@@ -785,7 +785,7 @@ def test_claim_scope_matches_the_python_replay_key(tmp_path: Path) -> None:
     assert repeat == scope
     # The caller operation hashes identically through either header; the
     # canonical request digest covers the decoded request, which records
-    # which header carried it, exactly as the python engine canonicalizes.
+    # which header carried it, exactly as the shared decoder canonicalizes.
     via_client_id = _claim_scope(
         control,
         raw_key,
@@ -822,7 +822,7 @@ def test_admit_escalates_host_ineligible_route_before_accounting(tmp_path: Path)
 
     admission = _admit(control, raw_key, _chat_body(), idempotency_key="shared-replay")
 
-    assert admission == {"escalate": "host policy requires the python execution engine"}
+    assert admission == {"escalate": "host policy does not permit native execution of this route"}
     assert [request.idempotency_key for request in seen_requests] == ["shared-replay"]
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 0
@@ -878,7 +878,7 @@ def test_keyed_admissions_enforce_the_durable_ledger_idempotency_rows(
 ) -> None:
     """With the process-local replay store empty (as after a restart), the
     durable ledger fails a repeated caller operation closed exactly as the
-    python engine does: a different body conflicts and an identical body
+    shared ledger enforces: a different body conflicts and an identical body
     reports the replay unavailable, never a second provider dispatch."""
     control, raw_key = _control_plane(tmp_path)
     admission = _admit_started(control, raw_key, _chat_body(), idempotency_key="durable-op")
@@ -1917,7 +1917,7 @@ def test_project_alias_embedding_failure_serves_the_frozen_baseline_natively(
 
     The unreachable provider endpoint makes the request-time embed fail, so
     the frozen conservative baseline serves the request with content-free
-    accounting instead of escalating to the python engine.
+    accounting instead of failing the admission.
     """
     import sqlite3
 
@@ -1974,7 +1974,7 @@ def test_project_alias_native_selection_matches_the_python_resolver(tmp_path: Pa
 
     A loopback embeddings endpoint gives both engines the same frozen policy
     inputs, so the deployment the native bridge admits equals the deployment
-    the python engine's async route resolution selects.
+    the shared async route resolution selects.
     """
     import asyncio
     import threading
@@ -2164,41 +2164,18 @@ def _messages_fixture_json() -> str:
     )
 
 
-def test_rust_messages_sse_frames_match_python_and_the_committed_golden() -> None:
-    """Rust Messages SSE frames equal the python encoder and the golden fixture.
-
-    The committed golden frames are the durable contract: they outlive the
-    python encoder, which is deprecated and scheduled for removal with the
-    python data plane.
-    """
+def test_rust_messages_sse_frames_match_the_committed_golden() -> None:
+    """Rust Messages SSE frames equal the committed golden fixture."""
     native = pytest.importorskip("exp_gateway_native")
-    from exp.runtime.anthropic_protocol.encoding_test import encode, tool_stream_events
 
     actual = native.encode_messages_fixture("request-abc", "coding", _messages_fixture_json())
     assert list(actual) == _parity_golden("messages_tool_stream_frames")
-    assert tuple(actual) == encode(tool_stream_events())
 
 
 def test_rust_messages_failure_frames_match_the_committed_golden() -> None:
     """A failed Messages terminal equals the committed golden error event."""
     native = pytest.importorskip("exp_gateway_native")
-    from exp.runtime.anthropic_protocol.encoding import MessagesSseEncoder
 
-    events = [
-        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=0, text_delta="oops"),
-        GatewayEvent(
-            kind=GatewayEventKind.FAILED,
-            sequence_number=1,
-            failure=GatewayFailure(
-                failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
-                safe_message="provider stream failed",
-            ),
-        ),
-    ]
-    encoder = MessagesSseEncoder(request_id="request-abc", model="coding")
-    expected = list(encoder.start())
-    for event in events:
-        expected.extend(encoder.feed(event))
     fixture = json.dumps(
         [
             {"kind": "text_delta", "text": "oops"},
@@ -2207,87 +2184,45 @@ def test_rust_messages_failure_frames_match_the_committed_golden() -> None:
     )
     actual = native.encode_messages_fixture("request-abc", "coding", fixture)
     assert list(actual) == _parity_golden("messages_failure_frames")
-    assert list(actual) == expected
 
 
-def test_rust_messages_completed_body_matches_python_and_the_committed_golden() -> None:
-    """The Rust non-streaming Anthropic message equals the python body."""
+def test_rust_messages_completed_body_matches_the_committed_golden() -> None:
+    """The Rust non-streaming Anthropic message equals the committed golden body."""
     native = pytest.importorskip("exp_gateway_native")
-    from exp.runtime.anthropic_protocol.encoding import completed_messages_body
-    from exp.runtime.anthropic_protocol.encoding_test import tool_stream_events
 
     actual = native.completed_messages_fixture("request-abc", "coding", _messages_fixture_json())
     assert actual == _parity_golden("messages_tool_stream_body")
-    expected = completed_messages_body(
-        request_id="request-abc", model="coding", events=tool_stream_events()
-    )
-    assert actual == json.dumps(expected, separators=(",", ":"), ensure_ascii=False)
 
 
 def test_rust_anthropic_error_translation_matches_the_committed_goldens() -> None:
     """The Rust Anthropic error envelope equals the committed translations.
 
     Every failure class is exercised through one committed OpenAI-shaped
-    input and its committed Anthropic envelope (generated from the retired
-    python translation at freeze time), plus one param-carrying protocol
-    error to prove the param folding. The committed inputs also pin the
-    OpenAI-side taxonomy for classes whose live rendering is wall-clock
+    input and its committed Anthropic envelope, plus one param-carrying
+    protocol error to prove the param folding. The committed inputs also pin
+    the OpenAI-side taxonomy for classes whose live rendering is wall-clock
     dependent (quota reset boundaries).
     """
     native = pytest.importorskip("exp_gateway_native")
-    from exp.runtime.anthropic_protocol.errors import anthropic_error_body
 
     inputs = cast("dict[str, JsonObject]", _parity_golden("anthropic_error_inputs"))
     envelopes = cast("dict[str, JsonObject]", _parity_golden("anthropic_error_envelopes"))
     assert set(inputs) == {failure_class.value for failure_class in GatewayFailureClass}
     assert set(envelopes) == set(inputs)
 
-    def _rebuilt(payload: JsonObject) -> OpenAIProtocolError:
-        """Reconstruct one committed OpenAI-shaped error for the python check."""
-        error_type = cast("_PublicErrorType", payload["error_type"])
-        return OpenAIProtocolError(
-            status_code=cast("int", payload["status_code"]),
-            code=cast("str", payload["code"]),
-            message=cast("str", payload["message"]),
-            error_type=error_type,
-            param=cast("str | None", payload["param"]),
-            retry_after_seconds=cast("int | None", payload["retry_after_seconds"]),
-        )
-
     for failure_class in GatewayFailureClass:
         payload = inputs[failure_class.value]
         translated = json.loads(native.anthropic_error_fixture(json.dumps(payload)))
         assert translated == envelopes[failure_class.value], failure_class
-        assert translated == anthropic_error_body(_rebuilt(payload)), failure_class
     with_param = cast("JsonObject", _parity_golden("anthropic_error_with_param_input"))
     translated = json.loads(native.anthropic_error_fixture(json.dumps(with_param)))
     assert translated == _parity_golden("anthropic_error_with_param")
-    assert translated == anthropic_error_body(_rebuilt(with_param))
 
 
 def test_rust_messages_body_preserves_interleaved_block_order() -> None:
-    """Both engines keep provider block order in the non-streaming body."""
+    """The native body keeps provider block order in the non-streaming shape."""
     native = pytest.importorskip("exp_gateway_native")
-    from exp.common.models.model import ToolCall
-    from exp.runtime.anthropic_protocol.encoding import completed_messages_body
 
-    events = (
-        GatewayEvent(
-            kind=GatewayEventKind.TOOL_CALL_STARTED,
-            sequence_number=0,
-            tool_call_index=0,
-            tool_call_id="call-1",
-            tool_name="search",
-        ),
-        GatewayEvent(
-            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
-            sequence_number=1,
-            tool_call_index=0,
-            tool_call=ToolCall(call_id="call-1", name="search", arguments={}, raw_arguments="{}"),
-        ),
-        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=2, text_delta="after"),
-        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=3),
-    )
     fixture = json.dumps(
         [
             {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
@@ -2304,49 +2239,19 @@ def test_rust_messages_body_preserves_interleaved_block_order() -> None:
     )
     actual = native.completed_messages_fixture("request-abc", "coding", fixture)
     assert actual == _parity_golden("messages_block_order_body")
-    expected = completed_messages_body(request_id="request-abc", model="coding", events=events)
-    assert actual == json.dumps(expected, separators=(",", ":"), ensure_ascii=False)
     assert json.loads(actual)["content"][0]["type"] == "tool_use"
     assert json.loads(actual)["content"][1] == {"type": "text", "text": "after"}
 
 
-def test_rust_messages_deferred_tool_completion_matches_python() -> None:
-    """Deferred completions (OpenAI-compatible [DONE] ordering) stay in parity.
+def test_rust_messages_deferred_tool_completion_matches_the_committed_goldens() -> None:
+    """Deferred completions (OpenAI-compatible [DONE] ordering) hold parity.
 
     Text arriving between a tool's arguments and its completion must stream
-    and aggregate identically on both engines, with the tool block anchored
-    at its start position.
+    and aggregate exactly as the committed goldens recorded, with the tool
+    block anchored at its start position.
     """
     native = pytest.importorskip("exp_gateway_native")
-    from exp.common.models.model import ToolCall
-    from exp.runtime.anthropic_protocol.encoding import (
-        MessagesSseEncoder,
-        completed_messages_body,
-    )
 
-    events = (
-        GatewayEvent(
-            kind=GatewayEventKind.TOOL_CALL_STARTED,
-            sequence_number=0,
-            tool_call_index=0,
-            tool_call_id="call-1",
-            tool_name="search",
-        ),
-        GatewayEvent(
-            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
-            sequence_number=1,
-            tool_call_index=0,
-            raw_arguments_delta="{}",
-        ),
-        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=2, text_delta="after"),
-        GatewayEvent(
-            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
-            sequence_number=3,
-            tool_call_index=0,
-            tool_call=ToolCall(call_id="call-1", name="search", arguments={}, raw_arguments="{}"),
-        ),
-        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=4),
-    )
     fixture = json.dumps(
         [
             {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
@@ -2362,32 +2267,20 @@ def test_rust_messages_deferred_tool_completion_matches_python() -> None:
             {"kind": "completed"},
         ]
     )
-    encoder = MessagesSseEncoder(request_id="request-abc", model="coding")
-    expected_frames = list(encoder.start())
-    for event in events:
-        expected_frames.extend(encoder.feed(event))
     actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
     assert list(actual_frames) == _parity_golden("messages_deferred_frames")
-    assert list(actual_frames) == expected_frames
-    expected_body = completed_messages_body(request_id="request-abc", model="coding", events=events)
     actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
     assert actual_body == _parity_golden("messages_deferred_body")
-    assert actual_body == json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False)
 
 
-def test_rust_messages_interleaved_parallel_tools_match_python_and_golden() -> None:
-    """Interleaved parallel tool calls stay in byte parity across engines.
+def test_rust_messages_interleaved_parallel_tools_match_the_goldens() -> None:
+    """Interleaved parallel tool calls stay in byte parity with the goldens.
 
     The canonical stream may legally interleave tool A arguments, tool B
-    start, and more tool A arguments; both encoders must schedule blocks in
+    start, and more tool A arguments; the encoder must schedule blocks in
     start order, streaming the open block live and buffering the rest.
     """
     native = pytest.importorskip("exp_gateway_native")
-    from exp.runtime.anthropic_protocol.encoding import completed_messages_body
-    from exp.runtime.anthropic_protocol.encoding_test import (
-        encode,
-        interleaved_parallel_tool_events,
-    )
 
     fixture = json.dumps(
         [
@@ -2416,10 +2309,5 @@ def test_rust_messages_interleaved_parallel_tools_match_python_and_golden() -> N
     )
     actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
     assert list(actual_frames) == _parity_golden("messages_interleaved_frames")
-    assert tuple(actual_frames) == encode(interleaved_parallel_tool_events())
     actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
     assert actual_body == _parity_golden("messages_interleaved_body")
-    expected_body = completed_messages_body(
-        request_id="request-abc", model="coding", events=interleaved_parallel_tool_events()
-    )
-    assert actual_body == json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False)

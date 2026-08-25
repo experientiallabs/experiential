@@ -96,9 +96,6 @@ if TYPE_CHECKING:
     from exp.optimize.router.spend import ProviderSpendEntry as ProviderSpendEntry
     from exp.optimize.router.spend import ProviderSpendLedger as ProviderSpendLedger
     from exp.optimize.router.spend import ProviderSpendStatus as ProviderSpendStatus
-    from exp.runtime.gateway.composition import GatewayRuntime as GatewayRuntime
-    from exp.runtime.gateway.composition import GatewayRuntimeConfig as GatewayRuntimeConfig
-    from exp.runtime.gateway.composition import create_gateway_runtime as create_gateway_runtime
     from exp.runtime.models import RuntimeModelCatalog as RuntimeModelCatalog
     from exp.runtime.router.economics import (
         BillingSourceEconomics as BillingSourceEconomics,
@@ -156,9 +153,6 @@ _EXPORT_MODULES = {
     "ResolvedDiscoveredModel": "exp.common.models",
     "resolve_discovered_model": "exp.common.models",
     "RuntimeModelCatalog": "exp.runtime.models",
-    "GatewayRuntime": "exp.runtime.gateway.composition",
-    "GatewayRuntimeConfig": "exp.runtime.gateway.composition",
-    "create_gateway_runtime": "exp.runtime.gateway.composition",
     "ExportedProjectBundle": "exp.common.project",
     "export_project_bundle": "exp.common.project",
     "restore_project_bundle": "exp.common.project",

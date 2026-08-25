@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction
-
-if TYPE_CHECKING:
-    from exp.runtime.anthropic_protocol.encoding import MessagesSseEncoder
 from exp.runtime.gateway.contracts import (
-    AuthorizationSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
@@ -21,56 +17,9 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.streaming import (
-    ChatSseEncoder,
     ResponsesSseEncoder,
     stable_public_id,
 )
-
-
-def stream_encoder(
-    *,
-    request: GatewayRequest,
-    authorization: AuthorizationSnapshot,
-    created_at: float,
-) -> ChatSseEncoder | ResponsesSseEncoder | MessagesSseEncoder:
-    """Create the surface-specific stateful SSE encoder."""
-    if request.surface == GatewayApiSurface.CHAT_COMPLETIONS:
-        return ChatSseEncoder(
-            request_id=authorization.request_id,
-            model=authorization.alias,
-            created_at=int(created_at),
-            include_usage=request.include_usage,
-        )
-    if request.surface == GatewayApiSurface.MESSAGES:
-        # Imported here to break the real package cycle: this module is
-        # imported by the openai_protocol package initializer, and the
-        # anthropic_protocol modules import openai_protocol errors and IDs.
-        from exp.runtime.anthropic_protocol.encoding import MessagesSseEncoder
-
-        return MessagesSseEncoder(
-            request_id=authorization.request_id,
-            model=authorization.alias,
-        )
-    return ResponsesSseEncoder(
-        request_id=authorization.request_id,
-        model=authorization.alias,
-        created_at=created_at,
-        request=request,
-    )
-
-
-def capture_frame(
-    buffer: bytearray,
-    data: bytes,
-    replayable: bool,
-    *,
-    maximum_bytes: int,
-) -> bool:
-    """Append one frame while it remains within the replay capture ceiling."""
-    if not replayable or len(buffer) + len(data) > maximum_bytes:
-        return False
-    buffer.extend(data)
-    return True
 
 
 def is_terminal(event: GatewayEvent) -> bool:
@@ -90,12 +39,11 @@ def completed_body(
     created_at: float,
     events: tuple[GatewayEvent, ...],
 ) -> JsonObject:
-    """Build one non-streaming public result from bounded normalized events."""
-    if request.surface == GatewayApiSurface.MESSAGES:
-        # Imported here to break the real package cycle (see stream_encoder).
-        from exp.runtime.anthropic_protocol.encoding import completed_messages_body
+    """Build one non-streaming public result from bounded normalized events.
 
-        return completed_messages_body(request_id=request_id, model=model, events=events)
+    The Anthropic Messages surface is rendered by the native data plane, so
+    this builder serves only the OpenAI Chat Completions and Responses shapes.
+    """
     if request.surface == GatewayApiSurface.RESPONSES:
         encoder = ResponsesSseEncoder(
             request_id=request_id,

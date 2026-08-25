@@ -7,7 +7,7 @@ from exp.runtime.openai_protocol.requests import (
     decode_chat,
     decode_responses,
 )
-from exp.runtime.openai_protocol.response import completed_body, stream_encoder
+from exp.runtime.openai_protocol.response import completed_body
 
 __all__ = [
     "DecodedGatewayRequest",
@@ -17,5 +17,4 @@ __all__ = [
     "completed_body",
     "model_request",
     "model_response_events",
-    "stream_encoder",
 ]

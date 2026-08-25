@@ -61,11 +61,6 @@ from exp.optimize.router.hosted import (
     run_hosted_router_workflow,
 )
 from exp.optimize.router.spend import ProviderSpendEntry, ProviderSpendLedger
-from exp.runtime.gateway.composition import (
-    GatewayRuntime,
-    GatewayRuntimeConfig,
-    create_gateway_runtime,
-)
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.router.economics import (
     BillingSourceEconomics,
@@ -154,14 +149,6 @@ def test_public_api_matches_quickstart() -> None:
     assert exp.ResolvedDiscoveredModel is ResolvedDiscoveredModel
     assert exp.resolve_discovered_model is resolve_discovered_model
     assert exp.RuntimeModelCatalog is RuntimeModelCatalog
-    assert exp.GatewayRuntime is GatewayRuntime
-    assert exp.GatewayRuntimeConfig is GatewayRuntimeConfig
-    assert exp.create_gateway_runtime is create_gateway_runtime
-    assert {
-        "GatewayRuntime",
-        "GatewayRuntimeConfig",
-        "create_gateway_runtime",
-    }.issubset(exp.__all__)
     assert "ledger" in signature(FileHostedAttemptAuthorityStore.commit_stage).parameters
     assert exp.ProviderSpendLedger is ProviderSpendLedger
     assert exp.ProviderSpendEntry is ProviderSpendEntry

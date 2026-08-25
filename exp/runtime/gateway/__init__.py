@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from importlib import import_module
-from typing import TYPE_CHECKING
-
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     CompatibilityDisposition,
@@ -31,7 +28,6 @@ from exp.runtime.gateway.interfaces import (
     GatewayClock,
     GatewayControlStore,
     ProjectTargetResolver,
-    ProviderStream,
     SecretResolver,
 )
 from exp.runtime.gateway.platform import (
@@ -91,17 +87,6 @@ from exp.runtime.gateway.platform import (
     VirtualKeyRecord,
 )
 
-if TYPE_CHECKING:
-    from exp.runtime.gateway.composition import GatewayRuntime as GatewayRuntime
-    from exp.runtime.gateway.composition import GatewayRuntimeConfig as GatewayRuntimeConfig
-    from exp.runtime.gateway.composition import create_gateway_runtime as create_gateway_runtime
-
-_LAZY_EXPORT_MODULES = {
-    "GatewayRuntime": "exp.runtime.gateway.composition",
-    "GatewayRuntimeConfig": "exp.runtime.gateway.composition",
-    "create_gateway_runtime": "exp.runtime.gateway.composition",
-}
-
 __all__ = [
     "ActivateAliasRevisionCommand",
     "AliasMutationCommand",
@@ -136,8 +121,6 @@ __all__ = [
     "GatewayMessage",
     "GatewayPlatform",
     "GatewayRequest",
-    "GatewayRuntime",
-    "GatewayRuntimeConfig",
     "GatewayTarget",
     "GatewayToolDefinition",
     "GatewayUsage",
@@ -172,7 +155,6 @@ __all__ = [
     "ProviderConnectionRevision",
     "ProviderConnectionRevisionAuthority",
     "ProviderRevisionBinding",
-    "ProviderStream",
     "RevokeAliasGrantCommand",
     "RoutingMutationAuthority",
     "RoutingRevisionAuthority",
@@ -184,20 +166,4 @@ __all__ = [
     "UsageAttributionAuthority",
     "UsageTerminalCount",
     "VirtualKeyRecord",
-    "create_gateway_runtime",
 ]
-
-
-def __getattr__(name: str) -> object:
-    """Resolve one composition export without widening gateway import dependencies."""
-    module_name = _LAZY_EXPORT_MODULES.get(name)
-    if module_name is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(import_module(module_name), name)
-    globals()[name] = value
-    return value
-
-
-def __dir__() -> list[str]:
-    """Return eager contracts plus supported lazy composition exports."""
-    return sorted(set(globals()) | set(__all__))

@@ -1,19 +1,15 @@
-"""Shared exception-to-public-error boundary for both gateway data planes.
+"""Exception-to-public-error boundary for the native gateway data plane.
 
 This is the single authority for mapping sanitized protocol, authority,
-routing, and execution failures to their stable public OpenAI errors. The
-HTTP layer (`GatewayService`) and the native engine's control-plane bridge
-both use it, so the two data planes cannot answer the same failure
-differently.
+routing, and execution failures to their stable public OpenAI errors, so
+every control-plane surface answers the same failure identically.
 """
 
 from __future__ import annotations
 
 import asyncio
 
-from exp.runtime.gateway.aggregation import GatewayAggregationOverflowError
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
-from exp.runtime.gateway.execution import GatewayExecutionError
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.ledger import (
     AttemptRejectedError,
@@ -39,9 +35,8 @@ class GatewayDrainingError(RuntimeError):
 def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
     """Map one sanitized boundary failure to its stable public protocol error.
 
-    This is the single authority for exception-to-public-error mapping; the
-    HTTP layer and the native engine's control-plane bridge both use it so
-    the two data planes cannot answer the same failure differently.
+    This is the single authority for exception-to-public-error mapping, so
+    every control-plane surface answers the same failure identically.
 
     Args:
         exception: Protocol, authority, routing, or execution failure.
@@ -101,8 +96,6 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
         # keeps the shape its ledger assigned (for example an injected ledger's
         # dispatch-time key revocation surfacing as authentication).
         error = public_failure_error(exception.failure)
-    elif isinstance(exception, GatewayExecutionError):
-        error = public_failure_error(exception.failure)
     elif isinstance(exception, ProviderDeadlineExceeded):
         error = public_failure_error(
             GatewayFailure(
@@ -135,16 +128,6 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
                 if isinstance(exception, GatewayRoutingError)
                 else "invalid_request_error"
             ),
-        )
-    elif isinstance(exception, GatewayAggregationOverflowError):
-        error = OpenAIProtocolError(
-            status_code=502,
-            code="provider_output_too_large",
-            message=(
-                "Provider output exceeded the gateway response limit. "
-                "Request less output, for example with a lower max_tokens value."
-            ),
-            error_type="api_error",
         )
     elif isinstance(exception, asyncio.CancelledError):
         error = OpenAIProtocolError(

@@ -439,35 +439,67 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
             changed=True,
         )
 
-    async def _preflight() -> None:
-        """Complete the gateway preflight without provider work."""
-
-    def _load_gateway(
+    def _load_components(
         run_root: Path,
         *,
-        graceful_timeout_seconds: float,
         project_repository: object,
         only_aliases: frozenset[str] | None,
     ) -> SimpleNamespace:
-        """Return a serving-ready gateway fixture for the mocked launch seam.
+        """Return loaded-component evidence for the mocked launch seam.
 
         Args:
             run_root: Gateway and artifact root.
-            graceful_timeout_seconds: Requested shutdown drain bound.
             project_repository: Injected selection-only project repository.
             only_aliases: Optional compatibility alias filter.
 
         Returns:
-            Gateway runtime fixture passed to the normal server.
+            Component fixture consumed by the native launch composition.
         """
-        del run_root, graceful_timeout_seconds, project_repository
+        del run_root, project_repository
         assert only_aliases == frozenset({"support"})
+        return SimpleNamespace(unavailable_aliases=())
+
+    def _control_plane(components: object, **_kwargs: object) -> SimpleNamespace:
+        """Return startup-receipt facts without loading real authority.
+
+        Args:
+            components: The mocked loaded components.
+            **_kwargs: Composition-only keyword wiring, unused here.
+
+        Returns:
+            Control-plane fixture consumed by the process host.
+        """
+        del components
         return SimpleNamespace(
-            app=object(),
-            service=SimpleNamespace(preflight=_preflight),
             reconciled_expired_requests=0,
             reconciled_unknown_attempts=0,
+            request_timeout_seconds=120.0,
         )
+
+    def _serve(
+        control_plane: object,
+        *,
+        host: str,
+        port: int,
+        max_active_requests: int = 64,
+        graceful_timeout_seconds: float = 10.0,
+        native_usage_enabled: bool = True,
+        shutdown: object | None = None,
+    ) -> None:
+        """Record the native serving bind instead of blocking the test.
+
+        Args:
+            control_plane: The mocked control plane.
+            host: Requested loopback host.
+            port: Requested loopback port.
+            max_active_requests: Native concurrent-admission bound, unused.
+            graceful_timeout_seconds: Drain bound, unused.
+            native_usage_enabled: Usage-route ownership flag, unused.
+            shutdown: Optional embedder stop handle, unused.
+        """
+        del control_plane, max_active_requests, graceful_timeout_seconds
+        del native_usage_enabled, shutdown
+        served.append((host, port))
 
     with monkeypatch.context() as run_patches:
         run_patches.setattr(
@@ -475,12 +507,20 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
             _prepare_compatibility,
         )
         run_patches.setattr(
-            "exp.runtime.gateway.lifecycle.load_local_gateway",
-            _load_gateway,
+            "exp.runtime.gateway.lifecycle.load_gateway_components",
+            _load_components,
         )
         run_patches.setattr(
-            "uvicorn.run",
-            lambda _app, *, host, port: served.append((host, port)),
+            "exp.runtime.gateway.native_execution.native_serving_blockers",
+            lambda _components: (),
+        )
+        run_patches.setattr(
+            "exp.runtime.gateway.native_bridge.NativeControlPlane",
+            _control_plane,
+        )
+        run_patches.setattr(
+            "exp.runtime.gateway.native_server.serve_native_gateway",
+            _serve,
         )
         run_result = _RUNNER.invoke(
             app,

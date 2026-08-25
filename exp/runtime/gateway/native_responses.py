@@ -1,8 +1,8 @@
 """Responses continuation and envelope helpers for the native control plane.
 
-The native (Rust) data plane serves ``/v1/responses`` with the same shared
-protocol state the python engine uses: one bounded continuation store keyed by
-tenant namespace and episode, the stable public identity derivation, and the
+The native (Rust) data plane serves ``/v1/responses`` over one shared set of
+protocol state rules: one bounded continuation store keyed by tenant
+namespace and episode, the stable public identity derivation, and the
 request-reflecting envelope fields the ``ResponsesSseEncoder`` renders. This
 module keeps those Responses-only rules in one place; the bridge boundary in
 :mod:`exp.runtime.gateway.native_bridge` wraps every raised
@@ -111,10 +111,9 @@ def remember_turn(
 ) -> None:
     """Retain one completed Responses continuation within strict bounds.
 
-    Mirrors the python engine's retention rules: refusal output and empty
-    assistant turns are never retained, and one oversize continuation fails
-    closed with the shared public error before the data plane flushes its
-    terminal frames.
+    Retention is strict: refusal output and empty assistant turns are never
+    retained, and one oversize continuation fails closed with the shared
+    public error before the data plane flushes its terminal frames.
 
     Args:
         continuations: The gateway's shared bounded continuation store.

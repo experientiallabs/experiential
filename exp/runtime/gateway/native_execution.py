@@ -4,7 +4,7 @@ The native (Rust) engine executes the certified deployment waterfall itself,
 but every policy decision stays here: the ordered wire route is resolved and
 built per deployment at admission, each physical dispatch is reserved through
 ``start_attempt`` immediately before network work, and candidate selection
-mirrors the python executor exactly (attempt caps, per-failure retry and
+enforces the frozen waterfall semantics (attempt caps, per-failure retry and
 failover eligibility, deployment health circuits with bounded last-resort and
 forced claims, and per-deployment budget skipping). The bridge module owns the
 boundary encoding; this module owns the frozen semantics.
@@ -24,16 +24,12 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
-
-# The executor's identity check is the authoritative pre-dispatch invariant;
-# the native path must enforce the same one, so the private helper is shared.
-from exp.runtime.gateway.execution import _require_deployment_identity  # noqa: PLC2701
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
-from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
@@ -41,13 +37,13 @@ from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeW
 if TYPE_CHECKING:
     from exp.runtime.gateway.lifecycle import LocalGatewayComponents
 
-# The frozen native retry policy, mirroring `GatewayExecutor`'s defaults.
+# The frozen native retry policy.
 MAXIMUM_TOTAL_ATTEMPTS = 8
 MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
 
 
 class NativeDialectUnavailableError(RuntimeError):
-    """The resolved provider has no native dialect; python must serve it."""
+    """The resolved provider has no native dialect, so the route cannot serve."""
 
 
 @dataclass
@@ -56,7 +52,7 @@ class InflightRequest:
 
     The entry carries everything ``start_attempt`` needs to reserve each
     physical dispatch (the frozen route, the provider request for budget
-    sizing, and the executor-parity attempt counters) plus the retention
+    sizing, and the per-deployment attempt counters) plus the retention
     facts the terminal settlement consumes.
     """
 
@@ -86,6 +82,37 @@ class InflightRequest:
             self.attempt_counts = [0 for _ in self.route.deployments]
 
 
+def _require_deployment_identity(
+    deployment: ExactModelDeployment,
+    resolved: ResolvedModel,
+) -> None:
+    """Fail before accounting or network work when runtime resolution drifts from authority.
+
+    A catalog record may pin a response-only served-model identity that differs from the
+    requested provider model. The frozen deployment names the requested model, so either the
+    resolved requested identity or the pinned served identity may match it.
+
+    Args:
+        deployment: Frozen certified deployment from the authorized catalog.
+        resolved: Runtime resolution of the deployment's source alias.
+
+    Raises:
+        ValueError: The resolved runtime client differs from the frozen deployment.
+    """
+    if (
+        resolved.alias != deployment.source_alias
+        or resolved.snapshot.provider != deployment.provider
+        or deployment.provider_model not in {resolved.snapshot.model_id, resolved.served_model_id}
+        or resolved.snapshot.revision != deployment.revision
+        or resolved.snapshot.connection_sha256 != deployment.connection_sha256
+        or resolved.snapshot.billing_source != deployment.billing_source
+        or (
+            deployment.capabilities is not None and resolved.capabilities != deployment.capabilities
+        )
+    ):
+        raise ValueError("resolved runtime client differs from the frozen gateway deployment")
+
+
 def deployment_health_key(
     authorization: AuthorizationSnapshot,
     deployment: ExactModelDeployment,
@@ -105,8 +132,8 @@ def claim_route_from(
 ) -> int | None:
     """Claim the first healthy later route, a bounded probe, or a forced dispatch.
 
-    Mirrors the executor's ``_claim_from`` so a request skipping an exhausted
-    or failed route can still probe a suppressed fallback instead of failing
+    A request skipping an exhausted or failed route can still probe a
+    suppressed fallback instead of failing
     for the whole circuit cooldown after the provider has recovered. When
     every healthy claim and bounded probe is unavailable, the first
     non-throttled route is dispatched anyway, subject only to the request
@@ -146,10 +173,10 @@ def next_route_candidate(
 ) -> int | None:
     """Choose a safe retry or later exact deployment without changing logical model.
 
-    Mirrors the executor's ``_next_candidate``: the hard total cap ends the
-    ladder, a retryable failure redials the same deployment while its bounded
-    count and a health claim allow, and otherwise a failover-eligible failure
-    (or an opted-in typed refusal) advances to the next claimable deployment.
+    The hard total cap ends the ladder, a retryable failure redials the same
+    deployment while its bounded count and a health claim allow, and otherwise
+    a failover-eligible failure (or an opted-in typed refusal) advances to the
+    next claimable deployment.
 
     Args:
         health: Revision-isolated circuit and throttle registry.
@@ -187,8 +214,8 @@ def resolve_route_profiles(
     """Resolve every route deployment's public wire profile for the data plane.
 
     Every deployment is resolved and identity-checked before any ledger write
-    or billable dispatch, mirroring the executor's whole-route resolution.
-    The check is structural (``NativeWireClient``), not a concrete HTTP base
+    or billable dispatch, so a drifted runtime catalog can never bill against
+    a frozen route. The check is structural (``NativeWireClient``), not a concrete HTTP base
     class: a non-HTTP client such as the bounded Bedrock adapter satisfies it
     too as long as it implements ``gateway_wire_profile``.
 
@@ -205,10 +232,8 @@ def resolve_route_profiles(
 
     Raises:
         NativeDialectUnavailableError: A route deployment's provider has no
-            native-dialect implementation; the python engine serves the
-            request.
-        GatewayRoutingError: A resolved client cannot stream or the
-            authorized catalog is not loaded.
+            native-dialect implementation.
+        GatewayRoutingError: The authorized catalog is not loaded.
         ValueError: A resolved client drifts from the frozen deployment.
     """
     authorization = route.snapshot.authorization
@@ -220,8 +245,6 @@ def resolve_route_profiles(
         resolved = catalog.resolve(deployment.source_alias)
         _require_deployment_identity(deployment, resolved)
         client = resolved.client
-        if getattr(client, "stream", None) is None:
-            raise GatewayRoutingError("resolved gateway deployment has no streaming capability")
         if not isinstance(client, NativeWireClient):
             raise NativeDialectUnavailableError(
                 f"provider {deployment.provider!r} has no native wire profile"
@@ -281,11 +304,11 @@ def deployment_wire_entry(
 def native_serving_blockers(components: LocalGatewayComponents) -> tuple[str, ...]:
     """Name every granted alias the native engine cannot serve, with reasons.
 
-    The rust-only launch runs this before binding the public socket: every
+    The launch runs this before binding the public socket: every
     deployment reachable from a granted alias revision (direct pools and
     project candidates alike live in the alias's catalog snapshot) must
-    resolve to a provider client with a native wire dialect, since no python
-    fallback engine exists to serve an escalated request.
+    resolve to a provider client with a native wire dialect, since no other
+    engine exists to serve the request.
 
     Args:
         components: Loaded local gateway components.

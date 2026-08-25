@@ -378,8 +378,8 @@ class BoundedContinuationStore:
     """Tenant-isolated Responses continuation with count, byte, and TTL limits.
 
     Guarded by one non-async lock held only for in-memory bookkeeping, so the
-    same instance is shared safely between the async python engine and the
-    native data plane's control-plane worker threads.
+    same instance is shared safely between async callers and the native data
+    plane's control-plane worker threads.
     """
 
     def __init__(

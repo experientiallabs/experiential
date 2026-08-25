@@ -144,7 +144,7 @@ def _wait_live(port: int, child: subprocess.Popen[bytes]) -> None:
     raise AssertionError("native engine did not become live in time")
 
 
-def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
+def test_native_metrics_snapshot_moves_for_served_keyed_and_escalated_traffic(
     tmp_path: Path,
 ) -> None:
     """Served, replay-keyed, and escalated traffic all land in the snapshot."""

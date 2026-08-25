@@ -33,7 +33,6 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "boto3",
         "botocore",
         "click",
-        "fastapi",
         "filelock",
         "httpx",
         "numpy",
@@ -43,7 +42,6 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "rich",
         "tomli-w",
         "typer",
-        "uvicorn",
     }
 )
 REQUIRED_WHEEL_MODULES = frozenset(
@@ -55,13 +53,11 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "exp/common/judging/review.py",
         "exp/common/models/model.py",
         "exp/runtime/environments/local.py",
-        "exp/runtime/gateway/composition.py",
         "exp/runtime/gateway/lifecycle.py",
         "exp/runtime/gateway/budgets.py",
         "exp/runtime/gateway/ledger.py",
         "exp/runtime/openai_protocol/requests.py",
         "exp/runtime/gateway/provider_certification.py",
-        "exp/runtime/gateway/service.py",
         "exp/runtime/gateway/usage.py",
         "exp/runtime/models/registry.py",
         "exp/runtime/router/application.py",
@@ -456,7 +452,6 @@ def _installed_release_driver() -> None:
     import httpx
     import numpy as np
     import openai
-    import uvicorn
     from openai import AsyncOpenAI, OpenAI
     from openai.types.responses import FunctionToolParam
 
@@ -496,8 +491,10 @@ def _installed_release_driver() -> None:
         upsert_connection,
         upsert_singleton_deployment,
     )
-    from exp.runtime.gateway.lifecycle import load_local_gateway
+    from exp.runtime.gateway.lifecycle import load_gateway_components
     from exp.runtime.gateway.management import GatewayManagement
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
+    from exp.runtime.gateway.native_server import serve_native_gateway
     from exp.runtime.gateway.project_activation import ProjectActivation
     from exp.runtime.models import (
         CatalogRoleName,
@@ -2326,29 +2323,50 @@ def _installed_release_driver() -> None:
     project_provider_before_load = state.snapshot()
     project_primary_before = state.count_containing("project-primary-model")
     project_secondary_before = state.count_containing("project-secondary-model")
-    installed_project_gateway = load_local_gateway(
+    import exp_gateway_native
+
+    project_components = load_gateway_components(
         project_root,
-        graceful_timeout_seconds=2,
         environment={"P9_LOOPBACK_PROVIDER_KEY": provider_secret},
         project_repository=InstalledActivationRepository(),
     )
     assert state.snapshot() == project_provider_before_load
     project_port = unused_loopback_port()
-    project_server = uvicorn.Server(
-        uvicorn.Config(
-            installed_project_gateway.app,
-            host="127.0.0.1",
-            port=project_port,
-            log_level="critical",
-            access_log=False,
-        )
+    project_control_plane = NativeControlPlane(
+        project_components,
+        data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
     )
-    project_thread = threading.Thread(target=project_server.run, daemon=True)
+    project_shutdown = exp_gateway_native.shutdown_handle()
+    project_serve_errors: list[BaseException] = []
+
+    def _serve_project_gateway() -> None:
+        """Run the blocking native project gateway, retaining any failure."""
+        try:
+            serve_native_gateway(
+                project_control_plane,
+                host="127.0.0.1",
+                port=project_port,
+                shutdown=project_shutdown,
+            )
+        except BaseException as error:  # noqa: BLE001 - surfaced after join.
+            project_serve_errors.append(error)
+
+    project_thread = threading.Thread(target=_serve_project_gateway, daemon=True)
     project_thread.start()
     project_deadline = time.monotonic() + 20
-    while not project_server.started and time.monotonic() < project_deadline:
+    project_live = False
+    while time.monotonic() < project_deadline:
+        assert project_thread.is_alive(), f"project gateway exited: {project_serve_errors}"
+        try:
+            live = httpx.get(f"http://127.0.0.1:{project_port}/health/live", timeout=1.0)
+        except httpx.HTTPError:
+            time.sleep(0.01)
+            continue
+        if live.status_code == 200:
+            project_live = True
+            break
         time.sleep(0.01)
-    assert project_server.started
+    assert project_live
     assert state.snapshot() == project_provider_before_load
     try:
         with OpenAI(
@@ -2362,9 +2380,11 @@ def _installed_release_driver() -> None:
             )
         assert project_response.choices[0].message.content == project_response_canary
     finally:
-        project_server.should_exit = True
+        project_shutdown.request_shutdown()
         project_thread.join(timeout=10)
+        project_components.write_ledger.close()
     assert not project_thread.is_alive()
+    assert project_serve_errors == []
     assert state.count_containing("project-primary-model") == project_primary_before + 2
     assert state.count_containing("project-secondary-model") == project_secondary_before + 1
     assert learned_client.embed_calls == 0

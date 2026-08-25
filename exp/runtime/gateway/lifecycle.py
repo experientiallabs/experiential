@@ -1,4 +1,4 @@
-"""Local gateway composition, readiness, usage routes, and process ownership."""
+"""Local gateway component loading, hot-reloadable authority, and process ownership."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from datetime import timedelta
 from pathlib import Path
 from typing import cast
 
-from fastapi import FastAPI
 from filelock import FileLock, Timeout
 
 from exp.common.config import ARTIFACT_DIR
@@ -22,12 +21,6 @@ from exp.common.models import (
     NormalizedGatewayCatalog,
     normalize_gateway_catalog,
 )
-from exp.runtime.gateway.composition import (
-    GatewayLifecycleState,
-    GatewayRuntime,
-    GatewayRuntimeConfig,
-    create_gateway_runtime,
-)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -36,10 +29,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     ProjectTarget,
 )
-from exp.runtime.gateway.execution import GatewayExecutor
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
-from exp.runtime.gateway.guardrails.config import load_guardrail_engine
-from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
@@ -54,12 +44,9 @@ from exp.runtime.gateway.routing import (
     RouterProjectTargetResolver,
     SelectionWorkerPool,
 )
-from exp.runtime.gateway.service import GatewayService
-from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore, SystemGatewayClock
-from exp.runtime.gateway.usage import read_usage_report
+from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import MissingModelCredentialError, ModelCredentialError
-from exp.runtime.openai_protocol.state import ResponseContinuationStore, ResponseReplayStore
 from exp.runtime.router.errors import RouterApplicationError
 from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntimeIntegrityError
 
@@ -71,54 +58,6 @@ _logger = logging.getLogger(__name__)
 
 class GatewayLifecycleError(ValueError):
     """Local gateway configuration cannot form one ready execution snapshot."""
-
-
-@dataclass(frozen=True)
-class LocalGatewayRuntime:
-    """Fully composed local service and its loopback application."""
-
-    runtime: GatewayRuntime
-    reconciled_expired_requests: int
-    reconciled_unknown_attempts: int
-    write_ledger: GroupCommitAttemptLedger | None = None
-    selection_workers: SelectionWorkerPool | None = None
-    unavailable_aliases: tuple[tuple[str, str], ...] = ()
-
-    @property
-    def app(self) -> FastAPI:
-        """Return the shared managed FastAPI application."""
-        return self.runtime.app
-
-    @property
-    def service(self) -> GatewayService:
-        """Return the shared injected gateway service."""
-        return self.runtime.service
-
-    @property
-    def state(self) -> GatewayLifecycleState:
-        """Return the shared process-local readiness state."""
-        return self.runtime.state
-
-    async def preflight(self) -> ExecutionSnapshot:
-        """Preflight the shared gateway composition seam."""
-        return await self.runtime.preflight()
-
-    async def readiness(self) -> bool:
-        """Return current shared runtime readiness."""
-        return await self.runtime.readiness()
-
-    async def drain(self, *, timeout_seconds: float | None = None) -> bool:
-        """Drain the shared runtime within the selected bound."""
-        return await self.runtime.drain(timeout_seconds=timeout_seconds)
-
-    async def shutdown(self) -> bool:
-        """Shut down the runtime, the selection lane, and the drained ledger writer."""
-        stopped = await self.runtime.shutdown()
-        if self.selection_workers is not None:
-            self.selection_workers.shutdown()
-        if self.write_ledger is not None:
-            self.write_ledger.close()
-        return stopped
 
 
 @dataclass(frozen=True)
@@ -150,7 +89,6 @@ class _AliasAuthorityReloader:
         loader: Callable[[], _AliasAuthorityState],
         state: _AliasAuthorityState,
         routes: CatalogRouteResolver,
-        executor: GatewayExecutor,
         selection_workers: SelectionWorkerPool,
         retention_seconds: float = _RETIRED_REVISION_RETENTION_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
@@ -161,14 +99,12 @@ class _AliasAuthorityReloader:
             loader: Builds one complete candidate generation from current authority.
             state: Fully validated startup generation.
             routes: Shared route resolver whose catalog index this reloader swaps.
-            executor: Shared executor whose runtime catalogs this reloader swaps.
             selection_workers: Process-wide selection lane reused by every generation.
             retention_seconds: How long retired revisions stay resolvable.
             monotonic: Monotonic clock used for retirement bookkeeping.
         """
         self._loader = loader
         self._routes = routes
-        self._executor = executor
         self._selection_workers = selection_workers
         self._retention_seconds = retention_seconds
         self._monotonic = monotonic
@@ -263,7 +199,6 @@ class _AliasAuthorityReloader:
             proof=loaded.proof,
             unavailable_aliases=loaded.unavailable_aliases,
         )
-        self._executor.swap_catalogs(runtime)
         self._routes.swap_catalogs(
             normalized,
             project_resolver=_project_resolver(
@@ -396,11 +331,10 @@ def gateway_instance_lock(root: Path, *, port: int) -> Iterator[None]:
 
 @dataclass(frozen=True)
 class LocalGatewayComponents:
-    """Loaded authority, accounting, and routing shared by both gateway engines.
+    """Loaded authority, accounting, and routing for the native gateway engine.
 
-    The Python engine composes these into a ``GatewayRuntime``; the Rust
-    engine's control-plane bridge uses them directly for admission and
-    settlement over the same SQLite state and the same hot-reloadable
+    The native engine's control-plane bridge uses these directly for
+    admission and settlement over shared SQLite state and hot-reloadable
     authority generations.
     """
 
@@ -409,7 +343,6 @@ class LocalGatewayComponents:
     ledger: SQLiteAttemptLedger
     write_ledger: GroupCommitAttemptLedger
     routes: CatalogRouteResolver
-    executor: GatewayExecutor
     reloader: _AliasAuthorityReloader
     selection_workers: SelectionWorkerPool
     reconciled_expired_requests: int
@@ -463,7 +396,7 @@ def load_gateway_components(
         only_aliases: Optional exact public aliases to expose.
 
     Returns:
-        Hot-reloadable authority, ledger, routes, executor, and startup proof.
+        Hot-reloadable authority, ledger, routes, and startup proof.
 
     Raises:
         GatewayLifecycleError: No granted alias can form a complete local route.
@@ -494,12 +427,10 @@ def load_gateway_components(
         ),
         listing_pools=state.listing_pools,
     )
-    executor = GatewayExecutor(state.runtime_catalogs, write_ledger)
     reloader = _AliasAuthorityReloader(
         loader=loader,
         state=state,
         routes=routes,
-        executor=executor,
         selection_workers=selection_workers,
     )
     return LocalGatewayComponents(
@@ -508,123 +439,10 @@ def load_gateway_components(
         ledger=ledger,
         write_ledger=write_ledger,
         routes=routes,
-        executor=executor,
         reloader=reloader,
         selection_workers=selection_workers,
         reconciled_expired_requests=expired,
         reconciled_unknown_attempts=unknown,
-    )
-
-
-def compose_local_gateway(
-    components: LocalGatewayComponents,
-    *,
-    graceful_timeout_seconds: float = _DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
-    replay: ResponseReplayStore | None = None,
-    continuations: ResponseContinuationStore | None = None,
-    guardrails: GuardrailEngine | None = None,
-) -> LocalGatewayRuntime:
-    """Compose the loopback application over already loaded components.
-
-    Args:
-        components: Loaded authority, ledger, routes, executor, and reloader.
-        graceful_timeout_seconds: Shutdown drain bound. Defaults to ten seconds.
-        replay: Optional shared Chat and Responses replay state.
-        continuations: Optional shared Responses continuation state.
-        guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
-
-    Returns:
-        Composed service, application, health state, and recovery counts.
-
-    Raises:
-        GatewayLifecycleError: The drain bound is not positive.
-    """
-    if graceful_timeout_seconds <= 0:
-        raise GatewayLifecycleError("graceful timeout must be positive")
-
-    async def readiness_probe() -> ExecutionSnapshot:
-        """Return the current generation's credential and route proof."""
-        return components.reloader.state.proof
-
-    runtime = create_gateway_runtime(
-        config=GatewayRuntimeConfig(
-            graceful_timeout_seconds=graceful_timeout_seconds,
-            title="EXP local gateway",
-        ),
-        authority=components.store,
-        ledger=components.write_ledger,
-        routes=components.routes,
-        executor=components.executor,
-        clock=SystemGatewayClock(),
-        readiness=readiness_probe,
-        usage=lambda raw_key: read_usage_report(
-            components.ledger,
-            organization_id=components.organization_id,
-            identity_id=(
-                None
-                if raw_key is None
-                else components.store.authenticated_identity(raw_key=raw_key)[1]
-            ),
-        ),
-        replay=replay,
-        continuations=continuations,
-        terminal_flusher=components.write_ledger.flush,
-        guardrails=guardrails,
-    )
-    return LocalGatewayRuntime(
-        runtime=runtime,
-        write_ledger=components.write_ledger,
-        selection_workers=components.selection_workers,
-        reconciled_expired_requests=components.reconciled_expired_requests,
-        reconciled_unknown_attempts=components.reconciled_unknown_attempts,
-        unavailable_aliases=components.unavailable_aliases,
-    )
-
-
-def load_local_gateway(
-    root: Path = Path(ARTIFACT_DIR),
-    *,
-    graceful_timeout_seconds: float = _DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
-    environment: Mapping[str, str] | None = None,
-    project_repository: ProjectActivationRepository | None = None,
-    decision_sink: DecisionSink | None = None,
-    replay: ResponseReplayStore | None = None,
-    continuations: ResponseContinuationStore | None = None,
-    only_aliases: frozenset[str] | None = None,
-) -> LocalGatewayRuntime:
-    """Load all granted active aliases and compose the loopback application.
-
-    Args:
-        root: Initialized EXP root. Defaults to the local ``.exp`` root.
-        graceful_timeout_seconds: Shutdown drain bound. Defaults to ten seconds.
-        environment: Optional provider credential mapping used by tests.
-        project_repository: Repository for verified immutable project activations.
-        decision_sink: Optional aggregate-safe recorder for served project selections.
-        replay: Optional shared Chat and Responses replay state.
-        continuations: Optional shared Responses continuation state.
-        only_aliases: Optional exact public aliases to expose from the shared application.
-
-    Returns:
-        Composed service, application, health state, and recovery counts.
-
-    Raises:
-        GatewayLifecycleError: No granted alias can form a complete local route.
-    """
-    if graceful_timeout_seconds <= 0:
-        raise GatewayLifecycleError("graceful timeout must be positive")
-    components = load_gateway_components(
-        root,
-        environment=environment,
-        project_repository=project_repository,
-        decision_sink=decision_sink,
-        only_aliases=only_aliases,
-    )
-    return compose_local_gateway(
-        components,
-        graceful_timeout_seconds=graceful_timeout_seconds,
-        replay=replay,
-        continuations=continuations,
-        guardrails=load_guardrail_engine(root),
     )
 
 

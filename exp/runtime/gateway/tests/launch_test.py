@@ -15,8 +15,6 @@ from pathlib import Path
 import httpx
 import openai
 import pytest
-import uvicorn
-from fastapi.testclient import TestClient
 from openai import AsyncOpenAI, OpenAI
 from typer.testing import CliRunner
 
@@ -31,8 +29,58 @@ from exp.runtime.gateway.catalog_authority import (
     upsert_connection,
     upsert_singleton_deployment,
 )
-from exp.runtime.gateway.lifecycle import load_local_gateway
+from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.native_bridge import NativeControlPlane
+from exp.runtime.gateway.native_server import serve_native_gateway
+
+exp_gateway_native = pytest.importorskip("exp_gateway_native")
+
+
+class _ServedGateway:
+    """One native gateway served on a loopback port in a background thread."""
+
+    def __init__(self, root: Path, port: int) -> None:
+        """Load components over the seeded root and bind the serving facts.
+
+        Args:
+            root: Initialized EXP root whose granted aliases are served.
+            port: Loopback port the native plane will bind.
+        """
+        self.port = port
+        self.components = load_gateway_components(root)
+        self.control_plane = NativeControlPlane(
+            self.components,
+            data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
+        )
+        self.shutdown = exp_gateway_native.shutdown_handle()
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+
+    def _serve(self) -> None:
+        """Run the blocking native server, retaining any failure."""
+        try:
+            serve_native_gateway(
+                self.control_plane,
+                host="127.0.0.1",
+                port=self.port,
+                shutdown=self.shutdown,
+            )
+        except BaseException as error:  # noqa: BLE001 - surfaced to the starter.
+            self.error = error
+
+    def start(self) -> None:
+        """Serve the native plane and wait for readiness on the real socket."""
+        self.thread.start()
+        _wait_ready(self.port, self.thread)
+
+    def stop(self) -> None:
+        """Stop the plane gracefully and drain the shared ledger writer."""
+        self.shutdown.request_shutdown()
+        self.thread.join(timeout=10)
+        assert not self.thread.is_alive()
+        assert self.error is None, f"native gateway failed: {self.error}"
+        self.components.write_ledger.close()
 
 
 class _LoopbackProvider(BaseHTTPRequestHandler):
@@ -116,18 +164,8 @@ def test_real_loopback_launch_serves_both_official_sdk_clients_and_revocation(
         base_url=f"http://127.0.0.1:{provider_port}/v1",
     )
     monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret-canary")
-    runtime = load_local_gateway(tmp_path, graceful_timeout_seconds=2)
-    server = uvicorn.Server(
-        uvicorn.Config(
-            runtime.app,
-            host="127.0.0.1",
-            port=gateway_port,
-            log_level="error",
-        )
-    )
-    gateway_thread = threading.Thread(target=server.run, daemon=True)
-    gateway_thread.start()
-    _wait_ready(gateway_port, gateway_thread)
+    gateway = _ServedGateway(tmp_path, gateway_port)
+    gateway.start()
     base_url = f"http://127.0.0.1:{gateway_port}/v1"
     prompt_canary = "private-prompt-canary"
     try:
@@ -158,12 +196,10 @@ def test_real_loopback_launch_serves_both_official_sdk_clients_and_revocation(
             with pytest.raises(openai.AuthenticationError):
                 revoked.models.list()
     finally:
-        server.should_exit = True
-        gateway_thread.join(timeout=5)
+        gateway.stop()
         provider.shutdown()
         provider.server_close()
         provider_thread.join(timeout=5)
-    assert not gateway_thread.is_alive()
     assert not provider_thread.is_alive()
 
     durable = b"".join(
@@ -187,7 +223,7 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
     runner = CliRunner()
     base_url = f"http://127.0.0.1:{provider_port}/v1"
     budget_period = datetime.now(UTC).strftime("%Y-%m")
-    gateway_client: TestClient | None = None
+    gateway: _ServedGateway | None = None
     try:
         commands = (
             ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
@@ -383,16 +419,17 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
             )
             assert configured.exit_code == 0, configured.output
 
-        runtime = load_local_gateway(tmp_path, graceful_timeout_seconds=2)
-        gateway_client = TestClient(runtime.app)
-        gateway_client.__enter__()
-        first_response = gateway_client.post(
-            "/v1/chat/completions",
+        gateway = _ServedGateway(tmp_path, _unused_port())
+        gateway.start()
+        gateway_base = f"http://127.0.0.1:{gateway.port}"
+        first_response = httpx.post(
+            f"{gateway_base}/v1/chat/completions",
             headers={"Authorization": f"Bearer {raw_key}"},
             json={
                 "model": "coding",
                 "messages": [{"role": "user", "content": "waterfall-canary"}],
             },
+            timeout=10,
         )
 
         assert first_response.status_code == 200, first_response.text
@@ -446,13 +483,14 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
             ],
         )
         assert exhausted_primary.exit_code == 0, exhausted_primary.output
-        second_response = gateway_client.post(
-            "/v1/chat/completions",
+        second_response = httpx.post(
+            f"{gateway_base}/v1/chat/completions",
             headers={"Authorization": f"Bearer {raw_key}"},
             json={
                 "model": "coding",
                 "messages": [{"role": "user", "content": "budget-fallback-canary"}],
             },
+            timeout=10,
         )
         assert second_response.status_code == 200, second_response.text
         assert second_response.headers["x-gateway-route-depth"] == "1"
@@ -466,15 +504,17 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
             "model": "coding",
             "messages": [{"role": "user", "content": "budget-replay-canary"}],
         }
-        original = gateway_client.post(
-            "/v1/chat/completions",
+        original = httpx.post(
+            f"{gateway_base}/v1/chat/completions",
             headers=replay_headers,
             json=replay_payload,
+            timeout=10,
         )
-        replay = gateway_client.post(
-            "/v1/chat/completions",
+        replay = httpx.post(
+            f"{gateway_base}/v1/chat/completions",
             headers=replay_headers,
             json=replay_payload,
+            timeout=10,
         )
         assert original.status_code == 200, original.text
         assert replay.status_code == 200, replay.text
@@ -523,10 +563,11 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
             ],
         )
         assert exhausted_identity.exit_code == 0, exhausted_identity.output
-        quota_response = gateway_client.post(
-            "/v1/responses",
+        quota_response = httpx.post(
+            f"{gateway_base}/v1/responses",
             headers={"Authorization": f"Bearer {raw_key}"},
             json={"model": "coding", "input": "quota-canary"},
+            timeout=10,
         )
         assert quota_response.status_code == 429
         assert quota_response.json()["error"]["code"] == "insufficient_quota"
@@ -548,8 +589,8 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
             ("secondary", 1, "completed"),
         ]
     finally:
-        if gateway_client is not None:
-            gateway_client.__exit__(None, None, None)
+        if gateway is not None:
+            gateway.stop()
         provider.shutdown()
         provider.server_close()
         provider_thread.join(timeout=5)

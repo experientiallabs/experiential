@@ -4,9 +4,9 @@ One registry owns every admitted request from acceptance to its terminal
 settlement: it reserves each physical dispatch (``start_attempt``), lands each
 attempt's durable terminal (``settle``), terminalizes requests with no
 settleable outcome (``abandon``), and sweeps retained settlements and
-abandoned reservations on a timer. Candidate selection mirrors the python
-executor's waterfall policy, including deployment-health circuits and
-per-deployment budget skipping. Every method takes and returns one JSON
+abandoned reservations on a timer. Candidate selection enforces the frozen
+waterfall policy, including deployment-health circuits and per-deployment
+budget skipping. Every method takes and returns one JSON
 string, matching the bridge boundary.
 """
 
@@ -151,9 +151,8 @@ class NativeAttemptAccounting:
         """
         self._write_ledger = write_ledger
         self._budget_error_factory = budget_error_factory
-        # The native waterfall's own deployment-health circuits. The embedded
-        # python engine serves only escalated aliases, so the two engines'
-        # circuit registries cover disjoint traffic.
+        # The native waterfall's deployment-health circuits, revision-scoped
+        # to the traffic this plane serves.
         self._health = DeploymentHealthRegistry()
         self._inflight: dict[str, InflightRequest] = {}
         self._lock = threading.Lock()

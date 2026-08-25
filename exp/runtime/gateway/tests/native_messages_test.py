@@ -4,9 +4,7 @@ One shared native serving subprocess (the same driver pattern as
 ``native_engine_disconnect_test``) serves a seeded root whose ``coding``
 alias points at a local OpenAI-compatible SSE mock upstream. The tests drive
 ``POST /v1/messages`` with Anthropic-shaped requests through the real Rust
-data plane and shared python control plane, then prove the deprecated
-python engine (scheduled for removal with the python data plane) serves the
-identical surface over the same root.
+data plane and shared python control plane.
 
 The Anthropic passthrough upstream dialect is deliberately not driven here:
 ``anthropic`` is a fixed-origin provider whose connection config rejects a
@@ -31,10 +29,8 @@ from pathlib import Path
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.lifecycle import load_local_gateway
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 
 pytest.importorskip("exp_gateway_native")
@@ -459,33 +455,3 @@ def test_protocol_and_key_failures_are_anthropic_shaped(engine: _ServingEngine) 
     )
     assert count_tokens.status_code == 404
     assert count_tokens.json()["error"]["type"] == "not_found_error"
-
-
-def test_python_engine_serves_the_identical_surface(engine: _ServingEngine) -> None:
-    """The deprecated python engine answers the same bytes modulo request identity."""
-    native = httpx.post(
-        f"{engine.base}/v1/messages",
-        headers={"x-api-key": engine.raw_key},
-        json=_messages_body("fast-token"),
-        timeout=30.0,
-    )
-    runtime = load_local_gateway(
-        engine.root,
-        graceful_timeout_seconds=1,
-        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
-    )
-    with TestClient(runtime.app) as client:
-        python_engine = client.post(
-            "/v1/messages",
-            headers={"x-api-key": engine.raw_key},
-            json=_messages_body("fast-token"),
-        )
-        python_bad_key = client.post(
-            "/v1/messages",
-            headers={"x-api-key": "exp_vk_invalid"},
-            json=_messages_body("fast-token"),
-        )
-    assert python_engine.status_code == 200
-    assert _normalized(python_engine.json()) == _normalized(native.json())
-    assert python_bad_key.status_code == 401
-    assert python_bad_key.json()["error"]["type"] == "authentication_error"
