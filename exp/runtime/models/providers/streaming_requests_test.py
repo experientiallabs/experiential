@@ -287,7 +287,7 @@ def test_gemini_stream_payload_matches_the_provider_client_builder() -> None:
 
     assert payload == gemini_generate_request("gemini-2.5-pro", model_request(request))
     assert payload["contents"] == [{"role": "user", "parts": [{"text": "hello"}]}]
-    generation = payload["generationConfig"]
+    generation = cast("dict[str, object]", payload["generationConfig"])
     assert isinstance(generation, dict)
     assert generation["temperature"] == 0.3
     # Streaming is selected by the streamGenerateContent route, not the body.
