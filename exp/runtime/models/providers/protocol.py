@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
-from exp.common.models import ModelClient, ModelRequest, ModelResponse
+from exp.common.models import ModelCapabilities, ModelClient, ModelRequest, ModelResponse
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.interfaces import ProviderStream
@@ -198,12 +198,17 @@ class GatewayDispatchSigner(Protocol):
 def preflight_gateway_request(
     request: GatewayRequest,
     capabilities: GatewayDeploymentCapabilities,
+    *,
+    model_capabilities: ModelCapabilities | None = None,
 ) -> None:
     """Reject gateway semantics a deployment cannot preserve before provider dispatch.
 
     Args:
         request: Canonical request produced by the public protocol decoder.
         capabilities: Versioned deployment and adapter capability declaration.
+        model_capabilities: Exact model-level semantic capabilities. Production
+            routes supply this value; ``None`` preserves compatibility for
+            standalone callers that only validate deployment protocol fields.
 
     Raises:
         ProviderCapabilityError: A present request feature is unsupported.
@@ -232,6 +237,16 @@ def preflight_gateway_request(
             "structured_text",
         ),
     )
+    if model_capabilities is not None:
+        model_requirements = (
+            (bool(request.tools), model_capabilities.supports_tools is not False, "function_tools"),
+            (
+                request.structured_text is not None,
+                model_capabilities.supports_structured_output,
+                "structured_output",
+            ),
+        )
+        requirements += model_requirements
     for requested, supported, capability in requirements:
         if requested and not supported:
             raise ProviderCapabilityError(capability=capability)

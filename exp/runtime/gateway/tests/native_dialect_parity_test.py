@@ -166,6 +166,13 @@ def _simplified(event: GatewayEvent) -> JsonObject:
         return {"kind": "text_delta", "text": event.text_delta}
     if event.kind is GatewayEventKind.REFUSAL_DELTA:
         return {"kind": "refusal_delta", "text": event.text_delta}
+    if event.kind is GatewayEventKind.REASONING_SUMMARY_DELTA:
+        return {
+            "kind": "reasoning_summary_delta",
+            "output_index": event.reasoning_summary_output_index,
+            "summary_index": event.reasoning_summary_index,
+            "text": event.text_delta,
+        }
     if event.kind is GatewayEventKind.TOOL_CALL_STARTED:
         return {
             "kind": "tool_call_started",

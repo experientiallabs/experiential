@@ -7,9 +7,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import cast
 
-from exp.common.core.artifacts import stable_id
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
@@ -24,21 +22,28 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.execution_resolution import (
+    _require_deployment_identity as _require_deployment_identity,
+)
+from exp.runtime.gateway.execution_resolution import (
+    _ResolvedDeployment,
+    resolve_route,
+)
 from exp.runtime.gateway.group_commit import abandoned_write_outcome
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.interfaces import AttemptLedger, GatewayClock, ProviderStream
 from exp.runtime.gateway.ledger import AttemptRejectedError, GatewayLedgerError
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
-from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
+from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers import (
-    AsyncGatewayProvider,
     RequestDeadline,
     preflight_gateway_request,
     require_gateway_provider,
 )
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.errors import normalized_provider_failure
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.models.providers.transport import RetryPolicy
 
 _SINGLE_DISPATCH = RetryPolicy(
@@ -72,16 +77,6 @@ class GatewayExecutionError(RuntimeError):
         self.request_finalized = request_finalized
 
 
-@dataclass(frozen=True)
-class _ResolvedDeployment:
-    """One verified provider binding for a frozen deployment."""
-
-    deployment: ExactModelDeployment
-    provider: AsyncGatewayProvider
-    health_key: DeploymentHealthKey
-    idempotency_key: str
-
-
 @dataclass
 class _PhysicalAttempt:
     """Mutable stream and usage state for one durably recorded dispatch."""
@@ -108,6 +103,7 @@ class GatewayExecutionStream:
         *,
         route: GatewayRoute,
         request: GatewayRequest,
+        public_request: GatewayRequest,
         deadline: RequestDeadline,
         resolved: tuple[_ResolvedDeployment, ...],
         ledger: AttemptLedger,
@@ -124,6 +120,7 @@ class GatewayExecutionStream:
         Args:
             route: Ordered certified deployment route.
             request: Canonical request forced into provider streaming mode.
+            public_request: Caller values plus route-wide ignored-field disclosure.
             deadline: One request-wide absolute deadline.
             resolved: Verified runtime providers in route order.
             ledger: Content-free request and attempt ledger.
@@ -137,6 +134,7 @@ class GatewayExecutionStream:
         """
         self._route = route
         self._request = request
+        self._public_request = public_request
         self._deadline = deadline
         self._resolved = resolved
         self._ledger = ledger
@@ -167,6 +165,11 @@ class GatewayExecutionStream:
         """Return the active or terminal physical deployment."""
         current = self._require_current()
         return self._resolved[current.route_index].deployment
+
+    @property
+    def public_request(self) -> GatewayRequest:
+        """Return caller values plus route-wide ignored-parameter disclosure."""
+        return self._public_request
 
     @property
     def route_depth(self) -> int:
@@ -819,12 +822,22 @@ class GatewayExecutor:
             GatewayExecutionError: Preflight, admission, resolution, or all openings fail.
         """
         deadline = RequestDeadline(route.snapshot.authorization.deadline_monotonic)
-        provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         try:
+            resolved = resolve_route(route, self._catalogs)
+            public_request, provider_request = route_generation_parameter_requests(
+                tuple(binding.wire_profile for binding in resolved),
+                request,
+            )
+            provider_request = provider_request.model_copy(
+                update={"stream": True, "include_usage": True}
+            )
             for deployment in route.deployments:
                 require_gateway_provider(deployment.provider)
-                preflight_gateway_request(provider_request, deployment.gateway.capabilities)
-            resolved = self._resolve_route(route)
+                preflight_gateway_request(
+                    provider_request,
+                    deployment.gateway.capabilities,
+                    model_capabilities=deployment.capabilities,
+                )
             await self._acquire(deadline)
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
@@ -833,6 +846,7 @@ class GatewayExecutor:
         execution = GatewayExecutionStream(
             route=route,
             request=provider_request,
+            public_request=public_request,
             deadline=deadline,
             resolved=resolved,
             ledger=self._ledger,
@@ -851,34 +865,6 @@ class GatewayExecutor:
             raise
         return execution
 
-    def _resolve_route(self, route: GatewayRoute) -> tuple[_ResolvedDeployment, ...]:
-        """Resolve and identity-check every deployment before the first billable dispatch."""
-        authorization = route.snapshot.authorization
-        catalog = self._catalogs.get(
-            (authorization.alias_revision_id, authorization.catalog_sha256)
-        )
-        if catalog is None:
-            raise ValueError("runtime catalog is not loaded for the authorized revision")
-        resolved: list[_ResolvedDeployment] = []
-        for deployment in route.deployments:
-            runtime_model = catalog.resolve(deployment.source_alias)
-            _require_deployment_identity(deployment, runtime_model)
-            if getattr(runtime_model.client, "stream", None) is None:
-                raise TypeError("resolved gateway deployment has no async stream capability")
-            resolved.append(
-                _ResolvedDeployment(
-                    deployment=deployment,
-                    provider=cast(AsyncGatewayProvider, runtime_model.client),
-                    health_key=(
-                        authorization.catalog_sha256,
-                        deployment.deployment_id,
-                        deployment.connection_sha256,
-                    ),
-                    idempotency_key=_deployment_idempotency_key(route, deployment),
-                )
-            )
-        return tuple(resolved)
-
     async def _acquire(self, deadline: RequestDeadline) -> None:
         """Wait for logical execution admission within the request-wide deadline."""
         try:
@@ -886,47 +872,6 @@ class GatewayExecutor:
                 await self._permits.acquire()
         except TimeoutError as exc:
             raise ProviderDeadlineExceeded("gateway execution queue deadline exceeded") from exc
-
-
-def _require_deployment_identity(
-    deployment: ExactModelDeployment,
-    resolved: ResolvedModel,
-) -> None:
-    """Fail before accounting or network work when runtime resolution drifts from authority.
-
-    A catalog record may pin a response-only served-model identity that differs from the
-    requested provider model. The frozen deployment names the requested model, so either the
-    resolved requested identity or the pinned served identity may match it.
-    """
-    if (
-        resolved.alias != deployment.source_alias
-        or resolved.snapshot.provider != deployment.provider
-        or deployment.provider_model not in {resolved.snapshot.model_id, resolved.served_model_id}
-        or resolved.snapshot.revision != deployment.revision
-        or resolved.snapshot.connection_sha256 != deployment.connection_sha256
-        or resolved.snapshot.billing_source != deployment.billing_source
-        or (
-            deployment.capabilities is not None and resolved.capabilities != deployment.capabilities
-        )
-    ):
-        raise ValueError("resolved runtime client differs from the frozen gateway deployment")
-
-
-def _deployment_idempotency_key(
-    route: GatewayRoute,
-    deployment: ExactModelDeployment,
-) -> str:
-    """Derive one stable key reused only by physical retries of this deployment."""
-    authorization = route.snapshot.authorization
-    return stable_id(
-        "gateway-provider-operation",
-        {
-            "request_id": authorization.request_id,
-            "catalog_sha256": authorization.catalog_sha256,
-            "deployment_id": deployment.deployment_id,
-            "connection_sha256": deployment.connection_sha256,
-        },
-    )
 
 
 def _with_latest_usage(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
@@ -13,6 +14,10 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderResponseError
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
+from exp.runtime.models.providers.reasoning_compat import (
+    anthropic_reasoning_effort,
+    openai_reasoning_effort,
+)
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 if TYPE_CHECKING:
@@ -63,6 +68,8 @@ def dialect_stream_payload(
             ),
             supports_top_k=profile.supports_top_k,
             supports_logprobs=profile.supports_logprobs,
+            supports_reasoning=profile.supports_reasoning,
+            reasoning_effort=profile.reasoning_effort,
         )
     if profile.dialect == "gemini_generate_content":
         return gemini_generate_content_stream_payload(
@@ -76,6 +83,8 @@ def dialect_stream_payload(
             ),
             supports_top_k=profile.supports_top_k,
             supports_logprobs=profile.supports_logprobs,
+            supports_reasoning=profile.supports_reasoning,
+            reasoning_effort=profile.reasoning_effort,
         )
     if profile.dialect == "bedrock_converse_stream":
         return bedrock_converse_stream_payload(
@@ -103,8 +112,103 @@ def dialect_stream_payload(
         supports_top_k=profile.supports_top_k,
         supports_logprobs=profile.supports_logprobs,
         supports_reasoning=profile.supports_reasoning,
+        reasoning_wire_format=profile.reasoning_wire_format,
         reasoning_effort=profile.reasoning_effort,
     )
+
+
+def route_generation_parameter_requests(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> tuple[GatewayRequest, GatewayRequest]:
+    """Apply one stable generation-control policy across a provider waterfall.
+
+    A caller-visible request parameter is forwarded only when every deployment
+    in the certified route can represent it. This prevents a precommit fallback
+    from changing request semantics or surfacing a provider-side unsupported
+    parameter error. Controls that are safe to omit are accepted at the public
+    boundary, removed from the provider request, and disclosed through
+    ``ignored_parameters`` on the public request.
+
+    Args:
+        profiles: Ordered wire profiles for every deployment in the route.
+        request: Decoded public request before provider streaming is forced.
+
+    Returns:
+        A pair of ``(public_request, provider_request)``. The public copy keeps
+        caller values for response reflection and adds ignored-field disclosure;
+        the provider copy removes controls unsupported anywhere in the route.
+
+    Raises:
+        ValueError: The route has no wire profiles.
+    """
+    if not profiles:
+        raise ValueError("generation parameter shaping requires at least one wire profile")
+
+    ignored = list(request.ignored_parameters)
+    provider_updates: dict[str, object] = {}
+
+    def ignore(field: str, public_path: str | None = None) -> None:
+        provider_updates[field] = None
+        path = public_path or field
+        if path not in ignored:
+            ignored.append(path)
+
+    if request.temperature is not None and not all(
+        profile.supports_temperature and request.temperature <= profile.maximum_temperature
+        for profile in profiles
+    ):
+        ignore("temperature")
+    if request.top_p is not None and not all(
+        profile.supports_top_p is True for profile in profiles
+    ):
+        ignore("top_p")
+    if request.top_k is not None and not all(
+        profile.supports_top_k
+        and profile.dialect != "openai_responses"
+        and request.top_k <= profile.maximum_top_k
+        for profile in profiles
+    ):
+        ignore("top_k")
+    if request.reasoning_effort is not None and not all(
+        profile.supports_reasoning and profile.reasoning_wire_format != "none"
+        for profile in profiles
+    ):
+        ignore(
+            "reasoning_effort",
+            "reasoning.effort" if request.surface.value == "responses" else "reasoning_effort",
+        )
+    if request.reasoning_summary is not None and not all(
+        profile.dialect == "openai_responses" and profile.supports_reasoning for profile in profiles
+    ):
+        for path in request.reasoning_summary_parameters or ("reasoning.summary",):
+            ignore("reasoning_summary", path)
+
+    # Tool-selection controls have no semantics without tool definitions and
+    # several provider APIs reject the otherwise harmless combination.
+    if not request.tools:
+        if request.tool_choice is not None:
+            ignore("tool_choice")
+        if request.parallel_tool_calls is not None:
+            ignore("parallel_tool_calls")
+
+    # The normalized public response does not yet preserve token-level
+    # probability arrays. Accept these compatibility controls but never send a
+    # request whose provider result would be discarded.
+    if request.logprobs is not None:
+        ignore(
+            "logprobs",
+            "top_logprobs"
+            if request.surface.value == "responses" and request.top_logprobs is not None
+            else "logprobs",
+        )
+    if request.top_logprobs is not None:
+        ignore("top_logprobs")
+
+    ignored_parameters = tuple(ignored)
+    public_request = request.model_copy(update={"ignored_parameters": ignored_parameters})
+    provider_request = public_request.model_copy(update=provider_updates)
+    return public_request, provider_request
 
 
 def openai_responses_stream_payload(
@@ -180,8 +284,13 @@ def openai_responses_stream_payload(
     # the shared capability argument, but ignore logprob controls before send.
     del supports_logprobs
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    reasoning: JsonObject = {}
     if supports_reasoning and effective_reasoning_effort is not None:
-        payload["reasoning"] = {"effort": effective_reasoning_effort}
+        reasoning["effort"] = openai_reasoning_effort(model_id, effective_reasoning_effort)
+    if supports_reasoning and request.reasoning_summary is not None:
+        reasoning["summary"] = request.reasoning_summary
+    if reasoning:
+        payload["reasoning"] = reasoning
     return payload
 
 
@@ -193,6 +302,8 @@ def anthropic_messages_stream_payload(
     supports_top_p: bool = True,
     supports_top_k: bool = False,
     supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Messages JSON.
 
@@ -258,6 +369,12 @@ def anthropic_messages_stream_payload(
         payload["top_p"] = request.top_p
     if request.top_k is not None and supports_top_k:
         payload["top_k"] = request.top_k
+    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    if supports_reasoning and effective_reasoning_effort is not None:
+        payload["thinking"] = {"type": "adaptive"}
+        payload["output_config"] = {
+            "effort": anthropic_reasoning_effort(model_id, effective_reasoning_effort)
+        }
     if request.stop:
         payload["stop_sequences"] = list(request.stop)
     return payload
@@ -271,6 +388,8 @@ def gemini_generate_content_stream_payload(
     supports_top_p: bool = True,
     supports_top_k: bool = False,
     supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to the native streamGenerateContent JSON.
 
@@ -299,6 +418,8 @@ def gemini_generate_content_stream_payload(
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,
             supports_logprobs=supports_logprobs,
+            supports_reasoning=supports_reasoning,
+            reasoning_effort=reasoning_effort,
         )
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc
@@ -356,6 +477,7 @@ def openai_compatible_stream_payload(
     supports_top_k: bool = False,
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
+    reasoning_wire_format: str = "reasoning_effort",
     reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
@@ -367,7 +489,8 @@ def openai_compatible_stream_payload(
             reasoning deployments reject ``max_tokens`` and require
             ``max_completion_tokens``.
         supports_temperature: Whether this exact model accepts explicit sampling controls.
-        supports_reasoning: Whether this exact model accepts ``reasoning_effort``.
+        supports_reasoning: Whether this exact model accepts a reasoning control.
+        reasoning_wire_format: Provider field used for normalized reasoning effort.
         reasoning_effort: Optional catalog-pinned reasoning effort.
 
     Returns:
@@ -407,7 +530,12 @@ def openai_compatible_stream_payload(
         payload["stop"] = list(request.stop)
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
-        payload["reasoning_effort"] = effective_reasoning_effort
+        if reasoning_wire_format == "reasoning":
+            payload["reasoning"] = {"effort": effective_reasoning_effort}
+        elif reasoning_wire_format == "reasoning_effort":
+            payload["reasoning_effort"] = openai_reasoning_effort(
+                model_id, effective_reasoning_effort
+            )
     return payload
 
 

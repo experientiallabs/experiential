@@ -137,6 +137,11 @@ class GatewayRequest(ContractModel):
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
+    reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
+    reasoning_summary_parameters: tuple[
+        Literal["reasoning.generate_summary", "reasoning.summary"], ...
+    ] = Field(default=(), exclude=True)
+    """Exact caller selector paths normalized into ``reasoning_summary``."""
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
@@ -188,6 +193,12 @@ class GatewayRequest(ContractModel):
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
+        if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("reasoning_summary is valid only for Responses requests")
+        if self.reasoning_summary_parameters and self.reasoning_summary is None:
+            raise ValueError("reasoning summary parameter paths require a summary selector")
+        if len(set(self.reasoning_summary_parameters)) != len(self.reasoning_summary_parameters):
+            raise ValueError("reasoning summary parameter paths must not repeat")
         return self
 
 
@@ -229,6 +240,7 @@ class GatewayEventKind(StrEnum):
 
     TEXT_DELTA = "text_delta"
     REFUSAL_DELTA = "refusal_delta"
+    REASONING_SUMMARY_DELTA = "reasoning_summary_delta"
     TOOL_CALL_STARTED = "tool_call_started"
     TOOL_ARGUMENTS_DELTA = "tool_arguments_delta"
     TOOL_CALL_COMPLETED = "tool_call_completed"
@@ -244,6 +256,8 @@ class GatewayEvent(ContractModel):
     kind: GatewayEventKind
     sequence_number: int = Field(ge=0)
     text_delta: str | None = None
+    reasoning_summary_output_index: int | None = Field(default=None, ge=0)
+    reasoning_summary_index: int | None = Field(default=None, ge=0)
     tool_call_index: int | None = Field(default=None, ge=0)
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
     tool_name: str | None = Field(default=None, min_length=1, max_length=256)
@@ -265,6 +279,13 @@ class GatewayEvent(ContractModel):
         if self.kind in {GatewayEventKind.TEXT_DELTA, GatewayEventKind.REFUSAL_DELTA}:
             if self.text_delta is None:
                 raise ValueError("text and refusal deltas require text_delta")
+        elif self.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
+            if (
+                self.text_delta is None
+                or self.reasoning_summary_output_index is None
+                or self.reasoning_summary_index is None
+            ):
+                raise ValueError("reasoning summary deltas require output, summary, and text")
         elif self.kind == GatewayEventKind.TOOL_CALL_STARTED:
             if self.tool_call_index is None or self.tool_call_id is None or self.tool_name is None:
                 raise ValueError("tool-call start requires index, ID, and name")

@@ -141,6 +141,8 @@ class MessagesSseEncoder:
             # one sanitized terminal error instead of assistant content.
             self._refusal_seen = True
             return ()
+        if event.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
+            return ()
         if event.kind == GatewayEventKind.TOOL_CALL_STARTED:
             return self._tool_started(event)
         if event.kind == GatewayEventKind.TOOL_ARGUMENTS_DELTA:

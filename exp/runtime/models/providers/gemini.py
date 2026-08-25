@@ -117,6 +117,8 @@ class GeminiClient(ProviderHttpClient):
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_logprobs: bool = False,
+        supports_reasoning: bool = False,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Create a Gemini client with explicit generation capability gates."""
         super().__init__(
@@ -131,6 +133,8 @@ class GeminiClient(ProviderHttpClient):
         self._supports_top_p = supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_logprobs = supports_logprobs
+        self._supports_reasoning = supports_reasoning
+        self._reasoning_effort = reasoning_effort
 
     async def stream(
         self,
@@ -163,6 +167,8 @@ class GeminiClient(ProviderHttpClient):
                 supports_top_p=self._supports_top_p,
                 supports_top_k=self._supports_top_k,
                 supports_logprobs=self._supports_logprobs,
+                supports_reasoning=self._supports_reasoning,
+                reasoning_effort=self._reasoning_effort,
             ),
             request=request,
             deadline=deadline,
@@ -185,9 +191,13 @@ class GeminiClient(ProviderHttpClient):
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
             supports_temperature=self._supports_temperature,
+            maximum_temperature=1.0,
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_wire_format="gemini_thinking",
+            reasoning_effort=self._reasoning_effort,
         )
 
     def _completion_path(self) -> str:
@@ -203,6 +213,8 @@ class GeminiClient(ProviderHttpClient):
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_effort=self._reasoning_effort,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:

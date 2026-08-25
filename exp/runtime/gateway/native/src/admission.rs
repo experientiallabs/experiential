@@ -36,6 +36,8 @@ pub(crate) struct Admission {
     pub exact_model_id: String,
     pub route_reason: String,
     pub route: Vec<DeploymentWire>,
+    #[serde(default)]
+    pub ignored_parameters: Vec<String>,
     pub maximum_total_attempts: u32,
     pub maximum_same_deployment_attempts: u32,
     #[serde(default)]

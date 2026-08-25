@@ -25,6 +25,7 @@ from exp.runtime.openai_protocol.streaming import (
     ResponsesSseEncoder,
     encode_chat_events,
     encode_responses_events,
+    stable_public_id,
 )
 
 _RAW_ARGUMENTS = '{ "city" : "Zürich" }'
@@ -195,6 +196,60 @@ def test_responses_sse_exposes_ignored_compatibility_parameters() -> None:
     response = cast(JsonObject, payload["response"])
 
     assert response["x-experiential-ignored-parameters"] == ["reasoning.summary"]
+
+
+def test_responses_sse_preserves_reasoning_summary_items() -> None:
+    """Reasoning summary deltas become official streaming and terminal output items."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="weather"),),
+        stream=True,
+        reasoning_effort="high",
+        reasoning_summary="concise",
+        reasoning_summary_parameters=("reasoning.summary",),
+    )
+    frames = encode_responses_events(
+        ResponsesSseEncoder(
+            request_id="request-reasoning",
+            model="coding",
+            created_at=123.0,
+            request=request,
+        ),
+        (
+            GatewayEvent(
+                kind=GatewayEventKind.REASONING_SUMMARY_DELTA,
+                sequence_number=0,
+                reasoning_summary_output_index=0,
+                reasoning_summary_index=0,
+                text_delta="Checked ",
+            ),
+            GatewayEvent(
+                kind=GatewayEventKind.REASONING_SUMMARY_DELTA,
+                sequence_number=1,
+                reasoning_summary_output_index=0,
+                reasoning_summary_index=0,
+                text_delta="the forecast.",
+            ),
+            GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=2),
+        ),
+    )
+    payloads = tuple(_responses_payload(frame) for frame in frames)
+    event_types = tuple(str(payload["type"]) for payload in payloads)
+
+    assert event_types.count("response.reasoning_summary_part.added") == 1
+    assert event_types.count("response.reasoning_summary_text.delta") == 2
+    assert event_types.count("response.reasoning_summary_text.done") == 1
+    terminal = cast(JsonObject, payloads[-1]["response"])
+    assert terminal["reasoning"] == {"effort": "high", "summary": "concise"}
+    output = cast(list[JsonObject], terminal["output"])
+    assert output == [
+        {
+            "id": stable_public_id("rs", f"{stable_public_id('resp', 'request-reasoning')}:0"),
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Checked the forecast."}],
+            "status": "completed",
+        }
+    ]
 
 
 def test_responses_failure_closes_visible_content_then_emits_one_failed_terminal() -> None:

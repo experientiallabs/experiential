@@ -34,6 +34,7 @@ pub fn collection_public_error(failure: &Failure) -> PublicError {
 pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
         Event::TextDelta(text) | Event::RefusalDelta(text) => text.len(),
+        Event::ReasoningSummaryDelta { delta, .. } => delta.len(),
         Event::ToolArgumentsDelta { delta, .. } => delta.len(),
         Event::ToolCallCompleted { call, .. } => call.raw_arguments.len().max(64),
         _ => 64,

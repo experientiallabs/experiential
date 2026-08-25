@@ -605,6 +605,7 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
             model_id=self._bedrock_client.model_id,
             timeout_seconds=READ_TIMEOUT_SECONDS,
             supports_temperature=self._bedrock_client.supports_temperature,
+            maximum_temperature=1.0,
             supports_top_p=self._bedrock_client.supports_top_p,
             supports_top_k=self._bedrock_client.supports_top_k,
             supports_logprobs=self._bedrock_client.supports_logprobs,

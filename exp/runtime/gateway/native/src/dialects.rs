@@ -141,6 +141,8 @@ pub struct Normalizer {
     refusal_seen: bool,
     terminal: bool,
     accumulated_tool_bytes: usize,
+    accumulated_summary_bytes: usize,
+    reasoning_summaries: BTreeMap<(u32, u32), String>,
     // Anthropic accumulation.
     input_tokens: u64,
     output_tokens: u64,
@@ -164,6 +166,8 @@ impl Normalizer {
             refusal_seen: false,
             terminal: false,
             accumulated_tool_bytes: 0,
+            accumulated_summary_bytes: 0,
+            reasoning_summaries: BTreeMap::new(),
             input_tokens: 0,
             output_tokens: 0,
             cache_read: 0,
@@ -178,7 +182,27 @@ impl Normalizer {
     /// Reserve retained-output budget for accumulated tool-argument text.
     fn reserve_tool_bytes(&mut self, additional: usize) -> Result<(), Failure> {
         self.accumulated_tool_bytes = self.accumulated_tool_bytes.saturating_add(additional);
-        if self.accumulated_tool_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
+        if self
+            .accumulated_tool_bytes
+            .saturating_add(self.accumulated_summary_bytes)
+            > MAXIMUM_RETAINED_OUTPUT_BYTES
+        {
+            return Err(Failure::new(
+                FailureClass::ProviderInternal,
+                OUTPUT_OVERFLOW_MESSAGE,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reserve retained-output budget for reasoning-summary verification.
+    fn reserve_summary_bytes(&mut self, additional: usize) -> Result<(), Failure> {
+        self.accumulated_summary_bytes = self.accumulated_summary_bytes.saturating_add(additional);
+        if self
+            .accumulated_tool_bytes
+            .saturating_add(self.accumulated_summary_bytes)
+            > MAXIMUM_RETAINED_OUTPUT_BYTES
+        {
             return Err(Failure::new(
                 FailureClass::ProviderInternal,
                 OUTPUT_OVERFLOW_MESSAGE,

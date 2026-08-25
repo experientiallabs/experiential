@@ -1346,6 +1346,7 @@ def _responses_body(
     stream: bool = False,
     previous_response_id: str | None = None,
     with_tools: bool = False,
+    reasoning_summary: str | None = None,
 ) -> str:
     """Return one raw Responses API request body."""
     payload: JsonObject = {"model": model, "input": [{"role": "user", "content": "hi"}]}
@@ -1353,6 +1354,8 @@ def _responses_body(
         payload["stream"] = True
     if previous_response_id is not None:
         payload["previous_response_id"] = previous_response_id
+    if reasoning_summary is not None:
+        payload["reasoning"] = {"effort": "high", "summary": reasoning_summary}
     if with_tools:
         payload["tools"] = [
             {
@@ -1401,24 +1404,31 @@ def _responses_parity_case() -> tuple[list[GatewayEvent], str]:
     from exp.common.models.model import ToolCall
 
     events = [
-        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=0, text_delta="Hel"),
-        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=1, text_delta="lo é"),
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_SUMMARY_DELTA,
+            sequence_number=0,
+            reasoning_summary_output_index=0,
+            reasoning_summary_index=0,
+            text_delta="Checked the plan.",
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=1, text_delta="Hel"),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=2, text_delta="lo é"),
         GatewayEvent(
             kind=GatewayEventKind.TOOL_CALL_STARTED,
-            sequence_number=2,
+            sequence_number=3,
             tool_call_index=0,
             tool_call_id="call-1",
             tool_name="search",
         ),
         GatewayEvent(
             kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
-            sequence_number=3,
+            sequence_number=4,
             tool_call_index=0,
             raw_arguments_delta='{"q": "x"}',
         ),
         GatewayEvent(
             kind=GatewayEventKind.TOOL_CALL_COMPLETED,
-            sequence_number=4,
+            sequence_number=5,
             tool_call_index=0,
             tool_call=ToolCall(
                 call_id="call-1",
@@ -1429,12 +1439,18 @@ def _responses_parity_case() -> tuple[list[GatewayEvent], str]:
         ),
         GatewayEvent(
             kind=GatewayEventKind.USAGE,
-            sequence_number=5,
+            sequence_number=6,
             usage=GatewayUsage(input_tokens=10, output_tokens=4, cached_input_tokens=1),
         ),
-        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=6),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=7),
     ]
     fixture = [
+        {
+            "kind": "reasoning_summary_delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "Checked the plan.",
+        },
         {"kind": "text_delta", "text": "Hel"},
         {"kind": "text_delta", "text": "lo é"},
         {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
@@ -1484,7 +1500,7 @@ def _native_envelope(body: str) -> str:
 def test_rust_responses_sse_frames_match_python_encoder() -> None:
     """Rust Responses SSE frames are byte-identical to the python encoder."""
     native = pytest.importorskip("exp_gateway_native")
-    body = _responses_body(stream=True, with_tools=True)
+    body = _responses_body(stream=True, with_tools=True, reasoning_summary="concise")
     events, fixture = _responses_parity_case()
     expected = _python_responses_frames(body, events, created_at=1_700_000_000.25)
     actual = native.encode_responses_fixture(
@@ -1555,7 +1571,7 @@ def test_rust_responses_completed_body_matches_python() -> None:
     native = pytest.importorskip("exp_gateway_native")
     from exp.runtime.openai_protocol.response import completed_body
 
-    body = _responses_body(with_tools=True)
+    body = _responses_body(with_tools=True, reasoning_summary="concise")
     events, fixture = _responses_parity_case()
     decoded = decode_responses(json.loads(body))
     expected = completed_body(
@@ -1599,21 +1615,33 @@ def test_rust_responses_rejects_streams_without_terminals() -> None:
 
 def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path) -> None:
     """A Responses request admits natively (no escalation) with the exact
-    request-reflecting envelope and the shared dialect payload."""
+    request-reflecting envelope and a route-safe dialect payload."""
     from exp.runtime.gateway.native_responses import responses_envelope
 
     control, raw_key = _control_plane(tmp_path)
-    body = _responses_body(with_tools=True)
+    payload = json.loads(_responses_body(with_tools=True))
+    payload["reasoning"] = {"effort": "high"}
+    body = json.dumps(payload)
     admission = _flatten_started(control, _admit_responses(control, raw_key, body))
     assert "escalate" not in admission
     assert admission["surface"] == "responses"
     assert admission["dialect"] == "openai_compatible"
     decoded = decode_responses(json.loads(body))
-    assert admission["envelope"] == responses_envelope(decoded.request)
-    provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
+    public_request = decoded.request.model_copy(
+        update={"ignored_parameters": ("reasoning.effort",)}
+    )
+    assert admission["ignored_parameters"] == ["reasoning.effort"]
+    assert admission["envelope"] == responses_envelope(public_request)
+    provider_request = public_request.model_copy(
+        update={"stream": True, "include_usage": True, "reasoning_effort": None}
+    )
     assert admission["upstream_payload"] == openai_compatible_stream_payload(
         "provider-model-exact", provider_request
     )
+    upstream_payload = admission["upstream_payload"]
+    assert isinstance(upstream_payload, dict)
+    assert "reasoning" not in upstream_payload
+    assert "reasoning_effort" not in upstream_payload
     settled = control.settle(
         json.dumps(
             {
