@@ -508,18 +508,24 @@ class NativeControlPlane:
         )
 
     def claim_scope(self, argument: str) -> str:
-        """Resolve the replay-store scope for one keyed Chat Completions request.
+        """Resolve the replay-store scope for one keyed request.
 
         The data plane owns the bounded in-process replay store; this call
         performs the same decode and authorization the python engine runs so
         the store key (tenant namespace, hashed caller operation, canonical
-        request digest) is computed by exactly one implementation. Requests
-        the native path cannot serve are escalated before any replay claim,
-        so one caller operation never spans both engines' replay stores.
+        request digest) is computed by exactly one implementation. The
+        surface is part of the key, so keyed Chat Completions and keyed
+        Responses operations never collide. A direct route whose provider has
+        no native dialect is escalated before any replay claim, so one caller
+        operation never spans both engines' replay stores; project targets
+        resolve their deployment at admission through the same frozen
+        selection, so their scope claims natively.
 
         Args:
-            argument: JSON object with ``raw_key``, ``body``, and optional
-                ``idempotency_key`` and ``client_request_id`` header values.
+            argument: JSON object with ``raw_key``, ``body``, optional
+                ``surface`` (``"chat"`` or ``"responses"``, defaulting to
+                chat), and optional ``idempotency_key`` and
+                ``client_request_id`` header values.
 
         Returns:
             JSON replay scope with ``organization_id``, ``identity_id``,
@@ -533,6 +539,7 @@ class NativeControlPlane:
         data = json.loads(argument)
         decoded = self._decode_body(
             data["body"],
+            surface=str(data.get("surface", "chat")),
             idempotency_key=optional_text(data.get("idempotency_key")),
             client_request_id=optional_text(data.get("client_request_id")),
         )
@@ -559,15 +566,14 @@ class NativeControlPlane:
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
-        if not isinstance(authorization.target, DirectTarget):
-            return _escalation("project-backed aliases use learned selection on the python engine")
-        try:
-            route = self._components.routes.resolve_direct(authorization)
-            resolve_route_profiles(self._components.runtime_catalogs, route)
-        except NativeDialectUnavailableError as exc:
-            return _escalation(str(exc))
-        except Exception:  # noqa: BLE001 - the owner's admission records this failure.
-            pass
+        if isinstance(authorization.target, DirectTarget):
+            try:
+                route = self._components.routes.resolve_direct(authorization)
+                resolve_route_profiles(self._components.runtime_catalogs, route)
+            except NativeDialectUnavailableError as exc:
+                return _escalation(str(exc))
+            except Exception:  # noqa: BLE001 - the owner's admission records this failure.
+                pass
         key = replay_key(
             namespace=ProtocolNamespace(
                 organization_id=authorization.organization_id,

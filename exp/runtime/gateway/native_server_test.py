@@ -73,6 +73,36 @@ def test_host_passes_public_and_fallback_configuration(monkeypatch: pytest.Monke
     assert _FallbackServer.last is not None and _FallbackServer.last.should_exit
 
 
+def test_rust_only_host_omits_the_fallback_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without a fallback app, no python server starts and no port is passed."""
+    captured: dict[str, object] = {}
+
+    def serve(control_plane: object, config_json: str) -> None:
+        """Capture the extension boundary call."""
+        captured["control_plane"] = control_plane
+        captured["config"] = json.loads(config_json)
+
+    native = SimpleNamespace(serve=serve)
+    monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
+    server_factory = mock.Mock(side_effect=AssertionError("rust-only must not start uvicorn"))
+    monkeypatch.setattr(native_server.uvicorn, "Server", server_factory)
+
+    serve_native_gateway(
+        None,
+        SimpleNamespace(request_timeout_seconds=12.0),
+        host="127.0.0.1",
+        port=8080,
+        max_active_requests=5,
+        graceful_timeout_seconds=3.0,
+    )
+
+    server_factory.assert_not_called()
+    config = cast("dict[str, object]", captured["config"])
+    assert "fallback_port" not in config
+    assert config["request_timeout_seconds"] == 12.0
+    assert config["native_usage_enabled"] is True
+
+
 def test_host_maps_native_runtime_failures_and_stops_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
@@ -163,3 +167,80 @@ def test_caller_invalid_request_never_advances() -> None:
         refusal_failover=False,
     )
     assert candidate is None
+
+
+def test_native_serving_blockers_name_dialectless_providers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rust-only startup validation names every alias the engine cannot serve.
+
+    Every currently supported provider implements a native dialect, so the
+    "no native dialect implementation" branch is exercised by patching a real
+    client's ``gateway_wire_profile`` back to the unimplemented base
+    behavior, rather than by a provider connection string this registry can
+    still resolve.
+    """
+    from exp.common.models import (
+        GatewayDeploymentCapabilities,
+        GatewayTokenPrices,
+        ModelCapabilities,
+    )
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+    from exp.runtime.gateway.lifecycle import load_gateway_components
+    from exp.runtime.gateway.lifecycle_test import _configured_gateway
+    from exp.runtime.gateway.native_execution import native_serving_blockers
+    from exp.runtime.models.providers.errors import ProviderCapabilityError
+    from exp.runtime.models.providers.gemini import GeminiClient
+
+    def _no_native_dialect(self: GeminiClient) -> object:
+        del self
+        raise ProviderCapabilityError(capability="native_data_plane")
+
+    monkeypatch.setattr(GeminiClient, "gateway_wire_profile", _no_native_dialect)
+
+    manager, _raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="escalated",
+        connection_name="gemini-main",
+        provider_model="gemini-model-exact",
+        exact_model_id="gemini-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="escalated",
+        alias_name="escalated",
+        revision_id="revision-escalated",
+        pool_id="escalated",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="escalated")
+    components = load_gateway_components(
+        tmp_path,
+        environment={
+            "TEST_PROVIDER_KEY": "provider-secret-canary",
+            "TEST_GEMINI_KEY": "gemini-secret-canary",
+        },
+    )
+    blockers = native_serving_blockers(components)
+    assert len(blockers) == 1
+    assert blockers[0].startswith("escalated: ")
+    assert "gemini" in blockers[0]
+    assert "native dialect" in blockers[0]

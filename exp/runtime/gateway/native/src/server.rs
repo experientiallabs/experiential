@@ -53,8 +53,15 @@ pub struct ServeConfig {
     pub request_timeout_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
-    /// Loopback port of the embedded python engine serving escalated requests.
-    pub fallback_port: u16,
+    /// Loopback port of the embedded python engine serving escalated
+    /// requests. Absent in rust-only mode: startup validation guarantees
+    /// every granted alias is natively servable, unknown routes answer a
+    /// native 404, and an escalation disposition is an internal error. The
+    /// optional fallback exists for hosted callers still migrating off the
+    /// python data plane and is scheduled for removal once the native engine
+    /// has soaked in production.
+    #[serde(default)]
+    pub fallback_port: Option<u16>,
     #[serde(default = "default_native_usage_enabled")]
     pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
@@ -88,7 +95,8 @@ struct AppState {
     http: reqwest::Client,
     permits: Arc<Semaphore>,
     request_timeout: Duration,
-    fallback_base: String,
+    /// Base URL of the embedded python fallback engine, when one exists.
+    fallback_base: Option<String>,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
@@ -186,7 +194,9 @@ pub async fn run(bridge: Arc<Bridge>, config: ServeConfig) -> Result<(), String>
         http,
         permits: Arc::new(Semaphore::new(max_active_requests)),
         request_timeout: Duration::from_secs_f64(config.request_timeout_seconds),
-        fallback_base: format!("http://127.0.0.1:{}", config.fallback_port),
+        fallback_base: config
+            .fallback_port
+            .map(|port| format!("http://127.0.0.1:{port}")),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         active_proxies: active_proxies.clone(),
@@ -411,18 +421,51 @@ async fn metrics_text(State(state): State<AppState>) -> Response {
     }
 }
 
+/// The native 404 for a route the gateway does not serve, in the OpenAI
+/// error envelope.
+fn unknown_route_error() -> PublicError {
+    PublicError::new(
+        404,
+        "unknown_route",
+        "Unknown route. The gateway serves /v1/models, /v1/chat/completions, \
+         /v1/responses, /health/live, /health/ready, /metrics, /metrics.json, \
+         /usage, and /usage.json.",
+        "invalid_request_error",
+    )
+}
+
+/// The rust-only answer to an escalation disposition: startup validation
+/// guarantees every granted alias is natively servable, so reaching this is
+/// an internal error rather than a degraded route.
+fn no_fallback_escalation_error() -> PublicError {
+    PublicError::new(
+        500,
+        "internal_error",
+        "The gateway cannot serve this request natively and no fallback \
+         engine is configured. Ask the gateway operator to inspect the \
+         server logs.",
+        "api_error",
+    )
+}
+
 /// Replay one HTTP request against the embedded python engine and stream the
-/// response back unchanged. Serves every surface the native plane does not
-/// implement (replay-keyed Responses, escalated aliases, unknown routes).
+/// response back unchanged. Serves the surfaces the native plane escalates
+/// (providers without a native dialect, host-ineligible routes) plus unknown
+/// routes while a fallback engine exists; `absent_error` answers the caller
+/// in rust-only mode.
 async fn proxy_to_python(
     state: &AppState,
     method: reqwest::Method,
     path_and_query: &str,
     headers: &HeaderMap,
     body: Bytes,
+    absent_error: PublicError,
 ) -> Response {
+    let Some(fallback_base) = state.fallback_base.clone() else {
+        return error_response(&absent_error);
+    };
     let guard = ProxyGuard::new(state.active_proxies.clone());
-    let url = format!("{}{}", state.fallback_base, path_and_query);
+    let url = format!("{fallback_base}{path_and_query}");
     // Connect failures are retried a bounded number of times: nothing has been
     // written to the python engine yet, so a replay cannot double-execute, and
     // a transient accept-queue overflow under concurrent load must not surface
@@ -512,7 +555,15 @@ async fn proxy_fallback(
         .path_and_query()
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| parts.uri.path().to_string());
-    proxy_to_python(&state, method, &path_and_query, &parts.headers, bytes).await
+    proxy_to_python(
+        &state,
+        method,
+        &path_and_query,
+        &parts.headers,
+        bytes,
+        unknown_route_error(),
+    )
+    .await
 }
 
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -706,6 +757,7 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
                 "/v1/chat/completions",
                 &headers,
                 body,
+                no_fallback_escalation_error(),
             )
             .await;
         }
@@ -761,6 +813,7 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
             "/v1/chat/completions",
             &headers,
             body,
+            no_fallback_escalation_error(),
         )
         .await;
     }
@@ -1621,57 +1674,148 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
         return error_response(&error);
     }
 
-    // Replay-keyed Responses keeps the python engine's idempotency semantics.
-    // Presence is checked on the raw header map so a non-UTF8 value still
-    // escalates instead of silently dropping replay behavior.
-    if headers.contains_key("idempotency-key") || headers.contains_key("x-client-request-id") {
-        return proxy_to_python(
-            &state,
-            reqwest::Method::POST,
-            "/v1/responses",
-            &headers,
-            body,
-        )
-        .await;
-    }
     let body_text = match String::from_utf8(body.to_vec()) {
         Ok(text) => text,
         Err(_) => return error_response(&PublicError::invalid_json()),
     };
 
+    // Replay-keyed Responses runs the python engine's exact idempotency
+    // protocol natively, sharing the same bounded replay store and
+    // tenant-scoped key derivation the chat surface uses (the surface is
+    // part of the key, so chat and Responses operations never collide).
+    let idempotency_key = latin1_header(&headers, "idempotency-key");
+    let client_request_id = latin1_header(&headers, "x-client-request-id");
+    let mut lease: Option<OwnerLease> = None;
+    if idempotency_key.is_some() || client_request_id.is_some() {
+        let scope_argument = compact_json(&json!({
+            "raw_key": raw_key,
+            "body": body_text,
+            "surface": "responses",
+            "idempotency_key": idempotency_key,
+            "client_request_id": client_request_id,
+        }));
+        let scope_text = match state.bridge.call("claim_scope", scope_argument).await {
+            Ok(text) => text,
+            Err(error) => return error_response(&error),
+        };
+        let scope_value: Value = match serde_json::from_str(&scope_text) {
+            Ok(value) => value,
+            Err(_) => return error_response(&PublicError::internal()),
+        };
+        if let Some(reason) = scope_value.get("escalate") {
+            METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
+            // No replay claim exists; the python engine owns this request
+            // end to end, including its own replay store.
+            return proxy_to_python(
+                &state,
+                reqwest::Method::POST,
+                "/v1/responses",
+                &headers,
+                body,
+                no_fallback_escalation_error(),
+            )
+            .await;
+        }
+        let key: ReplayKey = match serde_json::from_value(scope_value) {
+            Ok(key) => key,
+            Err(_) => return error_response(&PublicError::internal()),
+        };
+        match state.replays.claim(key).await {
+            Err(error) => return error_response(&error),
+            Ok(Claim::Replay(cached)) => return cached_response(&cached),
+            Ok(Claim::Join(joiner)) => {
+                // Joining never touches the ledger or budget: only the owner
+                // accounts for the single provider call.
+                return match joiner.result().await {
+                    Ok(cached) => cached_response(&cached),
+                    Err(error) => error_response(&error),
+                };
+            }
+            Ok(Claim::Owner(owner)) => lease = Some(owner),
+        }
+    }
+
     let admit_argument = compact_json(&json!({
         "raw_key": raw_key,
         "body": body_text,
         "surface": "responses",
+        "idempotency_key": idempotency_key,
+        "client_request_id": client_request_id,
     }));
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
-        Err(error) => return error_response(&error),
+        Err(error) => {
+            // A failed keyed admission abandons ownership so waiting
+            // duplicates fail closed instead of hanging.
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return error_response(&error);
+        }
     };
     let admission_value: Value = match serde_json::from_str(&admission_text) {
         Ok(value) => value,
         Err(_) => return error_response(&PublicError::internal()),
     };
-    if admission_value.get("escalate").is_some() {
+    if let Some(reason) = admission_value.get("escalate") {
+        METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
         // No ledger row exists; the python engine owns this request end to end.
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
         return proxy_to_python(
             &state,
             reqwest::Method::POST,
             "/v1/responses",
             &headers,
             body,
+            no_fallback_escalation_error(),
         )
         .await;
     }
     let admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
-        Err(_) => return wire_drift_response(&state, &admission_value, started).await,
+        Err(_) => {
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return wire_drift_response(&state, &admission_value, started).await;
+        }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
+    // The replay key was authorized independently of admission; a revision
+    // swap between the two fails closed exactly like the chat surface.
+    if lease
+        .as_ref()
+        .is_some_and(|owner| owner.alias_revision_id() != admission.alias_revision_id)
+    {
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
+        guard
+            .abandon(&Failure::new(
+                FailureClass::Internal,
+                "the alias revision changed during keyed admission",
+            ))
+            .await;
+        let mut error = PublicError::new(
+            409,
+            "idempotency_replay_unavailable",
+            "The alias revision changed while the keyed request was admitted. Retry the request.",
+            "api_error",
+        );
+        error.param = Some("Idempotency-Key".to_string());
+        return error_response(&error);
+    }
 
     let permit = match acquire_permit(&state, &mut guard, deadline).await {
         Ok(permit) => permit,
-        Err(response) => return *response,
+        Err(response) => {
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return *response;
+        }
     };
 
     let context = WaterfallContext {
@@ -1692,13 +1836,29 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
         .unwrap_or(0.0);
 
     match won {
-        Won::Failed(error) => error_response(&error),
-        Won::Settled(settled) => settled_responses_response(&admission, settled, created_at),
+        Won::Failed(error) => {
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            error_response(&error)
+        }
+        Won::Settled(settled) => {
+            settled_responses_response(&admission, settled, created_at, lease, client_request_id)
+                .await
+        }
         Won::Committed(committed) => {
             let committed = *committed;
             if admission.output_guardrail {
                 guarded_responses(
-                    state, admission, guard, committed, created_at, deadline, permit,
+                    state,
+                    admission,
+                    guard,
+                    committed,
+                    created_at,
+                    deadline,
+                    permit,
+                    lease,
+                    client_request_id,
                 )
                 .await
             } else if admission.stream {
@@ -1710,11 +1870,21 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
                     created_at,
                     deadline,
                     permit,
+                    lease,
+                    client_request_id,
                 )
                 .await
             } else {
                 completed_responses(
-                    &state, admission, guard, committed, created_at, deadline, permit,
+                    &state,
+                    admission,
+                    guard,
+                    committed,
+                    created_at,
+                    deadline,
+                    permit,
+                    lease,
+                    client_request_id,
                 )
                 .await
             }
@@ -1800,27 +1970,52 @@ async fn remember_continuation(
 /// Answer one Responses attempt that the waterfall already settled: a
 /// successful terminal with no semantic output, or an exhausted ladder
 /// flushing withheld refusal output ahead of the failing terminal.
-fn settled_responses_response(
+async fn settled_responses_response(
     admission: &Admission,
     settled: SettledAttempt,
     created_at: f64,
+    mut lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
 ) -> Response {
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
-    if refusal_completed.is_none() {
+    let failed = refusal_completed.is_none() && matches!(events.last(), Some(Event::Failed(_)));
+    if failed && !admission.stream {
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
         if let Some(Event::Failed(failure)) = events.last() {
-            if !admission.stream {
-                return error_response(&collection_public_error(&failure.clone().boundary()));
-            }
+            return error_response(&collection_public_error(&failure.clone().boundary()));
         }
     }
-    let mut headers = commit_independent(admission, None);
+    let mut headers = commit_independent(admission, client_request_id.as_deref());
     headers.extend(commit_dependent(admission, settled.depth));
     if admission.stream {
         let body = match encode_responses_sse(admission, created_at, &events) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
+        if failed {
+            // A failed flush is not a replayable success.
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return sse_body_response(&headers, body);
+        }
+        if let Some(mut owner) = lease.take() {
+            let mut sorted = headers.clone();
+            sorted.sort();
+            let cached = CachedResponse {
+                status_code: 200,
+                media_type: "text/event-stream".to_string(),
+                headers: sorted,
+                body: body.clone(),
+            };
+            return match owner.complete(cached.clone()).await {
+                Ok(()) => cached_response(&cached),
+                Err(error) => error_response(&error),
+            };
+        }
         return sse_body_response(&headers, body);
     }
     let envelope = admission.envelope.clone().unwrap_or_default();
@@ -1835,7 +2030,24 @@ fn settled_responses_response(
         Err(error) => return error_response(&error),
     };
     if let Some(failure) = &aggregated.failure {
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
         return error_response(&failure.clone().boundary().public_error());
+    }
+    if let Some(mut owner) = lease.take() {
+        let mut sorted = headers.clone();
+        sorted.sort();
+        let cached = CachedResponse {
+            status_code: 200,
+            media_type: "application/json".to_string(),
+            headers: sorted,
+            body: compact_json(&aggregated.body).into_bytes(),
+        };
+        return match owner.complete(cached.clone()).await {
+            Ok(()) => cached_response(&cached),
+            Err(error) => error_response(&error),
+        };
     }
     json_response(StatusCode::OK, &aggregated.body, &headers)
 }
@@ -1852,6 +2064,8 @@ async fn respond_from_responses_events(
     usage: Option<Usage>,
     tool_names: Vec<String>,
     created_at: f64,
+    mut lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
     stream_body: bool,
 ) -> Response {
     let refusal_completed = complete_visible_refusal(&mut events);
@@ -1880,6 +2094,9 @@ async fn respond_from_responses_events(
                     true,
                 )
                 .await;
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
             return error_response(&error);
         }
     };
@@ -1895,6 +2112,9 @@ async fn respond_from_responses_events(
                 true,
             )
             .await;
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
         return error_response(&error);
     }
     // Retention runs while the attempt row is still in flight so the control
@@ -1936,20 +2156,54 @@ async fn respond_from_responses_events(
     if let Err(error) = remembered {
         // The provider outcome already settled above, exactly like the python
         // executor; only the HTTP result reports the retention failure.
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
         return error_response(&error);
     }
     if !settled {
         // Success is only reported once the terminal accounting write landed.
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
         return error_response(&PublicError::internal());
     }
-    let mut headers = commit_independent(&admission, None);
+    let mut headers = commit_independent(&admission, client_request_id.as_deref());
     headers.extend(commit_dependent(&admission, depth));
     if stream_body {
         let body = match encode_responses_sse(&admission, created_at, &events) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
+        if let Some(mut owner) = lease.take() {
+            let mut sorted = headers.clone();
+            sorted.sort();
+            let cached = CachedResponse {
+                status_code: 200,
+                media_type: "text/event-stream".to_string(),
+                headers: sorted,
+                body: body.clone(),
+            };
+            return match owner.complete(cached.clone()).await {
+                Ok(()) => cached_response(&cached),
+                Err(error) => error_response(&error),
+            };
+        }
         return sse_body_response(&headers, body);
+    }
+    if let Some(mut owner) = lease.take() {
+        let mut sorted = headers.clone();
+        sorted.sort();
+        let cached = CachedResponse {
+            status_code: 200,
+            media_type: "application/json".to_string(),
+            headers: sorted,
+            body: compact_json(&aggregated.body).into_bytes(),
+        };
+        return match owner.complete(cached.clone()).await {
+            Ok(()) => cached_response(&cached),
+            Err(error) => error_response(&error),
+        };
     }
     json_response(StatusCode::OK, &aggregated.body, &headers)
 }
@@ -1963,6 +2217,8 @@ async fn completed_responses(
     created_at: f64,
     deadline: Instant,
     permit: tokio::sync::OwnedSemaphorePermit,
+    mut lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
 ) -> Response {
     let _permit = permit;
     let phase_timeout = admission.phase_timeout(committed.depth);
@@ -1981,6 +2237,9 @@ async fn completed_responses(
                         true,
                     )
                     .await;
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
                 return error_response(&error);
             }
         };
@@ -1993,6 +2252,8 @@ async fn completed_responses(
         committed.usage,
         committed.tool_names,
         created_at,
+        lease,
+        client_request_id,
         false,
     )
     .await
@@ -2031,6 +2292,8 @@ async fn guarded_responses(
     created_at: f64,
     deadline: Instant,
     permit: tokio::sync::OwnedSemaphorePermit,
+    mut lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
 ) -> Response {
     let _permit = permit;
     let phase_timeout = admission.phase_timeout(committed.depth);
@@ -2049,6 +2312,9 @@ async fn guarded_responses(
                         true,
                     )
                     .await;
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
                 return error_response(&error);
             }
         };
@@ -2064,6 +2330,9 @@ async fn guarded_responses(
                     true,
                 )
                 .await;
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
             return error_response(&failure.public_error());
         }
     };
@@ -2077,6 +2346,8 @@ async fn guarded_responses(
         committed.usage,
         committed.tool_names,
         created_at,
+        lease,
+        client_request_id,
         stream_body,
     )
     .await
@@ -2091,20 +2362,33 @@ async fn stream_responses(
     created_at: f64,
     deadline: Instant,
     permit: tokio::sync::OwnedSemaphorePermit,
+    lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    let mut header_pairs = commit_independent(&admission, None);
+    let mut header_pairs = commit_independent(&admission, client_request_id.as_deref());
     header_pairs.extend(commit_dependent(&admission, committed.depth));
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();
     let envelope = admission.envelope.clone().unwrap_or_default();
     let phase_timeout = admission.phase_timeout(committed.depth);
+    let cached_headers = {
+        let mut sorted = header_pairs.clone();
+        sorted.sort();
+        sorted
+    };
     let task_hold = guard.hold_task();
     tokio::spawn(async move {
         let _task = task_hold;
         let _permit = permit;
         let mut guard = guard;
         let mut committed = committed;
+        let mut lease = lease;
+        // Keyed streams capture every public frame so the owner can publish
+        // the exact byte stream; terminal frames flow through the shared
+        // publication tail, matching the chat surface.
+        let mut capture: Vec<u8> = Vec::new();
+        let mut replayable = lease.is_some();
         let mut encoder = ResponsesSseEncoder::new(&request_id, &alias, created_at, envelope);
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
@@ -2136,7 +2420,11 @@ async fn stream_responses(
             }
         };
         for frame in start_frames {
-            if !send_bounded(&sender, deadline, Bytes::from(frame)).await {
+            let data = Bytes::from(frame);
+            if lease.is_some() {
+                replayable = capture_frame(&mut capture, &data, replayable);
+            }
+            if !send_bounded(&sender, deadline, data).await {
                 guard.settle_cancelled(usage.as_ref(), &tool_names).await;
                 return;
             }
@@ -2195,7 +2483,11 @@ async fn stream_responses(
                 break;
             }
             for data in encoded {
-                if !send_bounded(&sender, deadline, Bytes::from(data)).await {
+                let data = Bytes::from(data);
+                if lease.is_some() {
+                    replayable = capture_frame(&mut capture, &data, replayable);
+                }
+                if !send_bounded(&sender, deadline, data).await {
                     settle_stream_end(
                         &mut guard,
                         terminal.as_ref(),
@@ -2228,25 +2520,30 @@ async fn stream_responses(
                 return;
             }
         }
-        for data in terminal_frames {
-            if !send_bounded(&sender, deadline, Bytes::from(data)).await {
-                settle_stream_end(
-                    &mut guard,
-                    terminal.as_ref(),
-                    usage.as_ref(),
-                    &tool_names,
-                    true,
-                )
-                .await;
-                return;
-            }
-        }
+        // The durable settlement lands before any keyed publication so a
+        // replayable success can never outlive a lost accounting write; a
+        // failed terminal abandons ownership so duplicates fail closed.
         settle_stream_end(
             &mut guard,
             terminal.as_ref(),
             usage.as_ref(),
             &tool_names,
             false,
+        )
+        .await;
+        if matches!(terminal, Some(Event::Failed(_))) {
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+        }
+        finish_stream_terminal(
+            &sender,
+            deadline,
+            &mut lease,
+            replayable,
+            &mut capture,
+            &cached_headers,
+            terminal_frames.into_iter().map(Bytes::from).collect(),
         )
         .await;
     });
