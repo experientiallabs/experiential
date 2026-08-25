@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from exp.common.core.artifacts import JsonObject, stable_id
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -102,14 +103,16 @@ def _optional_count(value: object) -> int | None:
     return value
 
 
-def deployment_operation_key(route: GatewayRoute) -> str:
+def deployment_operation_key(route: GatewayRoute, deployment: ExactModelDeployment) -> str:
     """Derive the stable per-deployment idempotency key used by dispatch.
 
     Mirrors the executor's provider-operation identity so retried physical
-    dispatches of the same deployment reuse one caller operation.
+    dispatches of the same deployment reuse one caller operation while every
+    later route position derives its own.
 
     Args:
-        route: Resolved single-deployment route.
+        route: Resolved ordered route.
+        deployment: The certified deployment being dispatched.
 
     Returns:
         Stable content-addressed operation identity.
@@ -120,8 +123,8 @@ def deployment_operation_key(route: GatewayRoute) -> str:
         {
             "request_id": authorization.request_id,
             "catalog_sha256": authorization.catalog_sha256,
-            "deployment_id": route.deployment.deployment_id,
-            "connection_sha256": route.deployment.connection_sha256,
+            "deployment_id": deployment.deployment_id,
+            "connection_sha256": deployment.connection_sha256,
         },
     )
 

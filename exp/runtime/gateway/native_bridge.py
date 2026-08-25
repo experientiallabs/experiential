@@ -13,34 +13,36 @@ interleave in the same batched fsyncs while every caller still blocks until
 its own write is durable. Every boundary call takes and returns one JSON
 string so the boundary stays narrow and typed on both sides.
 
+Admission returns the full ordered certified route (one wire configuration
+per deployment) plus the frozen retry-policy facts, accepting the request
+without starting any attempt. The data plane then reserves each physical
+dispatch through ``start_attempt`` immediately before network work and lands
+each attempt's durable terminal through ``settle`` (finalizing the request
+only on the terminal attempt); candidate selection stays here, mirroring the
+python executor's waterfall policy, health circuits, and budget skipping.
+
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
 the caller, mirroring ``GatewayService`` error mapping. Requests the native
-path cannot serve (multi-deployment pools, resolved clients exposing no
-native wire profile) are answered with an ``{"escalate": reason}`` admission
-disposition before any ledger write; the data plane replays those against the
-embedded python engine, which performs its own full authorization and
-accounting, so nothing is double-counted.
+path cannot serve (resolved clients exposing no native wire profile) are
+answered with an ``{"escalate": reason}`` admission disposition before any
+ledger write; the data plane replays those against the embedded python
+engine, which performs its own full authorization and accounting, so nothing
+is double-counted.
 """
 
 from __future__ import annotations
 
 import json
-import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.boundary import boundary_protocol_error
-from exp.runtime.gateway.budgets import BudgetReservationRejected, maximum_attempt_cost_micro_usd
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
     GatewayApiSurface,
-    GatewayEvent,
-    GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
     GatewayRequest,
@@ -54,17 +56,27 @@ from exp.runtime.gateway.discovery import (
 from exp.runtime.gateway.execution import GatewayExecutionError
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
-from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy, GuardrailRejected
+from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_native_output
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.native_accounting import (
+    NativeAttemptAccounting,
+    NativeBridgeError,
+)
+from exp.runtime.gateway.native_accounting import (
+    authority_error as _authority_error,
+)
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
-from exp.runtime.gateway.native_dispatch import (
+from exp.runtime.gateway.native_dispatch import dispatch_signature_headers, frozen_dispatch
+from exp.runtime.gateway.native_execution import (
+    MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
+    MAXIMUM_TOTAL_ATTEMPTS,
+    InflightRequest,
     NativeDialectUnavailableError,
-    dispatch_signature_headers,
-    frozen_dispatch,
-    resolve_wire_profile,
+    deployment_wire_entry,
+    resolve_route_profiles,
 )
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.native_responses import (
@@ -74,11 +86,7 @@ from exp.runtime.gateway.native_responses import (
     responses_envelope,
 )
 from exp.runtime.gateway.native_settlement import (
-    budget_quota_protocol_error,
-    deployment_operation_key,
-    first_token_at_from_settlement,
     optional_text,
-    terminal_from_settlement,
 )
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
@@ -100,63 +108,6 @@ from exp.runtime.openai_protocol.state import (
 )
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
-_SWEEP_GRACE_SECONDS = 5.0
-_SWEEP_INTERVAL_SECONDS = 5.0
-_SWEEP_BATCH = 16
-
-
-@dataclass
-class _InflightAttempt:
-    """One admitted attempt awaiting its durable terminal settlement."""
-
-    authorization: AuthorizationSnapshot
-    attempt_id: str
-    deadline_monotonic: float
-    # The exact settlement the data plane could not land; the sweep replays it
-    # verbatim so a completed outcome and its usage are never downgraded.
-    pending_settlement: JsonObject | None = field(default=None)
-    # Responses-only retention facts consumed by ``remember`` after a
-    # successful terminal; chat attempts carry ``None``.
-    continuation: ContinuationContext | None = field(default=None)
-    policy: GuardrailPolicy | None = field(default=None)
-    # Body-signing dialects only: the resolved client that signs the frozen
-    # body at dispatch time through the ``sign_dispatch`` callback.
-    signer: GatewayDispatchSigner | None = field(default=None)
-
-
-class NativeBridgeError(Exception):
-    """One sanitized boundary failure delivered to the native data plane."""
-
-    def __init__(self, error: OpenAIProtocolError) -> None:
-        """Retain the public error as the JSON payload the data plane returns.
-
-        Args:
-            error: Sanitized protocol error carrying its HTTP representation.
-        """
-        super().__init__(error.detail.message)
-        self.public_error_json = json.dumps(
-            {
-                "status_code": error.status_code,
-                "code": error.detail.code,
-                "message": error.detail.message,
-                "error_type": error.detail.type,
-                "param": error.detail.param,
-                "retry_after_seconds": error.retry_after_seconds,
-            },
-            separators=(",", ":"),
-        )
-
-
-def _authority_error(exception: Exception) -> NativeBridgeError:
-    """Map boundary failures through the shared service-layer mapper.
-
-    Args:
-        exception: Store, grant, routing, or execution failure.
-
-    Returns:
-        A boundary error carrying the matching public OpenAI error.
-    """
-    return NativeBridgeError(boundary_protocol_error(exception))
 
 
 def _escalation(reason: str) -> str:
@@ -237,19 +188,12 @@ class NativeControlPlane:
         self._budget_error_factory = budget_error_factory
         self._native_route_eligible = native_route_eligible
         self._guardrails = guardrails
-        self._inflight: dict[str, _InflightAttempt] = {}
-        self._lock = threading.Lock()
-        self._accounting_healthy = True
-        self._sweep_retained_replayed = 0
-        self._sweep_abandoned_cancelled = 0
-        # The sweep also runs on a timer so retained settlements and abandoned
-        # attempts are recovered even when no further requests arrive.
-        self._sweeper = threading.Thread(
-            target=self._sweep_loop,
-            name="exp-native-settlement-sweep",
-            daemon=True,
+        # The accounting registry owns in-flight requests, per-dispatch
+        # reservations, deployment-health circuits, and the deadline sweep.
+        self._accounting = NativeAttemptAccounting(
+            self._write_ledger,
+            budget_error_factory=budget_error_factory,
         )
-        self._sweeper.start()
 
     @property
     def request_timeout_seconds(self) -> float:
@@ -286,12 +230,13 @@ class NativeControlPlane:
         return "{}"
 
     def admit(self, argument: str) -> str:
-        """Decode, authorize, inspect, route, and durably start one attempt.
+        """Decode, authorize, inspect, route, and durably accept one request.
 
         The raw body is decoded with the same ``decode_chat`` the python
-        engine uses, and the upstream payload is built with the same shared
-        payload builders, so the two engines cannot drift at the protocol or
-        provider boundary.
+        engine uses, and every deployment's upstream payload is built with
+        the same shared payload builders, so the two engines cannot drift at
+        the protocol or provider boundary. No attempt row is written here:
+        each physical dispatch is reserved by :meth:`start_attempt`.
 
         Args:
             argument: JSON object with ``raw_key``, ``body`` (raw request
@@ -300,17 +245,19 @@ class NativeControlPlane:
                 ``app_referer``/``app_title`` caller app identity.
 
         Returns:
-            JSON wire configuration for the single resolved deployment,
-            including the fully built upstream payload, or an
-            ``{"escalate": reason}`` disposition (returned only before any
-            ledger write) handing the request to the python engine.
+            JSON wire configuration carrying the full ordered certified
+            ``route`` (one dialect, endpoint, headers, payload, and
+            per-deployment idempotency key entry per deployment) plus the
+            frozen retry-policy facts, or an ``{"escalate": reason}``
+            disposition (returned only before any ledger write) handing the
+            request to the python engine.
 
         Raises:
-            NativeBridgeError: Decoding, authorization, routing, capability,
-                or budget admission failed.
+            NativeBridgeError: Decoding, authorization, routing, or
+                capability admission failed.
         """
         assert_not_internal_classification()
-        self._sweep_expired()
+        self._accounting.sweep_expired()
         data = json.loads(argument)
         surface = str(data.get("surface", "chat"))
         decoded = self._decode_body(
@@ -367,17 +314,14 @@ class NativeControlPlane:
         # against the accepted request below.
         probe_failure: Exception | None = None
         route: GatewayRoute | None = None
-        profile: GatewayWireProfile | None = None
-        wire_client: NativeWireClient | None = None
+        resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
         try:
             route = self._resolve_route(authorization, request)
-            profile, wire_client = resolve_wire_profile(self._components.runtime_catalogs, route)
+            resolved_wires = resolve_route_profiles(self._components.runtime_catalogs, route)
         except NativeDialectUnavailableError as exc:
             return _escalation(str(exc))
         except Exception as exc:  # noqa: BLE001 - recorded after acceptance below.
             probe_failure = exc
-        if route is not None and route.fallback_deployments:
-            return _escalation("multi-deployment pools use the python engine's certified waterfall")
         if route is not None and self._native_route_eligible is not None:
             try:
                 native_route_eligible = self._native_route_eligible(route, request)
@@ -386,49 +330,40 @@ class NativeControlPlane:
             if not native_route_eligible:
                 return _escalation("host policy requires the python execution engine")
 
+        # Admission accepts the request and returns the full ordered route;
+        # no attempt row exists until the data plane's first `start_attempt`.
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         accepted = False
-        attempt_id: str | None = None
         try:
             self._write_ledger.accept_request(authorization=authorization)
             accepted = True
-            if probe_failure is not None or route is None or profile is None:
+            if probe_failure is not None or route is None or resolved_wires is None:
                 raise probe_failure or GatewayRoutingError("authorized route did not resolve")
-            deployment = route.deployment
-            require_gateway_provider(deployment.provider)
-            preflight_gateway_request(provider_request, deployment.gateway.capabilities)
-            upstream_payload = dialect_stream_payload(profile, provider_request)
-            upstream_body, dispatch_signer = frozen_dispatch(profile, wire_client, upstream_payload)
-            maximum_cost = maximum_attempt_cost_micro_usd(request, deployment)
-            attempt_id = self._write_ledger.start_attempt(
-                snapshot=route.snapshot,
-                deployment=deployment,
-                attempt_ordinal=0,
-                route_depth=0,
-                maximum_cost_micro_usd=maximum_cost,
-                route_reason=route.route_reason,
-                fallback_reason=route.fallback_reason,
-            )
-        except BudgetReservationRejected as exc:
-            error = (
-                NativeBridgeError(budget_quota_protocol_error())
-                if self._budget_error_factory is None
-                else self._budget_error_factory(data["raw_key"])
-            )
-            self._finish_request_quietly(
-                authorization,
-                GatewayFailure(
-                    failure_class=GatewayFailureClass.QUOTA_EXCEEDED,
-                    safe_message="monthly gateway allocation is exhausted",
-                ),
-            )
-            raise error from exc
+            wire_route: list[JsonObject] = []
+            signers: list[GatewayDispatchSigner | None] = []
+            for deployment, (profile, client) in zip(
+                route.deployments, resolved_wires, strict=True
+            ):
+                require_gateway_provider(deployment.provider)
+                preflight_gateway_request(provider_request, deployment.gateway.capabilities)
+                upstream_payload = dialect_stream_payload(profile, provider_request)
+                upstream_body, dispatch_signer = frozen_dispatch(profile, client, upstream_payload)
+                wire_route.append(
+                    deployment_wire_entry(
+                        route,
+                        deployment,
+                        profile,
+                        upstream_payload,
+                        upstream_body,
+                    )
+                )
+                signers.append(dispatch_signer)
         except ProviderCapabilityError as exc:
             failure = GatewayFailure(
                 failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
                 safe_message="the resolved deployment does not support the requested capability",
             )
-            self._finish_request_quietly(authorization, failure)
+            self._accounting.finish_request_quietly(authorization, failure)
             raise NativeBridgeError(public_failure_error(failure)) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             error = _authority_error(exc)
@@ -436,43 +371,33 @@ class NativeControlPlane:
                 failure_class=GatewayFailureClass.INTERNAL,
                 safe_message="gateway admission failed before provider dispatch",
             )
-            if attempt_id is not None:
-                self._finish_attempt_quietly(attempt_id, failure)
-            elif accepted:
-                self._finish_request_quietly(authorization, failure)
+            if accepted:
+                self._accounting.finish_request_quietly(authorization, failure)
             raise error from exc
 
-        with self._lock:
-            self._inflight[authorization.request_id] = _InflightAttempt(
+        self._accounting.register(
+            InflightRequest(
                 authorization=authorization,
-                attempt_id=attempt_id,
+                route=route,
+                request=provider_request,
                 deadline_monotonic=deadline,
                 continuation=continuation_context,
                 policy=policy,
-                signer=dispatch_signer,
+                signers=tuple(signers),
             )
+        )
         response: JsonObject = {
             "request_id": authorization.request_id,
-            "attempt_id": attempt_id,
             "alias": authorization.alias,
             "alias_revision_id": authorization.alias_revision_id,
             "stream": request.stream,
             "include_usage": request.include_usage,
             "exact_model_id": route.snapshot.exact_model_id,
-            "provider": route.deployment.provider,
-            "deployment_id": route.deployment.deployment_id,
             "route_reason": route.route_reason,
-            "dialect": profile.dialect,
-            "url": profile.url,
-            "headers": dict(profile.headers),
-            "model_id": profile.model_id,
-            "timeout_seconds": profile.timeout_seconds,
-            # A signed dispatch carries only the frozen body string; shipping
-            # the structured payload too would double the boundary bytes for
-            # a value the data plane must not re-serialize anyway.
-            "upstream_payload": None if upstream_body is not None else upstream_payload,
-            "upstream_body": upstream_body,
-            "idempotency_key": deployment_operation_key(route),
+            "route": wire_route,
+            "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
+            "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
+            "refusal_failover": authorization.refusal_failover,
             "output_guardrail": bool(policy is not None and policy.output_checks),
         }
         if request.surface == GatewayApiSurface.RESPONSES:
@@ -484,9 +409,11 @@ class NativeControlPlane:
         """Sign one frozen dispatch body immediately before the provider POST.
 
         The data plane calls this after it acquires its bounded dispatch
-        permit, so queue time can never age a signature toward AWS's short
-        clock window; the immediate bounded open retry reuses the result
-        within milliseconds.
+        permit and immediately before the open attempt reserved by
+        ``start_attempt``, so queue time can never age a signature toward
+        AWS's short clock window; a same-deployment redial or a failover
+        advance is a fresh physical attempt through ``start_attempt``, so it
+        always signs afresh too.
 
         Args:
             argument: JSON object with ``request_id``, the exact ``url``, and
@@ -496,15 +423,19 @@ class NativeControlPlane:
             JSON object with the ``headers`` to send verbatim.
 
         Raises:
-            NativeBridgeError: The attempt is unknown, carries no signer, or
-                credential resolution failed.
+            NativeBridgeError: The attempt is unknown, its route depth
+                carries no signer, or credential resolution failed.
         """
         data = json.loads(argument)
-        with self._lock:
-            entry = self._inflight.get(str(data.get("request_id") or ""))
+        entry = self._accounting.entry(str(data.get("request_id") or ""))
+        signer = None
+        if entry is not None and entry.active_attempt_id is not None:
+            depth = entry.attempt_depths.get(entry.active_attempt_id)
+            if depth is not None and depth < len(entry.signers):
+                signer = entry.signers[depth]
         try:
             headers = dispatch_signature_headers(
-                entry.signer if entry is not None else None,
+                signer,
                 url=str(data["url"]),
                 body=str(data["body"]),
             )
@@ -512,14 +443,63 @@ class NativeControlPlane:
             raise NativeBridgeError(exc) from exc
         return json.dumps({"headers": headers}, separators=(",", ":"))
 
+    def start_attempt(self, argument: str) -> str:
+        """Reserve one physical dispatch through the accounting registry.
+
+        Args:
+            argument: JSON object with ``request_id``, ``attempt_ordinal``,
+                optional ``current_depth``, and the optional classified
+                ``failure``; see
+                :meth:`NativeAttemptAccounting.start_attempt`.
+
+        Returns:
+            The registry's reservation or exhaustion disposition.
+
+        Raises:
+            NativeBridgeError: The reservation failed; the request is
+                finalized before the error is raised.
+        """
+        return self._accounting.start_attempt(argument)
+
+    def settle(self, argument: str) -> str:
+        """Durably settle one reserved attempt through the accounting registry.
+
+        Args:
+            argument: JSON settlement payload; see
+                :meth:`NativeAttemptAccounting.settle`.
+
+        Returns:
+            An empty JSON object; repeated settlement is a no-op.
+
+        Raises:
+            NativeBridgeError: The durable terminal write failed; the entry
+                is retained so a retried settlement can still land.
+        """
+        return self._accounting.settle(argument)
+
+    def abandon(self, argument: str) -> str:
+        """Terminalize one accepted request through the accounting registry.
+
+        Args:
+            argument: JSON object with ``request_id`` and optional
+                ``failure``; see :meth:`NativeAttemptAccounting.abandon`.
+
+        Returns:
+            An empty JSON object; an unknown request is a no-op.
+
+        Raises:
+            NativeBridgeError: The durable terminal write failed; the entry
+                is kept so the deadline sweep can still close it.
+        """
+        return self._accounting.abandon(argument)
+
     def enforce_output(self, argument: str) -> str:
         """Run one output-chain callback for a native buffered completion."""
         data = json.loads(argument)
         request_id = str(data.get("request_id") or "")
-        with self._lock:
-            entry = self._inflight.get(request_id)
-            policy = None if entry is None else entry.policy
-            deadline = time.monotonic() if entry is None else entry.deadline_monotonic
+        entry = self._accounting.entry(request_id)
+        policy = None if entry is None else entry.policy
+        deadline = time.monotonic() if entry is None else entry.deadline_monotonic
         return enforce_native_output(
             self._guardrails,
             policy,
@@ -583,13 +563,11 @@ class NativeControlPlane:
             return _escalation("project-backed aliases use learned selection on the python engine")
         try:
             route = self._components.routes.resolve_direct(authorization)
-            resolve_wire_profile(self._components.runtime_catalogs, route)
+            resolve_route_profiles(self._components.runtime_catalogs, route)
         except NativeDialectUnavailableError as exc:
             return _escalation(str(exc))
         except Exception:  # noqa: BLE001 - the owner's admission records this failure.
-            route = None
-        if route is not None and route.fallback_deployments:
-            return _escalation("multi-deployment pools use the python engine's certified waterfall")
+            pass
         key = replay_key(
             namespace=ProtocolNamespace(
                 organization_id=authorization.organization_id,
@@ -635,8 +613,7 @@ class NativeControlPlane:
         """
         data = json.loads(argument)
         request_id = str(data["request_id"])
-        with self._lock:
-            entry = self._inflight.get(request_id)
+        entry = self._accounting.entry(request_id)
         context = entry.continuation if entry is not None else None
         if context is None:
             return "{}"
@@ -646,48 +623,6 @@ class NativeControlPlane:
             raise NativeBridgeError(exc) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
-        return "{}"
-
-    def settle(self, argument: str) -> str:
-        """Durably settle one previously admitted attempt exactly once.
-
-        Args:
-            argument: JSON object with ``request_id``, ``attempt_id``,
-                ``outcome``, optional ``usage``, ``tool_names``, ``failure``.
-
-        Returns:
-            An empty JSON object; repeated settlement is a no-op.
-
-        Raises:
-            NativeBridgeError: The durable terminal write failed; the
-                in-flight entry is kept so a retried settlement (from the
-                data plane or the deadline sweep) can still reach the ledger.
-        """
-        data = json.loads(argument)
-        request_id = str(data["request_id"])
-        with self._lock:
-            entry = self._inflight.get(request_id)
-        if entry is None:
-            return "{}"
-        terminal, failure = terminal_from_settlement(data)
-        first_token_at = first_token_at_from_settlement(data)
-        try:
-            self._write_ledger.finish_attempt(
-                attempt_id=entry.attempt_id,
-                terminal_event=terminal,
-                failure=failure,
-                finalize_request=True,
-                first_token_at=first_token_at,
-            )
-        except Exception as exc:  # noqa: BLE001 - the data plane retries.
-            # The exact settlement is retained so a retry (from the data
-            # plane or the timer sweep) lands the ORIGINAL outcome and usage,
-            # never a downgraded cancellation.
-            with self._lock:
-                entry.pending_settlement = data
-            raise _authority_error(exc) from exc
-        with self._lock:
-            self._inflight.pop(request_id, None)
         return "{}"
 
     def models(self, argument: str) -> str:
@@ -797,15 +732,15 @@ class NativeControlPlane:
         data_plane: JsonObject | None = None
         if self._data_plane_metrics is not None:
             data_plane = json.loads(self._data_plane_metrics())
-        with self._lock:
-            control_plane: JsonObject = {
-                "sweep_retained_settlements_replayed": self._sweep_retained_replayed,
-                "sweep_abandoned_attempts_cancelled": self._sweep_abandoned_cancelled,
-                "inflight_attempts": len(self._inflight),
-                "reconciled_expired_requests": self._components.reconciled_expired_requests,
-                "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
-                "accounting_healthy": self._accounting_healthy,
-            }
+        retained_replayed, abandoned_cancelled, inflight = self._accounting.counters()
+        control_plane: JsonObject = {
+            "sweep_retained_settlements_replayed": retained_replayed,
+            "sweep_abandoned_attempts_cancelled": abandoned_cancelled,
+            "inflight_attempts": inflight,
+            "reconciled_expired_requests": self._components.reconciled_expired_requests,
+            "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
+            "accounting_healthy": self._accounting.accounting_healthy,
+        }
         return {"data_plane": data_plane, "control_plane": control_plane}
 
     def metrics_json(self, argument: str) -> str:
@@ -822,7 +757,7 @@ class NativeControlPlane:
     def readiness(self, argument: str) -> str:
         """Return whether shared executor and bridge accounting stay healthy."""
         del argument
-        if not self._accounting_healthy:
+        if not self._accounting.accounting_healthy:
             return "false"
         if self._readiness_probe is not None:
             try:
@@ -885,108 +820,3 @@ class NativeControlPlane:
             request=request,
             episode_namespace=episode,
         )
-
-    def _sweep_loop(self) -> None:
-        """Run the settlement sweep on a timer for the process lifetime."""
-        while True:
-            time.sleep(_SWEEP_INTERVAL_SECONDS)
-            self._sweep_expired()
-
-    def _sweep_expired(self) -> None:
-        """Recover retained settlements and close abandoned attempts.
-
-        A retained settlement (the data plane's terminal write failed) is
-        replayed verbatim so the original outcome and usage land. An attempt
-        with no settlement at all past its deadline plus grace is closed as
-        cancelled; that is the backstop for wire-contract failures and
-        data-plane crashes short of process death. A retained settlement that
-        fails again here latches accounting-unhealthy as a durable loss.
-        """
-        now = time.monotonic()
-        with self._lock:
-            retained = [
-                (request_id, entry)
-                for request_id, entry in self._inflight.items()
-                if entry.pending_settlement is not None
-            ][:_SWEEP_BATCH]
-            abandoned = [
-                (request_id, entry)
-                for request_id, entry in self._inflight.items()
-                if entry.pending_settlement is None
-                and entry.deadline_monotonic + _SWEEP_GRACE_SECONDS < now
-            ][:_SWEEP_BATCH]
-        for request_id, entry in retained:
-            settlement = entry.pending_settlement
-            if settlement is None:
-                continue
-            terminal, failure = terminal_from_settlement(settlement)
-            if self._settle_swept(request_id, entry, terminal, failure, latch_on_failure=True):
-                with self._lock:
-                    self._sweep_retained_replayed += 1
-        if not abandoned:
-            return
-        cancelled = GatewayFailure(
-            failure_class=GatewayFailureClass.CANCELLED,
-            safe_message="gateway request was abandoned before settlement",
-        )
-        terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=cancelled)
-        for request_id, entry in abandoned:
-            if self._settle_swept(request_id, entry, terminal, cancelled, latch_on_failure=True):
-                with self._lock:
-                    self._sweep_abandoned_cancelled += 1
-
-    def _settle_swept(
-        self,
-        request_id: str,
-        entry: _InflightAttempt,
-        terminal: GatewayEvent,
-        failure: GatewayFailure | None,
-        *,
-        latch_on_failure: bool,
-    ) -> bool:
-        """Land one swept settlement; keep the entry for retry on failure.
-
-        Returns:
-            Whether the swept terminal write reached the ledger.
-        """
-        try:
-            self._write_ledger.finish_attempt(
-                attempt_id=entry.attempt_id,
-                terminal_event=terminal,
-                failure=failure,
-                finalize_request=True,
-            )
-        except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
-            if latch_on_failure:
-                self._accounting_healthy = False
-            return False
-        with self._lock:
-            self._inflight.pop(request_id, None)
-        return True
-
-    def _finish_request_quietly(
-        self,
-        authorization: AuthorizationSnapshot,
-        failure: GatewayFailure,
-    ) -> None:
-        """Finalize accepted pre-dispatch work without masking the primary failure."""
-        try:
-            self._write_ledger.finish_request(
-                authorization=authorization,
-                failure=failure,
-            )
-        except Exception:  # noqa: BLE001 - primary admission failure stays authoritative.
-            self._accounting_healthy = False
-
-    def _finish_attempt_quietly(self, attempt_id: str, failure: GatewayFailure) -> None:
-        """Settle one started attempt without masking the primary failure."""
-        terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
-        try:
-            self._write_ledger.finish_attempt(
-                attempt_id=attempt_id,
-                terminal_event=terminal,
-                failure=failure,
-                finalize_request=True,
-            )
-        except Exception:  # noqa: BLE001 - primary admission failure stays authoritative.
-            self._accounting_healthy = False

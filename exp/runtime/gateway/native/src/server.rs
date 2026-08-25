@@ -1,6 +1,5 @@
-//! The axum data plane: routes, admission, upstream relay, and settlement.
+//! The axum data plane: routes, admission, waterfall execution, settlement.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,9 +19,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::bridge::Bridge;
-use crate::dialects::{
-    Dialect, FrameDecoder, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
-};
+use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::{chat_data, compact_json, completed_chat_body, ChatSseEncoder};
 use crate::encode_responses::{completed_responses_body, ResponsesEnvelope, ResponsesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
@@ -30,7 +27,11 @@ use crate::events::{CompletedToolCall, Event, Usage};
 use crate::guardrails;
 use crate::metrics::{classify_escalation, METRICS};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey, ReplayStore};
-use crate::upstream::open_stream;
+use crate::waterfall::{
+    acquire_attempt, collect_committed, collection_public_error, event_retained_bytes, remaining,
+    track_event, AttemptGuard, CommittedAttempt, DeploymentWire, RoutePolicy, SettledAttempt,
+    WaterfallContext, Won,
+};
 
 /// Largest accepted request body on every native-served or proxied route.
 /// Bounded so one client cannot hold unbounded gateway memory; far above any
@@ -123,36 +124,25 @@ impl Drop for ProxyGuard {
     }
 }
 
-/// The wire configuration returned by one successful admission. The upstream
-/// payload arrives fully built by the shared python dialect builders, so the
-/// two engines cannot drift at the provider boundary.
+/// The wire configuration returned by one successful admission: the full
+/// ordered certified route (one wire configuration per deployment, each with
+/// its payload fully built by the shared python dialect builders) plus the
+/// frozen retry-policy facts. No attempt is started at admission; each
+/// physical dispatch is reserved through the `start_attempt` callback.
 #[derive(Debug, Clone, Deserialize)]
 struct Admission {
     request_id: String,
-    attempt_id: String,
     alias: String,
     alias_revision_id: String,
     stream: bool,
     include_usage: bool,
-    dialect: String,
-    url: String,
-    headers: HashMap<String, String>,
-    timeout_seconds: f64,
-    /// Structured payload the data plane serializes itself; null for
-    /// body-signing dialects, whose admission carries `upstream_body`.
-    #[serde(default)]
-    upstream_payload: Value,
-    /// Exact pre-serialized body for body-signing dialects (Bedrock SigV4).
-    /// When present it is sent verbatim: the signature covers these exact
-    /// bytes, so re-serializing a structured payload here could invalidate
-    /// it.
-    #[serde(default)]
-    upstream_body: Option<String>,
-    idempotency_key: String,
     exact_model_id: String,
-    provider: String,
-    deployment_id: String,
     route_reason: String,
+    route: Vec<DeploymentWire>,
+    maximum_total_attempts: u32,
+    maximum_same_deployment_attempts: u32,
+    #[serde(default)]
+    refusal_failover: bool,
     /// Responses-only request-reflecting envelope fields; chat admissions
     /// omit it.
     #[serde(default)]
@@ -162,6 +152,26 @@ struct Admission {
     /// the flag (default false) and never invoke that callback.
     #[serde(default)]
     output_guardrail: bool,
+}
+
+impl Admission {
+    fn policy(&self) -> RoutePolicy {
+        RoutePolicy {
+            maximum_total_attempts: self.maximum_total_attempts.max(1),
+            maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
+            refusal_failover: self.refusal_failover,
+        }
+    }
+
+    /// The per-chunk transport bound of the deployment serving `depth`.
+    fn phase_timeout(&self, depth: usize) -> Duration {
+        let seconds = self
+            .route
+            .get(depth)
+            .map(|wire| wire.timeout_seconds)
+            .unwrap_or(60.0);
+        Duration::from_secs_f64(seconds.max(0.001))
+    }
 }
 
 /// Run the data plane until shutdown; returns after graceful stop.
@@ -403,7 +413,7 @@ async fn metrics_text(State(state): State<AppState>) -> Response {
 
 /// Replay one HTTP request against the embedded python engine and stream the
 /// response back unchanged. Serves every surface the native plane does not
-/// implement (replay-keyed requests, escalated aliases, unknown routes).
+/// implement (replay-keyed Responses, escalated aliases, unknown routes).
 async fn proxy_to_python(
     state: &AppState,
     method: reqwest::Method,
@@ -614,212 +624,27 @@ fn capture_frame(buffer: &mut Vec<u8>, data: &[u8], replayable: bool) -> bool {
     true
 }
 
-/// Commit-dependent headers, mirroring `commit_dependent_headers`.
-fn commit_dependent(admission: &Admission) -> Vec<(String, String)> {
+/// Commit-dependent headers, mirroring `commit_dependent_headers`: the
+/// deployment identity and route depth that actually served the request.
+fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(String, String)> {
+    let (provider, deployment_id) = admission
+        .route
+        .get(depth)
+        .map(|wire| (wire.provider.clone(), wire.deployment_id.clone()))
+        .unwrap_or_default();
     vec![
         (
             "x-gateway-canonical-model".to_string(),
             admission.exact_model_id.clone(),
         ),
-        ("x-gateway-provider".to_string(), admission.provider.clone()),
-        (
-            "x-gateway-deployment".to_string(),
-            admission.deployment_id.clone(),
-        ),
-        ("x-gateway-route-depth".to_string(), "0".to_string()),
+        ("x-gateway-provider".to_string(), provider),
+        ("x-gateway-deployment".to_string(), deployment_id),
+        ("x-gateway-route-depth".to_string(), depth.to_string()),
         (
             "x-gateway-route-reason".to_string(),
             admission.route_reason.clone(),
         ),
     ]
-}
-
-fn settle_argument(
-    request_id: &str,
-    attempt_id: &str,
-    outcome: &str,
-    usage: Option<&Usage>,
-    tool_names: &[String],
-    failure: Option<&Failure>,
-) -> String {
-    compact_json(&json!({
-        "request_id": request_id,
-        "attempt_id": attempt_id,
-        "outcome": outcome,
-        "usage": usage.map(|usage| json!({
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cached_input_tokens": usage.cached_input_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
-        })),
-        "tool_names": tool_names,
-        "failure": failure.map(|failure| json!({
-            "failure_class": failure.failure_class.as_str(),
-            "safe_message": failure.safe_message,
-        })),
-    }))
-}
-
-/// Deliver one settlement with bounded backoff; the control plane keeps the
-/// in-flight entry on a failed terminal write, so retries can still land. A
-/// persistent failure stays latched as accounting-unhealthy control-plane
-/// side and is reconciled at the next startup.
-async fn deliver_settlement(bridge: &Bridge, argument: String) -> bool {
-    for backoff_ms in [0u64, 100, 500, 2_000] {
-        if backoff_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            METRICS.record_settlement_retry();
-        }
-        if bridge.call("settle", argument.clone()).await.is_ok() {
-            return true;
-        }
-    }
-    // The control plane keeps the in-flight entry; its sweep keeps retrying
-    // and latches readiness if the loss is durable. Leave an operator signal
-    // as one structured, content-free stderr line beside the counter.
-    METRICS.record_settlement_give_up();
-    let parsed: Value = serde_json::from_str(&argument).unwrap_or(Value::Null);
-    let line = json!({
-        "event": "settlement_give_up",
-        "request_id": parsed.get("request_id").cloned().unwrap_or(Value::Null),
-        "attempt_id": parsed.get("attempt_id").cloned().unwrap_or(Value::Null),
-        "outcome": parsed.get("outcome").cloned().unwrap_or(Value::Null),
-    });
-    eprintln!("exp-gateway-native: {line}");
-    false
-}
-
-/// Exactly-once settlement owner for one admitted attempt.
-///
-/// Every admitted request settles through this guard. If the owning future is
-/// dropped before an explicit settlement lands (client disconnect cancels the
-/// handler, a panic unwinds the stream task), `Drop` spawns a settlement so
-/// the ledger row and its budget reservation are always closed: the decided
-/// settlement verbatim when delivery was cut short, a cancellation otherwise.
-struct AttemptGuard {
-    bridge: Arc<Bridge>,
-    request_id: String,
-    attempt_id: String,
-    pending: Arc<AtomicUsize>,
-    armed: bool,
-    outcome_recorded: bool,
-    /// The exact settlement whose delivery is in flight. The drop backstop
-    /// re-delivers this decided settlement instead of a cancellation, so a
-    /// task cancelled mid-write can neither downgrade the ledger outcome nor
-    /// diverge from the recorded metric.
-    decided_settlement: Option<String>,
-    started: Instant,
-}
-
-impl AttemptGuard {
-    fn new(state: &AppState, request_id: String, attempt_id: String, started: Instant) -> Self {
-        METRICS.record_served();
-        METRICS.enter_request();
-        Self {
-            bridge: state.bridge.clone(),
-            request_id,
-            attempt_id,
-            pending: state.pending_settlements.clone(),
-            armed: true,
-            outcome_recorded: false,
-            decided_settlement: None,
-            started,
-        }
-    }
-
-    /// Record this attempt's terminal outcome and duration exactly once, at
-    /// the moment the outcome is decided. Recording happens before delivery
-    /// is awaited, so a task cancelled mid-write cannot re-report a decided
-    /// outcome as a cancellation.
-    fn record_terminal(&mut self, outcome: &str, cancelled: bool) {
-        if self.outcome_recorded {
-            return;
-        }
-        self.outcome_recorded = true;
-        METRICS.record_outcome(outcome, cancelled);
-        METRICS.request_duration_ms.record(self.started.elapsed());
-        METRICS.exit_request();
-    }
-
-    /// Durably settle this attempt; disarms the drop backstop afterwards.
-    /// Returns whether the terminal write reached the ledger.
-    async fn settle(
-        &mut self,
-        outcome: &str,
-        usage: Option<&Usage>,
-        tool_names: &[String],
-        failure: Option<&Failure>,
-    ) -> bool {
-        let argument = settle_argument(
-            &self.request_id,
-            &self.attempt_id,
-            outcome,
-            usage,
-            tool_names,
-            failure,
-        );
-        let cancelled =
-            failure.map(|failure| failure.failure_class == FailureClass::Cancelled) == Some(true);
-        self.record_terminal(outcome, cancelled);
-        self.decided_settlement = Some(argument.clone());
-        let delivered = deliver_settlement(&self.bridge, argument).await;
-        self.armed = false;
-        self.decided_settlement = None;
-        delivered
-    }
-
-    async fn settle_cancelled(&mut self, usage: Option<&Usage>, tool_names: &[String]) -> bool {
-        self.settle(
-            "failed",
-            usage,
-            tool_names,
-            Some(&Failure::new(
-                FailureClass::Cancelled,
-                "gateway request was cancelled",
-            )),
-        )
-        .await
-    }
-}
-
-impl Drop for AttemptGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // A settlement already decided (its delivery was cut short by the
-        // cancellation) is re-delivered verbatim, matching the control
-        // plane's own never-downgrade sweep semantics; only an attempt with
-        // no decided outcome settles as cancelled.
-        let argument = match self.decided_settlement.take() {
-            Some(argument) => argument,
-            None => {
-                self.record_terminal("failed", true);
-                settle_argument(
-                    &self.request_id,
-                    &self.attempt_id,
-                    "failed",
-                    None,
-                    &[],
-                    Some(&Failure::new(
-                        FailureClass::Cancelled,
-                        "gateway request was cancelled",
-                    )),
-                )
-            }
-        };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            // Runtime teardown; startup reconciliation closes the row.
-            return;
-        };
-        let bridge = self.bridge.clone();
-        let pending = self.pending.clone();
-        pending.fetch_add(1, Ordering::SeqCst);
-        handle.spawn(async move {
-            deliver_settlement(&bridge, argument).await;
-            pending.fetch_sub(1, Ordering::SeqCst);
-        });
-    }
 }
 
 async fn chat(State(state): State<AppState>, request: axum::extract::Request) -> Response {
@@ -942,44 +767,18 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
     let admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => {
-            // The attempt is durably started; close it before failing so
-            // wire-contract drift cannot leak ledger rows.
-            let request_id = admission_value
-                .get("request_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let attempt_id = admission_value
-                .get("attempt_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if !request_id.is_empty() && !attempt_id.is_empty() {
-                let mut guard = AttemptGuard::new(&state, request_id, attempt_id, started);
-                guard
-                    .settle(
-                        "failed",
-                        None,
-                        &[],
-                        Some(&Failure::new(
-                            FailureClass::Internal,
-                            "gateway admission wire contract failed",
-                        )),
-                    )
-                    .await;
+            // The request is durably accepted; abandon it before failing so
+            // wire-contract drift cannot leak an open request row.
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
             }
-            return error_response(&PublicError::internal());
+            return wire_drift_response(&state, &admission_value, started).await;
         }
     };
-    let mut guard = AttemptGuard::new(
-        &state,
-        admission.request_id.clone(),
-        admission.attempt_id.clone(),
-        started,
-    );
+    let mut guard = new_guard(&state, admission.request_id.clone(), started);
     // The replay key was authorized independently of admission. If an alias
     // activation landed between the two, the admitted work belongs to a newer
-    // revision than the claimed replay scope, so the attempt fails closed:
+    // revision than the claimed replay scope, so the request fails closed:
     // executing without ownership would let a concurrent duplicate own the
     // new revision's key and run the same keyed operation a second time.
     if lease
@@ -990,15 +789,10 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
             owner.abandon().await;
         }
         guard
-            .settle(
-                "failed",
-                None,
-                &[],
-                Some(&Failure::new(
-                    FailureClass::Internal,
-                    "the alias revision changed during keyed admission",
-                )),
-            )
+            .abandon(&Failure::new(
+                FailureClass::Internal,
+                "the alias revision changed during keyed admission",
+            ))
             .await;
         let mut error = PublicError::new(
             409,
@@ -1010,205 +804,152 @@ async fn chat(State(state): State<AppState>, request: axum::extract::Request) ->
         return error_response(&error);
     }
 
-    let dialect = match Dialect::from_str(&admission.dialect) {
-        Some(dialect) => dialect,
-        None => {
-            guard
-                .settle(
-                    "failed",
-                    None,
-                    &[],
-                    Some(&Failure::new(
-                        FailureClass::Internal,
-                        "gateway engine does not support the resolved provider dialect",
-                    )),
-                )
-                .await;
-            return error_response(&PublicError::internal());
+    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+        Ok(permit) => permit,
+        Err(response) => {
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return *response;
         }
     };
 
-    // The connection's raw timeout bounds each transport phase (open, then
-    // every chunk read), exactly like the python streaming path.
-    let phase_timeout = Duration::from_secs_f64(admission.timeout_seconds.max(0.001));
-
-    // The bounded active-dispatch permit is awaited after admission, like the
-    // python executor: protocol and authority errors answer immediately even
-    // at capacity, and a queue-deadline expiry settles the started attempt.
-    let permit_wait_started = Instant::now();
-    let permit =
-        match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await
-        {
-            Ok(Ok(permit)) => {
-                METRICS.permit_wait_ms.record(permit_wait_started.elapsed());
-                permit
-            }
-            Ok(Err(_)) => {
-                guard
-                    .settle(
-                        "failed",
-                        None,
-                        &[],
-                        Some(&Failure::new(
-                            FailureClass::Cancelled,
-                            "gateway is draining and is not accepting new requests",
-                        )),
-                    )
-                    .await;
-                return error_response(&PublicError::draining());
-            }
-            Err(_) => {
-                let failure = Failure::new(
-                    FailureClass::Timeout,
-                    "gateway execution queue deadline exceeded",
-                );
-                let error = failure.public_error();
-                guard.settle("failed", None, &[], Some(&failure)).await;
-                return error_response(&error);
-            }
-        };
-
-    // One bounded same-deployment retry at the open phase, mirroring the
-    // python executor's retry policy before any byte reaches the client.
-    // Body-signing dialects sign immediately before every attempt so neither
-    // queue time nor a spent first attempt can age the signature; signing
-    // failures settle the attempt like any dispatch failure.
-    let mut response = None;
-    for attempt in 0..2u8 {
-        let headers = match dispatch_headers(&state.bridge, &admission).await {
-            Ok(headers) => headers,
-            Err(error) => {
-                let failure = Failure::new(
-                    FailureClass::ProviderAuthentication,
-                    "provider dispatch signing failed",
-                );
-                guard.settle("failed", None, &[], Some(&failure)).await;
-                return error_response(&error);
-            }
-        };
-        let open_bound = remaining(deadline).min(phase_timeout);
-        match open_stream(
-            &state.http,
-            &admission.url,
-            &headers,
-            &admission.idempotency_key,
-            &admission.upstream_payload,
-            admission.upstream_body.as_deref(),
-            open_bound,
-        )
-        .await
-        {
-            Ok(opened) => {
-                response = Some(opened);
-                break;
-            }
-            Err(transport) => {
-                if attempt == 0
-                    && transport.retryable_same_deployment
-                    && !remaining(deadline).is_zero()
-                {
-                    METRICS.record_open_retry();
-                    continue;
-                }
-                let failure = transport.failure;
-                let error = failure.public_error();
-                guard.settle("failed", None, &[], Some(&failure)).await;
-                return error_response(&error);
-            }
-        }
-    }
-    let response = match response {
-        Some(response) => response,
-        None => {
-            let failure = Failure::new(FailureClass::Internal, "provider dispatch failed");
-            guard.settle("failed", None, &[], Some(&failure)).await;
-            return error_response(&PublicError::internal());
-        }
+    // Run the certified waterfall to its committed or terminal attempt.
+    let context = WaterfallContext {
+        bridge: &state.bridge,
+        http: &state.http,
+        request_id: &admission.request_id,
+        raw_key: &raw_key,
+        route: &admission.route,
+        policy: admission.policy(),
+        deadline,
     };
+    let won = acquire_attempt(&context, &mut guard).await;
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
 
-    if admission.output_guardrail {
-        return guarded_chat_response(
-            admission,
-            guard,
-            dialect,
-            response,
-            created_at,
-            deadline,
-            phase_timeout,
-            permit,
-            lease,
-            client_request_id,
-        )
-        .await;
-    }
-    if admission.stream {
-        stream_response(
-            admission,
-            guard,
-            dialect,
-            response,
-            created_at,
-            deadline,
-            phase_timeout,
-            permit,
-            lease,
-            client_request_id,
-        )
-        .await
-    } else {
-        completed_response(
-            admission,
-            guard,
-            dialect,
-            response,
-            created_at,
-            deadline,
-            phase_timeout,
-            permit,
-            lease,
-            client_request_id,
-        )
-        .await
+    match won {
+        Won::Failed(error) => {
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            error_response(&error)
+        }
+        Won::Settled(settled) => {
+            settled_chat_response(&admission, settled, created_at, lease, client_request_id).await
+        }
+        Won::Committed(committed) => {
+            let committed = *committed;
+            if admission.output_guardrail {
+                guarded_chat_response(
+                    admission,
+                    guard,
+                    committed,
+                    created_at,
+                    deadline,
+                    permit,
+                    lease,
+                    client_request_id,
+                )
+                .await
+            } else if admission.stream {
+                stream_response(
+                    admission,
+                    guard,
+                    committed,
+                    created_at,
+                    deadline,
+                    permit,
+                    lease,
+                    client_request_id,
+                )
+                .await
+            } else {
+                completed_response(
+                    admission,
+                    guard,
+                    committed,
+                    created_at,
+                    deadline,
+                    permit,
+                    lease,
+                    client_request_id,
+                )
+                .await
+            }
+        }
     }
 }
 
-/// Resolve the dispatch headers for one open attempt. Body-signing dialects
-/// are signed here, after the bounded dispatch permit and immediately before
-/// each provider POST (the bounded open retry signs afresh too, since a
-/// first attempt can consume minutes before a retryable timeout), so neither
-/// queue time nor a spent attempt can age a SigV4 signature toward AWS's
-/// short clock window. Other dialects use the admission headers unchanged.
-async fn dispatch_headers(
-    bridge: &Bridge,
-    admission: &Admission,
-) -> Result<HashMap<String, String>, PublicError> {
-    let mut headers = admission.headers.clone();
-    let Some(body) = admission.upstream_body.as_deref() else {
-        return Ok(headers);
-    };
-    let argument = compact_json(&json!({
-        "request_id": admission.request_id,
-        "url": admission.url,
-        "body": body,
-    }));
-    let text = bridge.call("sign_dispatch", argument).await?;
-    let signed: HashMap<String, String> = serde_json::from_str::<Value>(&text)
-        .ok()
-        .and_then(|value| {
-            serde_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null)).ok()
-        })
-        .ok_or_else(PublicError::internal)?;
-    headers.extend(signed);
-    Ok(headers)
+/// Build one request guard bound to this server's settlement bookkeeping.
+fn new_guard(state: &AppState, request_id: String, started: Instant) -> AttemptGuard {
+    AttemptGuard::new(
+        state.bridge.clone(),
+        state.pending_settlements.clone(),
+        request_id,
+        started,
+    )
 }
 
-fn remaining(deadline: Instant) -> Duration {
-    deadline.saturating_duration_since(Instant::now())
+/// Abandon one accepted request whose admission body failed to deserialize.
+async fn wire_drift_response(
+    state: &AppState,
+    admission_value: &Value,
+    started: Instant,
+) -> Response {
+    let request_id = admission_value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !request_id.is_empty() {
+        let mut guard = new_guard(state, request_id, started);
+        guard
+            .abandon(&Failure::new(
+                FailureClass::Internal,
+                "gateway admission wire contract failed",
+            ))
+            .await;
+    }
+    error_response(&PublicError::internal())
+}
+
+/// Wait for one bounded active-dispatch permit after admission, like the
+/// python executor: protocol and authority errors answer immediately even at
+/// capacity, and a queue-deadline expiry terminalizes the accepted request.
+async fn acquire_permit(
+    state: &AppState,
+    guard: &mut AttemptGuard,
+    deadline: Instant,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Box<Response>> {
+    let permit_wait_started = Instant::now();
+    match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => {
+            METRICS.permit_wait_ms.record(permit_wait_started.elapsed());
+            Ok(permit)
+        }
+        Ok(Err(_)) => {
+            guard
+                .abandon(&Failure::new(
+                    FailureClass::Cancelled,
+                    "gateway is draining and is not accepting new requests",
+                ))
+                .await;
+            Err(Box::new(error_response(&PublicError::draining())))
+        }
+        Err(_) => {
+            let failure = Failure::new(
+                FailureClass::Timeout,
+                "gateway execution queue deadline exceeded",
+            );
+            let error = failure.public_error();
+            guard.abandon(&failure).await;
+            Err(Box::new(error_response(&error)))
+        }
+    }
 }
 
 /// Deliver one public frame bounded by the request deadline, so a connected
@@ -1229,209 +970,98 @@ async fn send_bounded(
     )
 }
 
-/// Classify one mid-stream chunk timeout the way the python transport does:
-/// a stalled provider read is a transport failure unless the request's own
-/// deadline is exhausted.
-fn stream_timeout_failure(deadline: Instant) -> Failure {
-    if remaining(deadline).is_zero() {
-        Failure::new(FailureClass::Timeout, "gateway execution deadline exceeded")
-    } else {
-        Failure::new(
-            FailureClass::Transport,
-            "provider transport failed; retry the request",
-        )
+/// Replace a typed refusal terminal with a public completion when refusal
+/// output already reached (or is reaching) the caller, mirroring the python
+/// executor's committed-refusal rule. Returns the recorded refusal failure.
+fn complete_visible_refusal(events: &mut [Event]) -> Option<Failure> {
+    let visible = events
+        .iter()
+        .any(|event| matches!(event, Event::RefusalDelta(_)));
+    if !visible {
+        return None;
     }
-}
-
-/// Approximate retained size of one aggregated event, in bytes. Completed
-/// tool calls charge their full argument text, matching the python engine's
-/// bounded aggregation, which also charges the completed call after its
-/// streamed deltas.
-fn event_retained_bytes(event: &Event) -> usize {
-    match event {
-        Event::TextDelta(text) | Event::RefusalDelta(text) => text.len(),
-        Event::ToolArgumentsDelta { delta, .. } => delta.len(),
-        Event::ToolCallCompleted { call, .. } => call.raw_arguments.len().max(64),
-        _ => 64,
-    }
-}
-
-/// Map one collection failure to its public error, honoring the shared
-/// aggregate-output overflow contract.
-fn collection_public_error(failure: &Failure) -> PublicError {
-    if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
-        return PublicError::provider_output_too_large();
-    }
-    failure.public_error()
-}
-
-/// Drain one upstream SSE response into normalized events. `request_started`
-/// anchors the time-to-first-byte observation at the first upstream chunk.
-async fn collect_events(
-    response: reqwest::Response,
-    dialect: Dialect,
-    deadline: Instant,
-    phase_timeout: Duration,
-    request_started: Instant,
-) -> Result<Vec<Event>, Failure> {
-    let mut normalizer = Normalizer::new(dialect);
-    let mut decoder = FrameDecoder::new(dialect);
-    let mut events = Vec::new();
-    let mut retained_bytes = 0usize;
-    let mut retain = |events: &mut Vec<Event>, event: Event| -> Result<(), Failure> {
-        retained_bytes = retained_bytes.saturating_add(event_retained_bytes(&event));
-        if retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
-            return Err(Failure::new(
-                FailureClass::ProviderInternal,
-                OUTPUT_OVERFLOW_MESSAGE,
-            ));
-        }
-        events.push(event);
-        Ok(())
-    };
-    let mut byte_stream = response.bytes_stream();
-    let mut first_byte_recorded = false;
-    loop {
-        let bound = remaining(deadline).min(phase_timeout);
-        let chunk = match tokio::time::timeout(bound, byte_stream.next()).await {
-            Ok(Some(Ok(chunk))) => chunk,
-            Ok(Some(Err(_))) => {
-                return Err(Failure::new(
-                    FailureClass::Transport,
-                    "provider transport failed; retry the request",
-                ))
-            }
-            Ok(None) => break,
-            Err(_) => return Err(stream_timeout_failure(deadline)),
-        };
-        if !first_byte_recorded {
-            METRICS
-                .time_to_first_byte_ms
-                .record(request_started.elapsed());
-            first_byte_recorded = true;
-        }
-        let frames = decoder
-            .feed(&chunk)
-            .map_err(|message| Failure::new(FailureClass::MalformedResponse, &message))?;
-        for frame in frames {
-            for event in normalizer.feed(&frame)? {
-                retain(&mut events, event)?;
-            }
-            if normalizer.saw_terminal() {
-                return Ok(events);
+    if let Some(last) = events.last_mut() {
+        if let Event::Failed(failure) = last {
+            if failure.failure_class == FailureClass::Refusal {
+                let failure = failure.clone();
+                *last = Event::Completed;
+                return Some(failure);
             }
         }
     }
-    // Recover a final unterminated SSE frame at EOF, exactly like the python
-    // decoder, so a provider that omits the closing blank line still settles
-    // by its terminal event.
-    if let Some(frame) = decoder
-        .finish()
-        .map_err(|message| Failure::new(FailureClass::MalformedResponse, &message))?
-    {
-        for event in normalizer.feed(&frame)? {
-            retain(&mut events, event)?;
-        }
-        if normalizer.saw_terminal() {
-            return Ok(events);
-        }
-    }
-    normalizer.stream_ended()?;
-    Ok(events)
+    None
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn completed_response(
-    admission: Admission,
-    mut guard: AttemptGuard,
-    dialect: Dialect,
-    response: reqwest::Response,
+/// Answer one attempt that the waterfall already settled: a successful
+/// terminal with no semantic output, or an exhausted ladder flushing its
+/// bounded withheld refusal output ahead of the failing terminal.
+async fn settled_chat_response(
+    admission: &Admission,
+    settled: SettledAttempt,
     created_at: i64,
-    deadline: Instant,
-    phase_timeout: Duration,
-    permit: tokio::sync::OwnedSemaphorePermit,
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
 ) -> Response {
-    let _permit = permit;
-    let events =
-        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
-            Ok(events) => events,
-            Err(failure) => {
-                let failure = failure.boundary();
-                let error = collection_public_error(&failure);
-                guard.settle("failed", None, &[], Some(&failure)).await;
+    let mut events = settled.events;
+    let refusal_completed = complete_visible_refusal(&mut events);
+    if refusal_completed.is_none() {
+        if let Some(Event::Failed(failure)) = events.last() {
+            let error = collection_public_error(&failure.clone().boundary());
+            if admission.stream {
+                // The withheld refusal output and its failing terminal flush
+                // outward as the stream's only frames.
+                let body = match encode_chat_sse(admission, created_at, &events) {
+                    Ok(body) => body,
+                    Err(error) => return error_response(&error),
+                };
+                let mut headers = commit_independent(admission, client_request_id.as_deref());
+                headers.extend(commit_dependent(admission, settled.depth));
                 if let Some(mut owner) = lease.take() {
                     owner.abandon().await;
                 }
-                return error_response(&error);
+                return sse_body_response(&headers, body);
             }
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return error_response(&error);
+        }
+    }
+    let mut headers = commit_independent(admission, client_request_id.as_deref());
+    headers.extend(commit_dependent(admission, settled.depth));
+    if admission.stream {
+        let body = match encode_chat_sse(admission, created_at, &events) {
+            Ok(body) => body,
+            Err(error) => return error_response(&error),
         };
+        if let Some(mut owner) = lease.take() {
+            let mut sorted = headers.clone();
+            sorted.sort();
+            let cached = CachedResponse {
+                status_code: 200,
+                media_type: "text/event-stream".to_string(),
+                headers: sorted,
+                body: body.clone(),
+            };
+            return match owner.complete(cached.clone()).await {
+                Ok(()) => cached_response(&cached),
+                Err(error) => error_response(&error),
+            };
+        }
+        return sse_body_response(&headers, body);
+    }
     let aggregated =
         match completed_chat_body(&admission.request_id, &admission.alias, created_at, &events) {
             Ok(aggregated) => aggregated,
-            Err(error) => {
-                guard
-                    .settle(
-                        "failed",
-                        None,
-                        &[],
-                        Some(
-                            &Failure::new(
-                                FailureClass::MalformedResponse,
-                                "provider stream ended without a terminal event",
-                            )
-                            .boundary(),
-                        ),
-                    )
-                    .await;
-                if let Some(mut owner) = lease.take() {
-                    owner.abandon().await;
-                }
-                return error_response(&error);
-            }
+            Err(error) => return error_response(&error),
         };
     if let Some(failure) = &aggregated.failure {
-        let failure = failure.clone().boundary();
-        let error = failure.public_error();
-        guard
-            .settle(
-                "failed",
-                aggregated.usage.as_ref(),
-                &aggregated.tool_names,
-                Some(&failure),
-            )
-            .await;
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
-        return error_response(&error);
+        return error_response(&failure.clone().boundary().public_error());
     }
-    let outcome = if aggregated.incomplete {
-        "incomplete"
-    } else {
-        "completed"
-    };
-    let settled = guard
-        .settle(
-            outcome,
-            aggregated.usage.as_ref(),
-            &aggregated.tool_names,
-            None,
-        )
-        .await;
-    if !settled {
-        // Success is only reported once the terminal accounting write landed.
-        if let Some(mut owner) = lease.take() {
-            owner.abandon().await;
-        }
-        return error_response(&PublicError::internal());
-    }
-    let mut headers = commit_independent(&admission, client_request_id.as_deref());
-    headers.extend(commit_dependent(&admission));
     if let Some(mut owner) = lease.take() {
-        // Publish the exact response body and headers, then answer from the
-        // stored copy, matching the python engine's `_cached_response`.
         let mut sorted = headers.clone();
         sorted.sort();
         let cached = CachedResponse {
@@ -1499,110 +1129,106 @@ fn sse_body_response(headers: &[(String, String)], body: Vec<u8>) -> Response {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+/// Aggregate one committed non-streaming or guarded chat attempt and answer
+/// it, settling exactly once and publishing keyed results.
 #[allow(clippy::too_many_arguments)]
-async fn guarded_chat_response(
+async fn respond_from_chat_events(
     admission: Admission,
     mut guard: AttemptGuard,
-    dialect: Dialect,
-    response: reqwest::Response,
+    depth: usize,
+    mut events: Vec<Event>,
+    usage: Option<Usage>,
+    tool_names: Vec<String>,
     created_at: i64,
-    deadline: Instant,
-    phase_timeout: Duration,
-    permit: tokio::sync::OwnedSemaphorePermit,
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
+    stream_body: bool,
 ) -> Response {
-    let _permit = permit;
-    let collected =
-        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
-            Ok(events) => events,
-            Err(failure) => {
-                let failure = failure.boundary();
-                let error = collection_public_error(&failure);
-                guard.settle("failed", None, &[], Some(&failure)).await;
+    let refusal_completed = complete_visible_refusal(&mut events);
+    let aggregated =
+        match completed_chat_body(&admission.request_id, &admission.alias, created_at, &events) {
+            Ok(aggregated) => aggregated,
+            Err(error) => {
+                guard
+                    .settle(
+                        "failed",
+                        usage.as_ref(),
+                        &tool_names,
+                        Some(
+                            &Failure::new(
+                                FailureClass::MalformedResponse,
+                                "provider stream ended without a terminal event",
+                            )
+                            .boundary(),
+                        ),
+                        true,
+                    )
+                    .await;
                 if let Some(mut owner) = lease.take() {
                     owner.abandon().await;
                 }
                 return error_response(&error);
             }
         };
-    let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
-        Ok(events) => events,
-        Err(failure) => {
-            guard.settle("failed", None, &[], Some(&failure)).await;
-            if let Some(mut owner) = lease.take() {
-                owner.abandon().await;
-            }
-            return error_response(&failure.public_error());
+    if let Some(failure) = &aggregated.failure {
+        let failure = failure.clone().boundary();
+        let error = failure.public_error();
+        guard
+            .settle(
+                "failed",
+                aggregated.usage.as_ref().or(usage.as_ref()),
+                &aggregated.tool_names,
+                Some(&failure),
+                true,
+            )
+            .await;
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
         }
-    };
-    if admission.stream {
-        let aggregated =
-            match completed_chat_body(&admission.request_id, &admission.alias, created_at, &events)
-            {
-                Ok(aggregated) => aggregated,
-                Err(error) => {
-                    guard
-                        .settle(
-                            "failed",
-                            None,
-                            &[],
-                            Some(
-                                &Failure::new(
-                                    FailureClass::MalformedResponse,
-                                    "provider stream ended without a terminal event",
-                                )
-                                .boundary(),
-                            ),
-                        )
-                        .await;
-                    if let Some(mut owner) = lease.take() {
-                        owner.abandon().await;
-                    }
-                    return error_response(&error);
-                }
-            };
-        if let Some(failure) = &aggregated.failure {
-            let failure = failure.clone().boundary();
-            let error = failure.public_error();
-            guard
-                .settle(
-                    "failed",
-                    aggregated.usage.as_ref(),
-                    &aggregated.tool_names,
-                    Some(&failure),
-                )
-                .await;
-            if let Some(mut owner) = lease.take() {
-                owner.abandon().await;
-            }
-            return error_response(&error);
-        }
+        return error_response(&error);
+    }
+    let settled = if let Some(refusal) = &refusal_completed {
+        // The caller saw the refusal output, so the public result completes;
+        // the ledger still records the provider's typed refusal.
+        guard
+            .settle(
+                "failed",
+                aggregated.usage.as_ref().or(usage.as_ref()),
+                &aggregated.tool_names,
+                Some(refusal),
+                true,
+            )
+            .await
+    } else {
         let outcome = if aggregated.incomplete {
             "incomplete"
         } else {
             "completed"
         };
-        if !guard
+        guard
             .settle(
                 outcome,
-                aggregated.usage.as_ref(),
+                aggregated.usage.as_ref().or(usage.as_ref()),
                 &aggregated.tool_names,
                 None,
+                true,
             )
             .await
-        {
-            if let Some(mut owner) = lease.take() {
-                owner.abandon().await;
-            }
-            return error_response(&PublicError::internal());
+    };
+    if !settled {
+        // Success is only reported once the terminal accounting write landed.
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
         }
+        return error_response(&PublicError::internal());
+    }
+    let mut headers = commit_independent(&admission, client_request_id.as_deref());
+    headers.extend(commit_dependent(&admission, depth));
+    if stream_body {
         let body = match encode_chat_sse(&admission, created_at, &events) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
-        let mut headers = commit_independent(&admission, client_request_id.as_deref());
-        headers.extend(commit_dependent(&admission));
         if let Some(mut owner) = lease.take() {
             let mut sorted = headers.clone();
             sorted.sort();
@@ -1619,88 +1245,9 @@ async fn guarded_chat_response(
         }
         return sse_body_response(&headers, body);
     }
-    completed_response_from_events(
-        admission,
-        guard,
-        events,
-        created_at,
-        lease,
-        client_request_id,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn completed_response_from_events(
-    admission: Admission,
-    mut guard: AttemptGuard,
-    events: Vec<Event>,
-    created_at: i64,
-    mut lease: Option<OwnerLease>,
-    client_request_id: Option<String>,
-) -> Response {
-    let aggregated =
-        match completed_chat_body(&admission.request_id, &admission.alias, created_at, &events) {
-            Ok(aggregated) => aggregated,
-            Err(error) => {
-                guard
-                    .settle(
-                        "failed",
-                        None,
-                        &[],
-                        Some(
-                            &Failure::new(
-                                FailureClass::MalformedResponse,
-                                "provider stream ended without a terminal event",
-                            )
-                            .boundary(),
-                        ),
-                    )
-                    .await;
-                if let Some(mut owner) = lease.take() {
-                    owner.abandon().await;
-                }
-                return error_response(&error);
-            }
-        };
-    if let Some(failure) = &aggregated.failure {
-        let failure = failure.clone().boundary();
-        let error = failure.public_error();
-        guard
-            .settle(
-                "failed",
-                aggregated.usage.as_ref(),
-                &aggregated.tool_names,
-                Some(&failure),
-            )
-            .await;
-        if let Some(mut owner) = lease.take() {
-            owner.abandon().await;
-        }
-        return error_response(&error);
-    }
-    let outcome = if aggregated.incomplete {
-        "incomplete"
-    } else {
-        "completed"
-    };
-    let settled = guard
-        .settle(
-            outcome,
-            aggregated.usage.as_ref(),
-            &aggregated.tool_names,
-            None,
-        )
-        .await;
-    if !settled {
-        if let Some(mut owner) = lease.take() {
-            owner.abandon().await;
-        }
-        return error_response(&PublicError::internal());
-    }
-    let mut headers = commit_independent(&admission, client_request_id.as_deref());
-    headers.extend(commit_dependent(&admission));
     if let Some(mut owner) = lease.take() {
+        // Publish the exact response body and headers, then answer from the
+        // stored copy, matching the python engine's `_cached_response`.
         let mut sorted = headers.clone();
         sorted.sort();
         let cached = CachedResponse {
@@ -1718,52 +1265,169 @@ async fn completed_response_from_events(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn completed_response(
+    admission: Admission,
+    mut guard: AttemptGuard,
+    mut committed: CommittedAttempt,
+    created_at: i64,
+    deadline: Instant,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    mut lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
+) -> Response {
+    let _permit = permit;
+    let phase_timeout = admission.phase_timeout(committed.depth);
+    let events =
+        match collect_committed(&mut committed, deadline, phase_timeout, guard.started).await {
+            Ok(events) => events,
+            Err(failure) => {
+                let failure = failure.boundary();
+                let error = collection_public_error(&failure);
+                guard
+                    .settle(
+                        "failed",
+                        committed.usage.as_ref(),
+                        &committed.tool_names,
+                        Some(&failure),
+                        true,
+                    )
+                    .await;
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
+                return error_response(&error);
+            }
+        };
+    respond_from_chat_events(
+        admission,
+        guard,
+        committed.depth,
+        events,
+        committed.usage,
+        committed.tool_names,
+        created_at,
+        lease,
+        client_request_id,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn guarded_chat_response(
+    admission: Admission,
+    mut guard: AttemptGuard,
+    mut committed: CommittedAttempt,
+    created_at: i64,
+    deadline: Instant,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    mut lease: Option<OwnerLease>,
+    client_request_id: Option<String>,
+) -> Response {
+    let _permit = permit;
+    let phase_timeout = admission.phase_timeout(committed.depth);
+    let collected =
+        match collect_committed(&mut committed, deadline, phase_timeout, guard.started).await {
+            Ok(events) => events,
+            Err(failure) => {
+                let failure = failure.boundary();
+                let error = collection_public_error(&failure);
+                guard
+                    .settle(
+                        "failed",
+                        committed.usage.as_ref(),
+                        &committed.tool_names,
+                        Some(&failure),
+                        true,
+                    )
+                    .await;
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
+                return error_response(&error);
+            }
+        };
+    let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
+        Ok(events) => events,
+        Err(failure) => {
+            guard
+                .settle(
+                    "failed",
+                    committed.usage.as_ref(),
+                    &committed.tool_names,
+                    Some(&failure),
+                    true,
+                )
+                .await;
+            if let Some(mut owner) = lease.take() {
+                owner.abandon().await;
+            }
+            return error_response(&failure.public_error());
+        }
+    };
+    let stream_body = admission.stream;
+    respond_from_chat_events(
+        admission,
+        guard,
+        committed.depth,
+        events,
+        committed.usage,
+        committed.tool_names,
+        created_at,
+        lease,
+        client_request_id,
+        stream_body,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn stream_response(
     admission: Admission,
     guard: AttemptGuard,
-    dialect: Dialect,
-    response: reqwest::Response,
+    committed: CommittedAttempt,
     created_at: i64,
     deadline: Instant,
-    phase_timeout: Duration,
     permit: tokio::sync::OwnedSemaphorePermit,
     lease: Option<OwnerLease>,
     client_request_id: Option<String>,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let mut header_pairs = commit_independent(&admission, client_request_id.as_deref());
-    header_pairs.extend(commit_dependent(&admission));
+    header_pairs.extend(commit_dependent(&admission, committed.depth));
     let include_usage = admission.include_usage;
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();
+    let phase_timeout = admission.phase_timeout(committed.depth);
     let cached_headers = {
         let mut sorted = header_pairs.clone();
         sorted.sort();
         sorted
     };
+    let task_hold = guard.hold_task();
     tokio::spawn(async move {
+        let _task = task_hold;
         let _permit = permit;
         let mut guard = guard;
         let mut lease = lease;
+        let mut committed = committed;
         let mut encoder = ChatSseEncoder::new(&request_id, &alias, created_at, include_usage);
-        let mut normalizer = Normalizer::new(dialect);
-        let mut decoder = FrameDecoder::new(dialect);
-        let mut usage: Option<Usage> = None;
-        let mut tool_names: Vec<String> = Vec::new();
+        let mut usage: Option<Usage> = committed.usage.take();
+        let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
+        let mut visible_refusal = committed.visible_refusal;
         let mut terminal: Option<Event> = None;
         // Keyed streams capture every public frame so the owner can publish
         // the exact byte stream; terminal frames are withheld until that
         // publication succeeds, matching the python engine's `_stream_body`.
         let mut capture: Vec<u8> = Vec::new();
         let mut replayable = lease.is_some();
-        let mut withheld: Vec<Bytes> = Vec::new();
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
                 let failure = $failure.boundary();
                 let frames = failure_frames(&mut encoder, &failure);
                 guard
-                    .settle("failed", usage.as_ref(), &tool_names, Some(&failure))
+                    .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
                     .await;
                 finish_stream_terminal(
                     &sender,
@@ -1799,190 +1463,88 @@ async fn stream_response(
             }
         }
 
-        let mut byte_stream = response.bytes_stream();
-        let mut first_byte_recorded = false;
-        'outer: loop {
-            let bound = remaining(deadline).min(phase_timeout);
-            let chunk = match tokio::time::timeout(bound, byte_stream.next()).await {
-                Ok(Some(Ok(chunk))) => chunk,
-                Ok(Some(Err(_))) => {
+        let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
+        loop {
+            let event = if let Some(event) = prefix.pop_front() {
+                event
+            } else {
+                match committed
+                    .relay
+                    .next_event(deadline, phase_timeout, guard.started)
+                    .await
+                {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        fail_stream!(Failure::new(
+                            FailureClass::MalformedResponse,
+                            "provider stream ended without a terminal event",
+                        ))
+                    }
+                    Err(failure) => fail_stream!(failure),
+                }
+            };
+            track_event(&event, &mut usage, &mut tool_names);
+            if matches!(event, Event::RefusalDelta(_)) {
+                visible_refusal = true;
+            }
+            // A typed refusal after visible refusal output completes
+            // publicly; the ledger still records the provider's refusal.
+            let outward = match &event {
+                Event::Failed(failure)
+                    if failure.failure_class == FailureClass::Refusal && visible_refusal =>
+                {
+                    Event::Completed
+                }
+                other => other.clone(),
+            };
+            if event.is_terminal() {
+                terminal = Some(event.clone());
+                if !settle_stream_end(&mut guard, Some(&event), usage.as_ref(), &tool_names, false)
+                    .await
+                {
+                    return;
+                }
+            }
+            let encoded = match encoder.feed(&outward) {
+                Ok(encoded) => encoded,
+                Err(_) => {
+                    if terminal.is_some() {
+                        // The attempt already settled by its provider
+                        // terminal; the stream simply ends short.
+                        return;
+                    }
                     fail_stream!(Failure::new(
-                        FailureClass::Transport,
-                        "provider transport failed; retry the request",
+                        FailureClass::Internal,
+                        "gateway could not encode the provider stream",
                     ))
                 }
-                Ok(None) => break 'outer,
-                Err(_) => fail_stream!(stream_timeout_failure(deadline)),
             };
-            if !first_byte_recorded {
-                METRICS
-                    .time_to_first_byte_ms
-                    .record(guard.started.elapsed());
-                first_byte_recorded = true;
+            if terminal.is_some() {
+                // Terminal frames flow through the shared publication tail so
+                // keyed owners publish the exact byte stream first.
+                finish_stream_terminal(
+                    &sender,
+                    deadline,
+                    &mut lease,
+                    replayable,
+                    &mut capture,
+                    &cached_headers,
+                    encoded.into_iter().map(Bytes::from).collect(),
+                )
+                .await;
+                return;
             }
-            let frames = match decoder.feed(&chunk) {
-                Ok(frames) => frames,
-                Err(message) => {
-                    fail_stream!(Failure::new(FailureClass::MalformedResponse, &message))
+            for data in encoded {
+                let data = Bytes::from(data);
+                if lease.is_some() {
+                    replayable = capture_frame(&mut capture, &data, replayable);
                 }
-            };
-            for frame in frames {
-                let events = match normalizer.feed(&frame) {
-                    Ok(events) => events,
-                    Err(failure) => fail_stream!(failure),
-                };
-                for event in events {
-                    track_event(&event, &mut usage, &mut tool_names);
-                    if event.is_terminal() {
-                        terminal = Some(event.clone());
-                        if !settle_stream_end(
-                            &mut guard,
-                            terminal.as_ref(),
-                            usage.as_ref(),
-                            &tool_names,
-                            false,
-                        )
-                        .await
-                        {
-                            return;
-                        }
-                    }
-                    let encoded = match encoder.feed(&event) {
-                        Ok(encoded) => encoded,
-                        Err(_) => {
-                            fail_stream!(Failure::new(
-                                FailureClass::Internal,
-                                "gateway could not encode the provider stream",
-                            ))
-                        }
-                    };
-                    let withhold = lease.is_some() && terminal.is_some();
-                    for data in encoded {
-                        let data = Bytes::from(data);
-                        if withhold {
-                            // Withheld terminal frames are captured exactly
-                            // once, at publication time inside
-                            // `finish_stream_terminal`.
-                            withheld.push(data);
-                            continue;
-                        }
-                        if lease.is_some() {
-                            replayable = capture_frame(&mut capture, &data, replayable);
-                        }
-                        if !send_bounded(&sender, deadline, data).await {
-                            settle_stream_end(
-                                &mut guard,
-                                terminal.as_ref(),
-                                usage.as_ref(),
-                                &tool_names,
-                                true,
-                            )
-                            .await;
-                            return;
-                        }
-                    }
-                    if terminal.is_some() {
-                        return;
-                    }
+                if !send_bounded(&sender, deadline, data).await {
+                    settle_stream_end(&mut guard, None, usage.as_ref(), &tool_names, true).await;
+                    return;
                 }
             }
         }
-
-        // Recover a final unterminated SSE frame at EOF (python decoder
-        // parity) before deciding the stream ended without a terminal.
-        if terminal.is_none() {
-            let tail = match decoder.finish() {
-                Ok(tail) => tail,
-                Err(message) => {
-                    fail_stream!(Failure::new(FailureClass::MalformedResponse, &message))
-                }
-            };
-            if let Some(frame) = tail {
-                let events = match normalizer.feed(&frame) {
-                    Ok(events) => events,
-                    Err(failure) => fail_stream!(failure),
-                };
-                for event in events {
-                    track_event(&event, &mut usage, &mut tool_names);
-                    if event.is_terminal() {
-                        terminal = Some(event.clone());
-                        if !settle_stream_end(
-                            &mut guard,
-                            terminal.as_ref(),
-                            usage.as_ref(),
-                            &tool_names,
-                            false,
-                        )
-                        .await
-                        {
-                            return;
-                        }
-                    }
-                    let encoded = match encoder.feed(&event) {
-                        Ok(encoded) => encoded,
-                        Err(_) => {
-                            fail_stream!(Failure::new(
-                                FailureClass::Internal,
-                                "gateway could not encode the provider stream",
-                            ))
-                        }
-                    };
-                    let withhold = lease.is_some() && terminal.is_some();
-                    for data in encoded {
-                        let data = Bytes::from(data);
-                        if withhold {
-                            // Withheld terminal frames are captured exactly
-                            // once, at publication time inside
-                            // `finish_stream_terminal`.
-                            withheld.push(data);
-                            continue;
-                        }
-                        if lease.is_some() {
-                            replayable = capture_frame(&mut capture, &data, replayable);
-                        }
-                        if !send_bounded(&sender, deadline, data).await {
-                            settle_stream_end(
-                                &mut guard,
-                                terminal.as_ref(),
-                                usage.as_ref(),
-                                &tool_names,
-                                true,
-                            )
-                            .await;
-                            return;
-                        }
-                    }
-                    if terminal.is_some() {
-                        return;
-                    }
-                }
-            }
-        }
-
-        if terminal.is_none() {
-            fail_stream!(Failure::new(
-                FailureClass::MalformedResponse,
-                "provider stream ended without a terminal event",
-            ));
-        }
-        let _ = settle_stream_end(
-            &mut guard,
-            terminal.as_ref(),
-            usage.as_ref(),
-            &tool_names,
-            false,
-        )
-        .await;
-        finish_stream_terminal(
-            &sender,
-            deadline,
-            &mut lease,
-            replayable,
-            &mut capture,
-            &cached_headers,
-            withheld,
-        )
-        .await;
     });
 
     let body = Body::from_stream(ReceiverStream::new(receiver));
@@ -2016,11 +1578,19 @@ async fn settle_stream_end(
         Some(Event::Failed(failure)) => {
             let failure = failure.clone().boundary();
             guard
-                .settle("failed", usage, tool_names, Some(&failure))
+                .settle("failed", usage, tool_names, Some(&failure), true)
                 .await
         }
-        Some(Event::Incomplete) => guard.settle("incomplete", usage, tool_names, None).await,
-        Some(_) => guard.settle("completed", usage, tool_names, None).await,
+        Some(Event::Incomplete) => {
+            guard
+                .settle("incomplete", usage, tool_names, None, true)
+                .await
+        }
+        Some(_) => {
+            guard
+                .settle("completed", usage, tool_names, None, true)
+                .await
+        }
         None => {
             if disconnected {
                 guard.settle_cancelled(usage, tool_names).await
@@ -2028,18 +1598,6 @@ async fn settle_stream_end(
                 true
             }
         }
-    }
-}
-
-fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Vec<String>) {
-    match event {
-        Event::Usage(candidate) if candidate.has_token_counts() => {
-            *usage = Some(candidate.clone());
-        }
-        Event::ToolCallCompleted { call, .. } if !tool_names.contains(&call.name) => {
-            tool_names.push(call.name.clone());
-        }
-        _ => {}
     }
 }
 
@@ -2107,153 +1665,25 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
     }
     let admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
-        Err(_) => {
-            // The attempt is durably started; close it before failing so
-            // wire-contract drift cannot leak ledger rows.
-            let request_id = admission_value
-                .get("request_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let attempt_id = admission_value
-                .get("attempt_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if !request_id.is_empty() && !attempt_id.is_empty() {
-                let mut guard = AttemptGuard::new(&state, request_id, attempt_id, started);
-                guard
-                    .settle(
-                        "failed",
-                        None,
-                        &[],
-                        Some(&Failure::new(
-                            FailureClass::Internal,
-                            "gateway admission wire contract failed",
-                        )),
-                    )
-                    .await;
-            }
-            return error_response(&PublicError::internal());
-        }
+        Err(_) => return wire_drift_response(&state, &admission_value, started).await,
     };
-    let mut guard = AttemptGuard::new(
-        &state,
-        admission.request_id.clone(),
-        admission.attempt_id.clone(),
-        started,
-    );
+    let mut guard = new_guard(&state, admission.request_id.clone(), started);
 
-    let dialect = match Dialect::from_str(&admission.dialect) {
-        Some(dialect) => dialect,
-        None => {
-            guard
-                .settle(
-                    "failed",
-                    None,
-                    &[],
-                    Some(&Failure::new(
-                        FailureClass::Internal,
-                        "gateway engine does not support the resolved provider dialect",
-                    )),
-                )
-                .await;
-            return error_response(&PublicError::internal());
-        }
+    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+        Ok(permit) => permit,
+        Err(response) => return *response,
     };
 
-    // The connection's raw timeout bounds each transport phase (open, then
-    // every chunk read), exactly like the python streaming path.
-    let phase_timeout = Duration::from_secs_f64(admission.timeout_seconds.max(0.001));
-
-    // The bounded active-dispatch permit is awaited after admission, like the
-    // python executor: protocol and authority errors answer immediately even
-    // at capacity, and a queue-deadline expiry settles the started attempt.
-    let permit =
-        match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                guard
-                    .settle(
-                        "failed",
-                        None,
-                        &[],
-                        Some(&Failure::new(
-                            FailureClass::Cancelled,
-                            "gateway is draining and is not accepting new requests",
-                        )),
-                    )
-                    .await;
-                return error_response(&PublicError::draining());
-            }
-            Err(_) => {
-                let failure = Failure::new(
-                    FailureClass::Timeout,
-                    "gateway execution queue deadline exceeded",
-                );
-                let error = failure.public_error();
-                guard.settle("failed", None, &[], Some(&failure)).await;
-                return error_response(&error);
-            }
-        };
-
-    // One bounded same-deployment retry at the open phase, mirroring the
-    // python executor's retry policy before any byte reaches the client.
-    // Body-signing dialects sign immediately before every attempt so neither
-    // queue time nor a spent first attempt can age the signature; signing
-    // failures settle the attempt like any dispatch failure.
-    let mut response = None;
-    for attempt in 0..2u8 {
-        let headers = match dispatch_headers(&state.bridge, &admission).await {
-            Ok(headers) => headers,
-            Err(error) => {
-                let failure = Failure::new(
-                    FailureClass::ProviderAuthentication,
-                    "provider dispatch signing failed",
-                );
-                guard.settle("failed", None, &[], Some(&failure)).await;
-                return error_response(&error);
-            }
-        };
-        let open_bound = remaining(deadline).min(phase_timeout);
-        match open_stream(
-            &state.http,
-            &admission.url,
-            &headers,
-            &admission.idempotency_key,
-            &admission.upstream_payload,
-            admission.upstream_body.as_deref(),
-            open_bound,
-        )
-        .await
-        {
-            Ok(opened) => {
-                response = Some(opened);
-                break;
-            }
-            Err(transport) => {
-                if attempt == 0
-                    && transport.retryable_same_deployment
-                    && !remaining(deadline).is_zero()
-                {
-                    continue;
-                }
-                let failure = transport.failure;
-                let error = failure.public_error();
-                guard.settle("failed", None, &[], Some(&failure)).await;
-                return error_response(&error);
-            }
-        }
-    }
-    let response = match response {
-        Some(response) => response,
-        None => {
-            let failure = Failure::new(FailureClass::Internal, "provider dispatch failed");
-            guard.settle("failed", None, &[], Some(&failure)).await;
-            return error_response(&PublicError::internal());
-        }
+    let context = WaterfallContext {
+        bridge: &state.bridge,
+        http: &state.http,
+        request_id: &admission.request_id,
+        raw_key: &raw_key,
+        route: &admission.route,
+        policy: admission.policy(),
+        deadline,
     };
+    let won = acquire_attempt(&context, &mut guard).await;
 
     // Responses envelopes carry a float wall clock, like the python encoder.
     let created_at = SystemTime::now()
@@ -2261,46 +1691,34 @@ async fn responses(State(state): State<AppState>, request: axum::extract::Reques
         .map(|elapsed| elapsed.as_secs_f64())
         .unwrap_or(0.0);
 
-    if admission.output_guardrail {
-        return guarded_responses(
-            state,
-            admission,
-            guard,
-            dialect,
-            response,
-            created_at,
-            deadline,
-            phase_timeout,
-            permit,
-        )
-        .await;
-    }
-    if admission.stream {
-        stream_responses(
-            state.clone(),
-            admission,
-            guard,
-            dialect,
-            response,
-            created_at,
-            deadline,
-            phase_timeout,
-            permit,
-        )
-        .await
-    } else {
-        completed_responses(
-            &state,
-            admission,
-            guard,
-            dialect,
-            response,
-            created_at,
-            deadline,
-            phase_timeout,
-            permit,
-        )
-        .await
+    match won {
+        Won::Failed(error) => error_response(&error),
+        Won::Settled(settled) => settled_responses_response(&admission, settled, created_at),
+        Won::Committed(committed) => {
+            let committed = *committed;
+            if admission.output_guardrail {
+                guarded_responses(
+                    state, admission, guard, committed, created_at, deadline, permit,
+                )
+                .await
+            } else if admission.stream {
+                stream_responses(
+                    state.clone(),
+                    admission,
+                    guard,
+                    committed,
+                    created_at,
+                    deadline,
+                    permit,
+                )
+                .await
+            } else {
+                completed_responses(
+                    &state, admission, guard, committed, created_at, deadline, permit,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -2379,29 +1797,64 @@ async fn remember_continuation(
         .map(|_| ())
 }
 
+/// Answer one Responses attempt that the waterfall already settled: a
+/// successful terminal with no semantic output, or an exhausted ladder
+/// flushing withheld refusal output ahead of the failing terminal.
+fn settled_responses_response(
+    admission: &Admission,
+    settled: SettledAttempt,
+    created_at: f64,
+) -> Response {
+    let mut events = settled.events;
+    let refusal_completed = complete_visible_refusal(&mut events);
+    if refusal_completed.is_none() {
+        if let Some(Event::Failed(failure)) = events.last() {
+            if !admission.stream {
+                return error_response(&collection_public_error(&failure.clone().boundary()));
+            }
+        }
+    }
+    let mut headers = commit_independent(admission, None);
+    headers.extend(commit_dependent(admission, settled.depth));
+    if admission.stream {
+        let body = match encode_responses_sse(admission, created_at, &events) {
+            Ok(body) => body,
+            Err(error) => return error_response(&error),
+        };
+        return sse_body_response(&headers, body);
+    }
+    let envelope = admission.envelope.clone().unwrap_or_default();
+    let aggregated = match completed_responses_body(
+        &admission.request_id,
+        &admission.alias,
+        created_at,
+        envelope,
+        &events,
+    ) {
+        Ok(aggregated) => aggregated,
+        Err(error) => return error_response(&error),
+    };
+    if let Some(failure) = &aggregated.failure {
+        return error_response(&failure.clone().boundary().public_error());
+    }
+    json_response(StatusCode::OK, &aggregated.body, &headers)
+}
+
+/// Aggregate one committed Responses attempt and answer it, retaining the
+/// continuation and settling exactly once.
 #[allow(clippy::too_many_arguments)]
-async fn completed_responses(
+async fn respond_from_responses_events(
     state: &AppState,
     admission: Admission,
     mut guard: AttemptGuard,
-    dialect: Dialect,
-    response: reqwest::Response,
+    depth: usize,
+    mut events: Vec<Event>,
+    usage: Option<Usage>,
+    tool_names: Vec<String>,
     created_at: f64,
-    deadline: Instant,
-    phase_timeout: Duration,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    stream_body: bool,
 ) -> Response {
-    let _permit = permit;
-    let events =
-        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
-            Ok(events) => events,
-            Err(failure) => {
-                let failure = failure.boundary();
-                let error = collection_public_error(&failure);
-                guard.settle("failed", None, &[], Some(&failure)).await;
-                return error_response(&error);
-            }
-        };
+    let refusal_completed = complete_visible_refusal(&mut events);
     let envelope = admission.envelope.clone().unwrap_or_default();
     let aggregated = match completed_responses_body(
         &admission.request_id,
@@ -2415,8 +1868,8 @@ async fn completed_responses(
             guard
                 .settle(
                     "failed",
-                    None,
-                    &[],
+                    usage.as_ref(),
+                    &tool_names,
                     Some(
                         &Failure::new(
                             FailureClass::MalformedResponse,
@@ -2424,6 +1877,7 @@ async fn completed_responses(
                         )
                         .boundary(),
                     ),
+                    true,
                 )
                 .await;
             return error_response(&error);
@@ -2435,9 +1889,10 @@ async fn completed_responses(
         guard
             .settle(
                 "failed",
-                aggregated.usage.as_ref(),
+                aggregated.usage.as_ref().or(usage.as_ref()),
                 &aggregated.tool_names,
                 Some(&failure),
+                true,
             )
             .await;
         return error_response(&error);
@@ -2447,24 +1902,37 @@ async fn completed_responses(
     // body is answered so an oversize continuation fails closed like python.
     let retention = ResponsesRetention {
         text: aggregated.text.clone(),
-        refusal: !aggregated.refusal.is_empty(),
+        refusal: !aggregated.refusal.is_empty() || refusal_completed.is_some(),
         tool_calls: aggregated.tool_calls.clone(),
         ..ResponsesRetention::default()
     };
     let remembered = remember_continuation(state, &admission.request_id, &retention).await;
-    let outcome = if aggregated.incomplete {
-        "incomplete"
+    let settled = if let Some(refusal) = &refusal_completed {
+        guard
+            .settle(
+                "failed",
+                aggregated.usage.as_ref().or(usage.as_ref()),
+                &aggregated.tool_names,
+                Some(refusal),
+                true,
+            )
+            .await
     } else {
-        "completed"
+        let outcome = if aggregated.incomplete {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        guard
+            .settle(
+                outcome,
+                aggregated.usage.as_ref().or(usage.as_ref()),
+                &aggregated.tool_names,
+                None,
+                true,
+            )
+            .await
     };
-    let settled = guard
-        .settle(
-            outcome,
-            aggregated.usage.as_ref(),
-            &aggregated.tool_names,
-            None,
-        )
-        .await;
     if let Err(error) = remembered {
         // The provider outcome already settled above, exactly like the python
         // executor; only the HTTP result reports the retention failure.
@@ -2475,8 +1943,59 @@ async fn completed_responses(
         return error_response(&PublicError::internal());
     }
     let mut headers = commit_independent(&admission, None);
-    headers.extend(commit_dependent(&admission));
+    headers.extend(commit_dependent(&admission, depth));
+    if stream_body {
+        let body = match encode_responses_sse(&admission, created_at, &events) {
+            Ok(body) => body,
+            Err(error) => return error_response(&error),
+        };
+        return sse_body_response(&headers, body);
+    }
     json_response(StatusCode::OK, &aggregated.body, &headers)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn completed_responses(
+    state: &AppState,
+    admission: Admission,
+    mut guard: AttemptGuard,
+    mut committed: CommittedAttempt,
+    created_at: f64,
+    deadline: Instant,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let _permit = permit;
+    let phase_timeout = admission.phase_timeout(committed.depth);
+    let events =
+        match collect_committed(&mut committed, deadline, phase_timeout, guard.started).await {
+            Ok(events) => events,
+            Err(failure) => {
+                let failure = failure.boundary();
+                let error = collection_public_error(&failure);
+                guard
+                    .settle(
+                        "failed",
+                        committed.usage.as_ref(),
+                        &committed.tool_names,
+                        Some(&failure),
+                        true,
+                    )
+                    .await;
+                return error_response(&error);
+            }
+        };
+    respond_from_responses_events(
+        state,
+        admission,
+        guard,
+        committed.depth,
+        events,
+        committed.usage,
+        committed.tool_names,
+        created_at,
+        false,
+    )
+    .await
 }
 
 fn encode_responses_sse(
@@ -2508,107 +2027,59 @@ async fn guarded_responses(
     state: AppState,
     admission: Admission,
     mut guard: AttemptGuard,
-    dialect: Dialect,
-    response: reqwest::Response,
+    mut committed: CommittedAttempt,
     created_at: f64,
     deadline: Instant,
-    phase_timeout: Duration,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let _permit = permit;
+    let phase_timeout = admission.phase_timeout(committed.depth);
     let collected =
-        match collect_events(response, dialect, deadline, phase_timeout, guard.started).await {
+        match collect_committed(&mut committed, deadline, phase_timeout, guard.started).await {
             Ok(events) => events,
             Err(failure) => {
                 let failure = failure.boundary();
                 let error = collection_public_error(&failure);
-                guard.settle("failed", None, &[], Some(&failure)).await;
+                guard
+                    .settle(
+                        "failed",
+                        committed.usage.as_ref(),
+                        &committed.tool_names,
+                        Some(&failure),
+                        true,
+                    )
+                    .await;
                 return error_response(&error);
             }
         };
     let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
         Ok(events) => events,
         Err(failure) => {
-            guard.settle("failed", None, &[], Some(&failure)).await;
-            return error_response(&failure.public_error());
-        }
-    };
-    let envelope = admission.envelope.clone().unwrap_or_default();
-    let aggregated = match completed_responses_body(
-        &admission.request_id,
-        &admission.alias,
-        created_at,
-        envelope,
-        &events,
-    ) {
-        Ok(aggregated) => aggregated,
-        Err(error) => {
             guard
                 .settle(
                     "failed",
-                    None,
-                    &[],
-                    Some(
-                        &Failure::new(
-                            FailureClass::MalformedResponse,
-                            "provider stream ended without a terminal event",
-                        )
-                        .boundary(),
-                    ),
+                    committed.usage.as_ref(),
+                    &committed.tool_names,
+                    Some(&failure),
+                    true,
                 )
                 .await;
-            return error_response(&error);
+            return error_response(&failure.public_error());
         }
     };
-    if let Some(failure) = &aggregated.failure {
-        let failure = failure.clone().boundary();
-        let error = failure.public_error();
-        guard
-            .settle(
-                "failed",
-                aggregated.usage.as_ref(),
-                &aggregated.tool_names,
-                Some(&failure),
-            )
-            .await;
-        return error_response(&error);
-    }
-    let retention = ResponsesRetention {
-        text: aggregated.text.clone(),
-        refusal: !aggregated.refusal.is_empty(),
-        tool_calls: aggregated.tool_calls.clone(),
-        ..ResponsesRetention::default()
-    };
-    let remembered = remember_continuation(&state, &admission.request_id, &retention).await;
-    let outcome = if aggregated.incomplete {
-        "incomplete"
-    } else {
-        "completed"
-    };
-    let settled = guard
-        .settle(
-            outcome,
-            aggregated.usage.as_ref(),
-            &aggregated.tool_names,
-            None,
-        )
-        .await;
-    if let Err(error) = remembered {
-        return error_response(&error);
-    }
-    if !settled {
-        return error_response(&PublicError::internal());
-    }
-    let mut headers = commit_independent(&admission, None);
-    headers.extend(commit_dependent(&admission));
-    if admission.stream {
-        let body = match encode_responses_sse(&admission, created_at, &events) {
-            Ok(body) => body,
-            Err(error) => return error_response(&error),
-        };
-        return sse_body_response(&headers, body);
-    }
-    json_response(StatusCode::OK, &aggregated.body, &headers)
+    let stream_body = admission.stream;
+    respond_from_responses_events(
+        &state,
+        admission,
+        guard,
+        committed.depth,
+        events,
+        committed.usage,
+        committed.tool_names,
+        created_at,
+        stream_body,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2616,39 +2087,40 @@ async fn stream_responses(
     state: AppState,
     admission: Admission,
     guard: AttemptGuard,
-    dialect: Dialect,
-    response: reqwest::Response,
+    committed: CommittedAttempt,
     created_at: f64,
     deadline: Instant,
-    phase_timeout: Duration,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let mut header_pairs = commit_independent(&admission, None);
-    header_pairs.extend(commit_dependent(&admission));
+    header_pairs.extend(commit_dependent(&admission, committed.depth));
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();
     let envelope = admission.envelope.clone().unwrap_or_default();
+    let phase_timeout = admission.phase_timeout(committed.depth);
+    let task_hold = guard.hold_task();
     tokio::spawn(async move {
+        let _task = task_hold;
         let _permit = permit;
         let mut guard = guard;
+        let mut committed = committed;
         let mut encoder = ResponsesSseEncoder::new(&request_id, &alias, created_at, envelope);
-        let mut normalizer = Normalizer::new(dialect);
-        let mut decoder = FrameDecoder::new(dialect);
-        let mut usage: Option<Usage> = None;
-        let mut tool_names: Vec<String> = Vec::new();
+        let mut usage: Option<Usage> = committed.usage.take();
+        let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
+        let mut visible_refusal = committed.visible_refusal;
         let mut terminal: Option<Event> = None;
         let mut retention = ResponsesRetention::default();
         // Terminal frames are withheld until continuation retention lands,
         // mirroring the python stream body's ordering.
-        let mut terminal_frames: Vec<String> = Vec::new();
+        let terminal_frames: Vec<String>;
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
                 let failure = $failure.boundary();
                 emit_responses_failure(&sender, deadline, &mut encoder, &failure).await;
                 guard
-                    .settle("failed", usage.as_ref(), &tool_names, Some(&failure))
+                    .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
                     .await;
                 return;
             }};
@@ -2670,132 +2142,73 @@ async fn stream_responses(
             }
         }
 
-        let mut byte_stream = response.bytes_stream();
-        'outer: loop {
-            let bound = remaining(deadline).min(phase_timeout);
-            let chunk = match tokio::time::timeout(bound, byte_stream.next()).await {
-                Ok(Some(Ok(chunk))) => chunk,
-                Ok(Some(Err(_))) => {
+        let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
+        loop {
+            let event = if let Some(event) = prefix.pop_front() {
+                event
+            } else {
+                match committed
+                    .relay
+                    .next_event(deadline, phase_timeout, guard.started)
+                    .await
+                {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        fail_stream!(Failure::new(
+                            FailureClass::MalformedResponse,
+                            "provider stream ended without a terminal event",
+                        ))
+                    }
+                    Err(failure) => fail_stream!(failure),
+                }
+            };
+            track_event(&event, &mut usage, &mut tool_names);
+            retention.track(&event);
+            if matches!(event, Event::RefusalDelta(_)) {
+                visible_refusal = true;
+            }
+            let outward = match &event {
+                Event::Failed(failure)
+                    if failure.failure_class == FailureClass::Refusal && visible_refusal =>
+                {
+                    Event::Completed
+                }
+                other => other.clone(),
+            };
+            // The terminal is recorded before its frames flush, so a
+            // disconnect during the final flush still settles by the
+            // provider's outcome instead of as a cancellation.
+            if event.is_terminal() {
+                terminal = Some(event.clone());
+            }
+            let encoded = match encoder.feed(&outward) {
+                Ok(encoded) => encoded,
+                Err(_) => {
                     fail_stream!(Failure::new(
-                        FailureClass::Transport,
-                        "provider transport failed; retry the request",
+                        FailureClass::Internal,
+                        "gateway could not encode the provider stream",
                     ))
                 }
-                Ok(None) => break 'outer,
-                Err(_) => fail_stream!(stream_timeout_failure(deadline)),
             };
-            let frames = match decoder.feed(&chunk) {
-                Ok(frames) => frames,
-                Err(message) => {
-                    fail_stream!(Failure::new(FailureClass::MalformedResponse, &message))
-                }
-            };
-            for frame in frames {
-                let events = match normalizer.feed(&frame) {
-                    Ok(events) => events,
-                    Err(failure) => fail_stream!(failure),
-                };
-                for event in events {
-                    track_event(&event, &mut usage, &mut tool_names);
-                    retention.track(&event);
-                    // The terminal is recorded before its frames flush, so a
-                    // disconnect during the final flush still settles by the
-                    // provider's outcome instead of as a cancellation.
-                    if event.is_terminal() {
-                        terminal = Some(event.clone());
-                    }
-                    let encoded = match encoder.feed(&event) {
-                        Ok(encoded) => encoded,
-                        Err(_) => {
-                            fail_stream!(Failure::new(
-                                FailureClass::Internal,
-                                "gateway could not encode the provider stream",
-                            ))
-                        }
-                    };
-                    if terminal.is_some() {
-                        terminal_frames = encoded;
-                        break 'outer;
-                    }
-                    for data in encoded {
-                        if !send_bounded(&sender, deadline, Bytes::from(data)).await {
-                            settle_stream_end(
-                                &mut guard,
-                                terminal.as_ref(),
-                                usage.as_ref(),
-                                &tool_names,
-                                true,
-                            )
-                            .await;
-                            return;
-                        }
-                    }
+            if terminal.is_some() {
+                terminal_frames = encoded;
+                break;
+            }
+            for data in encoded {
+                if !send_bounded(&sender, deadline, Bytes::from(data)).await {
+                    settle_stream_end(
+                        &mut guard,
+                        terminal.as_ref(),
+                        usage.as_ref(),
+                        &tool_names,
+                        true,
+                    )
+                    .await;
+                    return;
                 }
             }
         }
 
-        // Recover a final unterminated SSE frame at EOF (python decoder
-        // parity) before deciding the stream ended without a terminal.
-        if terminal.is_none() {
-            let tail = match decoder.finish() {
-                Ok(tail) => tail,
-                Err(message) => {
-                    fail_stream!(Failure::new(FailureClass::MalformedResponse, &message))
-                }
-            };
-            if let Some(frame) = tail {
-                let events = match normalizer.feed(&frame) {
-                    Ok(events) => events,
-                    Err(failure) => fail_stream!(failure),
-                };
-                for event in events {
-                    track_event(&event, &mut usage, &mut tool_names);
-                    retention.track(&event);
-                    if event.is_terminal() {
-                        terminal = Some(event.clone());
-                    }
-                    let encoded = match encoder.feed(&event) {
-                        Ok(encoded) => encoded,
-                        Err(_) => {
-                            fail_stream!(Failure::new(
-                                FailureClass::Internal,
-                                "gateway could not encode the provider stream",
-                            ))
-                        }
-                    };
-                    if terminal.is_some() {
-                        terminal_frames = encoded;
-                        break;
-                    }
-                    for data in encoded {
-                        if !send_bounded(&sender, deadline, Bytes::from(data)).await {
-                            settle_stream_end(
-                                &mut guard,
-                                terminal.as_ref(),
-                                usage.as_ref(),
-                                &tool_names,
-                                true,
-                            )
-                            .await;
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        if terminal.is_none() {
-            let failure = Failure::new(
-                FailureClass::MalformedResponse,
-                "provider stream ended without a terminal event",
-            )
-            .boundary();
-            emit_responses_failure(&sender, deadline, &mut encoder, &failure).await;
-            guard
-                .settle("failed", usage.as_ref(), &tool_names, Some(&failure))
-                .await;
-            return;
-        }
         // Retention runs before the terminal frames flush; a bounded
         // retention failure truncates the stream before its terminal, the
         // same observable behavior as the python service.

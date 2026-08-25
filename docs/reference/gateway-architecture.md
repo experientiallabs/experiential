@@ -25,16 +25,18 @@ extension is built, and otherwise prints the reason and serves through the
 python engine. `--engine rust` and `--engine python` force one engine.
 
 The native engine is a Rust HTTP server compiled as a PyO3 extension. It owns
-the public socket and the anonymous Chat Completions fast path: upstream
-dispatch, provider stream normalization, and public SSE encoding run off the
-GIL, with JSON-string callbacks into python per request (authenticate,
-admit, settle, and `enforce_output` only when admission sets
+the public socket and the Chat Completions and Responses fast paths: upstream
+dispatch, provider stream normalization, the certified deployment waterfall,
+and public SSE encoding run off the GIL, with JSON-string callbacks into
+python per request (authenticate, admit, `start_attempt` per physical
+dispatch, settle, and `enforce_output` only when admission sets
 `output_guardrail`). Unguarded traffic never calls that output callback.
 Everything protocol- and authority-shaped stays in the shared
 python code: admission decodes the raw body with the same `decode_chat`,
-enforces the same deployment-identity invariant, builds the upstream payload
-with the same `streaming_requests` builders, and writes the same durable
-SQLite transactions, over the same hot-reloadable authority generations.
+enforces the same deployment-identity invariant, builds every deployment's
+upstream payload with the same `streaming_requests` builders, and writes the
+same durable SQLite transactions, over the same hot-reloadable authority
+generations.
 Provider wire facts come from the public `gateway_wire_profile()` on each
 resolved provider client; native dialects are `openai_responses`,
 `anthropic_messages`, `openai_compatible` (which also covers Azure and
@@ -50,13 +52,24 @@ never age a signature toward AWS's short clock window; the engine's immediate
 bounded open retry reuses the result within milliseconds, and any later retry
 is a fresh admission and a fresh signature.
 
+Multi-deployment certified pools execute natively. Admission returns the full
+ordered route plus the frozen retry-policy facts without starting an attempt;
+the engine reserves each physical dispatch through `start_attempt`
+immediately before network work, redials the same deployment only for
+retryable failure classes, fails over to the next certified deployment for
+failover-eligible failures, and permanently freezes the serving deployment at
+the first outward semantic event. Candidate selection policy (health
+circuits, budgets, attempt caps) stays in python. When the alias revision
+enables refusal failover, refusal deltas are withheld in a bounded in-memory
+buffer so a refusal-only terminal can advance to the next deployment; mixed
+output or buffer overflow commits and flushes.
+
 The public surface is identical under either engine. An embedded python engine
 over the same authority, ledger, and routes listens on an internal loopback
 port, and the native engine forwards to it everything outside its fast path:
-`POST /v1/responses`, chat requests carrying `Idempotency-Key` or
-`X-Client-Request-Id` (replay semantics),
-multi-deployment pools (the certified waterfall), providers whose resolved
-client exposes no native wire profile, and unknown routes. Escalation happens
+Responses requests carrying `Idempotency-Key` or
+`X-Client-Request-Id`, providers without a native
+dialect, and unknown routes. Escalation happens
 before any ledger write, so each request is accounted exactly once by the
 engine that serves it. Shutdown drains admitted work on both engines within
 `--graceful-timeout`.

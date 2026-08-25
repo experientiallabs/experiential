@@ -1387,10 +1387,10 @@ def _activate_certified_pool_alias(
 ) -> None:
     """Grant one certified two-deployment pool alias on ``provider-main``.
 
-    Every granted provider has a native dialect, so a certified
-    multi-deployment pool is the escalated-by-construction route the native
-    engine hands to the embedded python engine's waterfall. Shared by the
-    native bridge, metrics, and dead-fallback tests.
+    The certified waterfall runs natively (every granted provider has a
+    native dialect), so this pool is exercised for its own multi-deployment
+    behavior, not as an escalation fixture; see
+    :func:`_activate_escalating_project_alias` for that.
 
     Args:
         root: Seeded gateway root that already holds ``provider-main``.
@@ -1425,6 +1425,51 @@ def _activate_certified_pool_alias(
             certified_at=datetime(2026, 8, 24, tzinfo=UTC),
         ),
         expected_catalog_sha256=normalized.identity_sha256(),
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id=alias,
+        alias_name=alias,
+        revision_id=f"revision-{alias}",
+        pool_id=alias,
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id=alias)
+
+
+def _activate_alias_for_escalation_policy(
+    root: Path,
+    manager: GatewayManagement,
+    *,
+    alias: str,
+) -> None:
+    """Grant one otherwise-ordinary direct alias for a host-policy escalation test.
+
+    Every granted provider now has a native dialect and every route shape
+    (direct pools, certified pools, and project-backed aliases) resolves
+    natively, so the only construction-independent escalation lever left is
+    the hosted ``native_route_eligible`` policy hook: pair this alias with a
+    callback that rejects it by name to build an escalated-by-construction
+    route for tests that need one. Shared by the native bridge, metrics, and
+    dead-fallback tests.
+
+    Args:
+        root: Seeded gateway root that already holds ``provider-main``.
+        manager: Management handle over the same root.
+        alias: Public alias and deployment-alias prefix.
+    """
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        root,
+        deployment_alias=alias,
+        connection_name="provider-main",
+        provider_model=f"{alias}-model-exact",
+        exact_model_id=f"{alias}-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
         replace=False,
     )
     manager.activate_direct_alias(

@@ -69,11 +69,14 @@ class _RewritingControlPlane:
         return getattr(self._inner, name)
 
     def admit(self, argument):
-        \"\"\"Admit through the real control plane, then rewrite the URL.\"\"\"
+        \"\"\"Admit through the real control plane, then rewrite the route's URL.\"\"\"
         result = self._inner.admit(argument)
         parsed = json.loads(result)
-        if parsed.get("dialect") == "bedrock_converse_stream":
-            parsed["url"] = self._upstream_base + "/model/test/converse-stream"
+        route = parsed.get("route")
+        if isinstance(route, list):
+            for wire in route:
+                if isinstance(wire, dict) and wire.get("dialect") == "bedrock_converse_stream":
+                    wire["url"] = self._upstream_base + "/model/test/converse-stream"
         return json.dumps(parsed, separators=(",", ":"))
 
     def sign_dispatch(self, argument):
