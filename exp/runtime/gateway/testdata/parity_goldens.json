@@ -1,0 +1,361 @@
+{
+ "anthropic_error_envelopes": {
+  "authentication": {
+   "error": {
+    "message": "parity probe message",
+    "type": "authentication_error"
+   },
+   "type": "error"
+  },
+  "authorization": {
+   "error": {
+    "message": "parity probe message",
+    "type": "permission_error"
+   },
+   "type": "error"
+  },
+  "cancelled": {
+   "error": {
+    "message": "parity probe message",
+    "type": "api_error"
+   },
+   "type": "error"
+  },
+  "guardrail": {
+   "error": {
+    "message": "parity probe message",
+    "type": "invalid_request_error"
+   },
+   "type": "error"
+  },
+  "internal": {
+   "error": {
+    "message": "parity probe message",
+    "type": "api_error"
+   },
+   "type": "error"
+  },
+  "invalid_request": {
+   "error": {
+    "message": "parity probe message",
+    "type": "invalid_request_error"
+   },
+   "type": "error"
+  },
+  "malformed_response": {
+   "error": {
+    "message": "parity probe message",
+    "type": "api_error"
+   },
+   "type": "error"
+  },
+  "provider_authentication": {
+   "error": {
+    "message": "parity probe message",
+    "type": "api_error"
+   },
+   "type": "error"
+  },
+  "provider_internal": {
+   "error": {
+    "message": "parity probe message",
+    "type": "api_error"
+   },
+   "type": "error"
+  },
+  "provider_not_found": {
+   "error": {
+    "message": "parity probe message",
+    "type": "api_error"
+   },
+   "type": "error"
+  },
+  "quota_exceeded": {
+   "error": {
+    "message": "parity probe message. The allocation resets at 2026-09-01T00:00:00Z; retry after that time or ask the gateway operator to raise the monthly budget.",
+    "type": "rate_limit_error"
+   },
+   "type": "error"
+  },
+  "refusal": {
+   "error": {
+    "message": "parity probe message",
+    "type": "api_error"
+   },
+   "type": "error"
+  },
+  "throttled": {
+   "error": {
+    "message": "parity probe message",
+    "type": "rate_limit_error"
+   },
+   "type": "error"
+  },
+  "timeout": {
+   "error": {
+    "message": "parity probe message",
+    "type": "api_error"
+   },
+   "type": "error"
+  },
+  "transport": {
+   "error": {
+    "message": "parity probe message",
+    "type": "api_error"
+   },
+   "type": "error"
+  },
+  "unsupported_capability": {
+   "error": {
+    "message": "parity probe message",
+    "type": "invalid_request_error"
+   },
+   "type": "error"
+  }
+ },
+ "anthropic_error_inputs": {
+  "authentication": {
+   "code": "invalid_key",
+   "error_type": "authentication_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 401
+  },
+  "authorization": {
+   "code": "model_not_granted",
+   "error_type": "permission_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 403
+  },
+  "cancelled": {
+   "code": "request_cancelled",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 499
+  },
+  "guardrail": {
+   "code": "content_filter",
+   "error_type": "invalid_request_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 400
+  },
+  "internal": {
+   "code": "all_routes_failed",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 502
+  },
+  "invalid_request": {
+   "code": "invalid_request",
+   "error_type": "invalid_request_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 400
+  },
+  "malformed_response": {
+   "code": "all_routes_failed",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 502
+  },
+  "provider_authentication": {
+   "code": "all_routes_failed",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 502
+  },
+  "provider_internal": {
+   "code": "all_routes_failed",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 502
+  },
+  "provider_not_found": {
+   "code": "all_routes_failed",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 502
+  },
+  "quota_exceeded": {
+   "code": "insufficient_quota",
+   "error_type": "insufficient_quota",
+   "message": "parity probe message. The allocation resets at 2026-09-01T00:00:00Z; retry after that time or ask the gateway operator to raise the monthly budget.",
+   "param": null,
+   "retry_after_seconds": 546099,
+   "status_code": 429
+  },
+  "refusal": {
+   "code": "all_routes_failed",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 502
+  },
+  "throttled": {
+   "code": "unavailable_route",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": 5,
+   "status_code": 429
+  },
+  "timeout": {
+   "code": "deadline_exceeded",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 504
+  },
+  "transport": {
+   "code": "all_routes_failed",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 502
+  },
+  "unsupported_capability": {
+   "code": "unsupported_capability",
+   "error_type": "invalid_request_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 400
+  }
+ },
+ "anthropic_error_with_param": {
+  "error": {
+   "message": "The parameter 'top_k' is not supported. (param: top_k)",
+   "type": "invalid_request_error"
+  },
+  "type": "error"
+ },
+ "anthropic_error_with_param_input": {
+  "code": "unsupported_parameter",
+  "error_type": "invalid_request_error",
+  "message": "The parameter 'top_k' is not supported.",
+  "param": "top_k",
+  "retry_after_seconds": null,
+  "status_code": 400
+ },
+ "chat_frames": [
+  "data: {\"id\":\"chatcmpl_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"coding\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null,\"logprobs\":null}]}\n\n",
+  "data: {\"id\":\"chatcmpl_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"coding\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null,\"logprobs\":null}]}\n\n",
+  "data: {\"id\":\"chatcmpl_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"coding\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo é\"},\"finish_reason\":null,\"logprobs\":null}]}\n\n",
+  "data: {\"id\":\"chatcmpl_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"coding\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]},\"finish_reason\":null,\"logprobs\":null}]}\n\n",
+  "data: {\"id\":\"chatcmpl_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"coding\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\": \\\"x\\\"}\"}}]},\"finish_reason\":null,\"logprobs\":null}]}\n\n",
+  "data: {\"id\":\"chatcmpl_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"coding\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\",\"logprobs\":null}]}\n\n",
+  "data: {\"id\":\"chatcmpl_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"coding\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14,\"prompt_tokens_details\":{\"cached_tokens\":1},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\n",
+  "data: [DONE]\n\n"
+ ],
+ "messages_block_order_body": "{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"coding\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"search\",\"input\":{}},{\"type\":\"text\",\"text\":\"after\"}],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}",
+ "messages_deferred_body": "{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"coding\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"search\",\"input\":{}},{\"type\":\"text\",\"text\":\"after\"}],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}",
+ "messages_deferred_frames": [
+  "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"coding\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+  "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+  "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"search\",\"input\":{}}}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+  "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+  "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"after\"}}\n\n",
+  "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+  "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}\n\n",
+  "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+ ],
+ "messages_failure_frames": [
+  "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"coding\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+  "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+  "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"oops\"}}\n\n",
+  "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"provider stream failed\"}}\n\n"
+ ],
+ "messages_interleaved_body": "{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"coding\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call-a\",\"name\":\"alpha\",\"input\":{\"a\":1}},{\"type\":\"tool_use\",\"id\":\"call-b\",\"name\":\"beta\",\"input\":{\"b\":2}}],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":6,\"output_tokens\":3}}",
+ "messages_interleaved_frames": [
+  "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"coding\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+  "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+  "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-a\",\"name\":\"alpha\",\"input\":{}}}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\": \"}}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"1}\"}}\n\n",
+  "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+  "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-b\",\"name\":\"beta\",\"input\":{}}}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"b\\\": 2}\"}}\n\n",
+  "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+  "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":6,\"output_tokens\":3}}\n\n",
+  "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+ ],
+ "messages_tool_stream_body": "{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"coding\",\"content\":[{\"type\":\"text\",\"text\":\"Hello é\"},{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"search\",\"input\":{\"q\":\"x\"}}],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":7,\"output_tokens\":4,\"cache_read_input_tokens\":3}}",
+ "messages_tool_stream_frames": [
+  "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"coding\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+  "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+  "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo é\"}}\n\n",
+  "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+  "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"search\",\"input\":{}}}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\": \"}}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"x\\\"}\"}}\n\n",
+  "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+  "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":7,\"output_tokens\":4,\"cache_read_input_tokens\":3}}\n\n",
+  "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+ ],
+ "responses_completed_body": "{\"id\":\"resp_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"response\",\"created_at\":1700000000.25,\"completed_at\":1700000000.25,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"metadata\":{\"team\":\"core\"},\"model\":\"coding\",\"output\":[{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello é\",\"annotations\":[]}]},{\"id\":\"fc_5c5e7c69cf9de82d85831c773eaec6be\",\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"search\",\"arguments\":\"{\\\"q\\\": \\\"x\\\"}\",\"status\":\"completed\"}],\"parallel_tool_calls\":true,\"temperature\":0.5,\"tool_choice\":\"auto\",\"tools\":[{\"type\":\"function\",\"name\":\"search\",\"description\":\"Find things.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}},\"strict\":false}],\"max_output_tokens\":128,\"previous_response_id\":null,\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":1},\"output_tokens\":4,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":14}}",
+ "responses_failed_frames": [
+  "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"response\",\"created_at\":1700000000.5,\"completed_at\":null,\"status\":\"in_progress\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"metadata\":null,\"model\":\"coding\",\"output\":[],\"parallel_tool_calls\":true,\"temperature\":null,\"tool_choice\":\"auto\",\"tools\":[],\"max_output_tokens\":null,\"previous_response_id\":null,\"usage\":null}}\n\n",
+  "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1,\"response\":{\"id\":\"resp_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"response\",\"created_at\":1700000000.5,\"completed_at\":null,\"status\":\"in_progress\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"metadata\":null,\"model\":\"coding\",\"output\":[],\"parallel_tool_calls\":true,\"temperature\":null,\"tool_choice\":\"auto\",\"tools\":[],\"max_output_tokens\":null,\"previous_response_id\":null,\"usage\":null}}\n\n",
+  "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+  "event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"sequence_number\":3,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}\n\n",
+  "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":4,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"delta\":\"part\",\"logprobs\":[]}\n\n",
+  "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"sequence_number\":5,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"text\":\"part\",\"logprobs\":[]}\n\n",
+  "event: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"sequence_number\":6,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"part\",\"annotations\":[]}}\n\n",
+  "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":7,\"output_index\":0,\"item\":{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"part\",\"annotations\":[]}]}}\n\n",
+  "event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":8,\"response\":{\"id\":\"resp_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"response\",\"created_at\":1700000000.5,\"completed_at\":null,\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"provider exploded\"},\"incomplete_details\":null,\"instructions\":null,\"metadata\":null,\"model\":\"coding\",\"output\":[{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"part\",\"annotations\":[]}]}],\"parallel_tool_calls\":true,\"temperature\":null,\"tool_choice\":\"auto\",\"tools\":[],\"max_output_tokens\":null,\"previous_response_id\":null,\"usage\":null}}\n\n"
+ ],
+ "responses_frames": [
+  "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"response\",\"created_at\":1700000000.25,\"completed_at\":null,\"status\":\"in_progress\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"metadata\":{\"team\":\"core\"},\"model\":\"coding\",\"output\":[],\"parallel_tool_calls\":true,\"temperature\":0.5,\"tool_choice\":\"auto\",\"tools\":[{\"type\":\"function\",\"name\":\"search\",\"description\":\"Find things.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}},\"strict\":false}],\"max_output_tokens\":128,\"previous_response_id\":null,\"usage\":null}}\n\n",
+  "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1,\"response\":{\"id\":\"resp_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"response\",\"created_at\":1700000000.25,\"completed_at\":null,\"status\":\"in_progress\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"metadata\":{\"team\":\"core\"},\"model\":\"coding\",\"output\":[],\"parallel_tool_calls\":true,\"temperature\":0.5,\"tool_choice\":\"auto\",\"tools\":[{\"type\":\"function\",\"name\":\"search\",\"description\":\"Find things.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}},\"strict\":false}],\"max_output_tokens\":128,\"previous_response_id\":null,\"usage\":null}}\n\n",
+  "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+  "event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"sequence_number\":3,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}\n\n",
+  "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":4,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hel\",\"logprobs\":[]}\n\n",
+  "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":5,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"delta\":\"lo é\",\"logprobs\":[]}\n\n",
+  "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":6,\"output_index\":1,\"item\":{\"id\":\"fc_5c5e7c69cf9de82d85831c773eaec6be\",\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"search\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n",
+  "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":7,\"item_id\":\"fc_5c5e7c69cf9de82d85831c773eaec6be\",\"output_index\":1,\"delta\":\"{\\\"q\\\": \\\"x\\\"}\"}\n\n",
+  "event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"sequence_number\":8,\"item_id\":\"fc_5c5e7c69cf9de82d85831c773eaec6be\",\"output_index\":1,\"arguments\":\"{\\\"q\\\": \\\"x\\\"}\"}\n\n",
+  "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":9,\"output_index\":1,\"item\":{\"id\":\"fc_5c5e7c69cf9de82d85831c773eaec6be\",\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"search\",\"arguments\":\"{\\\"q\\\": \\\"x\\\"}\",\"status\":\"completed\"}}\n\n",
+  "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"sequence_number\":10,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"text\":\"Hello é\",\"logprobs\":[]}\n\n",
+  "event: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"sequence_number\":11,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"Hello é\",\"annotations\":[]}}\n\n",
+  "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":12,\"output_index\":0,\"item\":{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello é\",\"annotations\":[]}]}}\n\n",
+  "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":13,\"response\":{\"id\":\"resp_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"response\",\"created_at\":1700000000.25,\"completed_at\":1700000000.25,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"metadata\":{\"team\":\"core\"},\"model\":\"coding\",\"output\":[{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello é\",\"annotations\":[]}]},{\"id\":\"fc_5c5e7c69cf9de82d85831c773eaec6be\",\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"search\",\"arguments\":\"{\\\"q\\\": \\\"x\\\"}\",\"status\":\"completed\"}],\"parallel_tool_calls\":true,\"temperature\":0.5,\"tool_choice\":\"auto\",\"tools\":[{\"type\":\"function\",\"name\":\"search\",\"description\":\"Find things.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}},\"strict\":false}],\"max_output_tokens\":128,\"previous_response_id\":null,\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":1},\"output_tokens\":4,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":14}}}\n\n"
+ ],
+ "responses_refusal_frames": [
+  "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"response\",\"created_at\":1700000000.0,\"completed_at\":null,\"status\":\"in_progress\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"metadata\":null,\"model\":\"coding\",\"output\":[],\"parallel_tool_calls\":true,\"temperature\":null,\"tool_choice\":\"auto\",\"tools\":[],\"max_output_tokens\":null,\"previous_response_id\":null,\"usage\":null}}\n\n",
+  "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1,\"response\":{\"id\":\"resp_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"response\",\"created_at\":1700000000.0,\"completed_at\":null,\"status\":\"in_progress\",\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"metadata\":null,\"model\":\"coding\",\"output\":[],\"parallel_tool_calls\":true,\"temperature\":null,\"tool_choice\":\"auto\",\"tools\":[],\"max_output_tokens\":null,\"previous_response_id\":null,\"usage\":null}}\n\n",
+  "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+  "event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"sequence_number\":3,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"\"}}\n\n",
+  "event: response.refusal.delta\ndata: {\"type\":\"response.refusal.delta\",\"sequence_number\":4,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"delta\":\"I ca\"}\n\n",
+  "event: response.refusal.delta\ndata: {\"type\":\"response.refusal.delta\",\"sequence_number\":5,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"delta\":\"nnot\"}\n\n",
+  "event: response.refusal.done\ndata: {\"type\":\"response.refusal.done\",\"sequence_number\":6,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"refusal\":\"I cannot\"}\n\n",
+  "event: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"sequence_number\":7,\"item_id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"I cannot\"}}\n\n",
+  "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":8,\"output_index\":0,\"item\":{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"I cannot\"}]}}\n\n",
+  "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"sequence_number\":9,\"response\":{\"id\":\"resp_ff596a02add1b410b6dc664a47e25b3e\",\"object\":\"response\",\"created_at\":1700000000.0,\"completed_at\":null,\"status\":\"incomplete\",\"error\":null,\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"instructions\":null,\"metadata\":null,\"model\":\"coding\",\"output\":[{\"id\":\"msg_ff596a02add1b410b6dc664a47e25b3e\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"I cannot\"}]}],\"parallel_tool_calls\":true,\"temperature\":null,\"tool_choice\":\"auto\",\"tools\":[],\"max_output_tokens\":null,\"previous_response_id\":null,\"usage\":null}}\n\n"
+ ]
+}
