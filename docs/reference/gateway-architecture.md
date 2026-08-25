@@ -21,10 +21,12 @@ perform no provider request. Only an authorized model request may cross the prov
 
 ## Data-plane engines
 
-The gateway has two data planes over one control plane. The default `exp` flow resolves
-`--engine auto` (the default) to the native engine when the `exp_gateway_native`
-extension is built, and otherwise prints the reason and serves through the
-python engine. `--engine rust` and `--engine python` force one engine.
+The native (Rust) engine is the supported data plane; the python data plane
+is deprecated and scheduled for removal once the native engine has soaked in
+production. The default `exp` flow resolves `--engine auto` (the default) to
+the native engine when the `exp_gateway_native` extension is built, and
+otherwise prints the reason and serves through the deprecated python engine.
+`--engine rust` and `--engine python` force one engine.
 
 The native engine is a Rust HTTP server compiled as a PyO3 extension. It owns
 the public socket and the Chat Completions and Responses fast paths: upstream
@@ -56,17 +58,18 @@ enables refusal failover, refusal deltas are withheld in a bounded in-memory
 buffer so a refusal-only terminal can advance to the next deployment; mixed
 output or buffer overflow commits and flushes.
 
-The public surface is identical under either engine. An embedded python
-engine (a deprecated data plane, scheduled for removal; the python control
-plane stays) over the same authority, ledger, and routes listens on an
-internal loopback port, and the native engine forwards to it everything
-outside its fast path:
-chat and Responses requests carrying `Idempotency-Key` or
-`X-Client-Request-Id` (replay semantics; the Messages surface defines no
-idempotency header and never proxies for one), providers without a native
-dialect, and unknown routes. Escalation happens
-before any ledger write, so each request is accounted exactly once by the
-engine that serves it. Shutdown drains admitted work on both engines within
+The public surface is identical under either engine, and `--engine rust` is
+rust-only: no embedded python engine runs, unknown routes answer a native 404
+in the OpenAI error envelope, keyed Chat Completions and keyed Responses run
+the replay protocol natively (the Messages surface defines no idempotency
+header and never joins either replay store), and `/usage` plus `/usage.json`
+are served natively. Startup validates that every granted alias is natively
+servable (every pool deployment resolves to a provider client with a native
+dialect) and fails with the offending aliases named otherwise. Hosted
+compositions may still pass an internal ASGI fallback to
+`serve_native_gateway` while they finish migrating off the python data plane;
+that seam is deprecated and scheduled for removal once the native engine has
+soaked in production. Shutdown drains admitted work within
 `--graceful-timeout`.
 
 Identity-scoped guardrails are optional and default-off. Policies are keyed by
