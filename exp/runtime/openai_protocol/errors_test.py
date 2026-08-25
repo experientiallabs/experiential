@@ -7,6 +7,10 @@ from datetime import UTC, datetime
 import pytest
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.models.providers.errors import (
+    UnsupportedReasoningEffortError,
+    normalized_provider_failure,
+)
 from exp.runtime.openai_protocol.errors import (
     THROTTLED_RETRY_AFTER_SECONDS,
     OpenAIProtocolError,
@@ -97,6 +101,25 @@ def test_non_retryable_failures_carry_no_retry_after_header() -> None:
 
     assert error.retry_after_seconds is None
     assert error.headers() == {}
+
+
+def test_unsupported_reasoning_effort_preserves_field_specific_error() -> None:
+    """Normalized gateway accounting retains the corrective public error contract."""
+    failure = normalized_provider_failure(
+        UnsupportedReasoningEffortError(
+            effort="minimal",
+            supported_efforts=("high",),
+            param="reasoning.effort",
+        )
+    )
+
+    error = public_failure_error(failure)
+
+    assert failure.failure_class is GatewayFailureClass.INVALID_REQUEST
+    assert error.status_code == 400
+    assert error.detail.code == "unsupported_parameter"
+    assert error.detail.param == "reasoning.effort"
+    assert "Supported values: 'high'" in error.detail.message
 
 
 def test_retry_after_must_be_positive() -> None:

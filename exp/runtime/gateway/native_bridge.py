@@ -95,7 +95,11 @@ from exp.runtime.models.providers import (
     require_gateway_provider,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
+    UnsupportedReasoningEffortError,
+    normalized_provider_failure,
+)
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.models.providers.streaming_requests import (
     dialect_stream_payload,
@@ -373,6 +377,10 @@ class NativeControlPlane:
                     )
                 )
                 signers.append(dispatch_signer)
+        except UnsupportedReasoningEffortError as exc:
+            failure = normalized_provider_failure(exc)
+            self._accounting.finish_request_quietly(authorization, failure)
+            raise NativeBridgeError(public_failure_error(failure)) from exc
         except ProviderCapabilityError as exc:
             failure = GatewayFailure(
                 failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,

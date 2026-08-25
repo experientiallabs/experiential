@@ -4,6 +4,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_reasoning_effort,
     gemini_thinking_level,
     openai_reasoning_effort,
+    supported_reasoning_efforts,
 )
 
 
@@ -41,3 +42,45 @@ def test_openai_reasoning_efforts_follow_exact_model_tables() -> None:
     assert openai_reasoning_effort("openai/gpt-5-pro", "low") == "high"
     assert openai_reasoning_effort("gpt-5.6-sol", "xhigh") == "xhigh"
     assert openai_reasoning_effort("third-party-reasoner", "minimal") == "minimal"
+
+
+def test_exact_effort_support_covers_each_reasoning_wire_family() -> None:
+    """Admission sees only values each provider can transmit without clamping."""
+    assert supported_reasoning_efforts("gpt-5-pro", "openai_responses") == ("high",)
+    assert supported_reasoning_efforts("gpt-5.2-pro", "reasoning_effort") == (
+        "medium",
+        "high",
+        "xhigh",
+    )
+    assert supported_reasoning_efforts("claude-sonnet-4-6", "anthropic_adaptive") == (
+        "low",
+        "medium",
+        "high",
+    )
+    assert supported_reasoning_efforts("gemini-3-pro-preview", "gemini_thinking") == (
+        "low",
+        "high",
+    )
+    assert supported_reasoning_efforts("openai/gpt-5-pro", "reasoning") == ("high",)
+    assert supported_reasoning_efforts("anthropic/claude-opus-5", "reasoning") == (
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    )
+    assert supported_reasoning_efforts("google/gemini-3.6-flash", "reasoning") == (
+        "minimal",
+        "low",
+        "medium",
+        "high",
+    )
+
+
+def test_unknown_compatible_model_exposes_only_its_catalog_pin() -> None:
+    """Unknown upstream shims cannot silently normalize arbitrary caller efforts."""
+    assert supported_reasoning_efforts(
+        "vendor/reasoner",
+        "reasoning",
+        configured_effort="medium",
+    ) == ("medium",)
+    assert supported_reasoning_efforts("vendor/reasoner", "reasoning") == ()

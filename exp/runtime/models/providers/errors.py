@@ -65,6 +65,38 @@ class ProviderCapabilityError(ValueError):
         self.capability = capability
 
 
+class UnsupportedReasoningEffortError(ValueError):
+    """An explicit reasoning effort cannot be preserved by one model route."""
+
+    def __init__(
+        self,
+        *,
+        effort: str,
+        supported_efforts: tuple[str, ...],
+        param: str,
+    ) -> None:
+        """Build one field-specific, provider-neutral pre-dispatch rejection.
+
+        Args:
+            effort: Exact caller-provided reasoning effort.
+            supported_efforts: Ordered effort values accepted by every route deployment.
+            param: Public request path carrying the unsupported value.
+        """
+        if supported_efforts:
+            choices = ", ".join(repr(value) for value in supported_efforts)
+            message = (
+                f"Reasoning effort {effort!r} is not supported by this model route. "
+                f"Supported values: {choices}."
+            )
+        else:
+            message = (
+                f"The parameter {param!r} is not supported by this model route. "
+                "Remove the field or choose a different model."
+            )
+        super().__init__(message)
+        self.param = param
+
+
 def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
     """Convert an execution error into one stable sanitized gateway failure.
 
@@ -96,6 +128,15 @@ def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
             failure_class=GatewayFailureClass.REFUSAL,
             safe_message="provider refused the request; revise the request content and retry",
             safe_details={"signal": exception.signal.value},
+        )
+    if isinstance(exception, UnsupportedReasoningEffortError):
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.INVALID_REQUEST,
+            safe_message=str(exception),
+            safe_details={
+                "code": "unsupported_parameter",
+                "param": exception.param,
+            },
         )
     if isinstance(exception, ProviderCapabilityError):
         return GatewayFailure(
