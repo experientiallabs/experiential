@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, cast
 
 if TYPE_CHECKING:
@@ -34,6 +35,7 @@ def serve_native_gateway(
     graceful_timeout_seconds: float = 10.0,
     native_usage_enabled: bool = True,
     shutdown: ShutdownHandle | None = None,
+    on_listening: Callable[[], None] | None = None,
 ) -> None:
     """Serve the native data plane until a stop signal, blocking this thread.
 
@@ -50,6 +52,11 @@ def serve_native_gateway(
             ``exp_gateway_native.shutdown_handle()``. A host serving on a
             background thread calls ``request_shutdown()`` to stop the plane
             gracefully, since threads cannot receive SIGINT.
+        on_listening: Optional callback the native server invokes exactly
+            once, after its listener socket is bound and queuing
+            connections and before any request is accepted, so the embedder
+            can announce readiness truthfully. A callback failure aborts
+            the launch.
 
     Raises:
         NativeGatewayServerError: The extension is unavailable or the native
@@ -69,7 +76,12 @@ def serve_native_gateway(
         "native_usage_enabled": native_usage_enabled,
     }
     try:
-        native.serve(cast("NativeControlPlane", control_plane), json.dumps(config), shutdown)
+        native.serve(
+            cast("NativeControlPlane", control_plane),
+            json.dumps(config),
+            shutdown,
+            on_listening,
+        )
     except KeyboardInterrupt:
         # The native server drains on SIGINT before returning control to Python.
         pass

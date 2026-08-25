@@ -5,11 +5,12 @@ from __future__ import annotations
 import io
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest import mock
 
 import pytest
@@ -203,15 +204,22 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         assert port == 8123
         yield
 
-    def serve(value: object, *, host: str, port: int, **_kwargs: object) -> None:
+    def serve(value: object, *, host: str, port: int, **kwargs: object) -> None:
         """Capture the control plane and loopback bind without serving.
+
+        The bound-listener callback is invoked exactly as the real server
+        does after its bind succeeds, so the launch announces readiness.
 
         Args:
             value: Composed native control plane.
             host: Required loopback host.
             port: Requested local port.
+            **kwargs: Remaining serving options, including ``on_listening``.
         """
         served.append((value, host, port))
+        on_listening = cast("Callable[[], None] | None", kwargs.get("on_listening"))
+        if on_listening is not None:
+            on_listening()
 
     monkeypatch.setattr("exp.cli.gateway.compatibility.prepare_project_gateway", prepare)
     monkeypatch.setattr("exp.runtime.gateway.lifecycle.load_gateway_components", load_components)
@@ -261,8 +269,15 @@ def test_project_option_launches_the_native_gateway_on_loopback(
 def test_unbindable_port_fails_before_any_ready_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An occupied port is a usage error and no ready receipt is ever emitted."""
+    """An occupied port is a usage error and no ready receipt is ever emitted.
+
+    The real native server attempts the bind; only its bound-listener
+    callback may announce readiness, so the occupied port fails the launch
+    with no receipt.
+    """
     import socket
+
+    pytest.importorskip("exp_gateway_native")
 
     def prepare(project: str, root: Path, *, policy_id: str | None) -> ProjectGatewayCompatibility:
         """Return one already materialized project-backed gateway alias.
@@ -312,12 +327,6 @@ def test_unbindable_port_fails_before_any_ready_receipt(
         ),
     )
 
-    def never_serve(*_args: object, **_kwargs: object) -> None:
-        """Fail the test if serving starts on an unbindable port."""
-        raise AssertionError("the native server must not start on an occupied port")
-
-    monkeypatch.setattr("exp.runtime.gateway.native_server.serve_native_gateway", never_serve)
-
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupier:
         occupier.bind(("127.0.0.1", 0))
         occupier.listen(1)
@@ -336,7 +345,7 @@ def test_unbindable_port_fails_before_any_ready_receipt(
         )
 
     assert result.exit_code == 2
-    assert "unavailable" in result.output
+    assert "bind" in result.output
     assert '"status":"ready"' not in result.output
 
 

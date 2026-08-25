@@ -89,12 +89,13 @@ fn shutdown_handle() -> ShutdownHandle {
 /// concurrency bounds. `enforce_output` is called only when admission sets
 /// `output_guardrail`.
 #[pyfunction]
-#[pyo3(signature = (control_plane, config_json, shutdown=None))]
+#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None))]
 fn serve(
     py: Python<'_>,
     control_plane: Py<PyAny>,
     config_json: &str,
     shutdown: Option<&ShutdownHandle>,
+    on_listening: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
@@ -105,7 +106,7 @@ fn serve(
             .enable_all()
             .build()
             .map_err(|error| format!("tokio runtime construction failed: {error}"))?;
-        runtime.block_on(server::run(bridge, config, stop))
+        runtime.block_on(server::run(bridge, config, stop, on_listening))
     });
     outcome.map_err(PyRuntimeError::new_err)
 }

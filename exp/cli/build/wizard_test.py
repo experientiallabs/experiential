@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -485,8 +486,12 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
         graceful_timeout_seconds: float = 10.0,
         native_usage_enabled: bool = True,
         shutdown: object | None = None,
+        on_listening: Callable[[], None] | None = None,
     ) -> None:
         """Record the native serving bind instead of blocking the test.
+
+        The bound-listener callback runs exactly as the real server would
+        after a successful bind, so the launch announces readiness.
 
         Args:
             control_plane: The mocked control plane.
@@ -496,10 +501,13 @@ def test_fresh_bare_wizard_recommends_builds_and_composes_provisional_router(
             graceful_timeout_seconds: Drain bound, unused.
             native_usage_enabled: Usage-route ownership flag, unused.
             shutdown: Optional embedder stop handle, unused.
+            on_listening: Bound-listener readiness callback.
         """
         del control_plane, max_active_requests, graceful_timeout_seconds
         del native_usage_enabled, shutdown
         served.append((host, port))
+        if on_listening is not None:
+            on_listening()
 
     with monkeypatch.context() as run_patches:
         run_patches.setattr(

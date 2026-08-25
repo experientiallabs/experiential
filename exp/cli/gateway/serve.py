@@ -216,7 +216,6 @@ def _run_gateway(
         _emit_exp_wordmark()
 
     import importlib
-    import socket
 
     from exp.cli.gateway.compatibility import prepare_project_gateway
     from exp.cli.gateway.setup import interactive_gateway_setup
@@ -286,19 +285,6 @@ def _run_gateway(
                     data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
                     guardrails=guardrails,
                 )
-                # The bind is proved before the ready receipt is emitted, so
-                # a launch that cannot own its port never announces a usable
-                # gateway. The probe closes with SO_REUSEADDR set, leaving
-                # the port immediately rebindable by the native server.
-                if not check:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                        try:
-                            probe.bind((_LOOPBACK_HOST, port))
-                        except OSError as exc:
-                            raise typer.BadParameter(
-                                f"port {port} is unavailable on {_LOOPBACK_HOST}: {exc}"
-                            ) from exc
                 receipt = {
                     "schema_version": 1,
                     "operation": "gateway.check" if check else "gateway.run",
@@ -323,18 +309,26 @@ def _run_gateway(
                             "gateway_accounting": "enabled",
                         }
                     )
-                if json_output:
-                    typer.echo(json.dumps(receipt, separators=(",", ":")))
-                else:
-                    _emit_gateway_ready(
-                        port=port,
-                        compatibility=compatibility,
-                        ghost=ghost,
-                    )
-                    _emit_unavailable_aliases(components.unavailable_aliases)
+
+                def announce_ready() -> None:
+                    """Emit the ready receipt or banner for the live listener."""
+                    if json_output:
+                        typer.echo(json.dumps(receipt, separators=(",", ":")))
+                    else:
+                        _emit_gateway_ready(
+                            port=port,
+                            compatibility=compatibility,
+                            ghost=ghost,
+                        )
+                        _emit_unavailable_aliases(components.unavailable_aliases)
+
                 if check:
+                    announce_ready()
                     return
 
+                # Readiness is announced by the native server itself, from
+                # its bound-listener callback, so a launch that cannot own
+                # the port fails without ever printing a ready receipt.
                 try:
                     serve_native_gateway(
                         control_plane,
@@ -342,6 +336,7 @@ def _run_gateway(
                         port=port,
                         max_active_requests=max_active_requests,
                         graceful_timeout_seconds=graceful_timeout,
+                        on_listening=announce_ready,
                     )
                 except NativeGatewayServerError as exc:
                     raise typer.BadParameter(str(exc)) from exc

@@ -15,6 +15,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::serve::ListenerExt;
 use axum::Router;
+use pyo3::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
@@ -90,6 +91,7 @@ pub async fn run(
     bridge: Arc<Bridge>,
     config: ServeConfig,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    on_listening: Option<Py<PyAny>>,
 ) -> Result<(), String> {
     let http = crate::upstream::build_client()?;
     let pending_settlements = Arc::new(AtomicUsize::new(0));
@@ -135,6 +137,13 @@ pub async fn run(
         .tap_io(|stream| {
             let _ = stream.set_nodelay(true);
         });
+    // The socket is bound and queuing connections, so the embedder may now
+    // truthfully announce readiness; a callback failure aborts the launch
+    // before any traffic is accepted.
+    if let Some(callback) = on_listening {
+        Python::attach(|py| callback.call0(py))
+            .map_err(|error| format!("on_listening callback failed: {error}"))?;
+    }
     let graceful = Duration::from_secs_f64(config.graceful_timeout_seconds.max(0.1));
     let server =
         axum::serve(listener, app).with_graceful_shutdown(shutdown_requested(shutdown.clone()));

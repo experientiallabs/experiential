@@ -20,11 +20,17 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
     """The host serializes the exact serve configuration for the extension."""
     captured: dict[str, object] = {}
 
-    def serve(control_plane: object, config_json: str, shutdown: object) -> None:
+    def serve(
+        control_plane: object,
+        config_json: str,
+        shutdown: object,
+        on_listening: object,
+    ) -> None:
         """Capture the extension boundary call."""
         captured["control_plane"] = control_plane
         captured["config"] = json.loads(config_json)
         captured["shutdown"] = shutdown
+        captured["on_listening"] = on_listening
 
     native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
@@ -56,9 +62,14 @@ def test_host_forwards_an_embedder_owned_shutdown_handle(
     """A provided stop handle reaches the extension beside the configuration."""
     captured: dict[str, object] = {}
 
-    def serve(control_plane: object, config_json: str, shutdown: object) -> None:
+    def serve(
+        control_plane: object,
+        config_json: str,
+        shutdown: object,
+        on_listening: object,
+    ) -> None:
         """Capture the extension boundary call."""
-        del control_plane, config_json
+        del control_plane, config_json, on_listening
         captured["shutdown"] = shutdown
 
     native = SimpleNamespace(serve=serve)

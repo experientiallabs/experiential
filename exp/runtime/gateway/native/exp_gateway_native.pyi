@@ -1,5 +1,6 @@
 """Type stubs for the exp_gateway_native extension module."""
 
+from collections.abc import Callable
 from typing import Protocol
 
 __version__: str
@@ -34,6 +35,7 @@ def serve(
     control_plane: _ControlPlane,
     config_json: str,
     shutdown: ShutdownHandle | None = None,
+    on_listening: Callable[[], None] | None = None,
 ) -> None: ...
 def metrics_snapshot_json() -> str: ...
 def encode_chat_fixture(
