@@ -12,11 +12,17 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.models.providers.bedrock_requests import converse_body
-from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderResponseError
+from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
+    ProviderResponseError,
+    UnsupportedReasoningEffortError,
+)
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.reasoning_compat import (
+    REASONING_EFFORTS,
     anthropic_reasoning_effort,
     openai_reasoning_effort,
+    supported_reasoning_efforts,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
@@ -170,14 +176,30 @@ def route_generation_parameter_requests(
         for profile in profiles
     ):
         ignore("top_k")
-    if request.reasoning_effort is not None and not all(
-        profile.supports_reasoning and profile.reasoning_wire_format != "none"
-        for profile in profiles
-    ):
-        ignore(
-            "reasoning_effort",
-            "reasoning.effort" if request.surface.value == "responses" else "reasoning_effort",
+    if request.reasoning_effort is not None:
+        effort_path = (
+            "reasoning.effort" if request.surface.value == "responses" else "reasoning_effort"
         )
+        portable_efforts = set(REASONING_EFFORTS)
+        for profile in profiles:
+            if not profile.supports_reasoning or profile.reasoning_wire_format == "none":
+                portable_efforts.clear()
+                break
+            portable_efforts.intersection_update(
+                supported_reasoning_efforts(
+                    profile.model_id,
+                    profile.reasoning_wire_format,
+                    configured_effort=profile.reasoning_effort,
+                )
+            )
+        if request.reasoning_effort not in portable_efforts:
+            raise UnsupportedReasoningEffortError(
+                effort=request.reasoning_effort,
+                supported_efforts=tuple(
+                    effort for effort in REASONING_EFFORTS if effort in portable_efforts
+                ),
+                param=effort_path,
+            )
     if request.reasoning_summary is not None and not all(
         profile.dialect == "openai_responses" and profile.supports_reasoning for profile in profiles
     ):

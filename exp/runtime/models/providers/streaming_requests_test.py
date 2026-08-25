@@ -11,6 +11,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
+from exp.runtime.models.providers.errors import UnsupportedReasoningEffortError
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.streaming_requests import (
     anthropic_messages_stream_payload,
@@ -283,6 +284,7 @@ def test_route_generation_controls_use_the_whole_waterfall_intersection() -> Non
         GatewayWireProfile(
             dialect="openai_compatible",
             url="https://first.test",
+            model_id="openai/gpt-5",
             supports_temperature=True,
             supports_top_p=True,
             supports_top_k=True,
@@ -292,6 +294,7 @@ def test_route_generation_controls_use_the_whole_waterfall_intersection() -> Non
         GatewayWireProfile(
             dialect="anthropic_messages",
             url="https://fallback.test",
+            model_id="claude-sonnet-4-6",
             supports_temperature=False,
             supports_top_p=False,
             supports_top_k=False,
@@ -315,6 +318,58 @@ def test_route_generation_controls_use_the_whole_waterfall_intersection() -> Non
     assert provider_request.logprobs is None
     assert provider_request.top_logprobs is None
     assert provider_request.reasoning_effort == "high"
+
+
+def test_route_rejects_effort_not_preserved_by_the_whole_waterfall() -> None:
+    """An exact effort mismatch fails locally instead of clamping on a fallback."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_effort="minimal",
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_responses",
+            url="https://first.test",
+            model_id="gpt-5",
+            supports_reasoning=True,
+            reasoning_wire_format="openai_responses",
+        ),
+        GatewayWireProfile(
+            dialect="openai_responses",
+            url="https://fallback.test",
+            model_id="gpt-5-pro",
+            supports_reasoning=True,
+            reasoning_wire_format="openai_responses",
+        ),
+    )
+
+    with pytest.raises(UnsupportedReasoningEffortError) as raised:
+        route_generation_parameter_requests(profiles, request)
+
+    assert raised.value.param == "reasoning.effort"
+    assert str(raised.value) == (
+        "Reasoning effort 'minimal' is not supported by this model route. Supported values: 'high'."
+    )
+
+
+def test_route_rejects_effort_when_reasoning_is_unsupported() -> None:
+    """Reasoning effort is semantic and is never silently dropped."""
+    request = _chat_request().model_copy(update={"reasoning_effort": "high"})
+
+    with pytest.raises(UnsupportedReasoningEffortError) as raised:
+        route_generation_parameter_requests(
+            (
+                GatewayWireProfile(
+                    dialect="openai_compatible",
+                    url="https://provider.test",
+                ),
+            ),
+            request,
+        )
+
+    assert raised.value.param == "reasoning_effort"
+    assert "not supported by this model route" in str(raised.value)
 
 
 def test_route_shaping_omits_tool_controls_when_no_tools_exist() -> None:

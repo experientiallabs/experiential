@@ -471,6 +471,47 @@ def test_protocol_and_key_failures_are_anthropic_shaped(engine: _ServingEngine) 
     assert count_tokens.json()["error"]["type"] == "not_found_error"
 
 
+def test_native_and_python_reject_unsupported_reasoning_effort_identically(
+    engine: _ServingEngine,
+) -> None:
+    """Both data planes return the local field error before provider dispatch."""
+    payload = {
+        "model": "coding",
+        "input": "hello",
+        "reasoning": {"effort": "high"},
+    }
+    headers = {"authorization": f"Bearer {engine.raw_key}"}
+    native = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers=headers,
+        json=payload,
+        timeout=10.0,
+    )
+    runtime = load_local_gateway(
+        engine.root,
+        graceful_timeout_seconds=1,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    with TestClient(runtime.app) as client:
+        python = client.post("/v1/responses", headers=headers, json=payload)
+
+    expected = {
+        "error": {
+            "message": (
+                "The parameter 'reasoning.effort' is not supported by this model route. "
+                "Remove the field or choose a different model."
+            ),
+            "type": "invalid_request_error",
+            "param": "reasoning.effort",
+            "code": "unsupported_parameter",
+        }
+    }
+    assert native.status_code == 400
+    assert python.status_code == 400
+    assert native.json() == expected
+    assert python.json() == expected
+
+
 def test_python_engine_serves_the_identical_surface(engine: _ServingEngine) -> None:
     """The deprecated python engine answers the same bytes modulo request identity."""
     native = httpx.post(

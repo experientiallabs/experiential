@@ -1620,21 +1620,16 @@ def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path)
 
     control, raw_key = _control_plane(tmp_path)
     payload = json.loads(_responses_body(with_tools=True))
-    payload["reasoning"] = {"effort": "high"}
     body = json.dumps(payload)
     admission = _flatten_started(control, _admit_responses(control, raw_key, body))
     assert "escalate" not in admission
     assert admission["surface"] == "responses"
     assert admission["dialect"] == "openai_compatible"
     decoded = decode_responses(json.loads(body))
-    public_request = decoded.request.model_copy(
-        update={"ignored_parameters": ("reasoning.effort",)}
-    )
-    assert admission["ignored_parameters"] == ["reasoning.effort"]
+    public_request = decoded.request
+    assert admission["ignored_parameters"] == []
     assert admission["envelope"] == responses_envelope(public_request)
-    provider_request = public_request.model_copy(
-        update={"stream": True, "include_usage": True, "reasoning_effort": None}
-    )
+    provider_request = public_request.model_copy(update={"stream": True, "include_usage": True})
     assert admission["upstream_payload"] == openai_compatible_stream_payload(
         "provider-model-exact", provider_request
     )
@@ -1657,6 +1652,23 @@ def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path)
     assert settled == "{}"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
+
+
+def test_responses_admission_rejects_unsupported_reasoning_effort(tmp_path: Path) -> None:
+    """Native admission returns the same local parameter error before Rust dispatch."""
+    control, raw_key = _control_plane(tmp_path)
+    payload = json.loads(_responses_body())
+    payload["reasoning"] = {"effort": "high"}
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit_responses(control, raw_key, json.dumps(payload))
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_parameter"
+    assert error["error_type"] == "invalid_request_error"
+    assert error["param"] == "reasoning.effort"
+    assert "not supported by this model route" in error["message"]
 
 
 def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> None:
