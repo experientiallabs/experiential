@@ -1,0 +1,165 @@
+"""Tests for the native waterfall's candidate policy and wire building."""
+
+from __future__ import annotations
+
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.native_execution import (
+    claim_route_from,
+    next_route_candidate,
+)
+
+_KEYS: tuple[DeploymentHealthKey, ...] = (
+    ("catalog" + "0" * 57, "deployment-a", "connection-a"),
+    ("catalog" + "0" * 57, "deployment-b", "connection-b"),
+)
+
+
+def _retryable() -> GatewayFailure:
+    """Build one failure the executor may redial on the same deployment."""
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+        safe_message="provider service failed; retry after a short delay",
+        retryable_same_deployment=True,
+        failover_eligible=True,
+    )
+
+
+def _failover_only() -> GatewayFailure:
+    """Build one failure that advances routes but never redials."""
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED,
+        safe_message="provider throttled the request",
+        failover_eligible=True,
+    )
+
+
+def test_claim_ladder_prefers_healthy_then_probe_then_forced() -> None:
+    """A suppressed route still admits through bounded probe and forced claims."""
+    health = DeploymentHealthRegistry(failure_threshold=1, open_seconds=60.0)
+    assert claim_route_from(health, _KEYS, 0) == 0
+    hard = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+        safe_message="provider authentication failed",
+    )
+    health.failed(_KEYS[0], hard)
+    health.failed(_KEYS[1], hard)
+    # Both circuits open: the first claim grants the bounded half-open probe.
+    assert claim_route_from(health, _KEYS, 0) == 0
+    # Probes taken on both routes: the forced claim still admits dispatch.
+    assert claim_route_from(health, _KEYS, 1) == 1
+    assert claim_route_from(health, _KEYS, 0) == 0
+
+
+def test_retryable_failure_redials_within_the_per_deployment_cap() -> None:
+    """A retryable failure redials the same deployment while its count allows."""
+    health = DeploymentHealthRegistry()
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=_retryable(),
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+    )
+    assert candidate == 0
+    # The per-deployment cap reached: the same failure fails over instead.
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=_retryable(),
+        current_depth=0,
+        attempt_counts=[2, 0],
+        total_attempts=2,
+        refusal_failover=False,
+    )
+    assert candidate == 1
+
+
+def test_total_attempt_cap_ends_the_ladder() -> None:
+    """No candidate exists once the hard total dispatch cap is reached."""
+    health = DeploymentHealthRegistry()
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=_retryable(),
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=8,
+        refusal_failover=False,
+    )
+    assert candidate is None
+
+
+def test_failover_only_failure_skips_the_redial() -> None:
+    """A failover-eligible, non-retryable failure advances immediately."""
+    health = DeploymentHealthRegistry()
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=_failover_only(),
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+    )
+    assert candidate == 1
+    exhausted = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=_failover_only(),
+        current_depth=1,
+        attempt_counts=[1, 1],
+        total_attempts=2,
+        refusal_failover=False,
+    )
+    assert exhausted is None
+
+
+def test_refusal_advances_only_with_the_revision_opt_in() -> None:
+    """A typed refusal fails over exactly when the alias revision enables it."""
+    health = DeploymentHealthRegistry()
+    refusal = GatewayFailure(
+        failure_class=GatewayFailureClass.REFUSAL,
+        safe_message="provider refused the request",
+    )
+    withheld = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=refusal,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=True,
+    )
+    assert withheld == 1
+    declined = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=refusal,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+    )
+    assert declined is None
+
+
+def test_caller_invalid_request_never_advances() -> None:
+    """A caller-owned rejection neither redials nor fails over."""
+    health = DeploymentHealthRegistry()
+    invalid = GatewayFailure(
+        failure_class=GatewayFailureClass.INVALID_REQUEST,
+        safe_message="provider rejected the request",
+    )
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=invalid,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+    )
+    assert candidate is None

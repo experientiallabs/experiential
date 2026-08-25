@@ -44,7 +44,9 @@ pub const MAXIMUM_RETAINED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 pub const OUTPUT_OVERFLOW_MESSAGE: &str = "provider output exceeded the gateway response limit";
 
 fn malformed(message: &str) -> Failure {
-    Failure::new(FailureClass::MalformedResponse, message)
+    // A malformed provider response mirrors `ProviderResponseError`: never a
+    // same-deployment redial, but a later certified deployment may serve it.
+    Failure::new(FailureClass::MalformedResponse, message).with_retry(false, true)
 }
 
 fn refusal_failure() -> Failure {
@@ -52,7 +54,8 @@ fn refusal_failure() -> Failure {
 }
 
 fn provider_stream_failed() -> Failure {
-    Failure::new(FailureClass::ProviderInternal, "provider stream failed")
+    // A provider-declared stream failure mirrors the 5xx classification.
+    Failure::new(FailureClass::ProviderInternal, "provider stream failed").with_retry(true, true)
 }
 
 fn parse_object(data: &str) -> Result<Map<String, Value>, Failure> {
@@ -127,10 +130,6 @@ impl Normalizer {
         }
     }
 
-    pub fn saw_terminal(&self) -> bool {
-        self.terminal
-    }
-
     /// Reserve retained-output budget for accumulated tool-argument text.
     fn reserve_tool_bytes(&mut self, additional: usize) -> Result<(), Failure> {
         self.accumulated_tool_bytes = self.accumulated_tool_bytes.saturating_add(additional);
@@ -141,6 +140,22 @@ impl Normalizer {
             ));
         }
         Ok(())
+    }
+
+    /// Whether a terminal event already ended the stream.
+    pub fn saw_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    /// Fail if the stream ended without ever producing a terminal event.
+    pub fn stream_ended(&self) -> Result<(), Failure> {
+        if self.terminal {
+            return Ok(());
+        }
+        Err(Failure::new(
+            FailureClass::MalformedResponse,
+            "provider stream ended without a terminal event",
+        ))
     }
 
     /// Feed one decoded SSE frame; a terminal event ends the stream.
@@ -158,17 +173,6 @@ impl Normalizer {
             self.terminal = true;
         }
         Ok(events)
-    }
-
-    /// The upstream byte stream closed; mirror the ended-without-terminal path.
-    pub fn stream_ended(&self) -> Result<(), Failure> {
-        if self.terminal {
-            return Ok(());
-        }
-        Err(Failure::new(
-            FailureClass::MalformedResponse,
-            "provider stream ended without a terminal event",
-        ))
     }
 
     fn feed_openai_responses(&mut self, frame: &SseEvent) -> Result<Vec<Event>, Failure> {
@@ -325,10 +329,13 @@ impl Normalizer {
                     } else if reason == "content_filter" || reason == "safety" {
                         events.push(Event::Failed(refusal_failure()));
                     } else {
-                        events.push(Event::Failed(Failure::new(
-                            FailureClass::ProviderInternal,
-                            "provider ended the stream incompletely",
-                        )));
+                        events.push(Event::Failed(
+                            Failure::new(
+                                FailureClass::ProviderInternal,
+                                "provider ended the stream incompletely",
+                            )
+                            .with_retry(true, true),
+                        ));
                     }
                 }
             }

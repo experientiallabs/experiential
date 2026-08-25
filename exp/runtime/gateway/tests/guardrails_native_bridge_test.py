@@ -89,7 +89,7 @@ def test_input_block_fails_admit_before_ledger_accept(tmp_path: Path) -> None:
     payload = json.loads(raised.value.public_error_json)
     assert payload["code"] == "content_filter"
     assert classifier.input_calls == 1
-    assert control._inflight == {}  # noqa: SLF001
+    assert control._accounting.counters()[2] == 0  # noqa: SLF001 - nothing in flight.
 
 
 def test_output_policy_sets_the_native_callback_flag(tmp_path: Path) -> None:
