@@ -76,8 +76,9 @@ def run(
         "--engine",
         help=(
             "Data-plane engine: 'auto' (rust when built, otherwise python), 'rust' "
-            "(native data plane with an embedded python engine for Responses, "
-            "replay, and project aliases), or 'python' (uvicorn only)."
+            "(the native data plane, serving every route itself), or 'python' "
+            "(deprecated fallback, scheduled for removal once the native engine "
+            "has soaked in production)."
         ),
     ),
     max_active_requests: int = typer.Option(
@@ -179,7 +180,10 @@ def start_gateway(
                 _gateway_not_initialized(json_output=json_output)
             raise typer.BadParameter(blocker)
         if not json_output:
-            _console.print(f"[yellow]rust engine unavailable ({blocker}); using python[/yellow]")
+            _console.print(
+                f"[yellow]rust engine unavailable ({blocker}); using the deprecated "
+                "python engine[/yellow]"
+            )
     if max_active_requests != _MAX_ACTIVE_REQUESTS_DEFAULT:
         typer.echo(
             "--max-active-requests applies only to the rust engine; the python "
@@ -340,12 +344,12 @@ def _run_rust_gateway(
     max_active_requests: int,
     graceful_timeout: float,
 ) -> None:
-    """Serve the rust data plane with an embedded python fallback engine.
+    """Serve the rust data plane; it owns the public socket and every route.
 
-    The rust engine owns the public socket and the anonymous Chat Completions
-    fast path; a python engine over the same authority, ledger, and routes
-    runs on an internal loopback port and serves Responses and replay-keyed
-    chat.
+    Startup validates that every granted alias is natively servable (all pool
+    deployments resolve to a provider client with a native dialect); a
+    blocker fails the launch with the offending aliases named, since no
+    embedded python engine exists to serve an escalated request.
 
     Args:
         root: Local artifact and model-catalog root.
@@ -356,8 +360,9 @@ def _run_rust_gateway(
         graceful_timeout: Gateway shutdown drain bound in seconds.
 
     Raises:
-        typer.BadParameter: The extension module is missing or the gateway
-            configuration cannot form one ready route.
+        typer.BadParameter: The extension module is missing, an alias is not
+            natively servable, or the gateway configuration cannot form one
+            ready route.
     """
     if not json_output:
         _emit_exp_wordmark()
@@ -368,18 +373,17 @@ def _run_rust_gateway(
     from exp.optimize.router.activation import verify_automatic_router_policy
     from exp.runtime.gateway.guardrails.config import load_guardrail_engine
     from exp.runtime.gateway.lifecycle import (
-        compose_local_gateway,
         gateway_instance_lock,
         load_gateway_components,
     )
     from exp.runtime.gateway.management import GatewayManagement
     from exp.runtime.gateway.native_bridge import NativeControlPlane
+    from exp.runtime.gateway.native_execution import native_serving_blockers
     from exp.runtime.gateway.native_server import (
         NativeGatewayServerError,
         serve_native_gateway,
     )
     from exp.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
-    from exp.runtime.openai_protocol.state import BoundedContinuationStore
 
     manager = GatewayManagement(root)
     if not manager.initialized:
@@ -391,10 +395,15 @@ def _run_rust_gateway(
                 verifier=verify_automatic_router_policy,
             )
             components = load_gateway_components(root, project_repository=project_repository)
-            # One bounded continuation store shared by the native Responses
-            # path and the embedded python engine, so keyed replays and
-            # native requests resolve identical namespaced history.
-            continuations = BoundedContinuationStore()
+            blockers = native_serving_blockers(components)
+            if blockers:
+                details = "; ".join(blockers)
+                raise typer.BadParameter(
+                    "the native engine cannot serve every granted alias: "
+                    f"{details}. Fix the provider configuration or serve with "
+                    "'--engine python' (deprecated, scheduled for removal once "
+                    "the native engine has soaked in production)."
+                )
             # Loaded directly (rather than through native_server's own import)
             # so this composition can wire the content-free metrics snapshot
             # into the control plane before the process host ever starts.
@@ -403,16 +412,8 @@ def _run_rust_gateway(
             control_plane = NativeControlPlane(
                 components,
                 data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
-                continuation_store=continuations,
                 guardrails=guardrails,
             )
-            runtime = compose_local_gateway(
-                components,
-                graceful_timeout_seconds=graceful_timeout,
-                continuations=continuations,
-                guardrails=guardrails,
-            )
-            asyncio.run(runtime.service.preflight())
             receipt = {
                 "schema_version": 1,
                 "operation": "gateway.check" if check else "gateway.run",
@@ -447,7 +448,7 @@ def _run_rust_gateway(
 
             try:
                 serve_native_gateway(
-                    runtime.app,
+                    None,
                     control_plane,
                     host=_LOOPBACK_HOST,
                     port=port,
