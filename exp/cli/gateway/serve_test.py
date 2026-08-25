@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -314,7 +315,10 @@ def test_engine_flag_is_gone(tmp_path: Path) -> None:
     """The retired --engine flag is a usage error, not a silent no-op."""
     result = CliRunner().invoke(app, ["--root", str(tmp_path), "--engine", "rust"])
     assert result.exit_code == 2
-    assert "--engine" in result.output
+    # Rich may interleave style escapes inside the echoed option name, so the
+    # assertion runs over the escape-stripped output.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert "--engine" in plain
 
 
 def test_first_run_delivers_credentials_before_readiness_failure(

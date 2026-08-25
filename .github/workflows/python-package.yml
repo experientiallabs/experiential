@@ -136,7 +136,7 @@ jobs:
           import exp.common.models
           import exp.runtime.models
           from exp.runtime.environments import LocalProcessEnvironmentRuntime
-          from exp.runtime.openai_protocol import decode_chat, stream_encoder
+          from exp.runtime.openai_protocol import completed_body, decode_chat
           from exp.runtime.router import RouterRuntime
           from exp.simulation import compare_text_and_sandbox
           from exp.simulation.engines import SandboxSimulator
@@ -147,7 +147,7 @@ jobs:
           assert callable(exp.load_project_router)
           assert callable(exp.load_router)
           assert callable(decode_chat)
-          assert callable(stream_encoder)
+          assert callable(completed_body)
           assert exp.RouterRuntime is RouterRuntime
           assert exp.RouterCompositionResult is RouterCompositionResult
           assert "create_project_router_app" not in exp.__all__
