@@ -142,6 +142,16 @@ class GroupCommitAttemptLedger:
         )
         self._thread.start()
 
+    @property
+    def closed(self) -> bool:
+        """Return whether this writer can no longer make any write durable.
+
+        The flag latches on explicit :meth:`close` and when the writer thread
+        exits on an unexpected error, so composition health surfaces can fail
+        readiness closed instead of queueing writes that only fail per call.
+        """
+        return self._closed
+
     async def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Durably persist accepted authority before route selection or dispatch.
 

@@ -53,7 +53,6 @@ from exp.runtime.gateway.discovery import (
     public_model_object,
     require_granted_authority,
 )
-from exp.runtime.gateway.execution import GatewayExecutionError
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
@@ -761,19 +760,26 @@ class NativeControlPlane:
         return json.dumps({"text": text}, separators=(",", ":"))
 
     def readiness(self, argument: str) -> str:
-        """Return whether shared executor and bridge accounting stay healthy."""
+        """Return whether bridge settlement and composition accounting stay healthy.
+
+        Readiness fails closed once the bridge's own settlement registry has
+        latched a durable-write loss, once the composition's accounting
+        surface reports unhealthy, or when an injected hosted lifecycle probe
+        answers false or raises.
+        """
         del argument
         if not self._accounting.accounting_healthy:
+            return "false"
+        try:
+            if not self._components.accounting_healthy:
+                return "false"
+        except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
             return "false"
         if self._readiness_probe is not None:
             try:
                 return "true" if self._readiness_probe() else "false"
             except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
                 return "false"
-        try:
-            self._components.executor.require_healthy()
-        except GatewayExecutionError:
-            return "false"
         return "true"
 
     def _decode_body(

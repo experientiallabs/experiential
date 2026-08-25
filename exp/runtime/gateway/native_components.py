@@ -14,7 +14,6 @@ from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayFailure,
 )
-from exp.runtime.gateway.execution import GatewayExecutor
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore
 from exp.runtime.gateway.routing import CatalogRouteResolver
@@ -106,8 +105,14 @@ class NativeGatewayComponents(Protocol):
         ...
 
     @property
-    def executor(self) -> GatewayExecutor:
-        """Return the shared accounting-health latch."""
+    def accounting_healthy(self) -> bool:
+        """Return whether this composition's durable accounting can still land.
+
+        The bridge's readiness callback reads this beside its own settlement
+        latch. The local composition reports its group-commit writer's
+        liveness (a crashed or closed writer can no longer make any terminal
+        write durable); a hosted composition reports its own store health.
+        """
         ...
 
     @property

@@ -421,6 +421,16 @@ class LocalGatewayComponents:
         return self.reloader.state.runtime_catalogs
 
     @property
+    def accounting_healthy(self) -> bool:
+        """Return whether the shared group-commit writer can still land writes.
+
+        The native bridge's readiness callback reads this composition health
+        surface; per-settlement durable losses latch separately inside the
+        bridge's own accounting registry.
+        """
+        return not self.write_ledger.closed
+
+    @property
     def readiness(self) -> tuple[ExecutionSnapshot, ...]:
         """Return the current generation's credential-free route proof."""
         return (self.reloader.state.proof,)

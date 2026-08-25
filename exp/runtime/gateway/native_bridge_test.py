@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from unittest import mock
 
 import pytest
@@ -32,7 +32,11 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.discovery import listing_metadata_by_alias
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
-from exp.runtime.gateway.lifecycle import _ReadyControlStore, load_gateway_components
+from exp.runtime.gateway.lifecycle import (
+    LocalGatewayComponents,
+    _ReadyControlStore,
+    load_gateway_components,
+)
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import (
@@ -47,6 +51,13 @@ from exp.runtime.openai_protocol.state import ProtocolNamespace
 from exp.runtime.openai_protocol.streaming import stable_public_id
 
 _PARITY_GOLDENS_PATH = Path(__file__).parent / "testdata" / "parity_goldens.json"
+_PublicErrorType = Literal[
+    "invalid_request_error",
+    "authentication_error",
+    "permission_error",
+    "insufficient_quota",
+    "api_error",
+]
 
 
 def _parity_golden(name: str) -> object:
@@ -965,11 +976,18 @@ def test_models_and_detail_mirror_the_python_discovery_bodies(tmp_path: Path) ->
     assert json.loads(excinfo.value.public_error_json)["status_code"] == 404
 
 
-def test_readiness_reflects_startup_proof_and_executor_health(tmp_path: Path) -> None:
-    """Readiness is true after load and follows the shared executor latch."""
+def test_readiness_reflects_startup_proof_and_composition_health(tmp_path: Path) -> None:
+    """Readiness is true after load and follows the composition health surface.
+
+    The local composition reports its group-commit writer's liveness, so a
+    closed (or crashed) writer fails readiness closed before any settlement
+    write is even attempted.
+    """
     control, _raw_key = _control_plane(tmp_path)
     assert control.readiness("{}") == "true"
-    control._components.executor.mark_accounting_unhealthy()  # noqa: SLF001 - fault injection.
+    components = cast("LocalGatewayComponents", control._components)  # noqa: SLF001 - fault injection.
+    components.write_ledger.close()
+    assert not components.accounting_healthy
     assert control.readiness("{}") == "false"
 
 
@@ -2226,11 +2244,12 @@ def test_rust_anthropic_error_translation_matches_the_committed_goldens() -> Non
 
     def _rebuilt(payload: JsonObject) -> OpenAIProtocolError:
         """Reconstruct one committed OpenAI-shaped error for the python check."""
+        error_type = cast("_PublicErrorType", payload["error_type"])
         return OpenAIProtocolError(
             status_code=cast("int", payload["status_code"]),
             code=cast("str", payload["code"]),
             message=cast("str", payload["message"]),
-            error_type=cast("str | None", payload["error_type"]),
+            error_type=error_type,
             param=cast("str | None", payload["param"]),
             retry_after_seconds=cast("int | None", payload["retry_after_seconds"]),
         )
