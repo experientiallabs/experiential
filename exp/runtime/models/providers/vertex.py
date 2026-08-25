@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -40,6 +41,7 @@ VERTEX_TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 """OAuth scope requested for every Vertex access token."""
 
 _MODEL_PATH_PREFIX = "publishers/google/models/"
+_VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
 
 
 class VertexCredentialError(ValueError):
@@ -300,9 +302,7 @@ def _require_vertex_host(base_url: str) -> None:
     """
     parts = urlsplit(base_url)
     host = (parts.hostname or "").lower()
-    if parts.scheme != "https" or not (
-        host == "aiplatform.googleapis.com" or host.endswith("-aiplatform.googleapis.com")
-    ):
+    if parts.scheme != "https" or not _VERTEX_HOST.fullmatch(host):
         raise ValueError(
             "Vertex clients only send OAuth tokens to HTTPS *.aiplatform.googleapis.com "
             f"hosts; got {base_url!r}"
