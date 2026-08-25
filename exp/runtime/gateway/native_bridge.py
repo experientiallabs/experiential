@@ -25,9 +25,9 @@ Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
 the caller through the shared boundary mapping. Requests the native path
 cannot serve (resolved clients exposing no native wire profile) are answered
-with an ``{"escalate": reason}`` admission disposition before any ledger
-write; the data plane classifies the reason for content-free metrics and
-fails the request closed with the shared internal error.
+with an ``{"escalate": reason}`` admission disposition after the accepted
+request is finalized content-free; the data plane classifies the reason for
+metrics and fails the request closed with the shared internal error.
 """
 
 from __future__ import annotations
@@ -111,8 +111,8 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 def _escalation(reason: str) -> str:
     """Return the admission disposition for a request the plane cannot serve.
 
-    No ledger row exists when this is returned; the data plane classifies
-    the reason for content-free metrics and fails the request closed.
+    The data plane classifies the reason for content-free metrics and fails
+    the request closed.
 
     Args:
         reason: Display-safe reason the native path cannot serve the request.
@@ -247,8 +247,9 @@ class NativeControlPlane:
             ``route`` (one dialect, endpoint, headers, payload, and
             per-deployment idempotency key entry per deployment) plus the
             frozen retry-policy facts, or an ``{"escalate": reason}``
-            disposition (returned only before any ledger write) naming why
-            the native plane cannot serve the request.
+            disposition (its accepted request already finalized, with no
+            attempt row) naming why the native plane cannot serve the
+            request.
 
         Raises:
             NativeBridgeError: Decoding, authorization, routing, or
@@ -306,10 +307,20 @@ class NativeControlPlane:
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
 
-        # Escalation runs after input enforcement and before any ledger
-        # write, so an unservable request is never accepted or billed.
-        # Routing failures found by the probe are recorded against the
-        # accepted request below.
+        # The ledger accepts the logical request before route selection, so a
+        # keyed operation whose durable terminal already exists (or whose key
+        # was reused with different content) fails closed here, before
+        # learned selection can run request-time embedding or any other
+        # provider-touching work.
+        try:
+            self._write_ledger.accept_request(authorization=authorization)
+        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            raise _authority_error(exc) from exc
+
+        # Escalation runs after acceptance; the accepted request is finished
+        # quietly before the disposition returns, so an unservable request is
+        # accounted content-free and never billed. Routing failures found by
+        # the probe are raised against the accepted request below.
         probe_failure: Exception | None = None
         route: GatewayRoute | None = None
         resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
@@ -321,24 +332,24 @@ class NativeControlPlane:
             )
             resolved_wires = resolve_route_profiles(self._components.runtime_catalogs, route)
         except NativeDialectUnavailableError as exc:
-            return _escalation(str(exc))
-        except Exception as exc:  # noqa: BLE001 - recorded after acceptance below.
+            return self._escalate_accepted(authorization, str(exc))
+        except Exception as exc:  # noqa: BLE001 - raised after route packaging below.
             probe_failure = exc
         if route is not None and self._native_route_eligible is not None:
             try:
                 native_route_eligible = self._native_route_eligible(route, request)
-            except Exception:  # noqa: BLE001 - hosted policy fails closed to Python.
+            except Exception:  # noqa: BLE001 - hosted policy fails closed.
                 native_route_eligible = False
             if not native_route_eligible:
-                return _escalation("host policy does not permit native execution of this route")
+                return self._escalate_accepted(
+                    authorization,
+                    "host policy does not permit native execution of this route",
+                )
 
-        # Admission accepts the request and returns the full ordered route;
-        # no attempt row exists until the data plane's first `start_attempt`.
+        # Admission returns the full ordered route; no attempt row exists
+        # until the data plane's first `start_attempt`.
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
-        accepted = False
         try:
-            self._write_ledger.accept_request(authorization=authorization)
-            accepted = True
             if probe_failure is not None or route is None or resolved_wires is None:
                 raise probe_failure or GatewayRoutingError("authorized route did not resolve")
             wire_route: list[JsonObject] = []
@@ -373,8 +384,7 @@ class NativeControlPlane:
                 failure_class=GatewayFailureClass.INTERNAL,
                 safe_message="gateway admission failed before provider dispatch",
             )
-            if accepted:
-                self._accounting.finish_request_quietly(authorization, failure)
+            self._accounting.finish_request_quietly(authorization, failure)
             raise error from exc
 
         self._accounting.register(
@@ -803,6 +813,30 @@ class NativeControlPlane:
             )
         except NativeDecodeError as exc:
             raise NativeBridgeError(exc.error) from exc
+
+    def _escalate_accepted(self, authorization: AuthorizationSnapshot, reason: str) -> str:
+        """Finish one accepted-but-unservable request and return its disposition.
+
+        The request was durably accepted before route probing, so the plane
+        finalizes it content-free (no attempt row ever exists) before the
+        escalation disposition tells the data plane to fail the request
+        closed.
+
+        Args:
+            authorization: Frozen authority for the accepted request.
+            reason: Display-safe reason the native path cannot serve it.
+
+        Returns:
+            The JSON admission body carrying the escalation disposition.
+        """
+        self._accounting.finish_request_quietly(
+            authorization,
+            GatewayFailure(
+                failure_class=GatewayFailureClass.INTERNAL,
+                safe_message="the native engine cannot serve the authorized route",
+            ),
+        )
+        return _escalation(reason)
 
     def _resolve_route(
         self,

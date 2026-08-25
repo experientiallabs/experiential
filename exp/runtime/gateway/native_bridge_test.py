@@ -804,8 +804,8 @@ def test_claim_scope_matches_the_python_replay_key(tmp_path: Path) -> None:
     assert decoded.request.idempotency_key == "operation-one"
 
 
-def test_admit_escalates_host_ineligible_route_before_accounting(tmp_path: Path) -> None:
-    """Hosted policy can retain requests whose native semantics are incomplete."""
+def test_admit_escalates_host_ineligible_route_and_finalizes_the_request(tmp_path: Path) -> None:
+    """Hosted policy escalation finalizes the accepted request content-free."""
     _manager, raw_key = _configured_gateway(tmp_path)
     components = load_gateway_components(
         tmp_path,
@@ -824,8 +824,12 @@ def test_admit_escalates_host_ineligible_route_before_accounting(tmp_path: Path)
 
     assert admission == {"escalate": "host policy does not permit native execution of this route"}
     assert [request.idempotency_key for request in seen_requests] == ["shared-replay"]
+    # The accepted request is finalized failed with no attempt row, so the
+    # escalated admission is accounted content-free and never billed.
     report = json.loads(control.usage_json("{}"))
-    assert report["totals"]["requests"] == 0
+    assert report["totals"]["requests"] == 1
+    assert report["totals"]["attempts"] == 0
+    assert report["totals"]["known_estimated_cost_micro_usd"] == 0
 
 
 def test_claim_scope_supports_the_responses_surface(tmp_path: Path) -> None:
