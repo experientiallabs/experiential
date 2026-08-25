@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "exp-gateway-native"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "bytes",
