@@ -286,6 +286,19 @@ def _run_gateway(
                     data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
                     guardrails=guardrails,
                 )
+                # The bind is proved before the ready receipt is emitted, so
+                # a launch that cannot own its port never announces a usable
+                # gateway. The probe closes with SO_REUSEADDR set, leaving
+                # the port immediately rebindable by the native server.
+                if not check:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        try:
+                            probe.bind((_LOOPBACK_HOST, port))
+                        except OSError as exc:
+                            raise typer.BadParameter(
+                                f"port {port} is unavailable on {_LOOPBACK_HOST}: {exc}"
+                            ) from exc
                 receipt = {
                     "schema_version": 1,
                     "operation": "gateway.check" if check else "gateway.run",
@@ -321,15 +334,6 @@ def _run_gateway(
                     _emit_unavailable_aliases(components.unavailable_aliases)
                 if check:
                     return
-
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    try:
-                        probe.bind((_LOOPBACK_HOST, port))
-                    except OSError as exc:
-                        raise typer.BadParameter(
-                            f"port {port} is unavailable on {_LOOPBACK_HOST}: {exc}"
-                        ) from exc
 
                 try:
                     serve_native_gateway(

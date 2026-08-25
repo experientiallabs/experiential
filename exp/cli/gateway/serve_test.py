@@ -258,6 +258,88 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     assert "--engine" not in CliRunner().invoke(app, ["--help"]).output
 
 
+def test_unbindable_port_fails_before_any_ready_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An occupied port is a usage error and no ready receipt is ever emitted."""
+    import socket
+
+    def prepare(project: str, root: Path, *, policy_id: str | None) -> ProjectGatewayCompatibility:
+        """Return one already materialized project-backed gateway alias.
+
+        Args:
+            project: Requested project identifier.
+            root: Requested gateway and artifact root.
+            policy_id: Optional exact policy selection.
+
+        Returns:
+            Compatibility authority consumed by the shared launch path.
+        """
+        del policy_id
+        return ProjectGatewayCompatibility(
+            alias=project,
+            alias_revision_id="revision-a",
+            identity_id="project-identity",
+            key_file=root / "gateway" / "compatibility-keys" / "project-identity.txt",
+            policy_id="policy-a",
+            changed=True,
+        )
+
+    components = SimpleNamespace(
+        reconciled_expired_requests=0,
+        reconciled_unknown_attempts=0,
+        unavailable_aliases=(),
+    )
+    monkeypatch.setattr("exp.cli.gateway.compatibility.prepare_project_gateway", prepare)
+    monkeypatch.setattr(
+        "exp.runtime.gateway.lifecycle.load_gateway_components",
+        lambda _root, **_kwargs: components,
+    )
+    monkeypatch.setattr(
+        "exp.runtime.gateway.native_execution.native_serving_blockers",
+        lambda _components: (),
+    )
+    monkeypatch.setattr(
+        "exp.runtime.gateway.guardrails.config.load_guardrail_engine",
+        lambda _root: None,
+    )
+    monkeypatch.setattr(
+        "exp.runtime.gateway.native_bridge.NativeControlPlane",
+        lambda _components, **_kwargs: SimpleNamespace(
+            reconciled_expired_requests=0,
+            reconciled_unknown_attempts=0,
+            request_timeout_seconds=120.0,
+        ),
+    )
+
+    def never_serve(*_args: object, **_kwargs: object) -> None:
+        """Fail the test if serving starts on an unbindable port."""
+        raise AssertionError("the native server must not start on an occupied port")
+
+    monkeypatch.setattr("exp.runtime.gateway.native_server.serve_native_gateway", never_serve)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupier:
+        occupier.bind(("127.0.0.1", 0))
+        occupier.listen(1)
+        port = occupier.getsockname()[1]
+        result = CliRunner().invoke(
+            app,
+            [
+                "--project",
+                "project-a",
+                "--root",
+                "/tmp/local-exp",
+                "--port",
+                str(port),
+                "--json",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "unavailable" in result.output
+    assert '"status":"ready"' not in result.output
+
+
 def test_noninteractive_default_gateway_returns_stable_empty_state_json(tmp_path: Path) -> None:
     """Automation receives exact setup commands instead of prompts or runtime seeds."""
     result = CliRunner().invoke(
