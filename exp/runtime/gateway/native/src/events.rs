@@ -157,14 +157,21 @@ impl ToolAccumulator {
     }
 }
 
+/// Largest count the durable ledger can persist: usage lands in signed
+/// 64-bit SQLite INTEGER columns, so anything above `i64::MAX` could never
+/// settle and is treated as a provider contract violation at the parser.
+pub const MAXIMUM_LEDGER_COUNT: u64 = i64::MAX as u64;
+
 /// Read an optional non-negative count, mirroring `require_integer`: absent
 /// or null counts as zero because providers omit zero-valued usage fields,
-/// while a present non-integer value is a provider contract violation.
+/// while a present non-integer (or unpersistably large) value is a provider
+/// contract violation.
 pub fn count_or_zero(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
     match object.get(key) {
         None | Some(Value::Null) => Ok(0),
         Some(value) => value
             .as_u64()
+            .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
             .ok_or_else(|| format!("{label} must be a non-negative integer")),
     }
 }
@@ -187,6 +194,7 @@ fn optional_usage_detail(
         None | Some(Value::Null) => Ok(None),
         Some(value) => value
             .as_u64()
+            .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
             .map(Some)
             .ok_or_else(|| format!("{label} must be a non-negative integer")),
     }
@@ -258,6 +266,79 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
     })
 }
 
+/// Parse Gemini `usageMetadata`, mirroring the python `_usage` normalizer:
+/// cached tokens are an input subset, absent counts are zero (`require_integer`
+/// parity), and `thoughtsTokenCount` stays unknown when omitted.
+pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Gemini usageMetadata must be an object".to_string())?;
+    let reasoning_tokens = match object.get("thoughtsTokenCount") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(count_or_zero(
+            object,
+            "thoughtsTokenCount",
+            "Gemini thoughtsTokenCount",
+        )?),
+    };
+    Ok(Usage {
+        input_tokens: Some(count_or_zero(
+            object,
+            "promptTokenCount",
+            "Gemini promptTokenCount",
+        )?),
+        output_tokens: Some(count_or_zero(
+            object,
+            "candidatesTokenCount",
+            "Gemini candidatesTokenCount",
+        )?),
+        cached_input_tokens: Some(count_or_zero(
+            object,
+            "cachedContentTokenCount",
+            "Gemini cachedContentTokenCount",
+        )?),
+        reasoning_tokens,
+    })
+}
+
+/// Parse Bedrock `metadata.usage`, mirroring the python `_usage` normalizer:
+/// cache read and write legs fold into total input, cached input reports the
+/// read leg, and absent counts are zero (`require_integer` parity). Legs and
+/// the folded total beyond the persistable ledger range are provider
+/// contract violations and fail the stream rather than reaching settlement
+/// as a value the ledger could never write.
+pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
+    let usage = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Bedrock metadata.usage must be an object".to_string())?;
+    let fresh = count_or_zero(usage, "inputTokens", "Bedrock inputTokens")?;
+    let cache_read = count_or_zero(
+        usage,
+        "cacheReadInputTokens",
+        "Bedrock cacheReadInputTokens",
+    )?;
+    let cache_write = count_or_zero(
+        usage,
+        "cacheWriteInputTokens",
+        "Bedrock cacheWriteInputTokens",
+    )?;
+    let input_tokens = fresh
+        .checked_add(cache_read)
+        .and_then(|total| total.checked_add(cache_write))
+        .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
+        .ok_or_else(|| "Bedrock input token total overflows a persistable count".to_string())?;
+    Ok(Usage {
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(count_or_zero(
+            usage,
+            "outputTokens",
+            "Bedrock outputTokens",
+        )?),
+        cached_input_tokens: Some(cache_read),
+        reasoning_tokens: None,
+    })
+}
+
 /// Fetch a required string field from a provider JSON object.
 pub fn require_string(
     object: &Map<String, Value>,
@@ -271,11 +352,14 @@ pub fn require_string(
         .ok_or_else(|| format!("{label} must be text"))
 }
 
-/// Fetch a required non-negative integer field from a provider JSON object.
+/// Fetch a required non-negative integer field from a provider JSON object,
+/// bounded like every parsed count so no downstream consumer can receive a
+/// value outside the persistable signed 64-bit range.
 pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
     object
         .get(key)
         .and_then(Value::as_u64)
+        .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
         .ok_or_else(|| format!("{label} must be a non-negative integer"))
 }
 
@@ -296,11 +380,69 @@ mod tests {
     #[test]
     fn openai_compatible_usage_rejects_malformed_counts() {
         assert!(openai_compatible_usage(&json!({"prompt_tokens": "7"})).is_err());
+        assert!(
+            openai_compatible_usage(&json!({"prompt_tokens": MAXIMUM_LEDGER_COUNT + 1})).is_err()
+        );
         assert!(openai_compatible_usage(&json!([1])).is_err());
         assert!(openai_compatible_usage(
             &json!({"prompt_tokens": 1, "completion_tokens": 1, "prompt_tokens_details": 3})
         )
         .is_err());
+    }
+
+    #[test]
+    fn parsed_counts_are_bounded_to_the_persistable_ledger_range() {
+        let at_bound = json!({"count": MAXIMUM_LEDGER_COUNT});
+        let over_bound = json!({"count": MAXIMUM_LEDGER_COUNT + 1});
+        let at_object = at_bound.as_object().expect("object");
+        let over_object = over_bound.as_object().expect("object");
+        // Exactly i64::MAX is persistable and accepted; one past it is a
+        // provider contract violation everywhere counts are parsed.
+        assert_eq!(
+            count_or_zero(at_object, "count", "count"),
+            Ok(MAXIMUM_LEDGER_COUNT)
+        );
+        assert!(count_or_zero(over_object, "count", "count").is_err());
+        assert_eq!(
+            require_u64(at_object, "count", "count"),
+            Ok(MAXIMUM_LEDGER_COUNT)
+        );
+        assert!(require_u64(over_object, "count", "count").is_err());
+        assert!(openai_usage(Some(&json!({
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "output_tokens_details": {"reasoning_tokens": MAXIMUM_LEDGER_COUNT + 1},
+        })))
+        .is_err());
+    }
+
+    #[test]
+    fn bedrock_usage_folds_cache_legs_and_rejects_unrepresentable_totals() {
+        let usage = bedrock_usage(Some(&json!({
+            "inputTokens": 9,
+            "outputTokens": 4,
+            "cacheReadInputTokens": 2,
+            "cacheWriteInputTokens": 1,
+        })))
+        .expect("valid usage");
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.cached_input_tokens, Some(2));
+        // A leg beyond the persistable ledger range fails at the parser.
+        assert!(bedrock_usage(Some(&json!({
+            "inputTokens": MAXIMUM_LEDGER_COUNT + 1,
+            "outputTokens": 1,
+        })))
+        .is_err());
+        // Individually persistable legs whose folded total is not are a
+        // provider contract violation, never a clamped or wrapped total.
+        assert!(bedrock_usage(Some(&json!({
+            "inputTokens": MAXIMUM_LEDGER_COUNT,
+            "outputTokens": 1,
+            "cacheReadInputTokens": 1,
+        })))
+        .is_err());
+        assert!(bedrock_usage(Some(&json!(null))).is_err());
+        assert!(bedrock_usage(None).is_err());
     }
 
     #[test]

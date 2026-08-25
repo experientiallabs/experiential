@@ -44,7 +44,17 @@ generations.
 Provider wire facts come from the public `gateway_wire_profile()` on each
 resolved provider client; native dialects are `openai_responses`,
 `anthropic_messages`, `openai_compatible` (which also covers Azure and
-OpenRouter connections), and `gemini_generate_content`.
+OpenRouter connections), `gemini_generate_content`, and
+`bedrock_converse_stream`, so every granted provider has a native dialect.
+Bedrock streams the AWS binary event-stream framing rather than SSE, and it
+authenticates with per-request SigV4 signatures: admission freezes the exact
+serialized Converse body, and the data plane signs it python-side through the
+`sign_dispatch` callback (credentials never cross the boundary) after its
+bounded dispatch permit and immediately before the provider POST, then sends
+the frozen bytes verbatim. Signing at dispatch time means queue wait can
+never age a signature toward AWS's short clock window; the engine's immediate
+bounded open retry reuses the result within milliseconds, and any later retry
+is a fresh admission and a fresh signature.
 
 Multi-deployment certified pools execute natively. Admission returns the full
 ordered route plus the frozen retry-policy facts without starting an attempt;

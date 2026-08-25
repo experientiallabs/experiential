@@ -633,7 +633,7 @@ fn latin1_header(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// Re-encode one latin-1 decoded header value to its original bytes.
-fn latin1_bytes(value: &str) -> Vec<u8> {
+pub(crate) fn latin1_bytes(value: &str) -> Vec<u8> {
     value
         .chars()
         .map(|character| {

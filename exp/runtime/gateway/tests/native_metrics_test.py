@@ -26,17 +26,10 @@ from threading import Thread
 import httpx
 import pytest
 
-from exp.common.models import (
-    GatewayDeploymentCapabilities,
-    GatewayTokenPrices,
-    ModelCapabilities,
+from exp.runtime.gateway.lifecycle_test import (
+    _activate_alias_for_escalation_policy,
+    _configured_gateway,
 )
-from exp.runtime.gateway.catalog_authority import (
-    ConnectionConfig,
-    upsert_connection,
-    upsert_singleton_deployment,
-)
-from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_metrics_text import METRICS_CONTENT_TYPE
 
@@ -56,9 +49,18 @@ components = load_gateway_components(
         "TEST_PROVIDER_KEY": "provider-secret-canary",
     },
 )
+
+
+def native_route_eligible(route, request):
+    \"\"\"Reject the escalated fixture alias by name; every other route is native.\"\"\"
+    del request
+    return route.snapshot.authorization.alias != "gem"
+
+
 control = NativeControlPlane(
     components,
     data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
+    native_route_eligible=native_route_eligible,
 )
 config = json.dumps(
     {
@@ -125,36 +127,9 @@ def _unused_port() -> int:
         return probe.getsockname()[1]
 
 
-def _activate_dialectless_alias(root: Path, manager: GatewayManagement) -> None:
-    """Grant one alias on a provider without a native dialect, so it escalates."""
-    upsert_connection(
-        root,
-        name="bedrock-main",
-        connection=ConnectionConfig(provider="bedrock", region="us-east-1"),
-        replace=False,
-    )
-    normalized, snapshot, _changed = upsert_singleton_deployment(
-        root,
-        deployment_alias="gem",
-        connection_name="bedrock-main",
-        provider_model="bedrock-model-exact",
-        exact_model_id="bedrock-revision-exact",
-        revision=None,
-        capabilities=ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
-        prices=GatewayTokenPrices(),
-        pricing_source=None,
-        replace=False,
-    )
-    manager.activate_direct_alias(
-        alias_id="gem",
-        alias_name="gem",
-        revision_id="revision-gem",
-        pool_id="gem",
-        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-        catalog_sha256=normalized.identity_sha256(),
-    )
-    manager.add_grant(identity_id="default", alias_id="gem")
+def _activate_escalating_alias(root: Path, manager: GatewayManagement) -> None:
+    """Grant one otherwise-native alias the child's host policy rejects."""
+    _activate_alias_for_escalation_policy(root, manager, alias="gem")
 
 
 def _wait_live(port: int, child: subprocess.Popen[bytes]) -> None:
@@ -186,7 +161,7 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
         tmp_path,
         base_url=f"http://127.0.0.1:{provider_port}/v1",
     )
-    _activate_dialectless_alias(tmp_path, manager)
+    _activate_escalating_alias(tmp_path, manager)
     child = subprocess.Popen(  # noqa: S603 - fixed argv built from this test.
         [
             sys.executable,
@@ -218,8 +193,9 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
             timeout=10,
         )
         assert keyed.status_code == 200
-        # An alias without a native dialect escalates; the dead fallback makes
-        # the relay fail with the only signal a dead embedded engine produces.
+        # The child's host policy rejects this alias by name, so it always
+        # escalates; the dead fallback makes the relay fail with the only
+        # signal a dead embedded engine produces.
         escalated = httpx.post(
             f"{base}/v1/chat/completions",
             headers=headers,
@@ -240,7 +216,7 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
             "failed": 0,
             "cancelled": 0,
         }
-        assert data_plane["escalated_requests"]["provider_dialect"] == 1
+        assert data_plane["escalated_requests"]["host_policy"] == 1
         assert data_plane["proxied_requests"] == 1
         assert data_plane["fallback_engine_unavailable"] == 1
         assert data_plane["active_requests"] == 0
@@ -268,7 +244,7 @@ def test_native_metrics_snapshot_moves_for_served_escalated_and_proxied_traffic(
         text = exposition.text
         assert 'exp_gateway_requests_total{outcome="completed"} 3' in text
         assert "exp_gateway_served_requests_total 3" in text
-        assert 'exp_gateway_escalated_requests_total{kind="provider_dialect"} 1' in text
+        assert 'exp_gateway_escalated_requests_total{kind="host_policy"} 1' in text
         assert "exp_gateway_fallback_engine_unavailable_total 1" in text
         assert 'exp_gateway_time_to_first_byte_ms_bucket{le="+Inf"} 3' in text
         assert "exp_gateway_accounting_healthy 1" in text

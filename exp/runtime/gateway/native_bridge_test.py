@@ -405,10 +405,12 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path
     assert report["totals"]["requests"] == 2
 
 
-def test_admit_escalates_native_unsupported_providers_before_accounting(
+def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A provider without a native dialect escalates with no ledger rows."""
+    """A Bedrock alias admits natively: the wire config carries the exact
+    pre-serialized Converse body and SigV4 headers computed over it."""
     from exp.common.models import (
         GatewayDeploymentCapabilities,
         GatewayTokenPrices,
@@ -420,6 +422,10 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
         upsert_singleton_deployment,
     )
 
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sigv4-secret-canary")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-token-canary")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
     manager, raw_key = _configured_gateway(tmp_path)
     upsert_connection(
         tmp_path,
@@ -431,7 +437,7 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
         tmp_path,
         deployment_alias="bed",
         connection_name="bedrock-main",
-        provider_model="bedrock-model-exact",
+        provider_model="us.anthropic.claude-sonnet-4-5",
         exact_model_id="bedrock-revision-exact",
         revision=None,
         capabilities=ModelCapabilities(),
@@ -455,12 +461,64 @@ def test_admit_escalates_native_unsupported_providers_before_accounting(
     )
     control = NativeControlPlane(components)
     admission = _admit(control, raw_key, _chat_body(model="bed"))
-    assert "escalate" in admission
-    assert "request_id" not in admission
-    scope = _claim_scope(control, raw_key, _chat_body(model="bed"), idempotency_key="op-1")
-    assert "escalate" in scope
+    assert "escalate" not in admission
+    # The route entry, not admission itself, carries the per-deployment wire
+    # fields; the data plane reserves the physical dispatch through
+    # ``start_attempt`` before it dials this deployment.
+    started = _flatten_started(control, admission)
+    assert started["dialect"] == "bedrock_converse_stream"
+    assert started["url"] == (
+        "https://bedrock-runtime.us-east-1.amazonaws.com/model/"
+        "us.anthropic.claude-sonnet-4-5/converse-stream"
+    )
+    body = started["upstream_body"]
+    assert isinstance(body, str)
+    # The frozen body is the only body channel for a signed dispatch; the
+    # structured payload is not shipped twice across the boundary.
+    assert started["upstream_payload"] is None
+    payload = json.loads(body)
+    assert body == json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    assert "modelId" not in payload
+    assert payload["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
+    # The route entry carries no signature: the data plane signs at dispatch
+    # time, after its bounded permit, so queue wait cannot age the signature.
+    assert started["headers"] == {}
+    signed = json.loads(
+        control.sign_dispatch(
+            json.dumps({"request_id": started["request_id"], "url": started["url"], "body": body})
+        )
+    )
+    headers = signed["headers"]
+    assert headers["X-Amz-Security-Token"] == "session-token-canary"
+    authorization = headers["Authorization"]
+    assert isinstance(authorization, str)
+    assert authorization.startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")
+    assert "/us-east-1/bedrock/aws4_request" in authorization
+    assert "sigv4-secret-canary" not in json.dumps(admission)
+    assert "sigv4-secret-canary" not in json.dumps(signed)
+    # Attempts without a retained signer fail closed and sanitized.
+    with pytest.raises(NativeBridgeError):
+        control.sign_dispatch(
+            json.dumps({"request_id": "unknown", "url": started["url"], "body": body})
+        )
+    # The attempt is durably started, exactly like other native admissions.
+    settled = control.settle(
+        json.dumps(
+            {
+                "request_id": started["request_id"],
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+    assert settled == "{}"
     report = json.loads(control.usage_json("{}"))
-    assert report["totals"]["requests"] == 0
+    assert report["totals"]["requests"] == 1
 
 
 def _configured_pool_gateway(

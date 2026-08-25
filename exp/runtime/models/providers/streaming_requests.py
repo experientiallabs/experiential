@@ -10,6 +10,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderResponseError
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -46,6 +47,8 @@ def dialect_stream_payload(
         return anthropic_messages_stream_payload(profile.model_id, provider_request)
     if profile.dialect == "gemini_generate_content":
         return gemini_generate_content_stream_payload(profile.model_id, provider_request)
+    if profile.dialect == "bedrock_converse_stream":
+        return bedrock_converse_stream_payload(profile.model_id, provider_request)
     return openai_compatible_stream_payload(
         profile.model_id,
         provider_request,
@@ -207,6 +210,34 @@ def gemini_generate_content_stream_payload(model_id: str, request: GatewayReques
     """
     try:
         return gemini_generate_request(model_id, gateway_model_request(request))
+    except ValueError as exc:
+        raise ProviderResponseError(str(exc)) from exc
+
+
+def bedrock_converse_stream_payload(model_id: str, request: GatewayRequest) -> JsonObject:
+    """Translate one canonical request to the native ConverseStream REST body.
+
+    The body is built by the exact converter the Bedrock provider client
+    uses (canonical request through the shared model adapter, then the shared
+    Converse body builder), so both engines send one identical document. On
+    the REST route the model travels in the URL path, never the body, and
+    streaming is selected by the ``converse-stream`` route itself.
+
+    Args:
+        model_id: Exact Bedrock model or inference-profile identifier; it
+            travels in the wire profile URL and keeps the dispatch signature.
+        request: Canonical gateway request.
+
+    Returns:
+        Native Converse request body for the streaming REST route.
+
+    Raises:
+        ProviderResponseError: A message cannot be represented without
+            dropping tool context.
+    """
+    del model_id
+    try:
+        return converse_body(gateway_model_request(request))
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc
 

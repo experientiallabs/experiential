@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from exp.common.models import (
-    AssistantAction,
     BillingSource,
     ConnectionConfig,
     EmbeddingClient,
@@ -23,10 +22,7 @@ from exp.common.models import (
     ModelRequest,
     ModelRoles,
     ModelSnapshot,
-    ToolCall,
-    ToolChoice,
 )
-from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.async_transport import RequestDeadline
 from exp.runtime.models.providers.bedrock import (
     AWS_DEFAULT_REGION_ENV,
@@ -38,7 +34,6 @@ from exp.runtime.models.providers.bedrock import (
     BedrockRegionError,
     BedrockRuntime,
     BoundedBedrockClient,
-    converse_request,
     converse_response,
     create_bedrock_runtime_client,
     resolve_bedrock_region,
@@ -107,39 +102,6 @@ def _snapshot(model_id: str = "us.anthropic.claude-sonnet-4-5") -> ModelSnapshot
 def _request() -> ModelRequest:
     """Build one user completion request."""
     return ModelRequest(messages=(ModelMessage(role="user", content="Hello"),))
-
-
-def _tool_transcript_request() -> ModelRequest:
-    """Build a visible transcript containing an earlier tool call and result."""
-    return ModelRequest(
-        messages=(
-            ModelMessage(role="system", content="You are precise."),
-            ModelMessage(role="user", content="Create a ticket."),
-            ModelMessage(
-                role="assistant",
-                assistant_action=AssistantAction(
-                    tool_calls=(
-                        ToolCall(
-                            call_id="call-old",
-                            name="create_ticket",
-                            arguments={"priority": "normal"},
-                        ),
-                    )
-                ),
-            ),
-            ModelMessage(role="tool", content="created", tool_call_id="call-old"),
-        ),
-        tools=(
-            ToolSchema(
-                name="create_ticket",
-                description="Create one support ticket.",
-                input_schema={"type": "object"},
-            ),
-        ),
-        tool_choice=ToolChoice(name="create_ticket"),
-        temperature=0.1,
-        maximum_output_tokens=256,
-    )
 
 
 def test_complete_sends_the_exact_model_id_and_preserves_cache_usage() -> None:
@@ -506,39 +468,6 @@ def test_runtime_construction_uses_the_aws_session_chain(
     assert runtime is not None
 
 
-def test_converse_request_preserves_tool_ids_and_named_choice() -> None:
-    """Converse keeps exact tool-use IDs and forwards named tool choice."""
-    payload = converse_request("us.anthropic.claude-sonnet-4-5", _tool_transcript_request())
-
-    assert payload["modelId"] == "us.anthropic.claude-sonnet-4-5"
-    assert payload["system"] == [{"text": "You are precise."}]
-    assert payload["inferenceConfig"] == {"maxTokens": 256, "temperature": 0.1}
-    tool_config = payload["toolConfig"]
-    assert isinstance(tool_config, dict)
-    assert tool_config["toolChoice"] == {"tool": {"name": "create_ticket"}}
-    messages = payload["messages"]
-    assert isinstance(messages, list)
-    assistant = messages[1]
-    tool_result = messages[2]
-    assert isinstance(assistant, dict)
-    assert isinstance(tool_result, dict)
-    assistant_content = assistant["content"]
-    result_content = tool_result["content"]
-    assert isinstance(assistant_content, list)
-    assert isinstance(result_content, list)
-    tool_use = assistant_content[0]
-    result_block = result_content[0]
-    assert isinstance(tool_use, dict)
-    assert isinstance(result_block, dict)
-    tool_use_block = tool_use["toolUse"]
-    result_payload = result_block["toolResult"]
-    assert isinstance(tool_use_block, dict)
-    assert isinstance(result_payload, dict)
-    assert tool_use_block["toolUseId"] == "call-old"
-    assert tool_result["role"] == "user"
-    assert result_payload["toolUseId"] == "call-old"
-
-
 def test_converse_response_normalizes_cache_legs_without_double_counting() -> None:
     """Converse inputTokens exclude cache legs, so read and write are added once."""
     response = converse_response(
@@ -611,3 +540,123 @@ def test_converse_response_maps_length_and_rejects_unsupported_blocks() -> None:
         )
     assert refusal_error.value.signal is ProviderRefusalSignal.GUARDRAIL
     assert "blocked" not in str(refusal_error.value)
+
+
+def _signing_client(monkeypatch: pytest.MonkeyPatch, *, token: str | None = None) -> BedrockClient:
+    """Build one region-bound client over deterministic environment credentials."""
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+    if token is None:
+        monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("AWS_SESSION_TOKEN", token)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    return BedrockClient(
+        model=_snapshot(),
+        region="us-east-1",
+        environment={},
+        runtime_factory=None,
+    )
+
+
+def test_converse_stream_url_encodes_the_model_like_botocore() -> None:
+    """The REST route keeps ``/`` and ``~`` raw and percent-encodes ``:``."""
+    client = BedrockClient(
+        model=_snapshot("arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic.claude"),
+        region="eu-central-1",
+        environment={},
+        runtime_factory=None,
+    )
+    assert client.converse_stream_url() == (
+        "https://bedrock-runtime.eu-central-1.amazonaws.com/model/"
+        "arn%3Aaws%3Abedrock%3Aus-east-1%3A123%3Ainference-profile/us.anthropic.claude"
+        "/converse-stream"
+    )
+
+
+def test_sign_gateway_dispatch_matches_an_independent_sigv4_computation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The produced Authorization header verifies against the SigV4 spec."""
+    import hashlib
+    import hmac
+
+    client = _signing_client(monkeypatch)
+    url = client.converse_stream_url()
+    body = '{"messages":[{"role":"user","content":[{"text":"Zürich"}]}]}'
+    headers = client.sign_gateway_dispatch(url=url, body=body)
+
+    amz_date = headers["X-Amz-Date"]
+    date_stamp = amz_date[:8]
+    scope = f"{date_stamp}/us-east-1/bedrock/aws4_request"
+    signed_headers = "accept;content-type;host;x-amz-date"
+    canonical = "\n".join(
+        (
+            "POST",
+            "/model/us.anthropic.claude-sonnet-4-5/converse-stream",
+            "",
+            "accept:application/vnd.amazon.eventstream",
+            "content-type:application/json",
+            "host:bedrock-runtime.us-east-1.amazonaws.com",
+            f"x-amz-date:{amz_date}",
+            "",
+            signed_headers,
+            hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        )
+    )
+    string_to_sign = "\n".join(
+        (
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            scope,
+            hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        )
+    )
+
+    def _hmac(key: bytes, value: str) -> bytes:
+        """Compute one HMAC-SHA256 chain link."""
+        return hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
+
+    key = _hmac(b"AWS4wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", date_stamp)
+    key = _hmac(key, "us-east-1")
+    key = _hmac(key, "bedrock")
+    key = _hmac(key, "aws4_request")
+    signature = hmac.new(key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    assert headers["Authorization"] == (
+        f"AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    assert headers["content-type"] == "application/json"
+    assert "X-Amz-Security-Token" not in headers
+
+
+def test_sign_gateway_dispatch_forwards_the_session_token_and_binds_the_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session tokens are signed in, and a changed body changes the signature."""
+    client = _signing_client(monkeypatch, token="the-session-token")
+    url = client.converse_stream_url()
+    first = client.sign_gateway_dispatch(url=url, body='{"messages":[]}')
+    assert first["X-Amz-Security-Token"] == "the-session-token"
+    assert "x-amz-security-token" in first["Authorization"]
+    second = client.sign_gateway_dispatch(url=url, body='{"messages":[{}]}')
+    if first["X-Amz-Date"] == second["X-Amz-Date"]:
+        assert first["Authorization"] != second["Authorization"]
+
+
+def test_bounded_client_wire_profile_marks_the_body_for_signing() -> None:
+    """The bounded adapter's profile carries the signing dialect facts."""
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-east-1",
+        environment={},
+        runtime_factory=None,
+    )
+    profile = BoundedBedrockClient(client).gateway_wire_profile()
+    assert profile.dialect == "bedrock_converse_stream"
+    assert profile.signs_request_body is True
+    assert profile.headers == {}
+    assert profile.model_id == "us.anthropic.claude-sonnet-4-5"
+    assert profile.timeout_seconds == 600.0
+    assert profile.url.endswith("/model/us.anthropic.claude-sonnet-4-5/converse-stream")

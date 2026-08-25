@@ -40,7 +40,10 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.lifecycle_test import (
+    _activate_alias_for_escalation_policy,
+    _configured_gateway,
+)
 from exp.runtime.gateway.management import GatewayManagement
 
 pytest.importorskip("exp_gateway_native")
@@ -73,9 +76,17 @@ _DRIVER_SOURCE = textwrap.dedent(
     import exp_gateway_native
 
 
-    def native_route_eligible(_route, request) -> bool:
-        """Escalate Responses requests to exercise the fallback boundary."""
-        return request.surface != GatewayApiSurface.RESPONSES
+    def native_route_eligible(route, request) -> bool:
+        """Escalate Responses requests and the fixed ``escalated`` alias.
+
+        Every granted provider now has a native dialect and every route
+        shape resolves natively, so this hosted policy is the only
+        construction-independent escalation lever left for exercising the
+        fallback boundary.
+        """
+        if request.surface == GatewayApiSurface.RESPONSES:
+            return False
+        return route.snapshot.authorization.alias != "escalated"
 
 
     def main() -> None:
@@ -132,56 +143,18 @@ _DRIVER_SOURCE = textwrap.dedent(
 
 
 def _seed_escalating_alias(root: Path, manager: GatewayManagement) -> None:
-    """Grant one alias the native path can never serve.
+    """Grant one alias the driver's host policy always escalates by name.
 
-    The provider has no native dialect, so admission escalates it to the
-    embedded python engine regardless of which public surfaces later become
-    native (Responses and project aliases already did). The dead-fallback
-    test needs a route that is escalated by construction.
+    Every granted provider now has a native dialect and every route shape
+    resolves natively, so the driver's ``native_route_eligible`` hook is what
+    makes this alias escalated by construction; see that hook in
+    ``_DRIVER_SOURCE``.
 
     Args:
         root: Seeded gateway root.
         manager: Management handle over the same root.
     """
-    from exp.common.models import (
-        GatewayDeploymentCapabilities,
-        GatewayTokenPrices,
-        ModelCapabilities,
-    )
-    from exp.runtime.gateway.catalog_authority import (
-        ConnectionConfig,
-        upsert_connection,
-        upsert_singleton_deployment,
-    )
-
-    upsert_connection(
-        root,
-        name="bedrock-main",
-        connection=ConnectionConfig(provider="bedrock", region="us-east-1"),
-        replace=False,
-    )
-    normalized, snapshot, _changed = upsert_singleton_deployment(
-        root,
-        deployment_alias="escalated",
-        connection_name="bedrock-main",
-        provider_model="bedrock-model-exact",
-        exact_model_id="bedrock-revision-exact",
-        revision=None,
-        capabilities=ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
-        prices=GatewayTokenPrices(),
-        pricing_source=None,
-        replace=False,
-    )
-    manager.activate_direct_alias(
-        alias_id="escalated",
-        alias_name="escalated",
-        revision_id="revision-escalated",
-        pool_id="escalated",
-        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
-        catalog_sha256=normalized.identity_sha256(),
-    )
-    manager.add_grant(identity_id="default", alias_id="escalated")
+    _activate_alias_for_escalation_policy(root, manager, alias="escalated")
 
 
 def _sse_frame(payload: object) -> bytes:
@@ -448,9 +421,10 @@ def test_dead_fallback_engine_degrades_only_escalated_routes(
     health and does not cover the fallback host: the CLI owns the embedded
     python engine's thread and its liveness, so a dead fallback degrades the
     escalated surfaces to an explicit 502 while readiness stays green. The
-    probe uses the ``escalated`` alias, whose provider has no native dialect,
-    because every dialect-capable single-deployment surface (chat, Responses,
-    project aliases) is now served natively and never reaches the fallback.
+    probe uses the ``escalated`` alias, which the driver's host policy
+    rejects by name: every route shape now resolves natively, so a hosted
+    policy is the only construction-independent way left to force
+    escalation for a single-deployment chat surface.
     """
     headers = {"authorization": f"Bearer {engine.raw_key}"}
     escalated = httpx.post(

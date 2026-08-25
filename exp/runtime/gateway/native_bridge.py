@@ -24,10 +24,11 @@ python executor's waterfall policy, health circuits, and budget skipping.
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
 the caller, mirroring ``GatewayService`` error mapping. Requests the native
-path cannot serve (providers without a native dialect) are answered with an
-``{"escalate": reason}`` admission disposition before any ledger write; the
-data plane replays those against the embedded python engine, which performs
-its own full authorization and accounting, so nothing is double-counted.
+path cannot serve (resolved clients exposing no native wire profile) are
+answered with an ``{"escalate": reason}`` admission disposition before any
+ledger write; the data plane replays those against the embedded python
+engine, which performs its own full authorization and accounting, so nothing
+is double-counted.
 """
 
 from __future__ import annotations
@@ -68,6 +69,7 @@ from exp.runtime.gateway.native_accounting import (
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
+from exp.runtime.gateway.native_dispatch import dispatch_signature_headers, frozen_dispatch
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     MAXIMUM_TOTAL_ATTEMPTS,
@@ -94,6 +96,7 @@ from exp.runtime.models.providers import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
@@ -311,10 +314,10 @@ class NativeControlPlane:
         # against the accepted request below.
         probe_failure: Exception | None = None
         route: GatewayRoute | None = None
-        profiles: tuple[GatewayWireProfile, ...] | None = None
+        resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
         try:
             route = self._resolve_route(authorization, request)
-            profiles = resolve_route_profiles(self._components.runtime_catalogs, route)
+            resolved_wires = resolve_route_profiles(self._components.runtime_catalogs, route)
         except NativeDialectUnavailableError as exc:
             return _escalation(str(exc))
         except Exception as exc:  # noqa: BLE001 - recorded after acceptance below.
@@ -334,20 +337,27 @@ class NativeControlPlane:
         try:
             self._write_ledger.accept_request(authorization=authorization)
             accepted = True
-            if probe_failure is not None or route is None or profiles is None:
+            if probe_failure is not None or route is None or resolved_wires is None:
                 raise probe_failure or GatewayRoutingError("authorized route did not resolve")
             wire_route: list[JsonObject] = []
-            for deployment, profile in zip(route.deployments, profiles, strict=True):
+            signers: list[GatewayDispatchSigner | None] = []
+            for deployment, (profile, client) in zip(
+                route.deployments, resolved_wires, strict=True
+            ):
                 require_gateway_provider(deployment.provider)
                 preflight_gateway_request(provider_request, deployment.gateway.capabilities)
+                upstream_payload = dialect_stream_payload(profile, provider_request)
+                upstream_body, dispatch_signer = frozen_dispatch(profile, client, upstream_payload)
                 wire_route.append(
                     deployment_wire_entry(
                         route,
                         deployment,
                         profile,
-                        dialect_stream_payload(profile, provider_request),
+                        upstream_payload,
+                        upstream_body,
                     )
                 )
+                signers.append(dispatch_signer)
         except ProviderCapabilityError as exc:
             failure = GatewayFailure(
                 failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
@@ -373,6 +383,7 @@ class NativeControlPlane:
                 deadline_monotonic=deadline,
                 continuation=continuation_context,
                 policy=policy,
+                signers=tuple(signers),
             )
         )
         response: JsonObject = {
@@ -393,6 +404,44 @@ class NativeControlPlane:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(request)
         return json.dumps(response, separators=(",", ":"))
+
+    def sign_dispatch(self, argument: str) -> str:
+        """Sign one frozen dispatch body immediately before the provider POST.
+
+        The data plane calls this after it acquires its bounded dispatch
+        permit and immediately before the open attempt reserved by
+        ``start_attempt``, so queue time can never age a signature toward
+        AWS's short clock window; a same-deployment redial or a failover
+        advance is a fresh physical attempt through ``start_attempt``, so it
+        always signs afresh too.
+
+        Args:
+            argument: JSON object with ``request_id``, the exact ``url``, and
+                the exact frozen ``body`` string the data plane will send.
+
+        Returns:
+            JSON object with the ``headers`` to send verbatim.
+
+        Raises:
+            NativeBridgeError: The attempt is unknown, its route depth
+                carries no signer, or credential resolution failed.
+        """
+        data = json.loads(argument)
+        entry = self._accounting.entry(str(data.get("request_id") or ""))
+        signer = None
+        if entry is not None and entry.active_attempt_id is not None:
+            depth = entry.attempt_depths.get(entry.active_attempt_id)
+            if depth is not None and depth < len(entry.signers):
+                signer = entry.signers[depth]
+        try:
+            headers = dispatch_signature_headers(
+                signer,
+                url=str(data["url"]),
+                body=str(data["body"]),
+            )
+        except OpenAIProtocolError as exc:
+            raise NativeBridgeError(exc) from exc
+        return json.dumps({"headers": headers}, separators=(",", ":"))
 
     def start_attempt(self, argument: str) -> str:
         """Reserve one physical dispatch through the accounting registry.

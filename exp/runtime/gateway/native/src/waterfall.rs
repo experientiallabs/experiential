@@ -31,13 +31,12 @@ use serde_json::{json, Value};
 
 use crate::bridge::Bridge;
 use crate::dialects::{
-    Dialect, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
+    Dialect, FrameDecoder, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
 };
 use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
-use crate::sse::SseDecoder;
 use crate::upstream::open_stream;
 
 /// Byte bound for withheld refusal deltas, matching the python executor's
@@ -59,7 +58,16 @@ pub struct DeploymentWire {
     pub url: String,
     pub headers: HashMap<String, String>,
     pub timeout_seconds: f64,
+    /// Structured payload the data plane serializes itself; null for
+    /// body-signing dialects, whose route entry carries `upstream_body`.
+    #[serde(default)]
     pub upstream_payload: Value,
+    /// Exact pre-serialized body for body-signing dialects (Bedrock SigV4).
+    /// When present it is sent verbatim: the signature covers these exact
+    /// bytes, so re-serializing a structured payload here could invalidate
+    /// it.
+    #[serde(default)]
+    pub upstream_body: Option<String>,
     pub idempotency_key: String,
 }
 
@@ -190,10 +198,12 @@ pub fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Ve
     }
 }
 
-/// One upstream SSE response being decoded and normalized incrementally.
+/// One upstream response being decoded and normalized incrementally, over
+/// whichever wire framing the dialect uses (SSE, or the AWS binary
+/// event-stream framing for Bedrock).
 pub struct UpstreamRelay {
     stream: BoxStream<'static, reqwest::Result<Bytes>>,
-    decoder: SseDecoder,
+    decoder: FrameDecoder,
     normalizer: Normalizer,
     pending: VecDeque<Event>,
     eof: bool,
@@ -204,7 +214,7 @@ impl UpstreamRelay {
     pub fn new(response: reqwest::Response, dialect: Dialect) -> Self {
         Self {
             stream: response.bytes_stream().boxed(),
-            decoder: SseDecoder::new(),
+            decoder: FrameDecoder::new(dialect),
             normalizer: Normalizer::new(dialect),
             pending: VecDeque::new(),
             eof: false,
@@ -800,6 +810,36 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
     }
 }
 
+/// Resolve the dispatch headers for one physical open attempt. Body-signing
+/// dialects (Bedrock SigV4) are signed here, immediately before the provider
+/// POST, so neither queue time nor a spent earlier attempt can age the
+/// signature toward AWS's short clock window. Other dialects use the route
+/// entry's headers unchanged.
+async fn dispatch_headers(
+    bridge: &Bridge,
+    request_id: &str,
+    wire: &DeploymentWire,
+) -> Result<HashMap<String, String>, PublicError> {
+    let mut headers = wire.headers.clone();
+    let Some(body) = wire.upstream_body.as_deref() else {
+        return Ok(headers);
+    };
+    let argument = compact_json(&json!({
+        "request_id": request_id,
+        "url": wire.url,
+        "body": body,
+    }));
+    let text = bridge.call("sign_dispatch", argument).await?;
+    let signed: HashMap<String, String> = serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|value| {
+            serde_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null)).ok()
+        })
+        .ok_or_else(PublicError::internal)?;
+    headers.extend(signed);
+    Ok(headers)
+}
+
 /// Open and read one physical attempt up to commitment or its terminal.
 async fn run_attempt(
     ctx: &WaterfallContext<'_>,
@@ -821,6 +861,28 @@ async fn run_attempt(
             opened: false,
         };
     };
+    // Body-signing dialects sign immediately before every physical attempt
+    // so neither queue time nor a spent prior attempt can age the signature
+    // (a same-deployment redial or a failover advance both call `run_attempt`
+    // again, so each always gets a fresh signature); signing failures are
+    // neither same-deployment-retryable nor failover-eligible, matching the
+    // python executor's hard stop on an authentication failure.
+    let headers = match dispatch_headers(ctx.bridge, ctx.request_id, wire).await {
+        Ok(headers) => headers,
+        Err(_) => {
+            return AttemptEnd::Ladder {
+                failure: Failure::new(
+                    FailureClass::ProviderAuthentication,
+                    "provider dispatch signing failed",
+                ),
+                refusal_eligible: false,
+                exhaustion_flush: Vec::new(),
+                usage: None,
+                tool_names: Vec::new(),
+                opened: false,
+            };
+        }
+    };
     // The connection's raw timeout bounds each transport phase (open, then
     // every chunk read), exactly like the python streaming path.
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
@@ -828,9 +890,10 @@ async fn run_attempt(
     let response = match open_stream(
         ctx.http,
         &wire.url,
-        &wire.headers,
+        &headers,
         &wire.idempotency_key,
         &wire.upstream_payload,
+        wire.upstream_body.as_deref(),
         open_bound,
     )
     .await

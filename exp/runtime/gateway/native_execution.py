@@ -34,8 +34,9 @@ from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models import RuntimeModelCatalog
-from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.lifecycle import LocalGatewayComponents
@@ -75,6 +76,9 @@ class InflightRequest:
     # successful terminal; chat attempts carry ``None``.
     continuation: ContinuationContext | None = None
     policy: GuardrailPolicy | None = None
+    # One signer per route deployment, for body-signing dialects (Bedrock
+    # SigV4); ``None`` at a depth whose dialect serializes its own payload.
+    signers: tuple[GatewayDispatchSigner | None, ...] = ()
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""
@@ -179,11 +183,14 @@ def next_route_candidate(
 def resolve_route_profiles(
     runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog],
     route: GatewayRoute,
-) -> tuple[GatewayWireProfile, ...]:
+) -> tuple[tuple[GatewayWireProfile, NativeWireClient], ...]:
     """Resolve every route deployment's public wire profile for the data plane.
 
     Every deployment is resolved and identity-checked before any ledger write
     or billable dispatch, mirroring the executor's whole-route resolution.
+    The check is structural (``NativeWireClient``), not a concrete HTTP base
+    class: a non-HTTP client such as the bounded Bedrock adapter satisfies it
+    too as long as it implements ``gateway_wire_profile``.
 
     Args:
         runtime_catalogs: Revision and catalog digests mapped to frozen
@@ -191,9 +198,10 @@ def resolve_route_profiles(
         route: Resolved ordered route.
 
     Returns:
-        One dialect, endpoint, headers, and timing profile per deployment, in
-        route order, with the model identity filled from the resolved
-        snapshot when the profile leaves it empty.
+        One ``(profile, client)`` pair per deployment, in route order, with
+        the model identity filled from the resolved snapshot when the
+        profile leaves it empty. The client rides alongside its profile so
+        body-signing dialects can freeze their dispatch signer at admission.
 
     Raises:
         NativeDialectUnavailableError: A route deployment's provider has no
@@ -207,14 +215,14 @@ def resolve_route_profiles(
     catalog = runtime_catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
     if catalog is None:
         raise GatewayRoutingError("runtime catalog is not loaded for the authorized revision")
-    profiles: list[GatewayWireProfile] = []
+    resolved_wires: list[tuple[GatewayWireProfile, NativeWireClient]] = []
     for deployment in route.deployments:
         resolved = catalog.resolve(deployment.source_alias)
         _require_deployment_identity(deployment, resolved)
         client = resolved.client
         if getattr(client, "stream", None) is None:
             raise GatewayRoutingError("resolved gateway deployment has no streaming capability")
-        if not isinstance(client, ProviderHttpClient):
+        if not isinstance(client, NativeWireClient):
             raise NativeDialectUnavailableError(
                 f"provider {deployment.provider!r} has no native wire profile"
             )
@@ -228,8 +236,8 @@ def resolve_route_profiles(
             ) from exc
         if not profile.model_id:
             profile = replace(profile, model_id=resolved.snapshot.model_id)
-        profiles.append(profile)
-    return tuple(profiles)
+        resolved_wires.append((profile, client))
+    return tuple(resolved_wires)
 
 
 def deployment_wire_entry(
@@ -237,6 +245,7 @@ def deployment_wire_entry(
     deployment: ExactModelDeployment,
     profile: GatewayWireProfile,
     upstream_payload: JsonObject,
+    upstream_body: str | None = None,
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -246,6 +255,11 @@ def deployment_wire_entry(
         profile: The deployment's resolved wire profile.
         upstream_payload: The fully built provider payload for this
             deployment's dialect and model identity.
+        upstream_body: The exact frozen body string for body-signing
+            dialects (Bedrock SigV4). When present it is sent verbatim, so
+            ``upstream_payload`` is nulled out rather than doubling the
+            boundary bytes for a value the data plane must not
+            re-serialize.
 
     Returns:
         The JSON-compatible wire entry consumed by the data plane.
@@ -258,7 +272,8 @@ def deployment_wire_entry(
         "headers": dict(profile.headers),
         "model_id": profile.model_id,
         "timeout_seconds": profile.timeout_seconds,
-        "upstream_payload": upstream_payload,
+        "upstream_payload": None if upstream_body is not None else upstream_payload,
+        "upstream_body": upstream_body,
         "idempotency_key": deployment_operation_key(route, deployment),
     }
 
@@ -294,7 +309,7 @@ def native_serving_blockers(components: LocalGatewayComponents) -> tuple[str, ..
                 reasons.append(f"deployment {deployment.deployment_id!r} does not resolve")
                 continue
             client = resolved.client
-            if not isinstance(client, ProviderHttpClient):
+            if not isinstance(client, NativeWireClient):
                 reasons.append(f"provider {deployment.provider!r} has no native wire profile")
                 continue
             try:
