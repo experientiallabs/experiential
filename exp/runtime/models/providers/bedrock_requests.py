@@ -15,7 +15,15 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 
 
-def converse_request(model_id: str, request: ModelRequest) -> JsonObject:
+def converse_request(
+    model_id: str,
+    request: ModelRequest,
+    *,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+) -> JsonObject:
     """Translate one EXP request into boto Converse keyword arguments.
 
     Args:
@@ -29,10 +37,26 @@ def converse_request(model_id: str, request: ModelRequest) -> JsonObject:
     Raises:
         ValueError: A message cannot be represented without dropping tool context.
     """
-    return {"modelId": model_id, **converse_body(request)}
+    return {
+        "modelId": model_id,
+        **converse_body(
+            request,
+            supports_temperature=supports_temperature,
+            supports_top_p=supports_top_p,
+            supports_top_k=supports_top_k,
+            supports_logprobs=supports_logprobs,
+        ),
+    }
 
 
-def converse_body(request: ModelRequest) -> JsonObject:
+def converse_body(
+    request: ModelRequest,
+    *,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+) -> JsonObject:
     """Translate one EXP request into the Converse wire document.
 
     The body carries no routing key: boto callers splice ``modelId`` beside it
@@ -47,6 +71,10 @@ def converse_body(request: ModelRequest) -> JsonObject:
     Raises:
         ValueError: A message cannot be represented without dropping tool context.
     """
+    # Converse has no provider-neutral logprobs field. Keep the flag in the
+    # shared signature so all provider lanes use one capability contract, but
+    # omit the request until response projection exists.
+    del supports_logprobs
     system: list[JsonObject] = []
     messages: list[JsonObject] = []
 
@@ -83,9 +111,18 @@ def converse_body(request: ModelRequest) -> JsonObject:
         )
 
     payload: JsonObject = {"messages": messages}
-    inference = _inference_config(request)
+    inference = _inference_config(
+        request,
+        supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+    )
     if inference:
         payload["inferenceConfig"] = inference
+    if request.top_k is not None and supports_top_k:
+        # Converse exposes model-specific controls at the request root, not
+        # inside inferenceConfig. The route flag is explicit because support
+        # varies by foundation model.
+        payload["additionalModelRequestFields"] = {"top_k": request.top_k}
     if system:
         payload["system"] = system
     tool_config = _tool_config(request)
@@ -131,13 +168,20 @@ def _message_blocks(message: ModelMessage) -> list[JsonObject]:
     return blocks
 
 
-def _inference_config(request: ModelRequest) -> JsonObject:
+def _inference_config(
+    request: ModelRequest,
+    *,
+    supports_temperature: bool,
+    supports_top_p: bool,
+) -> JsonObject:
     """Return Converse inference controls without inventing omitted sampling fields."""
     inference: JsonObject = {}
     if request.maximum_output_tokens is not None:
         inference["maxTokens"] = request.maximum_output_tokens
-    if request.temperature is not None:
+    if request.temperature is not None and supports_temperature:
         inference["temperature"] = request.temperature
+    if request.top_p is not None and supports_top_p:
+        inference["topP"] = request.top_p
     return inference
 
 

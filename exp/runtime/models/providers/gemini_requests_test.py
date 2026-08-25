@@ -49,6 +49,21 @@ def test_gemini_generate_request_builds_contents_tools_and_generation() -> None:
     assert payload["generationConfig"] == {"temperature": 0.4, "maxOutputTokens": 64}
 
 
+def test_gemini_generate_request_omits_unproven_top_k_and_logprobs() -> None:
+    """Gemini discovery must prove model-specific top-k/logprob support first."""
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hi"),),
+        top_p=0.8,
+        top_k=20,
+        logprobs=True,
+    )
+    payload = gemini_generate_request("gemini-2.5-pro", request)
+    generation = payload["generationConfig"]
+    assert generation["topP"] == 0.8
+    assert "topK" not in generation
+    assert "responseLogprobs" not in generation
+
+
 def test_gemini_generate_request_links_tool_results_to_prior_calls() -> None:
     """Tool results resolve their function name from the preceding assistant call."""
     call = ToolCall(call_id="call-1", name="lookup", arguments={"q": "x"})

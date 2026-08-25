@@ -19,7 +19,7 @@ from pydantic import (
 )
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models.model import ToolCall
+from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.gateway.contracts import (
     CompatibilityDisposition,
     CompatibilityManifest,
@@ -198,6 +198,10 @@ class _ChatRequest(_WireModel):
     stop: str | tuple[str, ...] | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
+    top_k: int | None = Field(default=None, gt=0)
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    reasoning_effort: ReasoningEffort | None = None
     response_format: _ChatResponseFormat | None = None
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None
@@ -268,6 +272,14 @@ class _ResponseText(_WireModel):
     format: _ResponseFormat
 
 
+class _ResponseReasoning(_WireModel):
+    """Responses reasoning controls preserved until route capability shaping."""
+
+    effort: ReasoningEffort | None = None
+    generate_summary: Literal["auto", "concise", "detailed"] | None = None
+    summary: Literal["auto", "concise", "detailed"] | None = None
+
+
 class _ResponsesRequest(_WireModel):
     """Closed gateway Responses request profile."""
 
@@ -280,6 +292,10 @@ class _ResponsesRequest(_WireModel):
     parallel_tool_calls: bool | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)
     temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    top_k: int | None = Field(default=None, gt=0)
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    reasoning: _ResponseReasoning | None = None
     text: _ResponseText | None = None
     stream: bool = False
     metadata: JsonObject = Field(default_factory=dict)
@@ -315,7 +331,7 @@ def decode_chat(
     """
     payload = _drop_opencode_cache_control(payload)
     _validate_manifest(payload, CHAT_MANIFEST)
-    _validate_official(_CHAT_OFFICIAL, payload)
+    _validate_official(_CHAT_OFFICIAL, payload, extension_fields={"top_k"})
     request = _validate_wire(_ChatRequest, payload)
     operation = _caller_operation(idempotency_key, client_request_id)
     maximum = request.max_completion_tokens or request.max_tokens
@@ -338,6 +354,10 @@ def decode_chat(
             stop=stop,
             temperature=request.temperature,
             top_p=request.top_p,
+            top_k=request.top_k,
+            logprobs=request.logprobs,
+            top_logprobs=request.top_logprobs,
+            reasoning_effort=request.reasoning_effort,
             stream=request.stream,
             include_usage=(
                 request.stream_options is not None and request.stream_options.include_usage
@@ -374,7 +394,7 @@ def decode_responses(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     _validate_manifest(payload, RESPONSES_MANIFEST)
-    _validate_official(_RESPONSES_OFFICIAL, payload)
+    _validate_official(_RESPONSES_OFFICIAL, payload, extension_fields={"top_k"})
     request = _validate_wire(_ResponsesRequest, payload)
     operation = _caller_operation(idempotency_key, client_request_id)
     messages = list(_response_input_messages(request.input))
@@ -390,6 +410,11 @@ def decode_responses(
             structured_text=_responses_structured_text(request.text),
             maximum_output_tokens=request.max_output_tokens,
             temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k,
+            logprobs=(request.top_logprobs is not None),
+            top_logprobs=request.top_logprobs,
+            reasoning_effort=(request.reasoning.effort if request.reasoning is not None else None),
             stream=request.stream,
             previous_response_id=request.previous_response_id,
             metadata=request.metadata,
@@ -530,10 +555,18 @@ def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> 
             raise unsupported_field(field)
 
 
-def _validate_official(adapter: TypeAdapter[object], payload: JsonObject) -> None:
+def _validate_official(
+    adapter: TypeAdapter[object],
+    payload: JsonObject,
+    *,
+    extension_fields: frozenset[str] = frozenset(),
+) -> None:
     """Run the installed official SDK request schema before gateway narrowing."""
     try:
-        adapter.validate_python(payload)
+        official_payload = {
+            key: value for key, value in payload.items() if key not in extension_fields
+        }
+        adapter.validate_python(official_payload)
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
 

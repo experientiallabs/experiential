@@ -175,6 +175,7 @@ def responses_envelope(request: GatewayRequest) -> JsonObject:
         "metadata": request.metadata or None,
         "parallel_tool_calls": request.parallel_tool_calls is not False,
         "temperature": request.temperature,
+        "top_p": request.top_p,
         "tool_choice": _responses_tool_choice(request),
         "tools": [
             {

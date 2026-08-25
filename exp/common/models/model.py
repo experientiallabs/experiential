@@ -335,10 +335,14 @@ class ModelCapabilities(ContractModel):
     at runtime so an undeclared or newly released model stays usable; only an explicit ``False``
     blocks the corresponding protocol feature before dispatch.
 
-    ``supports_temperature`` declares whether the provider accepts an explicit sampling
-    temperature for this model; reasoning models that pin their sampling reject the parameter, so
-    clients omit it when this is ``False``. ``reasoning_effort`` pins an explicit reasoning-effort
-    level on providers whose wire protocol accepts one.
+    ``supports_temperature`` and the optional sampling capability fields declare whether the
+    provider accepts the corresponding generation controls for this model. ``None`` means the
+    older catalog did not carry an explicit declaration; runtime clients fall back to the broad
+    temperature capability for ``top_p`` and omit the less portable controls. Reasoning models
+    that pin their sampling reject temperature and nucleus sampling, so clients omit both when
+    the route says they are unsupported. ``supports_reasoning`` is an explicit wire capability,
+    not an inference from ``reasoning_effort``. ``reasoning_effort`` pins an explicit
+    reasoning-effort level only when that capability is true.
     """
 
     supports_tools: bool | None = None
@@ -346,6 +350,10 @@ class ModelCapabilities(ContractModel):
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True
+    supports_top_p: bool | None = None
+    supports_top_k: bool | None = None
+    supports_logprobs: bool | None = None
+    supports_reasoning: bool = False
     reasoning_effort: ReasoningEffort | None = None
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
@@ -395,6 +403,10 @@ class ModelCapabilities(ContractModel):
         excluded = {
             "supports_structured_output",
             "supports_temperature",
+            "supports_top_p",
+            "supports_top_k",
+            "supports_logprobs",
+            "supports_reasoning",
             "reasoning_effort",
             "input_cost_per_million_tokens_usd",
             "output_cost_per_million_tokens_usd",
@@ -420,6 +432,11 @@ class ModelRequest(ContractModel):
         tool_choice: Optional automatic, disabled, required, or named-tool selection.
         temperature: Optional sampling temperature.
         top_p: Optional nucleus-sampling probability mass in ``[0, 1]``.
+        top_k: Optional maximum number of candidate tokens considered during sampling.
+        logprobs: Optional request for token log probabilities when a route can return them.
+        top_logprobs: Optional number of alternate token probabilities to request.
+        reasoning_effort: Optional caller-selected reasoning effort, preserved only on routes that
+            explicitly declare support.
         maximum_output_tokens: Optional upper bound for generated tokens.
     """
 
@@ -428,6 +445,10 @@ class ModelRequest(ContractModel):
     tool_choice: Literal["auto", "none", "required"] | ToolChoice | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
+    top_k: int | None = Field(default=None, gt=0)
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    reasoning_effort: ReasoningEffort | None = None
     maximum_output_tokens: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")

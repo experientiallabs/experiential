@@ -585,6 +585,7 @@ class ResponsesSseEncoder:
             "output": output,
             "parallel_tool_calls": self.request.parallel_tool_calls is not False,
             "temperature": self.request.temperature,
+            "top_p": self.request.top_p,
             "tool_choice": _responses_tool_choice(self.request),
             "tools": [
                 {

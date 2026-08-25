@@ -51,7 +51,11 @@ def _prepared_gateway_models() -> tuple[
         connection="openai",
         provider="openai",
         model="gpt-5.6-luna",
-        capabilities=ModelCapabilities(supports_completions=True, reasoning_effort="medium"),
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            supports_reasoning=True,
+            reasoning_effort="medium",
+        ),
         pricing_source=PricingSource.EXP_CATALOG,
         configured=False,
     )

@@ -55,6 +55,7 @@ def test_maintained_sampling_pins_flow_into_resolved_capabilities() -> None:
     )
 
     assert not pinned.capabilities.supports_temperature
+    assert pinned.capabilities.supports_reasoning
     assert pinned.capabilities.reasoning_effort == "medium"
     assert unpinned.capabilities.supports_temperature
     assert unpinned.capabilities.reasoning_effort is None
@@ -142,7 +143,9 @@ def test_reasoning_capable_models_resolve_with_the_default_medium_pin() -> None:
     )
 
     assert reasoning.capabilities.reasoning_effort == "medium"
+    assert reasoning.capabilities.supports_reasoning
     assert plain.capabilities.reasoning_effort is None
+    assert not plain.capabilities.supports_reasoning
     assert embedding.capabilities.reasoning_effort is None
 
 

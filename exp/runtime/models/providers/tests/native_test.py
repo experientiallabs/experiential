@@ -19,7 +19,6 @@ from exp.runtime.models.providers.anthropic import (
     anthropic_messages_response,
 )
 from exp.runtime.models.providers.errors import (
-    ProviderCapabilityError,
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderRetryableResponseError,
@@ -185,6 +184,7 @@ def test_openai_reasoning_model_declarations_shape_the_wire_payload() -> None:
         base_url="https://openai.fixture/v1",
         transport=transport,
         supports_temperature=False,
+        supports_reasoning=True,
         reasoning_effort="xhigh",
     )
 
@@ -202,28 +202,53 @@ def test_openai_responses_forwards_top_p_on_sampling_models() -> None:
         "gpt-5.4",
         _request(top_p=1.0),
         supports_temperature=True,
+        supports_reasoning=False,
     )
 
     assert payload["temperature"] == 0.2
     assert payload["top_p"] == 1.0
 
 
-def test_openai_reasoning_model_rejects_top_p_before_dispatch() -> None:
-    """Pinned-sampling OpenAI models reject top_p instead of silently ignoring it."""
-    transport = ScriptedJsonTransport([])
+def test_openai_reasoning_model_omits_top_p_before_dispatch() -> None:
+    """Pinned-sampling OpenAI models omit top_p instead of failing the request."""
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "id": "resp_visible",
+                    "object": "response",
+                    "created_at": 2.0,
+                    "status": "completed",
+                    "model": "gpt-5.6-luna",
+                    "parallel_tool_calls": True,
+                    "tool_choice": "auto",
+                    "tools": [],
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": "msg_visible",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+                        }
+                    ],
+                },
+            )
+        ]
+    )
     client = OpenAIClient(
         model=_snapshot("openai", "gpt-5.6-luna"),
         api_key="fixture-openai-key",
         base_url="https://openai.fixture/v1",
         transport=transport,
         supports_temperature=False,
+        supports_reasoning=True,
         reasoning_effort="xhigh",
     )
 
-    with pytest.raises(ProviderCapabilityError, match="top_p") as captured:
-        client.complete(_request(top_p=1.0))
-    assert captured.value.capability == "top_p"
-    assert transport.requests == []
+    client.complete(_request(top_p=1.0))
+    assert "top_p" not in transport.requests[0].payload
 
 
 def test_openai_embeddings_use_the_shared_normalized_response_contract() -> None:

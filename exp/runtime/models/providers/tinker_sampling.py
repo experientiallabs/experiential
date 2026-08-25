@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast, runtime_checkable
 
@@ -29,6 +30,7 @@ _OPTIONAL_DEPENDENCY_GUIDANCE = (
     "install the Tinker sampling dependencies with `uv sync --extra sft` or "
     "`pip install 'experiential[sft]'`"
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class TinkerPromptMessage(TypedDict):
@@ -122,6 +124,23 @@ class TinkerSdkSampler:
         renderer = self._get_renderer(sampler)
         prompt = _tinker_prompt(request, renderer)
         import tinker
+
+        ignored = tuple(
+            name
+            for name, value in (
+                ("top_p", request.top_p),
+                ("top_k", request.top_k),
+                ("logprobs", request.logprobs),
+                ("top_logprobs", request.top_logprobs),
+                ("reasoning_effort", request.reasoning_effort),
+            )
+            if value is not None
+        )
+        if ignored:
+            _LOGGER.info(
+                "omitting unsupported optional generation parameters for Tinker route: %s",
+                ", ".join(ignored),
+            )
 
         response = sampler.sample(
             prompt=prompt,

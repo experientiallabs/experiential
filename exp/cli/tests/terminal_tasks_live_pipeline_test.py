@@ -55,6 +55,7 @@ _MODELS: tuple[dict[str, object], ...] = (
         "capabilities": {
             "supports_completions": True,
             "supports_temperature": False,
+            "supports_reasoning": True,
             "reasoning_effort": "xhigh",
             "supports_tools": True,
             "supports_structured_output": True,
@@ -73,6 +74,7 @@ _MODELS: tuple[dict[str, object], ...] = (
         "capabilities": {
             "supports_completions": True,
             "supports_temperature": False,
+            "supports_reasoning": True,
             "reasoning_effort": "xhigh",
             "supports_structured_output": True,
             "maximum_output_tokens": 32000,

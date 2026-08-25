@@ -33,7 +33,6 @@ from exp.runtime.models.providers.base import (
     GatewayWireProfile,
 )
 from exp.runtime.models.providers.errors import (
-    ProviderCapabilityError,
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
@@ -54,6 +53,10 @@ def openai_responses_request(
     request: ModelRequest,
     *,
     supports_temperature: bool = True,
+    supports_top_p: bool | None = None,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Convert one EXP request into OpenAI's native Responses API shape.
@@ -62,16 +65,20 @@ def openai_responses_request(
         model_id: OpenAI model identifier.
         request: Typed EXP request.
         supports_temperature: Catalog declaration that the model accepts an explicit sampling
-            temperature. Reasoning models pin their sampling and reject the parameter, so a
-            ``False`` declaration omits any requested temperature from the wire payload and
-            rejects an explicit ``top_p`` before dispatch.
+            temperature. Unsupported optional controls are omitted before dispatch.
+        supports_top_p: Catalog declaration for nucleus sampling. ``None`` follows
+            ``supports_temperature`` for older catalog records.
+        supports_top_k: Whether this route accepts top-k sampling. Native OpenAI does not.
+        supports_logprobs: Whether this route accepts top-logprob controls. The normalized
+            gateway response does not currently expose provider logprob details.
+        supports_reasoning: Catalog declaration that this exact model accepts the Responses
+            ``reasoning`` object. Unsupported routes omit it before dispatch.
         reasoning_effort: Optional catalog-pinned reasoning-effort level sent verbatim.
 
     Returns:
         Non-streaming Responses API JSON with provider-side storage disabled.
 
     Raises:
-        ProviderCapabilityError: The request sets ``top_p`` on a model that pins sampling.
         ValueError: A message cannot be represented without losing tool linkage.
     """
     instructions: list[str] = []
@@ -109,12 +116,18 @@ def openai_responses_request(
         )
     if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
-    if request.top_p is not None:
-        if not supports_temperature:
-            raise ProviderCapabilityError(capability="top_p")
+    top_p_supported = supports_temperature if supports_top_p is None else supports_top_p
+    if request.top_p is not None and top_p_supported:
         payload["top_p"] = request.top_p
-    if reasoning_effort is not None:
-        payload["reasoning"] = {"effort": reasoning_effort}
+    # Native OpenAI Responses has no top-k request field. Keep the shared
+    # parameter in the signature so route capability plumbing stays uniform,
+    # but never let a mistaken catalog flag put this extension on the wire.
+    del supports_top_k
+    if request.top_logprobs is not None and supports_logprobs:
+        payload["top_logprobs"] = request.top_logprobs
+    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    if supports_reasoning and effective_reasoning_effort is not None:
+        payload["reasoning"] = {"effort": effective_reasoning_effort}
     if request.maximum_output_tokens is not None:
         payload["max_output_tokens"] = request.maximum_output_tokens
     return payload
@@ -208,6 +221,10 @@ class OpenAIClient(OpenAIEmbeddingMixin):
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         supports_temperature: bool = True,
+        supports_top_p: bool | None = None,
+        supports_top_k: bool = False,
+        supports_logprobs: bool = False,
+        supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
     ) -> None:
         """Create a direct OpenAI client with one explicitly resolved credential.
@@ -222,6 +239,8 @@ class OpenAIClient(OpenAIEmbeddingMixin):
                 above it with the requested maximum output tokens.
             supports_temperature: Catalog declaration that the model accepts an explicit
                 sampling temperature; ``False`` omits requested temperatures from payloads.
+            supports_reasoning: Catalog declaration that the model accepts the Responses
+                ``reasoning`` object.
             reasoning_effort: Optional catalog-pinned reasoning-effort level.
         """
         super().__init__(
@@ -233,6 +252,10 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             timeout_seconds=timeout_seconds,
         )
         self._supports_temperature = supports_temperature
+        self._supports_top_p = supports_temperature if supports_top_p is None else supports_top_p
+        self._supports_top_k = supports_top_k
+        self._supports_logprobs = supports_logprobs
+        self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
 
     async def stream(
@@ -270,6 +293,10 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             retry_policy=retry_policy or self._retry_policy,
             timeout_seconds=self._timeout_seconds,
             supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
         )
 
@@ -282,6 +309,10 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
             supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
         )
 
@@ -295,6 +326,10 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             self._model.model_id,
             request,
             supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
         )
 

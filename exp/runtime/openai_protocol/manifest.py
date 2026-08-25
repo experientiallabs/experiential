@@ -49,6 +49,10 @@ CHAT_MANIFEST = CompatibilityManifest(
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
             "structured_output",
         ),
+        _field("reasoning_effort", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
+        _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
+        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
         # gateway-side, never forwarded to the model: `safety_identifier` is the
@@ -65,16 +69,13 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "function_call",
                 "functions",
                 "logit_bias",
-                "logprobs",
                 "modalities",
                 "n",
                 "prediction",
                 "presence_penalty",
-                "reasoning_effort",
                 "seed",
                 "service_tier",
                 "store",
-                "top_logprobs",
                 "verbosity",
                 "web_search_options",
             )
@@ -95,6 +96,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "previous_response_id",
                 "max_output_tokens",
                 "temperature",
+                "top_p",
                 "stream",
             )
         ),
@@ -106,6 +108,9 @@ RESPONSES_MANIFEST = CompatibilityManifest(
             "parallel_tool_calls",
         ),
         _field("text", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "structured_output"),
+        _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
+        _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec), same handling as the
         # Chat surface: accepted and recorded gateway-side, never forwarded.
@@ -120,12 +125,9 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "include",
                 "max_tool_calls",
                 "prompt",
-                "reasoning",
                 "service_tier",
                 "store",
                 "stream_options",
-                "top_logprobs",
-                "top_p",
                 "truncation",
             )
         ),

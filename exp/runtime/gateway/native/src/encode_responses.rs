@@ -36,6 +36,8 @@ pub struct ResponsesEnvelope {
     pub parallel_tool_calls: bool,
     #[serde(default)]
     pub temperature: Value,
+    #[serde(default)]
+    pub top_p: Value,
     #[serde(default = "default_tool_choice")]
     pub tool_choice: Value,
     #[serde(default = "default_tools")]
@@ -52,6 +54,7 @@ impl Default for ResponsesEnvelope {
             metadata: Value::Null,
             parallel_tool_calls: true,
             temperature: Value::Null,
+            top_p: Value::Null,
             tool_choice: default_tool_choice(),
             tools: default_tools(),
             max_output_tokens: Value::Null,
@@ -537,6 +540,7 @@ impl ResponsesSseEncoder {
             "output": output,
             "parallel_tool_calls": self.envelope.parallel_tool_calls,
             "temperature": self.envelope.temperature,
+            "top_p": self.envelope.top_p,
             "tool_choice": self.envelope.tool_choice,
             "tools": self.envelope.tools,
             "max_output_tokens": self.envelope.max_output_tokens,

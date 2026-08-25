@@ -227,8 +227,19 @@ def declare_model(session: SetupSession, *, console: Console) -> AvailableModel 
         )
         if supports_completions
         else None,
-        reasoning_effort=_ask_reasoning_effort(console=console) if supports_completions else None,
+        supports_reasoning=False,
+        reasoning_effort=None,
     )
+    reasoning_effort = _ask_reasoning_effort(console=console) if supports_completions else None
+    if reasoning_effort is not None:
+        capabilities = capabilities.model_copy(
+            update={
+                "supports_temperature": False,
+                "supports_top_p": False,
+                "supports_reasoning": True,
+                "reasoning_effort": reasoning_effort,
+            }
+        )
     taken = frozenset(item.alias for item in (*session.available, *session.manual))
     return AvailableModel(
         alias=derive_model_alias(provider, model, taken),

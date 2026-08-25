@@ -21,8 +21,16 @@ from exp.common.models import (
     Usage,
 )
 from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.models.providers.async_transport import RequestDeadline
-from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
+from exp.runtime.models.providers.async_transport import (
+    AsyncJsonHttpTransport,
+    RequestDeadline,
+)
+from exp.runtime.models.providers.base import (
+    DEFAULT_RETRY_POLICY,
+    DEFAULT_TIMEOUT_SECONDS,
+    GatewayWireProfile,
+    ProviderHttpClient,
+)
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
@@ -36,7 +44,7 @@ from exp.runtime.models.providers.streaming import (
     NormalizedProviderStream,
     start_openai_compatible_stream,
 )
-from exp.runtime.models.providers.transport import RetryPolicy
+from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_REFERER = "https://github.com/experientiallabs/experiential"
@@ -52,6 +60,12 @@ def openai_compatible_request(
     request: ModelRequest,
     *,
     token_limit_key: str = "max_tokens",
+    supports_temperature: bool = True,
+    supports_top_p: bool | None = None,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Convert a EXP request into one non-streaming Chat Completions payload.
 
@@ -61,6 +75,14 @@ def openai_compatible_request(
         token_limit_key: Wire field carrying the output-token ceiling. Azure OpenAI
             reasoning deployments reject ``max_tokens`` and require
             ``max_completion_tokens``.
+        supports_temperature: Whether this exact model accepts explicit sampling controls.
+        supports_top_p: Whether this exact model accepts nucleus sampling. ``None`` follows
+            ``supports_temperature`` for older catalog records.
+        supports_top_k: Whether this exact route accepts top-k sampling.
+        supports_logprobs: Whether this exact route accepts Chat logprob controls. The
+            normalized gateway response currently leaves response logprobs null.
+        supports_reasoning: Whether this exact model accepts ``reasoning_effort``.
+        reasoning_effort: Optional catalog-pinned reasoning effort.
 
     Returns:
         A JSON object for ``/chat/completions``.
@@ -94,12 +116,22 @@ def openai_compatible_request(
             if not isinstance(request.tool_choice, str)
             else request.tool_choice
         )
-    if request.temperature is not None:
+    if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
-    if request.top_p is not None:
+    top_p_supported = supports_temperature if supports_top_p is None else supports_top_p
+    if request.top_p is not None and top_p_supported:
         payload["top_p"] = request.top_p
+    if request.top_k is not None and supports_top_k:
+        payload["top_k"] = request.top_k
+    if request.logprobs is not None and supports_logprobs:
+        payload["logprobs"] = request.logprobs
+    if request.top_logprobs is not None and supports_logprobs:
+        payload["top_logprobs"] = request.top_logprobs
     if request.maximum_output_tokens is not None:
         payload[token_limit_key] = request.maximum_output_tokens
+    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    if supports_reasoning and effective_reasoning_effort is not None:
+        payload["reasoning_effort"] = effective_reasoning_effort
     return payload
 
 
@@ -219,6 +251,38 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
 
     token_limit_key: ClassVar[str] = "max_tokens"
 
+    def __init__(
+        self,
+        *,
+        model: ModelSnapshot,
+        api_key: str,
+        base_url: str,
+        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        supports_temperature: bool = True,
+        supports_top_p: bool | None = None,
+        supports_top_k: bool = False,
+        supports_logprobs: bool = False,
+        supports_reasoning: bool = False,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        """Create one compatible client with explicit model wire capabilities."""
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            transport=transport,
+            retry_policy=retry_policy,
+            timeout_seconds=timeout_seconds,
+        )
+        self._supports_temperature = supports_temperature
+        self._supports_top_p = supports_temperature if supports_top_p is None else supports_top_p
+        self._supports_top_k = supports_top_k
+        self._supports_logprobs = supports_logprobs
+        self._supports_reasoning = supports_reasoning
+        self._reasoning_effort = reasoning_effort
+
     async def stream(
         self,
         request: GatewayRequest,
@@ -254,6 +318,12 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             retry_policy=retry_policy or self._retry_policy,
             timeout_seconds=self._timeout_seconds,
             token_limit_key=self.token_limit_key,
+            supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_effort=self._reasoning_effort,
         )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
@@ -264,6 +334,12 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
+            supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_effort=self._reasoning_effort,
             token_limit_key=self.token_limit_key,
         )
 
@@ -274,7 +350,15 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a Chat Completions payload."""
         return openai_compatible_request(
-            self._model.model_id, request, token_limit_key=self.token_limit_key
+            self._model.model_id,
+            request,
+            token_limit_key=self.token_limit_key,
+            supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_effort=self._reasoning_effort,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:

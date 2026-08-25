@@ -16,9 +16,11 @@ from exp.common.models import (
     Usage,
 )
 from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.models.providers.async_transport import RequestDeadline
+from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport, RequestDeadline
 from exp.runtime.models.providers.base import (
     DEFAULT_MAXIMUM_OUTPUT_TOKENS,
+    DEFAULT_RETRY_POLICY,
+    DEFAULT_TIMEOUT_SECONDS,
     GatewayWireProfile,
     ProviderHttpClient,
 )
@@ -35,13 +37,20 @@ from exp.runtime.models.providers.streaming import (
     NormalizedProviderStream,
     start_anthropic_messages_stream,
 )
-from exp.runtime.models.providers.transport import RetryPolicy
+from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
 
 
-def anthropic_messages_request(model_id: str, request: ModelRequest) -> JsonObject:
+def anthropic_messages_request(
+    model_id: str,
+    request: ModelRequest,
+    *,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+) -> JsonObject:
     """Convert one EXP request into native Anthropic Messages JSON.
 
     Args:
@@ -82,10 +91,12 @@ def anthropic_messages_request(model_id: str, request: ModelRequest) -> JsonObje
         ]
     if request.tool_choice is not None:
         payload["tool_choice"] = _anthropic_tool_choice(request.tool_choice)
-    if request.temperature is not None:
+    if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
-    if request.top_p is not None:
+    if request.top_p is not None and supports_top_p:
         payload["top_p"] = request.top_p
+    if request.top_k is not None and supports_top_k:
+        payload["top_k"] = request.top_k
     return payload
 
 
@@ -152,6 +163,34 @@ def anthropic_messages_response(
 class AnthropicClient(ProviderHttpClient):
     """Calls one Anthropic Messages model, which intentionally has no embedding method."""
 
+    def __init__(
+        self,
+        *,
+        model: ModelSnapshot,
+        api_key: str,
+        base_url: str = ANTHROPIC_BASE_URL,
+        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        supports_temperature: bool = True,
+        supports_top_p: bool = True,
+        supports_top_k: bool = False,
+        supports_logprobs: bool = False,
+    ) -> None:
+        """Create an Anthropic client with explicit generation capability gates."""
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            transport=transport,
+            retry_policy=retry_policy,
+            timeout_seconds=timeout_seconds,
+        )
+        self._supports_temperature = supports_temperature
+        self._supports_top_p = supports_top_p
+        self._supports_top_k = supports_top_k
+        self._supports_logprobs = supports_logprobs
+
     async def stream(
         self,
         request: GatewayRequest,
@@ -186,6 +225,10 @@ class AnthropicClient(ProviderHttpClient):
             idempotency_key=idempotency_key,
             retry_policy=retry_policy or self._retry_policy,
             timeout_seconds=self._timeout_seconds,
+            supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
         )
 
     def _headers(self) -> dict[str, str]:
@@ -204,6 +247,10 @@ class AnthropicClient(ProviderHttpClient):
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
+            supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
         )
 
     def _completion_path(self) -> str:
@@ -212,7 +259,13 @@ class AnthropicClient(ProviderHttpClient):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native Messages payload."""
-        return anthropic_messages_request(self._model.model_id, request)
+        return anthropic_messages_request(
+            self._model.model_id,
+            request,
+            supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+        )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one completed Messages payload into the shared response contract."""

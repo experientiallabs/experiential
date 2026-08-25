@@ -192,7 +192,12 @@ def interactive_gateway_setup(
     capabilities = selected.capabilities or ModelCapabilities()
     if model_selection.reasoning_effort is not None:
         capabilities = capabilities.model_copy(
-            update={"reasoning_effort": model_selection.reasoning_effort}
+            update={
+                "supports_reasoning": True,
+                "supports_temperature": False,
+                "supports_top_p": False,
+                "reasoning_effort": model_selection.reasoning_effort,
+            }
         )
     total_steps = len(session.endpoints) + 8
     completed_steps = 0

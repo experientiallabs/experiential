@@ -251,7 +251,7 @@ def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> No
 
 
 def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None:
-    """Invalid JSON, non-objects, and protocol violations use the shared codes."""
+    """Invalid JSON, non-objects, and unsupported protocol fields use shared codes."""
     control, raw_key = _control_plane(tmp_path)
     with pytest.raises(NativeBridgeError) as invalid_json:
         control.admit(json.dumps({"raw_key": raw_key, "body": "{not json"}))
@@ -260,7 +260,7 @@ def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None
         control.admit(json.dumps({"raw_key": raw_key, "body": "[1, 2]"}))
     assert json.loads(not_object.value.public_error_json)["code"] == "invalid_request"
     rejected = json.dumps(
-        {"model": "coding", "messages": [{"role": "user", "content": "x"}], "logprobs": True}
+        {"model": "coding", "messages": [{"role": "user", "content": "x"}], "logit_bias": {}}
     )
     with pytest.raises(NativeBridgeError) as protocol:
         control.admit(json.dumps({"raw_key": raw_key, "body": rejected}))
