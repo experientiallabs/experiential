@@ -43,6 +43,7 @@ from exp.runtime.models.providers.streaming_events import (
     TERMINAL_EVENT_KINDS,
     OpenAIReasoningSummaryParser,
     provider_refusal_failure,
+    retain_provider_entry,
 )
 from exp.runtime.models.providers.streaming_requests import (
     anthropic_messages_stream_payload,
@@ -575,7 +576,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                 )
                 name = require_string(item.get("name"), "OpenAI function call name")
                 tool = _ToolAccumulator(index=index, call_id=call_id, name=name)
-                tools[index] = tool
+                retain_provider_entry(tools, index, tool)
                 yield factory.create(
                     GatewayEventKind.TOOL_CALL_STARTED,
                     tool_call_index=index,
@@ -718,7 +719,8 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
                 name = require_string(block.get("name"), "Anthropic tool name")
                 if index in tools:
                     raise ProviderResponseError("Anthropic stream repeated a tool-call start")
-                tools[index] = _ToolAccumulator(index=index, call_id=call_id, name=name)
+                tool = _ToolAccumulator(index=index, call_id=call_id, name=name)
+                retain_provider_entry(tools, index, tool)
                 yield factory.create(
                     GatewayEventKind.TOOL_CALL_STARTED,
                     tool_call_index=index,
@@ -887,7 +889,7 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
                     call_id = require_string(item.get("id"), "OpenAI-compatible tool ID")
                     name = require_string(function.get("name"), "OpenAI-compatible tool name")
                     tool = _ToolAccumulator(index=index, call_id=call_id, name=name)
-                    tools[index] = tool
+                    retain_provider_entry(tools, index, tool)
                     yield factory.create(
                         GatewayEventKind.TOOL_CALL_STARTED,
                         tool_call_index=index,

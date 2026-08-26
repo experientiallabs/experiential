@@ -90,6 +90,7 @@ impl Normalizer {
             .map_err(|message| malformed(&message))?;
         let name = require_string(tool, "name", "Bedrock tool name")
             .map_err(|message| malformed(&message))?;
+        self.reserve_tool_entry(index)?;
         self.tools
             .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
         Ok(vec![Event::ToolCallStarted {

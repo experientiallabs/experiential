@@ -39,6 +39,36 @@ TERMINAL_EVENT_KINDS = frozenset(
 
 _REASONING_SUMMARY_DELTA = "response.reasoning_summary_text.delta"
 _REASONING_SUMMARY_DONE = "response.reasoning_summary_text.done"
+MAXIMUM_RETAINED_PROVIDER_ENTRIES = 4_096
+PROVIDER_OUTPUT_OVERFLOW_MESSAGE = "provider output exceeded the gateway response limit"
+
+
+def require_retained_provider_entry_capacity(retained_entries: int) -> None:
+    """Fail before adding another provider-indexed stream accumulator.
+
+    Args:
+        retained_entries: Number of entries already retained by the accumulator.
+
+    Raises:
+        ProviderResponseError: The bounded provider-state ceiling is exhausted.
+    """
+    if retained_entries >= MAXIMUM_RETAINED_PROVIDER_ENTRIES:
+        raise ProviderResponseError(PROVIDER_OUTPUT_OVERFLOW_MESSAGE)
+
+
+def retain_provider_entry[KeyT, ValueT](
+    entries: dict[KeyT, ValueT], key: KeyT, value: ValueT
+) -> None:
+    """Insert or replace one provider entry without exceeding the hard ceiling.
+
+    Args:
+        entries: Provider-indexed accumulator map.
+        key: Provider-controlled entry key.
+        value: New retained accumulator value.
+    """
+    if key not in entries:
+        require_retained_provider_entry_capacity(len(entries))
+    entries[key] = value
 
 
 @dataclass
@@ -76,14 +106,16 @@ class OpenAIReasoningSummaryParser:
         key = (output_index, summary_index)
         if event_type == _REASONING_SUMMARY_DELTA:
             delta = _optional_string(payload.get("delta"), "OpenAI reasoning summary delta")
-            self._summaries[key] = self._summaries.get(key, "") + delta
+            if delta:
+                retain_provider_entry(self._summaries, key, self._summaries.get(key, "") + delta)
         else:
             final_text = require_string(payload.get("text"), "OpenAI reasoning summary text")
             streamed = self._summaries.get(key, "")
             if streamed and streamed != final_text:
                 raise ProviderResponseError("OpenAI reasoning summary fragments changed at done")
             delta = final_text if not streamed else ""
-            self._summaries[key] = final_text
+            if final_text and not streamed:
+                retain_provider_entry(self._summaries, key, final_text)
         if not delta:
             return True, None
         return True, create(

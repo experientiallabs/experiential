@@ -26,6 +26,9 @@ from exp.runtime.models.providers.errors import (
     require_integer,
     require_string,
 )
+from exp.runtime.models.providers.streaming_events import (
+    retain_provider_entry,
+)
 from exp.runtime.models.providers.transport import ProviderTransportError
 
 _CANCELLATION_BOUND_SECONDS = 1.0
@@ -251,7 +254,7 @@ class BedrockProviderStream:
                 "Bedrock tool name",
             ),
         )
-        self._tools[index] = accumulator
+        retain_provider_entry(self._tools, index, accumulator)
         return [
             self._event(
                 GatewayEventKind.TOOL_CALL_STARTED,

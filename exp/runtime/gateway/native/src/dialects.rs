@@ -84,6 +84,11 @@ impl FrameDecoder {
 /// Python engine's 64 MiB bounded-aggregation limit.
 pub const MAXIMUM_RETAINED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Aggregate ceiling on provider-indexed state retained while normalizing a
+/// stream. Byte accounting alone cannot bound empty reasoning fragments or
+/// tool starts with many distinct provider-controlled indices.
+pub const MAXIMUM_RETAINED_PROVIDER_ENTRIES: usize = 4_096;
+
 /// The sanitized message that marks an aggregate output overflow; the HTTP
 /// layer maps it to the shared `provider_output_too_large` public error.
 pub const OUTPUT_OVERFLOW_MESSAGE: &str = "provider output exceeded the gateway response limit";
@@ -209,6 +214,33 @@ impl Normalizer {
             ));
         }
         Ok(())
+    }
+
+    /// Reserve one provider-indexed state entry across tools and summaries.
+    fn reserve_provider_entry(&self, exists: bool) -> Result<(), Failure> {
+        if !exists
+            && self
+                .tools
+                .len()
+                .saturating_add(self.reasoning_summaries.len())
+                >= MAXIMUM_RETAINED_PROVIDER_ENTRIES
+        {
+            return Err(Failure::new(
+                FailureClass::ProviderInternal,
+                OUTPUT_OVERFLOW_MESSAGE,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reserve a new tool-call accumulator when this index is not retained.
+    fn reserve_tool_entry(&self, index: u32) -> Result<(), Failure> {
+        self.reserve_provider_entry(self.tools.contains_key(&index))
+    }
+
+    /// Reserve a new reasoning-summary accumulator when this key is not retained.
+    fn reserve_summary_entry(&self, key: (u32, u32)) -> Result<(), Failure> {
+        self.reserve_provider_entry(self.reasoning_summaries.contains_key(&key))
     }
 
     /// Whether a terminal event already ended the stream.
