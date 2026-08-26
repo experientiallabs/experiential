@@ -13,7 +13,7 @@ boundary encoding; this module owns the frozen semantics.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
@@ -24,12 +24,16 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
+from exp.runtime.gateway.execution_resolution import (
+    _require_deployment_identity,
+    _resolved_wire_profile,
+)
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
-from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
+from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
@@ -80,37 +84,6 @@ class InflightRequest:
         """Size the per-deployment attempt counters to the frozen route."""
         if not self.attempt_counts:
             self.attempt_counts = [0 for _ in self.route.deployments]
-
-
-def _require_deployment_identity(
-    deployment: ExactModelDeployment,
-    resolved: ResolvedModel,
-) -> None:
-    """Fail before accounting or network work when runtime resolution drifts from authority.
-
-    A catalog record may pin a response-only served-model identity that differs from the
-    requested provider model. The frozen deployment names the requested model, so either the
-    resolved requested identity or the pinned served identity may match it.
-
-    Args:
-        deployment: Frozen certified deployment from the authorized catalog.
-        resolved: Runtime resolution of the deployment's source alias.
-
-    Raises:
-        ValueError: The resolved runtime client differs from the frozen deployment.
-    """
-    if (
-        resolved.alias != deployment.source_alias
-        or resolved.snapshot.provider != deployment.provider
-        or deployment.provider_model not in {resolved.snapshot.model_id, resolved.served_model_id}
-        or resolved.snapshot.revision != deployment.revision
-        or resolved.snapshot.connection_sha256 != deployment.connection_sha256
-        or resolved.snapshot.billing_source != deployment.billing_source
-        or (
-            deployment.capabilities is not None and resolved.capabilities != deployment.capabilities
-        )
-    ):
-        raise ValueError("resolved runtime client differs from the frozen gateway deployment")
 
 
 def deployment_health_key(
@@ -250,15 +223,15 @@ def resolve_route_profiles(
                 f"provider {deployment.provider!r} has no native wire profile"
             )
         try:
-            profile = client.gateway_wire_profile()
+            # Intersect the client's wire profile with the frozen catalog
+            # capability contract before payload bytes are frozen.
+            profile = _resolved_wire_profile(deployment, resolved)
         except ProviderCapabilityError as exc:
             if exc.capability != "native_data_plane":
                 raise
             raise NativeDialectUnavailableError(
                 f"provider {deployment.provider!r} has no native dialect implementation"
             ) from exc
-        if not profile.model_id:
-            profile = replace(profile, model_id=resolved.snapshot.model_id)
         resolved_wires.append((profile, client))
     return tuple(resolved_wires)
 

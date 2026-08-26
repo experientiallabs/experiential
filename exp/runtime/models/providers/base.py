@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import math
 import time
 from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import ClassVar, Literal
 from uuid import uuid4
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot
+from exp.common.models import ChatMaxTokensField, ModelRequest, ModelResponse, ModelSnapshot
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
     RequestDeadline,
@@ -35,6 +36,16 @@ from exp.runtime.models.providers.transport import (
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_RETRY_POLICY = RetryPolicy()
 DEFAULT_MAXIMUM_OUTPUT_TOKENS = 4096
+
+ReasoningWireFormat = Literal[
+    "none",
+    "openai_responses",
+    "reasoning_effort",
+    "reasoning",
+    "anthropic_adaptive",
+    "gemini_thinking",
+]
+"""Provider-wire representation for one normalized reasoning-effort control."""
 
 COMPLETION_SECONDS_PER_OUTPUT_TOKEN = 0.03
 """Per-token completion allowance, a conservative approximately 33 tokens per second."""
@@ -90,17 +101,123 @@ class GatewayWireProfile:
     supports_temperature: bool = True
     """Whether the exact model accepts explicit sampling temperature."""
 
+    minimum_temperature: float = 0.0
+    """Smallest temperature value accepted by this provider wire."""
+
+    maximum_temperature: float = 2.0
+    """Largest temperature value accepted by this provider wire."""
+
+    supports_top_p: bool | None = None
+    """Whether the exact route accepts nucleus sampling; ``None`` follows temperature support."""
+
+    minimum_top_p: float = 0.0
+    """Smallest top-p value accepted by this provider wire."""
+
+    maximum_top_p: float = 1.0
+    """Largest top-p value accepted by this provider wire."""
+
+    supports_top_k: bool = False
+    """Whether the exact route accepts top-k sampling."""
+
+    minimum_top_k: int = 1
+    """Smallest top-k value accepted by this provider wire."""
+
+    maximum_top_k: int | None = None
+    """Largest top-k value accepted by the provider wire, when known."""
+
+    supports_logprobs: bool = False
+    """Provider metadata for logprob support.
+
+    Dispatch stays disabled until normalized output projection exists.
+    """
+
+    supports_reasoning: bool = False
+    """Whether this exact route accepts the reasoning parameter on its wire dialect."""
+
+    reasoning_wire_format: ReasoningWireFormat = "none"
+    """Exact provider field used to carry normalized reasoning effort."""
+
     reasoning_effort: str | None = None
     """Optional catalog-pinned reasoning effort."""
 
-    token_limit_key: str = "max_tokens"
+    sampling_requires_reasoning_none: bool = False
+    """Whether sampling controls require an exact ``none`` reasoning effort."""
+
+    token_limit_key: ChatMaxTokensField = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
+
+    maximum_output_tokens: int | None = None
+    """Largest caller output-token ceiling accepted by this exact model."""
 
     signs_request_body: bool = False
     """Whether dispatch headers are computed per request over the exact
     serialized body bytes (SigV4). When true the admission response carries a
     pre-serialized body the data plane must send verbatim, and the resolved
     client exposes ``sign_gateway_dispatch``."""
+
+    def __post_init__(self) -> None:
+        """Reject malformed operator wire contracts before admission."""
+        if self.dialect not in {
+            "openai_responses",
+            "anthropic_messages",
+            "openai_compatible",
+            "gemini_generate_content",
+            "bedrock_converse_stream",
+        }:
+            raise ValueError("gateway wire dialect is not implemented")
+        if self.reasoning_wire_format not in {
+            "none",
+            "openai_responses",
+            "reasoning_effort",
+            "reasoning",
+            "anthropic_adaptive",
+            "gemini_thinking",
+        }:
+            raise ValueError("gateway reasoning wire format is not implemented")
+        if self.supports_reasoning and self.reasoning_wire_format == "none":
+            raise ValueError("reasoning support requires a concrete wire format")
+        if self.reasoning_effort is not None and not self.supports_reasoning:
+            raise ValueError("a configured reasoning effort requires reasoning support")
+        if self.sampling_requires_reasoning_none and not self.supports_reasoning:
+            raise ValueError("conditional sampling requires reasoning support")
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("gateway wire timeout_seconds must be finite and positive")
+        if self.token_limit_key not in {"max_tokens", "max_completion_tokens"}:
+            raise ValueError("gateway wire token_limit_key is not a supported Chat token field")
+        ranges = (
+            ("temperature", self.minimum_temperature, self.maximum_temperature, 2.0, False),
+            ("top_p", self.minimum_top_p, self.maximum_top_p, 1.0, False),
+            ("top_k", self.minimum_top_k, self.maximum_top_k, None, True),
+        )
+        for name, minimum, maximum, public_maximum, integral in ranges:
+            values = (minimum,) if maximum is None else (minimum, maximum)
+            if any(
+                isinstance(value, bool) or not isinstance(value, (int, float)) for value in values
+            ):
+                raise ValueError(f"gateway wire {name} range must be numeric")
+            if not math.isfinite(minimum) or (maximum is not None and not math.isfinite(maximum)):
+                raise ValueError(f"gateway wire {name} range must be finite")
+            if minimum < 0 or (maximum is not None and maximum < 0):
+                raise ValueError(f"gateway wire {name} range must be nonnegative")
+            if public_maximum is not None and maximum is not None and maximum > public_maximum:
+                raise ValueError(f"gateway wire maximum_{name} exceeds the public request surface")
+            if integral and (
+                not isinstance(minimum, int)
+                or isinstance(minimum, bool)
+                or (
+                    maximum is not None
+                    and (not isinstance(maximum, int) or isinstance(maximum, bool))
+                )
+            ):
+                raise ValueError(f"gateway wire {name} range must use integers")
+            if maximum is not None and minimum > maximum:
+                raise ValueError(f"gateway wire minimum_{name} cannot exceed maximum_{name}")
+        if self.maximum_output_tokens is not None and (
+            not isinstance(self.maximum_output_tokens, int)
+            or isinstance(self.maximum_output_tokens, bool)
+            or self.maximum_output_tokens <= 0
+        ):
+            raise ValueError("gateway wire maximum_output_tokens must be a positive integer")
 
 
 class ProviderHttpClient(abc.ABC):

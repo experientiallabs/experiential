@@ -751,6 +751,7 @@ def _configured_gateway(
     root: Path,
     *,
     base_url: str = "http://127.0.0.1:9/v1",
+    capabilities: ModelCapabilities | None = None,
 ) -> tuple[GatewayManagement, str]:
     """Create one explicit direct alias, identity, grant, and key in real SQLite."""
     manager = GatewayManagement(root)
@@ -772,7 +773,7 @@ def _configured_gateway(
         provider_model="provider-model-exact",
         exact_model_id="model-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(),
+        capabilities=capabilities or ModelCapabilities(),
         gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
         prices=GatewayTokenPrices(),
         pricing_source=None,

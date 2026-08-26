@@ -126,6 +126,7 @@ fn is_semantic(event: &Event) -> bool {
         event,
         Event::TextDelta(_)
             | Event::RefusalDelta(_)
+            | Event::ReasoningSummaryDelta { .. }
             | Event::ToolCallStarted { .. }
             | Event::ToolArgumentsDelta { .. }
             | Event::ToolCallCompleted { .. }

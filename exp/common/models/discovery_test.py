@@ -51,10 +51,11 @@ def test_maintained_sampling_pins_flow_into_resolved_capabilities() -> None:
     """A reasoning model's pinned sampling and effort reach the persisted catalog snapshot."""
     pinned = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.6-luna"))
     unpinned = resolve_discovered_model(
-        DiscoveredModel(provider="anthropic", model="claude-sonnet-5")
+        DiscoveredModel(provider="anthropic", model="claude-haiku-4-5")
     )
 
     assert not pinned.capabilities.supports_temperature
+    assert pinned.capabilities.supports_reasoning
     assert pinned.capabilities.reasoning_effort == "medium"
     assert unpinned.capabilities.supports_temperature
     assert unpinned.capabilities.reasoning_effort is None
@@ -136,14 +137,47 @@ def test_catalog_request_shaping_capability_reaches_openai_runtime_metadata() ->
 def test_reasoning_capable_models_resolve_with_the_default_medium_pin() -> None:
     """Models proven to accept reasoning effort default to medium; others stay unpinned."""
     reasoning = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.6-luna"))
-    plain = resolve_discovered_model(DiscoveredModel(provider="anthropic", model="claude-sonnet-5"))
+    plain = resolve_discovered_model(
+        DiscoveredModel(provider="anthropic", model="claude-haiku-4-5")
+    )
     embedding = resolve_discovered_model(
         DiscoveredModel(provider="openai", model="text-embedding-3-small")
     )
 
     assert reasoning.capabilities.reasoning_effort == "medium"
+    assert reasoning.capabilities.supports_reasoning
     assert plain.capabilities.reasoning_effort is None
+    assert not plain.capabilities.supports_reasoning
     assert embedding.capabilities.reasoning_effort is None
+
+
+def test_discovery_preserves_complete_generation_parameter_contracts() -> None:
+    """Maintained and live metadata reach the persisted standalone catalog losslessly."""
+    gpt_51 = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.1"))
+    claude = resolve_discovered_model(DiscoveredModel(provider="anthropic", model="claude-opus-5"))
+    gemini = resolve_discovered_model(
+        DiscoveredModel(
+            provider="gemini",
+            model="gemini-3.6-flash",
+            maximum_temperature=1.5,
+        )
+    )
+
+    assert gpt_51.capabilities.supports_temperature
+    assert gpt_51.capabilities.supports_top_p
+    assert gpt_51.capabilities.sampling_requires_reasoning_none
+    assert gpt_51.capabilities.reasoning_effort == "medium"
+    assert claude.capabilities.supports_reasoning
+    assert claude.capabilities.minimum_temperature == 1.0
+    assert claude.capabilities.maximum_temperature == 1.0
+    assert claude.capabilities.minimum_top_p == 0.99
+    assert claude.capabilities.supports_top_k is False
+    assert gemini.capabilities.supports_top_k
+    assert gemini.capabilities.maximum_temperature == 1.5
+    assert gemini.capabilities.maximum_output_tokens == 65_536
+
+    pro = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5-pro"))
+    assert pro.capabilities.reasoning_effort == "high"
 
 
 def test_openai_pro_models_without_structured_output_are_not_offered_as_judges() -> None:

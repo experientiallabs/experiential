@@ -229,6 +229,10 @@ class RuntimeModelCatalog:
                 region=connection.region,
                 environment=self._environment,
                 runtime_factory=self._bedrock_runtime_factory,
+                supports_temperature=capabilities.supports_temperature,
+                supports_top_p=_supports_top_p(capabilities),
+                supports_top_k=_supports_flag(capabilities, "supports_top_k"),
+                supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
             )
             client = BoundedBedrockClient(bedrock_client)
             return ResolvedModel(
@@ -278,7 +282,12 @@ class RuntimeModelCatalog:
                 base_url=connection.base_url or OPENAI_BASE_URL,
                 transport=self._transport_factory(),
                 supports_temperature=capabilities.supports_temperature,
+                supports_top_p=_supports_top_p(capabilities),
+                supports_top_k=_supports_flag(capabilities, "supports_top_k"),
+                supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                supports_reasoning=capabilities.supports_reasoning,
                 reasoning_effort=capabilities.reasoning_effort,
+                sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
             )
             return ResolvedModel(
                 alias,
@@ -307,6 +316,14 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 api_version=connection.api_version,
                 transport=self._transport_factory(),
+                supports_temperature=capabilities.supports_temperature,
+                supports_top_p=_supports_top_p(capabilities),
+                supports_top_k=_supports_flag(capabilities, "supports_top_k"),
+                supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                supports_reasoning=capabilities.supports_reasoning,
+                reasoning_effort=capabilities.reasoning_effort,
+                chat_max_tokens_field=capabilities.chat_max_tokens_field,
+                sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
             )
             return ResolvedModel(
                 alias,
@@ -345,12 +362,35 @@ class RuntimeModelCatalog:
             raise ModelConnectionError(
                 f"OpenAI-compatible alias {alias!r} needs connection.base_url"
             )
-        http_client = factory(
-            model=snapshot,
-            api_key=api_key,
-            base_url=base_url,
-            transport=self._transport_factory(),
-        )
+        http_kwargs: dict[str, object] = {
+            "model": snapshot,
+            "api_key": api_key,
+            "base_url": base_url,
+            "transport": self._transport_factory(),
+        }
+        if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
+            http_kwargs.update(
+                {
+                    "supports_temperature": capabilities.supports_temperature,
+                    "supports_top_p": _supports_top_p(capabilities),
+                    "supports_top_k": _supports_flag(capabilities, "supports_top_k"),
+                    "supports_logprobs": _supports_flag(capabilities, "supports_logprobs"),
+                }
+            )
+        if provider in {"openrouter", "openai-compatible"}:
+            http_kwargs["chat_max_tokens_field"] = capabilities.chat_max_tokens_field
+        if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
+            http_kwargs.update(
+                {
+                    "supports_reasoning": capabilities.supports_reasoning,
+                    "reasoning_effort": capabilities.reasoning_effort,
+                }
+            )
+        if provider in {"openrouter", "openai-compatible"}:
+            http_kwargs["sampling_requires_reasoning_none"] = (
+                capabilities.sampling_requires_reasoning_none
+            )
+        http_client = factory(**http_kwargs)
         embedding_client = (
             http_client
             if capabilities.supports_embeddings is not False
@@ -448,6 +488,17 @@ SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {
     "vertex",
 }
 """Every provider identifier the runtime registry can construct a client for."""
+
+
+def _supports_flag(capabilities: ModelCapabilities, name: str) -> bool:
+    """Resolve an optional route flag conservatively for older catalog records."""
+    return bool(getattr(capabilities, name, False))
+
+
+def _supports_top_p(capabilities: ModelCapabilities) -> bool:
+    """Resolve top-p support, deriving it from temperature for old catalog records."""
+    declared = getattr(capabilities, "supports_top_p", None)
+    return capabilities.supports_temperature if declared is None else bool(declared)
 
 
 def _runtime_tinker_sampler(

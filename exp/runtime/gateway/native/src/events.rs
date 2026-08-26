@@ -34,6 +34,11 @@ pub struct CompletedToolCall {
 pub enum Event {
     TextDelta(String),
     RefusalDelta(String),
+    ReasoningSummaryDelta {
+        output_index: u32,
+        summary_index: u32,
+        delta: String,
+    },
     ToolCallStarted {
         index: u32,
         call_id: String,
@@ -69,6 +74,16 @@ pub fn simplified_event(event: &Event) -> Value {
     match event {
         Event::TextDelta(text) => serde_json::json!({"kind": "text_delta", "text": text}),
         Event::RefusalDelta(text) => serde_json::json!({"kind": "refusal_delta", "text": text}),
+        Event::ReasoningSummaryDelta {
+            output_index,
+            summary_index,
+            delta,
+        } => serde_json::json!({
+            "kind": "reasoning_summary_delta",
+            "output_index": output_index,
+            "summary_index": summary_index,
+            "text": delta,
+        }),
         Event::ToolCallStarted {
             index,
             call_id,

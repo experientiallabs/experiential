@@ -72,7 +72,6 @@ def test_decode_splits_tool_results_and_keeps_assistant_tool_calls() -> None:
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "thinking", "thinking": "dropped"},
                         {"type": "text", "text": "on it"},
                         {
                             "type": "tool_use",
@@ -108,8 +107,8 @@ def test_decode_splits_tool_results_and_keeps_assistant_tool_calls() -> None:
     assert decoded.request.messages[3].content == "now answer"
 
 
-def test_decode_drops_cache_control_and_thinking_config() -> None:
-    """Accepted-and-dropped annotations do not fail or leak into the request."""
+def test_decode_drops_only_nonsemantic_cache_control() -> None:
+    """A cache hint may be omitted without changing the requested model behavior."""
     decoded = decode_messages(
         _body(
             messages=[
@@ -124,7 +123,6 @@ def test_decode_drops_cache_control_and_thinking_config() -> None:
                     ],
                 }
             ],
-            thinking={"type": "enabled", "budget_tokens": 1024},
         )
     )
     assert decoded.request.messages[0].content == "hi"
@@ -132,9 +130,37 @@ def test_decode_drops_cache_control_and_thinking_config() -> None:
 
 
 @pytest.mark.parametrize(
+    "field",
+    [
+        {"thinking": {"type": "enabled", "budget_tokens": 1024}},
+        {"output_config": {"effort": "high"}},
+    ],
+)
+def test_reasoning_controls_are_rejected_instead_of_silently_dropped(field: JsonObject) -> None:
+    """Native Messages reasoning controls fail until their semantics can be preserved."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(_body(**field))
+    assert excinfo.value.detail.param in field
+
+
+def test_thinking_history_blocks_are_rejected_instead_of_dropped() -> None:
+    """Assistant reasoning history cannot disappear during canonical translation."""
+    with pytest.raises(OpenAIProtocolError, match="thinking history blocks are not supported"):
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "thinking", "thinking": "private"}],
+                    }
+                ]
+            )
+        )
+
+
+@pytest.mark.parametrize(
     ("overrides", "param_fragment"),
     [
-        ({"top_k": 5}, "top_k"),
         ({"service_tier": "auto"}, "service_tier"),
         ({"container": "c"}, "container"),
         ({"unknown_field": 1}, "unknown_field"),
@@ -148,6 +174,12 @@ def test_unsupported_and_unknown_top_level_fields_are_rejected(
         decode_messages(_body(**overrides))
     assert excinfo.value.status_code == 400
     assert excinfo.value.detail.param == param_fragment
+
+
+def test_top_k_is_preserved_for_route_specific_validation() -> None:
+    """The official Messages top-k field reaches the shared route contract."""
+    decoded = decode_messages(_body(top_k=5))
+    assert decoded.request.top_k == 5
 
 
 def test_missing_max_tokens_is_rejected_with_its_field() -> None:
@@ -224,11 +256,7 @@ def test_role_misplaced_blocks_and_empty_content_are_rejected() -> None:
     with pytest.raises(OpenAIProtocolError, match="must not be empty"):
         decode_messages(_body(messages=[{"role": "user", "content": ""}]))
     with pytest.raises(OpenAIProtocolError, match="must contain text"):
-        decode_messages(
-            _body(
-                messages=[{"role": "assistant", "content": [{"type": "thinking", "thinking": "x"}]}]
-            )
-        )
+        decode_messages(_body(messages=[{"role": "assistant", "content": []}]))
 
 
 def test_tool_choice_forms_and_stop_sequence_validation() -> None:

@@ -13,7 +13,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelId,
     ExactModelPoolId,
 )
-from exp.common.models.model import ToolCall
+from exp.common.models.model import ReasoningEffort, ToolCall
 
 GatewayAliasName = ArtifactId
 OrganizationId = ArtifactId
@@ -88,10 +88,9 @@ class GatewayMessage(ContractModel):
     """Whether this tool result reports a failed tool invocation.
 
     Only the Anthropic Messages surface can express it (``tool_result.is_error``),
-    and only the Anthropic upstream dialect can emit it back, so an
-    Anthropic-to-Anthropic round trip is lossless. The OpenAI-family wire
-    formats have no tool-error flag; their builders ignore this field and the
-    error state travels in the result text the model reads. Like
+    and only the Anthropic upstream dialect can emit it back, so route
+    admission requires every waterfall rung to use that dialect. OpenAI-family
+    wires cannot represent the flag and are rejected instead of dropping it. Like
     ``ToolCall.raw_arguments``, the field is deliberately excluded from model
     serialization so request digests, replay identity, and immutable
     artifacts are unaffected by it.
@@ -130,13 +129,28 @@ class GatewayRequest(ContractModel):
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
     maximum_output_tokens: int | None = Field(default=None, gt=0)
+    maximum_output_tokens_parameter: (
+        Literal["max_tokens", "max_completion_tokens", "max_output_tokens"] | None
+    ) = Field(default=None, exclude=True)
+    """Exact caller field normalized into ``maximum_output_tokens``."""
     stop: tuple[str, ...] = ()
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
+    top_k: int | None = Field(default=None, ge=0)
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    reasoning_effort: ReasoningEffort | None = None
+    reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
+    reasoning_summary_parameters: tuple[
+        Literal["reasoning.generate_summary", "reasoning.summary"], ...
+    ] = Field(default=(), exclude=True)
+    """Exact caller selector paths normalized into ``reasoning_summary``."""
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     metadata: JsonObject = Field(default_factory=dict)
+    ignored_parameters: tuple[str, ...] = Field(default=(), exclude=True)
+    """Public compatibility fields accepted but intentionally omitted from provider dispatch."""
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=512)
     client_request_id: str | None = Field(default=None, min_length=1, max_length=512)
 
@@ -182,6 +196,14 @@ class GatewayRequest(ContractModel):
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
+        if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("reasoning_summary is valid only for Responses requests")
+        if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
+            raise ValueError("maximum output parameter requires a maximum output value")
+        if self.reasoning_summary_parameters and self.reasoning_summary is None:
+            raise ValueError("reasoning summary parameter paths require a summary selector")
+        if len(set(self.reasoning_summary_parameters)) != len(self.reasoning_summary_parameters):
+            raise ValueError("reasoning summary parameter paths must not repeat")
         return self
 
 
@@ -223,6 +245,7 @@ class GatewayEventKind(StrEnum):
 
     TEXT_DELTA = "text_delta"
     REFUSAL_DELTA = "refusal_delta"
+    REASONING_SUMMARY_DELTA = "reasoning_summary_delta"
     TOOL_CALL_STARTED = "tool_call_started"
     TOOL_ARGUMENTS_DELTA = "tool_arguments_delta"
     TOOL_CALL_COMPLETED = "tool_call_completed"
@@ -238,6 +261,8 @@ class GatewayEvent(ContractModel):
     kind: GatewayEventKind
     sequence_number: int = Field(ge=0)
     text_delta: str | None = None
+    reasoning_summary_output_index: int | None = Field(default=None, ge=0)
+    reasoning_summary_index: int | None = Field(default=None, ge=0)
     tool_call_index: int | None = Field(default=None, ge=0)
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
     tool_name: str | None = Field(default=None, min_length=1, max_length=256)
@@ -259,6 +284,13 @@ class GatewayEvent(ContractModel):
         if self.kind in {GatewayEventKind.TEXT_DELTA, GatewayEventKind.REFUSAL_DELTA}:
             if self.text_delta is None:
                 raise ValueError("text and refusal deltas require text_delta")
+        elif self.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
+            if (
+                self.text_delta is None
+                or self.reasoning_summary_output_index is None
+                or self.reasoning_summary_index is None
+            ):
+                raise ValueError("reasoning summary deltas require output, summary, and text")
         elif self.kind == GatewayEventKind.TOOL_CALL_STARTED:
             if self.tool_call_index is None or self.tool_call_id is None or self.tool_name is None:
                 raise ValueError("tool-call start requires index, ID, and name")
@@ -347,11 +379,17 @@ class ExecutionSnapshot(ContractModel):
 
 
 class CompatibilityDisposition(StrEnum):
-    """How one installed public request field is handled by the gateway."""
+    """How one installed public request field is handled by the gateway.
+
+    ``IGNORED`` keeps a compatibility field valid at the public boundary while
+    deliberately omitting it from provider dispatch when the normalized gateway
+    response cannot preserve its result.
+    """
 
     SUPPORTED = "supported"
     CONDITIONALLY_SUPPORTED = "conditionally_supported"
     METADATA_ONLY = "metadata_only"
+    IGNORED = "ignored"
     UNSUPPORTED = "unsupported"
 
 

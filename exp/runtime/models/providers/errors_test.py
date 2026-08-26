@@ -10,6 +10,7 @@ from exp.runtime.gateway.contracts import GatewayFailureClass
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
+    ProviderParameterError,
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
@@ -118,6 +119,20 @@ def test_refusal_and_capability_failures_keep_only_safe_signals() -> None:
     assert refusal.safe_details == {"signal": "safety"}
     assert capability.failure_class is GatewayFailureClass.UNSUPPORTED_CAPABILITY
     assert capability.safe_details == {"capability": "strict_tools"}
+
+
+def test_parameter_failure_preserves_only_public_code_and_path() -> None:
+    """Route validation reaches the public boundary without provider content."""
+    failure = normalized_provider_failure(
+        ProviderParameterError(
+            message="The value 2 is not valid for 'temperature'.",
+            param="temperature",
+            code="invalid_parameter",
+        )
+    )
+
+    assert failure.failure_class is GatewayFailureClass.INVALID_REQUEST
+    assert failure.safe_details == {"code": "invalid_parameter", "param": "temperature"}
 
 
 @pytest.mark.parametrize(

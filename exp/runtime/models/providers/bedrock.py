@@ -228,6 +228,10 @@ class BedrockClient:
         environment: Mapping[str, str],
         runtime_factory: BedrockRuntimeFactory | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        supports_temperature: bool = True,
+        supports_top_p: bool = True,
+        supports_top_k: bool = False,
+        supports_logprobs: bool = False,
     ) -> None:
         """Create a lazy Bedrock client that does not import boto or open a session.
 
@@ -243,6 +247,10 @@ class BedrockClient:
         self._environment = environment
         self._runtime_factory = runtime_factory
         self._retry_policy = retry_policy
+        self._supports_temperature = supports_temperature
+        self._supports_top_p = supports_top_p
+        self._supports_top_k = supports_top_k
+        self._supports_logprobs = supports_logprobs
         self._client: BedrockRuntime | None = None
         self._region: str | None = None
         self._signing_credentials: _ResolvableCredentials | None = None
@@ -258,7 +266,14 @@ class BedrockClient:
             The typed non-streaming model response with observed request economics.
         """
         started_at = time.monotonic()
-        payload = converse_request(self._model.model_id, request)
+        payload = converse_request(
+            self._model.model_id,
+            request,
+            supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+        )
         response = self._call_with_retry(lambda: self._runtime().converse(**payload))
         return converse_response(
             response,
@@ -359,6 +374,26 @@ class BedrockClient:
     def model_id(self) -> str:
         """Return the exact Bedrock model or inference-profile identifier."""
         return self._model.model_id
+
+    @property
+    def supports_temperature(self) -> bool:
+        """Return whether this Bedrock route accepts temperature."""
+        return self._supports_temperature
+
+    @property
+    def supports_top_p(self) -> bool:
+        """Return whether this Bedrock route accepts nucleus sampling."""
+        return self._supports_top_p
+
+    @property
+    def supports_top_k(self) -> bool:
+        """Return whether this Bedrock route accepts model-specific top-k."""
+        return self._supports_top_k
+
+    @property
+    def supports_logprobs(self) -> bool:
+        """Return whether this Bedrock route accepts logprob controls."""
+        return self._supports_logprobs
 
     def converse_stream_url(self) -> str:
         """Return the regional ConverseStream REST endpoint for this model.
@@ -481,6 +516,11 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
             headers={},
             model_id=self._bedrock_client.model_id,
             timeout_seconds=READ_TIMEOUT_SECONDS,
+            supports_temperature=self._bedrock_client.supports_temperature,
+            maximum_temperature=1.0,
+            supports_top_p=self._bedrock_client.supports_top_p,
+            supports_top_k=self._bedrock_client.supports_top_k,
+            supports_logprobs=self._bedrock_client.supports_logprobs,
             signs_request_body=True,
         )
 

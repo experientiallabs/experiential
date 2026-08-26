@@ -1,5 +1,7 @@
 """Tests for the shared native Gemini generateContent payload builders."""
 
+from typing import cast
+
 import pytest
 
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
@@ -47,6 +49,23 @@ def test_gemini_generate_request_builds_contents_tools_and_generation() -> None:
         "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["lookup"]}
     }
     assert payload["generationConfig"] == {"temperature": 0.4, "maxOutputTokens": 64}
+
+
+def test_gemini_generate_request_omits_unproven_top_k_and_logprobs() -> None:
+    """Gemini discovery must prove model-specific top-k/logprob support first."""
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hi"),),
+        top_p=0.8,
+        top_k=20,
+        logprobs=True,
+        top_logprobs=5,
+    )
+    payload = gemini_generate_request("gemini-2.5-pro", request, supports_logprobs=True)
+    generation = cast("dict[str, object]", payload["generationConfig"])
+    assert generation["topP"] == 0.8
+    assert "topK" not in generation
+    assert "responseLogprobs" not in generation
+    assert "logprobs" not in generation
 
 
 def test_gemini_generate_request_links_tool_results_to_prior_calls() -> None:

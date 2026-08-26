@@ -32,6 +32,7 @@ MESSAGES_MANIFEST = CompatibilityManifest(
                 "system",
                 "temperature",
                 "top_p",
+                "top_k",
                 "stop_sequences",
                 "stream",
             )
@@ -39,18 +40,15 @@ MESSAGES_MANIFEST = CompatibilityManifest(
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
-        # Extended thinking has no channel on this gateway: the request is
-        # validated and then served without it, exactly like ``cache_control``
-        # annotations inside content blocks.
-        _field("thinking", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
                 "container",
                 "context_management",
                 "mcp_servers",
+                "output_config",
                 "service_tier",
-                "top_k",
+                "thinking",
             )
         ),
     ),

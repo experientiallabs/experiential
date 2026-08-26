@@ -65,6 +65,47 @@ class ProviderCapabilityError(ValueError):
         self.capability = capability
 
 
+class ProviderParameterError(ValueError):
+    """A public parameter cannot be preserved by the resolved model route."""
+
+    def __init__(self, *, message: str, param: str, code: str) -> None:
+        """Create one sanitized, field-specific pre-dispatch rejection."""
+        super().__init__(message)
+        self.param = param
+        self.code = code
+
+
+class UnsupportedReasoningEffortError(ProviderParameterError):
+    """An explicit reasoning effort cannot be preserved by one model route."""
+
+    def __init__(
+        self,
+        *,
+        effort: str,
+        supported_efforts: tuple[str, ...],
+        param: str,
+    ) -> None:
+        """Build one field-specific, provider-neutral pre-dispatch rejection.
+
+        Args:
+            effort: Exact caller-provided reasoning effort.
+            supported_efforts: Ordered effort values accepted by every route deployment.
+            param: Public request path carrying the unsupported value.
+        """
+        if supported_efforts:
+            choices = ", ".join(repr(value) for value in supported_efforts)
+            message = (
+                f"Reasoning effort {effort!r} is not supported by this model route. "
+                f"Supported values: {choices}."
+            )
+        else:
+            message = (
+                f"The parameter {param!r} is not supported by this model route. "
+                "Remove the field or choose a different model."
+            )
+        super().__init__(message=message, param=param, code="unsupported_parameter")
+
+
 def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
     """Convert an execution error into one stable sanitized gateway failure.
 
@@ -96,6 +137,15 @@ def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
             failure_class=GatewayFailureClass.REFUSAL,
             safe_message="provider refused the request; revise the request content and retry",
             safe_details={"signal": exception.signal.value},
+        )
+    if isinstance(exception, ProviderParameterError):
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.INVALID_REQUEST,
+            safe_message=str(exception),
+            safe_details={
+                "code": exception.code,
+                "param": exception.param,
+            },
         )
     if isinstance(exception, ProviderCapabilityError):
         return GatewayFailure(

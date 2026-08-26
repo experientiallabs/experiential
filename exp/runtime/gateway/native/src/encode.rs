@@ -27,6 +27,7 @@ pub struct ChatSseEncoder {
     model: String,
     created_at: i64,
     include_usage: bool,
+    ignored_parameters: Vec<String>,
     started: bool,
     terminal: bool,
     tool_indices: HashMap<u32, (String, String)>,
@@ -35,12 +36,20 @@ pub struct ChatSseEncoder {
 }
 
 impl ChatSseEncoder {
-    pub fn new(request_id: &str, model: &str, created_at: i64, include_usage: bool) -> Self {
+    /// Build an encoder that discloses controls omitted by route shaping.
+    pub fn new_with_ignored(
+        request_id: &str,
+        model: &str,
+        created_at: i64,
+        include_usage: bool,
+        ignored_parameters: Vec<String>,
+    ) -> Self {
         Self {
             completion_id: stable_public_id("chatcmpl", request_id),
             model: model.to_string(),
             created_at,
             include_usage,
+            ignored_parameters,
             started: false,
             terminal: false,
             tool_indices: HashMap::new(),
@@ -75,6 +84,7 @@ impl ChatSseEncoder {
         match event {
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
+            Event::ReasoningSummaryDelta { .. } => Ok(Vec::new()),
             Event::ToolCallStarted {
                 index,
                 call_id,
@@ -172,7 +182,7 @@ impl ChatSseEncoder {
     }
 
     fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> String {
-        let payload = json!({
+        let mut payload = json!({
             "id": self.completion_id,
             "object": "chat.completion.chunk",
             "created": self.created_at,
@@ -186,6 +196,15 @@ impl ChatSseEncoder {
                 }
             ],
         });
+        if !self.ignored_parameters.is_empty() {
+            payload
+                .as_object_mut()
+                .expect("chat chunk is an object")
+                .insert(
+                    "x-experiential-ignored-parameters".to_string(),
+                    json!(self.ignored_parameters),
+                );
+        }
         chat_data(&payload)
     }
 
@@ -260,13 +279,13 @@ pub struct AggregatedCompletion {
     pub tool_names: Vec<String>,
 }
 
-/// Build one non-streaming public chat result from ordered events, mirroring
-/// the chat branch of `completed_body`.
-pub fn completed_chat_body(
+/// Build one non-streaming Chat result with ignored-control disclosure.
+pub fn completed_chat_body_with_ignored(
     request_id: &str,
     model: &str,
     created_at: i64,
     events: &[Event],
+    ignored_parameters: &[String],
 ) -> Result<AggregatedCompletion, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
@@ -345,7 +364,7 @@ pub fn completed_chat_body(
         "refusal": if refusal.is_empty() { Value::Null } else { Value::String(refusal) },
         "tool_calls": if tool_calls.is_empty() { Value::Null } else { Value::Array(tool_calls) },
     });
-    let body = json!({
+    let mut body = json!({
         "id": stable_public_id("chatcmpl", request_id),
         "object": "chat.completion",
         "created": created_at,
@@ -360,6 +379,14 @@ pub fn completed_chat_body(
         ],
         "usage": completed_chat_usage(usage.as_ref()),
     });
+    if !ignored_parameters.is_empty() {
+        body.as_object_mut()
+            .expect("chat completion is an object")
+            .insert(
+                "x-experiential-ignored-parameters".to_string(),
+                json!(ignored_parameters),
+            );
+    }
     Ok(AggregatedCompletion {
         body,
         failure: None,
@@ -367,4 +394,37 @@ pub fn completed_chat_body(
         incomplete,
         tool_names,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignored_generation_controls_are_disclosed_by_both_chat_encoders() {
+        let ignored = vec!["top_p".to_string(), "reasoning_effort".to_string()];
+        let mut stream = ChatSseEncoder::new_with_ignored(
+            "request-1",
+            "coding",
+            1_700_000_000,
+            false,
+            ignored.clone(),
+        );
+        let frames = stream.start().expect("stream start must encode");
+        assert!(frames[0]
+            .contains("\"x-experiential-ignored-parameters\":[\"top_p\",\"reasoning_effort\"]"));
+
+        let completed = completed_chat_body_with_ignored(
+            "request-1",
+            "coding",
+            1_700_000_000,
+            &[Event::Completed],
+            &ignored,
+        )
+        .expect("completed body must encode");
+        assert_eq!(
+            completed.body["x-experiential-ignored-parameters"],
+            json!(["top_p", "reasoning_effort"])
+        );
+    }
 }

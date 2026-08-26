@@ -59,6 +59,7 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
             "stop": ["END", "STOP"],
             "temperature": 0.2,
             "top_p": 1,
+            "reasoning_effort": "high",
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -89,9 +90,11 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
     assert isinstance(request.tool_choice, GatewayNamedToolChoice)
     assert request.tool_choice.name == "weather"
     assert request.maximum_output_tokens == 123
+    assert request.maximum_output_tokens_parameter == "max_completion_tokens"
     assert request.stop == ("END", "STOP")
     assert request.temperature == 0.2
     assert request.top_p == 1.0
+    assert request.reasoning_effort == "high"
     assert request.structured_text is not None and request.structured_text.strict
     assert request.include_usage
     assert request.metadata == {"cohort": "test"}
@@ -115,6 +118,7 @@ def test_chat_legacy_max_tokens_reaches_native_responses_as_max_output_tokens() 
     )
 
     assert decoded.request.maximum_output_tokens == 256
+    assert decoded.request.maximum_output_tokens_parameter == "max_tokens"
     payload = openai_responses_stream_payload(
         "gpt-fixture",
         decoded.request,
@@ -154,6 +158,11 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
             "parallel_tool_calls": False,
             "max_output_tokens": 321,
             "temperature": 0.4,
+            "reasoning": {
+                "effort": "high",
+                "generate_summary": "concise",
+                "summary": "concise",
+            },
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -177,11 +186,33 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
         "tool",
     )
     assert request.previous_response_id == "resp_previous"
+    assert request.reasoning_effort == "high"
+    assert request.reasoning_summary == "concise"
+    assert request.reasoning_summary_parameters == (
+        "reasoning.generate_summary",
+        "reasoning.summary",
+    )
+    assert request.ignored_parameters == ()
     assert request.messages[2].tool_calls[0].raw_arguments == '{"city":"Paris"}'
     assert request.parallel_tool_calls is False
     assert request.maximum_output_tokens == 321
+    assert request.maximum_output_tokens_parameter == "max_output_tokens"
     assert request.structured_text is not None
     assert request.client_request_id == "operation-two"
+
+
+def test_responses_decoder_rejects_conflicting_reasoning_summary_aliases() -> None:
+    """Current and deprecated summary selectors cannot request different outputs."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": "hello",
+                "reasoning": {"summary": "concise", "generate_summary": "detailed"},
+            }
+        )
+
+    assert captured.value.detail.code == "invalid_parameter"
 
 
 @pytest.mark.parametrize(
@@ -515,12 +546,50 @@ def test_chat_decoder_rejects_out_of_range_top_p() -> None:
     assert captured.value.detail.param == "top_p"
 
 
-def test_responses_decoder_still_rejects_top_p() -> None:
-    """Responses keeps top_p excluded so Chat support does not widen that surface."""
-    with pytest.raises(OpenAIProtocolError) as captured:
-        decode_responses({"model": "coding", "input": "hello", "top_p": 1})
-    assert captured.value.detail.code == "unsupported_parameter"
-    assert captured.value.detail.param == "top_p"
+def test_responses_decoder_preserves_top_p() -> None:
+    """Responses accepts the provider-supported nucleus-sampling control."""
+    decoded = decode_responses({"model": "coding", "input": "hello", "top_p": 1})
+    assert decoded.request.top_p == 1
+
+
+def test_chat_decoder_rejects_unprojectable_top_logprobs() -> None:
+    """Alternate-token probability output is rejected at the public boundary."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hello"}],
+                "logprobs": True,
+                "top_logprobs": 5,
+            }
+        )
+    assert raised.value.detail.code == "unsupported_parameter"
+    assert raised.value.detail.param == "top_logprobs"
+
+
+def test_chat_decoder_preserves_logprobs_for_route_validation() -> None:
+    """The route gate distinguishes a semantic true request from a false no-op."""
+    for value in (True, False):
+        decoded = decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hello"}],
+                "logprobs": value,
+            }
+        )
+        assert decoded.request.logprobs is value
+
+
+def test_chat_decoder_preserves_gateway_top_k_extension() -> None:
+    """The provider-neutral top-k extension survives official SDK validation."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hello"}],
+            "top_k": 40,
+        }
+    )
+    assert decoded.request.top_k == 40
 
 
 def test_empty_responses_input_is_a_public_protocol_error() -> None:

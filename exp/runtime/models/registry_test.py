@@ -247,6 +247,9 @@ def test_resolution_rejects_unsupported_connection_and_incomplete_compatible_url
     ("provider", "base_url"),
     [
         ("openai", None),
+        ("anthropic", None),
+        ("gemini", None),
+        ("openrouter", None),
         ("openai-compatible", "https://models.example.test/v1"),
         ("azure", "https://resource.example.test"),
     ],

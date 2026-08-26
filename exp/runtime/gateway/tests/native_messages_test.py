@@ -31,6 +31,7 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import ModelCapabilities
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 
 pytest.importorskip("exp_gateway_native")
@@ -134,10 +135,15 @@ def _terminal_frames(finish_reason: str) -> bytes:
 class _SseUpstream(BaseHTTPRequestHandler):
     """OpenAI-compatible SSE mock whose shape is selected by the prompt."""
 
+    payloads: list[JsonObject] = []
+    payloads_lock = threading.Lock()
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract.
         """Stream one canned SSE response selected by the request prompt."""
         length = int(self.headers.get("content-length", "0"))
         payload = json.loads(self.rfile.read(length))
+        with self.payloads_lock:
+            self.payloads.append(payload)
         prompt = payload["messages"][-1]["content"]
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
@@ -240,12 +246,19 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         The live serving facts as a :class:`_ServingEngine`.
     """
     root = tmp_path_factory.mktemp("native-messages-root")
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
     upstream = ThreadingHTTPServer((_HOST, 0), _SseUpstream)
     upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     upstream_thread.start()
     _manager, raw_key = _configured_gateway(
         root,
         base_url=f"http://{_HOST}:{upstream.server_address[1]}/v1",
+        capabilities=ModelCapabilities(
+            chat_max_tokens_field="max_completion_tokens",
+            maximum_output_tokens=128,
+            maximum_temperature=1.0,
+        ),
     )
     driver = root / "native_messages_driver.py"
     driver.write_text(_DRIVER_SOURCE + "\n")
@@ -354,6 +367,30 @@ def test_non_streaming_message_answers_the_anthropic_shape_and_accounts(
     assert _completed_attempts(engine.base) == completed_before + 1
 
 
+def test_native_admission_uses_the_catalog_token_field_on_the_provider_wire(
+    engine: _ServingEngine,
+) -> None:
+    """Rust dispatches the Python-frozen payload with the exact model token alias."""
+    payload = _messages_body("token-field")
+    payload["max_tokens"] = 63
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=payload,
+        timeout=30.0,
+    )
+
+    assert response.status_code == 200
+    with _SseUpstream.payloads_lock:
+        dispatched = _SseUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert dispatched[0]["max_completion_tokens"] == 63
+    assert "max_tokens" not in dispatched[0]
+
+
 def test_streaming_message_emits_the_full_anthropic_lifecycle(
     engine: _ServingEngine,
 ) -> None:
@@ -440,12 +477,12 @@ def test_protocol_and_key_failures_are_anthropic_shaped(engine: _ServingEngine) 
     unknown_field = httpx.post(
         f"{engine.base}/v1/messages",
         headers={"x-api-key": engine.raw_key},
-        json={**_messages_body("fast-token"), "top_k": 3},
+        json={**_messages_body("fast-token"), "unknown_field": 3},
         timeout=10.0,
     )
     assert unknown_field.status_code == 400
     assert unknown_field.json()["error"]["type"] == "invalid_request_error"
-    assert "top_k" in unknown_field.json()["error"]["message"]
+    assert "unknown_field" in unknown_field.json()["error"]["message"]
 
     count_tokens = httpx.post(
         f"{engine.base}/v1/messages/count_tokens",
@@ -455,3 +492,81 @@ def test_protocol_and_key_failures_are_anthropic_shaped(engine: _ServingEngine) 
     )
     assert count_tokens.status_code == 404
     assert count_tokens.json()["error"]["type"] == "not_found_error"
+
+
+def test_native_rejects_unsupported_reasoning_effort_with_the_public_field_error(
+    engine: _ServingEngine,
+) -> None:
+    """The native plane returns the local field error before any provider dispatch."""
+    payload = {
+        "model": "coding",
+        "input": "hello",
+        "reasoning": {"effort": "high"},
+    }
+    headers = {"authorization": f"Bearer {engine.raw_key}"}
+    native = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers=headers,
+        json=payload,
+        timeout=10.0,
+    )
+
+    expected = {
+        "error": {
+            "message": (
+                "The parameter 'reasoning.effort' is not supported by this model route. "
+                "Remove the field or choose a different model."
+            ),
+            "type": "invalid_request_error",
+            "param": "reasoning.effort",
+            "code": "unsupported_parameter",
+        }
+    }
+    assert native.status_code == 400
+    assert native.json() == expected
+
+
+def test_native_rejects_unsupported_sampling_with_the_public_field_error(
+    engine: _ServingEngine,
+) -> None:
+    """A route without top-k support fails the request locally with the field name."""
+    payload = {**_messages_body("fast-token"), "top_k": 3}
+    headers = {"x-api-key": engine.raw_key}
+    native = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers=headers,
+        json=payload,
+        timeout=10.0,
+    )
+
+    assert native.status_code == 400
+    assert "top_k" in native.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("temperature", 1.1), ("max_tokens", 129)),
+)
+def test_native_enforces_catalog_generation_limits_before_dispatch(
+    engine: _ServingEngine,
+    field: str,
+    value: float | int,
+) -> None:
+    """Model-specific sampling and output ceilings fail locally, with no upstream dispatch."""
+    payload = _messages_body("must-not-dispatch")
+    payload[field] = value
+    headers = {"x-api-key": engine.raw_key}
+    with _SseUpstream.payloads_lock:
+        dispatched_before = len(_SseUpstream.payloads)
+
+    native = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers=headers,
+        json=payload,
+        timeout=10.0,
+    )
+
+    assert native.status_code == 400
+    assert field in native.json()["error"]["message"]
+    with _SseUpstream.payloads_lock:
+        assert len(_SseUpstream.payloads) == dispatched_before

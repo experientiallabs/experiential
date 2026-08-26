@@ -23,7 +23,8 @@ from exp.common.tasks import ToolSchema
 ModelAlias = ArtifactId
 _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 
-ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+ChatMaxTokensField = Literal["max_tokens", "max_completion_tokens"]
 
 DEFAULT_REASONING_EFFORT: Final[ReasoningEffort] = "medium"
 """Reasoning effort pinned by default for models known to accept the parameter.
@@ -335,10 +336,16 @@ class ModelCapabilities(ContractModel):
     at runtime so an undeclared or newly released model stays usable; only an explicit ``False``
     blocks the corresponding protocol feature before dispatch.
 
-    ``supports_temperature`` declares whether the provider accepts an explicit sampling
-    temperature for this model; reasoning models that pin their sampling reject the parameter, so
-    clients omit it when this is ``False``. ``reasoning_effort`` pins an explicit reasoning-effort
-    level on providers whose wire protocol accepts one.
+    ``supports_temperature`` and the optional sampling capability fields declare whether the
+    provider accepts the corresponding generation controls for this model. ``None`` means the
+    older catalog did not carry an explicit declaration; runtime clients fall back to the broad
+    temperature capability for ``top_p`` and omit the less portable controls. Reasoning models
+    that pin their sampling reject temperature and nucleus sampling, so clients omit both when
+    the route says they are unsupported. ``supports_logprobs`` remains provider metadata, but
+    public logprob requests fail locally until normalized responses can expose their values.
+    ``supports_reasoning`` is an explicit wire capability, not an inference from
+    ``reasoning_effort``. ``reasoning_effort`` pins an explicit reasoning-effort level only when
+    that capability is true.
     """
 
     supports_tools: bool | None = None
@@ -346,7 +353,20 @@ class ModelCapabilities(ContractModel):
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True
+    supports_top_p: bool | None = None
+    supports_top_k: bool | None = None
+    supports_logprobs: bool | None = None
+    supports_reasoning: bool = False
     reasoning_effort: ReasoningEffort | None = None
+    sampling_requires_reasoning_none: bool = False
+    """Whether temperature and top-p are valid only with ``reasoning_effort='none'``."""
+    chat_max_tokens_field: ChatMaxTokensField | None = None
+    minimum_temperature: float | None = Field(default=None, ge=0, le=2)
+    maximum_temperature: float | None = Field(default=None, ge=0, le=2)
+    minimum_top_p: float | None = Field(default=None, ge=0, le=1)
+    maximum_top_p: float | None = Field(default=None, ge=0, le=1)
+    minimum_top_k: int | None = Field(default=None, ge=0)
+    maximum_top_k: int | None = Field(default=None, ge=0)
     context_window_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
@@ -377,6 +397,21 @@ class ModelCapabilities(ContractModel):
             raise ValueError("model token prices must be finite")
         return value
 
+    @model_validator(mode="after")
+    def _require_ordered_generation_ranges(self) -> ModelCapabilities:
+        """Reject inverted per-model generation-control ranges."""
+        ranges = (
+            ("temperature", self.minimum_temperature, self.maximum_temperature),
+            ("top_p", self.minimum_top_p, self.maximum_top_p),
+            ("top_k", self.minimum_top_k, self.maximum_top_k),
+        )
+        for name, minimum, maximum in ranges:
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ValueError(f"minimum_{name} cannot exceed maximum_{name}")
+        if self.sampling_requires_reasoning_none and not self.supports_reasoning:
+            raise ValueError("conditional sampling requires reasoning support")
+        return self
+
     def identity_sha256(self) -> Sha256:
         """Hash capabilities that identify the provider model protocol.
 
@@ -395,7 +430,19 @@ class ModelCapabilities(ContractModel):
         excluded = {
             "supports_structured_output",
             "supports_temperature",
+            "supports_top_p",
+            "supports_top_k",
+            "supports_logprobs",
+            "supports_reasoning",
             "reasoning_effort",
+            "sampling_requires_reasoning_none",
+            "chat_max_tokens_field",
+            "minimum_temperature",
+            "maximum_temperature",
+            "minimum_top_p",
+            "maximum_top_p",
+            "minimum_top_k",
+            "maximum_top_k",
             "input_cost_per_million_tokens_usd",
             "output_cost_per_million_tokens_usd",
             "cached_input_cost_per_million_tokens_usd",
@@ -420,6 +467,13 @@ class ModelRequest(ContractModel):
         tool_choice: Optional automatic, disabled, required, or named-tool selection.
         temperature: Optional sampling temperature.
         top_p: Optional nucleus-sampling probability mass in ``[0, 1]``.
+        top_k: Optional maximum number of candidate tokens considered during sampling.
+        logprobs: Optional request for token log probabilities. Gateway serving rejects a true
+            request until normalized responses can return them losslessly.
+        top_logprobs: Optional count for alternate token probabilities, subject to the same
+            lossless-response requirement as ``logprobs``.
+        reasoning_effort: Optional caller-selected reasoning effort, preserved only on routes that
+            explicitly declare support.
         maximum_output_tokens: Optional upper bound for generated tokens.
     """
 
@@ -428,6 +482,10 @@ class ModelRequest(ContractModel):
     tool_choice: Literal["auto", "none", "required"] | ToolChoice | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
+    top_k: int | None = Field(default=None, ge=0)
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    reasoning_effort: ReasoningEffort | None = None
     maximum_output_tokens: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")

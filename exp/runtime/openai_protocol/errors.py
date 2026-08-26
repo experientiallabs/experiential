@@ -184,6 +184,16 @@ def public_failure_error(
         failure.failure_class,
         (502, "all_routes_failed", "api_error"),
     )
+    detail_code = failure.safe_details.get("code")
+    if (
+        failure.failure_class is GatewayFailureClass.INVALID_REQUEST
+        and isinstance(detail_code, str)
+        and detail_code in {"invalid_parameter", "unsupported_parameter"}
+    ):
+        code = detail_code
+        detail_param = failure.safe_details.get("param")
+        if param is None and isinstance(detail_param, str):
+            param = detail_param
     message = failure.safe_message
     retry_after_seconds: int | None = None
     if failure.failure_class is GatewayFailureClass.THROTTLED:

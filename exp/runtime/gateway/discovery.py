@@ -43,6 +43,20 @@ class PublishedAliasMetadata:
     supports_completions: bool | None = None
     supports_tools: bool | None = None
     supports_structured_output: bool | None = None
+    supports_temperature: bool | None = None
+    supports_top_p: bool | None = None
+    supports_top_k: bool | None = None
+    supports_logprobs: bool | None = None
+    supports_reasoning: bool | None = None
+    reasoning_effort: str | None = None
+    sampling_requires_reasoning_none: bool | None = None
+    chat_max_tokens_field: str | None = None
+    minimum_temperature: float | None = None
+    maximum_temperature: float | None = None
+    minimum_top_p: float | None = None
+    maximum_top_p: float | None = None
+    minimum_top_k: int | None = None
+    maximum_top_k: int | None = None
     maximum_output_tokens: int | None = None
     context_window_tokens: int | None = None
     input_micro_usd_per_million_tokens: int | None = None
@@ -55,6 +69,24 @@ class PublishedAliasMetadata:
         _put_optional(fields, "supports_completions", self.supports_completions)
         _put_optional(fields, "supports_tools", self.supports_tools)
         _put_optional(fields, "supports_structured_output", self.supports_structured_output)
+        _put_optional(fields, "supports_temperature", self.supports_temperature)
+        _put_optional(fields, "supports_top_p", self.supports_top_p)
+        _put_optional(fields, "supports_top_k", self.supports_top_k)
+        _put_optional(fields, "supports_logprobs", self.supports_logprobs)
+        _put_optional(fields, "supports_reasoning", self.supports_reasoning)
+        _put_optional(fields, "reasoning_effort", self.reasoning_effort)
+        _put_optional(
+            fields,
+            "sampling_requires_reasoning_none",
+            self.sampling_requires_reasoning_none,
+        )
+        _put_optional(fields, "chat_max_tokens_field", self.chat_max_tokens_field)
+        _put_optional(fields, "minimum_temperature", self.minimum_temperature)
+        _put_optional(fields, "maximum_temperature", self.maximum_temperature)
+        _put_optional(fields, "minimum_top_p", self.minimum_top_p)
+        _put_optional(fields, "maximum_top_p", self.maximum_top_p)
+        _put_optional(fields, "minimum_top_k", self.minimum_top_k)
+        _put_optional(fields, "maximum_top_k", self.maximum_top_k)
         _put_optional(fields, "maximum_output_tokens", self.maximum_output_tokens)
         _put_optional(fields, "context_window_tokens", self.context_window_tokens)
         pricing: JsonObject = {}
@@ -100,6 +132,24 @@ def published_alias_metadata(
         supports_structured_output=(
             None if capabilities is None else capabilities.supports_structured_output
         ),
+        supports_temperature=(None if capabilities is None else capabilities.supports_temperature),
+        supports_top_p=None if capabilities is None else capabilities.supports_top_p,
+        supports_top_k=None if capabilities is None else capabilities.supports_top_k,
+        supports_logprobs=None if capabilities is None else capabilities.supports_logprobs,
+        supports_reasoning=None if capabilities is None else capabilities.supports_reasoning,
+        reasoning_effort=None if capabilities is None else capabilities.reasoning_effort,
+        sampling_requires_reasoning_none=(
+            None if capabilities is None else capabilities.sampling_requires_reasoning_none
+        ),
+        chat_max_tokens_field=(
+            None if capabilities is None else capabilities.chat_max_tokens_field
+        ),
+        minimum_temperature=(None if capabilities is None else capabilities.minimum_temperature),
+        maximum_temperature=(None if capabilities is None else capabilities.maximum_temperature),
+        minimum_top_p=None if capabilities is None else capabilities.minimum_top_p,
+        maximum_top_p=None if capabilities is None else capabilities.maximum_top_p,
+        minimum_top_k=None if capabilities is None else capabilities.minimum_top_k,
+        maximum_top_k=None if capabilities is None else capabilities.maximum_top_k,
         maximum_output_tokens=(
             None if capabilities is None else capabilities.maximum_output_tokens
         ),
@@ -233,7 +283,7 @@ def _completion_support(capabilities: ModelCapabilities | None) -> bool:
     return not (capabilities is not None and capabilities.supports_completions is False)
 
 
-def _put_optional(target: JsonObject, key: str, value: bool | int | None) -> None:
+def _put_optional(target: JsonObject, key: str, value: bool | int | float | str | None) -> None:
     """Copy one declared field onto a public JSON object.
 
     Args:

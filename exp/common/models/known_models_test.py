@@ -54,6 +54,7 @@ def test_documented_chat_model_carries_verified_capabilities_and_prices() -> Non
     assert known.cached_input_cost_per_million_tokens_usd == 0.2
     assert known.cache_write_cost_per_million_tokens_usd == 2.5
     assert known.supports_temperature is False
+    assert not known.sampling_requires_reasoning_none
     assert known.supports_reasoning_effort
 
 
@@ -129,7 +130,9 @@ def test_every_openai_chat_entry_has_complete_verified_metadata(
     assert known is not None
     assert known.supports_completions
     assert known.supports_tools
-    assert known.supports_temperature is False
+    assert known.supports_temperature is (model == "gpt-5.1")
+    assert known.sampling_requires_reasoning_none is (model == "gpt-5.1")
+    assert known.reasoning_effort == ("high" if model == "gpt-5-pro" else "medium")
     assert known.context_window_tokens == context_window_tokens
     assert known.maximum_output_tokens == maximum_output_tokens
     assert known.input_cost_per_million_tokens_usd == input_usd
@@ -177,6 +180,12 @@ def test_documented_anthropic_model_prices_both_cache_operations() -> None:
     assert known.cache_write_cost_per_million_tokens_usd == 2.5
     assert known.context_window_tokens == 1_000_000
     assert known.maximum_output_tokens == 128_000
+    assert known.supports_reasoning_effort
+    assert known.reasoning_effort == "medium"
+    assert known.minimum_temperature == 1.0
+    assert known.maximum_temperature == 1.0
+    assert known.minimum_top_p == 0.99
+    assert known.supports_top_k is False
 
 
 @pytest.mark.parametrize(
@@ -208,6 +217,10 @@ def test_every_gemini_chat_entry_has_complete_verified_metadata(
     assert known.supports_tools
     assert known.supports_structured_output
     assert known.supports_temperature is True
+    assert known.supports_top_p is True
+    assert known.supports_top_k is True
+    assert known.supports_reasoning_effort
+    assert known.reasoning_effort == "medium"
     assert known.context_window_tokens == 1_048_576
     assert known.maximum_output_tokens == 65_536
     assert known.input_cost_per_million_tokens_usd == input_usd

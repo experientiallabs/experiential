@@ -31,7 +31,7 @@ from exp.common.models import (
     serves_role,
 )
 
-_NO_REASONING_EFFORT = "none"
+_NO_REASONING_EFFORT = "__unset_reasoning_effort__"
 _REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
 _COMPLETION_PRICE_FIELDS = (
     ("input_cost_per_million_tokens_usd", "Input cost per million tokens in USD"),
@@ -227,8 +227,19 @@ def declare_model(session: SetupSession, *, console: Console) -> AvailableModel 
         )
         if supports_completions
         else None,
-        reasoning_effort=_ask_reasoning_effort(console=console) if supports_completions else None,
+        supports_reasoning=False,
+        reasoning_effort=None,
     )
+    reasoning_effort = _ask_reasoning_effort(console=console) if supports_completions else None
+    if reasoning_effort is not None:
+        capabilities = capabilities.model_copy(
+            update={
+                "supports_temperature": False,
+                "supports_top_p": False,
+                "supports_reasoning": True,
+                "reasoning_effort": reasoning_effort,
+            }
+        )
     taken = frozenset(item.alias for item in (*session.available, *session.manual))
     return AvailableModel(
         alias=derive_model_alias(provider, model, taken),
@@ -463,7 +474,7 @@ def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
         options=[
             PickerOption(
                 value=_NO_REASONING_EFFORT,
-                label="none",
+                label="unset",
                 detail="never send the reasoning parameter",
             ),
             *(PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS),

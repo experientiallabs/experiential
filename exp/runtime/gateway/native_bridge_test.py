@@ -281,7 +281,7 @@ def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> No
 
 
 def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None:
-    """Invalid JSON, non-objects, and protocol violations use the shared codes."""
+    """Invalid JSON, non-objects, and unsupported protocol fields use shared codes."""
     control, raw_key = _control_plane(tmp_path)
     with pytest.raises(NativeBridgeError) as invalid_json:
         control.admit(json.dumps({"raw_key": raw_key, "body": "{not json"}))
@@ -290,7 +290,7 @@ def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None
         control.admit(json.dumps({"raw_key": raw_key, "body": "[1, 2]"}))
     assert json.loads(not_object.value.public_error_json)["code"] == "invalid_request"
     rejected = json.dumps(
-        {"model": "coding", "messages": [{"role": "user", "content": "x"}], "logprobs": True}
+        {"model": "coding", "messages": [{"role": "user", "content": "x"}], "logit_bias": {}}
     )
     with pytest.raises(NativeBridgeError) as protocol:
         control.admit(json.dumps({"raw_key": raw_key, "body": rejected}))
@@ -1211,6 +1211,48 @@ def test_rust_chat_sse_frames_match_python_and_the_committed_golden() -> None:
     assert list(actual) == expected
 
 
+def test_rust_chat_ignored_parameter_disclosure_matches_python_and_the_committed_golden() -> None:
+    """Route-shaped controls are disclosed on the final Chat chunk, byte for byte.
+
+    The committed golden frames freeze the ``x-experiential-ignored-parameters``
+    disclosure contract; the python ``ChatSseEncoder`` remains a live secondary
+    reference.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.gateway.contracts import GatewayEvent, GatewayEventKind
+    from exp.runtime.openai_protocol.streaming import ChatSseEncoder
+
+    events = [
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=0, text_delta="Hi"),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+    ]
+    encoder = ChatSseEncoder(
+        request_id="request-abc",
+        model="coding",
+        created_at=1_700_000_000,
+        include_usage=False,
+        ignored_parameters=("logprobs", "reasoning.summary"),
+    )
+    expected = list(encoder.start())
+    for event in events:
+        expected.extend(encoder.feed(event))
+
+    fixture = [
+        {"kind": "text_delta", "text": "Hi"},
+        {"kind": "completed"},
+    ]
+    actual = native.encode_chat_fixture(
+        "request-abc",
+        "coding",
+        1_700_000_000,
+        False,
+        json.dumps(fixture),
+        ["logprobs", "reasoning.summary"],
+    )
+    assert list(actual) == _parity_golden("chat_frames_ignored_disclosure")
+    assert list(actual) == expected
+
+
 def _activate_revision_two(root: Path, manager: GatewayManagement) -> str:
     """Repoint the coding alias at a new revision and return its catalog digest."""
     normalized, snapshot, _changed = upsert_singleton_deployment(
@@ -1393,6 +1435,7 @@ def _responses_body(
     stream: bool = False,
     previous_response_id: str | None = None,
     with_tools: bool = False,
+    reasoning_summary: str | None = None,
 ) -> str:
     """Return one raw Responses API request body."""
     payload: JsonObject = {"model": model, "input": [{"role": "user", "content": "hi"}]}
@@ -1400,6 +1443,8 @@ def _responses_body(
         payload["stream"] = True
     if previous_response_id is not None:
         payload["previous_response_id"] = previous_response_id
+    if reasoning_summary is not None:
+        payload["reasoning"] = {"effort": "high", "summary": reasoning_summary}
     if with_tools:
         payload["tools"] = [
             {
@@ -1448,24 +1493,31 @@ def _responses_parity_case() -> tuple[list[GatewayEvent], str]:
     from exp.common.models.model import ToolCall
 
     events = [
-        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=0, text_delta="Hel"),
-        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=1, text_delta="lo é"),
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_SUMMARY_DELTA,
+            sequence_number=0,
+            reasoning_summary_output_index=0,
+            reasoning_summary_index=0,
+            text_delta="Checked the plan.",
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=1, text_delta="Hel"),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=2, text_delta="lo é"),
         GatewayEvent(
             kind=GatewayEventKind.TOOL_CALL_STARTED,
-            sequence_number=2,
+            sequence_number=3,
             tool_call_index=0,
             tool_call_id="call-1",
             tool_name="search",
         ),
         GatewayEvent(
             kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
-            sequence_number=3,
+            sequence_number=4,
             tool_call_index=0,
             raw_arguments_delta='{"q": "x"}',
         ),
         GatewayEvent(
             kind=GatewayEventKind.TOOL_CALL_COMPLETED,
-            sequence_number=4,
+            sequence_number=5,
             tool_call_index=0,
             tool_call=ToolCall(
                 call_id="call-1",
@@ -1476,12 +1528,18 @@ def _responses_parity_case() -> tuple[list[GatewayEvent], str]:
         ),
         GatewayEvent(
             kind=GatewayEventKind.USAGE,
-            sequence_number=5,
+            sequence_number=6,
             usage=GatewayUsage(input_tokens=10, output_tokens=4, cached_input_tokens=1),
         ),
-        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=6),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=7),
     ]
     fixture = [
+        {
+            "kind": "reasoning_summary_delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "Checked the plan.",
+        },
         {"kind": "text_delta", "text": "Hel"},
         {"kind": "text_delta", "text": "lo é"},
         {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
@@ -1535,7 +1593,7 @@ def test_rust_responses_sse_frames_match_python_and_the_committed_golden() -> No
     from the retired python Responses encoder and outlive it.
     """
     native = pytest.importorskip("exp_gateway_native")
-    body = _responses_body(stream=True, with_tools=True)
+    body = _responses_body(stream=True, with_tools=True, reasoning_summary="concise")
     events, fixture = _responses_parity_case()
     expected = _python_responses_frames(body, events, created_at=1_700_000_000.25)
     actual = native.encode_responses_fixture(
@@ -1613,7 +1671,7 @@ def test_rust_responses_completed_body_matches_python_and_the_committed_golden()
     native = pytest.importorskip("exp_gateway_native")
     from exp.runtime.openai_protocol.response import completed_body
 
-    body = _responses_body(with_tools=True)
+    body = _responses_body(with_tools=True, reasoning_summary="concise")
     events, fixture = _responses_parity_case()
     decoded = decode_responses(json.loads(body))
     expected = completed_body(
@@ -1658,21 +1716,28 @@ def test_rust_responses_rejects_streams_without_terminals() -> None:
 
 def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path) -> None:
     """A Responses request admits natively (no escalation) with the exact
-    request-reflecting envelope and the shared dialect payload."""
+    request-reflecting envelope and a route-safe dialect payload."""
     from exp.runtime.gateway.native_responses import responses_envelope
 
     control, raw_key = _control_plane(tmp_path)
-    body = _responses_body(with_tools=True)
+    payload = json.loads(_responses_body(with_tools=True))
+    body = json.dumps(payload)
     admission = _flatten_started(control, _admit_responses(control, raw_key, body))
     assert "escalate" not in admission
     assert admission["surface"] == "responses"
     assert admission["dialect"] == "openai_compatible"
     decoded = decode_responses(json.loads(body))
-    assert admission["envelope"] == responses_envelope(decoded.request)
-    provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
+    public_request = decoded.request
+    assert admission["ignored_parameters"] == []
+    assert admission["envelope"] == responses_envelope(public_request)
+    provider_request = public_request.model_copy(update={"stream": True, "include_usage": True})
     assert admission["upstream_payload"] == openai_compatible_stream_payload(
         "provider-model-exact", provider_request
     )
+    upstream_payload = admission["upstream_payload"]
+    assert isinstance(upstream_payload, dict)
+    assert "reasoning" not in upstream_payload
+    assert "reasoning_effort" not in upstream_payload
     settled = control.settle(
         json.dumps(
             {
@@ -1688,6 +1753,23 @@ def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path)
     assert settled == "{}"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
+
+
+def test_responses_admission_rejects_unsupported_reasoning_effort(tmp_path: Path) -> None:
+    """Native admission returns the same local parameter error before Rust dispatch."""
+    control, raw_key = _control_plane(tmp_path)
+    payload = json.loads(_responses_body())
+    payload["reasoning"] = {"effort": "high"}
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit_responses(control, raw_key, json.dumps(payload))
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_parameter"
+    assert error["error_type"] == "invalid_request_error"
+    assert error["param"] == "reasoning.effort"
+    assert "not supported by this model route" in error["message"]
 
 
 def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> None:
@@ -2250,6 +2332,28 @@ def test_rust_messages_sse_frames_match_the_committed_golden() -> None:
     native = pytest.importorskip("exp_gateway_native")
 
     actual = native.encode_messages_fixture("request-abc", "coding", _messages_fixture_json())
+    assert list(actual) == _parity_golden("messages_tool_stream_frames")
+
+
+def test_rust_messages_drop_reasoning_summary_deltas_without_changing_the_golden() -> None:
+    """The Messages surface has no reasoning-summary shape, so deltas emit nothing.
+
+    A stream carrying a reasoning summary produces exactly the committed golden
+    frames of the same stream without one.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+
+    events = json.loads(_messages_fixture_json())
+    events.insert(
+        0,
+        {
+            "kind": "reasoning_summary_delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "Checked the plan.",
+        },
+    )
+    actual = native.encode_messages_fixture("request-abc", "coding", json.dumps(events))
     assert list(actual) == _parity_golden("messages_tool_stream_frames")
 
 

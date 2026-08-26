@@ -42,6 +42,57 @@ impl Normalizer {
                 self.refusal_seen = true;
                 events.push(Event::RefusalDelta(delta));
             }
+            "response.reasoning_summary_text.delta" => {
+                let output_index =
+                    require_u64(&payload, "output_index", "OpenAI reasoning output_index")
+                        .map_err(|message| malformed(&message))? as u32;
+                let summary_index =
+                    require_u64(&payload, "summary_index", "OpenAI reasoning summary_index")
+                        .map_err(|message| malformed(&message))? as u32;
+                let delta = optional_text(&payload, "delta", "OpenAI reasoning summary delta")?;
+                self.reserve_summary_bytes(delta.len())?;
+                self.reasoning_summaries
+                    .entry((output_index, summary_index))
+                    .or_default()
+                    .push_str(&delta);
+                if !delta.is_empty() {
+                    events.push(Event::ReasoningSummaryDelta {
+                        output_index,
+                        summary_index,
+                        delta,
+                    });
+                }
+            }
+            "response.reasoning_summary_text.done" => {
+                let output_index =
+                    require_u64(&payload, "output_index", "OpenAI reasoning output_index")
+                        .map_err(|message| malformed(&message))? as u32;
+                let summary_index =
+                    require_u64(&payload, "summary_index", "OpenAI reasoning summary_index")
+                        .map_err(|message| malformed(&message))? as u32;
+                let final_text = require_string(&payload, "text", "OpenAI reasoning summary text")
+                    .map_err(|message| malformed(&message))?;
+                let key = (output_index, summary_index);
+                let streamed = self
+                    .reasoning_summaries
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                if !streamed.is_empty() && streamed != final_text {
+                    return Err(malformed(
+                        "OpenAI reasoning summary fragments changed at done",
+                    ));
+                }
+                if streamed.is_empty() && !final_text.is_empty() {
+                    self.reserve_summary_bytes(final_text.len())?;
+                    self.reasoning_summaries.insert(key, final_text.clone());
+                    events.push(Event::ReasoningSummaryDelta {
+                        output_index,
+                        summary_index,
+                        delta: final_text,
+                    });
+                }
+            }
             "response.output_item.added" => {
                 let item = payload
                     .get("item")
@@ -323,5 +374,53 @@ impl Normalizer {
             }
         }
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialects::Dialect;
+    use crate::sse::SseEvent;
+
+    #[test]
+    fn responses_reasoning_summary_is_normalized_and_verified() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let delta = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 2,
+                "summary_index": 1,
+                "delta": "checked",
+            })
+            .to_string(),
+        };
+        let events = normalizer
+            .feed(&delta)
+            .expect("summary delta must normalize");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ReasoningSummaryDelta {
+                output_index: 2,
+                summary_index: 1,
+                delta,
+            }] if delta == "checked"
+        ));
+
+        let done = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.reasoning_summary_text.done",
+                "output_index": 2,
+                "summary_index": 1,
+                "text": "checked",
+            })
+            .to_string(),
+        };
+        assert!(normalizer
+            .feed(&done)
+            .expect("matching summary completion must validate")
+            .is_empty());
     }
 }

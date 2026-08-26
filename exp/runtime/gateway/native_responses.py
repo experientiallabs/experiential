@@ -174,6 +174,12 @@ def responses_envelope(request: GatewayRequest) -> JsonObject:
         "metadata": request.metadata or None,
         "parallel_tool_calls": request.parallel_tool_calls is not False,
         "temperature": request.temperature,
+        "top_p": request.top_p,
+        "reasoning": {
+            "effort": request.reasoning_effort,
+            "summary": request.reasoning_summary,
+        },
+        "ignored_parameters": list(request.ignored_parameters),
         "tool_choice": _responses_tool_choice(request),
         "tools": [
             {

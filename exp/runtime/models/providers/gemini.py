@@ -16,7 +16,13 @@ from exp.common.models import (
     ToolCall,
     Usage,
 )
-from exp.runtime.models.providers.base import GatewayWireProfile, ProviderHttpClient
+from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
+from exp.runtime.models.providers.base import (
+    DEFAULT_RETRY_POLICY,
+    DEFAULT_TIMEOUT_SECONDS,
+    GatewayWireProfile,
+    ProviderHttpClient,
+)
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
@@ -31,6 +37,7 @@ from exp.runtime.models.providers.gemini_requests import (
     gemini_model_path,
 )
 from exp.runtime.models.providers.openai_compatible import normalize_embedding_vector
+from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -93,6 +100,38 @@ def gemini_generate_response(
 class GeminiClient(ProviderHttpClient):
     """Calls one explicit Gemini model through its native REST protocol."""
 
+    def __init__(
+        self,
+        *,
+        model: ModelSnapshot,
+        api_key: str,
+        base_url: str = GEMINI_BASE_URL,
+        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        supports_temperature: bool = True,
+        supports_top_p: bool = True,
+        supports_top_k: bool = False,
+        supports_logprobs: bool = False,
+        supports_reasoning: bool = False,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        """Create a Gemini client with explicit generation capability gates."""
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            transport=transport,
+            retry_policy=retry_policy,
+            timeout_seconds=timeout_seconds,
+        )
+        self._supports_temperature = supports_temperature
+        self._supports_top_p = supports_top_p
+        self._supports_top_k = supports_top_k
+        self._supports_logprobs = supports_logprobs
+        self._supports_reasoning = supports_reasoning
+        self._reasoning_effort = reasoning_effort
+
     def _headers(self) -> dict[str, str]:
         """Build native Gemini headers using the goog API key scheme."""
         return {"x-goog-api-key": self._api_key, "content-type": "application/json"}
@@ -106,6 +145,14 @@ class GeminiClient(ProviderHttpClient):
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
+            supports_temperature=self._supports_temperature,
+            maximum_temperature=2.0,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_wire_format="gemini_thinking",
+            reasoning_effort=self._reasoning_effort,
         )
 
     def _completion_path(self) -> str:
@@ -114,7 +161,16 @@ class GeminiClient(ProviderHttpClient):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native generateContent payload."""
-        return gemini_generate_request(self._model.model_id, request)
+        return gemini_generate_request(
+            self._model.model_id,
+            request,
+            supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_effort=self._reasoning_effort,
+        )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one completed generateContent payload into the shared response contract."""

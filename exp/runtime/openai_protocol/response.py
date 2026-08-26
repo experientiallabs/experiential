@@ -120,6 +120,7 @@ def completed_body(
             }
         ],
         "usage": chat_usage(usage),
+        **_ignored_parameters_extension(request),
     }
 
 
@@ -142,6 +143,13 @@ def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
         "prompt_tokens_details": details or None,
         "completion_tokens_details": output_details or None,
     }
+
+
+def _ignored_parameters_extension(request: GatewayRequest) -> JsonObject:
+    """Expose accepted-but-ignored controls so compatibility behavior is never silent."""
+    if not request.ignored_parameters:
+        return {}
+    return {"x-experiential-ignored-parameters": list(request.ignored_parameters)}
 
 
 def assistant_message(events: tuple[GatewayEvent, ...]) -> GatewayMessage | None:

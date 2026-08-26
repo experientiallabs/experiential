@@ -7,11 +7,13 @@ provider execution, so tests supply recorded responses and never contact a provi
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, cast
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import ReasoningEffort
 from exp.common.models.discovery import DiscoveredModel
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, ANTHROPIC_VERSION
 from exp.runtime.models.providers.gemini import GEMINI_BASE_URL
@@ -21,6 +23,7 @@ from exp.runtime.models.providers.openai_compatible import (
     OPENROUTER_REFERER,
     OPENROUTER_TITLE,
 )
+from exp.runtime.models.providers.reasoning_compat import default_reasoning_effort
 from exp.runtime.models.providers.transport import (
     HttpxJsonTransport,
     JsonHttpTransport,
@@ -234,12 +237,36 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
     """
     pricing = entry.get("pricing")
     prices: JsonObject = cast(JsonObject, pricing) if isinstance(pricing, dict) else {}
+    raw_token_field = entry.get("chat_max_tokens_field")
+    chat_max_tokens_field = (
+        "max_tokens"
+        if raw_token_field == "max_tokens"
+        else "max_completion_tokens"
+        if raw_token_field == "max_completion_tokens"
+        else None
+    )
     return DiscoveredModel(
         provider=provider,
         model=identity,
         supports_completions=_strict_bool(entry.get("supports_completions")),
         supports_tools=_strict_bool(entry.get("supports_tools")),
         supports_structured_output=_strict_bool(entry.get("supports_structured_output")),
+        supports_temperature=_strict_bool(entry.get("supports_temperature")),
+        supports_top_p=_strict_bool(entry.get("supports_top_p")),
+        supports_top_k=_strict_bool(entry.get("supports_top_k")),
+        supports_logprobs=_strict_bool(entry.get("supports_logprobs")),
+        supports_reasoning=_strict_bool(entry.get("supports_reasoning")),
+        reasoning_effort=_reasoning_effort(entry.get("reasoning_effort")),
+        sampling_requires_reasoning_none=_strict_bool(
+            entry.get("sampling_requires_reasoning_none")
+        ),
+        chat_max_tokens_field=chat_max_tokens_field,
+        minimum_temperature=_generation_number(entry.get("minimum_temperature"), maximum=2.0),
+        maximum_temperature=_generation_number(entry.get("maximum_temperature"), maximum=2.0),
+        minimum_top_p=_generation_number(entry.get("minimum_top_p"), maximum=1.0),
+        maximum_top_p=_generation_number(entry.get("maximum_top_p"), maximum=1.0),
+        minimum_top_k=_generation_integer(entry.get("minimum_top_k")),
+        maximum_top_k=_generation_integer(entry.get("maximum_top_k")),
         context_window_tokens=_strict_positive_int(entry.get("context_window_tokens")),
         maximum_output_tokens=_strict_positive_int(entry.get("maximum_output_tokens")),
         input_cost_per_million_tokens_usd=_micro_usd_price(
@@ -273,6 +300,20 @@ def _openrouter_model(provider: str, identity: str, entry: JsonObject) -> Discov
         supports_tools="tools" in supported or "tool_choice" in supported,
         supports_structured_output="structured_outputs" in supported
         or "response_format" in supported,
+        supports_temperature="temperature" in supported,
+        supports_top_p="top_p" in supported,
+        supports_top_k="top_k" in supported,
+        supports_logprobs="logprobs" in supported or "top_logprobs" in supported,
+        supports_reasoning="reasoning" in supported,
+        reasoning_effort=(
+            default_reasoning_effort(identity, "reasoning") if "reasoning" in supported else None
+        ),
+        chat_max_tokens_field="max_tokens",
+        minimum_temperature=0.0 if "temperature" in supported else None,
+        maximum_temperature=2.0 if "temperature" in supported else None,
+        minimum_top_p=0.0 if "top_p" in supported else None,
+        maximum_top_p=1.0 if "top_p" in supported else None,
+        minimum_top_k=1 if "top_k" in supported else None,
         context_window_tokens=_positive_int(entry.get("context_length")),
         maximum_output_tokens=_positive_int(limits.get("max_completion_tokens")),
         input_cost_per_million_tokens_usd=_million_token_price(prices.get("prompt")),
@@ -292,11 +333,32 @@ def _gemini_model(provider: str, identity: str, entry: JsonObject) -> Discovered
     supported = frozenset(
         value for value in (methods if isinstance(methods, list) else []) if isinstance(value, str)
     )
+    supports_temperature = _generation_number(entry.get("temperature"), maximum=2.0) is not None
+    supports_top_p = _generation_number(entry.get("topP"), maximum=1.0) is not None
+    supports_top_k = _generation_integer(entry.get("topK")) is not None
     return DiscoveredModel(
         provider=provider,
         model=identity,
         supports_completions="generateContent" in supported,
         supports_embeddings="embedContent" in supported or "batchEmbedContents" in supported,
+        supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+        supports_top_k=supports_top_k,
+        supports_reasoning=bool(entry.get("thinking")) or None,
+        reasoning_effort=(
+            default_reasoning_effort(identity, "gemini_thinking")
+            if bool(entry.get("thinking"))
+            else None
+        ),
+        minimum_temperature=0.0 if supports_temperature else None,
+        maximum_temperature=(
+            _generation_number(entry.get("maxTemperature"), maximum=2.0)
+            if supports_temperature
+            else None
+        ),
+        minimum_top_p=0.0 if supports_top_p else None,
+        maximum_top_p=1.0 if supports_top_p else None,
+        minimum_top_k=1 if supports_top_k else None,
         context_window_tokens=_positive_int(entry.get("inputTokenLimit")),
         maximum_output_tokens=_positive_int(entry.get("outputTokenLimit")),
     )
@@ -364,6 +426,40 @@ def _strict_positive_int(value: object) -> int | None:
 def _strict_bool(value: object) -> bool | None:
     """Read one exact boolean, rejecting truthy integers and other shapes."""
     return value if isinstance(value, bool) else None
+
+
+def _reasoning_effort(value: object) -> ReasoningEffort | None:
+    """Read one exact public reasoning-effort enum value."""
+    if value == "none":
+        return "none"
+    if value == "minimal":
+        return "minimal"
+    if value == "low":
+        return "low"
+    if value == "medium":
+        return "medium"
+    if value == "high":
+        return "high"
+    if value == "xhigh":
+        return "xhigh"
+    if value == "max":
+        return "max"
+    return None
+
+
+def _generation_number(value: object, *, maximum: float) -> float | None:
+    """Read one finite generation-control number inside its public domain."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and 0 <= number <= maximum else None
+
+
+def _generation_integer(value: object) -> int | None:
+    """Read one nonnegative exact integer generation-control bound."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
 
 
 def _micro_usd_price(value: object) -> float | None:

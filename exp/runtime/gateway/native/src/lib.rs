@@ -112,17 +112,27 @@ fn serve(
 }
 
 /// Encode one normalized event fixture through the Rust Chat SSE encoder for
-/// byte parity tests. `events_json` is a list of simplified event objects.
+/// byte parity tests. `events_json` is a list of simplified event objects and
+/// `ignored_parameters` names route-shaped controls disclosed on the final
+/// chunk.
 #[pyfunction]
+#[pyo3(signature = (request_id, model, created_at, include_usage, events_json, ignored_parameters=Vec::new()))]
 fn encode_chat_fixture(
     request_id: &str,
     model: &str,
     created_at: i64,
     include_usage: bool,
     events_json: &str,
+    ignored_parameters: Vec<String>,
 ) -> PyResult<Vec<String>> {
     let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
-    let mut encoder = encode::ChatSseEncoder::new(request_id, model, created_at, include_usage);
+    let mut encoder = encode::ChatSseEncoder::new_with_ignored(
+        request_id,
+        model,
+        created_at,
+        include_usage,
+        ignored_parameters,
+    );
     let mut frames = encoder
         .start()
         .map_err(|error| PyValueError::new_err(error_payload(&error)))?;
@@ -312,6 +322,17 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
         let event = match kind {
             "text_delta" => events::Event::TextDelta(text),
             "refusal_delta" => events::Event::RefusalDelta(text),
+            "reasoning_summary_delta" => events::Event::ReasoningSummaryDelta {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                summary_index: object
+                    .get("summary_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                delta: text,
+            },
             "tool_call_started" => events::Event::ToolCallStarted {
                 index,
                 call_id: object

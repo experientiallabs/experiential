@@ -59,7 +59,7 @@ _CandidateAssignment = tuple[
     tuple[AvailableModel, ...],
 ]
 _MANUAL_MODEL_ROW = "declare-model-manually"
-_NO_REASONING_EFFORT = "none"
+_NO_REASONING_EFFORT = "__unset_reasoning_effort__"
 _REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
 
 
@@ -363,7 +363,7 @@ def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
         options=[
             PickerOption(
                 value=_NO_REASONING_EFFORT,
-                label="none",
+                label="unset",
                 detail="never send the reasoning parameter",
             ),
             *(PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS),
