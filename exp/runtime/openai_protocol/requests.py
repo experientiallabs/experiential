@@ -389,7 +389,6 @@ def decode_chat(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
-            ignored_parameters=_ignored_chat_parameters(request),
             idempotency_key=operation if idempotency_key is not None else None,
             client_request_id=operation if client_request_id is not None else None,
         )
@@ -465,7 +464,6 @@ def decode_responses(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
-            ignored_parameters=_ignored_responses_parameters(request),
             idempotency_key=operation if idempotency_key is not None else None,
             client_request_id=operation if client_request_id is not None else None,
         )
