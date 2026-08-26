@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -104,6 +106,80 @@ def retain_provider_entry[KeyT, ValueT](
     if key not in entries:
         require_retained_provider_entry_capacity(len(entries))
     entries[key] = value
+
+
+@dataclass
+class ProviderToolAccumulator:
+    """Provider-order state for one incrementally emitted function call."""
+
+    index: int
+    call_id: str
+    name: str
+    raw_arguments: str = ""
+    completed: bool = False
+
+    def complete(self) -> ToolCall:
+        """Parse the accumulated raw JSON once the provider closes the call.
+
+        Returns:
+            A complete tool call retaining provider-order argument text.
+
+        Raises:
+            ProviderResponseError: The raw arguments are not one JSON object.
+        """
+        try:
+            arguments = json.loads(self.raw_arguments)
+        except json.JSONDecodeError as exc:
+            raise ProviderResponseError("streamed tool arguments are not valid JSON") from exc
+        if not isinstance(arguments, dict):
+            raise ProviderResponseError("streamed tool arguments must decode to an object")
+        try:
+            return ToolCall(
+                call_id=self.call_id,
+                name=self.name,
+                arguments=arguments,
+                raw_arguments=self.raw_arguments,
+            )
+        except ValidationError as exc:
+            raise ProviderResponseError("streamed tool call is incomplete") from exc
+
+
+def start_provider_tool_accumulator(
+    tools: dict[int, ProviderToolAccumulator],
+    *,
+    index: int,
+    call_id: str,
+    name: str,
+    budget: ProviderOutputRetentionBudget,
+) -> ProviderToolAccumulator:
+    """Retain one provider tool identity under the shared output budget."""
+    budget.retain(call_id)
+    budget.retain(name)
+    tool = ProviderToolAccumulator(index=index, call_id=call_id, name=name)
+    retain_provider_entry(tools, index, tool)
+    return tool
+
+
+def append_provider_tool_arguments(
+    tool: ProviderToolAccumulator,
+    fragment: str,
+    *,
+    budget: ProviderOutputRetentionBudget,
+) -> None:
+    """Append one raw argument fragment only after reserving aggregate capacity."""
+    budget.retain(fragment)
+    tool.raw_arguments += fragment
+
+
+def require_provider_tool(
+    tools: Mapping[int, ProviderToolAccumulator],
+    index: int,
+) -> ProviderToolAccumulator:
+    """Return one previously started provider tool call."""
+    try:
+        return tools[index]
+    except KeyError as exc:
+        raise ProviderResponseError("provider emitted arguments before a tool start") from exc
 
 
 @dataclass
