@@ -307,7 +307,7 @@ async fn settled_chat_response(
             sorted.sort();
             let cached = CachedResponse {
                 status_code: 200,
-                media_type: "text/event-stream".to_string(),
+                media_type: "text/event-stream; charset=utf-8".to_string(),
                 headers: sorted,
                 body: body.clone(),
             };
@@ -485,7 +485,7 @@ async fn respond_from_chat_events(
             sorted.sort();
             let cached = CachedResponse {
                 status_code: 200,
-                media_type: "text/event-stream".to_string(),
+                media_type: "text/event-stream; charset=utf-8".to_string(),
                 headers: sorted,
                 body: body.clone(),
             };
@@ -807,7 +807,7 @@ async fn stream_response(
     let body = Body::from_stream(ReceiverStream::new(receiver));
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream");
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8");
     for (name, value) in &header_pairs {
         if let (Ok(name), Ok(value)) = (
             header::HeaderName::try_from(name.as_str()),

@@ -203,7 +203,7 @@ pub(crate) fn complete_visible_refusal(events: &mut [Event]) -> Option<Failure> 
 pub(crate) fn sse_body_response(headers: &[(String, String)], body: Vec<u8>) -> Response {
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream");
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8");
     for (name, value) in headers {
         if let (Ok(header_name), Ok(header_value)) = (
             header::HeaderName::try_from(name.as_str()),
@@ -280,7 +280,7 @@ pub(crate) async fn finish_stream_terminal(
         if replayable {
             let cached = CachedResponse {
                 status_code: 200,
-                media_type: "text/event-stream".to_string(),
+                media_type: "text/event-stream; charset=utf-8".to_string(),
                 headers: cached_headers.to_vec(),
                 body: std::mem::take(capture),
             };

@@ -132,6 +132,26 @@ def _terminal_frames(finish_reason: str) -> bytes:
     )
 
 
+def _zero_output_terminal_frames(finish_reason: str) -> bytes:
+    """Encode a terminal with no content deltas: finish, real usage, done sentinel."""
+    return b"".join(
+        (
+            _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}),
+            _sse_frame(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 9,
+                        "completion_tokens": 0,
+                        "prompt_tokens_details": {"cached_tokens": 2},
+                    },
+                }
+            ),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
 class _SseUpstream(BaseHTTPRequestHandler):
     """OpenAI-compatible SSE mock whose shape is selected by the prompt."""
 
@@ -194,6 +214,10 @@ class _SseUpstream(BaseHTTPRequestHandler):
                     )
                 )
                 self.wfile.write(_terminal_frames("tool_calls"))
+            elif prompt == "empty-token":
+                self.wfile.write(_zero_output_terminal_frames("stop"))
+            elif prompt == "truncated-token":
+                self.wfile.write(_zero_output_terminal_frames("length"))
             else:
                 self.wfile.write(_content_chunk("hello "))
                 self.wfile.write(_content_chunk("world"))
@@ -403,7 +427,7 @@ def test_streaming_message_emits_the_full_anthropic_lifecycle(
         timeout=30.0,
     ) as response:
         assert response.status_code == 200
-        assert response.headers["content-type"] == "text/event-stream"
+        assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
         raw = b"".join(response.iter_bytes()).decode()
     names = [
         line.removeprefix("event: ") for line in raw.splitlines() if line.startswith("event: ")
@@ -570,3 +594,187 @@ def test_native_enforces_catalog_generation_limits_before_dispatch(
     assert field in native.json()["error"]["message"]
     with _SseUpstream.payloads_lock:
         assert len(_SseUpstream.payloads) == dispatched_before
+
+
+_ZERO_OUTPUT_CHAT_CASES = (
+    pytest.param("empty-token", "stop", id="empty-completion"),
+    pytest.param("truncated-token", "length", id="max-tokens-truncation"),
+)
+_ZERO_OUTPUT_RESPONSES_CASES = (
+    pytest.param("empty-token", "completed", id="empty-completion"),
+    pytest.param("truncated-token", "incomplete", id="max-tokens-truncation"),
+)
+_ZERO_OUTPUT_MESSAGES_CASES = (
+    pytest.param("empty-token", "end_turn", id="empty-completion"),
+    pytest.param("truncated-token", "max_tokens", id="max-tokens-truncation"),
+)
+
+
+@pytest.mark.parametrize(("prompt", "finish_reason"), _ZERO_OUTPUT_CHAT_CASES)
+def test_chat_non_stream_zero_output_keeps_client_visible_usage(
+    engine: _ServingEngine,
+    prompt: str,
+    finish_reason: str,
+) -> None:
+    """A successful zero-output completion still returns the real token usage."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "messages": [{"role": "user", "content": prompt}]},
+        timeout=30.0,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == finish_reason
+    usage = body["usage"]
+    assert usage is not None, "zero-output completion dropped client-visible usage"
+    assert usage["prompt_tokens"] == 9
+    assert usage["completion_tokens"] == 0
+    assert usage["total_tokens"] == 9
+    assert usage["prompt_tokens_details"]["cached_tokens"] == 2
+
+
+@pytest.mark.parametrize(("prompt", "finish_reason"), _ZERO_OUTPUT_CHAT_CASES)
+def test_chat_stream_zero_output_emits_the_include_usage_chunk(
+    engine: _ServingEngine,
+    prompt: str,
+    finish_reason: str,
+) -> None:
+    """A zero-output stream still ends with the requested usage chunk."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200
+        raw = b"".join(response.iter_bytes()).decode()
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    finish_reasons = [
+        choice["finish_reason"]
+        for payload in payloads
+        for choice in payload.get("choices", ())
+        if choice.get("finish_reason")
+    ]
+    assert finish_reasons == [finish_reason]
+    usage_chunks = [payload["usage"] for payload in payloads if payload.get("usage")]
+    assert usage_chunks, "zero-output stream never emitted the include_usage chunk"
+    assert usage_chunks[-1]["prompt_tokens"] == 9
+    assert usage_chunks[-1]["completion_tokens"] == 0
+
+
+@pytest.mark.parametrize(("prompt", "status"), _ZERO_OUTPUT_RESPONSES_CASES)
+def test_responses_non_stream_zero_output_keeps_client_visible_usage(
+    engine: _ServingEngine,
+    prompt: str,
+    status: str,
+) -> None:
+    """A zero-output Responses result still carries the real token usage."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": prompt},
+        timeout=30.0,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == status
+    usage = body["usage"]
+    assert usage is not None, "zero-output response dropped client-visible usage"
+    assert usage["input_tokens"] == 9
+    assert usage["output_tokens"] == 0
+    assert usage["input_tokens_details"]["cached_tokens"] == 2
+
+
+@pytest.mark.parametrize(("prompt", "status"), _ZERO_OUTPUT_RESPONSES_CASES)
+def test_responses_stream_zero_output_keeps_terminal_usage(
+    engine: _ServingEngine,
+    prompt: str,
+    status: str,
+) -> None:
+    """A zero-output Responses stream still reports usage on its terminal event."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": prompt, "stream": True},
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200
+        raw = b"".join(response.iter_bytes()).decode()
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+    terminal = next(payload for payload in payloads if payload["type"] == f"response.{status}")
+    usage = terminal["response"]["usage"]
+    assert usage is not None, "zero-output stream terminal dropped client-visible usage"
+    assert usage["input_tokens"] == 9
+    assert usage["output_tokens"] == 0
+
+
+@pytest.mark.parametrize(("prompt", "stop_reason"), _ZERO_OUTPUT_MESSAGES_CASES)
+def test_messages_non_stream_zero_output_keeps_real_input_tokens(
+    engine: _ServingEngine,
+    prompt: str,
+    stop_reason: str,
+) -> None:
+    """A zero-output Messages result reports the real input count, never zero."""
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body(prompt),
+        timeout=30.0,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stop_reason"] == stop_reason
+    assert body["usage"] == {
+        "input_tokens": 7,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 2,
+    }
+
+
+@pytest.mark.parametrize(("prompt", "stop_reason"), _ZERO_OUTPUT_MESSAGES_CASES)
+def test_messages_stream_zero_output_keeps_real_input_tokens(
+    engine: _ServingEngine,
+    prompt: str,
+    stop_reason: str,
+) -> None:
+    """A zero-output Messages stream reports the real input count on its final delta."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body(prompt, stream=True),
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200
+        raw = b"".join(response.iter_bytes()).decode()
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+    message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == stop_reason
+    assert message_delta["usage"] == {
+        "input_tokens": 7,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 2,
+    }

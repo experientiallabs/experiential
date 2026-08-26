@@ -547,8 +547,9 @@ async fn run_attempt(
                         opened: true,
                     };
                 }
-                // A successful terminal with no semantic output: settle and
-                // answer with the terminal alone.
+                // A successful terminal with no semantic output: settle, then
+                // answer with the tracked usage ahead of the terminal so the
+                // encoders keep the client-visible token accounting.
                 let outcome = if matches!(event, Event::Incomplete) {
                     "incomplete"
                 } else {
@@ -560,10 +561,12 @@ async fn run_attempt(
                 {
                     return AttemptEnd::Accounting;
                 }
-                return AttemptEnd::Settled(SettledAttempt {
-                    depth,
-                    events: vec![event],
-                });
+                let mut events = Vec::with_capacity(2);
+                if let Some(tracked) = usage {
+                    events.push(Event::Usage(tracked));
+                }
+                events.push(event);
+                return AttemptEnd::Settled(SettledAttempt { depth, events });
             }
         }
     }
