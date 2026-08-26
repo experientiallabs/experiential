@@ -109,4 +109,4 @@ def test_vertex_cells_name_native_profile_and_shared_stream_fixtures() -> None:
 
     assert cell.result is ProviderCertificationResult.PROVIDER_FIXTURE_PASS
     assert "exp/runtime/models/providers/vertex_test.py" in cell.evidence
-    assert "exp/runtime/models/providers/gemini_streaming_test.py" in cell.evidence
+    assert "exp/runtime/gateway/tests/native_dialect_parity_test.py" in cell.evidence
