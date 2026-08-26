@@ -20,6 +20,14 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
+      source:
+        description: Source to build for a release replay or an exact-ref verification
+        required: true
+        type: choice
+        default: latest-release
+        options:
+          - latest-release
+          - selected-ref
       publish:
         description: "Publish the built distribution to PyPI"
         required: true
@@ -52,7 +60,7 @@ jobs:
     steps:
       - name: Resolve the latest published release
         id: release
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -66,7 +74,7 @@ jobs:
           echo "tag=$published_tag" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
       - name: Build the abi3 extension wheel
         uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8  # v1.51.0
         with:
@@ -102,7 +110,7 @@ jobs:
     steps:
       - name: Resolve the latest published release
         id: release
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -115,7 +123,7 @@ jobs:
           echo "tag=$published_tag" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
       - name: Resolve the checked-out revision
         id: source_revision
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -183,7 +191,9 @@ jobs:
     if: >-
       github.event_name == 'release' ||
       (github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/main' && inputs.publish)
+      github.ref == 'refs/heads/main' &&
+      inputs.source == 'latest-release' &&
+      inputs.publish)
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
