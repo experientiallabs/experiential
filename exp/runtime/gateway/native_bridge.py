@@ -87,6 +87,7 @@ from exp.runtime.gateway.native_settlement import (
     optional_text,
 )
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.sqlite.migrations import close_idle_connections
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 from exp.runtime.models.providers import (
     preflight_gateway_request,
@@ -818,6 +819,23 @@ class NativeControlPlane:
             except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
                 return "false"
         return "true"
+
+    def close_thread_resources(self, argument: str) -> str:
+        """Release the calling thread's cached resources before it exits.
+
+        The data plane pins control-plane callbacks to a fixed pool of worker
+        threads and calls this once per worker as the pool shuts down, so the
+        SQLite connections cached per thread by ``persistent_connection``
+        close with the worker instead of outliving it.
+
+        Args:
+            argument: Empty JSON object, matching the callback shape.
+
+        Returns:
+            JSON object reporting the number of connections closed.
+        """
+        del argument
+        return json.dumps({"closed_connections": close_idle_connections()}, separators=(",", ":"))
 
     def _decode_body(
         self,

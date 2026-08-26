@@ -672,6 +672,25 @@ def persistent_connection(
     _connection_cache.idle[key] = connection
 
 
+def close_idle_connections() -> int:
+    """Close and forget the calling thread's cached idle connections.
+
+    A long-lived worker thread that stops servicing gateway operations calls
+    this before it exits, so the database descriptors held by its
+    ``persistent_connection`` cache release with the worker instead of
+    lingering for the life of the interpreter.
+
+    Returns:
+        Number of connections closed.
+    """
+    idle = _connection_cache.idle
+    closed = len(idle)
+    for connection in idle.values():
+        connection.close()
+    idle.clear()
+    return closed
+
+
 def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | None:
     """Create or forward-migrate one database without deleting incompatible state.
 

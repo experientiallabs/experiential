@@ -1567,6 +1567,28 @@ def test_usage_callbacks_scope_reports_to_the_presented_key(tmp_path: Path) -> N
     assert "default" not in isolated_page["html"]
 
 
+def test_close_thread_resources_releases_the_calling_thread_connections(
+    tmp_path: Path,
+) -> None:
+    """The worker-exit callback closes this thread's cached SQLite connections.
+
+    Bridge worker threads call this once as their pool shuts down, so the
+    per-thread connections cached by ``persistent_connection`` must close on
+    the calling thread and later callbacks must reopen cleanly.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    _settle_one_completed_chat(control, raw_key)
+    first = json.loads(control.close_thread_resources("{}"))
+    assert first["closed_connections"] >= 1
+    second = json.loads(control.close_thread_resources("{}"))
+    assert second["closed_connections"] == 0
+    # The cache repopulates transparently: the next ledger-backed callback
+    # reopens a connection and serves normally.
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
+    assert json.loads(control.close_thread_resources("{}"))["closed_connections"] >= 1
+
+
 def test_usage_callbacks_reject_an_invalid_key(tmp_path: Path) -> None:
     """A bad key on either usage callback maps to the shared 401 public error."""
     control, _raw_key = _control_plane(tmp_path)

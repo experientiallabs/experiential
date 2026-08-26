@@ -84,10 +84,12 @@ fn shutdown_handle() -> ShutdownHandle {
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
 /// `start_attempt`, `sign_dispatch`, `settle`, `abandon`, `remember`,
 /// `enforce_output`, `models`, `model_detail`, `usage_json`, `usage_page`,
-/// `metrics_json`, `metrics_text`, and `readiness`, each taking and
-/// returning one JSON string. `config_json` carries host, port, and
-/// concurrency bounds. `enforce_output` is called only when admission sets
-/// `output_guardrail`.
+/// `metrics_json`, `metrics_text`, `readiness`, and
+/// `close_thread_resources`, each taking and returning one JSON string.
+/// `config_json` carries host, port, and concurrency bounds.
+/// `enforce_output` is called only when admission sets `output_guardrail`;
+/// `close_thread_resources` is called once per bridge worker thread as it
+/// exits so per-thread caches release with the pool.
 #[pyfunction]
 #[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None))]
 fn serve(
@@ -99,7 +101,9 @@ fn serve(
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
-    let bridge = Arc::new(Bridge::new(control_plane, config.callback_permits));
+    let bridge = Arc::new(
+        Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
+    );
     let stop = shutdown.and_then(ShutdownHandle::take_receiver);
     let outcome = py.detach(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()

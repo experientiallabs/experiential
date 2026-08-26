@@ -81,6 +81,42 @@ def test_persistent_connection_closes_and_discards_on_error(tmp_path: Path) -> N
         assert replacement.execute("SELECT 1").fetchone()[0] == 1
 
 
+def test_close_idle_connections_releases_only_the_calling_thread_cache(
+    tmp_path: Path,
+) -> None:
+    """Closing idle connections closes the caller's cache and spares other threads."""
+    database = tmp_path / "close.db"
+    initialize_database(database)
+    # Drain connections cached by earlier tests so the counts below are exact.
+    migrations.close_idle_connections()
+    with persistent_connection(database) as cached:
+        pass
+
+    def _cache_and_close_elsewhere() -> tuple[int, bool]:
+        """Cache one connection on a worker thread and close that thread's cache."""
+        with persistent_connection(database) as connection:
+            pass
+        closed = migrations.close_idle_connections()
+        try:
+            connection.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            return closed, True
+        return closed, False
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker_closed, worker_connection_closed = pool.submit(_cache_and_close_elsewhere).result()
+    assert worker_closed == 1
+    assert worker_connection_closed is True
+    assert cached.execute("SELECT 1").fetchone()[0] == 1
+    assert migrations.close_idle_connections() == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        cached.execute("SELECT 1")
+    assert migrations.close_idle_connections() == 0
+    with persistent_connection(database) as replacement:
+        assert replacement is not cached
+        assert replacement.execute("SELECT 1").fetchone()[0] == 1
+
+
 def test_initial_database_is_private_wal_with_foreign_keys(tmp_path: Path) -> None:
     """Fresh state enables WAL, foreign keys, bounded busy waits, and mode 0600."""
     path = tmp_path / "gateway.db"
