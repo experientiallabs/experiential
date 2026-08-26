@@ -39,6 +39,7 @@ TERMINAL_EVENT_KINDS = frozenset(
 
 _REASONING_SUMMARY_DELTA = "response.reasoning_summary_text.delta"
 _REASONING_SUMMARY_DONE = "response.reasoning_summary_text.done"
+MAXIMUM_RETAINED_OUTPUT_BYTES = 64 * 1024 * 1024
 MAXIMUM_RETAINED_PROVIDER_ENTRIES = 4_096
 PROVIDER_OUTPUT_OVERFLOW_MESSAGE = "provider output exceeded the gateway response limit"
 
@@ -53,6 +54,20 @@ def require_retained_provider_entry_capacity(retained_entries: int) -> None:
         ProviderResponseError: The bounded provider-state ceiling is exhausted.
     """
     if retained_entries >= MAXIMUM_RETAINED_PROVIDER_ENTRIES:
+        raise ProviderResponseError(PROVIDER_OUTPUT_OVERFLOW_MESSAGE)
+
+
+def require_retained_provider_byte_capacity(retained_bytes: int, additional_bytes: int) -> None:
+    """Fail before retaining provider output beyond the aggregate byte ceiling.
+
+    Args:
+        retained_bytes: UTF-8 bytes already retained by the accumulator.
+        additional_bytes: UTF-8 bytes the next fragment would retain.
+
+    Raises:
+        ProviderResponseError: The bounded provider-state ceiling is exhausted.
+    """
+    if retained_bytes + additional_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES:
         raise ProviderResponseError(PROVIDER_OUTPUT_OVERFLOW_MESSAGE)
 
 
@@ -76,6 +91,16 @@ class OpenAIReasoningSummaryParser:
     """Validate and normalize one Responses reasoning-summary stream."""
 
     _summaries: dict[tuple[int, int], str] = field(default_factory=dict)
+    _retained_bytes: int = 0
+
+    def _append(self, key: tuple[int, int], fragment: str) -> None:
+        """Retain one non-empty UTF-8 fragment under both hard ceilings."""
+        if key not in self._summaries:
+            require_retained_provider_entry_capacity(len(self._summaries))
+        additional_bytes = len(fragment.encode("utf-8"))
+        require_retained_provider_byte_capacity(self._retained_bytes, additional_bytes)
+        self._summaries[key] = self._summaries.get(key, "") + fragment
+        self._retained_bytes += additional_bytes
 
     def consume(
         self,
@@ -107,7 +132,7 @@ class OpenAIReasoningSummaryParser:
         if event_type == _REASONING_SUMMARY_DELTA:
             delta = _optional_string(payload.get("delta"), "OpenAI reasoning summary delta")
             if delta:
-                retain_provider_entry(self._summaries, key, self._summaries.get(key, "") + delta)
+                self._append(key, delta)
         else:
             final_text = require_string(payload.get("text"), "OpenAI reasoning summary text")
             streamed = self._summaries.get(key, "")
@@ -115,7 +140,7 @@ class OpenAIReasoningSummaryParser:
                 raise ProviderResponseError("OpenAI reasoning summary fragments changed at done")
             delta = final_text if not streamed else ""
             if final_text and not streamed:
-                retain_provider_entry(self._summaries, key, final_text)
+                self._append(key, final_text)
         if not delta:
             return True, None
         return True, create(

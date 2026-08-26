@@ -67,6 +67,45 @@ def test_reasoning_summary_entries_fail_at_the_retained_state_ceiling(
         )
 
 
+def test_reasoning_summary_bytes_fail_atomically_at_the_retained_state_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated fragments on one key cannot bypass the UTF-8 byte ceiling."""
+    monkeypatch.setattr(streaming_events, "MAXIMUM_RETAINED_OUTPUT_BYTES", 5)
+    parser = OpenAIReasoningSummaryParser()
+    parser.consume(
+        "response.reasoning_summary_text.delta",
+        {"output_index": 0, "summary_index": 0, "delta": "éé"},
+        create=_create,
+    )
+
+    with pytest.raises(
+        ProviderResponseError,
+        match=streaming_events.PROVIDER_OUTPUT_OVERFLOW_MESSAGE,
+    ):
+        parser.consume(
+            "response.reasoning_summary_text.delta",
+            {"output_index": 0, "summary_index": 0, "delta": "é"},
+            create=_create,
+        )
+
+    consumed, event = parser.consume(
+        "response.reasoning_summary_text.delta",
+        {"output_index": 0, "summary_index": 0, "delta": "x"},
+        create=_create,
+    )
+    assert consumed is True
+    assert event is not None
+    assert event.text_delta == "x"
+    consumed, event = parser.consume(
+        "response.reasoning_summary_text.done",
+        {"output_index": 0, "summary_index": 0, "text": "ééx"},
+        create=_create,
+    )
+    assert consumed is True
+    assert event is None
+
+
 def test_provider_entry_insertion_is_atomic_at_the_ceiling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
