@@ -27,6 +27,7 @@ from exp.runtime.models.providers.async_transport import (
 from exp.runtime.models.providers.base import (
     DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT_SECONDS,
+    GatewayWireProfile,
     ProviderHttpClient,
     completion_timeout_seconds,
 )
@@ -172,8 +173,14 @@ class VertexClient(ProviderHttpClient):
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         token_provider: VertexTokenProvider | None = None,
+        supports_temperature: bool = True,
+        supports_top_p: bool = True,
+        supports_top_k: bool = False,
+        supports_logprobs: bool = False,
+        supports_reasoning: bool = False,
+        reasoning_effort: str | None = None,
     ) -> None:
-        """Create a client for one project-and-location Vertex endpoint root.
+        """Create a client with explicit generation gates for one Vertex endpoint root.
 
         Args:
             model: Resolved configured model identity.
@@ -186,6 +193,12 @@ class VertexClient(ProviderHttpClient):
             timeout_seconds: Per-attempt timeout floor.
             token_provider: Optional deterministic bearer-token seam for tests and callers
                 that own credential refresh themselves.
+            supports_temperature: Whether the exact model accepts temperature.
+            supports_top_p: Whether the exact model accepts top-p sampling.
+            supports_top_k: Whether the exact model accepts top-k sampling.
+            supports_logprobs: Whether the catalog reports logprob support.
+            supports_reasoning: Whether the exact model accepts thinking configuration.
+            reasoning_effort: Optional catalog-pinned reasoning effort.
         """
         _require_vertex_host(base_url)
         super().__init__(
@@ -197,6 +210,12 @@ class VertexClient(ProviderHttpClient):
             timeout_seconds=timeout_seconds,
         )
         self._token_provider = token_provider or ServiceAccountTokenProvider(api_key)
+        self._supports_temperature = supports_temperature
+        self._supports_top_p = supports_top_p
+        self._supports_top_k = supports_top_k
+        self._supports_logprobs = supports_logprobs
+        self._supports_reasoning = supports_reasoning
+        self._reasoning_effort = reasoning_effort
 
     async def complete_async(
         self,
@@ -253,6 +272,12 @@ class VertexClient(ProviderHttpClient):
             payload=gemini_generate_request(
                 self._model.model_id,
                 gateway_model_request(request),
+                supports_temperature=self._supports_temperature,
+                supports_top_p=self._supports_top_p,
+                supports_top_k=self._supports_top_k,
+                supports_logprobs=self._supports_logprobs,
+                supports_reasoning=self._supports_reasoning,
+                reasoning_effort=self._reasoning_effort,
             ),
             request=request,
             deadline=deadline,
@@ -297,6 +322,30 @@ class VertexClient(ProviderHttpClient):
             "content-type": "application/json",
         }
 
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the native Gemini-dialect profile for this Vertex connection.
+
+        Vertex serves the shared Gemini wire format. Profile resolution runs on
+        the native bridge's blocking callback thread, so the roughly-hourly
+        OAuth refresh never blocks Rust's async dispatcher; the resulting
+        bearer token is frozen only for this admitted request.
+        """
+        return GatewayWireProfile(
+            dialect="gemini_generate_content",
+            url=f"{self._base_url}/{self._stream_path()}",
+            headers=self._headers(),
+            model_id=self._model.model_id,
+            timeout_seconds=self._timeout_seconds,
+            supports_temperature=self._supports_temperature,
+            maximum_temperature=2.0,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_wire_format="gemini_thinking",
+            reasoning_effort=self._reasoning_effort,
+        )
+
     def _completion_path(self) -> str:
         """Return the publisher-scoped native generateContent route."""
         return f"{_MODEL_PATH_PREFIX}{_vertex_model_id(self._model.model_id)}:generateContent"
@@ -308,7 +357,16 @@ class VertexClient(ProviderHttpClient):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native generateContent payload."""
-        return gemini_generate_request(self._model.model_id, request)
+        return gemini_generate_request(
+            self._model.model_id,
+            request,
+            supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_logprobs=self._supports_logprobs,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_effort=self._reasoning_effort,
+        )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one completed generateContent payload into the shared response contract."""

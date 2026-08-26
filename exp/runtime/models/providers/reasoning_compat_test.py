@@ -37,6 +37,13 @@ def test_gemini_thinking_levels_follow_exact_model_tables() -> None:
         gemini_thinking_level("gemini-2.5-pro", "minimal")
     with pytest.raises(UnsupportedReasoningEffortError):
         gemini_thinking_level("gemini-3.99-unknown", "low")
+    assert (
+        gemini_thinking_level(
+            "publishers/google/models/gemini-2.5-pro",
+            "medium",
+        )
+        == "medium"
+    )
 
 
 def test_openai_reasoning_efforts_follow_exact_model_tables() -> None:

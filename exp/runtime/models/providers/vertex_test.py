@@ -19,11 +19,13 @@ from exp.common.models import (
     ModelRecord,
 )
 from exp.common.models.setup import ProviderConnection
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.models.providers.async_transport import (
     ProviderDeadlineExceeded,
     RequestDeadline,
 )
 from exp.runtime.models.providers.openai_compatible_test import _request, _snapshot
+from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.providers.vertex import (
     ServiceAccountTokenProvider,
@@ -33,6 +35,7 @@ from exp.runtime.models.providers.vertex import (
     _vertex_model_id,
 )
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.runtime.openai_protocol.model_adapter import model_request
 
 _BASE_URL = (
     "https://us-central1-aiplatform.googleapis.com/v1"
@@ -185,6 +188,60 @@ def test_vertex_stream_path_targets_the_sse_route() -> None:
     path = client._stream_path()
 
     assert path == "publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+
+
+def test_vertex_native_profile_and_payload_share_exact_generation_gates() -> None:
+    """Vertex preserves Gemini parameters identically on Python and Rust dispatch paths."""
+    client = VertexClient(
+        model=_snapshot("vertex", "publishers/google/models/gemini-2.5-flash"),
+        api_key='{"placeholder": true}',
+        base_url=_BASE_URL,
+        transport=ScriptedJsonTransport(),
+        token_provider=lambda: "fixture-bearer-token",
+        supports_temperature=False,
+        supports_top_p=False,
+        supports_top_k=True,
+        supports_reasoning=True,
+        reasoning_effort="high",
+    )
+
+    profile = client.gateway_wire_profile()
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="Preserve these controls."),),
+        maximum_output_tokens=128,
+        temperature=0.4,
+        top_p=0.8,
+        top_k=32,
+        reasoning_effort="high",
+    )
+    payload = client._build_request(model_request(request))
+    native_payload = dialect_stream_payload(profile, request)
+    generation = payload["generationConfig"]
+
+    assert profile.dialect == "gemini_generate_content"
+    assert profile.url == (
+        f"{_BASE_URL}/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+    )
+    assert profile.headers == {
+        "authorization": "Bearer fixture-bearer-token",
+        "content-type": "application/json",
+    }
+    assert profile.model_id == "publishers/google/models/gemini-2.5-flash"
+    assert not profile.supports_temperature
+    assert profile.supports_top_p is False
+    assert profile.supports_top_k
+    assert not profile.supports_logprobs
+    assert profile.supports_reasoning
+    assert profile.reasoning_wire_format == "gemini_thinking"
+    assert profile.reasoning_effort == "high"
+    assert isinstance(generation, dict)
+    assert "temperature" not in generation
+    assert "topP" not in generation
+    assert generation["topK"] == 32
+    assert generation["thinkingConfig"] == {"thinkingLevel": "HIGH"}
+    assert generation["maxOutputTokens"] == 128
+    assert native_payload == payload
 
 
 def test_vertex_model_id_strips_resource_path_spellings() -> None:

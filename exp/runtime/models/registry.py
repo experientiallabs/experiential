@@ -266,6 +266,12 @@ class RuntimeModelCatalog:
                 base_url=connection.base_url,
                 transport=self._transport_factory(),
                 token_provider=token_provider,
+                supports_temperature=capabilities.supports_temperature,
+                supports_top_p=_supports_top_p(capabilities),
+                supports_top_k=_supports_flag(capabilities, "supports_top_k"),
+                supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                supports_reasoning=capabilities.supports_reasoning,
+                reasoning_effort=capabilities.reasoning_effort,
             )
             return ResolvedModel(
                 alias,
