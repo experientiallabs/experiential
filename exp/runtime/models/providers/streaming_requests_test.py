@@ -673,12 +673,18 @@ def test_route_rejects_temperature_outside_any_provider_range() -> None:
     assert raised.value.param == "temperature"
 
 
-def test_route_rejects_output_ceiling_above_smallest_waterfall_limit() -> None:
+@pytest.mark.parametrize(
+    "public_parameter",
+    ("max_tokens", "max_completion_tokens", "max_output_tokens"),
+)
+def test_route_rejects_output_ceiling_above_smallest_waterfall_limit(
+    public_parameter: str,
+) -> None:
     """A caller token ceiling is checked against every known deployment limit."""
     request = _chat_request().model_copy(
         update={
             "maximum_output_tokens": 65_000,
-            "maximum_output_tokens_parameter": "max_completion_tokens",
+            "maximum_output_tokens_parameter": public_parameter,
         }
     )
     profiles = (
@@ -698,7 +704,7 @@ def test_route_rejects_output_ceiling_above_smallest_waterfall_limit() -> None:
         route_generation_parameter_requests(profiles, request)
 
     assert raised.value.code == "invalid_parameter"
-    assert raised.value.param == "max_completion_tokens"
+    assert raised.value.param == public_parameter
     assert "maximum of 64000" in str(raised.value)
 
 
