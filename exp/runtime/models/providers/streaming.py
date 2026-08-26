@@ -42,6 +42,7 @@ from exp.runtime.models.providers.streaming_events import (
     SEMANTIC_EVENT_KINDS,
     TERMINAL_EVENT_KINDS,
     OpenAIReasoningSummaryParser,
+    ProviderOutputRetentionBudget,
     provider_refusal_failure,
     retain_provider_entry,
 )
@@ -102,6 +103,33 @@ class _ToolAccumulator:
             )
         except ValidationError as exc:
             raise ProviderResponseError("streamed tool call is incomplete") from exc
+
+
+def _start_tool_accumulator(
+    tools: dict[int, _ToolAccumulator],
+    *,
+    index: int,
+    call_id: str,
+    name: str,
+    budget: ProviderOutputRetentionBudget,
+) -> _ToolAccumulator:
+    """Retain one provider tool identity under the shared output budget."""
+    budget.retain(call_id)
+    budget.retain(name)
+    tool = _ToolAccumulator(index=index, call_id=call_id, name=name)
+    retain_provider_entry(tools, index, tool)
+    return tool
+
+
+def _append_tool_arguments(
+    tool: _ToolAccumulator,
+    fragment: str,
+    *,
+    budget: ProviderOutputRetentionBudget,
+) -> None:
+    """Append one raw argument fragment only after reserving aggregate capacity."""
+    budget.retain(fragment)
+    tool.raw_arguments += fragment
 
 
 class _EventFactory:
@@ -543,7 +571,8 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
     """Map native Responses lifecycle events to provider-neutral events."""
     factory = _EventFactory()
     tools: dict[int, _ToolAccumulator] = {}
-    reasoning_summaries = OpenAIReasoningSummaryParser()
+    retained_output = ProviderOutputRetentionBudget()
+    reasoning_summaries = OpenAIReasoningSummaryParser(budget=retained_output)
     refusal_seen = False
     async for frame in sse.events():
         if frame.data == "[DONE]":
@@ -575,8 +604,13 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                     item.get("call_id") or item.get("id"), "OpenAI function call ID"
                 )
                 name = require_string(item.get("name"), "OpenAI function call name")
-                tool = _ToolAccumulator(index=index, call_id=call_id, name=name)
-                retain_provider_entry(tools, index, tool)
+                tool = _start_tool_accumulator(
+                    tools,
+                    index=index,
+                    call_id=call_id,
+                    name=name,
+                    budget=retained_output,
+                )
                 yield factory.create(
                     GatewayEventKind.TOOL_CALL_STARTED,
                     tool_call_index=index,
@@ -585,7 +619,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                 )
                 initial = item.get("arguments")
                 if isinstance(initial, str) and initial:
-                    tool.raw_arguments += initial
+                    _append_tool_arguments(tool, initial, budget=retained_output)
                     yield factory.create(
                         GatewayEventKind.TOOL_ARGUMENTS_DELTA,
                         tool_call_index=index,
@@ -597,7 +631,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
             index = require_integer(payload.get("output_index"), "OpenAI output_index")
             tool = _require_tool(tools, index)
             delta = _optional_string(payload.get("delta"), "OpenAI argument delta")
-            tool.raw_arguments += delta
+            _append_tool_arguments(tool, delta, budget=retained_output)
             yield factory.create(
                 GatewayEventKind.TOOL_ARGUMENTS_DELTA,
                 tool_call_index=index,
@@ -621,7 +655,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                             "OpenAI tool argument fragments changed at done"
                         )
                     if not tool.raw_arguments and final_arguments:
-                        tool.raw_arguments = final_arguments
+                        _append_tool_arguments(tool, final_arguments, budget=retained_output)
                         yield factory.create(
                             GatewayEventKind.TOOL_ARGUMENTS_DELTA,
                             tool_call_index=index,
@@ -690,6 +724,7 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
     """Map native Anthropic Messages events to provider-neutral events."""
     factory = _EventFactory()
     tools: dict[int, _ToolAccumulator] = {}
+    retained_output = ProviderOutputRetentionBudget()
     input_tokens = 0
     output_tokens = 0
     cache_read = 0
@@ -719,8 +754,13 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
                 name = require_string(block.get("name"), "Anthropic tool name")
                 if index in tools:
                     raise ProviderResponseError("Anthropic stream repeated a tool-call start")
-                tool = _ToolAccumulator(index=index, call_id=call_id, name=name)
-                retain_provider_entry(tools, index, tool)
+                tool = _start_tool_accumulator(
+                    tools,
+                    index=index,
+                    call_id=call_id,
+                    name=name,
+                    budget=retained_output,
+                )
                 yield factory.create(
                     GatewayEventKind.TOOL_CALL_STARTED,
                     tool_call_index=index,
@@ -750,7 +790,7 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
             elif delta_type == "input_json_delta":
                 fragment = _optional_string(delta.get("partial_json"), "Anthropic argument delta")
                 tool = _require_tool(tools, index)
-                tool.raw_arguments += fragment
+                _append_tool_arguments(tool, fragment, budget=retained_output)
                 yield factory.create(
                     GatewayEventKind.TOOL_ARGUMENTS_DELTA,
                     tool_call_index=index,
@@ -828,6 +868,7 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
     """Map generic Chat Completions chunks to provider-neutral events."""
     factory = _EventFactory()
     tools: dict[int, _ToolAccumulator] = {}
+    retained_output = ProviderOutputRetentionBudget()
     usage: GatewayUsage | None = None
     finish_reason: str | None = None
     refusal_seen = False
@@ -888,8 +929,13 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
                 if tool is None:
                     call_id = require_string(item.get("id"), "OpenAI-compatible tool ID")
                     name = require_string(function.get("name"), "OpenAI-compatible tool name")
-                    tool = _ToolAccumulator(index=index, call_id=call_id, name=name)
-                    retain_provider_entry(tools, index, tool)
+                    tool = _start_tool_accumulator(
+                        tools,
+                        index=index,
+                        call_id=call_id,
+                        name=name,
+                        budget=retained_output,
+                    )
                     yield factory.create(
                         GatewayEventKind.TOOL_CALL_STARTED,
                         tool_call_index=index,
@@ -910,7 +956,7 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
                 fragment = function.get("arguments")
                 if fragment is not None:
                     raw_fragment = _optional_string(fragment, "OpenAI-compatible argument delta")
-                    tool.raw_arguments += raw_fragment
+                    _append_tool_arguments(tool, raw_fragment, budget=retained_output)
                     yield factory.create(
                         GatewayEventKind.TOOL_ARGUMENTS_DELTA,
                         tool_call_index=index,

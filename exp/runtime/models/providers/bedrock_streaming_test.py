@@ -16,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.models.providers import streaming_events
 from exp.runtime.models.providers.async_transport import RequestDeadline
 from exp.runtime.models.providers.bedrock import BedrockClient, BoundedBedrockClient
 from exp.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
@@ -246,6 +247,61 @@ def test_bedrock_empty_tool_input_delta_is_skipped() -> None:
         assert events[2].tool_call_index == 0
         assert events[2].tool_call is not None
         assert events[2].tool_call.raw_arguments == '{"path":"fib.py"}'
+
+    asyncio.run(scenario())
+
+
+def test_bedrock_bounds_aggregate_tool_argument_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native Bedrock tool fragments share the same retained-output ceiling."""
+    monkeypatch.setattr(streaming_events, "MAXIMUM_RETAINED_OUTPUT_BYTES", 5)
+
+    async def scenario() -> None:
+        """Consume one tool stream whose second fragment exceeds the ceiling."""
+        upstream = _EventStream(
+            (
+                {
+                    "contentBlockStart": {
+                        "contentBlockIndex": 0,
+                        "start": {
+                            "toolUse": {
+                                "toolUseId": "i",
+                                "name": "n",
+                            }
+                        },
+                    }
+                },
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 0,
+                        "delta": {"toolUse": {"input": "abc"}},
+                    }
+                },
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 0,
+                        "delta": {"toolUse": {"input": "x"}},
+                    }
+                },
+            )
+        )
+        stream = await _client(_Runtime([upstream])).stream(
+            _request(),
+            deadline=RequestDeadline.after(10),
+            idempotency_key="bounded-tool-operation",
+            retry_policy=RetryPolicy(1, 0, 0),
+        )
+        events = [event async for event in stream]
+
+        assert [event.kind for event in events] == [
+            GatewayEventKind.TOOL_CALL_STARTED,
+            GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            GatewayEventKind.FAILED,
+        ]
+        assert events[-1].failure is not None
+        assert events[-1].failure.failure_class is GatewayFailureClass.MALFORMED_RESPONSE
+        assert upstream.closed
 
     asyncio.run(scenario())
 

@@ -9,6 +9,7 @@ from exp.runtime.models.providers import streaming_events
 from exp.runtime.models.providers.errors import ProviderResponseError
 from exp.runtime.models.providers.streaming_events import (
     OpenAIReasoningSummaryParser,
+    ProviderOutputRetentionBudget,
     retain_provider_entry,
 )
 
@@ -104,6 +105,28 @@ def test_reasoning_summary_bytes_fail_atomically_at_the_retained_state_ceiling(
     )
     assert consumed is True
     assert event is None
+
+
+def test_shared_output_budget_counts_utf8_fragments_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tool and summary accumulators can share one exact UTF-8 byte ceiling."""
+    monkeypatch.setattr(streaming_events, "MAXIMUM_RETAINED_OUTPUT_BYTES", 5)
+    budget = ProviderOutputRetentionBudget()
+    parser = OpenAIReasoningSummaryParser(budget=budget)
+    parser.consume(
+        "response.reasoning_summary_text.delta",
+        {"output_index": 0, "summary_index": 0, "delta": "éé"},
+        create=_create,
+    )
+
+    with pytest.raises(
+        ProviderResponseError,
+        match=streaming_events.PROVIDER_OUTPUT_OVERFLOW_MESSAGE,
+    ):
+        budget.retain("é")
+
+    budget.retain("x")
 
 
 def test_provider_entry_insertion_is_atomic_at_the_ceiling(

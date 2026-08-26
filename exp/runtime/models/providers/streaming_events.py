@@ -71,6 +71,26 @@ def require_retained_provider_byte_capacity(retained_bytes: int, additional_byte
         raise ProviderResponseError(PROVIDER_OUTPUT_OVERFLOW_MESSAGE)
 
 
+@dataclass
+class ProviderOutputRetentionBudget:
+    """Enforce one aggregate UTF-8 byte ceiling across retained stream state."""
+
+    _retained_bytes: int = 0
+
+    def retain(self, fragment: str) -> None:
+        """Account for one provider-controlled string before retaining it.
+
+        Args:
+            fragment: Provider text that an accumulator is about to retain.
+
+        Raises:
+            ProviderResponseError: The aggregate retained-output ceiling is exhausted.
+        """
+        additional_bytes = len(fragment.encode("utf-8"))
+        require_retained_provider_byte_capacity(self._retained_bytes, additional_bytes)
+        self._retained_bytes += additional_bytes
+
+
 def retain_provider_entry[KeyT, ValueT](
     entries: dict[KeyT, ValueT], key: KeyT, value: ValueT
 ) -> None:
@@ -90,17 +110,18 @@ def retain_provider_entry[KeyT, ValueT](
 class OpenAIReasoningSummaryParser:
     """Validate and normalize one Responses reasoning-summary stream."""
 
+    budget: ProviderOutputRetentionBudget = field(
+        default_factory=ProviderOutputRetentionBudget,
+        repr=False,
+    )
     _summaries: dict[tuple[int, int], str] = field(default_factory=dict)
-    _retained_bytes: int = 0
 
     def _append(self, key: tuple[int, int], fragment: str) -> None:
         """Retain one non-empty UTF-8 fragment under both hard ceilings."""
         if key not in self._summaries:
             require_retained_provider_entry_capacity(len(self._summaries))
-        additional_bytes = len(fragment.encode("utf-8"))
-        require_retained_provider_byte_capacity(self._retained_bytes, additional_bytes)
+        self.budget.retain(fragment)
         self._summaries[key] = self._summaries.get(key, "") + fragment
-        self._retained_bytes += additional_bytes
 
     def consume(
         self,

@@ -27,6 +27,7 @@ from exp.runtime.models.providers.errors import (
     require_string,
 )
 from exp.runtime.models.providers.streaming_events import (
+    ProviderOutputRetentionBudget,
     retain_provider_entry,
 )
 from exp.runtime.models.providers.transport import ProviderTransportError
@@ -113,6 +114,7 @@ class BedrockProviderStream:
         self._events: deque[GatewayEvent] = deque()
         self._workers: set[asyncio.Task[object]] = set()
         self._tools: dict[int, _ToolAccumulator] = {}
+        self._retained_output = ProviderOutputRetentionBudget()
         self._next_sequence = 0
         self._stop_reason: str | None = None
         self._committed = False
@@ -243,16 +245,20 @@ class BedrockProviderStream:
         if index in self._tools:
             raise ProviderResponseError("Bedrock stream repeated a tool-call start")
         tool = _mapping(raw_tool, "Bedrock toolUse start")
+        call_id = require_string(
+            cast("JsonValue | None", tool.get("toolUseId")),
+            "Bedrock toolUseId",
+        )
+        name = require_string(
+            cast("JsonValue | None", tool.get("name")),
+            "Bedrock tool name",
+        )
+        self._retained_output.retain(call_id)
+        self._retained_output.retain(name)
         accumulator = _ToolAccumulator(
             index=index,
-            call_id=require_string(
-                cast("JsonValue | None", tool.get("toolUseId")),
-                "Bedrock toolUseId",
-            ),
-            name=require_string(
-                cast("JsonValue | None", tool.get("name")),
-                "Bedrock tool name",
-            ),
+            call_id=call_id,
+            name=name,
         )
         retain_provider_entry(self._tools, index, accumulator)
         return [
@@ -284,6 +290,7 @@ class BedrockProviderStream:
                 raise ProviderResponseError("Bedrock tool input delta must be text")
             if not fragment:
                 return []
+            self._retained_output.retain(fragment)
             tool.raw_arguments += fragment
             return [
                 self._event(
