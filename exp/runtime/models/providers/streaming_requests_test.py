@@ -4,12 +4,14 @@ from typing import cast
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
     GatewayToolDefinition,
+    StructuredTextFormat,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
@@ -446,6 +448,75 @@ def test_route_shaping_omits_tool_controls_when_no_tools_exist() -> None:
     assert provider_request.parallel_tool_calls is None
 
 
+def test_route_shaping_omits_parallel_control_when_tool_choice_disables_tools() -> None:
+    """A parallel selector cannot affect a turn whose tool choice is none."""
+    request = _chat_request().model_copy(
+        update={
+            "tools": (GatewayToolDefinition(name="search", parameters={"type": "object"}),),
+            "tool_choice": "none",
+            "parallel_tool_calls": False,
+        }
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(
+        (GatewayWireProfile(dialect="gemini_generate_content", url="https://provider.test"),),
+        request,
+    )
+
+    assert public_request.ignored_parameters == ("parallel_tool_calls",)
+    assert provider_request.parallel_tool_calls is None
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    ("gemini_generate_content", "bedrock_converse_stream"),
+)
+def test_route_rejects_parallel_control_when_the_dialect_has_no_toggle(dialect: str) -> None:
+    """A semantic parallel-tool control never disappears on native provider wires."""
+    request = _chat_request().model_copy(
+        update={
+            "tools": (GatewayToolDefinition(name="search", parameters={"type": "object"}),),
+            "parallel_tool_calls": False,
+        }
+    )
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (GatewayWireProfile(dialect=dialect, url="https://provider.test"),),
+            request,
+        )
+
+    assert raised.value.code == "unsupported_parameter"
+    assert raised.value.param == "parallel_tool_calls"
+
+
+def test_route_rejects_non_strict_schema_on_a_strict_only_provider() -> None:
+    """Constrained decoding cannot silently strengthen a non-strict request."""
+    request = _chat_request().model_copy(
+        update={
+            "structured_text": StructuredTextFormat(
+                name="answer",
+                json_schema={"type": "object"},
+                strict=False,
+            )
+        }
+    )
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (
+                GatewayWireProfile(
+                    dialect="anthropic_messages",
+                    url="https://provider.test",
+                ),
+            ),
+            request,
+        )
+
+    assert raised.value.code == "unsupported_parameter"
+    assert raised.value.param == "response_format.json_schema.strict"
+
+
 def test_route_rejects_semantic_tool_selectors_without_a_matching_schema() -> None:
     """Required and named choices cannot be reduced to harmless no-ops."""
     profile = GatewayWireProfile(
@@ -602,12 +673,18 @@ def test_route_rejects_temperature_outside_any_provider_range() -> None:
     assert raised.value.param == "temperature"
 
 
-def test_route_rejects_output_ceiling_above_smallest_waterfall_limit() -> None:
+@pytest.mark.parametrize(
+    "public_parameter",
+    ("max_tokens", "max_completion_tokens", "max_output_tokens"),
+)
+def test_route_rejects_output_ceiling_above_smallest_waterfall_limit(
+    public_parameter: str,
+) -> None:
     """A caller token ceiling is checked against every known deployment limit."""
     request = _chat_request().model_copy(
         update={
             "maximum_output_tokens": 65_000,
-            "maximum_output_tokens_parameter": "max_completion_tokens",
+            "maximum_output_tokens_parameter": public_parameter,
         }
     )
     profiles = (
@@ -627,7 +704,7 @@ def test_route_rejects_output_ceiling_above_smallest_waterfall_limit() -> None:
         route_generation_parameter_requests(profiles, request)
 
     assert raised.value.code == "invalid_parameter"
-    assert raised.value.param == "max_completion_tokens"
+    assert raised.value.param == public_parameter
     assert "maximum of 64000" in str(raised.value)
 
 
@@ -738,6 +815,55 @@ def test_anthropic_messages_stream_payload_omits_absent_top_p() -> None:
     assert "temperature" not in payload
 
 
+def test_anthropic_payload_merges_reasoning_schema_and_tool_controls() -> None:
+    """Anthropic receives its native strict-output and parallel-tool wire shapes."""
+    request = _chat_request().model_copy(
+        update={
+            "tools": (
+                GatewayToolDefinition(
+                    name="lookup",
+                    description="Find a record.",
+                    parameters={"type": "object"},
+                    strict=True,
+                ),
+            ),
+            "parallel_tool_calls": False,
+            "reasoning_effort": "high",
+            "structured_text": StructuredTextFormat(
+                name="answer",
+                json_schema={"type": "object", "additionalProperties": False},
+            ),
+        }
+    )
+
+    payload = anthropic_messages_stream_payload(
+        "claude-opus-5",
+        request,
+        supports_reasoning=True,
+    )
+
+    assert payload["tools"] == [
+        {
+            "name": "lookup",
+            "description": "Find a record.",
+            "input_schema": {"type": "object"},
+            "strict": True,
+        }
+    ]
+    assert payload["tool_choice"] == {
+        "type": "auto",
+        "disable_parallel_tool_use": True,
+    }
+    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["output_config"] == {
+        "effort": "high",
+        "format": {
+            "type": "json_schema",
+            "schema": {"type": "object", "additionalProperties": False},
+        },
+    }
+
+
 def test_anthropic_messages_stream_payload_round_trips_tool_error_state() -> None:
     """A failed tool result keeps is_error on the Anthropic wire only when set."""
     request = GatewayRequest(
@@ -823,6 +949,27 @@ def test_gemini_generation_forwards_top_p_and_top_k_only_when_declared() -> None
     assert generation["topK"] == 20
 
 
+def test_gemini_generation_forwards_stop_and_strict_json_schema() -> None:
+    """Gemini stop and structured output controls use generationConfig names."""
+    schema: JsonObject = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+    }
+    request = _chat_request().model_copy(
+        update={
+            "stop": ("DONE",),
+            "structured_text": StructuredTextFormat(name="answer", json_schema=schema),
+        }
+    )
+
+    payload = gemini_generate_content_stream_payload("gemini-2.5-pro", request)
+    generation = cast("dict[str, object]", payload["generationConfig"])
+
+    assert generation["stopSequences"] == ["DONE"]
+    assert generation["responseMimeType"] == "application/json"
+    assert generation["responseJsonSchema"] == schema
+
+
 def test_openai_responses_stream_payload_ignores_logprobs_even_when_flagged() -> None:
     """Responses logprob controls are accepted but not sent without output projection."""
     request = _chat_request().model_copy(update={"top_logprobs": 5})
@@ -861,6 +1008,60 @@ def test_bedrock_stream_payload_matches_the_provider_builder_without_model_id() 
     inference = payload["inferenceConfig"]
     assert isinstance(inference, dict)
     assert inference["temperature"] == 0.2
+
+
+def test_bedrock_stream_payload_forwards_stop_schema_and_strict_tools() -> None:
+    """Converse receives every certified semantic control on its native fields."""
+    schema: JsonObject = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+    }
+    request = _chat_request().model_copy(
+        update={
+            "stop": ("DONE",),
+            "tools": (
+                GatewayToolDefinition(
+                    name="lookup",
+                    description="Find a record.",
+                    parameters={"type": "object"},
+                    strict=True,
+                ),
+            ),
+            "structured_text": StructuredTextFormat(
+                name="answer",
+                description="Return one answer.",
+                json_schema=schema,
+            ),
+        }
+    )
+
+    payload = bedrock_converse_stream_payload("exact-model", request)
+
+    assert payload["inferenceConfig"] == {"stopSequences": ["DONE"]}
+    assert payload["toolConfig"] == {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": "lookup",
+                    "description": "Find a record.",
+                    "inputSchema": {"json": {"type": "object"}},
+                    "strict": True,
+                }
+            }
+        ]
+    }
+    assert payload["outputConfig"] == {
+        "textFormat": {
+            "type": "json_schema",
+            "structure": {
+                "jsonSchema": {
+                    "schema": '{"properties":{"answer":{"type":"string"}},"type":"object"}',
+                    "name": "answer",
+                    "description": "Return one answer.",
+                }
+            },
+        }
+    }
 
 
 def test_dialect_dispatch_builds_the_bedrock_payload() -> None:

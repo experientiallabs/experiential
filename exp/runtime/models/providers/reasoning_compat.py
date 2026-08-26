@@ -128,7 +128,11 @@ def gemini_thinking_level(model_id: str, effort: str) -> str:
 
 def _gemini_supported_efforts(model_id: str) -> Collection[str]:
     """Return documented native thinking levels for one Gemini family."""
-    normalized = _normalized_model(model_id).removeprefix("models/")
+    normalized = (
+        _normalized_model(model_id)
+        .removeprefix("publishers/google/models/")
+        .removeprefix("models/")
+    )
     if "gemini-3-7-flash" in normalized or "gemini-3-1-pro" in normalized:
         supported: Collection[str] = ("low", "medium", "high")
     elif "gemini-3-pro" in normalized:

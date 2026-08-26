@@ -470,8 +470,16 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         provider_model="us.anthropic.claude-sonnet-4-5",
         exact_model_id="bedrock-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        capabilities=ModelCapabilities(
+            supports_tools=True,
+            supports_structured_output=True,
+        ),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_stop_sequences=True,
+            supports_strict_tools=True,
+            supports_structured_text=True,
+        ),
         prices=GatewayTokenPrices(),
         pricing_source=None,
         replace=False,
@@ -490,7 +498,38 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
     )
     control = NativeControlPlane(components)
-    admission = _admit(control, raw_key, _chat_body(model="bed"))
+    body_schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    admission = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "bed",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": ["DONE"],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "description": "Find a record.",
+                            "parameters": {"type": "object"},
+                            "strict": True,
+                        },
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "description": "Return one answer.",
+                        "schema": body_schema,
+                        "strict": True,
+                    },
+                },
+            }
+        ),
+    )
     assert "escalate" not in admission
     # The route entry, not admission itself, carries the per-deployment wire
     # fields; the data plane reserves the physical dispatch through
@@ -510,6 +549,20 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
     assert body == json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     assert "modelId" not in payload
     assert payload["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
+    assert payload["inferenceConfig"] == {"stopSequences": ["DONE"]}
+    assert payload["toolConfig"]["tools"][0]["toolSpec"]["strict"] is True
+    assert payload["outputConfig"] == {
+        "textFormat": {
+            "type": "json_schema",
+            "structure": {
+                "jsonSchema": {
+                    "schema": '{"properties":{"answer":{"type":"string"}},"type":"object"}',
+                    "name": "answer",
+                    "description": "Return one answer.",
+                }
+            },
+        }
+    }
     # The route entry carries no signature: the data plane signs at dispatch
     # time, after its bounded permit, so queue wait cannot age the signature.
     assert started["headers"] == {}
@@ -549,6 +602,102 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
     assert settled == "{}"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
+
+
+def test_admit_serves_gemini_stop_and_schema_on_the_native_wire(tmp_path: Path) -> None:
+    """Rust admission receives Gemini's exact stop and structured-output payload."""
+    from exp.common.models import GatewayTokenPrices
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="GEMINI_TEST_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="gem",
+        connection_name="gemini-main",
+        provider_model="gemini-2.5-pro",
+        exact_model_id="gemini-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(supports_structured_output=True),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_stop_sequences=True,
+            supports_structured_text=True,
+        ),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="gem",
+        alias_name="gem",
+        revision_id="revision-gem",
+        pool_id="gem",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="gem")
+    components = load_gateway_components(
+        tmp_path,
+        environment={
+            "TEST_PROVIDER_KEY": "provider-secret-canary",
+            "GEMINI_TEST_KEY": "gemini-secret-canary",
+        },
+    )
+    control = NativeControlPlane(components)
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    admission = _admit_started(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "gem",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": ["DONE"],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": schema,
+                        "strict": True,
+                    },
+                },
+            }
+        ),
+    )
+
+    assert admission["dialect"] == "gemini_generate_content"
+    payload = admission["upstream_payload"]
+    assert isinstance(payload, dict)
+    generation = payload["generationConfig"]
+    assert isinstance(generation, dict)
+    assert generation["stopSequences"] == ["DONE"]
+    assert generation["responseMimeType"] == "application/json"
+    assert generation["responseJsonSchema"] == schema
+    settled = control.settle(
+        json.dumps(
+            {
+                "request_id": admission["request_id"],
+                "attempt_id": admission["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+    assert settled == "{}"
 
 
 def _configured_pool_gateway(

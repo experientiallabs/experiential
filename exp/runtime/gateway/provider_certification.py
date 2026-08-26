@@ -68,6 +68,7 @@ class ProviderCertificationMatrix(ContractModel):
             "openai",
             "openai-compatible",
             "openrouter",
+            "vertex",
         }
         expected = {
             (provider, capability) for provider in providers for capability in ProviderCapability
@@ -84,7 +85,7 @@ class ProviderCertificationMatrix(ContractModel):
         return sha256_json(self)
 
 
-_EVALUATED_AT = datetime(2026, 8, 19, tzinfo=UTC)
+_EVALUATED_AT = datetime(2026, 8, 25, tzinfo=UTC)
 _CLIENT_SDK = "openai==3.0.0"
 _GATEWAY_API_SURFACES = ("chat.completions", "responses")
 _PROVIDER_API_SURFACES = {
@@ -95,8 +96,13 @@ _PROVIDER_API_SURFACES = {
     "openai": "responses SSE",
     "openai-compatible": "chat.completions SSE",
     "openrouter": "chat.completions SSE",
+    "vertex": "streamGenerateContent SSE",
 }
 _GEMINI_EVIDENCE = ("exp/runtime/gateway/tests/native_dialect_parity_test.py",)
+_VERTEX_EVIDENCE = (
+    "exp/runtime/models/providers/vertex_test.py",
+    "exp/runtime/gateway/tests/native_dialect_parity_test.py",
+)
 _BEDROCK_EVIDENCE = ("exp/runtime/gateway/tests/native_dialect_parity_test.py",)
 _OPENAI_EVIDENCE = (
     "exp/runtime/models/providers/tests/native_test.py",
@@ -154,7 +160,7 @@ def _native_provider_cells(
     """Return native provider fixture results plus the unrun live cell.
 
     Args:
-        provider: Gemini or Bedrock provider identifier.
+        provider: Gemini, Vertex, or Bedrock provider identifier.
         evidence: Provider-specific deterministic fixture path.
 
     Returns:
@@ -173,7 +179,10 @@ def _native_provider_cells(
                 )
             )
             continue
-        if provider == "gemini" and capability is ProviderCapability.TOOL_ARGUMENT_STREAM:
+        if (
+            provider in {"gemini", "vertex"}
+            and capability is ProviderCapability.TOOL_ARGUMENT_STREAM
+        ):
             cells.append(
                 _cell(
                     provider,
@@ -263,6 +272,7 @@ PROVIDER_CERTIFICATION_MATRIX = ProviderCertificationMatrix(
                     _OPENAI_COMPATIBLE_EVIDENCE,
                 ),
                 *_native_provider_cells("gemini", _GEMINI_EVIDENCE),
+                *_native_provider_cells("vertex", _VERTEX_EVIDENCE),
                 *_native_provider_cells("bedrock", _BEDROCK_EVIDENCE),
                 *_compatible_provider_cells("azure"),
                 *_compatible_provider_cells("openrouter"),

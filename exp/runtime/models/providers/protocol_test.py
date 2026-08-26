@@ -167,6 +167,19 @@ def test_preflight_rejects_explicitly_unsupported_plain_tools_before_dispatch() 
         )
 
 
+def test_preflight_treats_false_parallel_control_as_semantic() -> None:
+    """Explicitly disabling parallel calls requires deployment support too."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        parallel_tool_calls=False,
+    )
+
+    with pytest.raises(ProviderCapabilityError, match="parallel_tool_calls"):
+        preflight_gateway_request(request, GatewayDeploymentCapabilities())
+
+
 def test_tinker_is_explicitly_excluded_from_gateway_execution() -> None:
     """Tinker remains optimizer-only until it has a cancellable stream contract."""
     with pytest.raises(ProviderCapabilityError, match="tinker_gateway_execution"):

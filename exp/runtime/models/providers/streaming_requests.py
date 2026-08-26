@@ -33,6 +33,15 @@ if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
 
 _ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
+GATEWAY_GENERATION_PARAMETER_CONTRACT_VERSION = 2
+"""Version of the route admission and provider wire-translation contract."""
+
+_STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
+    {"anthropic_messages", "gemini_generate_content", "bedrock_converse_stream"}
+)
+_NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
+    {"gemini_generate_content", "bedrock_converse_stream"}
+)
 
 
 def dialect_stream_payload(
@@ -288,6 +297,26 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
+    if (
+        request.structured_text is not None
+        and not request.structured_text.strict
+        and any(profile.dialect in _STRICT_STRUCTURED_OUTPUT_DIALECTS for profile in profiles)
+    ):
+        path = (
+            "text.format.strict"
+            if request.surface.value == "responses"
+            else "response_format.json_schema.strict"
+        )
+        raise ProviderParameterError(
+            message=(
+                f"The parameter {path!r} cannot be false on this model route. "
+                "Every non-OpenAI structured-output deployment enforces the schema. "
+                "Set it to true or choose a different model."
+            ),
+            param=path,
+            code="unsupported_parameter",
+        )
+
     if any(message.tool_is_error for message in request.messages) and not all(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
@@ -328,6 +357,20 @@ def route_generation_parameter_requests(
             ),
             param="tool_choice",
             code="invalid_parameter",
+        )
+    elif request.tool_choice == "none" and request.parallel_tool_calls is not None:
+        ignore("parallel_tool_calls")
+    elif request.parallel_tool_calls is not None and any(
+        profile.dialect in _NO_PARALLEL_TOOL_CONTROL_DIALECTS for profile in profiles
+    ):
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'parallel_tool_calls' is not supported by this model route. "
+                "Remove the field or choose a provider route with an explicit parallel-tool "
+                "control."
+            ),
+            param="parallel_tool_calls",
+            code="unsupported_parameter",
         )
 
     # A true logprob request changes the requested result. Until the normalized
@@ -538,15 +581,12 @@ def anthropic_messages_stream_payload(
         Native Messages request with streaming enabled.
 
     Raises:
-        ProviderCapabilityError: Structured text is requested on this adapter.
         ProviderResponseError: Instruction or message content is malformed.
     """
     # Anthropic Messages has no compatible logprob request/response surface in
     # this adapter. Keep the shared route signature for capability plumbing,
     # but never put an OpenAI-shaped field on the Anthropic wire.
     del supports_logprobs
-    if request.structured_text is not None:
-        raise ProviderCapabilityError(capability="structured_text")
     system_parts: list[str] = []
     messages: list[JsonObject] = []
     for message in request.messages:
@@ -572,20 +612,29 @@ def anthropic_messages_stream_payload(
     if system_parts:
         payload["system"] = "\n\n".join(system_parts)
     if request.tools:
-        payload["tools"] = [
-            {
+        tools: list[JsonObject] = []
+        for tool in request.tools:
+            translated: JsonObject = {
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.parameters,
             }
-            for tool in request.tools
-        ]
+            if tool.strict:
+                translated["strict"] = True
+            tools.append(translated)
+        payload["tools"] = tools
+    tool_choice: JsonObject | None = None
     if request.tool_choice is not None:
         if isinstance(request.tool_choice, GatewayNamedToolChoice):
-            payload["tool_choice"] = {"type": "tool", "name": request.tool_choice.name}
+            tool_choice = {"type": "tool", "name": request.tool_choice.name}
         else:
             mapping = {"auto": "auto", "none": "none", "required": "any"}
-            payload["tool_choice"] = {"type": mapping[request.tool_choice]}
+            tool_choice = {"type": mapping[request.tool_choice]}
+    if request.parallel_tool_calls is not None:
+        tool_choice = tool_choice or {"type": "auto"}
+        tool_choice["disable_parallel_tool_use"] = not request.parallel_tool_calls
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
     if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
     if request.top_p is not None and supports_top_p:
@@ -593,11 +642,17 @@ def anthropic_messages_stream_payload(
     if request.top_k is not None and supports_top_k:
         payload["top_k"] = request.top_k
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    output_config: JsonObject = {}
     if supports_reasoning and effective_reasoning_effort is not None:
         payload["thinking"] = {"type": "adaptive"}
-        payload["output_config"] = {
-            "effort": anthropic_reasoning_effort(model_id, effective_reasoning_effort)
+        output_config["effort"] = anthropic_reasoning_effort(model_id, effective_reasoning_effort)
+    if request.structured_text is not None:
+        output_config["format"] = {
+            "type": "json_schema",
+            "schema": request.structured_text.json_schema,
         }
+    if output_config:
+        payload["output_config"] = output_config
     if request.stop:
         payload["stop_sequences"] = list(request.stop)
     return payload
@@ -643,6 +698,10 @@ def gemini_generate_content_stream_payload(
             supports_logprobs=supports_logprobs,
             supports_reasoning=supports_reasoning,
             reasoning_effort=reasoning_effort,
+            stop_sequences=request.stop,
+            response_json_schema=(
+                request.structured_text.json_schema if request.structured_text is not None else None
+            ),
         )
     except ProviderParameterError:
         raise
@@ -687,6 +746,17 @@ def bedrock_converse_stream_payload(
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,
             supports_logprobs=supports_logprobs,
+            stop_sequences=request.stop,
+            structured_output_name=(
+                request.structured_text.name if request.structured_text is not None else None
+            ),
+            structured_output_description=(
+                request.structured_text.description if request.structured_text is not None else None
+            ),
+            structured_output_schema=(
+                request.structured_text.json_schema if request.structured_text is not None else None
+            ),
+            strict_tool_names=tuple(tool.name for tool in request.tools if tool.strict),
         )
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc

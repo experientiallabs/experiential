@@ -54,6 +54,13 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
+        # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
+        # gateway-side, never forwarded to the model: `safety_identifier` is the
+        # current stable end-user identifier, `user` its deprecated predecessor,
+        # `prompt_cache_key` a same-prefix cache-routing hint (not identity).
+        _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
+        _field("user", CompatibilityDisposition.METADATA_ONLY),
+        _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -69,7 +76,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "seed",
                 "service_tier",
                 "store",
-                "user",
                 "verbosity",
                 "web_search_options",
             )
@@ -106,6 +112,11 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
+        # End-user attribution / cache hints (OpenAI spec), same handling as the
+        # Chat surface: accepted and recorded gateway-side, never forwarded.
+        _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
+        _field("user", CompatibilityDisposition.METADATA_ONLY),
+        _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -118,7 +129,6 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "store",
                 "stream_options",
                 "truncation",
-                "user",
             )
         ),
     ),

@@ -149,10 +149,30 @@ class GatewayRequest(ContractModel):
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     metadata: JsonObject = Field(default_factory=dict)
+    # End-user attribution / cache hints from the OpenAI request. Captured for
+    # gateway-side attribution and never forwarded to the model. `safety_identifier`
+    # is the current stable end-user identifier; `user` its deprecated predecessor;
+    # `prompt_cache_key` a same-prefix cache-routing hint (never an identity).
+    safety_identifier: str | None = Field(default=None, max_length=1024)
+    user: str | None = Field(default=None, max_length=1024)
+    prompt_cache_key: str | None = Field(default=None, max_length=1024)
     ignored_parameters: tuple[str, ...] = Field(default=(), exclude=True)
     """Public compatibility fields accepted but intentionally omitted from provider dispatch."""
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=512)
     client_request_id: str | None = Field(default=None, min_length=1, max_length=512)
+
+    @property
+    def attribution_label(self) -> str | None:
+        """The end-user attribution label for this request, per the OpenAI spec.
+
+        Prefers the current `safety_identifier`; falls back to the deprecated
+        `user` field for older clients. `prompt_cache_key` is deliberately never
+        used here — it is a cache-routing hint, not an end-user identity.
+
+        Returns:
+            The attribution label, or None when the caller sent neither field.
+        """
+        return self.safety_identifier or self.user
 
     @field_validator("stop")
     @classmethod
@@ -367,6 +387,9 @@ class AuthorizationSnapshot(ContractModel):
     """Caller-supplied ``HTTP-Referer`` app identity, content-free and never a credential."""
     app_title: str | None = Field(default=None, max_length=256)
     """Caller-supplied ``X-Title`` app label used only for content-free app attribution."""
+    attribution_label: str | None = Field(default=None, max_length=1024)
+    """End-user attribution from the OpenAI ``safety_identifier`` (or deprecated
+    ``user``) request field: content-free and never a credential."""
 
 
 class ExecutionSnapshot(ContractModel):

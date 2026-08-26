@@ -54,9 +54,11 @@ class _FakeBedrockRuntime:
         self,
         *,
         converse_response: Mapping[str, object] | None = None,
+        converse_stream_response: Mapping[str, object] | None = None,
         invoke_bodies: list[Mapping[str, object]] | None = None,
     ) -> None:
         self.converse_calls: list[Mapping[str, object]] = []
+        self.converse_stream_calls: list[Mapping[str, object]] = []
         self.invoke_calls: list[Mapping[str, object]] = []
         self._converse_response = converse_response or {
             "output": {"message": {"content": [{"text": "ok"}]}},
@@ -68,6 +70,7 @@ class _FakeBedrockRuntime:
                 "cacheWriteInputTokens": 1,
             },
         }
+        self._converse_stream_response = converse_stream_response
         self._invoke_bodies = list(invoke_bodies or [{"embedding": [3.0, 4.0]}])
 
     def converse(self, **request: object) -> Mapping[str, object]:
@@ -76,9 +79,11 @@ class _FakeBedrockRuntime:
         return self._converse_response
 
     def converse_stream(self, **request: object) -> Mapping[str, object]:
-        """Reject streaming in non-streaming fixtures that did not configure events."""
-        del request
-        raise AssertionError("test made an unexpected ConverseStream request")
+        """Record and return a configured stream, rejecting unexpected calls."""
+        self.converse_stream_calls.append(request)
+        if self._converse_stream_response is None:
+            raise AssertionError("test made an unexpected ConverseStream request")
+        return self._converse_stream_response
 
     def invoke_model(self, **request: object) -> Mapping[str, object]:
         """Record one InvokeModel request and return the next embedding body."""

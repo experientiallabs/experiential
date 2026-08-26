@@ -72,6 +72,7 @@ impl Normalizer {
                         if self.tools.contains_key(&index) {
                             return Err(malformed("Anthropic stream repeated a tool-call start"));
                         }
+                        self.reserve_tool_entry(index)?;
                         self.tools
                             .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
                         events.push(Event::ToolCallStarted {
