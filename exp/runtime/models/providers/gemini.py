@@ -169,6 +169,12 @@ class GeminiClient(ProviderHttpClient):
                 supports_logprobs=self._supports_logprobs,
                 supports_reasoning=self._supports_reasoning,
                 reasoning_effort=self._reasoning_effort,
+                stop_sequences=request.stop,
+                response_json_schema=(
+                    request.structured_text.json_schema
+                    if request.structured_text is not None
+                    else None
+                ),
             ),
             request=request,
             deadline=deadline,

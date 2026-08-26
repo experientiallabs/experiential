@@ -15,6 +15,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
+    StructuredTextFormat,
 )
 from exp.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
@@ -91,8 +92,17 @@ def test_gemini_stream_normalizes_text_usage_and_terminal_state() -> None:
             return httpx.Response(200, stream=upstream)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            request = _request().model_copy(
+                update={
+                    "stop": ("DONE",),
+                    "structured_text": StructuredTextFormat(
+                        name="answer",
+                        json_schema={"type": "object"},
+                    ),
+                }
+            )
             stream = await _client(http_client).stream(
-                _request(),
+                request,
                 deadline=RequestDeadline.after(10),
                 idempotency_key="deployment-operation",
                 retry_policy=RetryPolicy(1, 0, 0),
@@ -112,6 +122,10 @@ def test_gemini_stream_normalizes_text_usage_and_terminal_state() -> None:
         assert captured[0].url.path.endswith("/models/gemini-2.5-pro:streamGenerateContent")
         assert captured[0].url.params["alt"] == "sse"
         assert captured[0].headers["x-goog-api-key"] == "fixture-key"
+        request_payload = json.loads(captured[0].content)
+        assert request_payload["generationConfig"]["stopSequences"] == ["DONE"]
+        assert request_payload["generationConfig"]["responseMimeType"] == "application/json"
+        assert request_payload["generationConfig"]["responseJsonSchema"] == {"type": "object"}
         assert upstream.closed
 
     asyncio.run(scenario())

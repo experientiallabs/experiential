@@ -294,12 +294,22 @@ class BedrockClient:
         request: ModelRequest,
         *,
         retry_policy: RetryPolicy | None = None,
+        stop_sequences: Sequence[str] = (),
+        structured_output_name: str | None = None,
+        structured_output_description: str | None = None,
+        structured_output_schema: JsonObject | None = None,
+        strict_tool_names: Sequence[str] = (),
     ) -> BedrockEventStream:
         """Open one blocking native Converse EventStream without consuming it.
 
         Args:
             request: Provider-neutral request translated to Converse.
             retry_policy: Optional caller-owned response-opening attempt limit.
+            stop_sequences: Exact stop strings admitted for the selected route.
+            structured_output_name: Optional name for a strict JSON output contract.
+            structured_output_description: Optional description for that output contract.
+            structured_output_schema: Strict JSON schema admitted for structured output.
+            strict_tool_names: Tool definitions whose schemas Bedrock must enforce.
 
         Returns:
             The synchronous provider EventStream from the response envelope.
@@ -311,6 +321,11 @@ class BedrockClient:
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            stop_sequences=stop_sequences,
+            structured_output_name=structured_output_name,
+            structured_output_description=structured_output_description,
+            structured_output_schema=structured_output_schema,
+            strict_tool_names=strict_tool_names,
         )
         response = self._call_with_retry(
             lambda: self._runtime().converse_stream(**payload),
@@ -573,6 +588,21 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
                 self._bedrock_client.open_stream,
                 gateway_model_request(request),
                 retry_policy=retry_policy,
+                stop_sequences=request.stop,
+                structured_output_name=(
+                    request.structured_text.name if request.structured_text is not None else None
+                ),
+                structured_output_description=(
+                    request.structured_text.description
+                    if request.structured_text is not None
+                    else None
+                ),
+                structured_output_schema=(
+                    request.structured_text.json_schema
+                    if request.structured_text is not None
+                    else None
+                ),
+                strict_tool_names=tuple(tool.name for tool in request.tools if tool.strict),
             )
         )
         try:

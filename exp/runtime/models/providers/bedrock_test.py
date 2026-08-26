@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     BillingSource,
     ConnectionConfig,
@@ -23,6 +24,7 @@ from exp.common.models import (
     ModelRoles,
     ModelSnapshot,
 )
+from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.async_transport import RequestDeadline
 from exp.runtime.models.providers.bedrock import (
     AWS_DEFAULT_REGION_ENV,
@@ -54,9 +56,11 @@ class _FakeBedrockRuntime:
         self,
         *,
         converse_response: Mapping[str, object] | None = None,
+        converse_stream_response: Mapping[str, object] | None = None,
         invoke_bodies: list[Mapping[str, object]] | None = None,
     ) -> None:
         self.converse_calls: list[Mapping[str, object]] = []
+        self.converse_stream_calls: list[Mapping[str, object]] = []
         self.invoke_calls: list[Mapping[str, object]] = []
         self._converse_response = converse_response or {
             "output": {"message": {"content": [{"text": "ok"}]}},
@@ -68,6 +72,7 @@ class _FakeBedrockRuntime:
                 "cacheWriteInputTokens": 1,
             },
         }
+        self._converse_stream_response = converse_stream_response
         self._invoke_bodies = list(invoke_bodies or [{"embedding": [3.0, 4.0]}])
 
     def converse(self, **request: object) -> Mapping[str, object]:
@@ -76,9 +81,11 @@ class _FakeBedrockRuntime:
         return self._converse_response
 
     def converse_stream(self, **request: object) -> Mapping[str, object]:
-        """Reject streaming in non-streaming fixtures that did not configure events."""
-        del request
-        raise AssertionError("test made an unexpected ConverseStream request")
+        """Record and return a configured stream, rejecting unexpected calls."""
+        self.converse_stream_calls.append(request)
+        if self._converse_stream_response is None:
+            raise AssertionError("test made an unexpected ConverseStream request")
+        return self._converse_stream_response
 
     def invoke_model(self, **request: object) -> Mapping[str, object]:
         """Record one InvokeModel request and return the next embedding body."""
@@ -123,6 +130,80 @@ def test_complete_sends_the_exact_model_id_and_preserves_cache_usage() -> None:
     assert response.economics.usage.input_tokens == 6
     assert response.economics.usage.cached_input_tokens == 1
     assert response.economics.usage.cache_write_input_tokens == 1
+
+
+def test_open_stream_forwards_stop_schema_and_strict_tool_fields() -> None:
+    """The Python stream lane sends every route-admitted Converse control."""
+
+    class _Stream:
+        """Minimal synchronous Bedrock event stream fixture."""
+
+        def __iter__(self) -> Iterator[Mapping[str, object]]:
+            """Yield no events."""
+            return iter(())
+
+        def close(self) -> None:
+            """Close the empty fixture."""
+
+    stream = _Stream()
+    runtime = _FakeBedrockRuntime(converse_stream_response={"stream": stream})
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-east-1",
+        environment={},
+        runtime_factory=lambda *, region_name: runtime,
+    )
+    schema: JsonObject = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+    }
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="Hello"),),
+        tools=(
+            ToolSchema(
+                name="lookup",
+                description="Find one record.",
+                input_schema={"type": "object"},
+            ),
+        ),
+    )
+
+    opened = client.open_stream(
+        request,
+        stop_sequences=("DONE",),
+        structured_output_name="answer",
+        structured_output_description="Return one answer.",
+        structured_output_schema=schema,
+        strict_tool_names=("lookup",),
+    )
+
+    assert opened is stream
+    payload = runtime.converse_stream_calls[0]
+    assert payload["inferenceConfig"] == {"stopSequences": ["DONE"]}
+    assert payload["toolConfig"] == {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": "lookup",
+                    "description": "Find one record.",
+                    "inputSchema": {"json": {"type": "object"}},
+                    "strict": True,
+                }
+            }
+        ]
+    }
+    assert payload["outputConfig"] == {
+        "textFormat": {
+            "type": "json_schema",
+            "structure": {
+                "jsonSchema": {
+                    "schema": '{"properties":{"answer":{"type":"string"}},"type":"object"}',
+                    "name": "answer",
+                    "description": "Return one answer.",
+                }
+            },
+        }
+    }
 
 
 def test_embeddings_validate_count_dimensions_and_normalization() -> None:

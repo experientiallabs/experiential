@@ -9,6 +9,8 @@ builders import it without creating a cycle through the streaming stack.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Collection, Sequence
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
@@ -23,6 +25,11 @@ def converse_request(
     supports_top_p: bool = True,
     supports_top_k: bool = False,
     supports_logprobs: bool = False,
+    stop_sequences: Sequence[str] = (),
+    structured_output_name: str | None = None,
+    structured_output_description: str | None = None,
+    structured_output_schema: JsonObject | None = None,
+    strict_tool_names: Collection[str] = (),
 ) -> JsonObject:
     """Translate one EXP request into boto Converse keyword arguments.
 
@@ -30,6 +37,15 @@ def converse_request(
         model_id: Exact foundation-model or inference-profile ID sent as the
             boto ``modelId`` routing key.
         request: Typed EXP request.
+        supports_temperature: Whether this exact deployment accepts temperature.
+        supports_top_p: Whether this exact deployment accepts top-p sampling.
+        supports_top_k: Whether this exact deployment accepts top-k sampling.
+        supports_logprobs: Reserved response-projection capability flag.
+        stop_sequences: Exact stop strings admitted for the selected route.
+        structured_output_name: Optional name for a strict JSON output contract.
+        structured_output_description: Optional description for that output contract.
+        structured_output_schema: Strict JSON schema admitted for structured output.
+        strict_tool_names: Tool definitions whose schemas Bedrock must enforce.
 
     Returns:
         Keyword arguments accepted by ``bedrock-runtime`` Converse.
@@ -45,6 +61,11 @@ def converse_request(
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,
             supports_logprobs=supports_logprobs,
+            stop_sequences=stop_sequences,
+            structured_output_name=structured_output_name,
+            structured_output_description=structured_output_description,
+            structured_output_schema=structured_output_schema,
+            strict_tool_names=strict_tool_names,
         ),
     }
 
@@ -56,6 +77,11 @@ def converse_body(
     supports_top_p: bool = True,
     supports_top_k: bool = False,
     supports_logprobs: bool = False,
+    stop_sequences: Sequence[str] = (),
+    structured_output_name: str | None = None,
+    structured_output_description: str | None = None,
+    structured_output_schema: JsonObject | None = None,
+    strict_tool_names: Collection[str] = (),
 ) -> JsonObject:
     """Translate one EXP request into the Converse wire document.
 
@@ -64,6 +90,15 @@ def converse_body(
 
     Args:
         request: Typed EXP request.
+        supports_temperature: Whether this exact deployment accepts temperature.
+        supports_top_p: Whether this exact deployment accepts top-p sampling.
+        supports_top_k: Whether this exact deployment accepts top-k sampling.
+        supports_logprobs: Reserved response-projection capability flag.
+        stop_sequences: Exact stop strings admitted for the selected route.
+        structured_output_name: Optional name for a strict JSON output contract.
+        structured_output_description: Optional description for that output contract.
+        structured_output_schema: Strict JSON schema admitted for structured output.
+        strict_tool_names: Tool definitions whose schemas Bedrock must enforce.
 
     Returns:
         The native Converse request document.
@@ -115,6 +150,7 @@ def converse_body(
         request,
         supports_temperature=supports_temperature,
         supports_top_p=supports_top_p,
+        stop_sequences=stop_sequences,
     )
     if inference:
         payload["inferenceConfig"] = inference
@@ -125,7 +161,26 @@ def converse_body(
         payload["additionalModelRequestFields"] = {"top_k": request.top_k}
     if system:
         payload["system"] = system
-    tool_config = _tool_config(request)
+    if structured_output_schema is not None:
+        json_schema: JsonObject = {
+            "schema": json.dumps(
+                structured_output_schema,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        }
+        if structured_output_name is not None:
+            json_schema["name"] = structured_output_name
+        if structured_output_description is not None:
+            json_schema["description"] = structured_output_description
+        payload["outputConfig"] = {
+            "textFormat": {
+                "type": "json_schema",
+                "structure": {"jsonSchema": json_schema},
+            }
+        }
+    tool_config = _tool_config(request, strict_tool_names=strict_tool_names)
     if tool_config is not None:
         payload["toolConfig"] = tool_config
     return payload
@@ -173,6 +228,7 @@ def _inference_config(
     *,
     supports_temperature: bool,
     supports_top_p: bool,
+    stop_sequences: Sequence[str] = (),
 ) -> JsonObject:
     """Return Converse inference controls without inventing omitted sampling fields."""
     inference: JsonObject = {}
@@ -182,25 +238,34 @@ def _inference_config(
         inference["temperature"] = request.temperature
     if request.top_p is not None and supports_top_p:
         inference["topP"] = request.top_p
+    if stop_sequences:
+        inference["stopSequences"] = list(stop_sequences)
     return inference
 
 
-def _tool_config(request: ModelRequest) -> JsonObject | None:
+def _tool_config(
+    request: ModelRequest,
+    *,
+    strict_tool_names: Collection[str] = (),
+) -> JsonObject | None:
     """Return Converse tool configuration, or omit it when tools are disabled."""
     if request.tool_choice == "none" or not request.tools:
         return None
-    config: JsonObject = {
-        "tools": [
-            {
-                "toolSpec": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": {"json": tool.input_schema},
-                }
-            }
-            for tool in request.tools
-        ]
-    }
+    known_tool_names = {tool.name for tool in request.tools}
+    unknown_strict_tools = set(strict_tool_names) - known_tool_names
+    if unknown_strict_tools:
+        raise ValueError("strict Bedrock tools must name request tool definitions")
+    tools: list[JsonObject] = []
+    for tool in request.tools:
+        tool_spec: JsonObject = {
+            "name": tool.name,
+            "description": tool.description,
+            "inputSchema": {"json": tool.input_schema},
+        }
+        if tool.name in strict_tool_names:
+            tool_spec["strict"] = True
+        tools.append({"toolSpec": tool_spec})
+    config: JsonObject = {"tools": tools}
     if request.tool_choice == "required":
         config["toolChoice"] = {"any": {}}
     elif isinstance(request.tool_choice, ToolChoice):

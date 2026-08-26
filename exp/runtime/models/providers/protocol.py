@@ -227,7 +227,7 @@ def preflight_gateway_request(
             "strict_tools",
         ),
         (
-            request.parallel_tool_calls is True,
+            request.parallel_tool_calls is not None,
             capabilities.supports_parallel_tool_calls,
             "parallel_tool_calls",
         ),

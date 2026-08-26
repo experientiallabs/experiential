@@ -2,6 +2,7 @@
 
 from typing import cast
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.bedrock_requests import converse_request
@@ -101,3 +102,40 @@ def test_converse_request_omits_tools_when_choice_is_none() -> None:
     )
     payload = converse_request("model", request)
     assert "toolConfig" not in payload
+
+
+def test_converse_request_adds_stop_schema_and_strict_tool_fields() -> None:
+    """Shared Converse builders use AWS's exact structured generation fields."""
+    schema: JsonObject = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+    }
+
+    payload = converse_request(
+        "model",
+        _tool_transcript_request(),
+        stop_sequences=("DONE",),
+        structured_output_name="answer",
+        structured_output_description="Return one answer.",
+        structured_output_schema=schema,
+        strict_tool_names=("create_ticket",),
+    )
+
+    inference_config = cast("dict[str, object]", payload["inferenceConfig"])
+    assert inference_config["stopSequences"] == ["DONE"]
+    tool_config = cast("dict[str, object]", payload["toolConfig"])
+    tools = cast("list[dict[str, object]]", tool_config["tools"])
+    tool_spec = cast("dict[str, object]", tools[0]["toolSpec"])
+    assert tool_spec["strict"] is True
+    assert payload["outputConfig"] == {
+        "textFormat": {
+            "type": "json_schema",
+            "structure": {
+                "jsonSchema": {
+                    "schema": '{"properties":{"answer":{"type":"string"}},"type":"object"}',
+                    "name": "answer",
+                    "description": "Return one answer.",
+                }
+            },
+        }
+    }

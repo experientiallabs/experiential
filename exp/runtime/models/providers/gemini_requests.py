@@ -39,6 +39,8 @@ def gemini_generate_request(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    stop_sequences: tuple[str, ...] = (),
+    response_json_schema: JsonObject | None = None,
 ) -> JsonObject:
     """Convert a EXP request into Gemini's native generateContent payload.
 
@@ -47,6 +49,14 @@ def gemini_generate_request(
             travels in the route path, never the body; the parameter keeps the
             shared provider builder signature.
         request: Typed visible messages, tools, and sampling parameters.
+        supports_temperature: Whether this exact deployment accepts temperature.
+        supports_top_p: Whether this exact deployment accepts top-p sampling.
+        supports_top_k: Whether this exact deployment accepts top-k sampling.
+        supports_logprobs: Reserved response-projection capability flag.
+        supports_reasoning: Whether this exact deployment accepts thinking controls.
+        reasoning_effort: Catalog-pinned reasoning effort used when the request omits one.
+        stop_sequences: Exact stop strings admitted for the selected route.
+        response_json_schema: Strict JSON schema admitted for structured output.
 
     Returns:
         A native payload for the generateContent and streamGenerateContent
@@ -90,6 +100,11 @@ def gemini_generate_request(
         generation["topP"] = request.top_p
     if request.top_k is not None and supports_top_k:
         generation["topK"] = request.top_k
+    if stop_sequences:
+        generation["stopSequences"] = list(stop_sequences)
+    if response_json_schema is not None:
+        generation["responseMimeType"] = "application/json"
+        generation["responseJsonSchema"] = response_json_schema
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
         generation["thinkingConfig"] = {
