@@ -6,16 +6,25 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner profile for an explicit comparison or routine rerun
+        required: false
+        default: benchmark-32core
+        type: choice
+        options:
+          - benchmark-32core
+          - standard
 
 permissions:
   contents: read
 
 jobs:
   latency:
-    # Keep routine PR/push checks on the standard runner. The larger runner is
-    # reserved for explicit hosted-runner comparisons so public PRs cannot
-    # consume it.
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && 'gateway-benchmark-32core' || 'ubuntu-latest' }}
+    # Keep routine PR/push checks and explicitly standard manual reruns on the
+    # GitHub runner. The larger runner remains an opt-in hosted comparison so
+    # public PRs cannot consume it.
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'benchmark-32core' && 'gateway-benchmark-32core' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
