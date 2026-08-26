@@ -529,3 +529,60 @@ def test_empty_responses_input_is_a_public_protocol_error() -> None:
         decode_responses({"model": "coding", "input": []})
     assert captured.value.detail.code == "invalid_parameter"
     assert captured.value.detail.param == "messages"
+
+
+def test_chat_decoder_captures_end_user_attribution_and_cache_hint() -> None:
+    """safety_identifier/user/prompt_cache_key are captured; the label prefers safety_identifier."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "safety_identifier": "sha256:abc",
+            "user": "legacy-user",
+            "prompt_cache_key": "prompt_v1:sess",
+        }
+    )
+    request = decoded.request
+    assert request.safety_identifier == "sha256:abc"
+    assert request.user == "legacy-user"
+    assert request.prompt_cache_key == "prompt_v1:sess"
+    # The current safety_identifier wins over the deprecated user for attribution.
+    assert request.attribution_label == "sha256:abc"
+
+
+def test_chat_attribution_label_falls_back_to_deprecated_user() -> None:
+    """With no safety_identifier, the deprecated user field still labels the request."""
+    decoded = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "hi"}], "user": "u-1"}
+    )
+    assert decoded.request.safety_identifier is None
+    assert decoded.request.attribution_label == "u-1"
+
+
+def test_prompt_cache_key_is_never_an_attribution_label() -> None:
+    """prompt_cache_key is a cache-routing hint, not an end-user identity."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "pck",
+        }
+    )
+    assert decoded.request.prompt_cache_key == "pck"
+    assert decoded.request.attribution_label is None
+
+
+def test_responses_decoder_captures_end_user_attribution() -> None:
+    """The Responses surface captures the same attribution/cache fields as Chat."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "safety_identifier": "sid-9",
+            "prompt_cache_key": "pck-1",
+        }
+    )
+    request = decoded.request
+    assert request.safety_identifier == "sid-9"
+    assert request.prompt_cache_key == "pck-1"
+    assert request.attribution_label == "sid-9"

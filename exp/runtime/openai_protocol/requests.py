@@ -202,6 +202,10 @@ class _ChatRequest(_WireModel):
     stream: bool = False
     stream_options: _ChatStreamOptions | None = None
     metadata: JsonObject = Field(default_factory=dict)
+    # End-user attribution / cache hints; captured, never forwarded to the model.
+    safety_identifier: str | None = Field(default=None, max_length=1024)
+    user: str | None = Field(default=None, max_length=1024)
+    prompt_cache_key: str | None = Field(default=None, max_length=1024)
 
     @model_validator(mode="after")
     def _require_coherent_options(self) -> _ChatRequest:
@@ -279,6 +283,10 @@ class _ResponsesRequest(_WireModel):
     text: _ResponseText | None = None
     stream: bool = False
     metadata: JsonObject = Field(default_factory=dict)
+    # End-user attribution / cache hints; captured, never forwarded to the model.
+    safety_identifier: str | None = Field(default=None, max_length=1024)
+    user: str | None = Field(default=None, max_length=1024)
+    prompt_cache_key: str | None = Field(default=None, max_length=1024)
 
 
 def decode_chat(
@@ -335,6 +343,9 @@ def decode_chat(
                 request.stream_options is not None and request.stream_options.include_usage
             ),
             metadata=request.metadata,
+            safety_identifier=request.safety_identifier,
+            user=request.user,
+            prompt_cache_key=request.prompt_cache_key,
             idempotency_key=operation if idempotency_key is not None else None,
             client_request_id=operation if client_request_id is not None else None,
         )
@@ -382,6 +393,9 @@ def decode_responses(
             stream=request.stream,
             previous_response_id=request.previous_response_id,
             metadata=request.metadata,
+            safety_identifier=request.safety_identifier,
+            user=request.user,
+            prompt_cache_key=request.prompt_cache_key,
             idempotency_key=operation if idempotency_key is not None else None,
             client_request_id=operation if client_request_id is not None else None,
         )

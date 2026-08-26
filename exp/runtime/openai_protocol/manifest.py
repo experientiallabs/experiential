@@ -50,6 +50,13 @@ CHAT_MANIFEST = CompatibilityManifest(
             "structured_output",
         ),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
+        # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
+        # gateway-side, never forwarded to the model: `safety_identifier` is the
+        # current stable end-user identifier, `user` its deprecated predecessor,
+        # `prompt_cache_key` a same-prefix cache-routing hint (not identity).
+        _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
+        _field("user", CompatibilityDisposition.METADATA_ONLY),
+        _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -68,7 +75,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "service_tier",
                 "store",
                 "top_logprobs",
-                "user",
                 "verbosity",
                 "web_search_options",
             )
@@ -101,6 +107,11 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         ),
         _field("text", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "structured_output"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
+        # End-user attribution / cache hints (OpenAI spec), same handling as the
+        # Chat surface: accepted and recorded gateway-side, never forwarded.
+        _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
+        _field("user", CompatibilityDisposition.METADATA_ONLY),
+        _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -116,7 +127,6 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "top_logprobs",
                 "top_p",
                 "truncation",
-                "user",
             )
         ),
     ),
