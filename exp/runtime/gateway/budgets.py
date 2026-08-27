@@ -532,8 +532,20 @@ def maximum_attempt_cost_micro_usd(
     """
     input_tokens = len(canonical_json_bytes(request))
     output_tokens = request.maximum_output_tokens
-    if output_tokens is None and deployment.capabilities is not None:
-        output_tokens = deployment.capabilities.maximum_output_tokens
+    deployment_ceiling = (
+        deployment.capabilities.maximum_output_tokens
+        if deployment.capabilities is not None
+        else None
+    )
+    # The physical call can never emit more than the deployment's own ceiling,
+    # so clamp the caller's requested output to it before the worst case. A huge
+    # or unbounded caller value would otherwise inflate the estimate past
+    # MAXIMUM_MICRO_USD, return None, and mis-terminalize a fundable request as
+    # a quota refusal. Settlement still charges actual tokens, not this bound.
+    if output_tokens is None:
+        output_tokens = deployment_ceiling
+    elif deployment_ceiling is not None:
+        output_tokens = min(output_tokens, deployment_ceiling)
     if output_tokens is None:
         return None
     prices = deployment.gateway.prices

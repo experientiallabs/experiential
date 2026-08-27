@@ -228,6 +228,30 @@ def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_cl
     )
 
 
+def test_huge_caller_output_ceiling_clamps_to_deployment_instead_of_failing_closed() -> None:
+    """A caller output ceiling above the deployment's own is clamped, not None.
+
+    Without the clamp a very large caller ``maximum_output_tokens`` inflates the
+    worst case past ``MAXIMUM_MICRO_USD`` and returns ``None``, which fails a
+    perfectly fundable request closed and mis-terminalizes it as a quota refusal.
+    The deployment can never emit more than its own ceiling, so the output term
+    clamps to it: the huge request stays a small bounded int, differing from the
+    at-ceiling request only by the extra JSON bytes of the larger literal.
+    """
+    deployment = _deployment()  # ModelCapabilities(maximum_output_tokens=16)
+    bounded = maximum_attempt_cost_micro_usd(_request("four bytes"), deployment)
+    huge = maximum_attempt_cost_micro_usd(
+        _request("four bytes").model_copy(update={"maximum_output_tokens": 10**12}),
+        deployment,
+    )
+
+    assert bounded is not None
+    assert huge is not None and isinstance(huge, int)
+    # Output is clamped to the ceiling; only the input-byte count of the larger
+    # literal differs, so the two stay within a handful of micro-USD of each other.
+    assert abs(huge - bounded) < 100
+
+
 def test_concurrent_identity_reservations_never_exceed_hard_limit(tmp_path: Path) -> None:
     """BEGIN IMMEDIATE serializes competing reservations before attempt insertion."""
     clock = _Clock()
