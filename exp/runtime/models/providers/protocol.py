@@ -14,7 +14,10 @@ from exp.runtime.models.providers.async_transport import (
     run_then_close_pooled_client,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
+    ProviderParameterError,
+)
 
 
 class AsyncCompletedModelClient(Protocol):
@@ -233,6 +236,16 @@ def preflight_gateway_request(
     for requested, supported, capability in requirements:
         if requested and not supported:
             raise ProviderCapabilityError(capability=capability)
+    stop_limit = capabilities.maximum_stop_sequences
+    if stop_limit is not None and len(request.stop) > stop_limit:
+        raise ProviderParameterError(
+            message=(
+                f"This model route accepts at most {stop_limit} stop "
+                f"sequences; the request supplied {len(request.stop)}."
+            ),
+            param="stop",
+            code="too_many_stop_sequences",
+        )
 
 
 def require_gateway_provider(provider: str) -> None:

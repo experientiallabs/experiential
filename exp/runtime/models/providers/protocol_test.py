@@ -24,7 +24,10 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
 )
 from exp.runtime.models.providers.async_transport import RequestDeadline
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
+    ProviderParameterError,
+)
 from exp.runtime.models.providers.protocol import (
     BoundedSyncModelClientAdapter,
     SyncModelClientAdapter,
@@ -178,6 +181,29 @@ def test_preflight_treats_false_parallel_control_as_semantic() -> None:
 
     with pytest.raises(ProviderCapabilityError, match="parallel_tool_calls"):
         preflight_gateway_request(request, GatewayDeploymentCapabilities())
+
+
+def test_preflight_rejects_over_limit_stop_list_with_a_named_parameter_error() -> None:
+    """An over-cap stop list fails locally instead of surfacing the provider's opaque 4xx."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        stop=("a", "b", "c", "d", "e", "f"),
+    )
+    capabilities = GatewayDeploymentCapabilities(
+        supports_stop_sequences=True,
+        maximum_stop_sequences=5,
+    )
+
+    with pytest.raises(ProviderParameterError) as caught:
+        preflight_gateway_request(request, capabilities)
+    assert caught.value.param == "stop"
+    assert caught.value.code == "too_many_stop_sequences"
+
+    # At the limit passes, and an unbounded route (default None) never counts.
+    at_limit = request.model_copy(update={"stop": ("a", "b", "c", "d", "e")})
+    preflight_gateway_request(at_limit, capabilities)
+    preflight_gateway_request(request, GatewayDeploymentCapabilities(supports_stop_sequences=True))
 
 
 def test_tinker_is_explicitly_excluded_from_gateway_execution() -> None:

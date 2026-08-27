@@ -223,6 +223,13 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_parallel_tool_calls: bool = False
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
+    maximum_stop_sequences: int | None = Field(default=None, ge=1)
+    """Largest stop-sequence count this route accepts, when the provider caps it.
+
+    ``None`` leaves the count unbounded (only ``supports_stop_sequences`` gates the
+    field). A concrete value lets admission reject an over-limit list locally with a
+    named parameter error instead of forwarding it and surfacing the provider's
+    opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
