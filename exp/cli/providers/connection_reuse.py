@@ -13,6 +13,7 @@ def reused_connection(
     region: str | None,
     aws_access_key_id_env: str | None,
     bedrock_auth_mode: str | None,
+    require_ambient_bedrock_auth: bool = False,
 ) -> ProviderConnection | None:
     """Return the sole configured connection that semantically matches these fields."""
     matches: list[ProviderConnection] = []
@@ -23,6 +24,12 @@ def reused_connection(
         and bedrock_auth_mode is None
     )
     for connection in existing_connections:
+        if require_ambient_bedrock_auth and (
+            connection.api_key_env is not None
+            or connection.aws_access_key_id_env is not None
+            or connection.bedrock_auth_mode is not None
+        ):
+            continue
         if (
             connection.provider != provider
             or connection.base_url != base_url

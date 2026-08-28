@@ -2,7 +2,10 @@
 
 import pytest
 
-from exp.cli.providers.bedrock_credentials import infer_bedrock_auth
+from exp.cli.providers.bedrock_credentials import (
+    infer_bedrock_auth,
+    requires_ambient_bedrock_auth,
+)
 
 
 @pytest.mark.parametrize("session_token_env", ("AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"))
@@ -25,3 +28,16 @@ def test_long_lived_aws_pair_uses_explicit_locators() -> None:
             "AWS_SECRET_ACCESS_KEY": "long-lived-secret",
         }
     ) == ("AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "access_key_pair")
+
+
+@pytest.mark.parametrize("session_token_env", ("AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"))
+def test_temporary_aws_credentials_explicitly_require_ambient_reuse(
+    session_token_env: str,
+) -> None:
+    """Setup distinguishes STS intent from an entirely unconfigured environment."""
+    environment = {session_token_env: "temporary-session-token"}
+
+    assert requires_ambient_bedrock_auth(environment)
+    assert not requires_ambient_bedrock_auth(
+        {**environment, "AWS_BEARER_TOKEN_BEDROCK": "bearer-value"}
+    )

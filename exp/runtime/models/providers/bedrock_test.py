@@ -788,6 +788,36 @@ def test_real_access_key_client_ignores_hostile_ambient_aws_configuration(
     assert credentials.token is None
 
 
+@pytest.mark.parametrize("auth_mode", ("pair", "bearer"))
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    (
+        ("AWS_REQUEST_CHECKSUM_CALCULATION", "invalid-mode"),
+        ("AWS_REQUEST_MIN_COMPRESSION_SIZE_BYTES", "not-an-integer"),
+    ),
+)
+def test_real_explicit_clients_ignore_hostile_environment_client_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    auth_mode: str,
+    variable: str,
+    value: str,
+) -> None:
+    """Explicit pair and bearer clients ignore every environment config chain."""
+    monkeypatch.setenv(variable, value)
+    kwargs = (
+        {"bearer_token": "bedrock-bearer"}
+        if auth_mode == "bearer"
+        else {
+            "aws_access_key_id": "AKIAEXPLICITKEY001",
+            "aws_secret_access_key": "explicit-secret-access-key",
+        }
+    )
+
+    runtime = create_bedrock_runtime_client(region_name="us-west-2", **kwargs)
+
+    assert runtime is not None
+
+
 def test_real_bearer_request_emits_only_the_pinned_authorization_token() -> None:
     """A serialized Converse request carries the exact bearer before network dispatch."""
 
@@ -925,6 +955,31 @@ def test_converse_stream_url_encodes_the_model_like_botocore() -> None:
         "https://bedrock-runtime.eu-central-1.amazonaws.com/model/"
         "arn%3Aaws%3Abedrock%3Aus-east-1%3A123%3Ainference-profile/us.anthropic.claude"
         "/converse-stream"
+    )
+
+
+@pytest.mark.parametrize(
+    ("region", "suffix"),
+    (
+        ("cn-north-1", "amazonaws.com.cn"),
+        ("us-iso-east-1", "c2s.ic.gov"),
+        ("us-isob-east-1", "sc2s.sgov.gov"),
+    ),
+)
+def test_converse_stream_url_uses_the_region_partition_endpoint(
+    region: str,
+    suffix: str,
+) -> None:
+    """Native streaming derives China and isolated-partition DNS correctly."""
+    client = BedrockClient(
+        model=_snapshot(),
+        region=region,
+        environment={},
+        runtime_factory=None,
+    )
+
+    assert client.converse_stream_url().startswith(
+        f"https://bedrock-runtime.{region}.{suffix}/model/"
     )
 
 

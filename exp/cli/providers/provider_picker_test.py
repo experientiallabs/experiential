@@ -1116,6 +1116,40 @@ def test_bedrock_reuses_the_sole_explicit_pair_when_auth_is_not_reentered() -> N
     assert endpoints[0].connection == existing[0]
 
 
+def test_bedrock_sts_intent_never_reuses_an_explicit_pair() -> None:
+    """A session token keeps setup on ambient auth instead of truncating STS."""
+    existing = (
+        ProviderConnection(
+            name="bedrock-production",
+            provider="bedrock",
+            api_key_env="AWS_SECRET_ACCESS_KEY",
+            aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+            bedrock_auth_mode="access_key_pair",
+            region="us-west-2",
+        ),
+    )
+    prepared = _prepare(
+        ScriptedConsole("us-west-2\n"),
+        providers=("bedrock",),
+        lister=_FakeLister({}),
+        environment={
+            "AWS_ACCESS_KEY_ID": "temporary-access-id",
+            "AWS_SECRET_ACCESS_KEY": "temporary-secret",
+            "AWS_SESSION_TOKEN": "temporary-session-token",
+        },
+        existing_connections=existing,
+    )
+
+    assert prepared is not None
+    endpoints, _models = prepared
+    assert not endpoints[0].configured
+    assert endpoints[0].connection == ProviderConnection(
+        name="bedrock",
+        provider="bedrock",
+        region="us-west-2",
+    )
+
+
 def test_bedrock_authors_an_explicit_pair_from_complete_environment_credentials() -> None:
     """Complete standard AWS environment credentials become a secret-free pair config."""
     connection = provider_picker.collect_provider_connection(

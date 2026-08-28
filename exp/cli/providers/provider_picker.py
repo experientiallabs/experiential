@@ -20,7 +20,10 @@ from getpass import getpass
 from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
-from exp.cli.providers.bedrock_credentials import infer_bedrock_auth
+from exp.cli.providers.bedrock_credentials import (
+    infer_bedrock_auth,
+    requires_ambient_bedrock_auth,
+)
 from exp.cli.providers.connection_reuse import reused_connection
 from exp.cli.providers.experiential_cloud import (
     SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
@@ -512,6 +515,9 @@ def _resolve_endpoint(
         region=config.region,
         aws_access_key_id_env=config.aws_access_key_id_env,
         bedrock_auth_mode=config.bedrock_auth_mode,
+        require_ambient_bedrock_auth=(
+            provider == "bedrock" and requires_ambient_bedrock_auth(environment)
+        ),
     )
     configured = connection is not None
     if connection is None:

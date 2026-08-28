@@ -34,3 +34,13 @@ def infer_bedrock_auth(
     ):
         return _AWS_SECRET_ACCESS_KEY_ENV, _AWS_ACCESS_KEY_ID_ENV, "access_key_pair"
     return None, None, None
+
+
+def requires_ambient_bedrock_auth(environment: Mapping[str, str] | None) -> bool:
+    """Return whether temporary credentials require the complete ambient chain."""
+    if environment is None or environment.get(_BEDROCK_BEARER_ENV, "").strip():
+        return False
+    return any(
+        environment.get(name, "").strip()
+        for name in (_AWS_SESSION_TOKEN_ENV, _AWS_SECURITY_TOKEN_ENV)
+    )
