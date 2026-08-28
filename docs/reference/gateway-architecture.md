@@ -188,9 +188,10 @@ configuration is forwarded verbatim, overriding the catalog's adaptive default),
 `max_tokens`, validates and drops `cache_control` (the gateway has no prompt-caching channel),
 and rejects image and document blocks loudly because the surface is text-only. Thinking carriers
 replay only on the Anthropic wire, so route admission requires every waterfall rung to speak the
-`anthropic_messages` dialect; on OpenAI-shaped surfaces over Anthropic routes, thinking text is
+`anthropic_messages` dialect; on the Responses surface over Anthropic routes, thinking text is
 projected onto the reasoning-summary channel (signatures deliberately dropped) so callers receive
-the reasoning they pay for. Streaming emits the Anthropic
+the reasoning they pay for, while the Chat surface has no reasoning representation and drops it
+like summary deltas. Streaming emits the Anthropic
 lifecycle (`message_start`, `ping`, content blocks, `message_delta` with the mapped stop reason
 and usage, `message_stop`, or one terminal `error` event); the non-streaming body is the
 Anthropic message object. Completed streams stop with `end_turn` (`tool_use` when tool calls are

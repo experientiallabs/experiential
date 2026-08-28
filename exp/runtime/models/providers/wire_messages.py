@@ -110,6 +110,10 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
 
 def openai_chat_message(message: GatewayMessage) -> JsonObject:
     """Translate one gateway message to OpenAI Chat wire JSON."""
+    if message.provider_reasoning:
+        # No Chat wire field can replay any reasoning carrier; route
+        # admission rejects the combination before dispatch.
+        raise ProviderResponseError("reasoning carriers cannot replay on the Chat wire")
     if message.role == "tool":
         return {
             "role": "tool",
