@@ -386,10 +386,13 @@ def route_generation_parameter_requests(
             anthropic_adaptive_only_thinking(profile.model_id) for profile in profiles
         )
         if adaptive_only and config_type == "enabled":
-            # Translate to the model's one supported mode. The token budget
-            # has no adaptive equivalent, so it is disclosed as ignored
-            # rather than silently mapped onto an effort level.
-            ignore("provider_thinking_config", "thinking.budget_tokens")
+            # Translate to the model's one supported mode, emitted explicitly
+            # so the promise holds even on routes with no pinned effort. The
+            # token budget has no adaptive equivalent, so it is disclosed as
+            # ignored rather than silently mapped onto an effort level.
+            provider_updates["provider_thinking_config"] = {"type": "adaptive"}
+            if "thinking.budget_tokens" not in ignored:
+                ignored.append("thinking.budget_tokens")
             _logger.warning(
                 "translated a caller 'enabled' thinking config to adaptive for an "
                 "adaptive-only Anthropic route; thinking.budget_tokens was disclosed "
@@ -751,8 +754,18 @@ def anthropic_messages_stream_payload(
     if request.provider_thinking_config is not None:
         # The caller's exact thinking configuration wins over the catalog's
         # adaptive default and travels verbatim, so budget semantics are
-        # never reinterpreted by the gateway.
+        # never reinterpreted by the gateway. An adaptive config (caller-sent
+        # or route-translated) still composes with the route's pinned effort,
+        # exactly like a request that carried no thinking config.
         payload["thinking"] = request.provider_thinking_config
+        if (
+            request.provider_thinking_config.get("type") == "adaptive"
+            and supports_reasoning
+            and effective_reasoning_effort is not None
+        ):
+            output_config["effort"] = anthropic_reasoning_effort(
+                model_id, effective_reasoning_effort
+            )
     elif supports_reasoning and effective_reasoning_effort is not None:
         payload["thinking"] = {"type": "adaptive"}
         output_config["effort"] = anthropic_reasoning_effort(model_id, effective_reasoning_effort)

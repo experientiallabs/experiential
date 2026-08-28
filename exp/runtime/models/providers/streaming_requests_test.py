@@ -1519,7 +1519,7 @@ def test_enabled_thinking_translates_to_adaptive_on_adaptive_only_models() -> No
         (_anthropic_profile("claude-fable-5"),), request
     )
     assert "thinking.budget_tokens" in public.ignored_parameters
-    assert provider.provider_thinking_config is None
+    assert provider.provider_thinking_config == {"type": "adaptive"}
     payload = anthropic_messages_stream_payload(
         "claude-fable-5",
         provider,
@@ -1528,6 +1528,11 @@ def test_enabled_thinking_translates_to_adaptive_on_adaptive_only_models() -> No
     )
     assert payload["thinking"] == {"type": "adaptive"}
     assert payload["output_config"] == {"effort": "medium"}
+    # The translation stays explicit on routes that pin no effort, so the
+    # caller's request to think never degrades to an implicit provider default.
+    bare = anthropic_messages_stream_payload("claude-fable-5", provider)
+    assert bare["thinking"] == {"type": "adaptive"}
+    assert "output_config" not in bare
 
 
 def test_enabled_thinking_stays_verbatim_on_budget_capable_models() -> None:
