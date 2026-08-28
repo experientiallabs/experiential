@@ -118,8 +118,10 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = frozenset(
         "developer_messages",
         "function_tools",
         "parallel_tool_calls",
+        "stop_sequences",
         "streaming",
         "strict_tools",
+        "structured_output",
         "structured_text",
     }
 )

@@ -1099,6 +1099,63 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
     assert "internal" not in error["code"]
 
 
+@pytest.mark.parametrize(
+    ("body_update", "gateway_capabilities", "model_capabilities", "param"),
+    (
+        (
+            {"stop": ["DONE"]},
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            ModelCapabilities(),
+            "stop_sequences",
+        ),
+        (
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": {"type": "object"},
+                        "strict": True,
+                    },
+                }
+            },
+            GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                supports_structured_text=True,
+            ),
+            ModelCapabilities(),
+            "structured_output",
+        ),
+    ),
+)
+def test_admit_scopes_each_public_capability_failure_to_its_request_field(
+    tmp_path: Path,
+    body_update: JsonObject,
+    gateway_capabilities: GatewayDeploymentCapabilities,
+    model_capabilities: ModelCapabilities,
+    param: str,
+) -> None:
+    """Public admission failures never degrade to an unscoped internal error."""
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(gateway_capabilities, gateway_capabilities),
+        model_capabilities=(model_capabilities, model_capabilities),
+    )
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        **body_update,
+    }
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, json.dumps(body))
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_capability"
+    assert error["param"] == param
+
+
 def _partial_pool_control_plane(
     root: Path,
     environment: dict[str, str],
