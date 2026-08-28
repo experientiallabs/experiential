@@ -93,13 +93,21 @@ pub fn transport_failure(status: Option<u16>) -> Failure {
     Failure::new(class, message).with_retry(retryable, failover)
 }
 
-/// The classified open-phase timeout, matching `_transport_failure(408)`.
+/// Classify a lead that connected but never completed the request/response-header
+/// phase within `phase_timeout`. A deployment that accepted the connection but
+/// stalled awaiting response headers is the same dead-lane signal as a stalled
+/// first byte, so it mirrors `relay::first_byte_timeout_failure`: failover-eligible
+/// (advance to the next certified rung) but deliberately *not* same-deployment
+/// retryable. Redialing the same stalled deployment would only burn another full
+/// header-timeout window before failing over; skipping straight to the next rung
+/// keeps a stalled lead's cost near one fail-fast window. It stays a
+/// `FailureClass::Timeout`, so it feeds the health circuit like other timeouts.
 fn open_timeout_failure() -> Failure {
     Failure::new(
         FailureClass::Timeout,
-        "provider request timed out; retry the request",
+        "provider did not send response headers in time; failing over to the next deployment",
     )
-    .with_retry(true, true)
+    .with_retry(false, true)
 }
 
 /// Open one streaming POST and return the response on HTTP success. The
@@ -180,5 +188,22 @@ mod tests {
                 "failover for {status:?}"
             );
         }
+    }
+
+    #[test]
+    fn header_phase_timeout_fails_over_without_a_same_deployment_redial() {
+        // A lead that connects but never completes the response-header phase must
+        // skip straight to the next rung (failover-eligible) instead of redialing
+        // the same stalled deployment for another full header-timeout window.
+        let failure = open_timeout_failure();
+        assert_eq!(failure.failure_class, FailureClass::Timeout);
+        assert!(
+            !failure.retryable_same_deployment,
+            "a header-phase stall must not redial the same deployment"
+        );
+        assert!(
+            failure.failover_eligible,
+            "a header-phase stall must fail over to the next certified rung"
+        );
     }
 }
