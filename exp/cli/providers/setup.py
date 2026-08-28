@@ -633,6 +633,7 @@ def existing_setup_connections(existing: ModelCatalog | None) -> tuple[ProviderC
             api_key_env=connection.api_key_env,
             base_url=connection.base_url,
             api_version=connection.api_version,
+            azure_api_surface=connection.azure_api_surface,
             region=connection.region,
         )
         for name, connection in sorted(existing.connections.items())

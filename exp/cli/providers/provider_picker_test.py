@@ -1040,7 +1040,7 @@ def test_openai_compatible_does_not_reuse_when_multiple_accounts_share_an_endpoi
 
 def test_azure_prepares_exact_connection_for_manual_deployment_declaration() -> None:
     """Azure preserves endpoint and API version without inventing deployment metadata."""
-    console = ScriptedConsole("https://resource.openai.azure.com\n\n")
+    console = ScriptedConsole("https://resource.openai.azure.com\n\n\n")
     lister = _FakeLister({})
 
     prepared = _prepare(
@@ -1060,8 +1060,21 @@ def test_azure_prepares_exact_connection_for_manual_deployment_declaration() -> 
         api_key_env="AZURE_OPENAI_API_KEY",
         base_url="https://resource.openai.azure.com",
         api_version="v1",
+        azure_api_surface="openai_deployments",
     )
     assert "declare deployment model IDs" in console.output
+
+
+def test_azure_prepares_explicit_model_inference_surface() -> None:
+    """Interactive setup can author Foundry model inference without losing its discriminator."""
+    console = ScriptedConsole(
+        "https://resource.services.ai.azure.com/models\n2024-05-01-preview\nmodel_inference\n"
+    )
+
+    connection = provider_picker.collect_provider_connection("azure", console=console)
+
+    assert connection is not None
+    assert connection.azure_api_surface == "model_inference"
 
 
 def test_bedrock_prepares_credential_chain_without_listing_or_identity_invention() -> None:

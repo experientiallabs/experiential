@@ -16,6 +16,7 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from getpass import getpass
+from typing import Literal, cast
 
 from rich.console import Console
 from rich.prompt import Prompt
@@ -351,6 +352,7 @@ def collect_provider_connection(
         return hosted_connection(environment).catalog_config()
     base_url = None
     api_version = None
+    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region = None
     if provider in ("openai-compatible", "azure"):
         base_url = ask_text(f"{SETUP_PROVIDER_LABELS[provider]} base URL", console=console)
@@ -360,6 +362,16 @@ def collect_provider_connection(
         api_version = ask_text("Azure OpenAI API version", console=console, default="v1")
         if not api_version:
             return None
+        selected_surface = ask_text(
+            "Azure API surface",
+            console=console,
+            default="openai_deployments",
+        )
+        if not selected_surface:
+            return None
+        if selected_surface not in ("openai_deployments", "model_inference"):
+            raise ValueError(f"unsupported Azure API surface {selected_surface!r}")
+        azure_api_surface = cast(Literal["openai_deployments", "model_inference"], selected_surface)
     if provider == "bedrock":
         region = (
             ask_text(
@@ -376,6 +388,7 @@ def collect_provider_connection(
         base_url=base_url,
         api_key_env=api_key_env,
         api_version=api_version,
+        azure_api_surface=azure_api_surface,
         region=region,
     )
 
@@ -501,6 +514,7 @@ def _resolve_endpoint(
         api_key_env=config.api_key_env,
         base_url=config.base_url,
         api_version=config.api_version,
+        azure_api_surface=config.azure_api_surface,
         region=config.region,
     )
     configured = connection is not None
@@ -512,6 +526,7 @@ def _resolve_endpoint(
             api_key_env=config.api_key_env or derived_api_key_env(config.provider, name),
             base_url=config.base_url,
             api_version=config.api_version,
+            azure_api_surface=config.azure_api_surface,
             region=config.region,
         )
     if provider == "bedrock":
@@ -536,6 +551,7 @@ def _reused_connection(
     api_key_env: str | None,
     base_url: str | None,
     api_version: str | None,
+    azure_api_surface: Literal["openai_deployments", "model_inference"] | None,
     region: str | None,
 ) -> ProviderConnection | None:
     """Return the configured connection that already describes this exact endpoint.
@@ -546,6 +562,7 @@ def _reused_connection(
         api_key_env: Canonical or collected environment override name, if any.
         base_url: Optional collected endpoint.
         api_version: Optional Azure API version.
+        azure_api_surface: Optional Azure API surface discriminator.
         region: Optional Bedrock region.
 
     Returns:
@@ -557,6 +574,7 @@ def _reused_connection(
             connection.provider != provider
             or connection.base_url != base_url
             or connection.api_version != api_version
+            or connection.azure_api_surface != azure_api_surface
             or connection.region != region
         ):
             continue

@@ -143,3 +143,49 @@ def test_provider_add_accepts_a_supported_provider_identifier(tmp_path: Path) ->
     assert listing["resource_kind"] == "providers"
     (item,) = listing["items"]
     assert item["provider"] == "openai-compatible"
+
+
+def test_azure_update_preserves_model_inference_surface_when_omitted(tmp_path: Path) -> None:
+    """An endpoint-only update cannot silently switch Foundry back to classic Azure."""
+    root = _initialized_root(tmp_path)
+    common = [
+        "--provider",
+        "azure",
+        "--base-url",
+        "https://resource.services.ai.azure.com/models",
+        "--credential-env",
+        "AZURE_FOUNDRY_API_KEY",
+        "--api-version",
+        "2024-05-01-preview",
+        "--non-interactive",
+        "--json",
+        "--root",
+        str(root),
+    ]
+    added = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "foundry",
+            *common,
+            "--azure-api-surface",
+            "model_inference",
+        ],
+    )
+    updated = _runner.invoke(
+        app,
+        ["config", "gateway", "provider", "update", "foundry", *common],
+    )
+    listed = _runner.invoke(
+        app,
+        ["config", "gateway", "provider", "list", "--json", "--root", str(root)],
+    )
+
+    assert added.exit_code == 0
+    assert updated.exit_code == 0
+    (authority,) = GatewayManagement(root).provider_connections()
+    assert authority.config.azure_api_surface == "model_inference"
+    assert json.loads(listed.output)["items"][0]["azure_api_surface"] == "model_inference"

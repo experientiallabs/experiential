@@ -178,6 +178,27 @@ def test_model_inference_appends_models_to_a_resource_root() -> None:
     )
 
 
+def test_model_inference_canonicalizes_terminal_models_path_case() -> None:
+    """Equivalent endpoint spelling emits one lowercase provider wire path."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint="https://resource.services.ai.azure.com/MODELS",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    assert transport.requests[0][0].startswith(
+        "https://resource.services.ai.azure.com/models/chat/completions?"
+    )
+
+
 def test_model_inference_rejects_v1_without_a_supported_api_version_query() -> None:
     """The model-inference surface never silently omits its required api-version query."""
     with pytest.raises(ValueError, match="dated api_version"):

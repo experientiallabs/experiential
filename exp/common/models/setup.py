@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -45,6 +46,7 @@ class ProviderConnection(ContractModel):
     api_key_env: str | None = Field(default=None, max_length=256)
     base_url: str | None = Field(default=None, max_length=2_048)
     api_version: str | None = Field(default=None, max_length=64)
+    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
@@ -98,6 +100,7 @@ class ProviderConnection(ContractModel):
             base_url=self.base_url,
             api_key_env=self.api_key_env,
             api_version=self.api_version,
+            azure_api_surface=self.azure_api_surface,
             region=self.region,
         )
         return self
@@ -109,6 +112,7 @@ class ProviderConnection(ContractModel):
             base_url=self.base_url,
             api_key_env=self.api_key_env,
             api_version=self.api_version,
+            azure_api_surface=self.azure_api_surface,
             region=self.region,
         )
 

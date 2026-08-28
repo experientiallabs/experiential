@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import typer
 
@@ -21,6 +22,7 @@ _NON_INTERACTIVE_OPTION = typer.Option(False, "--non-interactive")
 _BASE_URL_OPTION = typer.Option(None, "--base-url")
 _CREDENTIAL_ENV_OPTION = typer.Option(None, "--credential-env")
 _API_VERSION_OPTION = typer.Option(None, "--api-version")
+_AZURE_API_SURFACE_OPTION = typer.Option(None, "--azure-api-surface")
 _REGION_OPTION = typer.Option(None, "--region")
 
 
@@ -32,6 +34,7 @@ class GatewayProviderView(ContractModel):
     credential_env: str | None = None
     base_url: str | None = None
     api_version: str | None = None
+    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = None
 
 
@@ -45,6 +48,7 @@ def provider_list(root: Path = ROOT_OPTION, json_output: bool = _JSON_OPTION) ->
             credential_env=connection.api_key_env,
             base_url=connection.base_url,
             api_version=connection.api_version,
+            azure_api_surface=connection.azure_api_surface,
             region=connection.region,
         )
         for authority in GatewayManagement(root).provider_connections()
@@ -61,6 +65,9 @@ def provider_add(
     credential_env: str | None = _CREDENTIAL_ENV_OPTION,
     base_url: str | None = _BASE_URL_OPTION,
     api_version: str | None = _API_VERSION_OPTION,
+    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = (
+        _AZURE_API_SURFACE_OPTION
+    ),
     region: str | None = _REGION_OPTION,
     replace: bool = typer.Option(False, "--replace"),
     non_interactive: bool = _NON_INTERACTIVE_OPTION,
@@ -76,6 +83,7 @@ def provider_add(
                 base_url=base_url,
                 api_key_env=credential_env,
                 api_version=api_version,
+                azure_api_surface=azure_api_surface,
                 region=region,
             ),
             replace=replace,
@@ -101,11 +109,24 @@ def provider_update(
     credential_env: str | None = _CREDENTIAL_ENV_OPTION,
     base_url: str | None = _BASE_URL_OPTION,
     api_version: str | None = _API_VERSION_OPTION,
+    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = (
+        _AZURE_API_SURFACE_OPTION
+    ),
     region: str | None = _REGION_OPTION,
     non_interactive: bool = _NON_INTERACTIVE_OPTION,
     json_output: bool = _JSON_OPTION,
 ) -> None:
     """Replace one provider connection and force active snapshot revalidation."""
+    existing = next(
+        (
+            authority.config
+            for authority in GatewayManagement(root).provider_connections()
+            if authority.connection_id == name
+        ),
+        None,
+    )
+    if azure_api_surface is None and existing is not None:
+        azure_api_surface = existing.azure_api_surface
     provider_add(
         name=name,
         provider=provider,
@@ -113,6 +134,7 @@ def provider_update(
         credential_env=credential_env,
         base_url=base_url,
         api_version=api_version,
+        azure_api_surface=azure_api_surface,
         region=region,
         replace=True,
         non_interactive=non_interactive,

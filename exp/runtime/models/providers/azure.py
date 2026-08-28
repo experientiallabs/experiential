@@ -114,7 +114,7 @@ def _azure_base_url(
     root = endpoint.rstrip("/")
     if api_surface == "model_inference":
         if root.lower().endswith("/models"):
-            return root
+            return f"{root[:-7]}/models"
         return f"{root}/models"
     if api_version == _V1_API_VERSION:
         if root.lower().endswith(_V1_ROOT_SUFFIX):
