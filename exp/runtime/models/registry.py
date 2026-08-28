@@ -214,6 +214,8 @@ class RuntimeModelCatalog:
             }
             if connection.api_version is not None:
                 current_connection["api_version"] = connection.api_version
+            if connection.azure_api_surface is not None:
+                current_connection["azure_api_surface"] = connection.azure_api_surface
             if connection.region is not None:
                 current_connection["region"] = connection.region
             current_connection_sha256 = sha256_json(current_connection)
@@ -321,6 +323,7 @@ class RuntimeModelCatalog:
                 endpoint=connection.base_url,
                 api_key=api_key,
                 api_version=connection.api_version,
+                api_surface=connection.azure_api_surface or "openai_deployments",
                 transport=self._transport_factory(),
                 supports_temperature=capabilities.supports_temperature,
                 supports_top_p=_supports_top_p(capabilities),

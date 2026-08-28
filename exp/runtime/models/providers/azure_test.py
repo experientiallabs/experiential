@@ -130,6 +130,54 @@ def test_classic_route_puts_the_exact_deployment_in_the_path() -> None:
     assert payload["model"] == "exact-deployment"
 
 
+def test_model_inference_route_keeps_deployment_in_body() -> None:
+    """Azure AI Model Inference uses the shared /models route, not deployment-in-path."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint="https://resource.services.ai.azure.com/models",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=transport,
+        chat_max_tokens_field="max_tokens",
+    )
+
+    client.complete(_request())
+
+    url, headers, payload = transport.requests[0]
+    assert url == (
+        "https://resource.services.ai.azure.com/models/chat/completions"
+        "?api-version=2024-05-01-preview"
+    )
+    assert headers["api-key"] == _SECRET
+    assert payload["model"] == "DeepSeek-V4-Flash"
+    assert payload["max_tokens"] == 128
+
+
+def test_model_inference_appends_models_to_a_resource_root() -> None:
+    """A Foundry resource root and its explicit /models root resolve identically."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "FW-GLM-5.2"),
+        endpoint="https://resource.services.ai.azure.com",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    assert transport.requests[0][0].startswith(
+        "https://resource.services.ai.azure.com/models/chat/completions?"
+    )
+
+
 def test_embeddings_use_the_configured_deployment_alias() -> None:
     """Embedding aliases send their own deployment ID rather than a guessed base model."""
     transport = ScriptedJsonTransport(

@@ -76,7 +76,13 @@ def bind_azure_api_key(
     return api_key
 
 
-def _azure_base_url(endpoint: str, *, deployment: str, api_version: str) -> str:
+def _azure_base_url(
+    endpoint: str,
+    *,
+    deployment: str,
+    api_version: str,
+    api_surface: str,
+) -> str:
     """Build the Azure request root for the configured API surface.
 
     ``v1`` uses the Foundry and Azure OpenAI ``/openai/v1`` root and places the deployment in
@@ -91,6 +97,10 @@ def _azure_base_url(endpoint: str, *, deployment: str, api_version: str) -> str:
         Absolute request root. The root never includes a credential or query string.
     """
     root = endpoint.rstrip("/")
+    if api_surface == "model_inference":
+        if root.lower().endswith("/models"):
+            return root
+        return f"{root}/models"
     if api_version == _V1_API_VERSION:
         if root.lower().endswith(_V1_ROOT_SUFFIX):
             return root
@@ -114,6 +124,7 @@ class AzureClient(OpenAICompatibleClient):
         endpoint: str,
         api_key: str,
         api_version: str,
+        api_surface: str = "openai_deployments",
         transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
@@ -132,7 +143,8 @@ class AzureClient(OpenAICompatibleClient):
             model: Resolved identity whose ``model_id`` is the exact Azure deployment name.
             endpoint: Explicit Azure resource endpoint from the catalog.
             api_key: Credential already paired with ``endpoint``.
-            api_version: ``v1`` or a dated Azure OpenAI API version.
+            api_version: ``v1`` or a dated Azure API version.
+            api_surface: Azure ``openai_deployments`` or Foundry ``model_inference`` wire API.
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
             timeout_seconds: Per-attempt timeout floor. Completion calls scale above it from the
@@ -145,10 +157,17 @@ class AzureClient(OpenAICompatibleClient):
             raise ValueError("Azure clients require an explicit resource endpoint")
         if not api_version:
             raise ValueError("Azure clients require an explicit api_version")
+        if api_surface not in {"openai_deployments", "model_inference"}:
+            raise ValueError("Azure clients require a supported api_surface")
         super().__init__(
             model=model,
             api_key=api_key,
-            base_url=_azure_base_url(endpoint, deployment=model.model_id, api_version=api_version),
+            base_url=_azure_base_url(
+                endpoint,
+                deployment=model.model_id,
+                api_version=api_version,
+                api_surface=api_surface,
+            ),
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,

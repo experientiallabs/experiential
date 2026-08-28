@@ -68,6 +68,7 @@ class ConnectionConfig(ContractModel):
     base_url: str | None = Field(default=None, max_length=2_048)
     api_key_env: str | None = Field(default=None, max_length=256)
     api_version: str | None = Field(default=None, max_length=64)
+    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=64)
 
     @field_validator("api_key_env")
@@ -94,6 +95,8 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        if self.provider != "azure" and self.azure_api_surface is not None:
+            raise ValueError("azure_api_surface is only accepted for provider='azure'")
         if self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
             raise ValueError(
                 f"native provider {self.provider!r} uses its built-in official endpoint; "
@@ -167,6 +170,7 @@ class ConnectionConfig(ContractModel):
                     "provider": self.provider,
                     "base_url": self.base_url,
                     "api_version": self.api_version,
+                    "azure_api_surface": self.azure_api_surface,
                     "region": self.region,
                 }
             )
@@ -187,6 +191,11 @@ class ConnectionConfig(ContractModel):
         }
         if self.api_version is not None:
             identity["api_version"] = self.api_version
+        if self.provider == "azure" and self.azure_api_surface == "model_inference":
+            # Keep classic Azure revisions byte-compatible with the identity
+            # contract that predates this discriminator. Only the genuinely
+            # different Foundry surface needs a new credential binding.
+            identity["azure_api_surface"] = "model_inference"
         if self.region is not None:
             identity["region"] = self.region
         return sha256_json(identity)
