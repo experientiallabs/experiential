@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 
+import exp.runtime.models.providers.bedrock_endpoints as bedrock_endpoints
 from exp.common.models import (
     BillingSource,
     ConnectionConfig,
@@ -818,6 +819,79 @@ def test_real_explicit_clients_ignore_hostile_environment_client_configuration(
     assert runtime is not None
 
 
+@pytest.mark.parametrize("auth_mode", ("pair", "bearer"))
+def test_explicit_clients_ignore_hostile_customer_endpoint_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    auth_mode: str,
+) -> None:
+    """Customer botocore models cannot redirect explicit credentials or signing."""
+    from botocore.loaders import Loader
+
+    customer_data = tmp_path / "models"
+    customer_data.mkdir()
+    built_in = Loader(
+        extra_search_paths=[Loader.BUILTIN_DATA_PATH],
+        include_default_search_paths=False,
+    ).load_data("endpoints")
+    aws_partition = next(
+        partition
+        for partition in cast("Any", built_in)["partitions"]
+        if partition["partition"] == "aws"
+    )
+    aws_partition["services"]["bedrock-runtime"] = {
+        "endpoints": {
+            "us-west-2": {
+                "hostname": "credential-exfiltration.invalid",
+                "protocols": ["https"],
+                "signatureVersions": ["v4"],
+            }
+        }
+    }
+    (customer_data / "endpoints.json").write_text(
+        json.dumps(built_in),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Loader, "CUSTOMER_DATA_PATH", str(customer_data))
+    bedrock_endpoints.bedrock_runtime_origin.cache_clear()
+    try:
+        if auth_mode == "bearer":
+            runtime = create_bedrock_runtime_client(
+                region_name="us-west-2",
+                bearer_token="bedrock-bearer",
+            )
+            native = BedrockClient(
+                model=_snapshot(),
+                region="us-west-2",
+                environment={},
+                runtime_factory=None,
+                bearer_token="bedrock-bearer",
+            )
+        else:
+            runtime = create_bedrock_runtime_client(
+                region_name="us-west-2",
+                aws_access_key_id="AKIAEXPLICITKEY001",
+                aws_secret_access_key="explicit-secret-access-key",
+            )
+            native = BedrockClient(
+                model=_snapshot(),
+                region="us-west-2",
+                environment={},
+                runtime_factory=None,
+                aws_access_key_id="AKIAEXPLICITKEY001",
+                aws_secret_access_key="explicit-secret-access-key",
+            )
+
+        assert cast("Any", runtime)._endpoint.host == (
+            "https://bedrock-runtime.us-west-2.amazonaws.com"
+        )
+        assert native.converse_stream_url().startswith(
+            "https://bedrock-runtime.us-west-2.amazonaws.com/"
+        )
+    finally:
+        bedrock_endpoints.bedrock_runtime_origin.cache_clear()
+
+
 def test_real_bearer_request_emits_only_the_pinned_authorization_token() -> None:
     """A serialized Converse request carries the exact bearer before network dispatch."""
 
@@ -981,6 +1055,36 @@ def test_converse_stream_url_uses_the_region_partition_endpoint(
     assert client.converse_stream_url().startswith(
         f"https://bedrock-runtime.{region}.{suffix}/model/"
     )
+
+
+def test_converse_stream_url_caches_bundled_endpoint_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated URL and signing checks do not reparse botocore endpoint data."""
+    real_loader = bedrock_endpoints.built_in_botocore_loader
+    calls = 0
+
+    def counted_loader() -> bedrock_endpoints.BotocoreLoader:
+        nonlocal calls
+        calls += 1
+        return real_loader()
+
+    monkeypatch.setattr(bedrock_endpoints, "built_in_botocore_loader", counted_loader)
+    bedrock_endpoints.bedrock_runtime_origin.cache_clear()
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-west-2",
+        environment={},
+        runtime_factory=None,
+    )
+    try:
+        first = client.converse_stream_url()
+        second = client.converse_stream_url()
+    finally:
+        bedrock_endpoints.bedrock_runtime_origin.cache_clear()
+
+    assert first == second
+    assert calls == 1
 
 
 def test_sign_gateway_dispatch_matches_an_independent_sigv4_computation(

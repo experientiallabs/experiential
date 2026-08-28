@@ -24,6 +24,10 @@ from exp.common.models import (
     Usage,
 )
 from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, GatewayWireProfile
+from exp.runtime.models.providers.bedrock_endpoints import (
+    bedrock_runtime_origin,
+    built_in_botocore_loader,
+)
 from exp.runtime.models.providers.bedrock_requests import converse_request
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
@@ -140,17 +144,6 @@ class _ConfigValueStore(Protocol):
 
     def set_config_provider(self, logical_name: str, provider: object) -> None:
         """Replace one variable's entire provider chain."""
-
-
-class _EndpointResolver(Protocol):
-    """Botocore partition resolver used for the native streaming origin."""
-
-    def construct_endpoint(
-        self,
-        service_name: str,
-        region_name: str,
-    ) -> Mapping[str, object] | None:
-        """Resolve one service endpoint without constructing a client."""
 
 
 class _NoAmbientTokenProvider:
@@ -587,7 +580,7 @@ class BedrockClient:
         """
         region = self._region_name()
         encoded_model = quote(self._model.model_id, safe="/~")
-        origin = _bedrock_runtime_origin(region)
+        origin = bedrock_runtime_origin(region)
         return f"{origin}/model/{encoded_model}/converse-stream"
 
     def sign_gateway_dispatch(self, *, url: str, body: str) -> Mapping[str, str]:
@@ -777,30 +770,9 @@ def _import_isolated_botocore_session() -> _BotocoreSession:
             config_store.set_config_provider(logical_name, ConstantProvider(default))
     config_store.set_config_provider("config_file", ConstantProvider(os.devnull))
     config_store.set_config_provider("credentials_file", ConstantProvider(os.devnull))
+    session.register_component("data_loader", built_in_botocore_loader())
     session.register_component("token_provider", _NoAmbientTokenProvider())
     return session
-
-
-def _bedrock_runtime_origin(region_name: str) -> str:
-    """Resolve the HTTPS Bedrock Runtime origin for the region's AWS partition."""
-    try:
-        from botocore.loaders import Loader
-        from botocore.regions import EndpointResolver
-    except ImportError as exc:
-        raise RuntimeError("Bedrock requires botocore; install experiential") from exc
-    resolver = cast("_EndpointResolver", EndpointResolver(Loader().load_data("endpoints")))
-    endpoint = resolver.construct_endpoint("bedrock-runtime", region_name)
-    hostname = None if endpoint is None else endpoint.get("hostname")
-    protocols = () if endpoint is None else endpoint.get("protocols", ())
-    if (
-        not isinstance(hostname, str)
-        or not isinstance(protocols, Sequence)
-        or "https" not in protocols
-    ):
-        raise ProviderTransportError(
-            f"Bedrock has no HTTPS runtime endpoint for region {region_name!r}"
-        )
-    return f"https://{hostname}"
 
 
 def _import_botocore_signing() -> tuple[_SigV4SignerFactory, _AwsRequestFactory]:
