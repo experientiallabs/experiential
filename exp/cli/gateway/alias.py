@@ -7,6 +7,7 @@ from pathlib import Path
 
 import typer
 
+from exp.cli.gateway.capability_authority import retained_streaming_tool_arguments
 from exp.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.common.core.artifacts import sha256_json
@@ -17,7 +18,6 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
     ModelCatalog,
-    load_model_catalog,
 )
 from exp.optimize.router.activation import load_project_router
 from exp.runtime.gateway.catalog_authority import (
@@ -282,17 +282,12 @@ def _activate(
         provider = serving_connections[connection].provider
         declared_streaming_tool_arguments = supports_streaming_tool_arguments
         if declared_streaming_tool_arguments is None and replace:
-            catalog_path = root / "models.toml"
-            if catalog_path.exists():
-                existing = load_model_catalog(catalog_path).models.get(alias)
-                if (
-                    existing is not None
-                    and existing.connection == connection
-                    and existing.gateway is not None
-                ):
-                    declared_streaming_tool_arguments = (
-                        existing.gateway.capabilities.supports_streaming_tool_arguments
-                    )
+            declared_streaming_tool_arguments = retained_streaming_tool_arguments(
+                manager,
+                alias_id=alias,
+                connection_id=connection,
+                connection=serving_connections[connection],
+            )
         if declared_streaming_tool_arguments is None:
             declared_streaming_tool_arguments = provider_has_certified_capability(
                 provider,

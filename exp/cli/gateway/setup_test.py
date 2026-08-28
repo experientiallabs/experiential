@@ -191,11 +191,66 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
     assert load_settings(tmp_path).commands.maximum_cost_usd == 50.0
 
 
+@pytest.mark.parametrize("supports_tools", (True, None))
 def test_gateway_setup_collects_custom_endpoint_tool_streaming_capability(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    supports_tools: bool | None,
 ) -> None:
-    """Interactive custom setup records endpoint truth instead of provider-family inference."""
+    """Custom setup asks for endpoint truth unless model tool support is explicitly false."""
+    connection = ProviderConnection(
+        name="custom",
+        provider="openai-compatible",
+        base_url="https://custom.example.test/v1",
+        api_key_env="CUSTOM_API_KEY",
+    )
+    endpoint = provider_picker.PreparedEndpoint(
+        connection=connection,
+        api_key="secret",
+        configured=True,
+    )
+    model = provider_picker.AvailableModel(
+        alias="custom-tools",
+        connection="custom",
+        provider="openai-compatible",
+        model="custom-tools",
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            supports_tools=supports_tools,
+        ),
+        pricing_source=PricingSource.UNKNOWN,
+        configured=True,
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai-compatible",), False),
+    )
+    monkeypatch.setattr(
+        setup,
+        "prepare_providers",
+        lambda *_args, **_kwargs: ((endpoint,), (model,)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(model, None),
+    )
+    console = ScriptedConsole("\ny\n")
+
+    setup.interactive_gateway_setup(tmp_path, console=console)
+
+    authored = load_model_catalog(tmp_path / "models.toml").models["custom-tools"]
+    assert authored.gateway is not None
+    assert authored.gateway.capabilities.supports_streaming_tool_arguments
+    assert "Does this custom endpoint stream tool-call arguments?" in console.output
+
+
+def test_gateway_setup_reconfigure_preserves_same_custom_endpoint_declaration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepting defaults retains explicit transport truth for the same frozen endpoint."""
     connection = ProviderConnection(
         name="custom",
         provider="openai-compatible",
@@ -231,9 +286,14 @@ def test_gateway_setup_collects_custom_endpoint_tool_streaming_capability(
         "select_gateway_model",
         lambda *_args, **_kwargs: model_picker.GatewayModelSelection(model, None),
     )
-    console = ScriptedConsole("\ny\n")
+    first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\ny\n"))
 
-    setup.interactive_gateway_setup(tmp_path, console=console)
+    console = ScriptedConsole(f"edit\n{first.alias}\ndefault\n50\noff\n\n")
+    setup.interactive_gateway_setup(
+        tmp_path,
+        console=console,
+        allow_reconfigure=True,
+    )
 
     authored = load_model_catalog(tmp_path / "models.toml").models["custom-tools"]
     assert authored.gateway is not None

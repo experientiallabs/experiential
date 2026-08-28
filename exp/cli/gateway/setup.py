@@ -15,6 +15,7 @@ from rich.prompt import Confirm
 from rich.table import Table
 from rich.text import Text
 
+from exp.cli.gateway.capability_authority import retained_streaming_tool_arguments
 from exp.cli.gateway.guardrail_setup import (
     GUARDRAILS_OFF,
     GuardrailSetupPlan,
@@ -217,11 +218,21 @@ def interactive_gateway_setup(
     )
     if selected.connection == HOSTED_SETUP_PICKER:
         supports_streaming_tool_arguments = True
-    elif selected_provider == "openai-compatible" and capabilities.supports_tools:
+    elif selected_provider == "openai-compatible" and capabilities.supports_tools is not False:
+        existing_declaration = (
+            retained_streaming_tool_arguments(
+                manager,
+                alias_id=values.alias,
+                connection_id=selected.connection,
+                connection=selected_connections[selected.connection],
+            )
+            if reconfigure
+            else None
+        )
         try:
             supports_streaming_tool_arguments = Confirm.ask(
                 "Does this custom endpoint stream tool-call arguments?",
-                default=False,
+                default=existing_declaration or False,
                 console=console,
             )
         except (EOFError, KeyboardInterrupt) as exc:

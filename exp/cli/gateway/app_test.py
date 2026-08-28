@@ -320,6 +320,50 @@ def test_direct_alias_uses_provider_certification_for_tool_streaming(
     assert not catalog.models["gemini-tools"].gateway.capabilities.supports_streaming_tool_arguments
     assert catalog.models["custom-tools"].gateway.capabilities.supports_streaming_tool_arguments
 
+    replaced = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "update",
+            "custom",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://replacement.example.test/v1",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert replaced.exit_code == 0, replaced.output
+    recertified = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "update",
+            "custom-tools",
+            "--deployment",
+            "custom:custom-fixture",
+            "--exact-model",
+            "custom-tools",
+            "--supports-tools",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert recertified.exit_code == 0, recertified.output
+    replaced_catalog = load_model_catalog(tmp_path / "models.toml")
+    replaced_custom = replaced_catalog.models["custom-tools"]
+    assert replaced_custom.gateway is not None
+    assert not replaced_custom.gateway.capabilities.supports_streaming_tool_arguments
+
 
 def test_direct_alias_rejects_an_unknown_provider_connection_cleanly(tmp_path: Path) -> None:
     """A deployment typo is a stable CLI usage error, never an unhandled mapping failure."""

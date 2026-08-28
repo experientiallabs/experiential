@@ -310,6 +310,21 @@ class GatewayManagement:
             organization_id=self.organization_id,
         )
 
+    def alias_provider_connections(
+        self,
+        *,
+        alias_id: str,
+        alias_revision_id: str,
+    ) -> tuple[ProviderConnectionAuthority, ...]:
+        """Return the exact provider revisions frozen into one alias revision."""
+        if not self.initialized:
+            return ()
+        return self.require_initialized().alias_provider_connections(
+            organization_id=self.organization_id,
+            alias_id=alias_id,
+            alias_revision_id=alias_revision_id,
+        )
+
     def disable_provider_connection(self, *, connection_id: str) -> bool:
         """Disable one provider connection not used by an active alias revision."""
         return self.require_initialized().disable_provider_connection(
