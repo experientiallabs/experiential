@@ -120,6 +120,9 @@ class _BotocoreSession(Protocol):
     def get_component(self, name: str) -> object:
         """Return one already-registered botocore session component."""
 
+    def get_credentials(self) -> _ResolvableCredentials | None:
+        """Return credentials bound to this isolated session, when any."""
+
     def set_config_variable(self, logical_name: str, value: object) -> None:
         """Override one ambient configuration source for this session only."""
 
@@ -516,9 +519,15 @@ class BedrockClient:
                 session_kwargs = _explicit_session_kwargs(
                     self._aws_access_key_id, self._aws_secret_access_key
                 )
-                self._signing_credentials = (
-                    _import_boto3().Session(**session_kwargs).get_credentials()
-                )
+                if session_kwargs:
+                    session = _import_isolated_botocore_session()
+                    session.set_credentials(
+                        session_kwargs["aws_access_key_id"],
+                        session_kwargs["aws_secret_access_key"],
+                    )
+                    self._signing_credentials = session.get_credentials()
+                else:
+                    self._signing_credentials = _import_boto3().Session().get_credentials()
             credentials = self._signing_credentials
         if credentials is None:
             raise ProviderTransportError(

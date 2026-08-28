@@ -1167,7 +1167,7 @@ def test_legacy_bedrock_pair_replay_is_semantically_idempotent(tmp_path: Path) -
     replayed, second = store.upsert_provider_connection(
         organization_id="org-one",
         connection_id="bedrock",
-        revision_id="unused-replay-revision",
+        revision_id="provider-revision-one",
         config=legacy.model_copy(update={"bedrock_auth_mode": "access_key_pair"}),
     )
 
@@ -1193,10 +1193,26 @@ def test_disabled_provider_connection_reuses_its_stable_id(tmp_path: Path) -> No
         connection_id="primary",
     )
 
+    store.create_organization(organization_id="org-two", slug="two", display_name="Two")
+    store.upsert_provider_connection(
+        organization_id="org-two",
+        connection_id="secondary",
+        revision_id="other-tenant-revision",
+        config=config,
+    )
+    with pytest.raises(ProviderAuthorityError, match="different immutable revision"):
+        store.upsert_provider_connection(
+            organization_id="org-one",
+            connection_id="primary",
+            revision_id="other-tenant-revision",
+            config=config,
+        )
+    assert store.provider_connections(organization_id="org-one") == ()
+
     changed, restored = store.upsert_provider_connection(
         organization_id="org-one",
         connection_id="primary",
-        revision_id="unused-restoration-revision",
+        revision_id="provider-revision-one",
         config=config,
     )
 

@@ -77,6 +77,10 @@ def upsert_provider_connection(
     if current is not None:
         authority = _authority(current)
         if authority.config == config and authority.connection_sha256 == digest:
+            if authority.revision_id != revision_id:
+                raise ProviderAuthorityError(
+                    "provider connection replay names a different immutable revision"
+                )
             if authority.active:
                 return False, authority
             connection.execute(

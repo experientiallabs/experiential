@@ -1014,24 +1014,15 @@ def test_bedrock_dispatch_signing_rejects_every_non_admitted_url(
 
 def test_sign_gateway_dispatch_uses_the_explicit_access_key_pair(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Native ConverseStream signing resolves the configured pair, not the ambient chain."""
-    import boto3
-
-    seen: dict[str, str] = {}
-
-    class _ExplicitBotoModule:
-        """Capture explicit Session kwargs while delegating credential freezing to boto3."""
-
-        @staticmethod
-        def Session(**credentials: str) -> object:
-            seen.update(credentials)
-            return boto3.Session(**credentials)
-
-    monkeypatch.setattr(
-        "exp.runtime.models.providers.bedrock._import_boto3",
-        lambda: _ExplicitBotoModule,
-    )
+    malformed = tmp_path / "malformed-aws-config"
+    malformed.write_text("[profile broken\n", encoding="utf-8")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(malformed))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(malformed))
+    monkeypatch.setenv("AWS_PROFILE", "profile-that-does-not-exist")
+    monkeypatch.setenv("AWS_DEFAULTS_MODE", "invalid-ambient-mode")
     client = BedrockClient(
         model=_snapshot(),
         region="us-west-2",
@@ -1046,10 +1037,6 @@ def test_sign_gateway_dispatch_uses_the_explicit_access_key_pair(
         body='{"messages":[]}',
     )
 
-    assert seen == {
-        "aws_access_key_id": "AKIAEXPLICITKEY001",
-        "aws_secret_access_key": "explicit-secret-access-key",
-    }
     assert "Credential=AKIAEXPLICITKEY001/" in headers["Authorization"]
 
 
