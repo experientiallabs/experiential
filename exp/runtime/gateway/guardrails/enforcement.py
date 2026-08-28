@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
 from exp.runtime.gateway.guardrails.client import InternalClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
@@ -21,6 +21,26 @@ from exp.runtime.gateway.guardrails.contracts import (
 from exp.runtime.gateway.guardrails.store import GuardrailPolicyStore
 
 _logger = logging.getLogger(__name__)
+
+
+def _preserves_provider_reasoning_authority(
+    original: Sequence[GatewayMessage],
+    replacement: Sequence[GatewayMessage],
+) -> bool:
+    """Return whether a classifier preserved every context-bound reasoning turn.
+
+    An authenticated provider carrier is valid only for the history that led
+    through its assistant turn. A modifier may redact later tool results or a
+    later user message, but it cannot rewrite that prefix or inject a new
+    provider-reasoning block that never passed provider authentication.
+    """
+    carrier_indexes = tuple(
+        index for index, message in enumerate(replacement) if message.provider_reasoning
+    )
+    if not carrier_indexes:
+        return True
+    bound = carrier_indexes[-1]
+    return len(original) > bound and tuple(replacement[: bound + 1]) == tuple(original[: bound + 1])
 
 
 class GuardrailEngine:
@@ -210,6 +230,13 @@ class GuardrailEngine:
             return request
         if check.action is GuardrailAction.MODIFY:
             if verdict.replacement_messages is None:
+                raise GuardrailRejected(
+                    guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
+                )
+            if not _preserves_provider_reasoning_authority(
+                request.messages,
+                verdict.replacement_messages,
+            ):
                 raise GuardrailRejected(
                     guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
                 )

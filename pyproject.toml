@@ -25,7 +25,9 @@ dependencies = [
     "openai>=3.0,<4",
     # Bedrock uses the official AWS runtime client. Imports stay lazy inside the Bedrock adapter.
     "boto3>=1.35,<2",
-    "botocore>=1.43.72,<2",
+    # Login-session profiles load botocore's CRT-backed credential provider. Ship the extra
+    # directly so the advertised ambient chain works in an installed release.
+    "botocore[crt]>=1.43.72,<2",
     # Vertex mints OAuth tokens from service-account JSON through Google's official credential
     # library. Imports stay lazy inside the Vertex adapter, mirroring the Bedrock boundary.
     "google-auth>=2.35,<3",

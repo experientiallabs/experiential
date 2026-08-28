@@ -79,6 +79,7 @@ def dialect_stream_payload(
         and profile.fireworks_reasoning_route_sha256 is not None
         and provider_request.response_store is False
         and not provider_request.include_encrypted_reasoning
+        and bool(provider_request.tools)
     ):
         raise ProviderCapabilityError(capability="responses_fireworks_reasoning_carrier")
     required_reasoning_effort = (
@@ -632,7 +633,9 @@ def openai_responses_stream_payload(
         "store": False,
         "stream": True,
     }
-    if request.include_encrypted_reasoning:
+    if request.include_encrypted_reasoning or (
+        supports_reasoning and request.response_store is not False
+    ):
         payload["include"] = ["reasoning.encrypted_content"]
     if instructions:
         payload["instructions"] = "\n\n".join(instructions)

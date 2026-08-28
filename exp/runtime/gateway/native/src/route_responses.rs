@@ -434,12 +434,10 @@ async fn respond_from_responses_events(
     // Retention runs while the attempt row is still in flight so the control
     // plane can resolve its namespaced continuation context, and before the
     // body is answered so an oversize continuation fails closed like python.
-    let retention = ResponsesRetention {
-        text: aggregated.text.clone(),
-        refusal: !aggregated.refusal.is_empty() || refusal_completed.is_some(),
-        tool_calls: aggregated.tool_calls.clone(),
-        ..ResponsesRetention::default()
-    };
+    let mut retention = ResponsesRetention::default();
+    for event in &events {
+        retention.track(event);
+    }
     let remembered = remember_continuation(
         state,
         &admission.request_id,

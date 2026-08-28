@@ -29,6 +29,7 @@ from exp.common.models import (
 from exp.runtime.models.credentials import MissingModelCredentialError
 from exp.runtime.models.providers.async_transport import RequestDeadline
 from exp.runtime.models.providers.bedrock import (
+    AWS_BEARER_TOKEN_BEDROCK_ENV,
     AWS_DEFAULT_REGION_ENV,
     AWS_REGION_ENV,
     CONNECT_TIMEOUT_SECONDS,
@@ -1219,7 +1220,7 @@ def test_sign_gateway_dispatch_uses_the_explicit_access_key_pair(
     client = BedrockClient(
         model=_snapshot(),
         region="us-west-2",
-        environment={},
+        environment={AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bearer-must-not-win"},
         aws_access_key_id="AKIAEXPLICITKEY001",
         aws_secret_access_key="explicit-secret-access-key",
         runtime_factory=None,
@@ -1231,6 +1232,84 @@ def test_sign_gateway_dispatch_uses_the_explicit_access_key_pair(
     )
 
     assert "Credential=AKIAEXPLICITKEY001/" in headers["Authorization"]
+
+
+def test_sign_gateway_dispatch_uses_the_ambient_bedrock_bearer() -> None:
+    """Ambient API-key auth reaches native dispatch without requiring access keys."""
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-west-2",
+        environment={AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bedrock-bearer"},
+        runtime_factory=None,
+    )
+
+    headers = client.sign_gateway_dispatch(
+        url=client.converse_stream_url(),
+        body='{"messages":[]}',
+    )
+
+    assert headers["authorization"] == "Bearer ambient-bedrock-bearer"
+    assert headers["content-type"] == "application/json"
+
+
+def test_sign_gateway_dispatch_prefers_the_explicit_bearer() -> None:
+    """A catalog-resolved bearer cannot be shadowed by ambient process state."""
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-west-2",
+        environment={AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bedrock-bearer"},
+        bearer_token="explicit-bedrock-bearer",
+        runtime_factory=None,
+    )
+
+    headers = client.sign_gateway_dispatch(
+        url=client.converse_stream_url(),
+        body='{"messages":[]}',
+    )
+
+    assert headers["authorization"] == "Bearer explicit-bedrock-bearer"
+
+
+def test_ambient_bearer_does_not_isolate_the_sdk_credential_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient API-key dispatch leaves ordinary boto SDK construction ambient."""
+    runtime = _FakeBedrockRuntime()
+    seen: dict[str, object] = {}
+
+    def create_runtime(
+        *,
+        region_name: str,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        bearer_token: str | None = None,
+    ) -> BedrockRuntime:
+        seen.update(
+            region_name=region_name,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            bearer_token=bearer_token,
+        )
+        return runtime
+
+    monkeypatch.setattr(
+        "exp.runtime.models.providers.bedrock.create_bedrock_runtime_client",
+        create_runtime,
+    )
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-west-2",
+        environment={AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bedrock-bearer"},
+        runtime_factory=None,
+    )
+
+    assert client._runtime() is runtime  # noqa: SLF001
+    assert seen == {
+        "region_name": "us-west-2",
+        "aws_access_key_id": None,
+        "aws_secret_access_key": None,
+        "bearer_token": None,
+    }
 
 
 def test_bounded_client_wire_profile_marks_the_body_for_signing() -> None:

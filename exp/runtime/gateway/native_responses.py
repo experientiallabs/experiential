@@ -19,6 +19,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
+    EncryptedReasoningBlock,
     GatewayMessage,
     GatewayRequest,
 )
@@ -159,10 +160,39 @@ def remember_turn(
     if not text and not tool_calls:
         return
     carrier = data.get("reasoning_content_carrier")
-    provider_reasoning = ()
+    raw_encrypted = data.get("encrypted_reasoning", [])
+    if not isinstance(raw_encrypted, list):
+        raise ValueError("Responses encrypted reasoning must be an array")
+    encrypted: list[tuple[int, EncryptedReasoningBlock]] = []
+    indexes: set[int] = set()
+    for item in raw_encrypted:
+        if not isinstance(item, dict):
+            raise ValueError("Responses encrypted reasoning item must be an object")
+        output_index = item.get("output_index")
+        encrypted_content = item.get("encrypted_content")
+        if (
+            not isinstance(output_index, int)
+            or isinstance(output_index, bool)
+            or output_index < 0
+            or output_index in indexes
+            or not isinstance(encrypted_content, str)
+            or not encrypted_content
+        ):
+            raise ValueError("Responses encrypted reasoning item is invalid")
+        indexes.add(output_index)
+        encrypted.append(
+            (
+                output_index,
+                EncryptedReasoningBlock(encrypted_content=encrypted_content),
+            )
+        )
+    encrypted.sort(key=lambda item: item[0])
+    provider_reasoning = tuple(block for _index, block in encrypted)
     if carrier is not None:
         if not isinstance(carrier, str):
             raise ValueError("Responses reasoning carrier must be text")
+        if provider_reasoning:
+            raise ValueError("Responses continuation cannot mix provider reasoning formats")
         provider_reasoning = (parse_reasoning_content_carrier(carrier),)
     message = GatewayMessage(
         role="assistant",

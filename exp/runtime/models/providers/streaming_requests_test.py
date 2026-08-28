@@ -703,11 +703,16 @@ def test_responses_requires_a_fireworks_continuation_channel() -> None:
         update={
             "surface": GatewayApiSurface.RESPONSES,
             "response_store": False,
+            "tools": (GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
         }
     )
 
     with pytest.raises(ProviderParameterError, match="continuation"):
         route_generation_parameter_requests((profile,), request)
+
+    text_only = request.model_copy(update={"tools": ()})
+    route_generation_parameter_requests((profile,), text_only)
+    assert dialect_stream_payload(profile, text_only)["stream"] is True
 
     generic = GatewayWireProfile(
         dialect="openai_compatible",
@@ -1705,6 +1710,32 @@ def test_responses_payload_forwards_include_and_replays_reasoning_items() -> Non
         "id": "rs_1",
     }
     assert items[2] == {"role": "assistant", "content": "done"}
+
+
+def test_responses_payload_acquires_internal_reasoning_for_gateway_continuation() -> None:
+    """Gateway-stored reasoning stays available even when the caller hides it."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+    )
+
+    retained = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert retained["store"] is False
+    assert retained["include"] == ["reasoning.encrypted_content"]
+
+    caller_opt_out = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request.model_copy(update={"response_store": False}),
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert "include" not in caller_opt_out
 
 
 def test_route_rejects_encrypted_reasoning_outside_native_responses() -> None:

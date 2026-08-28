@@ -49,6 +49,7 @@ from exp.runtime.models.providers.transport import (
 
 AWS_REGION_ENV = "AWS_REGION"
 AWS_DEFAULT_REGION_ENV = "AWS_DEFAULT_REGION"
+AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
 CONNECT_TIMEOUT_SECONDS = 15.0
 READ_TIMEOUT_SECONDS = 600.0
 _REGION_SOURCES = (
@@ -613,9 +614,14 @@ class BedrockClient:
             raise ProviderTransportError(
                 "Bedrock dispatch URL differs from the admitted regional model endpoint"
             )
-        if self._bearer_token is not None:
+        bearer_token = self._bearer_token
+        if bearer_token is None and self._aws_access_key_id is None:
+            bearer_token = (
+                self._environment.get(AWS_BEARER_TOKEN_BEDROCK_ENV) or ""
+            ).strip() or None
+        if bearer_token is not None:
             return {
-                "authorization": f"Bearer {self._bearer_token}",
+                "authorization": f"Bearer {bearer_token}",
                 "content-type": "application/json",
                 "accept": "application/vnd.amazon.eventstream",
             }

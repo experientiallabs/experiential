@@ -53,6 +53,14 @@ def unseal_reasoning_history(
         )
         if not sealed:
             continue
+        if index <= last_user:
+            retained = tuple(
+                block
+                for block in message.provider_reasoning
+                if block.kind != "sealed_reasoning_content"
+            )
+            messages[index] = message.model_copy(update={"provider_reasoning": retained})
+            continue
         if (
             len(sealed) != 1
             or len(message.provider_reasoning) != 1
@@ -91,10 +99,9 @@ def unseal_reasoning_history(
             tool_calls=message.tool_calls,
         )
         messages[index] = message.model_copy(update={"provider_reasoning": (block,)})
-        if index > last_user:
-            if pinned is not None and pinned.deployment != route.deployment:
-                raise ValueError("active reasoning carriers name different issuing rungs")
-            pinned = route
+        if pinned is not None and pinned.deployment != route.deployment:
+            raise ValueError("active reasoning carriers name different issuing rungs")
+        pinned = route
     return request.model_copy(update={"messages": tuple(messages)}), pinned
 
 

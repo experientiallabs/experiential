@@ -48,7 +48,7 @@ struct ReasoningState {
 }
 
 impl ReasoningState {
-    fn item(&self, completed: bool) -> Value {
+    fn item(&self, completed: bool, include_encrypted_content: bool) -> Value {
         let summary: Vec<Value> = if completed {
             self.parts
                 .values()
@@ -63,10 +63,12 @@ impl ReasoningState {
             "summary": summary,
             "status": if completed { "completed" } else { "in_progress" },
         });
-        if let Some(encrypted) = &self.encrypted_content {
-            item.as_object_mut()
-                .expect("reasoning item is an object")
-                .insert("encrypted_content".to_string(), json!(encrypted));
+        if include_encrypted_content {
+            if let Some(encrypted) = &self.encrypted_content {
+                item.as_object_mut()
+                    .expect("reasoning item is an object")
+                    .insert("encrypted_content".to_string(), json!(encrypted));
+            }
         }
         item
     }
@@ -325,7 +327,7 @@ impl ResponsesSseEncoder {
             "response.output_item.added",
             json!({
                 "output_index": state.output_index,
-                "item": state.item(false),
+                "item": state.item(false, false),
             }),
         );
         self.reasoning.insert(provider_output_index, state);
@@ -379,7 +381,7 @@ impl ResponsesSseEncoder {
             "response.output_item.added",
             json!({
                 "output_index": state.output_index,
-                "item": state.item(false),
+                "item": state.item(false, false),
             }),
         );
         self.fireworks_reasoning = Some(state);
@@ -600,7 +602,7 @@ impl ResponsesSseEncoder {
                 state.item_id.clone(),
                 state.output_index,
                 state.parts.clone(),
-                state.item(true),
+                state.item(true, self.envelope.include_encrypted_reasoning),
             )
         };
         let mut frames = Vec::new();
@@ -637,7 +639,7 @@ impl ResponsesSseEncoder {
             return Vec::new();
         };
         let output_index = state.output_index;
-        let item = state.item(true);
+        let item = state.item(true, self.envelope.include_encrypted_reasoning);
         vec![self.event(
             "response.output_item.done",
             json!({"output_index": output_index, "item": item}),
@@ -730,20 +732,21 @@ impl ResponsesSseEncoder {
     /// Build one SDK-readable Responses envelope for the current lifecycle state.
     fn response(&self, status: &str, failure: Option<&Failure>) -> Value {
         let completed = status != "in_progress";
-        let output: Vec<Value> = self
-            .output_order
-            .iter()
-            .map(|slot| match slot {
-                OutputSlot::Message => self.message_item(completed),
-                OutputSlot::Tool(index) => self.tools[index].item(completed),
-                OutputSlot::Reasoning(index) => self.reasoning[index].item(completed),
-                OutputSlot::FireworksReasoning => self
-                    .fireworks_reasoning
-                    .as_ref()
-                    .expect("Fireworks output slot has state")
-                    .item(completed),
-            })
-            .collect();
+        let output: Vec<Value> =
+            self.output_order
+                .iter()
+                .map(|slot| match slot {
+                    OutputSlot::Message => self.message_item(completed),
+                    OutputSlot::Tool(index) => self.tools[index].item(completed),
+                    OutputSlot::Reasoning(index) => self.reasoning[index]
+                        .item(completed, self.envelope.include_encrypted_reasoning),
+                    OutputSlot::FireworksReasoning => self
+                        .fireworks_reasoning
+                        .as_ref()
+                        .expect("Fireworks output slot has state")
+                        .item(completed, self.envelope.include_encrypted_reasoning),
+                })
+                .collect();
         let error = if status == "failed" {
             json!({
                 "code": "server_error",
@@ -832,9 +835,6 @@ pub struct AggregatedResponses {
     pub usage: Option<Usage>,
     pub incomplete: bool,
     pub tool_names: Vec<String>,
-    pub text: String,
-    pub refusal: String,
-    pub tool_calls: Vec<CompletedToolCall>,
 }
 
 /// Build one non-streaming public Responses result from ordered events,
@@ -880,29 +880,13 @@ pub fn completed_responses_body_with_carrier(
         }
     }
     let mut tool_names: Vec<String> = Vec::new();
-    let mut tool_calls: Vec<CompletedToolCall> = Vec::new();
     for event in events {
         if let Event::ToolCallCompleted { call, .. } = event {
             if !tool_names.contains(&call.name) {
                 tool_names.push(call.name.clone());
             }
-            tool_calls.push(call.clone());
         }
     }
-    let text: String = events
-        .iter()
-        .filter_map(|event| match event {
-            Event::TextDelta(delta) => Some(delta.as_str()),
-            _ => None,
-        })
-        .collect();
-    let refusal: String = events
-        .iter()
-        .filter_map(|event| match event {
-            Event::RefusalDelta(delta) => Some(delta.as_str()),
-            _ => None,
-        })
-        .collect();
     if let Event::Failed(failure) = terminal {
         return Ok(AggregatedResponses {
             body: Value::Null,
@@ -910,9 +894,6 @@ pub fn completed_responses_body_with_carrier(
             usage,
             incomplete: false,
             tool_names,
-            text,
-            refusal,
-            tool_calls,
         });
     }
     let mut encoder = ResponsesSseEncoder::new(request_id, model, created_at, envelope);
@@ -954,9 +935,6 @@ pub fn completed_responses_body_with_carrier(
         usage,
         incomplete: matches!(terminal, Event::Incomplete),
         tool_names,
-        text,
-        refusal,
-        tool_calls,
     })
 }
 

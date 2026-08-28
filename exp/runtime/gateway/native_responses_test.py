@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import base64
+from typing import cast
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway.contracts import EncryptedReasoningBlock
 from exp.runtime.gateway.native_responses import ContinuationContext, remember_turn
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
 from exp.runtime.openai_protocol.state import BoundedContinuationStore, ProtocolNamespace
@@ -78,4 +81,72 @@ def test_remember_turn_rejects_a_malformed_responses_carrier() -> None:
         store.resolve_now(
             namespace=context.namespace,
             previous_response_id=context.response_id,
+        )
+
+
+def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation() -> None:
+    """Server-side continuation replays provider-encrypted OpenAI state in output order."""
+    store = BoundedContinuationStore()
+    context = _context()
+
+    remember_turn(
+        store,
+        context=context,
+        data={
+            "text": "",
+            "refusal": False,
+            "encrypted_reasoning": [
+                {"output_index": 4, "encrypted_content": "second-opaque-item"},
+                {"output_index": 1, "encrypted_content": "first-opaque-item"},
+            ],
+            "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
+        },
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    message = state.messages[-1]
+    assert tuple(block.kind for block in message.provider_reasoning) == (
+        "encrypted_reasoning",
+        "encrypted_reasoning",
+    )
+    encrypted_blocks = tuple(
+        cast("EncryptedReasoningBlock", block) for block in message.provider_reasoning
+    )
+    assert tuple(block.encrypted_content for block in encrypted_blocks) == (
+        "first-opaque-item",
+        "second-opaque-item",
+    )
+
+
+@pytest.mark.parametrize(
+    "encrypted",
+    (
+        "not-an-array",
+        [{"output_index": 0, "encrypted_content": ""}],
+        [
+            {"output_index": 0, "encrypted_content": "one"},
+            {"output_index": 0, "encrypted_content": "duplicate"},
+        ],
+    ),
+)
+def test_remember_turn_rejects_malformed_openai_encrypted_reasoning(encrypted: object) -> None:
+    """Malformed internal reasoning state never enters the continuation store."""
+    store = BoundedContinuationStore()
+
+    with pytest.raises(ValueError, match="encrypted reasoning"):
+        remember_turn(
+            store,
+            context=_context(),
+            data=cast(
+                "JsonObject",
+                {
+                    "text": "",
+                    "refusal": False,
+                    "encrypted_reasoning": encrypted,
+                    "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
+                },
+            ),
         )

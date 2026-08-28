@@ -302,7 +302,7 @@ class _ResponseReasoningState:
         self.parts: dict[int, str] = {}
         self.encrypted_content: str | None = None
 
-    def item(self, *, completed: bool) -> JsonObject:
+    def item(self, *, completed: bool, include_encrypted_content: bool) -> JsonObject:
         """Return the current official Responses reasoning item."""
         item: JsonObject = {
             "id": self.item_id,
@@ -314,7 +314,7 @@ class _ResponseReasoningState:
             ),
             "status": "completed" if completed else "in_progress",
         }
-        if self.encrypted_content is not None:
+        if include_encrypted_content and self.encrypted_content is not None:
             item["encrypted_content"] = self.encrypted_content
         return item
 
@@ -537,7 +537,10 @@ class ResponsesSseEncoder:
                     "response.output_item.added",
                     {
                         "output_index": state.output_index,
-                        "item": state.item(completed=False),
+                        "item": state.item(
+                            completed=False,
+                            include_encrypted_content=self.request.include_encrypted_reasoning,
+                        ),
                     },
                 )
             )
@@ -713,7 +716,10 @@ class ResponsesSseEncoder:
                 "response.output_item.done",
                 {
                     "output_index": state.output_index,
-                    "item": state.item(completed=True),
+                    "item": state.item(
+                        completed=True,
+                        include_encrypted_content=self.request.include_encrypted_reasoning,
+                    ),
                 },
             )
         )
@@ -808,7 +814,10 @@ class ResponsesSseEncoder:
             output.append(
                 self._message_item(completed=status != "in_progress")
                 if kind == "message"
-                else self._reasoning[index].item(completed=status != "in_progress")
+                else self._reasoning[index].item(
+                    completed=status != "in_progress",
+                    include_encrypted_content=self.request.include_encrypted_reasoning,
+                )
                 if kind == "reasoning"
                 else self._tools[index].item(completed=status != "in_progress")
             )

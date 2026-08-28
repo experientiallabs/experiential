@@ -281,6 +281,15 @@ def test_fireworks_carrier_is_sealed_before_settlement_and_validates_cross_repli
     assert public_error["status_code"] == 400
     assert public_error["param"] == "messages.reasoning_content"
 
+    fresh_turn = json.loads(continuation_body)
+    fresh_turn["messages"].append({"role": "user", "content": "Start a fresh turn"})
+    fresh = _admit(rotated, raw_key, json.dumps(fresh_turn))
+    fresh_route = cast("list[JsonObject]", fresh["route"])
+    fresh_payload = cast("JsonObject", fresh_route[0]["upstream_payload"])
+    fresh_messages = cast("list[JsonObject]", fresh_payload["messages"])
+    assert fresh["route_reason"] != "reasoning_continuation"
+    assert all("reasoning_content" not in message for message in fresh_messages)
+
 
 def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: Path) -> None:
     """A fallback-issued carrier cannot replay to the lead or another same-origin key."""
@@ -3229,7 +3238,11 @@ def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -
         ]
     )
     body = native.completed_responses_fixture(
-        "request-abc", "coding", 1_700_000_000.0, "{}", fixture
+        "request-abc",
+        "coding",
+        1_700_000_000.0,
+        '{"include_encrypted_reasoning":true}',
+        fixture,
     )
     assert body == _parity_golden("responses_encrypted_reasoning_body")
 
@@ -3350,12 +3363,22 @@ def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None
         ensure_ascii=False,
     )
     body = json.loads(
-        native.completed_responses_fixture("request-abc", "coding", 1_700_000_000.0, "{}", fixture)
+        native.completed_responses_fixture(
+            "request-abc",
+            "coding",
+            1_700_000_000.0,
+            '{"include_encrypted_reasoning":true}',
+            fixture,
+        )
     )
     assert body["output"][0]["encrypted_content"].encode() == encrypted.encode()
 
     frames = native.encode_responses_fixture(
-        "request-abc", "coding", 1_700_000_000.0, "{}", fixture
+        "request-abc",
+        "coding",
+        1_700_000_000.0,
+        '{"include_encrypted_reasoning":true}',
+        fixture,
     )
     done_items = [
         json.loads(frame.split("data: ", 1)[1].strip())

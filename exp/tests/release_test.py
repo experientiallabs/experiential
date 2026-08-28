@@ -186,7 +186,7 @@ def _core_requirement_names(metadata: str) -> frozenset[str]:
         if not line.startswith("Requires-Dist:") or "; extra ==" in line:
             continue
         requirement = line.removeprefix("Requires-Dist:").strip()
-        name = re.split(r"[<>=;~!\s]", requirement, maxsplit=1)[0].casefold()
+        name = re.split(r"[\[<>=;~!\s]", requirement, maxsplit=1)[0].casefold()
         names.add(name)
     return frozenset(names)
 
@@ -454,6 +454,7 @@ def _installed_release_driver() -> None:
     from datetime import UTC, datetime
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+    import awscrt
     import httpx
     import numpy as np
     import openai
@@ -508,6 +509,7 @@ def _installed_release_driver() -> None:
     )
     from exp.runtime.router import RouterRuntime, RuntimeInteractionJournal
 
+    assert awscrt.__name__ == "awscrt"
     release_revision = os.environ["EXP_RELEASE_REVISION"]
     assert re.fullmatch(r"[0-9a-f]{40}", release_revision), release_revision
     execution_root = Path.cwd().resolve()
@@ -3149,6 +3151,7 @@ def test_built_archives_match_current_package_contract() -> None:
         assert not outside_package, f"wheel carries members outside the package: {outside_package}"
         assert FORBIDDEN_REQUIREMENT.search(metadata) is None
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        assert re.search(r"(?mi)^Requires-Dist:\s*botocore\[crt\]", metadata)
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
         names = tuple(
@@ -3161,6 +3164,7 @@ def test_built_archives_match_current_package_contract() -> None:
         )
         assert FORBIDDEN_REQUIREMENT.search(metadata) is None
         assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        assert re.search(r"(?mi)^Requires-Dist:\s*botocore\[crt\]", metadata)
 
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:

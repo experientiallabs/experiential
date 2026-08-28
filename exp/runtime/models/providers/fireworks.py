@@ -62,6 +62,7 @@ def require_responses_continuation_channel(
         request.surface == GatewayApiSurface.RESPONSES
         and request.response_store is False
         and not request.include_encrypted_reasoning
+        and bool(request.tools)
         and any(profile.fireworks_reasoning_route_sha256 is not None for profile in profiles)
     ):
         raise ProviderParameterError(

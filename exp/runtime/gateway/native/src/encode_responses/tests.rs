@@ -138,11 +138,15 @@ fn fireworks_reasoning_fails_closed_without_a_sealed_carrier() {
 
 #[test]
 fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
+    let public_envelope = ResponsesEnvelope {
+        include_encrypted_reasoning: true,
+        ..ResponsesEnvelope::default()
+    };
     let completed = completed_responses_body(
         "request-1",
         "coding",
         1_700_000_000.0,
-        ResponsesEnvelope::default(),
+        public_envelope.clone(),
         &[
             Event::ReasoningSummaryDelta {
                 output_index: 0,
@@ -172,7 +176,7 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
         "request-2",
         "coding",
         1_700_000_000.0,
-        ResponsesEnvelope::default(),
+        public_envelope,
         &[
             Event::EncryptedReasoning {
                 output_index: 0,
@@ -186,4 +190,22 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
     assert_eq!(bare.body["output"][0]["type"], json!("reasoning"));
     assert_eq!(bare.body["output"][0]["encrypted_content"], json!("blob=="));
     assert_eq!(bare.body["output"][0]["summary"], json!([]));
+
+    let hidden = completed_responses_body(
+        "request-3",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+        &[
+            Event::EncryptedReasoning {
+                output_index: 0,
+                encrypted_content: "internal-only".to_string(),
+            },
+            Event::TextDelta("answer".to_string()),
+            Event::Completed,
+        ],
+    )
+    .expect("internal reasoning must not break public encoding");
+    assert_eq!(hidden.body["output"][0]["type"], json!("reasoning"));
+    assert_eq!(hidden.body["output"][0]["encrypted_content"], Value::Null);
 }

@@ -14,6 +14,7 @@ pub(crate) struct ResponsesRetention {
     pub(crate) text: String,
     pub(crate) refusal: bool,
     pub(crate) tool_calls: Vec<CompletedToolCall>,
+    pub(crate) encrypted_reasoning: Vec<(u32, String)>,
     pub(crate) carrier_events: Vec<Event>,
     pub(crate) retained_bytes: usize,
     pub(crate) overflowed: bool,
@@ -31,6 +32,7 @@ impl ResponsesRetention {
             self.overflowed = true;
             self.text.clear();
             self.tool_calls.clear();
+            self.encrypted_reasoning.clear();
             self.carrier_events.clear();
             return;
         }
@@ -48,6 +50,12 @@ impl ResponsesRetention {
             Event::TextDelta(delta) => self.text.push_str(delta),
             Event::RefusalDelta(_) => self.refusal = true,
             Event::ToolCallCompleted { call, .. } => self.tool_calls.push(call.clone()),
+            Event::EncryptedReasoning {
+                output_index,
+                encrypted_content,
+            } => self
+                .encrypted_reasoning
+                .push((*output_index, encrypted_content.clone())),
             _ => {}
         }
     }
@@ -63,6 +71,12 @@ fn remember_argument(
         "text": retention.text,
         "refusal": retention.refusal,
         "reasoning_content_carrier": reasoning_content_carrier,
+        "encrypted_reasoning": retention.encrypted_reasoning.iter().map(
+            |(output_index, encrypted_content)| json!({
+                "output_index": output_index,
+                "encrypted_content": encrypted_content,
+            })
+        ).collect::<Vec<Value>>(),
         "tool_calls": retention.tool_calls.iter().map(|call| json!({
             "call_id": call.call_id,
             "name": call.name,
@@ -91,4 +105,27 @@ pub(crate) async fn remember_continuation(
         )
         .await
         .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypted_reasoning_is_retained_for_the_private_bridge_payload() {
+        let mut retention = ResponsesRetention::default();
+        retention.track(&Event::EncryptedReasoning {
+            output_index: 3,
+            encrypted_content: "provider-opaque".to_string(),
+        });
+
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-one", &retention, None))
+                .expect("remember payload must be valid JSON");
+
+        assert_eq!(
+            payload["encrypted_reasoning"],
+            json!([{"output_index": 3, "encrypted_content": "provider-opaque"}])
+        );
+    }
 }

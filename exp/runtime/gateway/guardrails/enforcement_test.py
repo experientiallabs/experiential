@@ -9,6 +9,7 @@ from collections.abc import Coroutine
 
 import pytest
 
+from exp.common.models import OpaqueReasoningContentBlock, ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayFailureClass,
@@ -274,6 +275,142 @@ def test_input_chain_runs_once_and_can_transform_the_request() -> None:
     assert result.messages == replacement
     assert classifier.input_calls == 1
     assert engine.input_invocations == 1
+
+
+def _reasoning_request() -> GatewayRequest:
+    """Build one authenticated provider-reasoning tool continuation."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="Use a tool"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-one",
+                        name="lookup",
+                        arguments={"query": "safe"},
+                        raw_arguments='{"query":"safe"}',
+                    ),
+                ),
+                provider_reasoning=(
+                    OpaqueReasoningContentBlock(
+                        route_sha256="a" * 64,
+                        content="authenticated hidden state",
+                    ),
+                ),
+            ),
+            GatewayMessage(role="tool", tool_call_id="call-one", content="secret result"),
+        ),
+    )
+
+
+def test_input_modify_can_redact_only_history_after_authenticated_reasoning() -> None:
+    """A modifier may redact tool output without rebinding the authenticated prefix."""
+    request = _reasoning_request()
+    replacement = (
+        *request.messages[:2],
+        GatewayMessage(role="tool", tool_call_id="call-one", content="[REDACTED]"),
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    result = _awaited(
+        engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0)
+    )
+
+    assert result.messages == replacement
+
+
+def test_input_modify_can_remove_provider_reasoning_and_clear_its_authority() -> None:
+    """Dropping every carrier is safe because no provider-private state survives."""
+    request = _reasoning_request()
+    replacement = (GatewayMessage(role="user", content="fully redacted"),)
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    result = _awaited(
+        engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0)
+    )
+
+    assert result.messages == replacement
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("prior_context", "tool_call", "raw_arguments", "injected_reasoning"),
+)
+def test_input_modify_rejects_provider_reasoning_rebinding(mutation: str) -> None:
+    """Classifier output cannot alter or invent provider-authenticated state."""
+    request = _reasoning_request()
+    replacement = list(request.messages)
+    if mutation == "prior_context":
+        replacement[0] = GatewayMessage(role="user", content="attacker context")
+    elif mutation == "tool_call":
+        replacement[1] = replacement[1].model_copy(
+            update={
+                "tool_calls": (
+                    ToolCall(
+                        call_id="call-one",
+                        name="lookup",
+                        arguments={"query": "tampered"},
+                    ),
+                )
+            }
+        )
+    elif mutation == "raw_arguments":
+        replacement[1] = replacement[1].model_copy(
+            update={
+                "tool_calls": (
+                    ToolCall(
+                        call_id="call-one",
+                        name="lookup",
+                        arguments={"query": "safe"},
+                        raw_arguments='{"query": "safe"}',
+                    ),
+                )
+            }
+        )
+    else:
+        replacement.append(
+            GatewayMessage(
+                role="assistant",
+                provider_reasoning=(
+                    OpaqueReasoningContentBlock(
+                        route_sha256="b" * 64,
+                        content="classifier injected state",
+                    ),
+                ),
+            )
+        )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(
+                flagged=True,
+                replacement_messages=tuple(replacement),
+            )
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    with pytest.raises(GuardrailRejected) as raised:
+        _awaited(engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0))
+
+    assert raised.value.failure.safe_details["action"] == GuardrailAction.ERROR.value
 
 
 def test_input_block_is_terminal_and_content_free() -> None:

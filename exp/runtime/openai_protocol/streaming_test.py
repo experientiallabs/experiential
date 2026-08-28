@@ -453,6 +453,42 @@ def test_responses_sse_round_trips_fireworks_carrier_without_plaintext() -> None
     assert reasoning["encrypted_content"] == "authenticated-carrier-v2"
 
 
+@pytest.mark.parametrize("include_encrypted_reasoning", (False, True))
+def test_responses_sse_exposes_provider_encrypted_reasoning_only_when_requested(
+    include_encrypted_reasoning: bool,
+) -> None:
+    """Internal continuation state is not automatically part of the public response."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="plan"),),
+        stream=True,
+        include_encrypted_reasoning=include_encrypted_reasoning,
+    )
+    frames = encode_responses_events(
+        ResponsesSseEncoder(
+            request_id="request-provider-encrypted",
+            model="coding",
+            created_at=123.0,
+            request=request,
+        ),
+        (
+            GatewayEvent(
+                kind=GatewayEventKind.ENCRYPTED_REASONING,
+                sequence_number=0,
+                reasoning_block_index=0,
+                encrypted_content="provider-opaque",
+            ),
+            GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+        ),
+    )
+
+    terminal = cast("JsonObject", _responses_payload(frames[-1])["response"])
+    reasoning = cast("list[JsonObject]", terminal["output"])[0]
+    assert reasoning.get("encrypted_content") == (
+        "provider-opaque" if include_encrypted_reasoning else None
+    )
+
+
 def test_responses_sse_fails_closed_when_fireworks_carrier_is_not_sealed() -> None:
     """A completed Fireworks tool turn cannot terminate without its carrier."""
     request = GatewayRequest(
