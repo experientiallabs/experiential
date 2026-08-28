@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest import mock
 
 import pytest
@@ -23,11 +23,13 @@ from exp.common.models import (
     GatewayEquivalenceCertification,
     GatewayTokenPrices,
     ModelCapabilities,
+    ModelCatalog,
     ModelRecord,
     ModelRequest,
     PricingSnapshot,
     RoutedCandidateSnapshot,
     load_model_catalog,
+    normalize_gateway_catalog,
     write_model_catalog,
 )
 from exp.runtime.gateway.catalog_authority import (
@@ -313,6 +315,60 @@ def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) 
     assert "MISSING_PROVIDER_KEY" in reason
     with pytest.raises(GatewayRoutingError):
         _authorize(components, raw_key, "broken")
+
+
+def test_unbound_legacy_bedrock_bearer_alias_is_invalidated_on_load(tmp_path: Path) -> None:
+    """A pre-mode bearer snapshot cannot remain active or replay its stale revision."""
+    manager = _configured_legacy_bedrock_alias(tmp_path, auth_mode="api_key")
+
+    with pytest.raises(GatewayLifecycleError, match="stale revision was disabled"):
+        load_gateway_components(
+            tmp_path,
+            environment={"AWS_BEARER_TOKEN_BEDROCK": "bearer-token"},
+        )
+
+    (alias,) = manager.aliases()
+    assert not alias.active
+    assert alias.revision_id is None
+
+
+def test_unbound_legacy_bedrock_pair_alias_remains_loadable(tmp_path: Path) -> None:
+    """Historical pair snapshots retain their already-stable canonical identity."""
+    manager = _configured_legacy_bedrock_alias(tmp_path, auth_mode="access_key_pair")
+
+    components = load_gateway_components(
+        tmp_path,
+        environment={
+            "AWS_ACCESS_KEY_ID": "AKIAEXAMPLEKEY0001",
+            "AWS_SECRET_ACCESS_KEY": "explicit-secret-access-key",
+        },
+    )
+
+    assert len(components.readiness) == 1
+    assert manager.aliases()[0].active
+
+
+def test_unbound_openai_alias_ignores_unrelated_bedrock_authority(tmp_path: Path) -> None:
+    """A sibling Bedrock repair never invalidates an OpenAI-only snapshot."""
+    manager, _raw_key = _configured_gateway(tmp_path)
+    manager.migrate_legacy_provider_connections()
+    manager.upsert_provider_connection(
+        connection_id="bedrock-unused",
+        config=ConnectionConfig(
+            provider="bedrock",
+            api_key_env="AWS_BEARER_TOKEN_BEDROCK",
+            region="us-west-2",
+            bedrock_auth_mode="api_key",
+        ),
+    )
+
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret"},
+    )
+
+    assert len(components.readiness) == 1
+    assert manager.aliases()[0].active
 
 
 def test_partial_startup_exposes_each_unavailable_alias_with_its_reason(tmp_path: Path) -> None:
@@ -791,6 +847,63 @@ def _configured_gateway(
     manager.add_grant(identity_id="default", alias_id="coding")
     issued = manager.issue_key(identity_id="default", key_id="key-one")
     return manager, issued.raw_key
+
+
+def _configured_legacy_bedrock_alias(
+    root: Path,
+    *,
+    auth_mode: str,
+) -> GatewayManagement:
+    """Create one unbound alias whose authored snapshot predates explicit auth mode."""
+    manager = GatewayManagement(root)
+    manager.initialize()
+    access_key_id_env = "AWS_ACCESS_KEY_ID" if auth_mode == "access_key_pair" else None
+    api_key_env = (
+        "AWS_SECRET_ACCESS_KEY" if auth_mode == "access_key_pair" else "AWS_BEARER_TOKEN_BEDROCK"
+    )
+    current = ConnectionConfig(
+        provider="bedrock",
+        api_key_env=api_key_env,
+        region="us-west-2",
+        aws_access_key_id_env=access_key_id_env,
+        bedrock_auth_mode=cast("Any", auth_mode),
+    )
+    upsert_connection(root, name="bedrock", connection=current, replace=False)
+    _normalized, snapshot, _changed = upsert_singleton_deployment(
+        root,
+        deployment_alias="bedrock-model",
+        connection_name="bedrock",
+        provider_model="amazon.nova-lite-v1:0",
+        exact_model_id="nova-lite-v1-0",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    authored = ModelCatalog.model_validate_json(snapshot.with_suffix(".models.json").read_bytes())
+    historical = current.model_copy(update={"bedrock_auth_mode": None})
+    legacy_catalog = authored.model_copy(update={"connections": {"bedrock": historical}})
+    legacy_normalized = normalize_gateway_catalog(legacy_catalog)
+    legacy_snapshot = snapshot.parent / f"{legacy_normalized.identity_sha256()}.json"
+    legacy_snapshot.write_text(legacy_normalized.model_dump_json(), encoding="utf-8")
+    legacy_snapshot.with_suffix(".models.json").write_text(
+        legacy_catalog.model_dump_json(),
+        encoding="utf-8",
+    )
+    manager.activate_direct_alias(
+        alias_id="bedrock-model",
+        alias_name="bedrock-model",
+        revision_id="legacy-revision",
+        pool_id="bedrock-model",
+        snapshot_ref=f"catalog-snapshots/{legacy_snapshot.name}",
+        catalog_sha256=legacy_normalized.identity_sha256(),
+    )
+    manager.create_identity(identity_id="default", display_name="Default")
+    manager.add_grant(identity_id="default", alias_id="bedrock-model")
+    manager.issue_key(identity_id="default", key_id="key-one")
+    return manager
 
 
 def _activate_alias_for_escalation_policy(

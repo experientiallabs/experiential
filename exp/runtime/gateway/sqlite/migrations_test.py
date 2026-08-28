@@ -1263,7 +1263,7 @@ def test_v13_deactivates_only_bound_schema_12_aliases_with_inferred_bedrock_auth
         migrated.close()
     if has_provider_binding:
         platform = SQLiteGatewayPlatform(manager.database_path)
-        with pytest.raises(ValueError, match="no longer active and current"):
+        with pytest.raises(ValueError, match="no longer points"):
             platform._reactivate_alias_revision(  # noqa: SLF001 - migration safety assertion
                 organization_id="org",
                 alias_id="alias",

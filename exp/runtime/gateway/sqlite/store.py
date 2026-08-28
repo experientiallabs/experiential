@@ -595,6 +595,34 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             )
         return result.rowcount == 1
 
+    def invalidate_alias_revision(
+        self,
+        *,
+        organization_id: str,
+        alias_id: str,
+        revision_id: str,
+    ) -> bool:
+        """Disable one stale alias revision so it cannot be reactivated in place."""
+        now = utc_text(self._clock.now())
+        with self._transaction() as connection:
+            connection.execute(
+                """
+                DELETE FROM project_activation_bindings
+                WHERE organization_id = ? AND alias_id = ? AND revision_id = ?
+                """,
+                (organization_id, alias_id, revision_id),
+            )
+            result = connection.execute(
+                """
+                UPDATE gateway_aliases
+                SET active = 0, active_revision_id = NULL, updated_at = ?
+                WHERE organization_id = ? AND alias_id = ?
+                  AND active = 1 AND active_revision_id = ?
+                """,
+                (now, organization_id, alias_id, revision_id),
+            )
+        return result.rowcount == 1
+
     def grant_alias(self, *, organization_id: str, identity_id: str, alias_id: str) -> bool:
         """Grant one identity one alias, returning whether a row was added.
 

@@ -16,6 +16,7 @@ def deactivate_aliases_with_inferred_bedrock_auth(connection: sqlite3.Connection
         """
         UPDATE gateway_aliases AS aliases
         SET active = 0,
+            active_revision_id = NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
         WHERE aliases.active = 1
           AND EXISTS (

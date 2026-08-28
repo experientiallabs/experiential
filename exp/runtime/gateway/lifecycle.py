@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -644,7 +645,7 @@ def _load_snapshot(
     authored = snapshot.with_suffix(".models.json")
     try:
         normalized = NormalizedGatewayCatalog.model_validate_json(snapshot.read_bytes())
-        authored_catalog = ModelCatalog.model_validate_json(authored.read_bytes())
+        authored_catalog, legacy_bearer_snapshot = _load_authored_catalog(authored.read_bytes())
     except (OSError, ValueError) as exc:
         raise GatewayLifecycleError(
             f"alias {alias.alias_name!r} has an unreadable catalog snapshot"
@@ -653,6 +654,33 @@ def _load_snapshot(
     if normalized.identity_sha256() != catalog_sha256:
         raise GatewayLifecycleError(f"alias {alias.alias_name!r} catalog digest does not match")
     revision_id, _digest = _required_revision(alias)
+    existing_bindings = manager.require_initialized().alias_provider_connections(
+        organization_id=manager.organization_id,
+        alias_id=alias.alias_id,
+        alias_revision_id=revision_id,
+    )
+    active_connections = {
+        item.connection_id: item.config for item in manager.provider_connections()
+    }
+    if (
+        not existing_bindings
+        and legacy_bearer_snapshot
+        and {name: config.canonicalized() for name, config in authored_catalog.connections.items()}
+        == active_connections
+        and normalize_gateway_catalog(
+            authored_catalog.model_copy(update={"connections": active_connections})
+        )
+        != normalized
+    ):
+        manager.require_initialized().invalidate_alias_revision(
+            organization_id=manager.organization_id,
+            alias_id=alias.alias_id,
+            revision_id=revision_id,
+        )
+        raise GatewayLifecycleError(
+            f"alias {alias.alias_name!r} snapshot predates explicit Bedrock bearer authority; "
+            "the stale revision was disabled and must be activated as a new revision"
+        )
     authorities = manager.ensure_alias_provider_bindings(
         alias_id=alias.alias_id,
         alias_revision_id=revision_id,
@@ -669,6 +697,37 @@ def _load_snapshot(
             f"alias {alias.alias_name!r} authored catalog differs from normalized authority"
         )
     return catalog, normalized
+
+
+def _load_authored_catalog(payload: bytes) -> tuple[ModelCatalog, bool]:
+    """Load one authored snapshot, repairing only the historical bearer shape."""
+    try:
+        return ModelCatalog.model_validate_json(payload), False
+    except ValueError as original:
+        raw = json.loads(payload)
+        if not isinstance(raw, dict):
+            raise original
+        connections = raw.get("connections")
+        if not isinstance(connections, dict):
+            raise original
+        repaired = False
+        for value in connections.values():
+            if not isinstance(value, dict):
+                continue
+            if (
+                value.get("provider") == "bedrock"
+                and value.get("api_key_env")
+                and value.get("aws_access_key_id_env") is None
+                and value.get("bedrock_auth_mode") is None
+            ):
+                value["bedrock_auth_mode"] = "api_key"
+                repaired = True
+        if not repaired:
+            raise original
+        try:
+            return ModelCatalog.model_validate(raw), True
+        except ValueError:
+            raise original from None
 
 
 def _direct_readiness(
