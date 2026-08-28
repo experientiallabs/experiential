@@ -175,7 +175,6 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
     assert migrated.models["explicit"].gateway == GatewayDeploymentMetadata(
         capabilities=GatewayDeploymentCapabilities(
             supports_strict_tools=True,
-            supports_streaming_tool_arguments=True,
         )
     )
     assert (

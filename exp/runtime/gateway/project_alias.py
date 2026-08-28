@@ -165,29 +165,9 @@ def _migrate_legacy_project_gateway_metadata(
             ProviderCapability.TOOL_ARGUMENT_STREAM,
         )
         if record.gateway is not None:
-            if provider == "openai-compatible":
-                # Generic endpoint families have no transport-wide truth. Preserve an explicit
-                # deployment declaration and otherwise leave the conservative default intact.
-                continue
-            existing = record.gateway.capabilities
-            if existing.supports_streaming_tool_arguments == supports_streaming_tool_arguments:
-                continue
-            models[alias] = record.model_copy(
-                update={
-                    "gateway": record.gateway.model_copy(
-                        update={
-                            "capabilities": existing.model_copy(
-                                update={
-                                    "supports_streaming_tool_arguments": (
-                                        supports_streaming_tool_arguments
-                                    )
-                                }
-                            )
-                        }
-                    )
-                }
-            )
-            changed = True
+            # Any gateway metadata is already an endpoint-specific declaration. The schema's
+            # conservative false default is indistinguishable from an explicit false, so a
+            # provider-family certification must never overwrite it during legacy migration.
             continue
         models[alias] = record.model_copy(
             update={
