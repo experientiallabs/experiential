@@ -333,21 +333,6 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
-    if request.include_encrypted_reasoning and not all(
-        profile.dialect == "openai_responses"
-        or profile.fireworks_reasoning_route_sha256 is not None
-        for profile in profiles
-    ):
-        raise ProviderParameterError(
-            message=(
-                "The parameter 'reasoning.encrypted_content' is not supported by every "
-                "deployment in this model route. Remove the include selector or choose a "
-                "native Responses or authenticated Fireworks route."
-            ),
-            param="include",
-            code="unsupported_parameter",
-        )
-
     if (
         request.structured_text is not None
         and not request.structured_text.strict

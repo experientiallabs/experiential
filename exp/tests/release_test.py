@@ -33,6 +33,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "boto3",
         "botocore",
         "click",
+        "cryptography",
         "exp-gateway-native",
         "filelock",
         "google-auth",
