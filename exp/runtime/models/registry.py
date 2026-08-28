@@ -317,6 +317,7 @@ class RuntimeModelCatalog:
                 api_key_env=connection.api_key_env,
                 api_key=api_key,
                 environment=self._environment,
+                api_surface=connection.azure_api_surface or "openai_deployments",
             )
             client = AzureClient(
                 model=snapshot,

@@ -495,6 +495,10 @@ def test_azure_connection_requires_endpoint_key_and_api_version() -> None:
         api_version="2024-05-01-preview",
         azure_api_surface="model_inference",
     )
+    inference_root = inference.model_copy(
+        update={"base_url": "https://resource.services.ai.azure.com"}
+    )
+    assert inference.identity_sha256() == inference_root.identity_sha256()
     assert inference.identity_sha256() != connection.identity_sha256()
     explicit_classic = connection.model_copy(update={"azure_api_surface": "openai_deployments"})
     assert explicit_classic.identity_sha256() == connection.identity_sha256()

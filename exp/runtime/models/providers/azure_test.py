@@ -238,6 +238,16 @@ def test_trusted_azure_key_is_not_sent_to_a_different_endpoint() -> None:
     )
     assert (
         bind_azure_api_key(
+            endpoint="https://resource.services.ai.azure.com/models",
+            api_key_env=AZURE_OPENAI_API_KEY_ENV,
+            api_key=_SECRET,
+            environment={AZURE_OPENAI_ENDPOINT_ENV: "https://resource.services.ai.azure.com"},
+            api_surface="model_inference",
+        )
+        == _SECRET
+    )
+    assert (
+        bind_azure_api_key(
             endpoint=_OTHER_ENDPOINT,
             api_key_env="AZURE_FOUNDRY_API_KEY",
             api_key=_SECRET,

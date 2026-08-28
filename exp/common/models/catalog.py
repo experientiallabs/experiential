@@ -57,6 +57,20 @@ def _normalize_base_url(value: str) -> str:
     return urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
 
 
+def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
+    """Normalize one endpoint while preserving provider-surface equivalence."""
+    if connection.base_url is None:
+        return None
+    normalized = _normalize_base_url(connection.base_url)
+    if (
+        connection.provider == "azure"
+        and connection.azure_api_surface == "model_inference"
+        and normalized.lower().endswith("/models")
+    ):
+        return normalized[:-7].rstrip("/")
+    return normalized
+
+
 class ModelCatalogError(ValueError):
     """A local model catalog was malformed or named a credential value."""
 
@@ -192,7 +206,7 @@ class ConnectionConfig(ContractModel):
         """
         identity: JsonObject = {
             "provider": self.provider,
-            "base_url": None if self.base_url is None else _normalize_base_url(self.base_url),
+            "base_url": _normalize_connection_base_url(self),
         }
         if self.api_version is not None:
             identity["api_version"] = self.api_version

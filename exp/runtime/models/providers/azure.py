@@ -19,7 +19,12 @@ _V1_API_VERSION = "v1"
 _V1_ROOT_SUFFIX = "/openai/v1"
 
 
-def same_azure_endpoint(left: str, right: str | None) -> bool:
+def same_azure_endpoint(
+    left: str,
+    right: str | None,
+    *,
+    api_surface: str = "openai_deployments",
+) -> bool:
     """Compare two Azure resource endpoints after canonical host and path normalization.
 
     Scheme and hostname are compared case-insensitively. Default HTTPS and HTTP ports are
@@ -30,13 +35,17 @@ def same_azure_endpoint(left: str, right: str | None) -> bool:
     Args:
         left: Catalog or request endpoint.
         right: Endpoint to compare, often ``AZURE_OPENAI_ENDPOINT``.
+        api_surface: Azure wire surface whose equivalent root spellings are accepted.
 
     Returns:
         ``True`` when both values name the same Azure resource after canonicalization.
     """
     if right is None:
         return False
-    return _canonical_azure_endpoint(left) == _canonical_azure_endpoint(right)
+    return _canonical_azure_endpoint(
+        left,
+        api_surface=api_surface,
+    ) == _canonical_azure_endpoint(right, api_surface=api_surface)
 
 
 def bind_azure_api_key(
@@ -45,6 +54,7 @@ def bind_azure_api_key(
     api_key_env: str,
     api_key: str,
     environment: Mapping[str, str],
+    api_surface: str = "openai_deployments",
 ) -> str:
     """Return the connection key only when it is paired with this exact Azure endpoint.
 
@@ -56,6 +66,7 @@ def bind_azure_api_key(
         api_key_env: Environment-variable name configured on the connection.
         api_key: Credential already read from ``api_key_env``.
         environment: Process or injected environment mapping.
+        api_surface: Azure wire surface used to normalize equivalent endpoint roots.
 
     Returns:
         The same non-empty API key when the pairing is valid.
@@ -68,7 +79,11 @@ def bind_azure_api_key(
         raise ValueError("Azure clients require a non-empty API key")
     if api_key_env == AZURE_OPENAI_API_KEY_ENV:
         trusted_endpoint = environment.get(AZURE_OPENAI_ENDPOINT_ENV)
-        if trusted_endpoint and not same_azure_endpoint(endpoint, trusted_endpoint):
+        if trusted_endpoint and not same_azure_endpoint(
+            endpoint,
+            trusted_endpoint,
+            api_surface=api_surface,
+        ):
             raise ModelCredentialError(
                 "AZURE_OPENAI_API_KEY is bound to AZURE_OPENAI_ENDPOINT and cannot be sent to a "
                 "different Azure resource"
@@ -206,11 +221,16 @@ class AzureClient(OpenAICompatibleClient):
         return path
 
 
-def _canonical_azure_endpoint(value: str) -> tuple[str, str, int | None, str]:
+def _canonical_azure_endpoint(
+    value: str,
+    *,
+    api_surface: str,
+) -> tuple[str, str, int | None, str]:
     """Return the comparable scheme, host, port, and path for one Azure endpoint.
 
     Default HTTPS port 443 and HTTP port 80 are treated as omitted so catalog identity and key
-    pairing stay aligned. A non-default port is part of the resource identity.
+    pairing stay aligned. A non-default port is part of the resource identity. Model-inference
+    resource roots and their terminal ``/models`` form share one authority.
     """
     parsed = urlsplit(value)
     hostname = (parsed.hostname or "").lower()
@@ -221,4 +241,7 @@ def _canonical_azure_endpoint(value: str) -> tuple[str, str, int | None, str]:
     scheme = parsed.scheme.lower()
     default_port = 443 if scheme == "https" else 80
     comparable_port = None if port in {None, default_port} else port
-    return (scheme, hostname, comparable_port, parsed.path.rstrip("/"))
+    path = parsed.path.rstrip("/")
+    if api_surface == "model_inference" and path.lower().endswith("/models"):
+        path = path[:-7].rstrip("/")
+    return (scheme, hostname, comparable_port, path)
