@@ -9,8 +9,29 @@ use super::{
 };
 use crate::errors::{Failure, FailureClass};
 use crate::events::{
-    openai_compatible_usage, openai_usage, require_string, require_u64, Event, ToolAccumulator,
+    openai_compatible_usage, openai_usage, require_bounded_string, require_string, require_u64,
+    Event, ProviderOutputItemKind, ToolAccumulator,
 };
+
+const MAXIMUM_OPENAI_ID_CHARS: usize = 256;
+
+fn openai_identity(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<String, Failure> {
+    require_bounded_string(object, key, label, MAXIMUM_OPENAI_ID_CHARS)
+        .map_err(|message| malformed(&message))
+}
+
+fn openai_index(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<u32, Failure> {
+    let value = require_u64(object, key, label).map_err(|message| malformed(&message))?;
+    u32::try_from(value).map_err(|_| malformed(&format!("{label} exceeds the supported range")))
+}
 
 impl Normalizer {
     pub(super) fn feed_openai_responses(
@@ -32,6 +53,19 @@ impl Normalizer {
         let mut events = Vec::new();
         match event_type.as_str() {
             "response.output_text.delta" => {
+                let output_index = openai_index(&payload, "output_index", "OpenAI output_index")?;
+                let item_id = openai_identity(&payload, "item_id", "OpenAI message item ID")?;
+                if self.bind_openai_output_item(
+                    output_index,
+                    ProviderOutputItemKind::Message,
+                    item_id.clone(),
+                )? {
+                    events.push(Event::ProviderOutputItemStarted {
+                        output_index,
+                        item_id,
+                        kind: ProviderOutputItemKind::Message,
+                    });
+                }
                 let delta = optional_text(&payload, "delta", "OpenAI text delta")?;
                 if !delta.is_empty() {
                     events.push(Event::TextDelta(delta));
@@ -44,14 +78,35 @@ impl Normalizer {
             }
             "response.reasoning_summary_text.delta" => {
                 let output_index =
-                    require_u64(&payload, "output_index", "OpenAI reasoning output_index")
-                        .map_err(|message| malformed(&message))? as u32;
+                    openai_index(&payload, "output_index", "OpenAI reasoning output_index")?;
                 let summary_index =
-                    require_u64(&payload, "summary_index", "OpenAI reasoning summary_index")
-                        .map_err(|message| malformed(&message))? as u32;
+                    openai_index(&payload, "summary_index", "OpenAI reasoning summary_index")?;
+                let item_id = openai_identity(&payload, "item_id", "OpenAI reasoning item ID")?;
                 let delta = optional_text(&payload, "delta", "OpenAI reasoning summary delta")?;
                 if delta.is_empty() {
+                    if self
+                        .openai_output_items
+                        .get(&output_index)
+                        .is_some_and(|identity| {
+                            identity != &(ProviderOutputItemKind::Reasoning, item_id.clone())
+                        })
+                    {
+                        return Err(malformed(
+                            "OpenAI output item changed identity or type during streaming",
+                        ));
+                    }
                     return Ok(events);
+                }
+                if self.bind_openai_output_item(
+                    output_index,
+                    ProviderOutputItemKind::Reasoning,
+                    item_id.clone(),
+                )? {
+                    events.push(Event::ProviderOutputItemStarted {
+                        output_index,
+                        item_id: item_id.clone(),
+                        kind: ProviderOutputItemKind::Reasoning,
+                    });
                 }
                 let key = (output_index, summary_index);
                 self.reserve_summary_entry(key)?;
@@ -63,18 +118,29 @@ impl Normalizer {
                 events.push(Event::ReasoningSummaryDelta {
                     output_index,
                     summary_index,
+                    item_id,
                     delta,
                 });
             }
             "response.reasoning_summary_text.done" => {
                 let output_index =
-                    require_u64(&payload, "output_index", "OpenAI reasoning output_index")
-                        .map_err(|message| malformed(&message))? as u32;
+                    openai_index(&payload, "output_index", "OpenAI reasoning output_index")?;
                 let summary_index =
-                    require_u64(&payload, "summary_index", "OpenAI reasoning summary_index")
-                        .map_err(|message| malformed(&message))? as u32;
+                    openai_index(&payload, "summary_index", "OpenAI reasoning summary_index")?;
+                let item_id = openai_identity(&payload, "item_id", "OpenAI reasoning item ID")?;
                 let final_text = require_string(&payload, "text", "OpenAI reasoning summary text")
                     .map_err(|message| malformed(&message))?;
+                if self.bind_openai_output_item(
+                    output_index,
+                    ProviderOutputItemKind::Reasoning,
+                    item_id.clone(),
+                )? {
+                    events.push(Event::ProviderOutputItemStarted {
+                        output_index,
+                        item_id: item_id.clone(),
+                        kind: ProviderOutputItemKind::Reasoning,
+                    });
+                }
                 let key = (output_index, summary_index);
                 let streamed = self
                     .reasoning_summaries
@@ -93,6 +159,7 @@ impl Normalizer {
                     events.push(Event::ReasoningSummaryDelta {
                         output_index,
                         summary_index,
+                        item_id,
                         delta: final_text,
                     });
                 }
@@ -103,10 +170,8 @@ impl Normalizer {
                     .and_then(Value::as_object)
                     .ok_or_else(|| malformed("OpenAI output item must be an object"))?;
                 let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                let index = openai_index(&payload, "output_index", "OpenAI output_index")?;
                 if item_type == "function_call" {
-                    let index = require_u64(&payload, "output_index", "OpenAI output_index")
-                        .map_err(|message| malformed(&message))?
-                        as u32;
                     if self.tools.contains_key(&index) {
                         return Err(malformed("OpenAI stream repeated a tool-call start"));
                     }
@@ -114,12 +179,30 @@ impl Normalizer {
                         .get("call_id")
                         .or_else(|| item.get("id"))
                         .and_then(Value::as_str)
-                        .ok_or_else(|| malformed("OpenAI function call ID must be text"))?
-                        .to_string();
-                    let name = require_string(item, "name", "OpenAI function call name")
-                        .map_err(|message| malformed(&message))?;
+                        .ok_or_else(|| malformed("OpenAI function call ID must be text"))?;
+                    if call_id.is_empty() || call_id.chars().count() > MAXIMUM_OPENAI_ID_CHARS {
+                        return Err(malformed(
+                            "OpenAI function call ID must contain between 1 and 256 characters",
+                        ));
+                    }
+                    let call_id = call_id.to_string();
+                    let name = openai_identity(item, "name", "OpenAI function call name")?;
+                    let item_id = openai_identity(item, "id", "OpenAI function call item ID")?;
+                    if !self.bind_openai_output_item(
+                        index,
+                        ProviderOutputItemKind::FunctionCall,
+                        item_id.clone(),
+                    )? {
+                        return Err(malformed("OpenAI stream repeated an output-item start"));
+                    }
                     self.reserve_tool_entry(index)?;
                     let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
+                    tool.provider_item_id = Some(item_id.clone());
+                    events.push(Event::ProviderOutputItemStarted {
+                        output_index: index,
+                        item_id,
+                        kind: ProviderOutputItemKind::FunctionCall,
+                    });
                     events.push(Event::ToolCallStarted {
                         index,
                         call_id,
@@ -136,15 +219,42 @@ impl Normalizer {
                         }
                     }
                     self.tools.insert(index, tool);
-                } else if item_type != "message" && item_type != "reasoning" {
+                } else if item_type == "reasoning" {
+                    let item_id = openai_identity(item, "id", "OpenAI reasoning item ID")?;
+                    if !self.bind_openai_output_item(
+                        index,
+                        ProviderOutputItemKind::Reasoning,
+                        item_id.clone(),
+                    )? {
+                        return Err(malformed("OpenAI stream repeated an output-item start"));
+                    }
+                    events.push(Event::ProviderOutputItemStarted {
+                        output_index: index,
+                        item_id,
+                        kind: ProviderOutputItemKind::Reasoning,
+                    });
+                } else if item_type == "message" {
+                    let item_id = openai_identity(item, "id", "OpenAI message item ID")?;
+                    if !self.bind_openai_output_item(
+                        index,
+                        ProviderOutputItemKind::Message,
+                        item_id.clone(),
+                    )? {
+                        return Err(malformed("OpenAI stream repeated an output-item start"));
+                    }
+                    events.push(Event::ProviderOutputItemStarted {
+                        output_index: index,
+                        item_id,
+                        kind: ProviderOutputItemKind::Message,
+                    });
+                } else {
                     return Err(malformed(
                         "OpenAI stream emitted an unsupported output item",
                     ));
                 }
             }
             "response.function_call_arguments.delta" => {
-                let index = require_u64(&payload, "output_index", "OpenAI output_index")
-                    .map_err(|message| malformed(&message))? as u32;
+                let index = openai_index(&payload, "output_index", "OpenAI output_index")?;
                 let delta = optional_text(&payload, "delta", "OpenAI argument delta")?;
                 self.reserve_tool_bytes(delta.len())?;
                 let tool = self
@@ -155,23 +265,80 @@ impl Normalizer {
                 events.push(Event::ToolArgumentsDelta { index, delta });
             }
             "response.function_call_arguments.done" | "response.output_item.done" => {
-                let index = require_u64(&payload, "output_index", "OpenAI output_index")
-                    .map_err(|message| malformed(&message))? as u32;
+                let index = openai_index(&payload, "output_index", "OpenAI output_index")?;
                 if event_type == "response.output_item.done" {
                     if let Some(item) = payload.get("item").and_then(Value::as_object) {
                         // Requested encrypted reasoning arrives whole on the
                         // completed reasoning item; pass the opaque payload
                         // through under the shared retained-output budget.
                         if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                            let item_id = openai_identity(item, "id", "OpenAI reasoning item ID")?;
+                            if self.bind_openai_output_item(
+                                index,
+                                ProviderOutputItemKind::Reasoning,
+                                item_id.clone(),
+                            )? {
+                                events.push(Event::ProviderOutputItemStarted {
+                                    output_index: index,
+                                    item_id: item_id.clone(),
+                                    kind: ProviderOutputItemKind::Reasoning,
+                                });
+                            }
                             if let Some(Value::String(encrypted)) = item.get("encrypted_content") {
                                 if !encrypted.is_empty() {
                                     self.reserve_summary_bytes(encrypted.len())?;
                                     events.push(Event::EncryptedReasoning {
                                         output_index: index,
+                                        item_id,
                                         encrypted_content: encrypted.clone(),
                                     });
                                 }
                             }
+                        } else if item.get("type").and_then(Value::as_str) == Some("function_call")
+                        {
+                            let item_id =
+                                openai_identity(item, "id", "OpenAI function call item ID")?;
+                            self.bind_openai_output_item(
+                                index,
+                                ProviderOutputItemKind::FunctionCall,
+                                item_id.clone(),
+                            )?;
+                            let tool = self.tools.get(&index).ok_or_else(|| {
+                                malformed("OpenAI function call completed before its start")
+                            })?;
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| malformed("OpenAI function call ID must be text"))?;
+                            let name =
+                                item.get("name").and_then(Value::as_str).ok_or_else(|| {
+                                    malformed("OpenAI function call name must be text")
+                                })?;
+                            if tool.provider_item_id.as_deref() != Some(item_id.as_str())
+                                || tool.call_id != call_id
+                                || tool.name != name
+                            {
+                                return Err(malformed(
+                                    "OpenAI function call changed identity at completion",
+                                ));
+                            }
+                        } else if item.get("type").and_then(Value::as_str) == Some("message") {
+                            let item_id = openai_identity(item, "id", "OpenAI message item ID")?;
+                            if self.bind_openai_output_item(
+                                index,
+                                ProviderOutputItemKind::Message,
+                                item_id.clone(),
+                            )? {
+                                events.push(Event::ProviderOutputItemStarted {
+                                    output_index: index,
+                                    item_id,
+                                    kind: ProviderOutputItemKind::Message,
+                                });
+                            }
+                        } else if self.openai_output_items.contains_key(&index) {
+                            return Err(malformed(
+                                "OpenAI output item changed identity or type at completion",
+                            ));
                         }
                     }
                 }
@@ -410,6 +577,7 @@ mod tests {
             event: None,
             data: serde_json::json!({
                 "type": "response.reasoning_summary_text.delta",
+                "item_id": format!("rs-{output_index}"),
                 "output_index": output_index,
                 "summary_index": summary_index,
                 "delta": delta,
@@ -425,6 +593,7 @@ mod tests {
             event: None,
             data: serde_json::json!({
                 "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs-2",
                 "output_index": 2,
                 "summary_index": 1,
                 "delta": "checked",
@@ -436,17 +605,26 @@ mod tests {
             .expect("summary delta must normalize");
         assert!(matches!(
             events.as_slice(),
-            [Event::ReasoningSummaryDelta {
-                output_index: 2,
-                summary_index: 1,
-                delta,
-            }] if delta == "checked"
+            [
+                Event::ProviderOutputItemStarted {
+                    output_index: 2,
+                    item_id,
+                    kind: ProviderOutputItemKind::Reasoning,
+                },
+                Event::ReasoningSummaryDelta {
+                    output_index: 2,
+                    summary_index: 1,
+                    item_id: _,
+                    delta,
+                }
+            ] if item_id == "rs-2" && delta == "checked"
         ));
 
         let done = SseEvent {
             event: None,
             data: serde_json::json!({
                 "type": "response.reasoning_summary_text.done",
+                "item_id": "rs-2",
                 "output_index": 2,
                 "summary_index": 1,
                 "text": "checked",
@@ -475,7 +653,7 @@ mod tests {
                 .feed(&reasoning_delta(0, 0, "bounded"))
                 .expect("non-empty summary still fits")
                 .len(),
-            1
+            2
         );
     }
 
@@ -520,10 +698,18 @@ mod tests {
         let events = normalizer.feed(&done).expect("reasoning item completes");
         assert!(matches!(
             events.as_slice(),
-            [Event::EncryptedReasoning {
-                output_index: 0,
-                encrypted_content,
-            }] if encrypted_content == "blob=="
+            [
+                Event::ProviderOutputItemStarted {
+                    output_index: 0,
+                    item_id,
+                    kind: ProviderOutputItemKind::Reasoning,
+                },
+                Event::EncryptedReasoning {
+                    output_index: 0,
+                    item_id: _,
+                    encrypted_content,
+                }
+            ] if item_id == "rs_provider" && encrypted_content == "blob=="
         ));
 
         // A reasoning item without the requested include stays silent.
@@ -536,6 +722,141 @@ mod tests {
             })
             .to_string(),
         };
-        assert!(normalizer.feed(&bare).expect("bare item").is_empty());
+        assert!(matches!(
+            normalizer.feed(&bare).expect("bare item").as_slice(),
+            [Event::ProviderOutputItemStarted {
+                output_index: 1,
+                item_id,
+                kind: ProviderOutputItemKind::Reasoning,
+            }] if item_id == "rs_2"
+        ));
+    }
+
+    #[test]
+    fn responses_output_item_identity_is_bounded_and_type_stable() {
+        for item_id in [String::new(), "x".repeat(257)] {
+            let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+            let frame = SseEvent {
+                event: None,
+                data: serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"id": item_id, "type": "reasoning", "summary": []},
+                })
+                .to_string(),
+            };
+            assert_eq!(
+                normalizer
+                    .feed(&frame)
+                    .expect_err("invalid item identity must fail")
+                    .failure_class,
+                FailureClass::MalformedResponse
+            );
+        }
+
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let reasoning_start = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "rs-0", "type": "reasoning", "summary": []},
+            })
+            .to_string(),
+        };
+        normalizer
+            .feed(&reasoning_start)
+            .expect("reasoning identity must bind");
+        let mismatched_summary = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs-other",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "mismatch",
+            })
+            .to_string(),
+        };
+        assert!(normalizer.feed(&mismatched_summary).is_err());
+
+        let cross_type = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc-0",
+                    "type": "function_call",
+                    "call_id": "call-0",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+            })
+            .to_string(),
+        };
+        assert!(normalizer.feed(&cross_type).is_err());
+    }
+
+    #[test]
+    fn responses_function_call_completion_preserves_every_identity_field() {
+        let start = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "id": "fc-1",
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+            })
+            .to_string(),
+        };
+        for item in [
+            serde_json::json!({
+                "id": "fc-other", "type": "function_call", "call_id": "call-1",
+                "name": "lookup", "arguments": "{}",
+            }),
+            serde_json::json!({
+                "id": "fc-1", "type": "function_call", "call_id": "call-other",
+                "name": "lookup", "arguments": "{}",
+            }),
+            serde_json::json!({
+                "id": "fc-1", "type": "function_call", "call_id": "call-1",
+                "name": "other", "arguments": "{}",
+            }),
+            serde_json::json!({
+                "id": "fc-1", "type": "message", "call_id": "call-1",
+                "name": "lookup", "arguments": "{}",
+            }),
+        ] {
+            let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+            let events = normalizer.feed(&start).expect("function call must start");
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    Event::ProviderOutputItemStarted {
+                        output_index: 1,
+                        item_id,
+                        kind: ProviderOutputItemKind::FunctionCall,
+                    },
+                    Event::ToolCallStarted { index: 1, .. },
+                    Event::ToolArgumentsDelta { index: 1, .. },
+                ] if item_id == "fc-1"
+            ));
+            let done = SseEvent {
+                event: None,
+                data: serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": item,
+                })
+                .to_string(),
+            };
+            assert!(normalizer.feed(&done).is_err());
+        }
     }
 }

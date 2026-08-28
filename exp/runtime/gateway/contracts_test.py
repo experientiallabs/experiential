@@ -309,6 +309,48 @@ def test_reasoning_carrier_request_fields_are_surface_scoped() -> None:
         )
 
 
+def test_provider_replay_identity_hashes_exact_tool_and_message_state() -> None:
+    """Excluded wire identity and raw argument bytes still bind idempotent replay."""
+    from exp.runtime.gateway.contracts import canonical_request_sha256
+
+    def request(*, item_id: str, raw_arguments: str, output_index: int = 2) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="assistant",
+                    content="preamble",
+                    provider_item_id="msg_1",
+                    provider_output_index=1,
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-1",
+                            name="lookup",
+                            arguments={"q": "x"},
+                            raw_arguments=raw_arguments,
+                            provider_item_id=item_id,
+                            provider_output_index=output_index,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    original = request(item_id="fc_1", raw_arguments='{"q":"x"}')
+    assert canonical_request_sha256(original) == canonical_request_sha256(
+        request(item_id="fc_1", raw_arguments='{"q":"x"}')
+    )
+    assert canonical_request_sha256(original) != canonical_request_sha256(
+        request(item_id="fc_2", raw_arguments='{"q":"x"}')
+    )
+    assert canonical_request_sha256(original) != canonical_request_sha256(
+        request(item_id="fc_1", raw_arguments='{ "q" : "x" }')
+    )
+    assert canonical_request_sha256(original) != canonical_request_sha256(
+        request(item_id="fc_1", raw_arguments='{"q":"x"}', output_index=3)
+    )
+
+
 def test_reasoning_stream_events_require_their_payloads() -> None:
     """Each new reasoning event kind carries its block index and payload."""
     thinking = GatewayEvent(
@@ -336,6 +378,7 @@ def test_reasoning_stream_events_require_their_payloads() -> None:
         kind=GatewayEventKind.ENCRYPTED_REASONING,
         sequence_number=3,
         reasoning_block_index=0,
+        reasoning_item_id="rs_1",
         encrypted_content="blob",
     )
     assert encrypted.encrypted_content == "blob"

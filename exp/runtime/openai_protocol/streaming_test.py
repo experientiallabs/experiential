@@ -25,7 +25,6 @@ from exp.runtime.openai_protocol.streaming import (
     ResponsesSseEncoder,
     encode_chat_events,
     encode_responses_events,
-    stable_public_id,
 )
 
 _RAW_ARGUMENTS = '{ "city" : "Zürich" }'
@@ -221,6 +220,7 @@ def test_responses_sse_preserves_reasoning_summary_items() -> None:
                 sequence_number=0,
                 reasoning_summary_output_index=0,
                 reasoning_summary_index=0,
+                reasoning_item_id="rs_reasoning",
                 text_delta="Checked ",
             ),
             GatewayEvent(
@@ -228,6 +228,7 @@ def test_responses_sse_preserves_reasoning_summary_items() -> None:
                 sequence_number=1,
                 reasoning_summary_output_index=0,
                 reasoning_summary_index=0,
+                reasoning_item_id="rs_reasoning",
                 text_delta="the forecast.",
             ),
             GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=2),
@@ -244,12 +245,53 @@ def test_responses_sse_preserves_reasoning_summary_items() -> None:
     output = cast(list[JsonObject], terminal["output"])
     assert output == [
         {
-            "id": stable_public_id("rs", f"{stable_public_id('resp', 'request-reasoning')}:0"),
+            "id": "rs_reasoning",
             "type": "reasoning",
             "summary": [{"type": "summary_text", "text": "Checked the forecast."}],
             "status": "completed",
         }
     ]
+
+
+@pytest.mark.parametrize("include_encrypted_reasoning", (False, True))
+def test_responses_sse_exposes_provider_encrypted_reasoning_only_when_requested(
+    include_encrypted_reasoning: bool,
+) -> None:
+    """Internal continuation state is not automatically part of the public response."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="plan"),),
+        stream=True,
+        include_encrypted_reasoning=include_encrypted_reasoning,
+    )
+    frames = encode_responses_events(
+        ResponsesSseEncoder(
+            request_id="request-provider-encrypted",
+            model="coding",
+            created_at=123.0,
+            request=request,
+        ),
+        (
+            GatewayEvent(
+                kind=GatewayEventKind.ENCRYPTED_REASONING,
+                sequence_number=0,
+                reasoning_block_index=0,
+                reasoning_item_id="rs-provider",
+                encrypted_content="provider-opaque",
+            ),
+            GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+        ),
+    )
+
+    payloads = tuple(_responses_payload(frame) for frame in frames)
+    done = next(payload for payload in payloads if payload["type"] == "response.output_item.done")
+    terminal = cast(JsonObject, payloads[-1]["response"])
+    items = (cast(JsonObject, done["item"]), cast(list[JsonObject], terminal["output"])[0])
+    for reasoning in items:
+        if include_encrypted_reasoning:
+            assert cast(str, reasoning["encrypted_content"]).encode() == b"provider-opaque"
+        else:
+            assert "encrypted_content" not in reasoning
 
 
 def test_responses_failure_closes_visible_content_then_emits_one_failed_terminal() -> None:

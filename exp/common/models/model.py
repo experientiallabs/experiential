@@ -181,10 +181,9 @@ class ToolCall(ContractModel):
     """One complete tool invocation emitted by an assistant.
 
     ``arguments`` retains the existing parsed-object contract used by environments and
-    optimization artifacts. ``raw_arguments`` optionally preserves the exact provider-emitted
-    JSON string for immediate protocol replay. It is deliberately excluded from model
-    serialization so provider formatting cannot affect immutable artifacts, lineage, or
-    deduplication.
+    optimization artifacts. The excluded replay fields preserve the provider's exact arguments,
+    item identity, and output position for immediate protocol replay. They remain absent from
+    immutable artifacts but join gateway idempotency identity explicitly.
     """
 
     call_id: str = Field(min_length=1, max_length=256)
@@ -205,6 +204,8 @@ class ToolCall(ContractModel):
     other wires. Like ``raw_arguments``, it is excluded from serialization so
     a cache hint can never affect immutable artifacts or request digests.
     """
+    provider_item_id: str | None = Field(default=None, min_length=1, max_length=256, exclude=True)
+    provider_output_index: int | None = Field(default=None, ge=0, exclude=True)
 
     @model_validator(mode="after")
     def _require_matching_raw_arguments(self) -> ToolCall:
@@ -216,14 +217,13 @@ class ToolCall(ContractModel):
         Raises:
             ValueError: Raw arguments are invalid JSON, not an object, or change the parsed value.
         """
-        if self.raw_arguments is None:
-            return self
-        try:
-            parsed = _JSON_OBJECT_ADAPTER.validate_json(self.raw_arguments)
-        except ValidationError as exc:
-            raise ValueError("raw tool arguments must encode one JSON object") from exc
-        if parsed != self.arguments:
-            raise ValueError("raw tool arguments must match parsed tool arguments")
+        if self.raw_arguments is not None:
+            try:
+                parsed = _JSON_OBJECT_ADAPTER.validate_json(self.raw_arguments)
+            except ValidationError as exc:
+                raise ValueError("raw tool arguments must encode one JSON object") from exc
+            if parsed != self.arguments:
+                raise ValueError("raw tool arguments must match parsed tool arguments")
         return self
 
     def arguments_json(self, *, sort_keys: bool = False, compact: bool = False) -> str:

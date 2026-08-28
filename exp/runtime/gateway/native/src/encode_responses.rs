@@ -8,7 +8,9 @@ use serde_json::{json, Value};
 
 use crate::encode::{compact_json, stable_public_id};
 use crate::errors::{Failure, PublicError};
-use crate::events::{CompletedToolCall, Event, Usage};
+use crate::events::{CompletedToolCall, Event, ProviderOutputItemKind, Usage};
+
+mod provider;
 
 fn invalid_provider_stream(message: &str) -> PublicError {
     PublicError::new(502, "invalid_provider_stream", message, "api_error")
@@ -54,6 +56,8 @@ pub struct ResponsesEnvelope {
     pub max_output_tokens: Value,
     #[serde(default)]
     pub previous_response_id: Value,
+    #[serde(default)]
+    pub include_encrypted_reasoning: bool,
 }
 
 impl Default for ResponsesEnvelope {
@@ -69,6 +73,7 @@ impl Default for ResponsesEnvelope {
             tools: default_tools(),
             max_output_tokens: Value::Null,
             previous_response_id: Value::Null,
+            include_encrypted_reasoning: false,
         }
     }
 }
@@ -107,7 +112,7 @@ struct ReasoningState {
 }
 
 impl ReasoningState {
-    fn item(&self, completed: bool) -> Value {
+    fn item(&self, completed: bool, include_encrypted_content: bool) -> Value {
         let summary: Vec<Value> = if completed {
             self.parts
                 .values()
@@ -122,13 +127,22 @@ impl ReasoningState {
             "summary": summary,
             "status": if completed { "completed" } else { "in_progress" },
         });
-        if let Some(encrypted) = &self.encrypted_content {
-            item.as_object_mut()
-                .expect("reasoning item is an object")
-                .insert("encrypted_content".to_string(), json!(encrypted));
+        if include_encrypted_content {
+            if let Some(encrypted) = &self.encrypted_content {
+                item.as_object_mut()
+                    .expect("reasoning item is an object")
+                    .insert("encrypted_content".to_string(), json!(encrypted));
+            }
         }
         item
     }
+}
+
+/// Provider-owned output item reserved before its content-bearing event.
+struct ProviderOutputStart {
+    item_id: String,
+    kind: ProviderOutputItemKind,
+    output_index: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +166,7 @@ pub struct ResponsesSseEncoder {
     output_order: Vec<OutputSlot>,
     tools: HashMap<u32, ToolState>,
     reasoning: HashMap<u32, ReasoningState>,
+    provider_output_starts: HashMap<u32, ProviderOutputStart>,
     message_output_index: Option<usize>,
     text: String,
     refusal: String,
@@ -179,6 +194,7 @@ impl ResponsesSseEncoder {
             output_order: Vec::new(),
             tools: HashMap::new(),
             reasoning: HashMap::new(),
+            provider_output_starts: HashMap::new(),
             message_output_index: None,
             text: String::new(),
             refusal: String::new(),
@@ -222,21 +238,32 @@ impl ResponsesSseEncoder {
         match event {
             Event::TextDelta(delta) => self.content_delta(true, delta),
             Event::RefusalDelta(delta) => self.content_delta(false, delta),
+            Event::ProviderOutputItemStarted {
+                output_index,
+                item_id,
+                kind,
+            } => self.provider_output_item_started(*output_index, item_id, *kind),
             Event::ReasoningSummaryDelta {
                 output_index,
                 summary_index,
+                item_id,
                 delta,
-            } => self.reasoning_summary_delta(*output_index, *summary_index, delta),
+            } => self.reasoning_summary_delta(*output_index, *summary_index, item_id, delta),
             // Lossy projection: Anthropic thinking text streams as a summary
             // part so callers receive what they pay for. Signatures and
             // redacted payloads are dropped deliberately, since this surface
             // cannot round-trip them.
-            Event::ThinkingDelta { index, delta } => self.reasoning_summary_delta(*index, 0, delta),
+            Event::ThinkingDelta { index, delta } => {
+                let item_id =
+                    stable_public_id("rs", &format!("{}:thinking:{index}", self.response_id));
+                self.reasoning_summary_delta(*index, 0, &item_id, delta)
+            }
             Event::ThinkingSignature { .. } | Event::RedactedThinking { .. } => Ok(Vec::new()),
             Event::EncryptedReasoning {
                 output_index,
+                item_id,
                 encrypted_content,
-            } => self.encrypted_reasoning(*output_index, encrypted_content),
+            } => self.encrypted_reasoning(*output_index, item_id, encrypted_content),
             Event::ToolCallStarted {
                 index,
                 call_id,
@@ -344,59 +371,16 @@ impl ResponsesSseEncoder {
         index
     }
 
-    /// Create one stable reasoning output item on first use.
-    fn ensure_reasoning(&mut self, provider_output_index: u32, frames: &mut Vec<String>) {
-        if self.reasoning.contains_key(&provider_output_index) {
-            return;
-        }
-        let state = ReasoningState {
-            item_id: stable_public_id(
-                "rs",
-                &format!("{}:{}", self.response_id, provider_output_index),
-            ),
-            output_index: self.output_order.len(),
-            parts: BTreeMap::new(),
-            encrypted_content: None,
-        };
-        let frame = self.event(
-            "response.output_item.added",
-            json!({
-                "output_index": state.output_index,
-                "item": state.item(false),
-            }),
-        );
-        self.reasoning.insert(provider_output_index, state);
-        self.output_order
-            .push(OutputSlot::Reasoning(provider_output_index));
-        frames.push(frame);
-    }
-
-    /// Retain one opaque encrypted reasoning payload on its output item; the
-    /// payload surfaces on the item's completion frames rather than a delta.
-    fn encrypted_reasoning(
-        &mut self,
-        provider_output_index: u32,
-        encrypted_content: &str,
-    ) -> Result<Vec<String>, PublicError> {
-        let mut frames = Vec::new();
-        self.ensure_reasoning(provider_output_index, &mut frames);
-        let state = self
-            .reasoning
-            .get_mut(&provider_output_index)
-            .expect("reasoning state just ensured");
-        state.encrypted_content = Some(encrypted_content.to_string());
-        Ok(frames)
-    }
-
     /// Start one reasoning item/summary part as needed and emit its text delta.
     fn reasoning_summary_delta(
         &mut self,
         provider_output_index: u32,
         summary_index: u32,
+        item_id: &str,
         delta: &str,
     ) -> Result<Vec<String>, PublicError> {
         let mut frames = Vec::new();
-        self.ensure_reasoning(provider_output_index, &mut frames);
+        self.ensure_reasoning(provider_output_index, item_id, &mut frames)?;
         let (item_id, output_index, new_part) = {
             let state = self
                 .reasoning
@@ -445,9 +429,23 @@ impl ResponsesSseEncoder {
                 "A Responses tool-call index was started twice.",
             ));
         }
+        let reserved = self.provider_output_starts.get(&index);
+        if reserved.is_some_and(|start| start.kind != ProviderOutputItemKind::FunctionCall) {
+            return Err(invalid_provider_stream(
+                "Responses tool call reused a non-tool provider output item.",
+            ));
+        }
+        let (item_id, output_index, already_reserved) = match reserved {
+            Some(start) => (start.item_id.clone(), start.output_index, true),
+            None => (
+                stable_public_id("fc", &format!("{}:{}", self.response_id, call_id)),
+                self.output_order.len(),
+                false,
+            ),
+        };
         let state = ToolState {
-            item_id: stable_public_id("fc", &format!("{}:{}", self.response_id, call_id)),
-            output_index: self.output_order.len(),
+            item_id,
+            output_index,
             call_id: call_id.to_string(),
             name: name.to_string(),
             arguments: String::new(),
@@ -461,7 +459,9 @@ impl ResponsesSseEncoder {
             }),
         );
         self.tools.insert(index, state);
-        self.output_order.push(OutputSlot::Tool(index));
+        if !already_reserved {
+            self.output_order.push(OutputSlot::Tool(index));
+        }
         Ok(vec![frame])
     }
 
@@ -486,10 +486,13 @@ impl ResponsesSseEncoder {
         index: u32,
         call: &CompletedToolCall,
     ) -> Result<Vec<String>, PublicError> {
+        let provider_owned_identity = self.provider_output_starts.contains_key(&index);
         let state = self.open_tool(index)?;
         if state.call_id != call.call_id
             || state.name != call.name
             || state.arguments != call.raw_arguments
+            || (provider_owned_identity
+                && call.provider_item_id.as_deref() != Some(state.item_id.as_str()))
         {
             return Err(invalid_provider_stream(
                 "Responses tool completion changed streamed identity or bytes.",
@@ -580,7 +583,7 @@ impl ResponsesSseEncoder {
                 state.item_id.clone(),
                 state.output_index,
                 state.parts.clone(),
-                state.item(true),
+                state.item(true, self.envelope.include_encrypted_reasoning),
             )
         };
         let mut frames = Vec::new();
@@ -697,15 +700,16 @@ impl ResponsesSseEncoder {
     /// Build one SDK-readable Responses envelope for the current lifecycle state.
     fn response(&self, status: &str, failure: Option<&Failure>) -> Value {
         let completed = status != "in_progress";
-        let output: Vec<Value> = self
-            .output_order
-            .iter()
-            .map(|slot| match slot {
-                OutputSlot::Message => self.message_item(completed),
-                OutputSlot::Tool(index) => self.tools[index].item(completed),
-                OutputSlot::Reasoning(index) => self.reasoning[index].item(completed),
-            })
-            .collect();
+        let output: Vec<Value> =
+            self.output_order
+                .iter()
+                .map(|slot| match slot {
+                    OutputSlot::Message => self.message_item(completed),
+                    OutputSlot::Tool(index) => self.tools[index].item(completed),
+                    OutputSlot::Reasoning(index) => self.reasoning[index]
+                        .item(completed, self.envelope.include_encrypted_reasoning),
+                })
+                .collect();
         let error = if status == "failed" {
             json!({
                 "code": "server_error",
@@ -794,9 +798,6 @@ pub struct AggregatedResponses {
     pub usage: Option<Usage>,
     pub incomplete: bool,
     pub tool_names: Vec<String>,
-    pub text: String,
-    pub refusal: String,
-    pub tool_calls: Vec<CompletedToolCall>,
 }
 
 /// Build one non-streaming public Responses result from ordered events,
@@ -830,29 +831,13 @@ pub fn completed_responses_body(
         }
     }
     let mut tool_names: Vec<String> = Vec::new();
-    let mut tool_calls: Vec<CompletedToolCall> = Vec::new();
     for event in events {
         if let Event::ToolCallCompleted { call, .. } = event {
             if !tool_names.contains(&call.name) {
                 tool_names.push(call.name.clone());
             }
-            tool_calls.push(call.clone());
         }
     }
-    let text: String = events
-        .iter()
-        .filter_map(|event| match event {
-            Event::TextDelta(delta) => Some(delta.as_str()),
-            _ => None,
-        })
-        .collect();
-    let refusal: String = events
-        .iter()
-        .filter_map(|event| match event {
-            Event::RefusalDelta(delta) => Some(delta.as_str()),
-            _ => None,
-        })
-        .collect();
     if let Event::Failed(failure) = terminal {
         return Ok(AggregatedResponses {
             body: Value::Null,
@@ -860,9 +845,6 @@ pub fn completed_responses_body(
             usage,
             incomplete: false,
             tool_names,
-            text,
-            refusal,
-            tool_calls,
         });
     }
     let mut encoder = ResponsesSseEncoder::new(request_id, model, created_at, envelope);
@@ -901,9 +883,6 @@ pub fn completed_responses_body(
         usage,
         incomplete: matches!(terminal, Event::Incomplete),
         tool_names,
-        text,
-        refusal,
-        tool_calls,
     })
 }
 

@@ -405,6 +405,10 @@ class NativeControlPlane(NativeObservabilityMixin):
             )
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
+        if continuation_context is not None:
+            # Retain exactly the post-guardrail history dispatched upstream;
+            # otherwise a later continuation could resurrect removed input.
+            continuation_context.messages = request.messages
 
         # The ledger accepts the logical request before route selection, so a
         # keyed operation whose durable terminal already exists (or whose key

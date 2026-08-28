@@ -32,6 +32,7 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
     if message.role != "assistant":
         raise ProviderResponseError("unsupported Responses message role")
     items: list[JsonObject] = []
+    indexed_items: list[tuple[int, JsonObject]] = []
     for block in message.provider_reasoning:
         if block.kind != "encrypted_reasoning":
             # Anthropic thinking cannot replay on the OpenAI wire; route
@@ -45,20 +46,54 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             "summary": [],
             "encrypted_content": block.encrypted_content,
         }
-        if block.id is not None:
-            item["id"] = block.id
-        items.append(item)
+        item["id"] = block.id
+        if block.output_index is None:
+            items.append(item)
+        else:
+            indexed_items.append((block.output_index, item))
     if message.content is not None:
-        items.append({"role": "assistant", "content": message.content})
-    items.extend(
-        {
+        if message.provider_output_index is None:
+            items.append({"role": "assistant", "content": message.content})
+        else:
+            if message.provider_item_id is None:
+                raise ProviderResponseError("Responses assistant output omitted its provider ID")
+            indexed_items.append(
+                (
+                    message.provider_output_index,
+                    {
+                        "type": "message",
+                        "id": message.provider_item_id,
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": message.content,
+                                "annotations": [],
+                                "logprobs": [],
+                            }
+                        ],
+                    },
+                )
+            )
+    for call in message.tool_calls:
+        item: JsonObject = {
             "type": "function_call",
             "call_id": call.call_id,
             "name": call.name,
             "arguments": call.arguments_json(),
         }
-        for call in message.tool_calls
-    )
+        if call.provider_item_id is not None:
+            item["id"] = call.provider_item_id
+        if call.provider_output_index is None:
+            items.append(item)
+        else:
+            indexed_items.append((call.provider_output_index, item))
+    if indexed_items:
+        output_indexes = tuple(index for index, _item in indexed_items)
+        if len(output_indexes) != len(set(output_indexes)):
+            raise ProviderResponseError("Responses output items repeated a provider index")
+        items[:0] = [item for _index, item in sorted(indexed_items)]
     return items
 
 

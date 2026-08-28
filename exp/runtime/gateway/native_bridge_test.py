@@ -2265,6 +2265,7 @@ def _responses_parity_case() -> tuple[list[GatewayEvent], str]:
             sequence_number=0,
             reasoning_summary_output_index=0,
             reasoning_summary_index=0,
+            reasoning_item_id="rs_01161eec6982f41bdc4271a8fceb6c60",
             text_delta="Checked the plan.",
         ),
         GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=1, text_delta="Hel"),
@@ -2305,6 +2306,7 @@ def _responses_parity_case() -> tuple[list[GatewayEvent], str]:
             "kind": "reasoning_summary_delta",
             "output_index": 0,
             "summary_index": 0,
+            "item_id": "rs_01161eec6982f41bdc4271a8fceb6c60",
             "text": "Checked the plan.",
         },
         {"kind": "text_delta", "text": "Hel"},
@@ -3357,9 +3359,15 @@ def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -
                 "kind": "reasoning_summary_delta",
                 "output_index": 0,
                 "summary_index": 0,
+                "item_id": "rs_01161eec6982f41bdc4271a8fceb6c60",
                 "text": "planned",
             },
-            {"kind": "encrypted_reasoning", "output_index": 0, "encrypted_content": "ZW5jcnlwdGVk"},
+            {
+                "kind": "encrypted_reasoning",
+                "output_index": 0,
+                "item_id": "rs_01161eec6982f41bdc4271a8fceb6c60",
+                "encrypted_content": "ZW5jcnlwdGVk",
+            },
             {"kind": "text_delta", "text": "Hello"},
             {
                 "kind": "usage",
@@ -3372,7 +3380,11 @@ def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -
         ]
     )
     body = native.completed_responses_fixture(
-        "request-abc", "coding", 1_700_000_000.0, "{}", fixture
+        "request-abc",
+        "coding",
+        1_700_000_000.0,
+        json.dumps({"include_encrypted_reasoning": True}),
+        fixture,
     )
     assert body == _parity_golden("responses_encrypted_reasoning_body")
 
@@ -3486,19 +3498,34 @@ def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None
     encrypted = "gAAAA" + "Zm9vYmFy+/=" * 1200  # ~13 KB, base64-shaped.
     fixture = json.dumps(
         [
-            {"kind": "encrypted_reasoning", "output_index": 0, "encrypted_content": encrypted},
+            {
+                "kind": "encrypted_reasoning",
+                "output_index": 0,
+                "item_id": "rs_01161eec6982f41bdc4271a8fceb6c60",
+                "encrypted_content": encrypted,
+            },
             {"kind": "text_delta", "text": "done ✓"},
             {"kind": "completed"},
         ],
         ensure_ascii=False,
     )
     body = json.loads(
-        native.completed_responses_fixture("request-abc", "coding", 1_700_000_000.0, "{}", fixture)
+        native.completed_responses_fixture(
+            "request-abc",
+            "coding",
+            1_700_000_000.0,
+            json.dumps({"include_encrypted_reasoning": True}),
+            fixture,
+        )
     )
     assert body["output"][0]["encrypted_content"].encode() == encrypted.encode()
 
     frames = native.encode_responses_fixture(
-        "request-abc", "coding", 1_700_000_000.0, "{}", fixture
+        "request-abc",
+        "coding",
+        1_700_000_000.0,
+        json.dumps({"include_encrypted_reasoning": True}),
+        fixture,
     )
     done_items = [
         json.loads(frame.split("data: ", 1)[1].strip())

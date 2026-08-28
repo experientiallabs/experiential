@@ -106,8 +106,9 @@ class EncryptedReasoningBlock(ContractModel):
     """
 
     kind: Literal["encrypted_reasoning"] = "encrypted_reasoning"
-    id: str | None = Field(default=None, min_length=1, max_length=256)
+    id: str = Field(min_length=1, max_length=256)
     encrypted_content: str = Field(min_length=1)
+    output_index: int | None = Field(default=None, ge=0, exclude=True)
 
 
 ProviderReasoningBlock = Annotated[
@@ -147,6 +148,8 @@ class GatewayMessage(ContractModel):
     :func:`canonical_request_sha256`, so a caller operation key reused with
     different reasoning is a rejected conflict, never a silent replay.
     """
+    provider_item_id: str | None = Field(default=None, min_length=1, max_length=256, exclude=True)
+    provider_output_index: int | None = Field(default=None, ge=0, exclude=True)
 
     @model_validator(mode="after")
     def _require_role_coherence(self) -> GatewayMessage:
@@ -164,6 +167,15 @@ class GatewayMessage(ContractModel):
             raise ValueError("tool_calls are valid only for assistant messages")
         if self.role != "assistant" and self.provider_reasoning:
             raise ValueError("provider reasoning blocks are valid only for assistant messages")
+        if self.role != "assistant" and (
+            self.provider_item_id is not None or self.provider_output_index is not None
+        ):
+            raise ValueError("provider output identity is valid only for assistant messages")
+        if (self.provider_item_id is None) != (self.provider_output_index is None):
+            raise ValueError("provider item ID and output index must be retained together")
+        call_ids = tuple(call.call_id for call in self.tool_calls)
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("assistant tool call IDs must be unique")
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
@@ -319,7 +331,7 @@ class GatewayRequest(ContractModel):
 
 
 def canonical_request_sha256(request: GatewayRequest) -> Sha256:
-    """Digest one canonical request including its opaque reasoning carriers.
+    """Digest one canonical request including excluded provider replay authority.
 
     The carriers are excluded from model serialization so immutable artifacts
     and pre-existing request digests stay byte-identical, but they are
@@ -335,16 +347,46 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
     Returns:
         The stable canonical request digest.
     """
-    carriers: list[JsonObject] = [
-        {
-            "message_index": index,
-            "blocks": [block.model_dump(mode="json") for block in message.provider_reasoning],
-        }
-        for index, message in enumerate(request.messages)
-        if message.provider_reasoning
-    ]
+    replay: list[JsonObject] = []
+    for message_index, message in enumerate(request.messages):
+        authority: JsonObject = {"message_index": message_index}
+        if message.provider_item_id is not None:
+            authority["provider_item_id"] = message.provider_item_id
+            authority["provider_output_index"] = message.provider_output_index
+        if message.provider_reasoning:
+            blocks: list[JsonObject] = []
+            for block in message.provider_reasoning:
+                serialized = block.model_dump(mode="json")
+                if isinstance(block, EncryptedReasoningBlock):
+                    serialized["output_index"] = block.output_index
+                blocks.append(serialized)
+            authority["provider_reasoning"] = blocks
+        retained_calls: list[JsonObject] = []
+        for tool_call_index, call in enumerate(message.tool_calls):
+            if (
+                call.raw_arguments is None
+                and call.provider_item_id is None
+                and call.provider_output_index is None
+            ):
+                continue
+            retained_calls.append(
+                {
+                    "tool_call_index": tool_call_index,
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "raw_arguments": call.raw_arguments,
+                    "provider_item_id": call.provider_item_id,
+                    "provider_output_index": call.provider_output_index,
+                }
+            )
+        if retained_calls:
+            authority["tool_calls"] = retained_calls
+        if message.tool_is_error:
+            authority["tool_is_error"] = True
+        if len(authority) > 1:
+            replay.append(authority)
     if (
-        not carriers
+        not replay
         and request.provider_thinking_config is None
         and request.reasoning_context is None
     ):
@@ -352,7 +394,7 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
     return sha256_json(
         {
             "request_sha256": sha256_json(request),
-            "provider_reasoning": carriers,
+            "provider_replay": replay,
             "provider_thinking_config": request.provider_thinking_config,
             "reasoning_context": request.reasoning_context,
         }
@@ -423,6 +465,7 @@ class GatewayEvent(ContractModel):
     text_delta: str | None = None
     reasoning_summary_output_index: int | None = Field(default=None, ge=0)
     reasoning_summary_index: int | None = Field(default=None, ge=0)
+    reasoning_item_id: str | None = Field(default=None, min_length=1, max_length=256)
     reasoning_block_index: int | None = Field(default=None, ge=0)
     """Provider content-block (or output-item) index grouping reasoning events."""
     thinking_signature: str | None = None
@@ -454,8 +497,9 @@ class GatewayEvent(ContractModel):
                 self.text_delta is None
                 or self.reasoning_summary_output_index is None
                 or self.reasoning_summary_index is None
+                or self.reasoning_item_id is None
             ):
-                raise ValueError("reasoning summary deltas require output, summary, and text")
+                raise ValueError("reasoning summary deltas require item, output, summary, and text")
         elif self.kind == GatewayEventKind.THINKING_DELTA:
             if self.text_delta is None or self.reasoning_block_index is None:
                 raise ValueError("thinking deltas require block index and text")
@@ -466,8 +510,12 @@ class GatewayEvent(ContractModel):
             if self.redacted_thinking_data is None or self.reasoning_block_index is None:
                 raise ValueError("redacted thinking requires block index and data")
         elif self.kind == GatewayEventKind.ENCRYPTED_REASONING:
-            if self.encrypted_content is None or self.reasoning_block_index is None:
-                raise ValueError("encrypted reasoning requires block index and content")
+            if (
+                self.encrypted_content is None
+                or self.reasoning_block_index is None
+                or self.reasoning_item_id is None
+            ):
+                raise ValueError("encrypted reasoning requires item, block index, and content")
         elif self.kind == GatewayEventKind.TOOL_CALL_STARTED:
             if self.tool_call_index is None or self.tool_call_id is None or self.tool_name is None:
                 raise ValueError("tool-call start requires index, ID, and name")

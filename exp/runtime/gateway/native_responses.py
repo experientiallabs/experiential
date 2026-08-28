@@ -19,6 +19,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
+    EncryptedReasoningBlock,
     GatewayMessage,
     GatewayRequest,
 )
@@ -145,22 +146,112 @@ def remember_turn(
     if bool(data.get("refusal")):
         return
     text = str(data.get("text") or "")
+    raw_message_item_id = data.get("message_item_id")
+    raw_message_output_index = data.get("message_output_index")
+    message_item_id: str | None
+    message_output_index: int | None
+    if raw_message_item_id is None and raw_message_output_index is None:
+        message_item_id = None
+        message_output_index = None
+    elif (
+        isinstance(raw_message_item_id, str)
+        and bool(raw_message_item_id)
+        and isinstance(raw_message_output_index, int)
+        and not isinstance(raw_message_output_index, bool)
+        and raw_message_output_index >= 0
+    ):
+        message_item_id = raw_message_item_id
+        message_output_index = raw_message_output_index
+    else:
+        raise ValueError("Responses assistant message identity is invalid")
     raw_calls = data.get("tool_calls")
-    tool_calls = tuple(
-        ToolCall(
-            call_id=str(call["call_id"]),
-            name=str(call["name"]),
-            arguments=json.loads(str(call["arguments"])),
-            raw_arguments=str(call["arguments"]),
+    tool_calls_list: list[ToolCall] = []
+    for call in raw_calls if isinstance(raw_calls, list) else ():
+        if not isinstance(call, dict):
+            raise ValueError("Responses retained tool call must be an object")
+        item_id = call.get("item_id")
+        output_index = call.get("output_index")
+        if item_id is None and output_index is None:
+            provider_item_id = None
+            provider_output_index = None
+        elif (
+            isinstance(item_id, str)
+            and bool(item_id)
+            and isinstance(output_index, int)
+            and not isinstance(output_index, bool)
+            and output_index >= 0
+        ):
+            provider_item_id = item_id
+            provider_output_index = output_index
+        else:
+            raise ValueError("Responses retained tool call identity is invalid")
+        raw_arguments = str(call["arguments"])
+        tool_calls_list.append(
+            ToolCall(
+                call_id=str(call["call_id"]),
+                name=str(call["name"]),
+                arguments=json.loads(raw_arguments),
+                raw_arguments=raw_arguments,
+                provider_item_id=provider_item_id,
+                provider_output_index=provider_output_index,
+            )
         )
-        for call in (raw_calls if isinstance(raw_calls, list) else ())
+    tool_calls = tuple(tool_calls_list)
+    raw_encrypted = data.get("encrypted_reasoning", [])
+    if not isinstance(raw_encrypted, list):
+        raise ValueError("Responses encrypted reasoning must be an array")
+    encrypted: list[tuple[int, EncryptedReasoningBlock]] = []
+    indexes: set[int] = set()
+    for item in raw_encrypted:
+        if not isinstance(item, dict):
+            raise ValueError("Responses encrypted reasoning item must be an object")
+        output_index = item.get("output_index")
+        item_id = item.get("item_id")
+        encrypted_content = item.get("encrypted_content")
+        if (
+            not isinstance(output_index, int)
+            or isinstance(output_index, bool)
+            or output_index < 0
+            or output_index in indexes
+            or not isinstance(item_id, str)
+            or not item_id
+            or not isinstance(encrypted_content, str)
+            or not encrypted_content
+        ):
+            raise ValueError("Responses encrypted reasoning item is invalid")
+        indexes.add(output_index)
+        encrypted.append(
+            (
+                output_index,
+                EncryptedReasoningBlock(
+                    id=item_id,
+                    encrypted_content=encrypted_content,
+                    output_index=output_index,
+                ),
+            )
+        )
+    encrypted.sort(key=lambda item: item[0])
+    provider_reasoning = tuple(block for _index, block in encrypted)
+    if provider_reasoning and any(
+        call.provider_item_id is None or call.provider_output_index is None for call in tool_calls
+    ):
+        raise ValueError("Responses retained tool calls require provider item identity and order")
+    indexed_output = bool(provider_reasoning) or any(
+        call.provider_output_index is not None for call in tool_calls
     )
-    if not text and not tool_calls:
+    if text and indexed_output and message_output_index is None:
+        raise ValueError(
+            "Responses retained assistant text requires provider item identity and order"
+        )
+    if not text and not tool_calls and not provider_reasoning:
         return
     message = GatewayMessage(
         role="assistant",
         content=text or None,
         tool_calls=tool_calls,
+        provider_reasoning=provider_reasoning,
+        provider_item_id=message_item_id,
+        provider_output_index=message_output_index,
     )
     continuations.remember_now(
         namespace=context.namespace,
@@ -213,4 +304,5 @@ def responses_envelope(request: GatewayRequest) -> JsonObject:
         ],
         "max_output_tokens": request.maximum_output_tokens,
         "previous_response_id": request.previous_response_id,
+        "include_encrypted_reasoning": request.include_encrypted_reasoning,
     }

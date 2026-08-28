@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
 from exp.runtime.gateway.guardrails.client import InternalClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
@@ -21,6 +21,27 @@ from exp.runtime.gateway.guardrails.contracts import (
 from exp.runtime.gateway.guardrails.store import GuardrailPolicyStore
 
 _logger = logging.getLogger(__name__)
+
+
+def _preserves_provider_reasoning_authority(
+    original: Sequence[GatewayMessage],
+    replacement: Sequence[GatewayMessage],
+) -> bool:
+    """Return whether a classifier preserved every context-bound reasoning turn."""
+    original_carrier_indexes = tuple(
+        index for index, message in enumerate(original) if message.provider_reasoning
+    )
+    replacement_carrier_indexes = tuple(
+        index for index, message in enumerate(replacement) if message.provider_reasoning
+    )
+    if not original_carrier_indexes:
+        return not replacement_carrier_indexes
+    if not replacement_carrier_indexes:
+        return all(message.role in {"system", "developer", "user"} for message in replacement)
+    if replacement_carrier_indexes != original_carrier_indexes:
+        return False
+    bound = original_carrier_indexes[-1]
+    return len(original) > bound and tuple(replacement[: bound + 1]) == tuple(original[: bound + 1])
 
 
 class GuardrailEngine:
@@ -210,6 +231,13 @@ class GuardrailEngine:
             return request
         if check.action is GuardrailAction.MODIFY:
             if verdict.replacement_messages is None:
+                raise GuardrailRejected(
+                    guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
+                )
+            if not _preserves_provider_reasoning_authority(
+                request.messages,
+                verdict.replacement_messages,
+            ):
                 raise GuardrailRejected(
                     guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
                 )

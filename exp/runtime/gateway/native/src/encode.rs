@@ -86,7 +86,8 @@ impl ChatSseEncoder {
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
             // The Chat wire has no reasoning representation, so provider
             // reasoning follows the summary path and is deliberately dropped.
-            Event::ReasoningSummaryDelta { .. }
+            Event::ProviderOutputItemStarted { .. }
+            | Event::ReasoningSummaryDelta { .. }
             | Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }

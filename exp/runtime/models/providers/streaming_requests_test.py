@@ -1463,6 +1463,56 @@ def test_responses_payload_forwards_include_and_replays_reasoning_items() -> Non
     assert items[2] == {"role": "assistant", "content": "done"}
 
 
+def test_responses_payload_acquires_internal_reasoning_for_gateway_continuation() -> None:
+    """Gateway-stored reasoning stays available even when the caller hides it."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+    )
+
+    retained = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert retained["store"] is False
+    assert retained["include"] == ["reasoning.encrypted_content"]
+
+    caller_opt_out = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request.model_copy(update={"response_store": False}),
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert "include" not in caller_opt_out
+
+    stored = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request.model_copy(update={"response_store": True}),
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert stored["include"] == ["reasoning.encrypted_content"]
+
+    caller_public = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request.model_copy(update={"response_store": False, "include_encrypted_reasoning": True}),
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert caller_public["include"] == ["reasoning.encrypted_content"]
+
+    non_reasoning = openai_responses_stream_payload(
+        "plain-model",
+        request,
+        supports_temperature=True,
+        supports_reasoning=False,
+    )
+    assert "include" not in non_reasoning
+
+
 def test_route_rejects_encrypted_reasoning_outside_native_responses() -> None:
     """Encrypted reasoning requires every waterfall rung to speak native Responses."""
     responses = GatewayWireProfile(

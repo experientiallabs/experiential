@@ -9,7 +9,9 @@ from collections.abc import Coroutine
 
 import pytest
 
+from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import (
+    EncryptedReasoningBlock,
     GatewayApiSurface,
     GatewayFailureClass,
     GatewayMessage,
@@ -274,6 +276,100 @@ def test_input_chain_runs_once_and_can_transform_the_request() -> None:
     assert result.messages == replacement
     assert classifier.input_calls == 1
     assert engine.input_invocations == 1
+
+
+def _reasoning_request() -> GatewayRequest:
+    """Build one provider-reasoning tool continuation."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="Use a tool"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-one",
+                        name="lookup",
+                        arguments={"query": "safe"},
+                        raw_arguments='{"query":"safe"}',
+                        provider_item_id="fc-one",
+                        provider_output_index=1,
+                    ),
+                ),
+                provider_reasoning=(
+                    EncryptedReasoningBlock(
+                        id="rs-one",
+                        encrypted_content="authenticated hidden state",
+                        output_index=0,
+                    ),
+                ),
+            ),
+            GatewayMessage(role="tool", tool_call_id="call-one", content="secret result"),
+        ),
+    )
+
+
+def test_input_modify_can_redact_only_history_after_authenticated_reasoning() -> None:
+    """A modifier may redact tool output without rebinding the authenticated prefix."""
+    request = _reasoning_request()
+    replacement = (
+        *request.messages[:2],
+        GatewayMessage(role="tool", tool_call_id="call-one", content="[REDACTED]"),
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    result = _awaited(
+        engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0)
+    )
+    assert result.messages == replacement
+
+
+def test_input_modify_can_remove_provider_reasoning_with_all_bound_history() -> None:
+    """User-only redaction may clear all provider-private history and authority."""
+    request = _reasoning_request()
+    replacement = (GatewayMessage(role="user", content="fully redacted"),)
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    result = _awaited(
+        engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0)
+    )
+    assert result.messages == replacement
+
+
+def test_input_modify_rejects_carrier_stripping_while_tool_history_survives() -> None:
+    """Carrier-bound assistant and tool turns cannot survive without the carrier."""
+    request = _reasoning_request()
+    replacement = (
+        request.messages[0],
+        request.messages[1].model_copy(update={"provider_reasoning": ()}),
+        request.messages[2],
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    with pytest.raises(GuardrailRejected) as raised:
+        _awaited(engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0))
+    assert raised.value.failure.safe_details["action"] == GuardrailAction.ERROR.value
 
 
 def test_input_block_is_terminal_and_content_free() -> None:

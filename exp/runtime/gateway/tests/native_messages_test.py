@@ -26,6 +26,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -58,9 +59,16 @@ _DRIVER_SOURCE = textwrap.dedent(
     def main() -> None:
         """Compose the control plane, announce the public port, and serve."""
         config = json.loads(sys.argv[1])
+        if "openai_base_url" in config:
+            import exp.runtime.models.registry as model_registry
+
+            model_registry.OPENAI_BASE_URL = config["openai_base_url"]
+        environment = {"TEST_PROVIDER_KEY": os.environ["TEST_PROVIDER_KEY"]}
+        if "OPENAI_API_KEY" in os.environ:
+            environment["OPENAI_API_KEY"] = os.environ["OPENAI_API_KEY"]
         components = load_gateway_components(
             Path(config["root"]),
-            environment={"TEST_PROVIDER_KEY": os.environ["TEST_PROVIDER_KEY"]},
+            environment=environment,
         )
         control_plane = NativeControlPlane(
             components,
@@ -231,6 +239,123 @@ class _SseUpstream(BaseHTTPRequestHandler):
         del format, args
 
 
+class _ResponsesUpstream(BaseHTTPRequestHandler):
+    """Native Responses SSE mock that issues one opaque tool continuation."""
+
+    payloads: list[JsonObject] = []
+    payloads_lock = threading.Lock()
+    raw_arguments = '{ "query" : "λ" }'
+    encrypted_content = "provider-opaque-state"
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract.
+        """Return a tool turn first and visible text after its function output."""
+        length = int(self.headers.get("content-length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        with self.payloads_lock:
+            self.payloads.append(payload)
+        input_items = payload.get("input", [])
+        continued = any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        )
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        try:
+            if continued:
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "item_id": "msg_provider_continued",
+                            "content_index": 0,
+                            "delta": "continued-ok",
+                        }
+                    )
+                )
+            else:
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": {
+                                "id": "rs_provider",
+                                "type": "reasoning",
+                                "summary": [],
+                                "encrypted_content": self.encrypted_content,
+                                "status": "completed",
+                            },
+                        }
+                    )
+                )
+                tool = {
+                    "id": "fc_provider",
+                    "type": "function_call",
+                    "call_id": "call-one",
+                    "name": "lookup",
+                    "arguments": self.raw_arguments,
+                }
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": 1,
+                            "item": {**tool, "status": "in_progress"},
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 1,
+                            "item": {**tool, "status": "completed"},
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 2,
+                            "item": {
+                                "id": "rs_provider_2",
+                                "type": "reasoning",
+                                "summary": [],
+                                "encrypted_content": "provider-opaque-state-2",
+                                "status": "completed",
+                            },
+                        }
+                    )
+                )
+            self.wfile.write(
+                _sse_frame(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": 9,
+                                "output_tokens": 4,
+                                "input_tokens_details": {"cached_tokens": 0},
+                                "output_tokens_details": {"reasoning_tokens": 2},
+                            },
+                        },
+                    }
+                )
+            )
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except OSError:
+            return
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Suppress request logs so test output cannot retain payload context."""
+        del format, args
+
+
 @dataclass(frozen=True)
 class _ServingEngine:
     """One live native serving subprocess and its access facts."""
@@ -335,6 +460,128 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
                     pass
             assert process.poll() is None, f"driver died: {stderr_log.read_text()}"
             assert time.monotonic() < live_deadline, "native engine never became live"
+            time.sleep(0.05)
+        yield _ServingEngine(port=port, raw_key=raw_key, root=root)
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+        exit_code = process.wait(timeout=20)
+        stderr_sink.close()
+        upstream.shutdown()
+        upstream.server_close()
+        upstream_thread.join(timeout=5)
+        assert exit_code == 0, f"driver exited {exit_code}: {stderr_log.read_text()}"
+
+
+@pytest.fixture(scope="module", name="responses_engine")
+def _responses_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine]:
+    """Serve a native OpenAI Responses route against a deterministic loopback provider."""
+    from exp.common.models import GatewayDeploymentCapabilities, GatewayTokenPrices
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    root = tmp_path_factory.mktemp("native-responses-root")
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    upstream = ThreadingHTTPServer((_HOST, 0), _ResponsesUpstream)
+    upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    upstream_thread.start()
+    manager, raw_key = _configured_gateway(
+        root,
+        base_url=f"http://{_HOST}:{upstream.server_address[1]}/compatible/v1",
+    )
+    upsert_connection(
+        root,
+        name="openai-responses-test",
+        connection=ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        root,
+        deployment_alias="responses",
+        connection_name="openai-responses-test",
+        provider_model="gpt-5.6-sol",
+        exact_model_id="responses-test-revision",
+        revision=None,
+        capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            supports_temperature=False,
+        ),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="responses",
+        alias_name="responses",
+        revision_id="revision-responses",
+        pool_id="responses",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="responses")
+    driver = root / "native_responses_driver.py"
+    driver.write_text(_DRIVER_SOURCE + "\n")
+    config = json.dumps(
+        {
+            "root": str(root),
+            "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
+            "openai_base_url": f"http://{_HOST}:{upstream.server_address[1]}/v1",
+        }
+    )
+    stderr_log = root / "driver-stderr.log"
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "TEST_PROVIDER_KEY": "provider-secret-canary",
+            "OPENAI_API_KEY": "openai-test-key",
+        }
+    )
+    stderr_sink = stderr_log.open("wb")
+    process = subprocess.Popen(  # noqa: S603 - the interpreter runs our generated driver.
+        [sys.executable, str(driver), config],
+        stdout=subprocess.PIPE,
+        stderr=stderr_sink,
+        env=environment,
+        text=True,
+    )
+    try:
+        announced_ports: list[int] = []
+
+        def _collect_announcements() -> None:
+            """Record every port announcement the driver prints on stdout."""
+            assert process.stdout is not None
+            for line in process.stdout:
+                announced_ports.append(int(json.loads(line)["port"]))
+
+        reader = threading.Thread(target=_collect_announcements, daemon=True)
+        reader.start()
+        live_deadline = time.monotonic() + 30
+        port = 0
+        while True:
+            if announced_ports:
+                port = announced_ports[-1]
+                try:
+                    live = httpx.get(f"http://{_HOST}:{port}/health/live", timeout=1.0)
+                    if live.status_code == 200:
+                        models = httpx.get(
+                            f"http://{_HOST}:{port}/v1/models",
+                            headers={"authorization": f"Bearer {raw_key}"},
+                            timeout=2.0,
+                        )
+                        if models.status_code == 200 and {
+                            item["id"] for item in models.json()["data"]
+                        } == {"coding", "responses"}:
+                            break
+                except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                    pass
+            assert process.poll() is None, f"driver died: {stderr_log.read_text()}"
+            assert time.monotonic() < live_deadline, "native Responses engine never became live"
             time.sleep(0.05)
         yield _ServingEngine(port=port, raw_key=raw_key, root=root)
     finally:
@@ -846,6 +1093,123 @@ def test_encrypted_reasoning_include_rejects_non_responses_routes(
     body = response.json()
     assert body["error"]["param"] == "include"
     assert body["error"]["code"] == "unsupported_parameter"
+
+
+def _responses_result(
+    response: httpx.Response, *, stream: bool
+) -> tuple[JsonObject, list[JsonObject]]:
+    """Return the terminal response and every SSE payload from one public response."""
+    assert response.status_code == 200, response.text
+    if not stream:
+        return response.json(), []
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    terminal = next(payload for payload in payloads if payload["type"] == "response.completed")
+    return terminal["response"], payloads
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_native_openai_responses_retains_hidden_reasoning_for_tool_continuation(
+    responses_engine: _ServingEngine,
+    stream: bool,
+) -> None:
+    """Buffered and streaming routes replay every private tool-turn identity and byte."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    headers = {"authorization": f"Bearer {responses_engine.raw_key}"}
+    first = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "input": "use the lookup tool",
+            "stream": stream,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        },
+        timeout=30.0,
+    )
+    first_body, first_events = _responses_result(first, stream=stream)
+    first_output = cast(list[JsonObject], first_body["output"])
+    public_items = list(first_output)
+    if stream:
+        public_items.extend(
+            cast(JsonObject, payload["item"])
+            for payload in first_events
+            if payload["type"] == "response.output_item.done"
+        )
+    reasoning_items = [item for item in public_items if item["type"] == "reasoning"]
+    assert reasoning_items
+    assert all("encrypted_content" not in item for item in reasoning_items)
+    call = next(item for item in first_output if item["type"] == "function_call")
+    assert cast(str, call["arguments"]).encode() == _ResponsesUpstream.raw_arguments.encode()
+
+    second = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "previous_response_id": first_body["id"],
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-one",
+                    "output": "tool-result",
+                }
+            ],
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    second_body, _second_events = _responses_result(second, stream=stream)
+    assert second_body["status"] == "completed"
+    second_output = cast(list[JsonObject], second_body["output"])
+    assert any(
+        content.get("text") == "continued-ok"
+        for item in second_output
+        if item["type"] == "message"
+        for content in cast(list[JsonObject], item["content"])
+    )
+
+    with _ResponsesUpstream.payloads_lock:
+        upstream = tuple(_ResponsesUpstream.payloads)
+    assert len(upstream) == 2
+    assert upstream[0]["include"] == ["reasoning.encrypted_content"]
+    replay = cast(list[JsonObject], upstream[1]["input"])
+    assert replay[-4:] == [
+        {
+            "type": "reasoning",
+            "id": "rs_provider",
+            "summary": [],
+            "encrypted_content": _ResponsesUpstream.encrypted_content,
+        },
+        {
+            "type": "function_call",
+            "id": "fc_provider",
+            "call_id": "call-one",
+            "name": "lookup",
+            "arguments": _ResponsesUpstream.raw_arguments,
+        },
+        {
+            "type": "reasoning",
+            "id": "rs_provider_2",
+            "summary": [],
+            "encrypted_content": "provider-opaque-state-2",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-one",
+            "output": "tool-result",
+        },
+    ]
 
 
 def test_store_false_responses_cannot_be_continued(engine: _ServingEngine) -> None:

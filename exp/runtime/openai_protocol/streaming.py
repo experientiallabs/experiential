@@ -16,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
+from exp.runtime.openai_protocol.response_streaming_state import ResponseReasoningState
 
 
 def stable_public_id(prefix: str, request_id: str) -> str:
@@ -251,33 +252,6 @@ class _ResponseToolState:
         }
 
 
-class _ResponseReasoningState:
-    """Accumulated reasoning-summary item with stable public output identity."""
-
-    def __init__(self, *, item_id: str, output_index: int) -> None:
-        """Initialize one reasoning item with no summary parts."""
-        self.item_id = item_id
-        self.output_index = output_index
-        self.parts: dict[int, str] = {}
-        self.encrypted_content: str | None = None
-
-    def item(self, *, completed: bool) -> JsonObject:
-        """Return the current official Responses reasoning item."""
-        item: JsonObject = {
-            "id": self.item_id,
-            "type": "reasoning",
-            "summary": (
-                [{"type": "summary_text", "text": text} for _, text in sorted(self.parts.items())]
-                if completed
-                else []
-            ),
-            "status": "completed" if completed else "in_progress",
-        }
-        if self.encrypted_content is not None:
-            item["encrypted_content"] = self.encrypted_content
-        return item
-
-
 class ResponsesSseEncoder:
     """Incremental Responses lifecycle encoder with one monotonic terminal event."""
 
@@ -300,7 +274,7 @@ class ResponsesSseEncoder:
         self._sequence = 0
         self._output_order: list[tuple[str, int]] = []
         self._tools: dict[int, _ResponseToolState] = {}
-        self._reasoning: dict[int, _ResponseReasoningState] = {}
+        self._reasoning: dict[int, ResponseReasoningState] = {}
         self._message_output_index: int | None = None
         self._message_id = stable_public_id("msg", request_id)
         self._text = ""
@@ -466,17 +440,21 @@ class ResponsesSseEncoder:
         if provider_output_index is None or summary_index is None:
             raise self._state_error("Responses reasoning delta omitted its indices.")
         return self._reasoning_summary_text(
-            provider_output_index, summary_index, _required_text(event.text_delta)
+            provider_output_index,
+            summary_index,
+            _required_text(event.text_delta),
+            item_id=event.reasoning_item_id,
         )
 
     def _ensure_reasoning_state(
-        self, provider_output_index: int, frames: list[str]
-    ) -> _ResponseReasoningState:
+        self, provider_output_index: int, frames: list[str], item_id: str | None = None
+    ) -> ResponseReasoningState:
         """Create one stable reasoning output item on first use."""
         state = self._reasoning.get(provider_output_index)
         if state is None:
-            state = _ResponseReasoningState(
-                item_id=stable_public_id("rs", f"{self.response_id}:{provider_output_index}"),
+            state = ResponseReasoningState(
+                item_id=item_id
+                or stable_public_id("rs", f"{self.response_id}:{provider_output_index}"),
                 output_index=len(self._output_order),
             )
             self._reasoning[provider_output_index] = state
@@ -486,10 +464,15 @@ class ResponsesSseEncoder:
                     "response.output_item.added",
                     {
                         "output_index": state.output_index,
-                        "item": state.item(completed=False),
+                        "item": state.item(
+                            completed=False,
+                            include_encrypted_content=self.request.include_encrypted_reasoning,
+                        ),
                     },
                 )
             )
+        elif item_id is not None and state.item_id != item_id:
+            raise self._state_error("Responses reasoning item changed provider identity.")
         return state
 
     def _encrypted_reasoning(self, event: GatewayEvent) -> tuple[str, ...]:
@@ -497,16 +480,23 @@ class ResponsesSseEncoder:
         if event.reasoning_block_index is None or event.encrypted_content is None:
             raise self._state_error("Responses encrypted reasoning omitted its payload.")
         frames: list[str] = []
-        state = self._ensure_reasoning_state(event.reasoning_block_index, frames)
+        state = self._ensure_reasoning_state(
+            event.reasoning_block_index, frames, event.reasoning_item_id
+        )
         state.encrypted_content = event.encrypted_content
         return tuple(frames)
 
     def _reasoning_summary_text(
-        self, provider_output_index: int, summary_index: int, delta: str
+        self,
+        provider_output_index: int,
+        summary_index: int,
+        delta: str,
+        *,
+        item_id: str | None = None,
     ) -> tuple[str, ...]:
         """Emit one summary text delta, opening its item and part as needed."""
         frames: list[str] = []
-        state = self._ensure_reasoning_state(provider_output_index, frames)
+        state = self._ensure_reasoning_state(provider_output_index, frames, item_id)
         if summary_index not in state.parts:
             state.parts[summary_index] = ""
             frames.append(
@@ -608,7 +598,7 @@ class ResponsesSseEncoder:
         frames.append(self._event(event_name, {"response": self._response(status, event.failure)}))
         return tuple(frames)
 
-    def _close_reasoning(self, state: _ResponseReasoningState) -> tuple[str, ...]:
+    def _close_reasoning(self, state: ResponseReasoningState) -> tuple[str, ...]:
         """Complete every summary part and its containing reasoning item."""
         frames: list[str] = []
         for summary_index, text in sorted(state.parts.items()):
@@ -639,7 +629,10 @@ class ResponsesSseEncoder:
                 "response.output_item.done",
                 {
                     "output_index": state.output_index,
-                    "item": state.item(completed=True),
+                    "item": state.item(
+                        completed=True,
+                        include_encrypted_content=self.request.include_encrypted_reasoning,
+                    ),
                 },
             )
         )
@@ -734,7 +727,10 @@ class ResponsesSseEncoder:
             output.append(
                 self._message_item(completed=status != "in_progress")
                 if kind == "message"
-                else self._reasoning[index].item(completed=status != "in_progress")
+                else self._reasoning[index].item(
+                    completed=status != "in_progress",
+                    include_encrypted_content=self.request.include_encrypted_reasoning,
+                )
                 if kind == "reasoning"
                 else self._tools[index].item(completed=status != "in_progress")
             )

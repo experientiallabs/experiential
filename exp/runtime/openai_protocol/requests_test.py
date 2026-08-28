@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import cast
 
 import pytest
 
@@ -692,9 +693,16 @@ def test_responses_decoder_accepts_the_codex_request_shape() -> None:
                 },
                 {
                     "type": "function_call",
+                    "id": "fc_1",
                     "call_id": "call-1",
                     "name": "search",
                     "arguments": "{}",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": [],
+                    "encrypted_content": "second-blob==",
                 },
                 {"type": "function_call_output", "call_id": "call-1", "output": "found"},
             ],
@@ -714,6 +722,158 @@ def test_responses_decoder_accepts_the_codex_request_shape() -> None:
     assert blocks[0].kind == "encrypted_reasoning"
     assert blocks[0].id == "rs_1"
     assert blocks[0].encrypted_content == "blob=="
+    trailing_block = request.messages[2].provider_reasoning[0]
+    assert trailing_block.kind == "encrypted_reasoning"
+    assert trailing_block.id == "rs_2"
+    assert trailing_block.encrypted_content == "second-blob=="
+    payload = openai_responses_stream_payload(
+        "gpt-fixture",
+        request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[1:] == [
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [],
+            "encrypted_content": "blob==",
+        },
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call-1",
+            "name": "search",
+            "arguments": "{}",
+        },
+        {
+            "type": "reasoning",
+            "id": "rs_2",
+            "summary": [],
+            "encrypted_content": "second-blob==",
+        },
+        {"type": "function_call_output", "call_id": "call-1", "output": "found"},
+    ]
+
+
+def test_responses_decoder_rejects_reasoning_without_item_id() -> None:
+    """Opaque reasoning replay requires the provider-issued item identity."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [{"type": "reasoning", "summary": [], "encrypted_content": "blob=="}],
+            }
+        )
+
+    assert raised.value.status_code == 400
+    assert raised.value.detail.param == "input.0.id"
+
+
+def test_responses_decoder_replays_output_message_in_provider_order() -> None:
+    """A stateless output transcript keeps reasoning, message, and call order."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_0",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "I will look that up.",
+                            "annotations": [],
+                            "logprobs": [],
+                        }
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_2",
+                    "call_id": "call-2",
+                    "name": "lookup",
+                    "arguments": '{ "q" : "x" }',
+                },
+                {"type": "function_call_output", "call_id": "call-2", "output": "found"},
+            ],
+        }
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-fixture",
+        decoded.request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert [(item["type"], item.get("id")) for item in payload_input[:3]] == [
+        ("reasoning", "rs_0"),
+        ("message", "msg_1"),
+        ("function_call", "fc_2"),
+    ]
+    message_content = cast(list[JsonObject], payload_input[1]["content"])
+    assert message_content[0]["text"] == "I will look that up."
+    assert payload_input[2]["arguments"] == '{ "q" : "x" }'
+
+
+def test_responses_decoder_orders_function_calls_without_optional_item_ids() -> None:
+    """A legacy ID-less call keeps its provider output index beside identified calls."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_0",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "first",
+                    "arguments": '{ "position" : 1 }',
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_2",
+                    "call_id": "call-2",
+                    "name": "second",
+                    "arguments": '{"position":2}',
+                },
+            ],
+        }
+    )
+    calls = decoded.request.messages[0].tool_calls
+    assert [(call.provider_item_id, call.provider_output_index) for call in calls] == [
+        (None, 1),
+        ("fc_2", 2),
+    ]
+    payload = openai_responses_stream_payload(
+        "gpt-fixture",
+        decoded.request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert [(item["type"], item.get("id")) for item in payload_input] == [
+        ("reasoning", "rs_0"),
+        ("function_call", None),
+        ("function_call", "fc_2"),
+    ]
+    assert [item["arguments"] for item in payload_input[1:]] == [
+        '{ "position" : 1 }',
+        '{"position":2}',
+    ]
 
 
 def test_responses_decoder_keeps_orphaned_reasoning_as_its_own_turn() -> None:

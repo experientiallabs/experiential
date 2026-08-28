@@ -23,7 +23,7 @@ use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::compact_json;
 use crate::encode_responses::{completed_responses_body, ResponsesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
-use crate::events::{CompletedToolCall, Event, Usage};
+use crate::events::{CompletedToolCall, Event, ProviderOutputItemKind, Usage};
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, event_retained_bytes, track_event};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
@@ -268,8 +268,10 @@ pub(crate) async fn responses(
 #[derive(Default)]
 struct ResponsesRetention {
     text: String,
+    message_output: Option<(u32, String)>,
     refusal: bool,
-    tool_calls: Vec<CompletedToolCall>,
+    tool_calls: Vec<(u32, CompletedToolCall)>,
+    encrypted_reasoning: Vec<(u32, String, String)>,
     retained_bytes: usize,
     overflowed: bool,
 }
@@ -287,13 +289,31 @@ impl ResponsesRetention {
             // the stream keeps flowing but nothing oversize is remembered.
             self.overflowed = true;
             self.text.clear();
+            self.message_output = None;
             self.tool_calls.clear();
+            self.encrypted_reasoning.clear();
             return;
         }
         match event {
+            Event::ProviderOutputItemStarted {
+                output_index,
+                item_id,
+                kind: ProviderOutputItemKind::Message,
+            } => self.message_output = Some((*output_index, item_id.clone())),
             Event::TextDelta(delta) => self.text.push_str(delta),
             Event::RefusalDelta(_) => self.refusal = true,
-            Event::ToolCallCompleted { call, .. } => self.tool_calls.push(call.clone()),
+            Event::ToolCallCompleted { index, call } => {
+                self.tool_calls.push((*index, call.clone()));
+            }
+            Event::EncryptedReasoning {
+                output_index,
+                item_id,
+                encrypted_content,
+            } => self.encrypted_reasoning.push((
+                *output_index,
+                item_id.clone(),
+                encrypted_content.clone(),
+            )),
             _ => {}
         }
     }
@@ -304,11 +324,22 @@ fn remember_argument(request_id: &str, retention: &ResponsesRetention) -> String
     compact_json(&json!({
         "request_id": request_id,
         "text": retention.text,
+        "message_output_index": retention.message_output.as_ref().map(|(index, _id)| index),
+        "message_item_id": retention.message_output.as_ref().map(|(_index, id)| id),
         "refusal": retention.refusal,
+        "encrypted_reasoning": retention.encrypted_reasoning.iter().map(
+            |(output_index, item_id, encrypted_content)| json!({
+                "output_index": output_index,
+                "item_id": item_id,
+                "encrypted_content": encrypted_content,
+            })
+        ).collect::<Vec<Value>>(),
         "tool_calls": retention
             .tool_calls
             .iter()
-            .map(|call| json!({
+            .map(|(output_index, call)| json!({
+                "output_index": call.provider_item_id.as_ref().map(|_| output_index),
+                "item_id": call.provider_item_id,
                 "call_id": call.call_id,
                 "name": call.name,
                 "arguments": call.raw_arguments,
@@ -491,12 +522,10 @@ async fn respond_from_responses_events(
     // Retention runs while the attempt row is still in flight so the control
     // plane can resolve its namespaced continuation context, and before the
     // body is answered so an oversize continuation fails closed like python.
-    let retention = ResponsesRetention {
-        text: aggregated.text.clone(),
-        refusal: !aggregated.refusal.is_empty() || refusal_completed.is_some(),
-        tool_calls: aggregated.tool_calls.clone(),
-        ..ResponsesRetention::default()
-    };
+    let mut retention = ResponsesRetention::default();
+    for event in &events {
+        retention.track(event);
+    }
     let remembered = remember_continuation(state, &admission.request_id, &retention).await;
     let settled = if let Some(refusal) = &refusal_completed {
         guard
