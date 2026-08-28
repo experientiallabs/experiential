@@ -324,3 +324,17 @@ def test_setup_accepts_a_bedrock_api_key_without_an_access_key_id() -> None:
 
     assert connection.catalog_config().bedrock_auth_mode == "api_key"
     assert connection.catalog_config().aws_access_key_id_env is None
+
+
+def test_absent_bedrock_fields_preserve_legacy_setup_payload_shape() -> None:
+    """New setup metadata remains absent from pre-Bedrock connection shapes."""
+    connection = ProviderConnection(
+        name="openai-main",
+        provider="openai",
+        api_key_env="OPENAI_API_KEY",
+    )
+
+    payload = connection.model_dump(mode="json", exclude_none=False)
+
+    assert "aws_access_key_id_env" not in payload
+    assert "bedrock_auth_mode" not in payload

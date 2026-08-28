@@ -38,6 +38,11 @@ _FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openroute
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
 
+def _exclude_absent(value: object) -> bool:
+    """Keep new optional connection metadata out of legacy canonical payloads."""
+    return value is None
+
+
 def _normalize_base_url(value: str) -> str:
     """Return the stable endpoint spelling used for connection identity."""
     parsed = urlsplit(value)
@@ -84,8 +89,15 @@ class ConnectionConfig(ContractModel):
     api_version: str | None = Field(default=None, max_length=64)
     azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=64)
-    aws_access_key_id_env: str | None = Field(default=None, max_length=256)
-    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    aws_access_key_id_env: str | None = Field(
+        default=None,
+        max_length=256,
+        exclude_if=_exclude_absent,
+    )
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = Field(
+        default=None,
+        exclude_if=_exclude_absent,
+    )
 
     @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod

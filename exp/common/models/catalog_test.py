@@ -628,6 +628,24 @@ def test_bedrock_connection_accepts_complete_key_pair_without_hashing_secret_poi
         ConnectionConfig(provider="bedrock", base_url="https://bedrock.example.test")
 
 
+def test_absent_bedrock_fields_preserve_legacy_connection_payload_shape() -> None:
+    """Optional Bedrock metadata does not rewrite unrelated canonical payloads."""
+    legacy = ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")
+    payload = legacy.model_dump(mode="json", exclude_none=False)
+
+    assert "aws_access_key_id_env" not in payload
+    assert "bedrock_auth_mode" not in payload
+
+    explicit = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="BEDROCK_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="BEDROCK_ACCESS_KEY_ID",
+        bedrock_auth_mode="access_key_pair",
+    ).model_dump(mode="json", exclude_none=False)
+    assert explicit["aws_access_key_id_env"] == "BEDROCK_ACCESS_KEY_ID"
+    assert explicit["bedrock_auth_mode"] == "access_key_pair"
+
+
 def test_azure_and_bedrock_models_require_explicit_capabilities(tmp_path: Path) -> None:
     """Provider names do not imply Azure or Bedrock protocol support or prices."""
     azure_path = tmp_path / "azure.toml"

@@ -34,6 +34,11 @@ SETUP_PROVIDERS = frozenset(
 )
 
 
+def _exclude_absent(value: object) -> bool:
+    """Keep new optional Bedrock metadata out of legacy setup payloads."""
+    return value is None
+
+
 class ProviderSetupError(ValueError):
     """Provider setup cannot be applied without replacing or losing catalog state."""
 
@@ -48,8 +53,15 @@ class ProviderConnection(ContractModel):
     api_version: str | None = Field(default=None, max_length=64)
     azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=64)
-    aws_access_key_id_env: str | None = Field(default=None, max_length=256)
-    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    aws_access_key_id_env: str | None = Field(
+        default=None,
+        max_length=256,
+        exclude_if=_exclude_absent,
+    )
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = Field(
+        default=None,
+        exclude_if=_exclude_absent,
+    )
 
     @model_validator(mode="after")
     def _require_supported_connection_shape(self) -> ProviderConnection:
