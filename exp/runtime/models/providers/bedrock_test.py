@@ -853,7 +853,7 @@ def test_explicit_clients_ignore_hostile_customer_endpoint_metadata(
         encoding="utf-8",
     )
     monkeypatch.setattr(Loader, "CUSTOMER_DATA_PATH", str(customer_data))
-    bedrock_endpoints.bedrock_runtime_origin.cache_clear()
+    bedrock_endpoints.resolve_bedrock_runtime_endpoint.cache_clear()
     try:
         if auth_mode == "bearer":
             runtime = create_bedrock_runtime_client(
@@ -889,7 +889,7 @@ def test_explicit_clients_ignore_hostile_customer_endpoint_metadata(
             "https://bedrock-runtime.us-west-2.amazonaws.com/"
         )
     finally:
-        bedrock_endpoints.bedrock_runtime_origin.cache_clear()
+        bedrock_endpoints.resolve_bedrock_runtime_endpoint.cache_clear()
 
 
 def test_real_bearer_request_emits_only_the_pinned_authorization_token() -> None:
@@ -1057,6 +1057,40 @@ def test_converse_stream_url_uses_the_region_partition_endpoint(
     )
 
 
+@pytest.mark.parametrize("region", ("us-west-2-fips", "fips-us-west-2"))
+@pytest.mark.parametrize("auth_mode", ("pair", "bearer"))
+def test_native_fips_dispatch_uses_official_origin_and_canonical_signing_region(
+    region: str,
+    auth_mode: str,
+) -> None:
+    """Both FIPS spellings match boto endpoint and SigV4 behavior."""
+    if auth_mode == "bearer":
+        client = BedrockClient(
+            model=_snapshot(),
+            region=region,
+            environment={},
+            bearer_token="bedrock-bearer",
+            runtime_factory=None,
+        )
+    else:
+        client = BedrockClient(
+            model=_snapshot(),
+            region=region,
+            environment={},
+            aws_access_key_id="AKIAEXPLICITKEY001",
+            aws_secret_access_key="explicit-secret-access-key",
+            runtime_factory=None,
+        )
+    url = client.converse_stream_url()
+
+    assert url.startswith("https://bedrock-runtime-fips.us-west-2.amazonaws.com/model/")
+    headers = client.sign_gateway_dispatch(url=url, body='{"messages":[]}')
+    if auth_mode == "bearer":
+        assert headers["authorization"] == "Bearer bedrock-bearer"
+    else:
+        assert "/us-west-2/bedrock/aws4_request" in headers["Authorization"]
+
+
 def test_converse_stream_url_caches_bundled_endpoint_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1070,7 +1104,7 @@ def test_converse_stream_url_caches_bundled_endpoint_metadata(
         return real_loader()
 
     monkeypatch.setattr(bedrock_endpoints, "built_in_botocore_loader", counted_loader)
-    bedrock_endpoints.bedrock_runtime_origin.cache_clear()
+    bedrock_endpoints.resolve_bedrock_runtime_endpoint.cache_clear()
     client = BedrockClient(
         model=_snapshot(),
         region="us-west-2",
@@ -1081,7 +1115,7 @@ def test_converse_stream_url_caches_bundled_endpoint_metadata(
         first = client.converse_stream_url()
         second = client.converse_stream_url()
     finally:
-        bedrock_endpoints.bedrock_runtime_origin.cache_clear()
+        bedrock_endpoints.resolve_bedrock_runtime_endpoint.cache_clear()
 
     assert first == second
     assert calls == 1

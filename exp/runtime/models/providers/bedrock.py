@@ -26,6 +26,7 @@ from exp.common.models import (
 from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, GatewayWireProfile
 from exp.runtime.models.providers.bedrock_endpoints import (
     bedrock_runtime_origin,
+    bedrock_signing_region,
     built_in_botocore_loader,
 )
 from exp.runtime.models.providers.bedrock_requests import converse_request
@@ -629,7 +630,7 @@ class BedrockClient:
                 "accept": "application/vnd.amazon.eventstream",
             },
         )
-        auth_factory(frozen, "bedrock", region).add_auth(request)
+        auth_factory(frozen, "bedrock", bedrock_signing_region(region)).add_auth(request)
         return {str(name): str(value) for name, value in dict(request.headers).items()}
 
     def _call_with_retry(

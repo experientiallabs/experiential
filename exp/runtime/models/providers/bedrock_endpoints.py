@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from functools import cache
-from typing import Protocol, cast
+from typing import NamedTuple, Protocol, cast
 
 from exp.runtime.models.providers.transport import ProviderTransportError
 
@@ -23,13 +23,22 @@ class _EndpointResolver(Protocol):
         self,
         service_name: str,
         region_name: str,
+        *,
+        use_fips_endpoint: bool = False,
     ) -> Mapping[str, object] | None:
         """Resolve one service endpoint without constructing a client."""
 
 
+class BedrockRuntimeEndpoint(NamedTuple):
+    """Official runtime origin and canonical SigV4 region."""
+
+    origin: str
+    signing_region: str
+
+
 @cache
-def bedrock_runtime_origin(region_name: str) -> str:
-    """Resolve the HTTPS Bedrock Runtime origin from bundled AWS metadata."""
+def resolve_bedrock_runtime_endpoint(region_name: str) -> BedrockRuntimeEndpoint:
+    """Resolve the official origin and signing region from bundled metadata."""
     try:
         from botocore.regions import EndpointResolver
     except ImportError as exc:
@@ -38,7 +47,12 @@ def bedrock_runtime_origin(region_name: str) -> str:
         "_EndpointResolver",
         EndpointResolver(built_in_botocore_loader().load_data("endpoints")),
     )
-    endpoint = resolver.construct_endpoint("bedrock-runtime", region_name)
+    canonical_region, use_fips = _canonical_fips_region(region_name)
+    endpoint = resolver.construct_endpoint(
+        "bedrock-runtime",
+        canonical_region,
+        use_fips_endpoint=use_fips,
+    )
     hostname = None if endpoint is None else endpoint.get("hostname")
     protocols = () if endpoint is None else endpoint.get("protocols", ())
     if (
@@ -49,7 +63,29 @@ def bedrock_runtime_origin(region_name: str) -> str:
         raise ProviderTransportError(
             f"Bedrock has no HTTPS runtime endpoint for region {region_name!r}"
         )
-    return f"https://{hostname}"
+    return BedrockRuntimeEndpoint(
+        origin=f"https://{hostname}",
+        signing_region=canonical_region,
+    )
+
+
+def bedrock_runtime_origin(region_name: str) -> str:
+    """Return the official HTTPS Bedrock Runtime origin."""
+    return resolve_bedrock_runtime_endpoint(region_name).origin
+
+
+def bedrock_signing_region(region_name: str) -> str:
+    """Return the canonical region used in Bedrock SigV4 scope."""
+    return resolve_bedrock_runtime_endpoint(region_name).signing_region
+
+
+def _canonical_fips_region(region_name: str) -> tuple[str, bool]:
+    """Normalize either botocore-supported FIPS pseudo-region spelling."""
+    if region_name.startswith("fips-"):
+        return region_name.removeprefix("fips-"), True
+    if region_name.endswith("-fips"):
+        return region_name.removesuffix("-fips"), True
+    return region_name, False
 
 
 def built_in_botocore_loader() -> BotocoreLoader:
