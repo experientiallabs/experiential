@@ -63,6 +63,7 @@ def require_responses_continuation_channel(
         and request.response_store is False
         and not request.include_encrypted_reasoning
         and bool(request.tools)
+        and request.tool_choice != "none"
         and any(profile.fireworks_reasoning_route_sha256 is not None for profile in profiles)
     ):
         raise ProviderParameterError(

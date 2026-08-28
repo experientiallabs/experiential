@@ -154,6 +154,15 @@ def remember_turn(
             name=str(call["name"]),
             arguments=json.loads(str(call["arguments"])),
             raw_arguments=str(call["arguments"]),
+            provider_item_id=(
+                str(call["item_id"]) if isinstance(call.get("item_id"), str) else None
+            ),
+            provider_output_index=(
+                int(call["output_index"])
+                if isinstance(call.get("output_index"), int)
+                and not isinstance(call.get("output_index"), bool)
+                else None
+            ),
         )
         for call in (raw_calls if isinstance(raw_calls, list) else ())
     )
@@ -169,12 +178,15 @@ def remember_turn(
         if not isinstance(item, dict):
             raise ValueError("Responses encrypted reasoning item must be an object")
         output_index = item.get("output_index")
+        item_id = item.get("item_id")
         encrypted_content = item.get("encrypted_content")
         if (
             not isinstance(output_index, int)
             or isinstance(output_index, bool)
             or output_index < 0
             or output_index in indexes
+            or not isinstance(item_id, str)
+            or not item_id
             or not isinstance(encrypted_content, str)
             or not encrypted_content
         ):
@@ -183,11 +195,19 @@ def remember_turn(
         encrypted.append(
             (
                 output_index,
-                EncryptedReasoningBlock(encrypted_content=encrypted_content),
+                EncryptedReasoningBlock(
+                    id=item_id,
+                    encrypted_content=encrypted_content,
+                    output_index=output_index,
+                ),
             )
         )
     encrypted.sort(key=lambda item: item[0])
     provider_reasoning = tuple(block for _index, block in encrypted)
+    if provider_reasoning and any(
+        call.provider_item_id is None or call.provider_output_index is None for call in tool_calls
+    ):
+        raise ValueError("Responses retained tool calls require provider item identity and order")
     if carrier is not None:
         if not isinstance(carrier, str):
             raise ValueError("Responses reasoning carrier must be text")

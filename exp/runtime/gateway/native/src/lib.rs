@@ -359,6 +359,11 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .get("summary_index")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 delta: text,
             },
             "thinking_delta" => events::Event::ThinkingDelta { index, delta: text },
@@ -383,6 +388,11 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .get("output_index")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 encrypted_content: object
                     .get("encrypted_content")
                     .and_then(serde_json::Value::as_str)
@@ -424,6 +434,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                         .to_string(),
+                    provider_item_id: object
+                        .get("item_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
                     raw_arguments: object
                         .get("raw_arguments")
                         .and_then(serde_json::Value::as_str)

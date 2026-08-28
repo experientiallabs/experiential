@@ -348,6 +348,29 @@ def test_input_modify_can_remove_provider_reasoning_and_clear_its_authority() ->
     assert result.messages == replacement
 
 
+def test_input_modify_rejects_removing_carrier_while_retaining_tool_history() -> None:
+    """Carrier-bound assistant and tool turns cannot survive without the carrier."""
+    request = _reasoning_request()
+    replacement = (
+        request.messages[0],
+        request.messages[1].model_copy(update={"provider_reasoning": ()}),
+        request.messages[2],
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    with pytest.raises(GuardrailRejected) as raised:
+        _awaited(engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0))
+
+    assert raised.value.failure.safe_details["action"] == GuardrailAction.ERROR.value
+
+
 @pytest.mark.parametrize(
     "mutation",
     ("prior_context", "tool_call", "raw_arguments", "injected_reasoning"),

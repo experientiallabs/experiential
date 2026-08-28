@@ -102,11 +102,13 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
             "text": "",
             "refusal": False,
             "encrypted_reasoning": [
-                {"output_index": 4, "encrypted_content": "second-opaque-item"},
-                {"output_index": 1, "encrypted_content": "first-opaque-item"},
+                {"output_index": 2, "item_id": "rs-2", "encrypted_content": "second-opaque-item"},
+                {"output_index": 0, "item_id": "rs-0", "encrypted_content": "first-opaque-item"},
             ],
             "tool_calls": [
                 {
+                    "output_index": 1,
+                    "item_id": "fc-1",
                     "call_id": "call-one",
                     "name": "lookup",
                     "arguments": '{ "query" : "λ" }',
@@ -147,19 +149,22 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
     assert payload["input"] == [
         {
             "type": "reasoning",
+            "id": "rs-0",
             "summary": [],
             "encrypted_content": "first-opaque-item",
         },
         {
-            "type": "reasoning",
-            "summary": [],
-            "encrypted_content": "second-opaque-item",
-        },
-        {
             "type": "function_call",
+            "id": "fc-1",
             "call_id": "call-one",
             "name": "lookup",
             "arguments": '{ "query" : "λ" }',
+        },
+        {
+            "type": "reasoning",
+            "id": "rs-2",
+            "summary": [],
+            "encrypted_content": "second-opaque-item",
         },
         {
             "type": "function_call_output",
@@ -173,10 +178,10 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
     "encrypted",
     (
         "not-an-array",
-        [{"output_index": 0, "encrypted_content": ""}],
+        [{"output_index": 0, "item_id": "rs-0", "encrypted_content": ""}],
         [
-            {"output_index": 0, "encrypted_content": "one"},
-            {"output_index": 0, "encrypted_content": "duplicate"},
+            {"output_index": 0, "item_id": "rs-0", "encrypted_content": "one"},
+            {"output_index": 0, "item_id": "rs-1", "encrypted_content": "duplicate"},
         ],
     ),
 )
@@ -213,8 +218,18 @@ def test_remember_turn_rejects_mixed_provider_reasoning_without_storage() -> Non
                 "text": "",
                 "refusal": False,
                 "reasoning_content_carrier": _carrier(),
-                "encrypted_reasoning": [{"output_index": 0, "encrypted_content": "openai-opaque"}],
-                "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
+                "encrypted_reasoning": [
+                    {"output_index": 0, "item_id": "rs-0", "encrypted_content": "openai-opaque"}
+                ],
+                "tool_calls": [
+                    {
+                        "output_index": 1,
+                        "item_id": "fc-1",
+                        "call_id": "call-one",
+                        "name": "lookup",
+                        "arguments": "{}",
+                    }
+                ],
             },
         )
 

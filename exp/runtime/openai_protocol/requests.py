@@ -252,6 +252,7 @@ class _ResponseFunctionCall(_WireModel):
     """Completed Responses function call included as assistant history."""
 
     type: Literal["function_call"]
+    id: str | None = Field(default=None, min_length=1, max_length=256)
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     arguments: str = Field(max_length=4_000_000)
@@ -273,15 +274,10 @@ class _ReasoningSummaryPart(_WireModel):
 
 
 class _ResponseReasoningItem(_WireModel):
-    """One opaque reasoning item a stateless caller replays with its input.
-
-    ``encrypted_content`` is the round-trip payload; the display-only
-    ``summary`` parts are validated and dropped because the provider derives
-    the model-visible reasoning from the encrypted payload alone.
-    """
+    """One opaque provider reasoning item replayed byte-exact by a caller."""
 
     type: Literal["reasoning"]
-    id: str | None = Field(default=None, min_length=1, max_length=256)
+    id: str = Field(min_length=1, max_length=256)
     encrypted_content: str = Field(min_length=1)
     summary: tuple[_ReasoningSummaryPart, ...] = ()
 
@@ -467,8 +463,11 @@ def decode_responses(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     _validate_manifest(payload, RESPONSES_MANIFEST)
-    # The installed SDK's effort literal lags the newest provider tier
-    # ("ultra"), so the strict wire model owns reasoning validation.
+    input_items = payload.get("input")
+    if isinstance(input_items, list):
+        for index, item in enumerate(input_items):
+            if isinstance(item, dict) and item.get("type") == "reasoning" and "id" not in item:
+                raise invalid_field(f"input.{index}.id")
     _validate_official(_RESPONSES_OFFICIAL, payload, extension_fields={"top_k", "reasoning"})
     request = _validate_wire(_ResponsesRequest, payload)
     include_encrypted_reasoning = _include_encrypted_reasoning(request.include)
@@ -957,7 +956,11 @@ def _response_input_messages(
                     pending_reasoning.append(carrier)
             else:
                 pending_reasoning.append(
-                    EncryptedReasoningBlock(id=item.id, encrypted_content=item.encrypted_content)
+                    EncryptedReasoningBlock(
+                        id=item.id,
+                        encrypted_content=item.encrypted_content,
+                        output_index=index,
+                    )
                 )
         elif isinstance(item, _ResponseMessage):
             flush_calls()
@@ -977,7 +980,14 @@ def _response_input_messages(
                 id=item.call_id,
                 function=_FunctionCall(name=item.name, arguments=item.arguments),
             )
-            pending_calls.append(_tool_call(wire_call, f"input.{index}.arguments"))
+            pending_calls.append(
+                _tool_call(wire_call, f"input.{index}.arguments").model_copy(
+                    update={
+                        "provider_item_id": item.id,
+                        "provider_output_index": index,
+                    }
+                )
+            )
         else:
             flush_calls()
             flush_orphaned_reasoning()

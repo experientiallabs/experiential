@@ -614,6 +614,7 @@ mod tests {
                 call: crate::events::CompletedToolCall {
                     call_id: "call-one".to_string(),
                     name: "lookup".to_string(),
+                    provider_item_id: None,
                     raw_arguments: "{}".to_string(),
                 },
             },
@@ -644,7 +645,7 @@ mod tests {
                 .count(),
             1
         );
-        assert!(frames.iter().any(|frame| frame.contains(&expected)));
+        assert!(frames.iter().any(|frame| frame.contains(expected)));
 
         let completed = completed_chat_body_with_ignored(
             "request-1",

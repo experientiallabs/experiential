@@ -77,6 +77,7 @@ fn fireworks_tool_events() -> Vec<Event> {
             call: CompletedToolCall {
                 call_id: "call-one".to_string(),
                 name: "weather".to_string(),
+                provider_item_id: Some("fc-one".to_string()),
                 raw_arguments: "{}".to_string(),
             },
         },
@@ -151,10 +152,12 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
             Event::ReasoningSummaryDelta {
                 output_index: 0,
                 summary_index: 0,
+                item_id: "rs-1".to_string(),
                 delta: "planned".to_string(),
             },
             Event::EncryptedReasoning {
                 output_index: 0,
+                item_id: "rs-1".to_string(),
                 encrypted_content: "blob==".to_string(),
             },
             Event::TextDelta("answer".to_string()),
@@ -180,6 +183,7 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
         &[
             Event::EncryptedReasoning {
                 output_index: 0,
+                item_id: "rs-2".to_string(),
                 encrypted_content: "blob==".to_string(),
             },
             Event::TextDelta("answer".to_string()),
@@ -199,6 +203,7 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
         &[
             Event::EncryptedReasoning {
                 output_index: 0,
+                item_id: "rs-3".to_string(),
                 encrypted_content: "internal-only".to_string(),
             },
             Event::TextDelta("answer".to_string()),
@@ -223,6 +228,7 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
         let mut frames = encoder
             .feed(&Event::EncryptedReasoning {
                 output_index: 0,
+                item_id: "rs-stream".to_string(),
                 encrypted_content: "stream-opaque".to_string(),
             })
             .expect("encrypted reasoning must encode");

@@ -17,6 +17,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
@@ -714,6 +715,10 @@ def test_responses_requires_a_fireworks_continuation_channel() -> None:
     route_generation_parameter_requests((profile,), text_only)
     assert dialect_stream_payload(profile, text_only)["stream"] is True
 
+    tools_disabled = request.model_copy(update={"tool_choice": "none"})
+    route_generation_parameter_requests((profile,), tools_disabled)
+    assert dialect_stream_payload(profile, tools_disabled)["tool_choice"] == "none"
+
     generic = GatewayWireProfile(
         dialect="openai_compatible",
         url="https://compatible.example/v1/chat/completions",
@@ -731,6 +736,35 @@ def test_responses_requires_a_fireworks_continuation_channel() -> None:
 
     stored = request.model_copy(update={"response_store": True})
     route_generation_parameter_requests((profile,), stored)
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    (None, "auto", "required", GatewayNamedToolChoice(name="lookup")),
+)
+def test_responses_fireworks_requires_continuation_when_tools_can_run(
+    tool_choice: object,
+) -> None:
+    """Every selector that can emit a tool call still requires continuation state."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        model_id="accounts/fireworks/models/deepseek-v4-flash-0731",
+        fireworks_reasoning_route_sha256="a" * 64,
+    )
+    request = _chat_request().model_copy(
+        update={
+            "surface": GatewayApiSurface.RESPONSES,
+            "response_store": False,
+            "tools": (GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+            "tool_choice": tool_choice,
+        }
+    )
+
+    with pytest.raises(ProviderParameterError, match="continuation"):
+        route_generation_parameter_requests((profile,), request)
+    with pytest.raises(ProviderCapabilityError, match="responses_fireworks_reasoning_carrier"):
+        dialect_stream_payload(profile, request)
 
 
 def test_explicit_effort_authority_is_preserved_during_wire_translation() -> None:

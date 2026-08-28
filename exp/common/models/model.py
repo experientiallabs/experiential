@@ -195,6 +195,8 @@ class ToolCall(ContractModel):
         max_length=4_000_000,
         exclude=True,
     )
+    provider_item_id: str | None = Field(default=None, min_length=1, max_length=256, exclude=True)
+    provider_output_index: int | None = Field(default=None, ge=0, exclude=True)
 
     @model_validator(mode="after")
     def _require_matching_raw_arguments(self) -> ToolCall:

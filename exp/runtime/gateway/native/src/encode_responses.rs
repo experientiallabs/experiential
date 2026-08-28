@@ -175,13 +175,18 @@ impl ResponsesSseEncoder {
             Event::ReasoningSummaryDelta {
                 output_index,
                 summary_index,
+                item_id,
                 delta,
-            } => self.reasoning_summary_delta(*output_index, *summary_index, delta),
+            } => self.reasoning_summary_delta(*output_index, *summary_index, item_id, delta),
             // Lossy projection: Anthropic thinking text streams as a summary
             // part so callers receive what they pay for. Signatures and
             // redacted payloads are dropped deliberately, since this surface
             // cannot round-trip them.
-            Event::ThinkingDelta { index, delta } => self.reasoning_summary_delta(*index, 0, delta),
+            Event::ThinkingDelta { index, delta } => {
+                let item_id =
+                    stable_public_id("rs", &format!("{}:thinking:{index}", self.response_id));
+                self.reasoning_summary_delta(*index, 0, &item_id, delta)
+            }
             Event::ThinkingSignature { .. } | Event::RedactedThinking { .. } => Ok(Vec::new()),
             Event::ReasoningContentDelta {
                 route_sha256,
@@ -189,8 +194,9 @@ impl ResponsesSseEncoder {
             } => self.fireworks_reasoning(route_sha256, delta),
             Event::EncryptedReasoning {
                 output_index,
+                item_id,
                 encrypted_content,
-            } => self.encrypted_reasoning(*output_index, encrypted_content),
+            } => self.encrypted_reasoning(*output_index, item_id, encrypted_content),
             Event::ToolCallStarted {
                 index,
                 call_id,
@@ -310,15 +316,23 @@ impl ResponsesSseEncoder {
     }
 
     /// Create one stable reasoning output item on first use.
-    fn ensure_reasoning(&mut self, provider_output_index: u32, frames: &mut Vec<String>) {
-        if self.reasoning.contains_key(&provider_output_index) {
-            return;
+    fn ensure_reasoning(
+        &mut self,
+        provider_output_index: u32,
+        item_id: &str,
+        frames: &mut Vec<String>,
+    ) -> Result<(), PublicError> {
+        if let Some(existing) = self.reasoning.get(&provider_output_index) {
+            return if existing.item_id == item_id {
+                Ok(())
+            } else {
+                Err(invalid_provider_stream(
+                    "Responses reasoning item changed provider identity.",
+                ))
+            };
         }
         let state = ReasoningState {
-            item_id: stable_public_id(
-                "rs",
-                &format!("{}:{}", self.response_id, provider_output_index),
-            ),
+            item_id: item_id.to_string(),
             output_index: self.output_order.len(),
             parts: BTreeMap::new(),
             encrypted_content: None,
@@ -334,6 +348,7 @@ impl ResponsesSseEncoder {
         self.output_order
             .push(OutputSlot::Reasoning(provider_output_index));
         frames.push(frame);
+        Ok(())
     }
 
     /// Retain one opaque encrypted reasoning payload on its output item; the
@@ -341,10 +356,11 @@ impl ResponsesSseEncoder {
     fn encrypted_reasoning(
         &mut self,
         provider_output_index: u32,
+        item_id: &str,
         encrypted_content: &str,
     ) -> Result<Vec<String>, PublicError> {
         let mut frames = Vec::new();
-        self.ensure_reasoning(provider_output_index, &mut frames);
+        self.ensure_reasoning(provider_output_index, item_id, &mut frames)?;
         let state = self
             .reasoning
             .get_mut(&provider_output_index)
@@ -394,10 +410,11 @@ impl ResponsesSseEncoder {
         &mut self,
         provider_output_index: u32,
         summary_index: u32,
+        item_id: &str,
         delta: &str,
     ) -> Result<Vec<String>, PublicError> {
         let mut frames = Vec::new();
-        self.ensure_reasoning(provider_output_index, &mut frames);
+        self.ensure_reasoning(provider_output_index, item_id, &mut frames)?;
         let (item_id, output_index, new_part) = {
             let state = self
                 .reasoning

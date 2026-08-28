@@ -156,6 +156,7 @@ mod tests {
                 call: CompletedToolCall {
                     call_id: "call-1".to_string(),
                     name: "lookup".to_string(),
+                    provider_item_id: None,
                     raw_arguments: "{\"q\":\"x\"}".to_string(),
                 },
             },
@@ -189,6 +190,7 @@ mod tests {
             },
             Event::EncryptedReasoning {
                 output_index: 0,
+                item_id: "rs-1".to_string(),
                 encrypted_content: "blob==".to_string(),
             },
             Event::TextDelta("disallowed".to_string()),
@@ -211,6 +213,7 @@ mod tests {
                 call: CompletedToolCall {
                     call_id: "call-1".to_string(),
                     name: "lookup".to_string(),
+                    provider_item_id: None,
                     raw_arguments: "{}".to_string(),
                 },
             },

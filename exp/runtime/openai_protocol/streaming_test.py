@@ -25,7 +25,6 @@ from exp.runtime.openai_protocol.streaming import (
     ResponsesSseEncoder,
     encode_chat_events,
     encode_responses_events,
-    stable_public_id,
 )
 
 _RAW_ARGUMENTS = '{ "city" : "Zürich" }'
@@ -368,6 +367,7 @@ def test_responses_sse_preserves_reasoning_summary_items() -> None:
                 sequence_number=0,
                 reasoning_summary_output_index=0,
                 reasoning_summary_index=0,
+                reasoning_item_id="rs-provider",
                 text_delta="Checked ",
             ),
             GatewayEvent(
@@ -375,6 +375,7 @@ def test_responses_sse_preserves_reasoning_summary_items() -> None:
                 sequence_number=1,
                 reasoning_summary_output_index=0,
                 reasoning_summary_index=0,
+                reasoning_item_id="rs-provider",
                 text_delta="the forecast.",
             ),
             GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=2),
@@ -391,7 +392,7 @@ def test_responses_sse_preserves_reasoning_summary_items() -> None:
     output = cast(list[JsonObject], terminal["output"])
     assert output == [
         {
-            "id": stable_public_id("rs", f"{stable_public_id('resp', 'request-reasoning')}:0"),
+            "id": "rs-provider",
             "type": "reasoning",
             "summary": [{"type": "summary_text", "text": "Checked the forecast."}],
             "status": "completed",
@@ -476,6 +477,7 @@ def test_responses_sse_exposes_provider_encrypted_reasoning_only_when_requested(
                 kind=GatewayEventKind.ENCRYPTED_REASONING,
                 sequence_number=0,
                 reasoning_block_index=0,
+                reasoning_item_id="rs-provider",
                 encrypted_content="provider-opaque",
             ),
             GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),

@@ -71,8 +71,7 @@ def dialect_stream_payload(
         The exact JSON payload the gateway sends upstream for this dialect.
 
     Raises:
-        ProviderCapabilityError: The request uses a capability this dialect
-            cannot preserve.
+        ProviderCapabilityError: The request uses an unsupported capability.
     """
     if (
         provider_request.surface == GatewayApiSurface.RESPONSES
@@ -80,6 +79,7 @@ def dialect_stream_payload(
         and provider_request.response_store is False
         and not provider_request.include_encrypted_reasoning
         and bool(provider_request.tools)
+        and provider_request.tool_choice != "none"
     ):
         raise ProviderCapabilityError(capability="responses_fireworks_reasoning_carrier")
     required_reasoning_effort = (

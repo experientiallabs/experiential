@@ -49,6 +49,8 @@ impl Normalizer {
                 let summary_index =
                     require_u64(&payload, "summary_index", "OpenAI reasoning summary_index")
                         .map_err(|message| malformed(&message))? as u32;
+                let item_id = require_string(&payload, "item_id", "OpenAI reasoning item ID")
+                    .map_err(|message| malformed(&message))?;
                 let delta = optional_text(&payload, "delta", "OpenAI reasoning summary delta")?;
                 if delta.is_empty() {
                     return Ok(events);
@@ -63,6 +65,7 @@ impl Normalizer {
                 events.push(Event::ReasoningSummaryDelta {
                     output_index,
                     summary_index,
+                    item_id,
                     delta,
                 });
             }
@@ -73,6 +76,8 @@ impl Normalizer {
                 let summary_index =
                     require_u64(&payload, "summary_index", "OpenAI reasoning summary_index")
                         .map_err(|message| malformed(&message))? as u32;
+                let item_id = require_string(&payload, "item_id", "OpenAI reasoning item ID")
+                    .map_err(|message| malformed(&message))?;
                 let final_text = require_string(&payload, "text", "OpenAI reasoning summary text")
                     .map_err(|message| malformed(&message))?;
                 let key = (output_index, summary_index);
@@ -93,6 +98,7 @@ impl Normalizer {
                     events.push(Event::ReasoningSummaryDelta {
                         output_index,
                         summary_index,
+                        item_id,
                         delta: final_text,
                     });
                 }
@@ -118,8 +124,11 @@ impl Normalizer {
                         .to_string();
                     let name = require_string(item, "name", "OpenAI function call name")
                         .map_err(|message| malformed(&message))?;
+                    let item_id = require_string(item, "id", "OpenAI function call item ID")
+                        .map_err(|message| malformed(&message))?;
                     self.reserve_tool_entry(index)?;
                     let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
+                    tool.provider_item_id = Some(item_id);
                     events.push(Event::ToolCallStarted {
                         index,
                         call_id,
@@ -165,9 +174,13 @@ impl Normalizer {
                         if item.get("type").and_then(Value::as_str) == Some("reasoning") {
                             if let Some(Value::String(encrypted)) = item.get("encrypted_content") {
                                 if !encrypted.is_empty() {
+                                    let item_id =
+                                        require_string(item, "id", "OpenAI reasoning item ID")
+                                            .map_err(|message| malformed(&message))?;
                                     self.reserve_summary_bytes(encrypted.len())?;
                                     events.push(Event::EncryptedReasoning {
                                         output_index: index,
+                                        item_id,
                                         encrypted_content: encrypted.clone(),
                                     });
                                 }
@@ -428,6 +441,7 @@ mod tests {
             event: None,
             data: serde_json::json!({
                 "type": "response.reasoning_summary_text.delta",
+                "item_id": format!("rs-{output_index}"),
                 "output_index": output_index,
                 "summary_index": summary_index,
                 "delta": delta,
@@ -504,6 +518,7 @@ mod tests {
             event: None,
             data: serde_json::json!({
                 "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs-2",
                 "output_index": 2,
                 "summary_index": 1,
                 "delta": "checked",
@@ -518,6 +533,7 @@ mod tests {
             [Event::ReasoningSummaryDelta {
                 output_index: 2,
                 summary_index: 1,
+                item_id: _,
                 delta,
             }] if delta == "checked"
         ));
@@ -526,6 +542,7 @@ mod tests {
             event: None,
             data: serde_json::json!({
                 "type": "response.reasoning_summary_text.done",
+                "item_id": "rs-2",
                 "output_index": 2,
                 "summary_index": 1,
                 "text": "checked",
@@ -601,6 +618,7 @@ mod tests {
             events.as_slice(),
             [Event::EncryptedReasoning {
                 output_index: 0,
+                item_id: _,
                 encrypted_content,
             }] if encrypted_content == "blob=="
         ));

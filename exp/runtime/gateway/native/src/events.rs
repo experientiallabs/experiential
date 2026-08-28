@@ -25,6 +25,7 @@ impl Usage {
 pub struct CompletedToolCall {
     pub call_id: String,
     pub name: String,
+    pub provider_item_id: Option<String>,
     /// Raw provider-order JSON argument text, already validated as one object.
     pub raw_arguments: String,
 }
@@ -37,6 +38,7 @@ pub enum Event {
     ReasoningSummaryDelta {
         output_index: u32,
         summary_index: u32,
+        item_id: String,
         delta: String,
     },
     /// Verbatim Anthropic extended-thinking text for one provider block.
@@ -59,6 +61,7 @@ pub enum Event {
     /// provider output-item index.
     EncryptedReasoning {
         output_index: u32,
+        item_id: String,
         encrypted_content: String,
     },
     /// Opaque Fireworks Chat reasoning, bound to the exact issuing route.
@@ -104,11 +107,13 @@ pub fn simplified_event(event: &Event) -> Value {
         Event::ReasoningSummaryDelta {
             output_index,
             summary_index,
+            item_id,
             delta,
         } => serde_json::json!({
             "kind": "reasoning_summary_delta",
             "output_index": output_index,
             "summary_index": summary_index,
+            "item_id": item_id,
             "text": delta,
         }),
         Event::ThinkingDelta { index, delta } => serde_json::json!({
@@ -128,10 +133,12 @@ pub fn simplified_event(event: &Event) -> Value {
         }),
         Event::EncryptedReasoning {
             output_index,
+            item_id,
             encrypted_content,
         } => serde_json::json!({
             "kind": "encrypted_reasoning",
             "output_index": output_index,
+            "item_id": item_id,
             "encrypted_content": encrypted_content,
         }),
         Event::ReasoningContentDelta {
@@ -195,6 +202,7 @@ pub fn require_json_object_text(raw: &str) -> Result<(), String> {
 pub struct ToolAccumulator {
     pub call_id: String,
     pub name: String,
+    pub provider_item_id: Option<String>,
     pub raw_arguments: String,
     pub completed: bool,
 }
@@ -204,6 +212,7 @@ impl ToolAccumulator {
         Self {
             call_id,
             name,
+            provider_item_id: None,
             raw_arguments: String::new(),
             completed: false,
         }
@@ -225,6 +234,7 @@ impl ToolAccumulator {
         Ok(CompletedToolCall {
             call_id: self.call_id.clone(),
             name: self.name.clone(),
+            provider_item_id: self.provider_item_id.clone(),
             raw_arguments: self.raw_arguments.clone(),
         })
     }

@@ -314,6 +314,21 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
                         }
                     )
                 )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 2,
+                            "item": {
+                                "id": "rs_provider_2",
+                                "type": "reasoning",
+                                "summary": [],
+                                "encrypted_content": "provider-opaque-state-2",
+                                "status": "completed",
+                            },
+                        }
+                    )
+                )
             self.wfile.write(
                 _sse_frame(
                     {
@@ -1168,17 +1183,25 @@ def test_native_openai_responses_retains_hidden_reasoning_for_tool_continuation(
     assert len(upstream) == 2
     assert upstream[0]["include"] == ["reasoning.encrypted_content"]
     replay = cast("list[JsonObject]", upstream[1]["input"])
-    assert replay[-3:] == [
+    assert replay[-4:] == [
         {
             "type": "reasoning",
+            "id": "rs_provider",
             "summary": [],
             "encrypted_content": _ResponsesUpstream.encrypted_content,
         },
         {
             "type": "function_call",
+            "id": "fc_provider",
             "call_id": "call-one",
             "name": "lookup",
             "arguments": _ResponsesUpstream.raw_arguments,
+        },
+        {
+            "type": "reasoning",
+            "id": "rs_provider_2",
+            "summary": [],
+            "encrypted_content": "provider-opaque-state-2",
         },
         {
             "type": "function_call_output",

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
+from typing import cast
 
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayNamedToolChoice
+from exp.runtime.gateway.contracts import (
+    EncryptedReasoningBlock,
+    GatewayApiSurface,
+    GatewayNamedToolChoice,
+)
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
@@ -778,9 +783,16 @@ def test_responses_decoder_accepts_the_codex_request_shape() -> None:
                 },
                 {
                     "type": "function_call",
+                    "id": "fc_1",
                     "call_id": "call-1",
                     "name": "search",
                     "arguments": "{}",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_2",
+                    "summary": [],
+                    "encrypted_content": "second-blob==",
                 },
                 {"type": "function_call_output", "call_id": "call-1", "output": "found"},
             ],
@@ -800,6 +812,52 @@ def test_responses_decoder_accepts_the_codex_request_shape() -> None:
     assert blocks[0].kind == "encrypted_reasoning"
     assert blocks[0].id == "rs_1"
     assert blocks[0].encrypted_content == "blob=="
+    trailing_block = cast("EncryptedReasoningBlock", request.messages[2].provider_reasoning[0])
+    assert trailing_block.id == "rs_2"
+    assert trailing_block.encrypted_content == "second-blob=="
+    payload = openai_responses_stream_payload(
+        "gpt-fixture",
+        request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    payload_input = cast("list[JsonObject]", payload["input"])
+    assert payload_input[1:] == [
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [],
+            "encrypted_content": "blob==",
+        },
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call-1",
+            "name": "search",
+            "arguments": "{}",
+        },
+        {
+            "type": "reasoning",
+            "id": "rs_2",
+            "summary": [],
+            "encrypted_content": "second-blob==",
+        },
+        {"type": "function_call_output", "call_id": "call-1", "output": "found"},
+    ]
+
+
+def test_responses_decoder_rejects_reasoning_without_item_id() -> None:
+    """Opaque reasoning replay requires the provider-issued item identity."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [{"type": "reasoning", "summary": [], "encrypted_content": "blob=="}],
+            }
+        )
+
+    assert raised.value.status_code == 400
+    assert raised.value.detail.param == "input.0.id"
 
 
 def test_responses_decoder_groups_fireworks_carrier_with_all_tool_calls() -> None:

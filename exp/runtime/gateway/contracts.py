@@ -106,8 +106,9 @@ class EncryptedReasoningBlock(ContractModel):
     """
 
     kind: Literal["encrypted_reasoning"] = "encrypted_reasoning"
-    id: str | None = Field(default=None, min_length=1, max_length=256)
+    id: str = Field(min_length=1, max_length=256)
     encrypted_content: str = Field(min_length=1)
+    output_index: int | None = Field(default=None, ge=0, exclude=True)
 
 
 class SealedReasoningContentBlock(ContractModel):
@@ -429,6 +430,7 @@ class GatewayEvent(ContractModel):
     reasoning_summary_index: int | None = Field(default=None, ge=0)
     reasoning_block_index: int | None = Field(default=None, ge=0)
     """Provider content-block (or output-item) index grouping reasoning events."""
+    reasoning_item_id: str | None = Field(default=None, min_length=1, max_length=256)
     thinking_signature: str | None = None
     redacted_thinking_data: str | None = None
     encrypted_content: str | None = None
@@ -459,8 +461,9 @@ class GatewayEvent(ContractModel):
                 self.text_delta is None
                 or self.reasoning_summary_output_index is None
                 or self.reasoning_summary_index is None
+                or self.reasoning_item_id is None
             ):
-                raise ValueError("reasoning summary deltas require output, summary, and text")
+                raise ValueError("reasoning summary deltas require item, output, summary, and text")
         elif self.kind == GatewayEventKind.THINKING_DELTA:
             if self.text_delta is None or self.reasoning_block_index is None:
                 raise ValueError("thinking deltas require block index and text")
@@ -471,8 +474,12 @@ class GatewayEvent(ContractModel):
             if self.redacted_thinking_data is None or self.reasoning_block_index is None:
                 raise ValueError("redacted thinking requires block index and data")
         elif self.kind == GatewayEventKind.ENCRYPTED_REASONING:
-            if self.encrypted_content is None or self.reasoning_block_index is None:
-                raise ValueError("encrypted reasoning requires block index and content")
+            if (
+                self.encrypted_content is None
+                or self.reasoning_block_index is None
+                or self.reasoning_item_id is None
+            ):
+                raise ValueError("encrypted reasoning requires item, block index, and content")
         elif self.kind == GatewayEventKind.REASONING_CONTENT_DELTA:
             if self.text_delta is None or self.reasoning_content_route_sha256 is None:
                 raise ValueError("reasoning-content deltas require route identity and text")

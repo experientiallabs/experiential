@@ -13,8 +13,8 @@ use crate::server::AppState;
 pub(crate) struct ResponsesRetention {
     pub(crate) text: String,
     pub(crate) refusal: bool,
-    pub(crate) tool_calls: Vec<CompletedToolCall>,
-    pub(crate) encrypted_reasoning: Vec<(u32, String)>,
+    pub(crate) tool_calls: Vec<(u32, CompletedToolCall)>,
+    pub(crate) encrypted_reasoning: Vec<(u32, String, String)>,
     pub(crate) carrier_events: Vec<Event>,
     pub(crate) retained_bytes: usize,
     pub(crate) overflowed: bool,
@@ -49,13 +49,18 @@ impl ResponsesRetention {
         match event {
             Event::TextDelta(delta) => self.text.push_str(delta),
             Event::RefusalDelta(_) => self.refusal = true,
-            Event::ToolCallCompleted { call, .. } => self.tool_calls.push(call.clone()),
+            Event::ToolCallCompleted { index, call } => {
+                self.tool_calls.push((*index, call.clone()));
+            }
             Event::EncryptedReasoning {
                 output_index,
+                item_id,
                 encrypted_content,
-            } => self
-                .encrypted_reasoning
-                .push((*output_index, encrypted_content.clone())),
+            } => self.encrypted_reasoning.push((
+                *output_index,
+                item_id.clone(),
+                encrypted_content.clone(),
+            )),
             _ => {}
         }
     }
@@ -72,12 +77,15 @@ fn remember_argument(
         "refusal": retention.refusal,
         "reasoning_content_carrier": reasoning_content_carrier,
         "encrypted_reasoning": retention.encrypted_reasoning.iter().map(
-            |(output_index, encrypted_content)| json!({
+            |(output_index, item_id, encrypted_content)| json!({
                 "output_index": output_index,
+                "item_id": item_id,
                 "encrypted_content": encrypted_content,
             })
         ).collect::<Vec<Value>>(),
-        "tool_calls": retention.tool_calls.iter().map(|call| json!({
+        "tool_calls": retention.tool_calls.iter().map(|(output_index, call)| json!({
+            "output_index": output_index,
+            "item_id": call.provider_item_id,
             "call_id": call.call_id,
             "name": call.name,
             "arguments": call.raw_arguments,
@@ -116,6 +124,7 @@ mod tests {
         let mut retention = ResponsesRetention::default();
         retention.track(&Event::EncryptedReasoning {
             output_index: 3,
+            item_id: "rs-provider".to_string(),
             encrypted_content: "provider-opaque".to_string(),
         });
 
@@ -125,7 +134,11 @@ mod tests {
 
         assert_eq!(
             payload["encrypted_reasoning"],
-            json!([{"output_index": 3, "encrypted_content": "provider-opaque"}])
+            json!([{
+                "output_index": 3,
+                "item_id": "rs-provider",
+                "encrypted_content": "provider-opaque",
+            }])
         );
     }
 }

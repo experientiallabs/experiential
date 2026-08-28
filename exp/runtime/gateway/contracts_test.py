@@ -336,6 +336,7 @@ def test_reasoning_stream_events_require_their_payloads() -> None:
         kind=GatewayEventKind.ENCRYPTED_REASONING,
         sequence_number=3,
         reasoning_block_index=0,
+        reasoning_item_id="rs-1",
         encrypted_content="blob",
     )
     assert encrypted.encrypted_content == "blob"
