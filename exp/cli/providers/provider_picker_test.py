@@ -1176,6 +1176,34 @@ def test_bedrock_reuses_the_sole_explicit_pair_when_auth_is_not_reentered() -> N
     assert endpoints[0].connection == existing[0]
 
 
+def test_bedrock_reuses_a_legacy_explicit_pair_without_a_stored_mode() -> None:
+    """Legacy pair metadata compares as the canonical access-key-pair auth mode."""
+    existing = (
+        ProviderConnection(
+            name="bedrock-production",
+            provider="bedrock",
+            api_key_env="AWS_SECRET_ACCESS_KEY",
+            aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+            region="us-west-2",
+        ),
+    )
+    prepared = _prepare(
+        ScriptedConsole("us-west-2\n"),
+        providers=("bedrock",),
+        lister=_FakeLister({}),
+        environment={
+            "AWS_ACCESS_KEY_ID": "access-id",
+            "AWS_SECRET_ACCESS_KEY": "secret-value",
+        },
+        existing_connections=existing,
+    )
+
+    assert prepared is not None
+    endpoints, _models = prepared
+    assert endpoints[0].configured
+    assert endpoints[0].connection == existing[0]
+
+
 def test_bedrock_sts_intent_never_reuses_an_explicit_pair() -> None:
     """A session token keeps setup on ambient auth instead of truncating STS."""
     existing = (

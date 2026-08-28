@@ -6,6 +6,24 @@ from exp.common.models import ConnectionConfig
 from exp.common.models import ProviderConnection
 
 
+def _effective_bedrock_auth_mode(
+    *,
+    provider: str,
+    api_key_env: str | None,
+    aws_access_key_id_env: str | None,
+    bedrock_auth_mode: str | None,
+) -> str | None:
+    """Canonicalize legacy explicit-pair records for semantic comparison."""
+    if (
+        provider == "bedrock"
+        and bedrock_auth_mode is None
+        and api_key_env is not None
+        and aws_access_key_id_env is not None
+    ):
+        return "access_key_pair"
+    return bedrock_auth_mode
+
+
 def reused_connection(
     existing_connections: tuple[ProviderConnection, ...],
     *,
@@ -27,6 +45,12 @@ def reused_connection(
         and aws_access_key_id_env is None
         and bedrock_auth_mode is None
     )
+    requested_bedrock_auth_mode = _effective_bedrock_auth_mode(
+        provider=provider,
+        api_key_env=api_key_env,
+        aws_access_key_id_env=aws_access_key_id_env,
+        bedrock_auth_mode=bedrock_auth_mode,
+    )
     candidate = ConnectionConfig(
         provider=provider,
         base_url=base_url,
@@ -35,7 +59,7 @@ def reused_connection(
         azure_api_surface=azure_api_surface,
         region=region,
         aws_access_key_id_env=aws_access_key_id_env,
-        bedrock_auth_mode=bedrock_auth_mode,
+        bedrock_auth_mode=requested_bedrock_auth_mode,
     )
     for connection in existing_connections:
         if require_ambient_bedrock_auth and (
@@ -51,6 +75,17 @@ def reused_connection(
                     "api_key_env": None,
                     "aws_access_key_id_env": None,
                     "bedrock_auth_mode": None,
+                }
+            )
+        elif provider == "bedrock":
+            configured = configured.model_copy(
+                update={
+                    "bedrock_auth_mode": _effective_bedrock_auth_mode(
+                        provider=connection.provider,
+                        api_key_env=connection.api_key_env,
+                        aws_access_key_id_env=connection.aws_access_key_id_env,
+                        bedrock_auth_mode=connection.bedrock_auth_mode,
+                    )
                 }
             )
         if configured.identity_sha256() != candidate.identity_sha256():

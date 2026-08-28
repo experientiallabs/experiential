@@ -244,3 +244,66 @@ def test_provider_update_drops_azure_surface_when_changing_provider(tmp_path: Pa
     (authority,) = GatewayManagement(root).provider_connections()
     assert authority.config.provider == "openai-compatible"
     assert authority.config.azure_api_surface is None
+
+
+def test_provider_update_preserves_explicit_bedrock_credentials(tmp_path: Path) -> None:
+    """A metadata-only update does not downgrade an explicit Bedrock pair to ambient auth."""
+    root = _initialized_root(tmp_path)
+    added = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "bedrock-production",
+            "--provider",
+            "bedrock",
+            "--credential-env",
+            "AWS_SECRET_ACCESS_KEY",
+            "--access-key-id-env",
+            "AWS_ACCESS_KEY_ID",
+            "--bedrock-auth-mode",
+            "access_key_pair",
+            "--region",
+            "us-west-2",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+    updated = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "update",
+            "bedrock-production",
+            "--provider",
+            "bedrock",
+            "--region",
+            "us-east-1",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+    listed = _runner.invoke(
+        app,
+        ["config", "gateway", "provider", "list", "--json", "--root", str(root)],
+    )
+
+    assert added.exit_code == 0
+    assert updated.exit_code == 0
+    (authority,) = GatewayManagement(root).provider_connections()
+    assert authority.config.api_key_env == "AWS_SECRET_ACCESS_KEY"
+    assert authority.config.aws_access_key_id_env == "AWS_ACCESS_KEY_ID"
+    assert authority.config.bedrock_auth_mode == "access_key_pair"
+    assert authority.config.region == "us-east-1"
+    (item,) = json.loads(listed.output)["items"]
+    assert item["credential_env"] == "AWS_SECRET_ACCESS_KEY"
+    assert item["access_key_id_env"] == "AWS_ACCESS_KEY_ID"
+    assert item["bedrock_auth_mode"] == "access_key_pair"
