@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "label": "gateway latency",
-  "message": "17.2 ms",
+  "message": "16.9 ms",
   "color": "0070f3",
   "cacheSeconds": 300
 }
