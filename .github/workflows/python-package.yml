@@ -222,10 +222,15 @@ jobs:
         run: |
           for file in dist/*; do
             name="$(basename "$file")"
-            project="$(echo "$name" | cut -d- -f1 | tr '_' '-')"
-            if curl -fsSL "https://pypi.org/simple/$project/" | grep -qF "$name"; then
+            project="$(echo "$name" | sed -E 's/-[0-9].*//' | tr '_' '-')"
+            code="$(curl -sSL --retry 3 -o /tmp/pypi-index.html -w '%{http_code}' \
+              "https://pypi.org/simple/$project/")"
+            if [ "$code" = "200" ] && grep -qF "$name" /tmp/pypi-index.html; then
               echo "Dropping $name: already published to $project"
               rm "$file"
+            elif [ "$code" != "200" ] && [ "$code" != "404" ]; then
+              echo "PyPI index lookup for $project failed with HTTP $code" >&2
+              exit 1
             fi
           done
           ls dist/
