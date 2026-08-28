@@ -184,7 +184,7 @@ def test_preflight_treats_false_parallel_control_as_semantic() -> None:
 
 
 def test_preflight_requires_streaming_tool_argument_support() -> None:
-    """Internally streamed tool calls only select deployments that can frame arguments."""
+    """Caller-streamed tool calls only select deployments that can frame arguments."""
     request = GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         messages=(GatewayMessage(role="user", content="hi"),),
@@ -207,6 +207,13 @@ def test_preflight_requires_streaming_tool_argument_support() -> None:
             supports_streaming_tool_arguments=True,
         ),
         model_capabilities=model_capabilities,
+    )
+
+    preflight_gateway_request(
+        request,
+        GatewayDeploymentCapabilities(supports_streaming=True),
+        model_capabilities=model_capabilities,
+        requested_stream=False,
     )
 
 

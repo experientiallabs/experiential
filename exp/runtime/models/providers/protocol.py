@@ -186,6 +186,7 @@ def preflight_gateway_request(
     capabilities: GatewayDeploymentCapabilities,
     *,
     model_capabilities: ModelCapabilities | None = None,
+    requested_stream: bool | None = None,
 ) -> None:
     """Reject gateway semantics a deployment cannot preserve before provider dispatch.
 
@@ -195,6 +196,8 @@ def preflight_gateway_request(
         model_capabilities: Exact model-level semantic capabilities. Production
             routes supply this value; ``None`` preserves compatibility for
             standalone callers that only validate deployment protocol fields.
+        requested_stream: Caller-visible streaming intent when the gateway has
+            forced the provider request into streaming mode internally.
 
     Raises:
         ProviderCapabilityError: A present request feature is unsupported.
@@ -233,7 +236,8 @@ def preflight_gateway_request(
             "structured_text",
         ),
         (
-            request.stream and bool(request.tools),
+            (request.stream if requested_stream is None else requested_stream)
+            and bool(request.tools),
             capabilities.supports_streaming_tool_arguments,
             "streaming_tool_arguments",
         ),

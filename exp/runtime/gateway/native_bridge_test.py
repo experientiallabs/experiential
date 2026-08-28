@@ -1080,6 +1080,26 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
             GatewayDeploymentCapabilities(supports_streaming=True),
             (ModelCapabilities(), ModelCapabilities()),
         ),
+        (
+            {
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                supports_streaming_tool_arguments=True,
+            ),
+            (ModelCapabilities(supports_tools=True), ModelCapabilities(supports_tools=True)),
+        ),
     ),
 )
 def test_admit_filters_each_protocol_capability_before_selection(
@@ -1147,8 +1167,8 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
     assert "internal" not in error["code"]
 
 
-def test_non_streaming_tool_transport_failure_names_tools_not_stream(tmp_path: Path) -> None:
-    """Internally forced streaming attributes incompatibility to the declared tools field."""
+def test_non_streaming_tools_do_not_require_public_streaming_transport(tmp_path: Path) -> None:
+    """Internally forced streaming does not invent a caller transport requirement."""
     unsupported = GatewayDeploymentCapabilities(
         supports_streaming=True,
         supports_strict_tools=True,
@@ -1177,12 +1197,13 @@ def test_non_streaming_tool_transport_failure_names_tools_not_stream(tmp_path: P
         }
     )
 
-    with pytest.raises(NativeBridgeError) as raised:
-        _admit(control, raw_key, body)
+    admission = _admit(control, raw_key, body)
 
-    error = json.loads(raised.value.public_error_json)
-    assert error["code"] == "unsupported_capability"
-    assert error["param"] == "tools"
+    route = cast("list[JsonObject]", admission["route"])
+    assert [item["model_id"] for item in route] == [
+        "alpha-model-exact",
+        "beta-model-exact",
+    ]
 
 
 def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Path) -> None:

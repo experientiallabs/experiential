@@ -11,7 +11,6 @@ from exp.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
-    ModelCapabilities,
     ModelCatalog,
     ModelRecord,
     PricingSnapshot,
@@ -75,8 +74,8 @@ def _activation(*, project_ref: str, activation_ref: str) -> ProjectActivation:
     )
 
 
-def test_legacy_project_candidates_gain_their_known_streaming_transport(tmp_path: Path) -> None:
-    """Upgrade known tool streaming without overriding explicit declarations."""
+def test_legacy_project_candidates_gain_only_shared_streaming_transport(tmp_path: Path) -> None:
+    """Upgrade absent gateway metadata without overriding explicit declarations."""
     catalog = ModelCatalog(
         schema_version=2,
         connections={"provider": ConnectionConfig(provider="openai")},
@@ -85,7 +84,6 @@ def test_legacy_project_candidates_gain_their_known_streaming_transport(tmp_path
                 connection="provider",
                 model="legacy-model",
                 billing_source=BillingSource.CUSTOMER_MANAGED,
-                capabilities=ModelCapabilities(supports_tools=True),
             ),
             "explicit": ModelRecord(
                 connection="provider",
@@ -107,10 +105,7 @@ def test_legacy_project_candidates_gain_their_known_streaming_transport(tmp_path
 
     assert changed is True
     assert migrated.models["legacy"].gateway == GatewayDeploymentMetadata(
-        capabilities=GatewayDeploymentCapabilities(
-            supports_streaming=True,
-            supports_streaming_tool_arguments=True,
-        )
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
     )
     assert migrated.models["explicit"].gateway == catalog.models["explicit"].gateway
     assert (

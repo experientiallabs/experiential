@@ -448,6 +448,7 @@ class NativeControlPlane(NativeObservabilityMixin):
                         provider_request,
                         deployment.gateway.capabilities,
                         model_capabilities=deployment.capabilities,
+                        requested_stream=public_request.stream,
                     )
                     dialect_stream_payload(profile, provider_request)
                 except (ProviderParameterError, ProviderCapabilityError) as exc:
@@ -481,6 +482,7 @@ class NativeControlPlane(NativeObservabilityMixin):
                     provider_request,
                     deployment.gateway.capabilities,
                     model_capabilities=deployment.capabilities,
+                    requested_stream=public_request.stream,
                 )
                 upstream_payload = dialect_stream_payload(profile, provider_request)
                 upstream_body, dispatch_signer = frozen_dispatch(profile, client, upstream_payload)
