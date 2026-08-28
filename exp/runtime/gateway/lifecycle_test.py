@@ -774,7 +774,10 @@ def _configured_gateway(
         exact_model_id="model-revision-exact",
         revision=None,
         capabilities=capabilities or ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        ),
         prices=GatewayTokenPrices(),
         pricing_source=None,
         replace=False,

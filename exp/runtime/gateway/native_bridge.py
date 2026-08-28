@@ -114,26 +114,42 @@ from exp.runtime.openai_protocol.state import (
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
 _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
-    "developer_messages": "messages",
-    "function_tools": "tools",
-    "parallel_tool_calls": "parallel_tool_calls",
-    "stop_sequences": "stop",
-    "streaming": "stream",
-    "strict_tools": "tools",
-    "structured_output": "response_format",
-    "structured_text": "response_format",
+    GatewayApiSurface.CHAT_COMPLETIONS: {
+        "developer_messages": "messages",
+        "function_tools": "tools",
+        "parallel_tool_calls": "parallel_tool_calls",
+        "stop_sequences": "stop",
+        "streaming": "stream",
+        "streaming_tool_arguments": "stream",
+        "strict_tools": "tools",
+        "structured_output": "response_format",
+        "structured_text": "response_format",
+    },
+    GatewayApiSurface.RESPONSES: {
+        "developer_messages": "instructions",
+        "function_tools": "tools",
+        "parallel_tool_calls": "parallel_tool_calls",
+        "streaming": "stream",
+        "streaming_tool_arguments": "stream",
+        "strict_tools": "tools",
+        "structured_output": "text.format",
+        "structured_text": "text.format",
+    },
+    GatewayApiSurface.MESSAGES: {
+        "developer_messages": "system",
+        "function_tools": "tools",
+        "parallel_tool_calls": "tool_choice.disable_parallel_tool_use",
+        "stop_sequences": "stop_sequences",
+        "streaming": "stream",
+        "streaming_tool_arguments": "stream",
+        "strict_tools": "tools",
+    },
 }
 
 
 def _public_capability_param(capability: str, surface: GatewayApiSurface) -> str | None:
     """Translate an internal capability label to the caller's request field."""
-    parameter = _PUBLIC_REQUEST_CAPABILITY_PARAMS.get(capability)
-    if surface == GatewayApiSurface.RESPONSES:
-        if parameter == "messages":
-            return "input"
-        if parameter == "response_format":
-            return "text.format"
-    return parameter
+    return _PUBLIC_REQUEST_CAPABILITY_PARAMS[surface].get(capability)
 
 
 _logger = logging.getLogger(__name__)
@@ -486,12 +502,12 @@ class NativeControlPlane(NativeObservabilityMixin):
             # request feature the route cannot preserve.
             failure = normalized_provider_failure(exc)
             self._accounting.finish_request_quietly(authorization, failure)
-            capability_param = (
+            failure_param = (
                 _public_capability_param(exc.capability, provider_request.surface)
                 if isinstance(exc, ProviderCapabilityError)
-                else None
+                else exc.param
             )
-            raise NativeBridgeError(public_failure_error(failure, param=capability_param)) from exc
+            raise NativeBridgeError(public_failure_error(failure, param=failure_param)) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             error = _authority_error(exc)
             failure = GatewayFailure(

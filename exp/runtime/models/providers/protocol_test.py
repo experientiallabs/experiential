@@ -183,6 +183,33 @@ def test_preflight_treats_false_parallel_control_as_semantic() -> None:
         preflight_gateway_request(request, GatewayDeploymentCapabilities())
 
 
+def test_preflight_requires_streaming_tool_argument_support() -> None:
+    """Internally streamed tool calls only select deployments that can frame arguments."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        stream=True,
+    )
+    model_capabilities = ModelCapabilities(supports_tools=True)
+
+    with pytest.raises(ProviderCapabilityError, match="streaming_tool_arguments"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            model_capabilities=model_capabilities,
+        )
+
+    preflight_gateway_request(
+        request,
+        GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        ),
+        model_capabilities=model_capabilities,
+    )
+
+
 def test_preflight_rejects_over_limit_stop_list_with_a_named_parameter_error() -> None:
     """An over-cap stop list fails locally instead of surfacing the provider's opaque 4xx."""
     request = GatewayRequest(
@@ -198,7 +225,7 @@ def test_preflight_rejects_over_limit_stop_list_with_a_named_parameter_error() -
     with pytest.raises(ProviderParameterError) as caught:
         preflight_gateway_request(request, capabilities)
     assert caught.value.param == "stop"
-    assert caught.value.code == "too_many_stop_sequences"
+    assert caught.value.code == "invalid_parameter"
 
     # At the limit passes, and an unbounded route (default None) never counts.
     at_limit = request.model_copy(update={"stop": ("a", "b", "c", "d", "e")})

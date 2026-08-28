@@ -62,25 +62,34 @@ _PublicErrorType = Literal[
 
 
 @pytest.mark.parametrize(
-    ("capability", "chat_param", "responses_param"),
+    ("capability", "chat_param", "responses_param", "messages_param"),
     (
-        ("developer_messages", "messages", "input"),
-        ("function_tools", "tools", "tools"),
-        ("stop_sequences", "stop", "stop"),
-        ("streaming", "stream", "stream"),
-        ("strict_tools", "tools", "tools"),
-        ("structured_output", "response_format", "text.format"),
-        ("structured_text", "response_format", "text.format"),
+        ("developer_messages", "messages", "instructions", "system"),
+        ("function_tools", "tools", "tools", "tools"),
+        (
+            "parallel_tool_calls",
+            "parallel_tool_calls",
+            "parallel_tool_calls",
+            "tool_choice.disable_parallel_tool_use",
+        ),
+        ("stop_sequences", "stop", None, "stop_sequences"),
+        ("streaming", "stream", "stream", "stream"),
+        ("streaming_tool_arguments", "stream", "stream", "stream"),
+        ("strict_tools", "tools", "tools", "tools"),
+        ("structured_output", "response_format", "text.format", None),
+        ("structured_text", "response_format", "text.format", None),
     ),
 )
 def test_public_capability_params_name_real_surface_fields(
     capability: str,
-    chat_param: str,
-    responses_param: str,
+    chat_param: str | None,
+    responses_param: str | None,
+    messages_param: str | None,
 ) -> None:
     """Internal admission labels never leak as nonexistent public fields."""
     assert _public_capability_param(capability, GatewayApiSurface.CHAT_COMPLETIONS) == chat_param
     assert _public_capability_param(capability, GatewayApiSurface.RESPONSES) == responses_param
+    assert _public_capability_param(capability, GatewayApiSurface.MESSAGES) == messages_param
 
 
 def _parity_golden(name: str) -> object:
@@ -540,6 +549,7 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
+            supports_streaming_tool_arguments=True,
             supports_stop_sequences=True,
             supports_strict_tools=True,
             supports_structured_text=True,
@@ -1025,6 +1035,7 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
             GatewayDeploymentCapabilities(supports_streaming=True),
             GatewayDeploymentCapabilities(
                 supports_streaming=True,
+                supports_streaming_tool_arguments=True,
                 supports_strict_tools=True,
             ),
             (ModelCapabilities(supports_tools=True), ModelCapabilities(supports_tools=True)),
@@ -1121,6 +1132,34 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
     assert error["code"] == "unsupported_capability"
     assert error["param"] == "tools"
     assert "internal" not in error["code"]
+
+
+def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Path) -> None:
+    """A parameter validator reaches the public 400 with its exact field path intact."""
+    capabilities = GatewayDeploymentCapabilities(
+        supports_streaming=True,
+        supports_stop_sequences=True,
+        maximum_stop_sequences=5,
+    )
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(capabilities, capabilities),
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["a", "b", "c", "d", "e", "f"],
+        }
+    )
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, body)
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "invalid_parameter"
+    assert error["param"] == "stop"
 
 
 @pytest.mark.parametrize(
