@@ -124,16 +124,35 @@ fn optional_text(object: &Map<String, Value>, key: &str, label: &str) -> Result<
     }
 }
 
+/// Complete one streamed tool call, defaulting a zero-argument call to `{}`.
+///
+/// Providers legally stream no argument fragments (or a single empty one)
+/// for a call whose input is empty, so completion seeds the canonical empty
+/// object and emits the seeding fragment first, keeping every downstream
+/// byte verification consistent with what was streamed.
+fn complete_streamed_tool(
+    index: u32,
+    tool: &mut ToolAccumulator,
+    events: &mut Vec<Event>,
+) -> Result<(), Failure> {
+    tool.completed = true;
+    if tool.raw_arguments.is_empty() {
+        tool.raw_arguments.push_str("{}");
+        events.push(Event::ToolArgumentsDelta {
+            index,
+            delta: "{}".to_string(),
+        });
+    }
+    let call = tool.complete().map_err(|message| malformed(&message))?;
+    events.push(Event::ToolCallCompleted { index, call });
+    Ok(())
+}
+
 fn finish_open_tools(tools: &mut BTreeMap<u32, ToolAccumulator>) -> Result<Vec<Event>, Failure> {
     let mut events = Vec::new();
     for (index, tool) in tools.iter_mut() {
         if !tool.completed {
-            tool.completed = true;
-            let call = tool.complete().map_err(|message| malformed(&message))?;
-            events.push(Event::ToolCallCompleted {
-                index: *index,
-                call,
-            });
+            complete_streamed_tool(*index, tool, &mut events)?;
         }
     }
     Ok(events)

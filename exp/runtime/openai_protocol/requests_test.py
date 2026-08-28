@@ -805,3 +805,87 @@ def test_responses_decoder_accepts_reasoning_context_and_names_rejections() -> N
             }
         )
     assert rejected_field.value.detail.param == "reasoning.mode"
+
+
+def test_responses_decoder_accepts_verbatim_echoes_of_prior_output_items() -> None:
+    """Turn-2 input echoing turn-1 output items verbatim must decode.
+
+    Customer repro (Codex continuation model, 2026-08-28): a function_call
+    output item carries {arguments, call_id, id, name, status, type}; echoing
+    it with its function_call_output failed 400 on the echo-only ``id`` and
+    ``status`` markers. Every item shape below mirrors what this gateway (and
+    OpenAI-direct) actually emit.
+    """
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "Weather in Paris?"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "plan"}],
+                    "content": [{"type": "reasoning_text", "text": "thinking"}],
+                    "encrypted_content": "blob==",
+                    "status": "completed",
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call-1",
+                    "name": "get_weather",
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fco_1",
+                    "call_id": "call-1",
+                    "output": "sunny",
+                    "status": "completed",
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "It is sunny.",
+                            "annotations": [],
+                            "logprobs": [],
+                        }
+                    ],
+                },
+                {"type": "message", "role": "user", "content": "And tomorrow?"},
+            ],
+        }
+    )
+    roles = [message.role for message in decoded.request.messages]
+    assert roles == ["user", "assistant", "tool", "assistant", "user"]
+    assistant_call = decoded.request.messages[1]
+    assert assistant_call.tool_calls[0].call_id == "call-1"
+    assert assistant_call.provider_reasoning[0].kind == "encrypted_reasoning"
+    assert decoded.request.messages[3].content == "It is sunny."
+
+
+def test_responses_union_errors_name_the_item_field_not_the_branch() -> None:
+    """A bad echoed item names its field, never a union branch like input.str."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {"type": "message", "role": "user", "content": "hi"},
+                    {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "get_weather",
+                        "arguments": "{}",
+                        "caller": {"type": "direct"},
+                    },
+                ],
+            }
+        )
+    assert raised.value.detail.param == "input.1.caller"

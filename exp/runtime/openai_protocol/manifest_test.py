@@ -12,6 +12,8 @@ from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     RESPONSES_INCLUDE_PATHS_ACCEPTED,
     RESPONSES_INCLUDE_PATHS_REJECTED,
+    RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED,
+    RESPONSES_INPUT_ITEM_FIELDS_REJECTED,
     RESPONSES_MANIFEST,
     RESPONSES_REASONING_CONTEXTS_ACCEPTED,
     RESPONSES_REASONING_EFFORTS_ACCEPTED,
@@ -141,3 +143,31 @@ def test_every_official_sdk_include_selector_is_decided() -> None:
     undecided = sdk_selectors - RESPONSES_INCLUDE_PATHS_ACCEPTED - RESPONSES_INCLUDE_PATHS_REJECTED
     assert not undecided, _decided(undecided, "include selector")
     assert not RESPONSES_INCLUDE_PATHS_ACCEPTED & RESPONSES_INCLUDE_PATHS_REJECTED
+
+
+def test_every_official_sdk_echoable_input_item_field_is_decided() -> None:
+    """Echoed output items are part of the drift gate.
+
+    A stateless caller resends prior output items verbatim as input, so a
+    new SDK field on any echoable item type must be a conscious decision:
+    accepted-and-dropped or rejected by name, never a silent 400.
+    """
+    from openai.types.responses.response_function_tool_call_param import (
+        ResponseFunctionToolCallParam,
+    )
+    from openai.types.responses.response_input_param import FunctionCallOutput
+    from openai.types.responses.response_output_message_param import ResponseOutputMessageParam
+    from openai.types.responses.response_reasoning_item_param import ResponseReasoningItemParam
+
+    sdk_items = {
+        "message": ResponseOutputMessageParam,
+        "function_call": ResponseFunctionToolCallParam,
+        "function_call_output": FunctionCallOutput,
+        "reasoning": ResponseReasoningItemParam,
+    }
+    for item_type, sdk_type in sdk_items.items():
+        accepted = RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED[item_type]
+        rejected = RESPONSES_INPUT_ITEM_FIELDS_REJECTED[item_type]
+        assert not accepted & rejected, item_type
+        undecided = set(sdk_type.__annotations__) - accepted - rejected
+        assert not undecided, _decided(undecided, f"echoed {item_type} input item")

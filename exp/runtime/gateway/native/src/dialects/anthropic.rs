@@ -6,8 +6,8 @@
 use serde_json::Value;
 
 use super::{
-    finish_open_tools, malformed, optional_text, parse_object, provider_stream_failed,
-    refusal_failure, Normalizer,
+    complete_streamed_tool, finish_open_tools, malformed, optional_text, parse_object,
+    provider_stream_failed, refusal_failure, Normalizer,
 };
 use crate::errors::Failure;
 use crate::events::{
@@ -167,9 +167,7 @@ impl Normalizer {
                     .map_err(|message| malformed(&message))? as u32;
                 if let Some(tool) = self.tools.get_mut(&index) {
                     if !tool.completed {
-                        tool.completed = true;
-                        let call = tool.complete().map_err(|message| malformed(&message))?;
-                        events.push(Event::ToolCallCompleted { index, call });
+                        complete_streamed_tool(index, tool, &mut events)?;
                     }
                 }
             }

@@ -5,6 +5,7 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.model import ReasoningEffort
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -380,7 +381,7 @@ def test_route_rejects_an_unsupported_configured_effort_without_clamping() -> No
                     model_id="gpt-5.6-sol",
                     supports_reasoning=True,
                     reasoning_wire_format="openai_responses",
-                    reasoning_effort="minimal",
+                    reasoning_effort="ultra",
                     reasoning_effort_required=True,
                 ),
             ),
@@ -388,7 +389,9 @@ def test_route_rejects_an_unsupported_configured_effort_without_clamping() -> No
         )
 
     assert raised.value.param == "reasoning_effort"
-    assert "Supported values: 'low', 'medium', 'high', 'xhigh'" in str(raised.value)
+    assert "Supported values: 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'" in str(
+        raised.value
+    )
 
 
 def test_route_preserves_each_required_reasoning_default_across_fallbacks() -> None:
@@ -1387,13 +1390,14 @@ def test_route_rejects_encrypted_reasoning_outside_native_responses() -> None:
     assert raised.value.code == "unsupported_parameter"
 
 
-def test_ultra_effort_is_admitted_only_where_the_family_documents_it() -> None:
-    """The gpt-5.6 family accepts ultra; other routes reject it before dispatch."""
-    request = GatewayRequest(
-        surface=GatewayApiSurface.RESPONSES,
-        messages=(GatewayMessage(role="user", content="go"),),
-        reasoning_effort="ultra",
-    )
+def test_gpt_56_efforts_match_the_provider_and_ultra_rejects_loud() -> None:
+    """The gpt-5.6 family accepts the provider-verified seven efforts.
+
+    Live check 2026-08-28: gpt-5.6-sol and gpt-5.6-codex reject "ultra" by
+    name and accept none through xhigh plus max, so admission mirrors the
+    provider exactly: decode still accepts the token, and the route rejects
+    it with the supported list before any dispatch.
+    """
     codex = GatewayWireProfile(
         dialect="openai_responses",
         url="https://openai.test",
@@ -1401,24 +1405,29 @@ def test_ultra_effort_is_admitted_only_where_the_family_documents_it() -> None:
         supports_reasoning=True,
         reasoning_wire_format="openai_responses",
     )
-    route_generation_parameter_requests((codex,), request)
+
+    def request_with(effort: str) -> GatewayRequest:
+        """Build one Responses request carrying the given effort."""
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(GatewayMessage(role="user", content="go"),),
+            reasoning_effort=cast("ReasoningEffort", effort),
+        )
+
+    max_request = request_with("max")
+    route_generation_parameter_requests((codex,), max_request)
     payload = openai_responses_stream_payload(
         "gpt-5.6-sol",
-        request,
+        max_request,
         supports_temperature=True,
         supports_reasoning=True,
     )
-    assert payload["reasoning"] == {"effort": "ultra"}
+    assert payload["reasoning"] == {"effort": "max"}
 
-    older = GatewayWireProfile(
-        dialect="openai_responses",
-        url="https://openai.test",
-        model_id="gpt-5.2",
-        supports_reasoning=True,
-        reasoning_wire_format="openai_responses",
-    )
-    with pytest.raises(UnsupportedReasoningEffortError):
-        route_generation_parameter_requests((older,), request)
+    with pytest.raises(UnsupportedReasoningEffortError) as raised:
+        route_generation_parameter_requests((codex,), request_with("ultra"))
+    assert "'ultra'" in str(raised.value)
+    assert "'max'" in str(raised.value)
 
 
 def test_reasoning_context_passes_through_verbatim_and_narrows_per_rung() -> None:

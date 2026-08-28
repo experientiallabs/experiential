@@ -76,11 +76,22 @@ class _EphemeralCacheControl(_WireModel):
         return value
 
 
+_EchoedItemStatus = Literal["in_progress", "completed", "incomplete"]
+"""Lifecycle marker carried by echoed output items; validated and dropped."""
+
+
 class _TextPart(_WireModel):
-    """One supported text-only content part."""
+    """One supported text-only content part.
+
+    Echoed ``output_text`` parts carry empty ``annotations`` and ``logprobs``
+    arrays (this gateway emits them and callers resend prior output verbatim
+    on continuations); only a populated value is rejected as unsupported.
+    """
 
     type: Literal["text", "input_text", "output_text"]
     text: str
+    annotations: tuple[()] | None = None
+    logprobs: tuple[()] | None = None
 
 
 class _FunctionCall(_WireModel):
@@ -137,9 +148,16 @@ class _Message(_WireModel):
 
 
 class _ResponseMessage(_Message):
-    """Responses message item with its optional official discriminator."""
+    """Responses message item with its optional official discriminator.
+
+    Stateless continuations echo prior OUTPUT items verbatim into the next
+    input, so the provider-issued ``id`` and lifecycle ``status`` are
+    accepted and dropped; the gateway mints its own public identities.
+    """
 
     type: Literal["message"] = "message"
+    id: str | None = Field(default=None, min_length=1, max_length=256)
+    status: _EchoedItemStatus | None = None
 
 
 class _FunctionDefinition(_WireModel):
@@ -234,20 +252,32 @@ class _ResponseTool(_WireModel):
 
 
 class _ResponseFunctionCall(_WireModel):
-    """Completed Responses function call included as assistant history."""
+    """Completed Responses function call included as assistant history.
+
+    ``id`` and ``status`` arrive on verbatim echoes of prior output items
+    and are accepted and dropped; ``call_id`` is the linkage that matters.
+    """
 
     type: Literal["function_call"]
     call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     arguments: str = Field(max_length=4_000_000)
+    id: str | None = Field(default=None, min_length=1, max_length=256)
+    status: _EchoedItemStatus | None = None
 
 
 class _ResponseFunctionOutput(_WireModel):
-    """Text function result included as Responses tool history."""
+    """Text function result included as Responses tool history.
+
+    ``id`` and ``status`` arrive when a stored turn's input items are
+    re-listed and echoed; accepted and dropped like the other echo markers.
+    """
 
     type: Literal["function_call_output"]
     call_id: str = Field(min_length=1, max_length=256)
     output: str
+    id: str | None = Field(default=None, min_length=1, max_length=256)
+    status: _EchoedItemStatus | None = None
 
 
 class _ReasoningSummaryPart(_WireModel):
@@ -257,18 +287,28 @@ class _ReasoningSummaryPart(_WireModel):
     text: str
 
 
+class _ReasoningTextPart(_WireModel):
+    """One display-only reasoning text part replayed inside a reasoning item."""
+
+    type: Literal["reasoning_text"]
+    text: str
+
+
 class _ResponseReasoningItem(_WireModel):
     """One opaque reasoning item a stateless caller replays with its input.
 
     ``encrypted_content`` is the round-trip payload; the display-only
-    ``summary`` parts are validated and dropped because the provider derives
-    the model-visible reasoning from the encrypted payload alone.
+    ``summary`` and ``content`` parts and the echoed lifecycle ``status``
+    are validated and dropped because the provider derives the
+    model-visible reasoning from the encrypted payload alone.
     """
 
     type: Literal["reasoning"]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     encrypted_content: str = Field(min_length=1)
     summary: tuple[_ReasoningSummaryPart, ...] = ()
+    content: tuple[_ReasoningTextPart, ...] = ()
+    status: _EchoedItemStatus | None = None
 
 
 class _ResponseFormat(_WireModel):
@@ -662,13 +702,49 @@ def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) 
         raise _validation_protocol_error(exc) from exc
 
 
+_LOCATION_NOISE = {"body", "non-streaming", "streaming"}
+_UNION_BRANCH_TYPES = {"str", "int", "float", "bool", "list", "tuple", "dict", "NoneType"}
+
+
+def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
+    """Drop pydantic union-branch labels so the path names request fields."""
+    cleaned: list[str] = []
+    for part in location:
+        text = str(part)
+        if text in _LOCATION_NOISE:
+            continue
+        if isinstance(part, str) and (
+            part.startswith("_") or "[" in text or text in _UNION_BRANCH_TYPES
+        ):
+            continue
+        cleaned.append(text)
+    return tuple(cleaned)
+
+
 def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
-    """Convert Pydantic locations into stable dotted OpenAI ``param`` paths."""
-    first = error.errors(include_url=False)[0]
-    location = tuple(
-        part for part in first["loc"] if part not in {"body", "non-streaming", "streaming"}
-    )
-    param = ".".join(str(part) for part in location) or "body"
+    """Convert Pydantic locations into stable dotted OpenAI ``param`` paths.
+
+    Union validation reports every branch's complaints. Errors group by
+    their branch (the location minus its final field segment); among the
+    most field-specific groups, the branch the caller actually meant is the
+    one with the fewest complaints, so its deepest cleaned location names
+    the real field (an echoed item's ``input.1.caller``), never a union
+    branch label such as ``input.str``.
+    """
+    groups: dict[tuple[str | int, ...], list[tuple[str, ...]]] = {}
+    for detail in error.errors(include_url=False):
+        groups.setdefault(tuple(detail["loc"][:-1]), []).append(_cleaned_location(detail["loc"]))
+    if not groups:
+        return invalid_field("body")
+    deepest = max(len(location) for locations in groups.values() for location in locations)
+    candidates = [
+        locations
+        for locations in groups.values()
+        if any(len(location) == deepest for location in locations)
+    ]
+    best = min(candidates, key=len)
+    location = max(best, key=len, default=())
+    param = ".".join(location) or "body"
     return invalid_field(param)
 
 

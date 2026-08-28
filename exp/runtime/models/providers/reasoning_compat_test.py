@@ -53,8 +53,12 @@ def test_openai_reasoning_efforts_follow_exact_model_tables() -> None:
     with pytest.raises(UnsupportedReasoningEffortError):
         openai_reasoning_effort("gpt-5.2-pro", "low")
     assert openai_reasoning_effort("gpt-5.4-pro-2026-03-05", "xhigh") == "xhigh"
+    # Provider-verified 2026-08-28: the gpt-5.6 family accepts the full
+    # seven-effort ladder (and rejects "ultra" by name).
+    assert openai_reasoning_effort("gpt-5.6-sol", "minimal") == "minimal"
+    assert openai_reasoning_effort("gpt-5.6-sol", "max") == "max"
     with pytest.raises(UnsupportedReasoningEffortError):
-        openai_reasoning_effort("gpt-5.6-sol", "minimal")
+        openai_reasoning_effort("gpt-5.6-sol", "ultra")
     with pytest.raises(UnsupportedReasoningEffortError):
         openai_reasoning_effort("gpt-5.5", "minimal")
     with pytest.raises(UnsupportedReasoningEffortError):

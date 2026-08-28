@@ -185,6 +185,33 @@ multimodal surface this gateway does not serve, so honoring the selector is
 impossible and accepting it would be silent."""
 
 
+RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {
+    "message": frozenset({"type", "role", "content", "id", "status"}),
+    "function_call": frozenset({"type", "call_id", "name", "arguments", "id", "status"}),
+    "function_call_output": frozenset({"type", "call_id", "output", "id", "status"}),
+    "reasoning": frozenset({"type", "id", "encrypted_content", "summary", "content", "status"}),
+}
+"""Echoable input-item fields the Responses decoder models per item type.
+
+Stateless continuations resend prior OUTPUT items verbatim as the next
+INPUT, so every field this gateway's own output items carry must decode.
+"""
+
+RESPONSES_INPUT_ITEM_FIELDS_REJECTED: dict[str, frozenset[str]] = {
+    "message": frozenset({"phase"}),
+    "function_call": frozenset({"caller", "namespace"}),
+    "function_call_output": frozenset({"caller", "namespace", "name"}),
+    "reasoning": frozenset(),
+}
+"""Echoable input-item fields consciously rejected with a named 400.
+
+``caller``/``namespace`` attribute server-tool invocations this gateway does
+not serve, ``phase`` is a provider response-phase marker outside the replay
+contract, and a ``name`` on a function output duplicates the call linkage
+already carried by ``call_id``.
+"""
+
+
 def disposition_map(manifest: CompatibilityManifest) -> dict[str, CompatibilityDisposition]:
     """Index one manifest by exact top-level request field.
 

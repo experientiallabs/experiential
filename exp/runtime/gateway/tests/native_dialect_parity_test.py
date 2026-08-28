@@ -520,3 +520,59 @@ def test_native_anthropic_normalizer_decodes_the_live_tool_use_wire() -> None:
     result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_TOOL_FRAMES)
     assert result["failure"] is None
     assert result["events"] == list(ANTHROPIC_LIVE_TOOL_EVENTS)
+
+
+# Captured live (2026-08-28, claude-haiku-4-5, ids neutralized): a
+# zero-argument tool call streams exactly one EMPTY input_json_delta and no
+# other fragments, so completion must default the accumulated arguments to
+# the canonical empty object instead of failing the stream as malformed.
+ANTHROPIC_LIVE_ZERO_ARG_FRAMES: tuple[bytes, ...] = (
+    b'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-haiku-4-5",'
+    b'"id":"msg_fixture","type":"message","role":"assistant","content":[],"stop_reason":null,'
+    b'"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":550,'
+    b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":21}}      }\n\n',
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+    b'"content_block":{"type":"tool_use","id":"toolu_fixture","name":"get_time",'
+    b'"input":{},"caller":{"type":"direct"}}      }\n\n',
+    b'event: ping\ndata: {"type": "ping"}\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"input_json_delta","partial_json":""}            }\n\n',
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0     }\n\n',
+    b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use",'
+    b'"stop_sequence":null,"stop_details":null},"usage":{"input_tokens":550,'
+    b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":37}}\n\n',
+    b'event: message_stop\ndata: {"type":"message_stop"               }\n\n',
+)
+
+
+def test_native_anthropic_normalizer_completes_a_zero_argument_tool_call() -> None:
+    """The live zero-argument wire completes with {} instead of malforming.
+
+    Production incident (2026-08-28): every zero-argument tool (the shape
+    most coding agents ship) failed with malformed_response because the
+    accumulated raw arguments stayed empty.
+    """
+    result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_ZERO_ARG_FRAMES)
+    assert result["failure"] is None
+    assert result["events"] == [
+        {"kind": "tool_call_started", "index": 0, "call_id": "toolu_fixture", "name": "get_time"},
+        {"kind": "tool_arguments_delta", "index": 0, "text": ""},
+        # The completion-time seed streams before the completed call so every
+        # downstream byte verification matches the accumulated fragments.
+        {"kind": "tool_arguments_delta", "index": 0, "text": "{}"},
+        {
+            "kind": "tool_call_completed",
+            "index": 0,
+            "call_id": "toolu_fixture",
+            "name": "get_time",
+            "raw_arguments": "{}",
+        },
+        {
+            "kind": "usage",
+            "input_tokens": 550,
+            "output_tokens": 37,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": None,
+        },
+        {"kind": "completed"},
+    ]

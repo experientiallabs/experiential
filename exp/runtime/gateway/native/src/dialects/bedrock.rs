@@ -3,7 +3,7 @@
 
 use serde_json::{Map, Value};
 
-use super::{malformed, parse_object, refusal_failure, Normalizer};
+use super::{complete_streamed_tool, malformed, parse_object, refusal_failure, Normalizer};
 use crate::errors::{Failure, FailureClass};
 use crate::events::{bedrock_usage, require_string, require_u64, Event, ToolAccumulator};
 
@@ -154,11 +154,12 @@ impl Normalizer {
         let payload = parse_object(&frame.data)?;
         let index = require_u64(&payload, "contentBlockIndex", "Bedrock contentBlockIndex")
             .map_err(|message| malformed(&message))? as u32;
-        let Some(tool) = self.tools.remove(&index) else {
+        let Some(mut tool) = self.tools.remove(&index) else {
             return Ok(Vec::new());
         };
-        let call = tool.complete().map_err(|message| malformed(&message))?;
-        Ok(vec![Event::ToolCallCompleted { index, call }])
+        let mut events = Vec::new();
+        complete_streamed_tool(index, &mut tool, &mut events)?;
+        Ok(events)
     }
 
     /// Flush Bedrock usage and, once the stop reason is retained, terminate.
