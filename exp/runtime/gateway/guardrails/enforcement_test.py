@@ -372,6 +372,59 @@ def test_input_modify_rejects_carrier_stripping_while_tool_history_survives() ->
     assert raised.value.failure.safe_details["action"] == GuardrailAction.ERROR.value
 
 
+def test_input_modify_rejects_tool_authority_stripping_without_reasoning() -> None:
+    """Raw call bytes and provider identity stay protected even without reasoning blocks."""
+    original = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="Use a tool"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-one",
+                        name="lookup",
+                        arguments={"query": "safe"},
+                        raw_arguments='{"query":"safe"}',
+                        provider_item_id="fc-one",
+                        provider_output_index=0,
+                        provider_status="completed",
+                    ),
+                ),
+            ),
+            GatewayMessage(role="tool", tool_call_id="call-one", content="result"),
+        ),
+    )
+    stripped_call = (
+        original.messages[1]
+        .tool_calls[0]
+        .model_copy(
+            update={
+                "raw_arguments": None,
+                "provider_item_id": None,
+                "provider_output_index": None,
+                "provider_status": None,
+            }
+        )
+    )
+    replacement = (
+        original.messages[0],
+        original.messages[1].model_copy(update={"tool_calls": (stripped_call,)}),
+        original.messages[2],
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    with pytest.raises(GuardrailRejected):
+        _awaited(engine.enforce_input(policy=policy, request=original, deadline_monotonic=200.0))
+
+
 def test_input_block_is_terminal_and_content_free() -> None:
     """A block action raises a sanitized failure without request text."""
     engine, _classifier = _engine(

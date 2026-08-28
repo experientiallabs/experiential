@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection
-from typing import Literal, cast
+from collections.abc import Collection, Mapping
+from typing import Annotated, Literal, cast
 
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses.response_create_params import ResponseCreateParams
@@ -364,9 +364,11 @@ class _ResponseReasoning(_WireModel):
         return self
 
 
-_ResponsesInputItem = (
-    _ResponseMessage | _ResponseFunctionCall | _ResponseFunctionOutput | _ResponseReasoningItem
-)
+_ResponsesOutputItem = Annotated[
+    _ResponseFunctionCall | _ResponseFunctionOutput | _ResponseReasoningItem,
+    Field(discriminator="type"),
+]
+_ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem
 
 
 class _ResponsesRequest(_WireModel):
@@ -494,15 +496,10 @@ def decode_responses(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     _validate_manifest(payload, RESPONSES_MANIFEST)
-    input_items = payload.get("input")
-    if isinstance(input_items, list):
-        for index, item in enumerate(input_items):
-            if isinstance(item, dict) and item.get("type") == "reasoning" and "id" not in item:
-                raise invalid_field(f"input.{index}.id")
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
-    _validate_official(_RESPONSES_OFFICIAL, payload, extension_fields={"top_k", "reasoning"})
     request = _validate_wire(_ResponsesRequest, payload)
+    _validate_official(_RESPONSES_OFFICIAL, payload, extension_fields={"top_k", "reasoning"})
     include_encrypted_reasoning = _include_encrypted_reasoning(request.include)
     operation = _caller_operation(idempotency_key, client_request_id)
     messages = list(_response_input_messages(request.input))
@@ -891,6 +888,7 @@ def _response_input_messages(
                     id=item.id,
                     encrypted_content=item.encrypted_content,
                     output_index=index,
+                    status=item.status,
                 )
             )
         elif isinstance(item, _ResponseMessage):
@@ -905,6 +903,7 @@ def _response_input_messages(
                             "provider_reasoning": take_reasoning("assistant"),
                             "provider_item_id": item.id,
                             "provider_output_index": index if item.id is not None else None,
+                            "provider_status": item.status,
                         }
                     ),
                     *converted[1:],
@@ -920,6 +919,7 @@ def _response_input_messages(
                     update={
                         "provider_item_id": item.id,
                         "provider_output_index": index,
+                        "provider_status": item.status,
                     }
                 )
             )

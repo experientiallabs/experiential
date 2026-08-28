@@ -194,6 +194,7 @@ def remember_turn(
                 raw_arguments=raw_arguments,
                 provider_item_id=provider_item_id,
                 provider_output_index=provider_output_index,
+                provider_status="completed" if provider_item_id is not None else None,
             )
         )
     tool_calls = tuple(tool_calls_list)
@@ -227,6 +228,7 @@ def remember_turn(
                     id=item_id,
                     encrypted_content=encrypted_content,
                     output_index=output_index,
+                    status="completed",
                 ),
             )
         )
@@ -252,6 +254,7 @@ def remember_turn(
         provider_reasoning=provider_reasoning,
         provider_item_id=message_item_id,
         provider_output_index=message_output_index,
+        provider_status="completed" if message_item_id is not None else None,
     )
     continuations.remember_now(
         namespace=context.namespace,

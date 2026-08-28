@@ -206,6 +206,10 @@ class ToolCall(ContractModel):
     """
     provider_item_id: str | None = Field(default=None, min_length=1, max_length=256, exclude=True)
     provider_output_index: int | None = Field(default=None, ge=0, exclude=True)
+    provider_status: Literal["in_progress", "completed", "incomplete"] | None = Field(
+        default=None,
+        exclude=True,
+    )
 
     @model_validator(mode="after")
     def _require_matching_raw_arguments(self) -> ToolCall:
@@ -224,6 +228,8 @@ class ToolCall(ContractModel):
                 raise ValueError("raw tool arguments must encode one JSON object") from exc
             if parsed != self.arguments:
                 raise ValueError("raw tool arguments must match parsed tool arguments")
+        if self.provider_status is not None and self.provider_item_id is None:
+            raise ValueError("provider tool-call status requires retained item identity")
         return self
 
     def arguments_json(self, *, sort_keys: bool = False, compact: bool = False) -> str:

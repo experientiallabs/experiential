@@ -109,6 +109,10 @@ class EncryptedReasoningBlock(ContractModel):
     id: str = Field(min_length=1, max_length=256)
     encrypted_content: str = Field(min_length=1)
     output_index: int | None = Field(default=None, ge=0, exclude=True)
+    status: Literal["in_progress", "completed", "incomplete"] | None = Field(
+        default=None,
+        exclude=True,
+    )
 
 
 ProviderReasoningBlock = Annotated[
@@ -150,6 +154,10 @@ class GatewayMessage(ContractModel):
     """
     provider_item_id: str | None = Field(default=None, min_length=1, max_length=256, exclude=True)
     provider_output_index: int | None = Field(default=None, ge=0, exclude=True)
+    provider_status: Literal["in_progress", "completed", "incomplete"] | None = Field(
+        default=None,
+        exclude=True,
+    )
 
     @model_validator(mode="after")
     def _require_role_coherence(self) -> GatewayMessage:
@@ -168,11 +176,15 @@ class GatewayMessage(ContractModel):
         if self.role != "assistant" and self.provider_reasoning:
             raise ValueError("provider reasoning blocks are valid only for assistant messages")
         if self.role != "assistant" and (
-            self.provider_item_id is not None or self.provider_output_index is not None
+            self.provider_item_id is not None
+            or self.provider_output_index is not None
+            or self.provider_status is not None
         ):
             raise ValueError("provider output identity is valid only for assistant messages")
         if (self.provider_item_id is None) != (self.provider_output_index is None):
             raise ValueError("provider item ID and output index must be retained together")
+        if self.provider_status is not None and self.provider_item_id is None:
+            raise ValueError("provider output status requires retained item identity")
         call_ids = tuple(call.call_id for call in self.tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")
@@ -353,12 +365,14 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
         if message.provider_item_id is not None:
             authority["provider_item_id"] = message.provider_item_id
             authority["provider_output_index"] = message.provider_output_index
+            authority["provider_status"] = message.provider_status
         if message.provider_reasoning:
             blocks: list[JsonObject] = []
             for block in message.provider_reasoning:
                 serialized = block.model_dump(mode="json")
                 if isinstance(block, EncryptedReasoningBlock):
                     serialized["output_index"] = block.output_index
+                    serialized["status"] = block.status
                 blocks.append(serialized)
             authority["provider_reasoning"] = blocks
         retained_calls: list[JsonObject] = []
@@ -367,6 +381,7 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
                 call.raw_arguments is None
                 and call.provider_item_id is None
                 and call.provider_output_index is None
+                and call.provider_status is None
             ):
                 continue
             retained_calls.append(
@@ -377,6 +392,7 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
                     "raw_arguments": call.raw_arguments,
                     "provider_item_id": call.provider_item_id,
                     "provider_output_index": call.provider_output_index,
+                    "provider_status": call.provider_status,
                 }
             )
         if retained_calls:

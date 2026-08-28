@@ -93,6 +93,7 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
             "id": "rs-0",
             "summary": [],
             "encrypted_content": "first-opaque",
+            "status": "completed",
         },
         {
             "type": "function_call",
@@ -100,12 +101,14 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
             "call_id": "call-one",
             "name": "lookup",
             "arguments": '{ "query" : "λ" }',
+            "status": "completed",
         },
         {
             "type": "reasoning",
             "id": "rs-2",
             "summary": [],
             "encrypted_content": "second-opaque",
+            "status": "completed",
         },
         {"type": "function_call_output", "call_id": "call-one", "output": "tool-result"},
     ]

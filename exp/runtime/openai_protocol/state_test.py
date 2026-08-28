@@ -6,7 +6,12 @@ import asyncio
 
 import pytest
 
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage
+from exp.common.models.model import ToolCall
+from exp.runtime.gateway.contracts import (
+    EncryptedReasoningBlock,
+    GatewayApiSurface,
+    GatewayMessage,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -268,3 +273,39 @@ def test_continuation_is_bounded_namespaced_and_restart_unavailable() -> None:
             await store.resolve(namespace=_namespace(), previous_response_id="resp_two")
 
     asyncio.run(scenario())
+
+
+def test_continuation_byte_cap_counts_excluded_provider_replay_authority() -> None:
+    """Encrypted reasoning and raw arguments cannot bypass the in-memory byte ceiling."""
+    state = ContinuationState(
+        episode_key="d" * 64,
+        messages=(
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-one",
+                        name="lookup",
+                        arguments={},
+                        raw_arguments="{" + (" " * 2_048) + "}",
+                        provider_item_id="fc-one",
+                        provider_output_index=1,
+                        provider_status="completed",
+                    ),
+                ),
+                provider_reasoning=(
+                    EncryptedReasoningBlock(
+                        id="rs-one",
+                        encrypted_content="x" * 2_048,
+                        output_index=0,
+                        status="completed",
+                    ),
+                ),
+            ),
+        ),
+    )
+    assert state.size_bytes > 4_096
+    store = BoundedContinuationStore(capacity=1, byte_cap=4_096, ttl_seconds=60)
+
+    with pytest.raises(OpenAIProtocolError, match="too large"):
+        store.remember_now(namespace=_namespace(), response_id="resp_large", state=state)

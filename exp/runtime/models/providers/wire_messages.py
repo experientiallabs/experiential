@@ -47,6 +47,8 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             "encrypted_content": block.encrypted_content,
         }
         item["id"] = block.id
+        if block.status is not None:
+            item["status"] = block.status
         if block.output_index is None:
             items.append(item)
         else:
@@ -64,7 +66,7 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
                         "type": "message",
                         "id": message.provider_item_id,
                         "role": "assistant",
-                        "status": "completed",
+                        "status": message.provider_status or "completed",
                         "content": [
                             {
                                 "type": "output_text",
@@ -85,6 +87,8 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
         }
         if call.provider_item_id is not None:
             item["id"] = call.provider_item_id
+        if call.provider_status is not None:
+            item["status"] = call.provider_status
         if call.provider_output_index is None:
             items.append(item)
         else:

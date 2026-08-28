@@ -780,6 +780,7 @@ def test_responses_decoder_replays_output_message_in_provider_order() -> None:
                 {
                     "type": "reasoning",
                     "id": "rs_0",
+                    "status": "completed",
                     "summary": [],
                     "encrypted_content": "opaque",
                 },
@@ -803,6 +804,7 @@ def test_responses_decoder_replays_output_message_in_provider_order() -> None:
                     "call_id": "call-2",
                     "name": "lookup",
                     "arguments": '{ "q" : "x" }',
+                    "status": "completed",
                 },
                 {"type": "function_call_output", "call_id": "call-2", "output": "found"},
             ],
@@ -822,7 +824,40 @@ def test_responses_decoder_replays_output_message_in_provider_order() -> None:
     ]
     message_content = cast(list[JsonObject], payload_input[1]["content"])
     assert message_content[0]["text"] == "I will look that up."
+    assert payload_input[0]["status"] == "completed"
     assert payload_input[2]["arguments"] == '{ "q" : "x" }'
+    assert payload_input[2]["status"] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("item", "param"),
+    (
+        (
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            "input.0.encrypted_content",
+        ),
+        (
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "",
+                "arguments": "{}",
+            },
+            "input.0.name",
+        ),
+    ),
+)
+def test_responses_decoder_reports_the_specific_malformed_output_item_field(
+    item: JsonObject,
+    param: str,
+) -> None:
+    """Union validation never leaks implementation branches such as input.str."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses({"model": "coding", "input": [item]})
+
+    assert raised.value.status_code == 400
+    assert raised.value.detail.param == param
 
 
 def test_responses_decoder_orders_function_calls_without_optional_item_ids() -> None:

@@ -27,12 +27,30 @@ def _preserves_provider_reasoning_authority(
     original: Sequence[GatewayMessage],
     replacement: Sequence[GatewayMessage],
 ) -> bool:
-    """Return whether a classifier preserved every context-bound reasoning turn."""
+    """Return whether a classifier preserved every provider replay-authority turn."""
+
+    def has_authority(message: GatewayMessage) -> bool:
+        """Identify fields that must replay byte-exact on a provider continuation."""
+        return bool(
+            message.provider_reasoning
+            or message.provider_item_id is not None
+            or message.provider_output_index is not None
+            or message.provider_status is not None
+            or message.tool_is_error
+            or any(
+                call.raw_arguments is not None
+                or call.provider_item_id is not None
+                or call.provider_output_index is not None
+                or call.provider_status is not None
+                for call in message.tool_calls
+            )
+        )
+
     original_carrier_indexes = tuple(
-        index for index, message in enumerate(original) if message.provider_reasoning
+        index for index, message in enumerate(original) if has_authority(message)
     )
     replacement_carrier_indexes = tuple(
-        index for index, message in enumerate(replacement) if message.provider_reasoning
+        index for index, message in enumerate(replacement) if has_authority(message)
     )
     if not original_carrier_indexes:
         return not replacement_carrier_indexes
