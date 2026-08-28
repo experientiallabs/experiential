@@ -391,34 +391,37 @@ def test_route_rejects_an_unsupported_configured_effort_without_clamping() -> No
     assert "Supported values: 'low', 'medium', 'high', 'xhigh'" in str(raised.value)
 
 
-def test_route_rejects_inconsistent_configured_efforts_across_fallbacks() -> None:
-    """A fallback cannot silently change an operator-pinned reasoning level."""
+def test_route_preserves_each_required_reasoning_default_across_fallbacks() -> None:
+    """An omitted caller effort is injected independently on each required wire."""
     profiles = (
         GatewayWireProfile(
-            dialect="anthropic_messages",
+            dialect="openai_compatible",
             url="https://first.test",
-            model_id="claude-opus-5",
+            model_id="provider/first",
             supports_reasoning=True,
-            reasoning_wire_format="anthropic_adaptive",
+            reasoning_wire_format="reasoning",
             reasoning_effort="high",
+            supported_reasoning_efforts=("medium", "high"),
             reasoning_effort_required=True,
         ),
         GatewayWireProfile(
-            dialect="anthropic_messages",
+            dialect="openai_compatible",
             url="https://fallback.test",
-            model_id="claude-opus-5",
+            model_id="provider/fallback",
             supports_reasoning=True,
-            reasoning_wire_format="anthropic_adaptive",
+            reasoning_wire_format="reasoning",
             reasoning_effort="medium",
+            supported_reasoning_efforts=("medium", "high"),
             reasoning_effort_required=True,
         ),
     )
 
-    with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests(profiles, _chat_request())
+    public, provider = route_generation_parameter_requests(profiles, _chat_request())
 
-    assert raised.value.code == "invalid_parameter"
-    assert "gateway operator must align" in str(raised.value)
+    assert public.reasoning_effort is None
+    assert provider.reasoning_effort is None
+    assert dialect_stream_payload(profiles[0], provider)["reasoning"] == {"effort": "high"}
+    assert dialect_stream_payload(profiles[1], provider)["reasoning"] == {"effort": "medium"}
 
 
 def test_explicit_provider_effort_set_accepts_exact_values_and_rejects_others() -> None:
@@ -472,7 +475,7 @@ def test_required_reasoning_default_is_sent_but_optional_default_is_not() -> Non
 
     public, provider = route_generation_parameter_requests((required,), _chat_request())
     assert public.reasoning_effort is None
-    assert provider.reasoning_effort == "max"
+    assert provider.reasoning_effort is None
     assert dialect_stream_payload(required, provider)["reasoning"] == {"effort": "max"}
     optional_public, optional_provider = route_generation_parameter_requests(
         (optional,), _chat_request()
@@ -480,6 +483,14 @@ def test_required_reasoning_default_is_sent_but_optional_default_is_not() -> Non
     assert optional_public.reasoning_effort is None
     assert optional_provider.reasoning_effort is None
     assert "reasoning" not in dialect_stream_payload(optional, optional_provider)
+
+    mixed_public, mixed_provider = route_generation_parameter_requests(
+        (required, optional), _chat_request()
+    )
+    assert mixed_public.reasoning_effort is None
+    assert mixed_provider.reasoning_effort is None
+    assert dialect_stream_payload(required, mixed_provider)["reasoning"] == {"effort": "max"}
+    assert "reasoning" not in dialect_stream_payload(optional, mixed_provider)
 
 
 def test_generation_parameter_selection_skips_incompatible_fallbacks() -> None:
@@ -500,6 +511,65 @@ def test_generation_parameter_selection_skips_incompatible_fallbacks() -> None:
         ),
     )
     request = _chat_request().model_copy(update={"reasoning_effort": "high"})
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
+
+
+def test_generation_parameter_selection_accepts_different_required_defaults() -> None:
+    """Omitted effort keeps independently valid rungs with different wire defaults."""
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://first.test",
+            model_id="provider/first",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            reasoning_effort="high",
+            supported_reasoning_efforts=("medium", "high"),
+            reasoning_effort_required=True,
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://fallback.test",
+            model_id="provider/fallback",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            reasoning_effort="medium",
+            supported_reasoning_efforts=("medium", "high"),
+            reasoning_effort_required=True,
+        ),
+    )
+
+    assert compatible_generation_parameter_profile_indexes(profiles, _chat_request()) == (0, 1)
+
+
+def test_generation_parameter_selection_uses_each_default_for_sampling() -> None:
+    """Conditional sampling narrows against each required default independently."""
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://reasoning.test",
+            model_id="provider/reasoning",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            reasoning_effort="high",
+            supported_reasoning_efforts=("none", "high"),
+            reasoning_effort_required=True,
+            sampling_requires_reasoning_none=True,
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://sampling.test",
+            model_id="provider/sampling",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            reasoning_effort="none",
+            supported_reasoning_efforts=("none", "high"),
+            reasoning_effort_required=True,
+            sampling_requires_reasoning_none=True,
+        ),
+    )
+    request = _chat_request().model_copy(update={"temperature": 0.5})
 
     assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
 

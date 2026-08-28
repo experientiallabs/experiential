@@ -212,19 +212,17 @@ def route_generation_parameter_requests(
             (_ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT, *route_limits)
         )
     effort_path = "reasoning.effort" if request.surface.value == "responses" else "reasoning_effort"
-    effective_reasoning_effort = _effective_route_reasoning_effort(
-        profiles,
-        request.reasoning_effort,
-        param=effort_path,
-    )
-    if request.reasoning_effort is None and effective_reasoning_effort is not None:
-        provider_updates["reasoning_effort"] = effective_reasoning_effort
+
+    def profile_reasoning_effort(profile: GatewayWireProfile) -> str | None:
+        """Return the caller effort or this wire's required provider default."""
+        return _effective_profile_reasoning_effort(profile, request.reasoning_effort)
 
     def sampling_supported(profile: GatewayWireProfile, *, top_p: bool = False) -> bool:
         """Return whether one rung accepts this request's sampling mode."""
         declared = profile.supports_top_p is True if top_p else profile.supports_temperature
         return declared and (
-            not profile.sampling_requires_reasoning_none or effective_reasoning_effort == "none"
+            not profile.sampling_requires_reasoning_none
+            or profile_reasoning_effort(profile) == "none"
         )
 
     if request.temperature is not None:
@@ -256,28 +254,33 @@ def route_generation_parameter_requests(
             minimum=lambda profile: profile.minimum_top_k,
             maximum=lambda profile: profile.maximum_top_k,
         )
-    if effective_reasoning_effort is not None:
+    if request.reasoning_effort is not None:
         portable_efforts = set(REASONING_EFFORTS)
         for profile in profiles:
-            if not profile.supports_reasoning or profile.reasoning_wire_format == "none":
-                portable_efforts.clear()
-                break
-            portable_efforts.intersection_update(
-                supported_reasoning_efforts(
-                    profile.model_id,
-                    profile.reasoning_wire_format,
-                    configured_effort=profile.reasoning_effort,
-                    explicit_efforts=profile.supported_reasoning_efforts or None,
-                )
-            )
-        if effective_reasoning_effort not in portable_efforts:
+            portable_efforts.intersection_update(_profile_reasoning_efforts(profile))
+        if request.reasoning_effort not in portable_efforts:
             raise UnsupportedReasoningEffortError(
-                effort=effective_reasoning_effort,
+                effort=request.reasoning_effort,
                 supported_efforts=tuple(
                     effort for effort in REASONING_EFFORTS if effort in portable_efforts
                 ),
                 param=effort_path,
             )
+    else:
+        # An omitted caller value remains omitted on the shared request. Each
+        # dialect payload injects only its own provider-required default, so a
+        # fallback never forces that default onto a wire where it is optional.
+        for profile in profiles:
+            required_effort = profile_reasoning_effort(profile)
+            if required_effort is None:
+                continue
+            profile_efforts = _profile_reasoning_efforts(profile)
+            if required_effort not in profile_efforts:
+                raise UnsupportedReasoningEffortError(
+                    effort=required_effort,
+                    supported_efforts=profile_efforts,
+                    param=effort_path,
+                )
     if request.stop and any(profile.dialect == "openai_responses" for profile in profiles):
         raise ProviderParameterError(
             message=(
@@ -413,30 +416,26 @@ def route_generation_parameter_requests(
     return public_request, provider_request
 
 
-def _effective_route_reasoning_effort(
-    profiles: Sequence[GatewayWireProfile],
+def _effective_profile_reasoning_effort(
+    profile: GatewayWireProfile,
     requested_effort: str | None,
-    *,
-    param: str,
 ) -> str | None:
-    """Return an explicit effort or one consistent required provider default."""
+    """Return an explicit caller effort or one wire's required default."""
     if requested_effort is not None:
         return requested_effort
-    configured = {
-        profile.reasoning_effort for profile in profiles if profile.reasoning_effort_required
-    }
-    if not configured:
-        return None
-    if None in configured or len(configured) != 1:
-        raise ProviderParameterError(
-            message=(
-                "The model route has inconsistent required reasoning efforts. "
-                "The gateway operator must align every waterfall deployment before retrying."
-            ),
-            param=param,
-            code="invalid_parameter",
-        )
-    return next(iter(configured))
+    return profile.reasoning_effort if profile.reasoning_effort_required else None
+
+
+def _profile_reasoning_efforts(profile: GatewayWireProfile) -> tuple[str, ...]:
+    """Return exact accepted efforts for one deployment wire profile."""
+    if not profile.supports_reasoning or profile.reasoning_wire_format == "none":
+        return ()
+    return supported_reasoning_efforts(
+        profile.model_id,
+        profile.reasoning_wire_format,
+        configured_effort=profile.reasoning_effort,
+        explicit_efforts=profile.supported_reasoning_efforts or None,
+    )
 
 
 def _require_route_numeric_parameter(
