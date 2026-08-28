@@ -63,8 +63,6 @@ def _fireworks_continuation_required(
     return (
         request.surface == GatewayApiSurface.RESPONSES
         and _is_fireworks_profile(profile)
-        and request.response_store is False
-        and not request.include_encrypted_reasoning
         and bool(request.tools)
         and request.tool_choice != "none"
     )
@@ -208,9 +206,8 @@ def route_generation_parameter_requests(
     if any(_fireworks_continuation_required(profile, request) for profile in profiles):
         raise ProviderParameterError(
             message=(
-                "Fireworks Responses tool continuations require gateway storage or encrypted "
-                "reasoning. Enable one continuation channel, set tool_choice to 'none', or "
-                "choose another provider route."
+                "Fireworks Responses tool continuations are unavailable on this route. Set "
+                "tool_choice to 'none' or choose another provider route."
             ),
             param="tool_choice",
             code="unsupported_parameter",

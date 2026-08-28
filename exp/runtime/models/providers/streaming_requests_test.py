@@ -114,17 +114,29 @@ def test_fireworks_tools_that_can_run_require_continuation(
         dialect_stream_payload(profile, request)
 
 
-def test_fireworks_continuation_gate_accepts_safe_alternatives() -> None:
-    """No tools or gateway storage each provide a safe route."""
+def test_fireworks_continuation_gate_accepts_no_tools() -> None:
+    """A request without tools needs no continuation channel."""
     profile = _fireworks_profile()
     request = _fireworks_responses_request()
 
-    for safe in (
-        request.model_copy(update={"tools": ()}),
-        request.model_copy(update={"response_store": True}),
-    ):
-        route_generation_parameter_requests((profile,), safe)
-        assert dialect_stream_payload(profile, safe)["stream"] is True
+    safe = request.model_copy(update={"tools": ()})
+    route_generation_parameter_requests((profile,), safe)
+    assert dialect_stream_payload(profile, safe)["stream"] is True
+
+
+@pytest.mark.parametrize(
+    "update",
+    ({"response_store": True}, {"include_encrypted_reasoning": True}),
+)
+def test_fireworks_unimplemented_continuation_channels_still_fail_closed(
+    update: dict[str, bool],
+) -> None:
+    """Storage flags cannot claim retention before the carrier PR lands."""
+    profile = _fireworks_profile()
+    request = _fireworks_responses_request().model_copy(update=update)
+
+    with pytest.raises(ProviderParameterError, match="unavailable"):
+        route_generation_parameter_requests((profile,), request)
 
 
 def test_fireworks_encrypted_reasoning_waits_for_the_authenticated_carrier() -> None:
@@ -134,9 +146,9 @@ def test_fireworks_encrypted_reasoning_waits_for_the_authenticated_carrier() -> 
         update={"include_encrypted_reasoning": True}
     )
 
-    with pytest.raises(ProviderParameterError, match="encrypted reasoning") as raised:
+    with pytest.raises(ProviderParameterError, match="unavailable") as raised:
         route_generation_parameter_requests((profile,), request)
-    assert raised.value.param == "include"
+    assert raised.value.param == "tool_choice"
 
 
 def test_openai_compatible_stream_payload_forwards_top_p_and_usage() -> None:
