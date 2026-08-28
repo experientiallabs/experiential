@@ -767,6 +767,79 @@ def test_newer_and_marker_only_schemas_refuse_without_deleting_state(tmp_path: P
         initialize_database(corrupt)
 
 
+def test_v14_upgrades_a_pre_marker_schema_13_database(tmp_path: Path) -> None:
+    """A schema-13 database from before the provenance marker stays readable."""
+    path = tmp_path / "gateway.db"
+    initialize_database(path)
+    connection = connect_database(path)
+    try:
+        connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
+        connection.execute(
+            """
+            INSERT INTO provider_connections (
+                connection_id, organization_id, active_revision_id,
+                active, created_at, updated_at
+            ) VALUES ('conn', 'org', NULL, 1, 't', 't')
+            """
+        )
+        config = ConnectionConfig(
+            provider="bedrock",
+            api_key_env="AWS_SECRET_ACCESS_KEY",
+            region="us-west-2",
+            aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+            bedrock_auth_mode="access_key_pair",
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_connection_revisions (
+                revision_id, organization_id, connection_id, revision_number,
+                provider, api_key_env, region, aws_access_key_id_env,
+                bedrock_auth_mode, connection_sha256, created_at
+            ) VALUES ('legacy-rev', 'org', 'conn', 1, 'bedrock',
+                      'AWS_SECRET_ACCESS_KEY', 'us-west-2', 'AWS_ACCESS_KEY_ID',
+                      'access_key_pair', ?, 't')
+            """,
+            (config.identity_sha256(),),
+        )
+        connection.execute(
+            "UPDATE provider_connections SET active_revision_id = 'legacy-rev' "
+            "WHERE connection_id = 'conn'"
+        )
+        connection.execute(
+            "ALTER TABLE provider_connection_revisions DROP COLUMN migration_revision_alias"
+        )
+        connection.execute("PRAGMA user_version = 13")
+    finally:
+        connection.close()
+
+    initialize_database(path)
+    migrated = connect_database(path)
+    try:
+        columns = {
+            str(row[1])
+            for row in migrated.execute(
+                "PRAGMA table_info(provider_connection_revisions)"
+            ).fetchall()
+        }
+        assert "migration_revision_alias" in columns
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        authorities = active_provider_connections(migrated, organization_id="org")
+        assert len(authorities) == 1
+        assert authorities[0].revision_id == "legacy-rev"
+        assert authorities[0].config == config
+        assert (
+            migrated.execute(
+                "SELECT migration_revision_alias FROM provider_connection_revisions "
+                "WHERE revision_id = 'legacy-rev'"
+            ).fetchone()[0]
+            is None
+        )
+        assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        migrated.close()
+
+
 def test_v10_migration_widens_api_surface_and_preserves_rows(tmp_path: Path) -> None:
     """The v10 rewrite admits the messages surface without touching v9 data.
 

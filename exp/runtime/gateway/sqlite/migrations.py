@@ -18,7 +18,7 @@ from exp.runtime.gateway.sqlite.migration_repairs import (
 )
 from exp.runtime.gateway.sqlite.provider_authority import provider_connection_revision_id
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 class GatewaySchemaError(RuntimeError):
@@ -610,6 +610,8 @@ _MIGRATION_12: tuple[str, ...] = ()
 # either published schema-11 shapes or short-lived local schema-12 databases.
 _MIGRATION_13: tuple[str, ...] = ()
 
+_MIGRATION_14: tuple[str, ...] = ()  # Pre-marker schema-13 compatibility.
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -624,29 +626,27 @@ _MIGRATIONS = {
     11: _MIGRATION_11,
     12: _MIGRATION_12,
     13: _MIGRATION_13,
+    14: _MIGRATION_14,
 }
+
+
+def _provider_revision_columns(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(provider_connection_revisions)").fetchall()
+    }
 
 
 def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
     """Apply one forward migration, including schema-11 compatibility repair."""
     if version == 12:
-        columns = {
-            str(row[1])
-            for row in connection.execute(
-                "PRAGMA table_info(provider_connection_revisions)"
-            ).fetchall()
-        }
+        columns = _provider_revision_columns(connection)
         if "aws_access_key_id_env" not in columns:
             connection.execute(
                 "ALTER TABLE provider_connection_revisions ADD COLUMN aws_access_key_id_env TEXT"
             )
     if version == 13:
-        columns = {
-            str(row[1])
-            for row in connection.execute(
-                "PRAGMA table_info(provider_connection_revisions)"
-            ).fetchall()
-        }
+        columns = _provider_revision_columns(connection)
         if "bedrock_auth_mode" not in columns:
             connection.execute(
                 "ALTER TABLE provider_connection_revisions ADD COLUMN bedrock_auth_mode TEXT "
@@ -749,6 +749,12 @@ def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
                 "SET connection_sha256 = ?, migration_revision_alias = ? "
                 "WHERE revision_id = ?",
                 (digest, migration_alias, row["revision_id"]),
+            )
+    if version == 14:
+        columns = _provider_revision_columns(connection)
+        if "migration_revision_alias" not in columns:
+            connection.execute(
+                "ALTER TABLE provider_connection_revisions ADD COLUMN migration_revision_alias TEXT"
             )
     for statement in _MIGRATIONS[version]:
         connection.execute(statement)
