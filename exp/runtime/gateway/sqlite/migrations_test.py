@@ -769,7 +769,9 @@ def test_newer_and_marker_only_schemas_refuse_without_deleting_state(tmp_path: P
 
 def test_v14_upgrades_a_pre_marker_schema_13_database(tmp_path: Path) -> None:
     """A schema-13 database from before the provenance marker stays readable."""
-    path = tmp_path / "gateway.db"
+    manager = GatewayManagement(tmp_path, organization_id="org")
+    manager.state_dir.mkdir(parents=True)
+    path = manager.database_path
     initialize_database(path)
     connection = connect_database(path)
     try:
@@ -838,6 +840,20 @@ def test_v14_upgrades_a_pre_marker_schema_13_database(tmp_path: Path) -> None:
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         migrated.close()
+
+    changed, replayed = manager.upsert_provider_connection(
+        connection_id="conn",
+        config=config,
+    )
+    assert not changed
+    assert replayed.revision_id == "legacy-rev"
+    assert manager.disable_provider_connection(connection_id="conn")
+    changed, restored = manager.upsert_provider_connection(
+        connection_id="conn",
+        config=config,
+    )
+    assert changed
+    assert restored.revision_id == "legacy-rev"
 
 
 def test_v10_migration_widens_api_surface_and_preserves_rows(tmp_path: Path) -> None:

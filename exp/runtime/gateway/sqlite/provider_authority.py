@@ -203,6 +203,23 @@ def active_provider_connections(
     return tuple(_authority(row) for row in rows)
 
 
+def provider_connection(
+    connection: sqlite3.Connection,
+    *,
+    organization_id: str,
+    connection_id: str,
+) -> ProviderConnectionAuthority | None:
+    """Return one current provider authority whether active or disabled."""
+    row = connection.execute(
+        f"""
+        {_SELECT_AUTHORITY}
+        WHERE c.organization_id = ? AND c.connection_id = ?
+        """,
+        (organization_id, connection_id),
+    ).fetchone()
+    return None if row is None else _authority(row)
+
+
 def bound_provider_connections(
     connection: sqlite3.Connection,
     *,

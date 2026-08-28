@@ -16,6 +16,7 @@ from exp.runtime.gateway.sqlite.provider_authority import (
     bind_alias_provider_connections,
     bound_provider_connections,
     disable_provider_connection,
+    provider_connection,
     upsert_provider_connection,
 )
 
@@ -71,6 +72,21 @@ class ProviderConnectionStoreMixin:
             return active_provider_connections(
                 connection,
                 organization_id=organization_id,
+            )
+
+    def provider_connection(
+        self,
+        *,
+        organization_id: str,
+        connection_id: str,
+    ) -> ProviderConnectionAuthority | None:
+        """Return one current connection whether active or disabled."""
+        store = cast(_ProviderStore, self)
+        with store._connect() as connection:
+            return provider_connection(
+                connection,
+                organization_id=organization_id,
+                connection_id=connection_id,
             )
 
     def alias_provider_connections(

@@ -186,8 +186,13 @@ class GatewayManagement:
             connection_id=connection_id,
             provider=config.provider,
         )
-        revision_id = provider_connection_revision_id(connection_id, config)
-        return self.require_initialized().upsert_provider_connection(
+        store = self.require_initialized()
+        revision_id = self._provider_revision_id(
+            store=store,
+            connection_id=connection_id,
+            config=config,
+        )
+        return store.upsert_provider_connection(
             organization_id=self.organization_id,
             connection_id=connection_id,
             revision_id=revision_id,
@@ -222,15 +227,20 @@ class GatewayManagement:
         Raises:
             GatewayStoreError: The requested authority violates an existing invariant.
         """
+        store = self.require_initialized()
         mutations = tuple(
             ProviderConnectionMutation(
                 connection_id=connection_id,
-                revision_id=provider_connection_revision_id(connection_id, config),
+                revision_id=self._provider_revision_id(
+                    store=store,
+                    connection_id=connection_id,
+                    config=config,
+                ),
                 config=config,
             )
             for connection_id, config in sorted(provider_connections.items())
         )
-        self.require_initialized().upsert_provider_connections_and_activate_direct_alias(
+        store.upsert_provider_connections_and_activate_direct_alias(
             organization_id=self.organization_id,
             alias_id=alias_id,
             alias_name=alias_name,
@@ -278,15 +288,20 @@ class GatewayManagement:
         Raises:
             GatewayStoreError: The requested authority violates an existing invariant.
         """
+        store = self.require_initialized()
         mutations = tuple(
             ProviderConnectionMutation(
                 connection_id=connection_id,
-                revision_id=provider_connection_revision_id(connection_id, config),
+                revision_id=self._provider_revision_id(
+                    store=store,
+                    connection_id=connection_id,
+                    config=config,
+                ),
                 config=config,
             )
             for connection_id, config in sorted(provider_connections.items())
         )
-        return self.require_initialized().configure_direct_alias_with_identity(
+        return store.configure_direct_alias_with_identity(
             organization_id=self.organization_id,
             alias_id=alias_id,
             alias_name=alias_name,
@@ -300,6 +315,27 @@ class GatewayManagement:
             identity_display_name=identity_display_name,
             key_id=key_id,
         )
+
+    def _provider_revision_id(
+        self,
+        *,
+        store: SQLiteGatewayStore,
+        connection_id: str,
+        config: ConnectionConfig,
+    ) -> str:
+        """Preserve the current ID for an exact semantic replay."""
+        canonical = config.canonicalized()
+        current = store.provider_connection(
+            organization_id=self.organization_id,
+            connection_id=connection_id,
+        )
+        if (
+            current is not None
+            and current.config == canonical
+            and current.connection_sha256 == canonical.identity_sha256()
+        ):
+            return current.revision_id
+        return provider_connection_revision_id(connection_id, canonical)
 
     def provider_connections(self) -> tuple[ProviderConnectionAuthority, ...]:
         """Return active SQLite-authoritative serving connections."""
