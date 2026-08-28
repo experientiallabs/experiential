@@ -159,6 +159,11 @@ class NativeAttemptAccounting:
         self._accounting_healthy = True
         self._sweep_retained_replayed = 0
         self._sweep_abandoned_cancelled = 0
+        # Admission-time dead-rung skips: a request served off a fallback
+        # because a certified rung could not be resolved for dispatch, and the
+        # subset of those where the skipped rung was the lead.
+        self._admission_dead_rungs_skipped = 0
+        self._admission_lead_rungs_skipped = 0
         # The sweep also runs on a timer so retained settlements and abandoned
         # attempts are recovered even when no further requests arrive.
         self._sweeper = threading.Thread(
@@ -190,6 +195,23 @@ class NativeAttemptAccounting:
                 self._sweep_abandoned_cancelled,
                 len(self._inflight),
             )
+
+    def record_admission_rung_skips(self, dead_count: int, *, lead_skipped: bool) -> None:
+        """Count admission-time dead-rung skips for the metrics snapshot.
+
+        Args:
+            dead_count: Number of certified rungs skipped as dead at admission.
+            lead_skipped: Whether the skipped set included the lead rung.
+        """
+        with self._lock:
+            self._admission_dead_rungs_skipped += dead_count
+            if lead_skipped:
+                self._admission_lead_rungs_skipped += 1
+
+    def admission_rung_skips(self) -> tuple[int, int]:
+        """Return ``(lead_rungs_skipped, dead_rungs_skipped)`` for metrics."""
+        with self._lock:
+            return (self._admission_lead_rungs_skipped, self._admission_dead_rungs_skipped)
 
     def register(self, entry: InflightRequest) -> None:
         """Track one accepted request until its terminal settlement."""

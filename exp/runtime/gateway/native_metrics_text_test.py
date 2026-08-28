@@ -38,6 +38,8 @@ def _control_plane() -> JsonObject:
     return {
         "sweep_retained_settlements_replayed": 1,
         "sweep_abandoned_attempts_cancelled": 0,
+        "admission_dead_rungs_skipped": 0,
+        "admission_lead_rungs_skipped": 0,
         "inflight_attempts": 2,
         "reconciled_expired_requests": 0,
         "reconciled_unknown_attempts": 0,
@@ -95,6 +97,12 @@ exp_gateway_sweep_retained_settlements_replayed_total 1
 # HELP exp_gateway_sweep_abandoned_attempts_cancelled_total Abandoned attempts the sweep cancelled.
 # TYPE exp_gateway_sweep_abandoned_attempts_cancelled_total counter
 exp_gateway_sweep_abandoned_attempts_cancelled_total 0
+# HELP exp_gateway_admission_dead_rungs_skipped_total Certified rungs skipped as dead at admission.
+# TYPE exp_gateway_admission_dead_rungs_skipped_total counter
+exp_gateway_admission_dead_rungs_skipped_total 0
+# HELP exp_gateway_admission_lead_rungs_skipped_total Fallbacks served for a dead lead rung.
+# TYPE exp_gateway_admission_lead_rungs_skipped_total counter
+exp_gateway_admission_lead_rungs_skipped_total 0
 # HELP exp_gateway_reconciled_expired_requests_total Crashed requests reconciled at startup.
 # TYPE exp_gateway_reconciled_expired_requests_total counter
 exp_gateway_reconciled_expired_requests_total 0

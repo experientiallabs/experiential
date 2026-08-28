@@ -34,7 +34,8 @@ from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegi
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
-from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
+from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
@@ -181,6 +182,87 @@ def next_route_candidate(
     return claim_route_from(health, keys, current_depth + 1)
 
 
+# Resolve-time deadness that a frozen route narrows past at admission instead
+# of failing the whole request. A missing credential, connection drift, or
+# capability drift means the deployment cannot be dispatched right now; it is an
+# operational outage, not a request fault, so the route narrows past the rung
+# and the rung's health circuit is fed like any runtime failure so it recovers
+# automatically when it heals. Operator-*disabled* deployments never reach here:
+# the catalog drops a disabled deployment from the live route on its ~15s
+# refresh, so this path only ever sees operational deadness that should recover.
+_ADMISSION_DEAD_ERRORS = (ModelConnectionError, ModelCredentialError, ProviderCapabilityError)
+
+
+@dataclass(frozen=True)
+class DeadRung:
+    """One route deployment that could not be resolved for dispatch at admission."""
+
+    index: int
+    deployment: ExactModelDeployment
+    failure: GatewayFailure
+
+
+@dataclass(frozen=True)
+class DispatchableRoute:
+    """The dispatchable subset of a frozen route resolved at admission.
+
+    ``indexes`` and ``resolved_wires`` are aligned and hold only the rungs that
+    resolved; ``dead`` names every rung skipped because it was operationally
+    dead at admission, in route order, for the health circuit and metrics.
+    """
+
+    indexes: tuple[int, ...]
+    resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...]
+    dead: tuple[DeadRung, ...]
+
+
+def _authorized_runtime_catalog(
+    runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog],
+    route: GatewayRoute,
+) -> RuntimeModelCatalog:
+    """Return the frozen runtime catalog for the route's authorized revision."""
+    authorization = route.snapshot.authorization
+    catalog = runtime_catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
+    if catalog is None:
+        raise GatewayRoutingError("runtime catalog is not loaded for the authorized revision")
+    return catalog
+
+
+def _resolve_deployment_profile(
+    catalog: RuntimeModelCatalog,
+    deployment: ExactModelDeployment,
+) -> tuple[GatewayWireProfile, NativeWireClient]:
+    """Resolve one route deployment's identity-checked native wire profile.
+
+    Raises:
+        NativeDialectUnavailableError: The provider has no native-dialect
+            implementation, so no engine can serve it.
+        ModelConnectionError: The alias provider cannot be constructed in the
+            approved shape (drift, missing endpoint, unsupported provider).
+        ModelCredentialError: The connection's credential is absent.
+        ProviderCapabilityError: The client cannot carry a catalog-declared
+            capability.
+        ValueError: A resolved client drifts from the frozen deployment.
+    """
+    resolved = catalog.resolve(deployment.source_alias)
+    _require_deployment_identity(deployment, resolved)
+    client = resolved.client
+    if not isinstance(client, NativeWireClient):
+        raise NativeDialectUnavailableError(
+            f"provider {deployment.provider!r} has no native wire profile"
+        )
+    try:
+        # Intersect the client's wire profile with the frozen catalog
+        # capability contract before payload bytes are frozen.
+        return _resolved_wire_profile(deployment, resolved), client
+    except ProviderCapabilityError as exc:
+        if exc.capability != "native_data_plane":
+            raise
+        raise NativeDialectUnavailableError(
+            f"provider {deployment.provider!r} has no native dialect implementation"
+        ) from exc
+
+
 def resolve_route_profiles(
     runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog],
     route: GatewayRoute,
@@ -192,6 +274,11 @@ def resolve_route_profiles(
     a frozen route. The check is structural (``NativeWireClient``), not a concrete HTTP base
     class: a non-HTTP client such as the bounded Bedrock adapter satisfies it
     too as long as it implements ``gateway_wire_profile``.
+
+    This is the all-or-nothing resolver used off the request hot path (for
+    example the replay-scope probe); request admission uses
+    :func:`dispatchable_route_profiles`, which narrows past an operationally
+    dead rung instead of failing the whole route.
 
     Args:
         runtime_catalogs: Revision and catalog digests mapped to frozen
@@ -210,31 +297,86 @@ def resolve_route_profiles(
         GatewayRoutingError: The authorized catalog is not loaded.
         ValueError: A resolved client drifts from the frozen deployment.
     """
-    authorization = route.snapshot.authorization
-    catalog = runtime_catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
-    if catalog is None:
-        raise GatewayRoutingError("runtime catalog is not loaded for the authorized revision")
+    catalog = _authorized_runtime_catalog(runtime_catalogs, route)
+    return tuple(
+        _resolve_deployment_profile(catalog, deployment) for deployment in route.deployments
+    )
+
+
+def dispatchable_route_profiles(
+    runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog],
+    route: GatewayRoute,
+) -> DispatchableRoute:
+    """Resolve a frozen route, narrowing past any rung dead at admission.
+
+    A rung whose provider client cannot be constructed right now (a lost
+    credential, a drifted connection, or a capability drift) is skipped so a
+    live fallback still serves, instead of the whole request failing on a dead
+    lead. The caller feeds each skipped rung into the deployment health circuit
+    (so it recovers on its own when it heals) and narrows the served route with
+    :func:`select_route_deployments`, keeping accounting anchored to the rung
+    that actually serves.
+
+    A provider with no native dialect is a structural fault no engine can
+    serve, so it still raises ``NativeDialectUnavailableError`` (escalation)
+    rather than being narrowed past.
+
+    Args:
+        runtime_catalogs: Revision and catalog digests mapped to frozen
+            runtime catalogs.
+        route: Resolved ordered route.
+
+    Returns:
+        The dispatchable rung indexes with their resolved wires, plus every
+        rung skipped as operationally dead.
+
+    Raises:
+        NativeDialectUnavailableError: A route deployment's provider has no
+            native-dialect implementation.
+        GatewayRoutingError: The authorized catalog is not loaded.
+    """
+    catalog = _authorized_runtime_catalog(runtime_catalogs, route)
+    indexes: list[int] = []
     resolved_wires: list[tuple[GatewayWireProfile, NativeWireClient]] = []
-    for deployment in route.deployments:
-        resolved = catalog.resolve(deployment.source_alias)
-        _require_deployment_identity(deployment, resolved)
-        client = resolved.client
-        if not isinstance(client, NativeWireClient):
-            raise NativeDialectUnavailableError(
-                f"provider {deployment.provider!r} has no native wire profile"
-            )
+    dead: list[DeadRung] = []
+    for index, deployment in enumerate(route.deployments):
         try:
-            # Intersect the client's wire profile with the frozen catalog
-            # capability contract before payload bytes are frozen.
-            profile = _resolved_wire_profile(deployment, resolved)
-        except ProviderCapabilityError as exc:
-            if exc.capability != "native_data_plane":
-                raise
-            raise NativeDialectUnavailableError(
-                f"provider {deployment.provider!r} has no native dialect implementation"
-            ) from exc
-        resolved_wires.append((profile, client))
-    return tuple(resolved_wires)
+            resolved = _resolve_deployment_profile(catalog, deployment)
+        except _ADMISSION_DEAD_ERRORS as exc:
+            dead.append(DeadRung(index, deployment, _admission_dead_failure(exc)))
+            continue
+        indexes.append(index)
+        resolved_wires.append(resolved)
+    return DispatchableRoute(tuple(indexes), tuple(resolved_wires), tuple(dead))
+
+
+def _admission_dead_failure(exc: Exception) -> GatewayFailure:
+    """Classify one admission-time deadness into a health-circuit failure.
+
+    A missing credential mirrors a runtime auth rejection (a hard failure that
+    opens the circuit at once); a connection or capability drift mirrors a
+    runtime transport failure (an operational failure that opens after the
+    circuit threshold). Both stay honest by feeding the same circuit that
+    runtime failures do, so recovery is the existing cooldown plus half-open
+    probe and never a permanent blacklist.
+    """
+    match exc:
+        case ModelCredentialError():
+            return GatewayFailure(
+                failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+                safe_message=(
+                    "the resolved deployment had no usable credential at admission; "
+                    "failing over to the next deployment"
+                ),
+            )
+        case _:
+            return GatewayFailure(
+                failure_class=GatewayFailureClass.TRANSPORT,
+                safe_message=(
+                    "the resolved deployment was unavailable at admission; "
+                    "failing over to the next deployment"
+                ),
+            )
 
 
 def select_route_deployments(

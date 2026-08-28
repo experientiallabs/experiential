@@ -33,6 +33,7 @@ metrics and fails the request closed with the shared internal error.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable
 from typing import cast
@@ -70,9 +71,12 @@ from exp.runtime.gateway.native_dispatch import dispatch_signature_headers, froz
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     MAXIMUM_TOTAL_ATTEMPTS,
+    DeadRung,
     InflightRequest,
     NativeDialectUnavailableError,
+    deployment_health_key,
     deployment_wire_entry,
+    dispatchable_route_profiles,
     resolve_route_profiles,
     select_route_deployments,
 )
@@ -117,6 +121,8 @@ from exp.runtime.openai_protocol.state import (
 )
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
+
+_logger = logging.getLogger(__name__)
 
 
 def _escalation(reason: str) -> str:
@@ -341,7 +347,21 @@ class NativeControlPlane:
                 request,
                 continuation=continuation_context,
             )
-            resolved_wires = resolve_route_profiles(self._components.runtime_catalogs, route)
+            # A rung that is dead at admission (a lost credential, a drifted
+            # connection) is skipped so a live fallback still serves the
+            # request instead of the whole request failing on a dead lead.
+            dispatchable = dispatchable_route_profiles(self._components.runtime_catalogs, route)
+            self._record_dead_admission_rungs(authorization, dispatchable.dead)
+            if not dispatchable.indexes:
+                # Every certified rung was operationally dead at admission;
+                # there is nothing live to serve, so the accepted request is
+                # finished closed.
+                return self._escalate_accepted(
+                    authorization,
+                    "every certified deployment was unavailable at admission",
+                )
+            route = select_route_deployments(route, dispatchable.indexes)
+            resolved_wires = dispatchable.resolved_wires
         except NativeDialectUnavailableError as exc:
             return self._escalate_accepted(authorization, str(exc))
         except Exception as exc:  # noqa: BLE001 - raised after route packaging below.
@@ -807,9 +827,12 @@ class NativeControlPlane:
         if self._data_plane_metrics is not None:
             data_plane = json.loads(self._data_plane_metrics())
         retained_replayed, abandoned_cancelled, inflight = self._accounting.counters()
+        lead_rungs_skipped, dead_rungs_skipped = self._accounting.admission_rung_skips()
         control_plane: JsonObject = {
             "sweep_retained_settlements_replayed": retained_replayed,
             "sweep_abandoned_attempts_cancelled": abandoned_cancelled,
+            "admission_dead_rungs_skipped": dead_rungs_skipped,
+            "admission_lead_rungs_skipped": lead_rungs_skipped,
             "inflight_attempts": inflight,
             "reconciled_expired_requests": self._components.reconciled_expired_requests,
             "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
@@ -886,6 +909,41 @@ class NativeControlPlane:
             )
         except NativeDecodeError as exc:
             raise NativeBridgeError(exc.error) from exc
+
+    def _record_dead_admission_rungs(
+        self,
+        authorization: AuthorizationSnapshot,
+        dead: tuple[DeadRung, ...],
+    ) -> None:
+        """Feed each admission-dead rung into its health circuit and surface it.
+
+        A rung skipped because it was operationally dead at admission is
+        recorded in the same deployment health circuit as a runtime failure,
+        so the existing cooldown and half-open probe bring it back
+        automatically when it heals; it is never permanently blacklisted. A
+        skipped lead rung is logged and counted so a persistently dead lead
+        reaches a human instead of being silently masked behind a healthy
+        fallback forever.
+
+        Args:
+            authorization: Frozen authority for the accepted request.
+            dead: Every rung skipped as operationally dead, in route order.
+        """
+        if not dead:
+            return
+        health = self._accounting.health
+        for rung in dead:
+            health.failed(deployment_health_key(authorization, rung.deployment), rung.failure)
+        lead = next((rung for rung in dead if rung.index == 0), None)
+        self._accounting.record_admission_rung_skips(len(dead), lead_skipped=lead is not None)
+        if lead is not None:
+            _logger.warning(
+                "gateway admission skipped the lead rung for alias %r: served off a "
+                "fallback because deployment %r (provider %r) was dead at admission",
+                authorization.alias,
+                lead.deployment.deployment_id,
+                lead.deployment.provider,
+            )
 
     def _escalate_accepted(self, authorization: AuthorizationSnapshot, reason: str) -> str:
         """Finish one accepted-but-unservable request and return its disposition.

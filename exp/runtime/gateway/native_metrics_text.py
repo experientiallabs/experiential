@@ -48,6 +48,14 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "Abandoned attempts the sweep cancelled.",
     ),
     (
+        "admission_dead_rungs_skipped",
+        "Certified rungs skipped as dead at admission.",
+    ),
+    (
+        "admission_lead_rungs_skipped",
+        "Fallbacks served for a dead lead rung.",
+    ),
+    (
         "reconciled_expired_requests",
         "Crashed requests reconciled at startup.",
     ),

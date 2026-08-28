@@ -706,6 +706,7 @@ def _configured_pool_gateway(
     base_urls: tuple[str, str] = ("http://127.0.0.1:9/v1", "http://127.0.0.1:10/v1"),
     gateway_capabilities: tuple[GatewayDeploymentCapabilities, GatewayDeploymentCapabilities]
     | None = None,
+    api_key_envs: tuple[str, str] = ("TEST_PROVIDER_KEY", "TEST_PROVIDER_KEY"),
 ) -> tuple[GatewayManagement, str]:
     """Create one certified two-deployment pool alias, grant, and key.
 
@@ -714,6 +715,9 @@ def _configured_pool_gateway(
         refusal_failover: Whether the alias revision opts into refusal failover.
         base_urls: One provider endpoint per ordered deployment.
         gateway_capabilities: Optional protocol contract for each deployment.
+        api_key_envs: One credential environment-variable name per ordered
+            deployment, so a test can make one rung's credential resolvable
+            while another is absent.
 
     Returns:
         The management handle and the issued raw key.
@@ -736,8 +740,8 @@ def _configured_pool_gateway(
         GatewayDeploymentCapabilities(supports_streaming=True),
         GatewayDeploymentCapabilities(supports_streaming=True),
     )
-    for alias, base_url, gateway_capability in zip(
-        ("alpha", "beta"), base_urls, declared_gateway_capabilities, strict=True
+    for alias, base_url, gateway_capability, api_key_env in zip(
+        ("alpha", "beta"), base_urls, declared_gateway_capabilities, api_key_envs, strict=True
     ):
         upsert_connection(
             root,
@@ -745,7 +749,7 @@ def _configured_pool_gateway(
             connection=ConnectionConfig(
                 provider="openai-compatible",
                 base_url=base_url,
-                api_key_env="TEST_PROVIDER_KEY",
+                api_key_env=api_key_env,
             ),
             replace=False,
         )
@@ -877,6 +881,100 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
     assert [item["model_id"] for item in route] == ["beta-model-exact"]
     upstream = cast("JsonObject", route[0]["upstream_payload"])
     assert upstream["stop"] == ["DONE"]
+
+
+def _partial_pool_control_plane(
+    root: Path,
+    environment: dict[str, str],
+) -> tuple[NativeControlPlane, str]:
+    """Load a two-rung pool whose lead reads a separately-toggled credential.
+
+    The lead (``alpha``) reads ``TEST_ALPHA_KEY`` and the fallback (``beta``)
+    reads ``TEST_PROVIDER_KEY``. Both must be present in ``environment`` at load
+    so readiness admits the alias; a test then mutates the shared ``environment``
+    mapping to make the lead dead or healthy at a later admission.
+    """
+    _manager, raw_key = _configured_pool_gateway(
+        root,
+        api_key_envs=("TEST_ALPHA_KEY", "TEST_PROVIDER_KEY"),
+    )
+    components = load_gateway_components(root, environment=environment)
+    return NativeControlPlane(components), raw_key
+
+
+def test_admit_skips_a_dead_lead_rung_and_serves_the_fallback(tmp_path: Path) -> None:
+    """A lead dead at admission fails over to the live fallback and feeds the circuit."""
+    environment = {"TEST_ALPHA_KEY": "alpha-secret", "TEST_PROVIDER_KEY": "beta-secret"}
+    control, raw_key = _partial_pool_control_plane(tmp_path, environment)
+
+    # The lead credential is lost after load, so its rung is dead at admission
+    # while the fallback stays healthy.
+    del environment["TEST_ALPHA_KEY"]
+    admission = _admit(control, raw_key, _chat_body())
+
+    assert "escalate" not in admission
+    route = cast("list[JsonObject]", admission["route"])
+    assert [item["model_id"] for item in route] == ["beta-model-exact"]
+
+    snapshot = control.metrics_snapshot()
+    control_plane = cast("JsonObject", snapshot["control_plane"])
+    assert control_plane["admission_lead_rungs_skipped"] == 1
+    assert control_plane["admission_dead_rungs_skipped"] == 1
+
+    # The skip fed the SAME deployment health circuit runtime failures feed:
+    # exactly the dead lead's circuit is open (a cooldown, never a blacklist),
+    # and admission never claims the fallback so no other circuit was touched.
+    states = control._accounting.health._states  # noqa: SLF001 - assert the circuit state.
+    assert len(states) == 1
+    (dead_state,) = states.values()
+    assert dead_state.open_until > time.monotonic()
+
+    # The narrowed route is what serves and anchors accounting.
+    started = _start_first(control, admission)
+    assert started["route_depth"] == 0
+
+
+def test_admit_recovers_a_dead_lead_when_its_credential_heals(tmp_path: Path) -> None:
+    """A healed lead is served again on a later admission; the skip is never permanent."""
+    environment = {"TEST_ALPHA_KEY": "alpha-secret", "TEST_PROVIDER_KEY": "beta-secret"}
+    control, raw_key = _partial_pool_control_plane(tmp_path, environment)
+
+    del environment["TEST_ALPHA_KEY"]
+    narrowed = cast("list[JsonObject]", _admit(control, raw_key, _chat_body())["route"])
+    assert [item["model_id"] for item in narrowed] == ["beta-model-exact"]
+
+    # The credential returns; admission re-resolves the frozen route and the
+    # lead is served again, proving the skip is not a permanent blacklist.
+    environment["TEST_ALPHA_KEY"] = "alpha-secret"
+    recovered = cast("list[JsonObject]", _admit(control, raw_key, _chat_body())["route"])
+    assert [item["model_id"] for item in recovered] == ["alpha-model-exact", "beta-model-exact"]
+
+
+def test_admit_escalates_when_every_rung_is_dead(tmp_path: Path) -> None:
+    """A route with no resolvable rung is finished closed, not served."""
+    environment = {"TEST_ALPHA_KEY": "alpha-secret", "TEST_PROVIDER_KEY": "beta-secret"}
+    control, raw_key = _partial_pool_control_plane(tmp_path, environment)
+
+    environment.clear()
+    admission = _admit(control, raw_key, _chat_body())
+
+    assert "escalate" in admission
+    control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
+    assert control_plane["admission_dead_rungs_skipped"] == 2
+    assert control_plane["admission_lead_rungs_skipped"] == 1
+
+
+def test_admit_keeps_a_fully_resolvable_route_and_never_skips(tmp_path: Path) -> None:
+    """A healthy route admits every rung; only resolve-time deadness narrows."""
+    control, raw_key = _pool_control_plane(tmp_path)
+
+    admission = _admit(control, raw_key, _chat_body())
+
+    route = cast("list[JsonObject]", admission["route"])
+    assert [item["model_id"] for item in route] == ["alpha-model-exact", "beta-model-exact"]
+    control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
+    assert control_plane["admission_dead_rungs_skipped"] == 0
+    assert control_plane["admission_lead_rungs_skipped"] == 0
 
 
 def test_pool_failover_records_ordinals_depths_and_one_finalize(tmp_path: Path) -> None:
@@ -1192,6 +1290,8 @@ def test_metrics_snapshot_reports_control_plane_state_without_a_data_plane(
     control_plane = snapshot["control_plane"]
     assert control_plane["sweep_retained_settlements_replayed"] == 0
     assert control_plane["sweep_abandoned_attempts_cancelled"] == 0
+    assert control_plane["admission_dead_rungs_skipped"] == 0
+    assert control_plane["admission_lead_rungs_skipped"] == 0
     assert control_plane["inflight_attempts"] == 1
     assert control_plane["reconciled_expired_requests"] == 0
     assert control_plane["reconciled_unknown_attempts"] == 0
