@@ -836,7 +836,7 @@ def test_azure_provider_connection_collects_required_endpoint_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Azure setup collects the resource endpoint and defaults its API version to v1."""
-    answers = iter(("https://resource.openai.azure.com", "v1"))
+    answers = iter(("https://resource.openai.azure.com", "v1", "openai_deployments"))
 
     def _prompt(_text: str, **_kwargs: object) -> str:
         """Return the next scripted Azure connection field."""
@@ -851,6 +851,7 @@ def test_azure_provider_connection_collects_required_endpoint_fields(
         base_url="https://resource.openai.azure.com",
         api_key_env="AZURE_OPENAI_API_KEY",
         api_version="v1",
+        azure_api_surface="openai_deployments",
     )
 
 

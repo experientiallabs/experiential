@@ -2495,6 +2495,7 @@ def _installed_release_driver() -> None:
         ),
         ("azure base URL", azure_endpoint),
         ("Azure OpenAI API version", ""),
+        ("Azure API surface", ""),
         ("Models to configure", space + down + enter),
         ("Connection for the declared model", enter),
         ("Provider model ID", "core-model"),
