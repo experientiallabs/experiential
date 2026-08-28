@@ -20,6 +20,8 @@ from getpass import getpass
 from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
+from exp.cli.providers.bedrock_credentials import infer_bedrock_auth
+from exp.cli.providers.connection_reuse import reused_connection
 from exp.cli.providers.experiential_cloud import (
     SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
 )
@@ -352,6 +354,8 @@ def collect_provider_connection(
     base_url = None
     api_version = None
     region = None
+    aws_access_key_id_env = None
+    bedrock_auth_mode = None
     if provider in ("openai-compatible", "azure"):
         base_url = ask_text(f"{SETUP_PROVIDER_LABELS[provider]} base URL", console=console)
         if not base_url:
@@ -371,12 +375,16 @@ def collect_provider_connection(
     api_key_env = (
         None if provider == "openai-compatible" else CANONICAL_CREDENTIAL_ENV.get(provider)
     )
+    if provider == "bedrock":
+        api_key_env, aws_access_key_id_env, bedrock_auth_mode = infer_bedrock_auth(environment)
     return ConnectionConfig(
         provider=provider,
         base_url=base_url,
         api_key_env=api_key_env,
         api_version=api_version,
         region=region,
+        aws_access_key_id_env=aws_access_key_id_env,
+        bedrock_auth_mode=bedrock_auth_mode,
     )
 
 
@@ -495,7 +503,7 @@ def _resolve_endpoint(
     config = collect_provider_connection(provider, console=console, environment=environment)
     if config is None:
         return None
-    connection = _reused_connection(
+    connection = reused_connection(
         existing_connections,
         provider=config.provider,
         api_key_env=config.api_key_env,
@@ -531,37 +539,6 @@ def _resolve_endpoint(
     if api_key is None:
         return None
     return PreparedEndpoint(connection=connection, api_key=api_key, configured=configured)
-
-
-def _reused_connection(
-    existing_connections: tuple[ProviderConnection, ...],
-    *,
-    provider: str,
-    api_key_env: str | None,
-    base_url: str | None,
-    api_version: str | None,
-    region: str | None,
-    aws_access_key_id_env: str | None,
-    bedrock_auth_mode: str | None,
-) -> ProviderConnection | None:
-    """Return the sole configured connection that exactly matches these fields."""
-    matches: list[ProviderConnection] = []
-    for connection in existing_connections:
-        if (
-            connection.provider != provider
-            or connection.base_url != base_url
-            or connection.api_version != api_version
-            or connection.region != region
-            or connection.aws_access_key_id_env != aws_access_key_id_env
-            or connection.bedrock_auth_mode != bedrock_auth_mode
-        ):
-            continue
-        if api_key_env is not None and connection.api_key_env != api_key_env:
-            continue
-        matches.append(connection)
-    if len(matches) == 1:
-        return matches[0]
-    return None
 
 
 def _stored_credential_action(

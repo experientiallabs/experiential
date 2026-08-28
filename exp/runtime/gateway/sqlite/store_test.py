@@ -1147,6 +1147,36 @@ def test_provider_revisions_are_sqlite_authority_and_alias_bindings_remain_froze
         )
 
 
+def test_legacy_bedrock_pair_replay_is_semantically_idempotent(tmp_path: Path) -> None:
+    """An omitted historical pair mode replays against canonical SQLite authority."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    legacy = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="AWS_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+        region="us-west-2",
+    )
+
+    changed, first = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="bedrock",
+        revision_id="provider-revision-one",
+        config=legacy,
+    )
+    replayed, second = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="bedrock",
+        revision_id="unused-replay-revision",
+        config=legacy.model_copy(update={"bedrock_auth_mode": "access_key_pair"}),
+    )
+
+    assert changed
+    assert not replayed
+    assert first == second
+    assert second.config.bedrock_auth_mode == "access_key_pair"
+
+
 def test_alias_activation_rejects_stale_provider_binding_atomically(tmp_path: Path) -> None:
     """A stale connection revision cannot create either an alias or a partial binding."""
     store = SQLiteGatewayStore(tmp_path / "gateway.db")

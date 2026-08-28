@@ -885,15 +885,49 @@ def test_v13_repairs_historical_v11_access_key_column(tmp_path: Path) -> None:
             """
             INSERT INTO provider_connection_revisions (
                 revision_id, organization_id, connection_id, revision_number,
-                provider, region, aws_access_key_id, connection_sha256, created_at
-            ) VALUES ('rev', 'org', 'conn', 1, 'bedrock', 'us-west-2',
-                      'AKIAHISTORICALVALUE', ?, 't')
+                provider, api_key_env, region, aws_access_key_id,
+                connection_sha256, created_at
+            ) VALUES ('rev', 'org', 'conn', 1, 'bedrock', 'AWS_SECRET_ACCESS_KEY',
+                      'us-west-2', 'AKIAHISTORICALVALUE', ?, 't')
             """,
             ("a" * 64,),
         )
         connection.execute(
             "UPDATE provider_connections SET active_revision_id = 'rev' "
             "WHERE connection_id = 'conn'"
+        )
+        connection.execute(
+            "INSERT INTO catalog_snapshot_refs VALUES ('snap', 'org', ?, 't')",
+            ("b" * 64,),
+        )
+        connection.execute(
+            """
+            INSERT INTO gateway_aliases (
+                alias_id, organization_id, alias_name, active_revision_id,
+                active, created_at, updated_at
+            ) VALUES ('alias', 'org', 'alias', NULL, 1, 't', 't')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO alias_revisions (
+                revision_id, organization_id, alias_id, revision_number,
+                target_kind, pool_id, catalog_sha256, snapshot_ref, created_at
+            ) VALUES ('alias-rev', 'org', 'alias', 1, 'direct', 'pool', ?, 'snap', 't')
+            """,
+            ("b" * 64,),
+        )
+        connection.execute(
+            "UPDATE gateway_aliases SET active_revision_id = 'alias-rev' WHERE alias_id = 'alias'"
+        )
+        connection.execute(
+            """
+            INSERT INTO alias_revision_provider_connections (
+                organization_id, alias_id, alias_revision_id, connection_id,
+                connection_revision_id, connection_sha256, created_at
+            ) VALUES ('org', 'alias', 'alias-rev', 'conn', 'rev', ?, 't')
+            """,
+            ("a" * 64,),
         )
         connection.execute("COMMIT")
     finally:
@@ -920,8 +954,69 @@ def test_v13_repairs_historical_v11_access_key_column(tmp_path: Path) -> None:
         expected = ConnectionConfig(provider="bedrock", region="us-west-2").identity_sha256()
         assert tuple(row) == (None, None, expected)
         assert active_provider_connections(migrated, organization_id="org") == ()
+        assert (
+            migrated.execute(
+                "SELECT active FROM gateway_aliases WHERE alias_id = 'alias'"
+            ).fetchone()[0]
+            == 0
+        )
         assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        migrated.close()
+
+
+def test_v13_infers_a_schema_12_bedrock_bearer_authority(tmp_path: Path) -> None:
+    """A schema-12 bearer row regains its unpersisted authentication mode."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = connect_database(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for version in range(1, 12):
+            for statement in migrations._MIGRATIONS[version]:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 12")
+        connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
+        connection.execute(
+            """
+            INSERT INTO provider_connections (
+                connection_id, organization_id, active_revision_id,
+                active, created_at, updated_at
+            ) VALUES ('conn', 'org', NULL, 1, 't', 't')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_connection_revisions (
+                revision_id, organization_id, connection_id, revision_number,
+                provider, api_key_env, region, connection_sha256, created_at
+            ) VALUES ('rev', 'org', 'conn', 1, 'bedrock',
+                      'AWS_BEARER_TOKEN_BEDROCK', 'us-west-2', ?, 't')
+            """,
+            ("a" * 64,),
+        )
+        connection.execute(
+            "UPDATE provider_connections SET active_revision_id = 'rev' "
+            "WHERE connection_id = 'conn'"
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    initialize_database(path)
+    migrated = connect_database(path)
+    try:
+        authorities = active_provider_connections(migrated, organization_id="org")
+        assert len(authorities) == 1
+        assert authorities[0].config == ConnectionConfig(
+            provider="bedrock",
+            api_key_env="AWS_BEARER_TOKEN_BEDROCK",
+            region="us-west-2",
+            bedrock_auth_mode="api_key",
+        )
+        assert authorities[0].connection_sha256 == authorities[0].config.identity_sha256()
     finally:
         migrated.close()
 

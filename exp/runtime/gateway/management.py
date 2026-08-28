@@ -364,7 +364,7 @@ class GatewayManagement:
         bindings: list[ProviderConnectionBinding] = []
         for connection_id, config in sorted(catalog.connections.items()):
             authority = authorities.get(connection_id)
-            if authority is None or authority.config != config:
+            if authority is None or authority.config != config.canonicalized():
                 raise GatewayStoreError(
                     f"provider connection {connection_id!r} differs from SQLite authority"
                 )

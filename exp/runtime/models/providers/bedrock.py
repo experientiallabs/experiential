@@ -116,6 +116,16 @@ class _BotocoreSession(Protocol):
     def register_component(self, name: str, component: object) -> None:
         """Replace one lazy session component before client construction."""
 
+    def get_component(self, name: str) -> object:
+        """Return one already-registered botocore session component."""
+
+
+class _ConfigValueStore(Protocol):
+    """Botocore configuration store used to replace ambient profile lookup."""
+
+    def set_config_provider(self, logical_name: str, provider: object) -> None:
+        """Replace one variable's entire provider chain."""
+
 
 class _NoAmbientTokenProvider:
     """Token provider that deliberately ignores every ambient AWS login."""
@@ -190,6 +200,7 @@ def create_bedrock_runtime_client(
         # credential chain. The isolated per-client bearer signer is installed
         # immediately after construction.
         config_kwargs["signature_version"] = _import_botocore_unsigned()
+        config_kwargs["ignore_configured_endpoint_urls"] = True
     with _CLIENT_CONSTRUCTION_LOCK:
         client = session.client(
             "bedrock-runtime",
@@ -707,10 +718,13 @@ def _import_botocore_unsigned() -> object:
 def _import_isolated_botocore_session() -> _BotocoreSession:
     """Create a botocore session whose token provider cannot consult ambient login state."""
     try:
+        from botocore.configprovider import ConstantProvider
         from botocore.session import get_session
     except ImportError as exc:
         raise RuntimeError("Bedrock requires botocore; install experiential") from exc
     session = cast("_BotocoreSession", get_session())
+    config_store = cast("_ConfigValueStore", session.get_component("config_store"))
+    config_store.set_config_provider("profile", ConstantProvider(None))
     session.register_component("token_provider", _NoAmbientTokenProvider())
     return session
 

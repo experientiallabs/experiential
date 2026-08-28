@@ -17,6 +17,7 @@ from exp.common.auth import (
     StoredCredentialEndpointMismatch,
     StoredCredentialStatus,
 )
+from exp.common.core.artifacts import sha256_json
 from exp.common.models import ConnectionConfig
 
 CredentialSource = Literal["environment", "stored", "prompt"]
@@ -263,15 +264,25 @@ def resolve_or_prompt_connection_api_key(
 
 
 def _credential_binding(connection: ConnectionConfig) -> StoredCredentialBinding:
-    """Return the secret-free endpoint identity stored with one API key.
+    """Return the secret-free endpoint and credential-locator identity for one key.
 
     Args:
         connection: Secret-free connection metadata.
 
     Returns:
-        Provider name plus the catalog endpoint digest.
+        Provider name, catalog endpoint digest, and Bedrock locator digest when needed.
     """
+    credential_locator_sha256 = None
+    if connection.provider == "bedrock" and connection.api_key_env is not None:
+        credential_locator_sha256 = sha256_json(
+            {
+                "api_key_env": connection.api_key_env,
+                "aws_access_key_id_env": connection.aws_access_key_id_env,
+                "bedrock_auth_mode": connection.canonicalized().bedrock_auth_mode,
+            }
+        )
     return StoredCredentialBinding(
         provider=connection.provider,
         endpoint_sha256=connection.identity_sha256(),
+        credential_locator_sha256=credential_locator_sha256,
     )

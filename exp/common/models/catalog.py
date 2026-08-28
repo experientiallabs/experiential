@@ -223,6 +223,23 @@ class ConnectionConfig(ContractModel):
             identity["bedrock_auth_mode"] = effective_bedrock_auth_mode
         return sha256_json(identity)
 
+    def canonicalized(self) -> ConnectionConfig:
+        """Return the canonical persisted shape for backward-compatible Bedrock pairs.
+
+        Historical catalogs represented an explicit Bedrock access-key pair by
+        naming both environment variables without storing an authentication mode.
+        That shape remains valid input, but SQLite authority persists the inferred
+        mode so semantic replay and exact snapshot binding stay stable.
+        """
+        if (
+            self.provider == "bedrock"
+            and self.bedrock_auth_mode is None
+            and self.api_key_env is not None
+            and self.aws_access_key_id_env is not None
+        ):
+            return self.model_copy(update={"bedrock_auth_mode": "access_key_pair"})
+        return self
+
 
 class SFTModelProvenance(ContractModel):
     """Immutable W12, W13, and base-model bindings for one registered SFT sampling handle."""

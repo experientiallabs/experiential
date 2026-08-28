@@ -24,6 +24,7 @@ from exp.cli.shared.picker import PickerKey
 from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.auth import ProviderAuthStore, StoredCredentialBinding, default_auth_path
 from exp.common.models import (
+    ConnectionConfig,
     DiscoveredModel,
     PricingSource,
     ProviderConnection,
@@ -1087,6 +1088,68 @@ def test_bedrock_prepares_credential_chain_without_listing_or_identity_invention
         region="us-east-1",
     )
     assert "declare deployment model IDs" in console.output
+
+
+def test_bedrock_reuses_the_sole_explicit_pair_when_auth_is_not_reentered() -> None:
+    """Rerunning setup keeps one existing explicit pair instead of adding ambient auth."""
+    existing = (
+        ProviderConnection(
+            name="bedrock-production",
+            provider="bedrock",
+            api_key_env="AWS_SECRET_ACCESS_KEY",
+            aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+            bedrock_auth_mode="access_key_pair",
+            region="us-west-2",
+        ),
+    )
+    prepared = _prepare(
+        ScriptedConsole("us-west-2\n"),
+        providers=("bedrock",),
+        lister=_FakeLister({}),
+        environment={},
+        existing_connections=existing,
+    )
+
+    assert prepared is not None
+    endpoints, _models = prepared
+    assert endpoints[0].configured
+    assert endpoints[0].connection == existing[0]
+
+
+def test_bedrock_authors_an_explicit_pair_from_complete_environment_credentials() -> None:
+    """Complete standard AWS environment credentials become a secret-free pair config."""
+    connection = provider_picker.collect_provider_connection(
+        "bedrock",
+        console=ScriptedConsole("us-west-2\n"),
+        environment={
+            "AWS_ACCESS_KEY_ID": "access-id",
+            "AWS_SECRET_ACCESS_KEY": "secret-value",
+        },
+    )
+
+    assert connection == ConnectionConfig(
+        provider="bedrock",
+        api_key_env="AWS_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+        bedrock_auth_mode="access_key_pair",
+        region="us-west-2",
+    )
+
+
+def test_bedrock_authors_bearer_mode_without_persisting_the_token() -> None:
+    """A Bedrock bearer environment value records only its locator and mode."""
+    connection = provider_picker.collect_provider_connection(
+        "bedrock",
+        console=ScriptedConsole("us-west-2\n"),
+        environment={"AWS_BEARER_TOKEN_BEDROCK": "bearer-value"},
+    )
+
+    assert connection == ConnectionConfig(
+        provider="bedrock",
+        api_key_env="AWS_BEARER_TOKEN_BEDROCK",
+        bedrock_auth_mode="api_key",
+        region="us-west-2",
+    )
 
 
 def test_release_tty_walk_selects_azure_then_completes() -> None:

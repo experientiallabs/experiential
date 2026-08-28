@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.auth import ProviderAuthStore, StoredCredentialBinding
+from exp.common.auth import (
+    ProviderAuthStore,
+    StoredCredentialBinding,
+    StoredCredentialEndpointMismatch,
+)
 from exp.common.models import ConnectionConfig
 from exp.runtime.models.credentials import (
     CredentialResolution,
@@ -99,6 +103,40 @@ def test_fresh_resolver_reads_the_store_written_by_another_instance(tmp_path: Pa
     )
 
     assert api_key == _SECRET
+
+
+def test_bedrock_pair_secret_is_bound_to_both_credential_locators(tmp_path: Path) -> None:
+    """A stored secret-access key cannot be reused after both locator names change."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    original = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="AWS_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+        region="us-west-2",
+        bedrock_auth_mode="access_key_pair",
+    )
+    resolve_or_prompt_connection_api_key(
+        original,
+        connection_id="bedrock",
+        environment={},
+        store=store,
+        prompt=lambda: _SECRET,
+        persist=True,
+    )
+    swapped = original.model_copy(
+        update={
+            "api_key_env": "SECONDARY_AWS_SECRET_ACCESS_KEY",
+            "aws_access_key_id_env": "SECONDARY_AWS_ACCESS_KEY_ID",
+        }
+    )
+
+    with pytest.raises(StoredCredentialEndpointMismatch):
+        lookup_connection_credential(
+            swapped,
+            connection_id="bedrock",
+            environment={},
+            store=store,
+        )
 
 
 def test_store_resolves_when_the_connection_omits_an_env_name(tmp_path: Path) -> None:

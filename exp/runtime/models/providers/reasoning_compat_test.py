@@ -72,6 +72,8 @@ def test_openai_reasoning_efforts_follow_exact_model_tables() -> None:
     with pytest.raises(UnsupportedReasoningEffortError):
         openai_reasoning_effort("openai/gpt-5-pro", "low")
     assert openai_reasoning_effort("gpt-5.6-sol", "xhigh") == "xhigh"
+    with pytest.raises(UnsupportedReasoningEffortError):
+        openai_reasoning_effort("gpt-5.6-pro", "max")
     assert openai_reasoning_effort("third-party-reasoner", "minimal") == "minimal"
 
 

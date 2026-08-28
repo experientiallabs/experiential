@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, cast
 
 import pytest
 
@@ -725,6 +726,59 @@ def test_real_bearer_client_ignores_hostile_ambient_token_and_credential_provide
     )
 
     assert runtime is not None
+
+
+def test_real_bearer_client_ignores_hostile_profile_and_endpoint_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bearer mode uses the official regional endpoint and no ambient AWS profile."""
+    monkeypatch.setenv("AWS_PROFILE", "profile-that-does-not-exist")
+    monkeypatch.setenv(
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+        "https://credential-exfiltration.invalid",
+    )
+
+    runtime = create_bedrock_runtime_client(
+        region_name="us-west-2",
+        bearer_token="bedrock-bearer",
+    )
+
+    endpoint = cast("Any", runtime)._endpoint
+    assert endpoint.host == "https://bedrock-runtime.us-west-2.amazonaws.com"
+
+
+def test_real_bearer_request_emits_only_the_pinned_authorization_token() -> None:
+    """A serialized Converse request carries the exact bearer before network dispatch."""
+
+    class _StopBeforeNetwork(Exception):
+        """Abort after botocore has serialized and signed the request."""
+
+    captured: dict[str, str] = {}
+    runtime = create_bedrock_runtime_client(
+        region_name="us-west-2",
+        bearer_token="bedrock-bearer",
+    )
+
+    def capture(request: object, **_: object) -> None:
+        headers = cast("Any", request).headers
+        value = headers.get("Authorization")
+        captured["authorization"] = (
+            value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        )
+        raise _StopBeforeNetwork
+
+    cast("Any", runtime).meta.events.register(
+        "before-send.bedrock-runtime.Converse",
+        capture,
+    )
+
+    with pytest.raises(_StopBeforeNetwork):
+        runtime.converse(
+            modelId="amazon.nova-lite-v1:0",
+            messages=[{"role": "user", "content": [{"text": "ping"}]}],
+        )
+
+    assert captured == {"authorization": "Bearer bedrock-bearer"}
 
 
 def test_converse_response_normalizes_cache_legs_without_double_counting() -> None:

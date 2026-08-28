@@ -655,6 +655,26 @@ def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
             # remove the obsolete column before the database can serve again.
             connection.execute(
                 """
+                UPDATE gateway_aliases
+                SET active = 0,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+                WHERE active = 1
+                  AND EXISTS (
+                    SELECT 1
+                    FROM alias_revision_provider_connections AS bindings
+                    JOIN provider_connection_revisions AS revisions
+                      ON revisions.organization_id = bindings.organization_id
+                     AND revisions.connection_id = bindings.connection_id
+                     AND revisions.revision_id = bindings.connection_revision_id
+                    WHERE bindings.organization_id = gateway_aliases.organization_id
+                      AND bindings.alias_id = gateway_aliases.alias_id
+                      AND bindings.alias_revision_id = gateway_aliases.active_revision_id
+                      AND revisions.aws_access_key_id IS NOT NULL
+                  )
+                """
+            )
+            connection.execute(
+                """
                 UPDATE provider_connections
                 SET active = 0
                 WHERE active_revision_id IN (
@@ -663,7 +683,14 @@ def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
                 )
                 """
             )
-            connection.execute("UPDATE provider_connection_revisions SET aws_access_key_id = NULL")
+            connection.execute(
+                """
+                UPDATE provider_connection_revisions
+                SET aws_access_key_id = NULL, api_key_env = NULL,
+                    aws_access_key_id_env = NULL, bedrock_auth_mode = NULL
+                WHERE aws_access_key_id IS NOT NULL
+                """
+            )
             connection.execute(
                 "ALTER TABLE provider_connection_revisions DROP COLUMN aws_access_key_id"
             )
@@ -673,7 +700,15 @@ def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
             SET bedrock_auth_mode = 'access_key_pair'
             WHERE provider = 'bedrock'
               AND api_key_env IS NOT NULL
-              AND aws_access_key_id_env IS NOT NULL
+              AND aws_access_key_id_env IS NOT NULL AND bedrock_auth_mode IS NULL
+            """
+        )
+        connection.execute(
+            """
+            UPDATE provider_connection_revisions
+            SET bedrock_auth_mode = 'api_key'
+            WHERE provider = 'bedrock' AND api_key_env IS NOT NULL
+              AND aws_access_key_id_env IS NULL
               AND bedrock_auth_mode IS NULL
             """
         )
@@ -705,7 +740,7 @@ def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
                         str(row["bedrock_auth_mode"]),
                     )
                 ),
-            )
+            ).canonicalized()
             digest = config.identity_sha256()
             connection.execute(
                 "UPDATE provider_connection_revisions SET connection_sha256 = ? "
@@ -858,7 +893,7 @@ def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | N
         except GatewaySchemaError:
             connection.execute("ROLLBACK")
             raise
-        except (sqlite3.DatabaseError, OSError) as exc:
+        except (sqlite3.DatabaseError, OSError, ValueError) as exc:
             connection.execute("ROLLBACK")
             raise GatewaySchemaError("gateway database migration failed") from exc
     except sqlite3.DatabaseError as exc:

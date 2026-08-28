@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.models import GATEWAY_EXCLUDED_PROVIDERS, ConnectionConfig
+from exp.common.models import GATEWAY_EXCLUDED_PROVIDERS, ConnectionConfig, ModelCatalog
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.sqlite.store import GatewayStoreError
 from exp.runtime.models import SUPPORTED_PROVIDERS
@@ -90,3 +90,25 @@ def test_upsert_provider_connection_accepts_registry_supported_providers(
     assert native_authority.config.provider == "anthropic"
     assert "anthropic" in SUPPORTED_PROVIDERS
     assert "openai-compatible" in SUPPORTED_PROVIDERS
+
+
+def test_legacy_bedrock_snapshot_binds_to_canonical_pair_authority(tmp_path: Path) -> None:
+    """An authored pre-mode snapshot remains bindable after canonical persistence."""
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+    legacy = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="AWS_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+        region="us-west-2",
+    )
+    changed, authority = manager.upsert_provider_connection(
+        connection_id="bedrock",
+        config=legacy,
+    )
+
+    bindings = manager.provider_bindings(ModelCatalog(connections={"bedrock": legacy}, models={}))
+
+    assert changed
+    assert authority.config.bedrock_auth_mode == "access_key_pair"
+    assert bindings[0].connection_sha256 == authority.connection_sha256

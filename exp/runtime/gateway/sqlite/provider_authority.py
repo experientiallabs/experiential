@@ -67,6 +67,7 @@ def upsert_provider_connection(
     Raises:
         ProviderAuthorityError: Identity, replacement, or revision invariants conflict.
     """
+    config = config.canonicalized()
     current = _active_row(
         connection,
         organization_id=organization_id,
