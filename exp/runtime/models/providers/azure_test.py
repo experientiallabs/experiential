@@ -220,6 +220,27 @@ def test_model_inference_canonicalizes_redundant_resource_path_separators() -> N
     )
 
 
+def test_model_inference_preserves_identity_distinct_internal_separators() -> None:
+    """Only separators adjacent to the equivalent terminal models suffix collapse."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint="https://gateway.example.test/tenant-a//azure/models",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    assert transport.requests[0][0].startswith(
+        "https://gateway.example.test/tenant-a//azure/models/chat/completions?"
+    )
+
+
 def test_classic_surface_preserves_endpoint_path_authority() -> None:
     """Classic custom endpoint paths remain byte-distinct from collapsed credentials."""
     transport = ScriptedJsonTransport(

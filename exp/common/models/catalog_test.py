@@ -499,6 +499,20 @@ def test_azure_connection_requires_endpoint_key_and_api_version() -> None:
         update={"base_url": "https://resource.services.ai.azure.com"}
     )
     assert inference.identity_sha256() == inference_root.identity_sha256()
+    inference_redundant_terminal = inference.model_copy(
+        update={"base_url": "https://resource.services.ai.azure.com//models"}
+    )
+    assert inference_redundant_terminal.identity_sha256() == inference_root.identity_sha256()
+    inference_internal_separator = inference.model_copy(
+        update={"base_url": "https://gateway.example.test/tenant-a//azure/models"}
+    )
+    inference_collapsed_separator = inference_internal_separator.model_copy(
+        update={"base_url": "https://gateway.example.test/tenant-a/azure/models"}
+    )
+    assert (
+        inference_internal_separator.identity_sha256()
+        != inference_collapsed_separator.identity_sha256()
+    )
     assert inference.identity_sha256() != connection.identity_sha256()
     explicit_classic = connection.model_copy(update={"azure_api_surface": "openai_deployments"})
     assert explicit_classic.identity_sha256() == connection.identity_sha256()
