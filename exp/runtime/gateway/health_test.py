@@ -68,6 +68,36 @@ def test_operational_failures_still_open_the_circuit() -> None:
         assert not registry.claim(_KEY)
 
 
+def test_default_threshold_preserves_one_transient_redial_before_opening() -> None:
+    """The default keeps a lane admissible after a single transient failure.
+
+    A stalled lane is skipped by the data plane's failover-not-redial timeout
+    classification, so the circuit deliberately tolerates one blip here rather
+    than suppressing a lane that a bounded redial could still recover.
+    """
+    registry = DeploymentHealthRegistry(clock=lambda: 100.0)
+
+    registry.failed(_KEY, _failure(GatewayFailureClass.PROVIDER_INTERNAL))
+    assert registry.claim(_KEY)
+
+    registry.failed(_KEY, _failure(GatewayFailureClass.PROVIDER_INTERNAL))
+    assert not registry.claim(_KEY)
+
+
+def test_a_suppressed_lane_recovers_after_the_cooldown_window() -> None:
+    """A circuit reopens for a probe once the cooldown window elapses."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(
+        failure_threshold=1, open_seconds=30.0, clock=lambda: now[0]
+    )
+
+    registry.failed(_KEY, _failure(GatewayFailureClass.TRANSPORT))
+    assert not registry.claim(_KEY)
+
+    now[0] += 31
+    assert registry.claim(_KEY)
+
+
 def test_throttle_storms_still_suppress_the_deployment() -> None:
     """Provider throttling keeps its authoritative suppression window."""
     registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: 100.0)

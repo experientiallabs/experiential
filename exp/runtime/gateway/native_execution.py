@@ -50,6 +50,17 @@ class NativeDialectUnavailableError(RuntimeError):
     """The resolved provider has no native dialect, so the route cannot serve."""
 
 
+class NoDispatchableDeploymentError(RuntimeError):
+    """Every certified deployment in the route is currently un-dispatchable.
+
+    Raised only when no rung resolves to a usable wire profile for a reason
+    other than a missing native dialect (a disabled or drifted connection).
+    A route with no native dialect anywhere raises
+    :class:`NativeDialectUnavailableError` instead, preserving the launch-time
+    servability escalation contract.
+    """
+
+
 @dataclass
 class InflightRequest:
     """One admitted request awaiting its terminal settlement.
@@ -180,17 +191,70 @@ def next_route_candidate(
     return claim_route_from(health, keys, current_depth + 1)
 
 
-def resolve_route_profiles(
+def _resolve_one_wire(
+    catalog: RuntimeModelCatalog,
+    deployment: ExactModelDeployment,
+) -> tuple[GatewayWireProfile, NativeWireClient]:
+    """Resolve one deployment's public wire profile, or fail deployment-scoped.
+
+    The deployment is resolved and identity-checked before any ledger write or
+    billable dispatch, so a drifted runtime catalog can never bill against a
+    frozen route. The client check is structural (``NativeWireClient``), not a
+    concrete HTTP base class: a non-HTTP client such as the bounded Bedrock
+    adapter satisfies it too as long as it implements ``gateway_wire_profile``.
+
+    Args:
+        catalog: The authorized revision's frozen runtime catalog.
+        deployment: The certified deployment to resolve.
+
+    Returns:
+        The ``(profile, client)`` pair, with the model identity filled from
+        the resolved snapshot when the profile leaves it empty.
+
+    Raises:
+        NativeDialectUnavailableError: The deployment's provider has no
+            native-dialect implementation.
+        ProviderCapabilityError: The resolved wire profile rejects a
+            non-dialect capability.
+        ModelConnectionError: The connection cannot be constructed (a disabled
+            or absent provider credential); a subclass of ``ValueError``.
+        ValueError: The resolved client drifts from the frozen deployment.
+    """
+    resolved = catalog.resolve(deployment.source_alias)
+    _require_deployment_identity(deployment, resolved)
+    client = resolved.client
+    if not isinstance(client, NativeWireClient):
+        raise NativeDialectUnavailableError(
+            f"provider {deployment.provider!r} has no native wire profile"
+        )
+    try:
+        # Intersect the client's wire profile with the frozen catalog
+        # capability contract before payload bytes are frozen.
+        profile = _resolved_wire_profile(deployment, resolved)
+    except ProviderCapabilityError as exc:
+        if exc.capability != "native_data_plane":
+            raise
+        raise NativeDialectUnavailableError(
+            f"provider {deployment.provider!r} has no native dialect implementation"
+        ) from exc
+    return profile, client
+
+
+def resolve_dispatchable_wires(
     runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog],
     route: GatewayRoute,
-) -> tuple[tuple[GatewayWireProfile, NativeWireClient], ...]:
-    """Resolve every route deployment's public wire profile for the data plane.
+) -> tuple[tuple[ExactModelDeployment, GatewayWireProfile, NativeWireClient], ...]:
+    """Resolve the route's dispatchable rungs, skipping the un-dispatchable ones.
 
-    Every deployment is resolved and identity-checked before any ledger write
-    or billable dispatch, so a drifted runtime catalog can never bill against
-    a frozen route. The check is structural (``NativeWireClient``), not a concrete HTTP base
-    class: a non-HTTP client such as the bounded Bedrock adapter satisfies it
-    too as long as it implements ``gateway_wire_profile``.
+    A certified waterfall can lead with a rung whose connection is disabled,
+    drifted, or otherwise not currently dispatchable. Resolving the whole route
+    all-or-nothing turns that dead lead rung into a failed admission ("gateway
+    admission failed before provider dispatch") even when a live fallback rung
+    could still serve. This resolves each rung independently and keeps only the
+    ones that produce a usable wire profile, in route order, so a disabled lead
+    rung is skipped to the next live rung. Only deployment-scoped resolution
+    faults are skipped; a request-scoped fault (raised later while the surviving
+    wires are built) still fails the whole admission.
 
     Args:
         runtime_catalogs: Revision and catalog digests mapped to frozen
@@ -198,42 +262,70 @@ def resolve_route_profiles(
         route: Resolved ordered route.
 
     Returns:
-        One ``(profile, client)`` pair per deployment, in route order, with
-        the model identity filled from the resolved snapshot when the
-        profile leaves it empty. The client rides alongside its profile so
-        body-signing dialects can freeze their dispatch signer at admission.
+        One ``(deployment, profile, client)`` triple per dispatchable rung, in
+        route order. The client rides alongside its profile so body-signing
+        dialects can freeze their dispatch signer at admission.
 
     Raises:
-        NativeDialectUnavailableError: A route deployment's provider has no
-            native-dialect implementation.
-        GatewayRoutingError: The authorized catalog is not loaded.
-        ValueError: A resolved client drifts from the frozen deployment.
+        GatewayRoutingError: The authorized catalog is not loaded (whole route).
+        NativeDialectUnavailableError: No rung is dispatchable and every skipped
+            rung lacked a native dialect, preserving the servability escalation.
+        NoDispatchableDeploymentError: No rung is dispatchable and at least one
+            was skipped for a non-dialect reason (a disabled connection).
     """
     authorization = route.snapshot.authorization
     catalog = runtime_catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
     if catalog is None:
         raise GatewayRoutingError("runtime catalog is not loaded for the authorized revision")
-    resolved_wires: list[tuple[GatewayWireProfile, NativeWireClient]] = []
+    dispatchable: list[tuple[ExactModelDeployment, GatewayWireProfile, NativeWireClient]] = []
+    only_dialect_gaps = True
     for deployment in route.deployments:
-        resolved = catalog.resolve(deployment.source_alias)
-        _require_deployment_identity(deployment, resolved)
-        client = resolved.client
-        if not isinstance(client, NativeWireClient):
-            raise NativeDialectUnavailableError(
-                f"provider {deployment.provider!r} has no native wire profile"
-            )
         try:
-            # Intersect the client's wire profile with the frozen catalog
-            # capability contract before payload bytes are frozen.
-            profile = _resolved_wire_profile(deployment, resolved)
-        except ProviderCapabilityError as exc:
-            if exc.capability != "native_data_plane":
-                raise
-            raise NativeDialectUnavailableError(
-                f"provider {deployment.provider!r} has no native dialect implementation"
-            ) from exc
-        resolved_wires.append((profile, client))
-    return tuple(resolved_wires)
+            profile, client = _resolve_one_wire(catalog, deployment)
+        except NativeDialectUnavailableError:
+            continue
+        except (ProviderCapabilityError, ValueError):
+            # A disabled or drifted connection, a runtime-identity mismatch, or
+            # a non-dialect capability rejection: this rung cannot dispatch now,
+            # but a later live rung still can.
+            only_dialect_gaps = False
+            continue
+        dispatchable.append((deployment, profile, client))
+    if dispatchable:
+        return tuple(dispatchable)
+    if only_dialect_gaps:
+        raise NativeDialectUnavailableError(
+            "no certified deployment for the resolved model has a native dialect"
+        )
+    raise NoDispatchableDeploymentError(
+        "all certified deployments for the resolved model are currently unavailable"
+    )
+
+
+def route_with_dispatchable_deployments(
+    route: GatewayRoute,
+    deployments: tuple[ExactModelDeployment, ...],
+) -> GatewayRoute:
+    """Narrow a route to only its dispatchable rungs, preserving order.
+
+    The frozen execution snapshot keeps the full certified pool identity; only
+    the executable lead deployment and its fallbacks are narrowed, so per-rung
+    health keys, idempotency keys, and route-depth headers stay aligned with
+    the rungs the data plane will actually dispatch.
+
+    Args:
+        route: The originally resolved route.
+        deployments: The dispatchable subset, in route order (non-empty).
+
+    Returns:
+        A route whose lead and fallback deployments are exactly ``deployments``.
+    """
+    return route.model_copy(
+        update={
+            "deployment": deployments[0],
+            "fallback_deployments": tuple(deployments[1:]),
+        }
+    )
 
 
 def deployment_wire_entry(

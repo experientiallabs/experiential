@@ -33,6 +33,8 @@ def serve_native_gateway(
     port: int,
     max_active_requests: int = 64,
     graceful_timeout_seconds: float = 10.0,
+    connect_timeout_seconds: float = 5.0,
+    time_to_first_byte_seconds: float = 15.0,
     native_usage_enabled: bool = True,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
@@ -45,6 +47,15 @@ def serve_native_gateway(
         port: Public listener port.
         max_active_requests: Native concurrent-admission bound.
         graceful_timeout_seconds: Bound for graceful shutdown.
+        connect_timeout_seconds: Fail-fast bound on the TCP+TLS connect phase
+            of every provider call, so a lane whose host never accepts the
+            connection fails over in seconds instead of hanging on the
+            per-deployment request timeout.
+        time_to_first_byte_seconds: Fail-fast bound on the wait for a
+            provider's first streamed byte per attempt. It never caps total
+            generation time: once the first byte arrives, reads are paced by
+            the deployment's own per-chunk timeout, so slow reasoning models
+            keep streaming for as long as they need.
         native_usage_enabled: Whether Rust owns ``/usage.json``. Hosted,
             multi-tenant callers should disable it so their own surface owns
             usage.
@@ -73,6 +84,8 @@ def serve_native_gateway(
         "max_active_requests": max_active_requests,
         "request_timeout_seconds": control_plane.request_timeout_seconds,
         "graceful_timeout_seconds": graceful_timeout_seconds,
+        "connect_timeout_seconds": connect_timeout_seconds,
+        "time_to_first_byte_seconds": time_to_first_byte_seconds,
         "native_usage_enabled": native_usage_enabled,
     }
     try:

@@ -5,7 +5,7 @@ the upstream payload itself. Body-signing dialects (Bedrock SigV4) compute
 their headers over the exact serialized body bytes, so the control plane
 freezes one canonical serialization at admission (:func:`frozen_dispatch`,
 called per route deployment alongside
-``native_execution.resolve_route_profiles``) and retains the resolved
+``native_execution.resolve_dispatchable_wires``) and retains the resolved
 signer. The data plane must send the frozen bytes verbatim: re-serializing
 JSON on the other side of the boundary could reorder or reformat bytes and
 invalidate the signature. Signing itself happens at dispatch time, through

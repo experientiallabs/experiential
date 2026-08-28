@@ -10,10 +10,14 @@ use crate::errors::{Failure, FailureClass};
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a
 /// provider 3xx can never re-send credentials to an attacker-chosen location.
-pub fn build_client() -> Result<reqwest::Client, String> {
+///
+/// `connect_timeout` bounds only the TCP+TLS connect phase; a dead lane whose
+/// host never accepts the connection fails over after this window instead of
+/// hanging on the per-deployment request timeout.
+pub fn build_client(connect_timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .pool_max_idle_per_host(64)
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(connect_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .use_rustls_tls()
         .build()

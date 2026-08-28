@@ -1,4 +1,24 @@
-"""Bounded per-deployment circuit and throttle state for exact-model waterfalls."""
+"""Bounded per-deployment circuit and throttle state for exact-model waterfalls.
+
+This registry is per-process: each gateway pod keeps its own circuit state, so a
+lane that one pod has proven dead is still probed by every other pod. Two things
+keep that probe cheap rather than a 35-second stall: the data plane's fail-fast
+connect and time-to-first-byte bounds detect the dead lane in seconds, and a
+first-byte stall is classified failover-eligible but not same-deployment
+retryable, so the pod advances to the next live rung instead of redialing the
+stalled lane.
+
+Follow-up (fleet-shared health): to route the *whole* fleet around a dead lane
+without every pod paying its own probe, this in-memory state should be backed by
+a small shared, TTL'd health signal the control plane reads at route time and
+writes on failure (keyed by the same ``DeploymentHealthKey`` tuple). That
+cross-pod state change is deliberately kept out of this change: the OSS engine's
+store is per-pod SQLite, so a true fleet-shared signal needs a shared store and
+is a fragile distributed-state change to force into one PR. It layers onto the
+same ``claim``/``failed`` seam without changing the waterfall contract, so the
+per-pod fast-fail-and-skip above is the conservative first step and the shared
+signal is the follow-up.
+"""
 
 from __future__ import annotations
 
@@ -47,6 +67,13 @@ class DeploymentHealthRegistry:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Initialize finite in-process deployment health policy.
+
+        The default opens a circuit after two consecutive operational failures,
+        which preserves the bounded same-deployment redial: a single transient
+        blip still redials the lane, and only a lane that fails twice is
+        suppressed for the cooldown. A stalled (dead) lane is skipped before it
+        reaches this threshold because a first-byte timeout is classified
+        failover-not-redial in the data plane.
 
         Args:
             failure_threshold: Consecutive operational failures that open one circuit.

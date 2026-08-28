@@ -38,6 +38,14 @@ pub struct ServeConfig {
     pub max_active_requests: usize,
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: f64,
+    /// Fail-fast bound on the TCP+TLS connect phase of every provider call.
+    #[serde(default = "default_connect_timeout_seconds")]
+    pub connect_timeout_seconds: f64,
+    /// Fail-fast bound on the wait for a provider's first streamed byte. This
+    /// never caps total generation time: once the first byte arrives, reads
+    /// are paced by the deployment's own per-chunk timeout.
+    #[serde(default = "default_time_to_first_byte_seconds")]
+    pub time_to_first_byte_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
     #[serde(default = "default_native_usage_enabled")]
@@ -48,6 +56,14 @@ pub struct ServeConfig {
 
 fn default_graceful_timeout_seconds() -> f64 {
     10.0
+}
+
+fn default_connect_timeout_seconds() -> f64 {
+    5.0
+}
+
+fn default_time_to_first_byte_seconds() -> f64 {
+    15.0
 }
 
 fn default_max_active_requests() -> usize {
@@ -73,6 +89,8 @@ pub(crate) struct AppState {
     pub(crate) http: reqwest::Client,
     pub(crate) permits: Arc<Semaphore>,
     pub(crate) request_timeout: Duration,
+    /// Fail-fast bound on the wait for the first provider byte per attempt.
+    pub(crate) time_to_first_byte: Duration,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pub(crate) pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
@@ -93,7 +111,8 @@ pub async fn run(
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     on_listening: Option<Py<PyAny>>,
 ) -> Result<(), String> {
-    let http = crate::upstream::build_client()?;
+    let connect_timeout = Duration::from_secs_f64(config.connect_timeout_seconds.max(0.001));
+    let http = crate::upstream::build_client(connect_timeout)?;
     let pending_settlements = Arc::new(AtomicUsize::new(0));
     let max_active_requests = config.max_active_requests.max(1);
     let handled_requests = Arc::new(AtomicUsize::new(0));
@@ -102,6 +121,7 @@ pub async fn run(
         http,
         permits: Arc::new(Semaphore::new(max_active_requests)),
         request_timeout: Duration::from_secs_f64(config.request_timeout_seconds),
+        time_to_first_byte: Duration::from_secs_f64(config.time_to_first_byte_seconds.max(0.001)),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),

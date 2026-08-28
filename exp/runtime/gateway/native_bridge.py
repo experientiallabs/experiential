@@ -73,8 +73,10 @@ from exp.runtime.gateway.native_execution import (
     MAXIMUM_TOTAL_ATTEMPTS,
     InflightRequest,
     NativeDialectUnavailableError,
+    NoDispatchableDeploymentError,
     deployment_wire_entry,
-    resolve_route_profiles,
+    resolve_dispatchable_wires,
+    route_with_dispatchable_deployments,
 )
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.native_responses import (
@@ -338,9 +340,27 @@ class NativeControlPlane:
                 request,
                 continuation=continuation_context,
             )
-            resolved_wires = resolve_route_profiles(self._components.runtime_catalogs, route)
+            # Skip any disabled or un-dispatchable rung so a dead lead rung
+            # never fails admission when a live fallback rung can still serve.
+            dispatchable = resolve_dispatchable_wires(self._components.runtime_catalogs, route)
+            route = route_with_dispatchable_deployments(
+                route, tuple(deployment for deployment, _profile, _client in dispatchable)
+            )
+            resolved_wires = tuple(
+                (profile, client) for _deployment, profile, client in dispatchable
+            )
         except NativeDialectUnavailableError as exc:
             return self._escalate_accepted(authorization, str(exc))
+        except NoDispatchableDeploymentError as exc:
+            # Every certified rung is disabled or unavailable: finish the
+            # accepted request with an honest provider-unavailable terminal
+            # rather than a mislabeled internal error or a hang.
+            failure = GatewayFailure(
+                failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+                safe_message="all certified deployments for this model are currently unavailable",
+            )
+            self._accounting.finish_request_quietly(authorization, failure)
+            raise NativeBridgeError(public_failure_error(failure)) from exc
         except Exception as exc:  # noqa: BLE001 - raised after route packaging below.
             probe_failure = exc
         if route is not None and self._native_route_eligible is not None:
@@ -606,7 +626,10 @@ class NativeControlPlane:
         if isinstance(authorization.target, DirectTarget):
             try:
                 route = self._components.routes.resolve_direct(authorization)
-                resolve_route_profiles(self._components.runtime_catalogs, route)
+                # Servability mirrors admission: a route with at least one
+                # dispatchable rung is servable even if its lead rung is
+                # disabled, so only a fully dialectless route escalates here.
+                resolve_dispatchable_wires(self._components.runtime_catalogs, route)
             except NativeDialectUnavailableError as exc:
                 return _escalation(str(exc))
             except Exception:  # noqa: BLE001 - the owner's admission records this failure.
