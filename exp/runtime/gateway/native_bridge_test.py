@@ -95,13 +95,28 @@ def test_public_capability_params_name_real_surface_fields(
 def test_internal_tool_streaming_failure_names_the_public_tools_field() -> None:
     """A transport detail never blames stream when the caller requested non-streaming tools."""
     for surface in GatewayApiSurface:
+        for capability in ("streaming", "streaming_tool_arguments"):
+            assert (
+                _public_capability_param(
+                    capability,
+                    surface,
+                    public_stream=False,
+                    public_tools=True,
+                )
+                == "tools"
+            )
+
+
+def test_internal_text_streaming_failure_names_the_public_model_field() -> None:
+    """An internal text transport deficit is attributed to route selection, not stream."""
+    for surface in GatewayApiSurface:
         assert (
             _public_capability_param(
-                "streaming_tool_arguments",
+                "streaming",
                 surface,
                 public_stream=False,
             )
-            == "tools"
+            == "model"
         )
 
 
@@ -1169,10 +1184,7 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
 
 def test_non_streaming_tool_transport_failure_names_tools_not_stream(tmp_path: Path) -> None:
     """Internally forced streaming attributes incompatibility to the declared tools field."""
-    unsupported = GatewayDeploymentCapabilities(
-        supports_streaming=True,
-        supports_strict_tools=True,
-    )
+    unsupported = GatewayDeploymentCapabilities(supports_strict_tools=True)
     control, raw_key = _pool_control_plane(
         tmp_path,
         gateway_capabilities=(unsupported, unsupported),
