@@ -315,11 +315,12 @@ def test_complete_passes_the_derived_timeout_to_the_transport() -> None:
     client.complete(ModelRequest(messages=(message,)))
 
     # Each attempt is bounded by the derived timeout minus the wall time
-    # already spent under the request deadline, so scheduling jitter legally
-    # lands the observed value slightly below the exact derivation. The
-    # contract under test is WHICH timeout reached the transport (the
-    # token-scaled one, then the configured default), so a whole second of
-    # slack still distinguishes 480.0 from 60.0 unambiguously.
+    # already spent under the request deadline, so scheduling delay legally
+    # lands the observed value below the exact derivation. The contract under
+    # test is WHICH timeout reached the transport (the token-scaled one, then
+    # the configured default), so the slack is sized for the worst loaded CI
+    # worker while the 420-second gap between 480.0 and 60.0 keeps the
+    # discrimination unambiguous.
     assert len(transport.timeouts) == 2
     for observed, derived in zip(transport.timeouts, (480.0, DEFAULT_TIMEOUT_SECONDS), strict=True):
-        assert derived - 1.0 < observed <= derived
+        assert derived - 30.0 < observed <= derived
