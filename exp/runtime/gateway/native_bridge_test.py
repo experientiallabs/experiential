@@ -23,6 +23,7 @@ from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKi
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
+    GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -41,6 +42,7 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
+    _public_capability_param,
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
@@ -57,6 +59,28 @@ _PublicErrorType = Literal[
     "insufficient_quota",
     "api_error",
 ]
+
+
+@pytest.mark.parametrize(
+    ("capability", "chat_param", "responses_param"),
+    (
+        ("developer_messages", "messages", "input"),
+        ("function_tools", "tools", "tools"),
+        ("stop_sequences", "stop", "stop"),
+        ("streaming", "stream", "stream"),
+        ("strict_tools", "tools", "tools"),
+        ("structured_output", "response_format", "text.format"),
+        ("structured_text", "response_format", "text.format"),
+    ),
+)
+def test_public_capability_params_name_real_surface_fields(
+    capability: str,
+    chat_param: str,
+    responses_param: str,
+) -> None:
+    """Internal admission labels never leak as nonexistent public fields."""
+    assert _public_capability_param(capability, GatewayApiSurface.CHAT_COMPLETIONS) == chat_param
+    assert _public_capability_param(capability, GatewayApiSurface.RESPONSES) == responses_param
 
 
 def _parity_golden(name: str) -> object:
@@ -1095,7 +1119,7 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
     error = json.loads(raised.value.public_error_json)
     assert error["status_code"] == 400
     assert error["code"] == "unsupported_capability"
-    assert error["param"] == "strict_tools"
+    assert error["param"] == "tools"
     assert "internal" not in error["code"]
 
 
@@ -1106,7 +1130,7 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
             {"stop": ["DONE"]},
             GatewayDeploymentCapabilities(supports_streaming=True),
             ModelCapabilities(),
-            "stop_sequences",
+            "stop",
         ),
         (
             {
@@ -1124,7 +1148,7 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
                 supports_structured_text=True,
             ),
             ModelCapabilities(),
-            "structured_output",
+            "response_format",
         ),
     ),
 )

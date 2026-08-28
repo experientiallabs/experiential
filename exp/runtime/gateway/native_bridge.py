@@ -113,18 +113,28 @@ from exp.runtime.openai_protocol.state import (
 )
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
-_PUBLIC_REQUEST_CAPABILITY_PARAMS = frozenset(
-    {
-        "developer_messages",
-        "function_tools",
-        "parallel_tool_calls",
-        "stop_sequences",
-        "streaming",
-        "strict_tools",
-        "structured_output",
-        "structured_text",
-    }
-)
+_PUBLIC_REQUEST_CAPABILITY_PARAMS = {
+    "developer_messages": "messages",
+    "function_tools": "tools",
+    "parallel_tool_calls": "parallel_tool_calls",
+    "stop_sequences": "stop",
+    "streaming": "stream",
+    "strict_tools": "tools",
+    "structured_output": "response_format",
+    "structured_text": "response_format",
+}
+
+
+def _public_capability_param(capability: str, surface: GatewayApiSurface) -> str | None:
+    """Translate an internal capability label to the caller's request field."""
+    parameter = _PUBLIC_REQUEST_CAPABILITY_PARAMS.get(capability)
+    if surface == GatewayApiSurface.RESPONSES:
+        if parameter == "messages":
+            return "input"
+        if parameter == "response_format":
+            return "text.format"
+    return parameter
+
 
 _logger = logging.getLogger(__name__)
 
@@ -477,9 +487,8 @@ class NativeControlPlane(NativeObservabilityMixin):
             failure = normalized_provider_failure(exc)
             self._accounting.finish_request_quietly(authorization, failure)
             capability_param = (
-                exc.capability
+                _public_capability_param(exc.capability, provider_request.surface)
                 if isinstance(exc, ProviderCapabilityError)
-                and exc.capability in _PUBLIC_REQUEST_CAPABILITY_PARAMS
                 else None
             )
             raise NativeBridgeError(public_failure_error(failure, param=capability_param)) from exc
