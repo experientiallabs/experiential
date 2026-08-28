@@ -57,6 +57,8 @@ def test_openai_reasoning_efforts_follow_exact_model_tables() -> None:
         openai_reasoning_effort("gpt-5.6-sol", "minimal")
     with pytest.raises(UnsupportedReasoningEffortError):
         openai_reasoning_effort("gpt-5.5", "minimal")
+    assert openai_reasoning_effort("gpt-5.5", "none") == "none"
+    assert openai_reasoning_effort("gpt-5.6-sol", "max") == "max"
     with pytest.raises(UnsupportedReasoningEffortError):
         openai_reasoning_effort("gpt-5.1-2025-11-13", "xhigh")
     assert openai_reasoning_effort("gpt-5.1", "none") == "none"
@@ -80,6 +82,21 @@ def test_exact_effort_support_covers_each_reasoning_wire_family() -> None:
         "medium",
         "high",
         "xhigh",
+    )
+    assert supported_reasoning_efforts("gpt-5.5", "openai_responses") == (
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    )
+    assert supported_reasoning_efforts("gpt-5.6-luna", "openai_responses") == (
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
     )
     assert supported_reasoning_efforts("claude-sonnet-4-6", "anthropic_adaptive") == (
         "low",

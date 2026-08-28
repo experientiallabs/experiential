@@ -181,16 +181,17 @@ def _openai_supported_efforts(model_id: str) -> Collection[str] | None:
         supported: Collection[str] = ("high",)
     elif identity in {"gpt-5.2-pro", "gpt-5.4-pro", "gpt-5.5-pro"}:
         supported = ("medium", "high", "xhigh")
+    elif identity in {"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"}:
+        supported = ("none", "low", "medium", "high", "xhigh", "max")
     elif identity.startswith("gpt-5.6-"):
-        # The gpt-5.6 family is the first to document the "ultra" tier
-        # (Codex sends it by default at its highest setting).
-        supported = ("low", "medium", "high", "xhigh", "ultra")
+        supported = ()
+    elif identity == "gpt-5.5":
+        supported = ("none", "low", "medium", "high", "xhigh")
     elif identity in {
         "gpt-5.2",
         "gpt-5.4",
         "gpt-5.4-mini",
         "gpt-5.4-nano",
-        "gpt-5.5",
     }:
         supported = ("low", "medium", "high", "xhigh")
     elif identity == "gpt-5.1":

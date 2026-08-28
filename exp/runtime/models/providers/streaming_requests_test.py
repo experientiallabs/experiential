@@ -388,7 +388,7 @@ def test_route_rejects_an_unsupported_configured_effort_without_clamping() -> No
         )
 
     assert raised.value.param == "reasoning_effort"
-    assert "Supported values: 'low', 'medium', 'high', 'xhigh'" in str(raised.value)
+    assert "Supported values: 'none', 'low', 'medium', 'high', 'xhigh', 'max'" in str(raised.value)
 
 
 def test_route_preserves_each_required_reasoning_default_across_fallbacks() -> None:
