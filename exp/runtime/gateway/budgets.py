@@ -25,6 +25,13 @@ from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 
 MAXIMUM_MICRO_USD = 9_223_372_036_854_775_807
 
+# Reservation-only output bound used when neither the caller nor the frozen
+# deployment declares an output ceiling. This is a pricing estimate for the
+# per-attempt reservation, not a wire capability: it never rejects or clamps a
+# caller's requested output. Settlement always charges actual tokens, so a
+# longer real response simply over-spends its reservation.
+DEFAULT_RESERVATION_OUTPUT_TOKENS = 32_768
+
 
 class BudgetScopeKind(StrEnum):
     """Supported hard-limit scopes inside one UTC month."""
@@ -526,11 +533,13 @@ def maximum_attempt_cost_micro_usd(
     """Return a conservative integer micro-USD ceiling for one physical call.
 
     Canonical UTF-8 bytes conservatively upper-bound input tokens. The caller's output ceiling
-    wins when present, otherwise the frozen deployment limit is required. Cached-input and
+    wins when present, then the frozen deployment limit, then a reservation-only default bounded
+    by the model's context window, so a missing output ceiling never makes a priced route
+    unpriceable. Cached-input and
     reasoning counts are subsets of the total input and output counts, so the worst case uses
     the highest applicable rate in each direction rather than adding subset rates to the same
-    token ceiling. Unknown required prices produce ``None`` so an applicable hard limit fails
-    closed.
+    token ceiling. Unknown required prices still produce ``None`` so an applicable hard limit
+    fails closed.
     """
     input_tokens = len(canonical_json_bytes(request))
     output_tokens = request.maximum_output_tokens
@@ -549,7 +558,21 @@ def maximum_attempt_cost_micro_usd(
     elif deployment_ceiling is not None:
         output_tokens = min(output_tokens, deployment_ceiling)
     if output_tokens is None:
-        return None
+        # No caller value and no deployment ceiling: reserve against a realistic
+        # default instead of failing closed. An output bound is not a price, so
+        # its absence must not unprice an otherwise fully priced route. The
+        # model can never emit more than its context window, so a smaller known
+        # window still bounds the default.
+        context_window = (
+            deployment.capabilities.context_window_tokens
+            if deployment.capabilities is not None
+            else None
+        )
+        output_tokens = (
+            min(DEFAULT_RESERVATION_OUTPUT_TOKENS, context_window)
+            if context_window is not None
+            else DEFAULT_RESERVATION_OUTPUT_TOKENS
+        )
     prices = deployment.gateway.prices
     capabilities = deployment.gateway.capabilities
     required_rates = [

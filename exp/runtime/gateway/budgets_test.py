@@ -22,6 +22,7 @@ from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
 )
 from exp.runtime.gateway.budgets import (
+    DEFAULT_RESERVATION_OUTPUT_TOKENS,
     BudgetReservationRejected,
     BudgetScope,
     BudgetScopeKind,
@@ -219,10 +220,47 @@ def test_maximum_attempt_cost_is_integer_conservative_and_unknown_prices_fail_cl
     assert all_prices.gateway.capabilities.reports_reasoning_tokens is False
     all_dimensions = maximum_attempt_cost_micro_usd(request, all_prices)
     assert all_dimensions is not None and all_dimensions > known
+
+
+def test_missing_output_ceiling_reserves_against_the_default_instead_of_failing_closed() -> None:
+    """A priced route with no output ceiling anywhere stays priceable.
+
+    An output bound is a token count, not a price, so its absence must not
+    unprice the route: when the caller omits ``maximum_output_tokens`` and the
+    deployment declares none, the reservation uses
+    ``DEFAULT_RESERVATION_OUTPUT_TOKENS``, bounded by a smaller declared context
+    window. Unknown required prices still fail closed.
+    """
+    request = _request("four bytes").model_copy(update={"maximum_output_tokens": None})
+    no_ceiling = _deployment().model_copy(update={"capabilities": ModelCapabilities()})
+
+    default_bound = maximum_attempt_cost_micro_usd(request, no_ceiling)
+    assert default_bound is not None and isinstance(default_bound, int) and default_bound > 0
+    explicit_default = maximum_attempt_cost_micro_usd(
+        request.model_copy(update={"maximum_output_tokens": DEFAULT_RESERVATION_OUTPUT_TOKENS}),
+        no_ceiling,
+    )
+    # The fallback reserves exactly the default when nothing bounds it lower.
+    assert explicit_default is not None
+    assert abs(default_bound - explicit_default) < 100
+
+    small_window = _deployment().model_copy(
+        update={"capabilities": ModelCapabilities(context_window_tokens=1_024)}
+    )
+    windowed = maximum_attempt_cost_micro_usd(request, small_window)
+    explicit_window = maximum_attempt_cost_micro_usd(
+        request.model_copy(update={"maximum_output_tokens": 1_024}),
+        small_window,
+    )
+    # A smaller declared context window bounds the default.
+    assert windowed is not None and explicit_window is not None
+    assert abs(windowed - explicit_window) < 100
+
+    # A missing required price still fails closed regardless of the default.
     assert (
         maximum_attempt_cost_micro_usd(
-            request.model_copy(update={"maximum_output_tokens": None}),
-            _deployment().model_copy(update={"capabilities": ModelCapabilities()}),
+            request,
+            _deployment(priced=False).model_copy(update={"capabilities": ModelCapabilities()}),
         )
         is None
     )
