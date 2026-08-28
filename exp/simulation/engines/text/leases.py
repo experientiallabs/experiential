@@ -8,6 +8,7 @@ import os
 import stat
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -539,10 +540,8 @@ class TextCellLeaseStore:
         finally:
             if staging_descriptor is not None:
                 os.close(staging_descriptor)
-            try:
+            with suppress(FileNotFoundError):
                 os.unlink(staging_name, dir_fd=directory_descriptor)
-            except FileNotFoundError:
-                pass
             os.close(directory_descriptor)
 
     def _open_exact(self, path: Path, expected: TextCellLease) -> tuple[int, os.stat_result]:
@@ -660,10 +659,8 @@ class TextCellLeaseStore:
                 handle.flush()
                 os.fsync(handle.fileno())
         except BaseException:
-            try:
+            with suppress(FileNotFoundError):
                 os.unlink(path.name, dir_fd=directory_descriptor)
-            except FileNotFoundError:
-                pass
             raise
         finally:
             os.close(descriptor)

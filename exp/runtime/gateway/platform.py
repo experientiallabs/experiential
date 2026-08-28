@@ -57,7 +57,7 @@ class OpaqueSecretReference(ContractModel):
         if any(ord(character) < 32 or ord(character) == 127 for character in self.reference):
             raise ValueError("secret references must not contain control characters")
         lowered = self.reference.lower()
-        if lowered.startswith("exp_vk_") or lowered.startswith("sk-"):
+        if lowered.startswith(("exp_vk_", "sk-")):
             raise ValueError("secret references must identify a locator, not raw key material")
         if self.scheme is OpaqueSecretScheme.ENVIRONMENT:
             if re.fullmatch(r"[A-Z_][A-Z0-9_]*", self.reference) is None:

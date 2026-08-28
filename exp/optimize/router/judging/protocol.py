@@ -704,9 +704,12 @@ def _rollout_payload(
         return evidence
     spans = []
     for span in cast(list[JsonObject], evidence["spans"]):
-        if (rollout.rollout_id, cast(str, span["span_id"])) in elided_spans:
-            payload = cast(JsonObject, span["payload"])
-            span = {
+        if (rollout.rollout_id, cast(str, span["span_id"])) not in elided_spans:
+            spans.append(span)
+            continue
+        payload = cast(JsonObject, span["payload"])
+        spans.append(
+            {
                 **span,
                 "payload": {
                     "payload_elided": True,
@@ -716,7 +719,7 @@ def _rollout_payload(
                     ),
                 },
             }
-        spans.append(span)
+        )
     return {**evidence, "spans": spans}
 
 

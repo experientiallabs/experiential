@@ -412,7 +412,7 @@ class RuntimeInteractionJournal:
                 return JournalClaim("live")
             settled = rebind_settlement(reservation, settlement)
             prior = _settled_sidecar_operations(spend_events, identity.interaction_id)
-            operations = tuple((*prior, settled))
+            operations = (*prior, settled)
             accepted = _accepted_event(
                 identity,
                 acceptance,
