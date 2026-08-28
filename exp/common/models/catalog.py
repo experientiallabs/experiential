@@ -237,6 +237,8 @@ class GatewayDeploymentCapabilities(ContractModel):
     contract. OpenRouter and other catalog-driven providers declare the exact
     ordered set here because their supported values vary by model.
     """
+    reasoning_default_effort: ReasoningEffort | None = None
+    """Explicit provider default used only when the wire requires this field."""
     reasoning_effort_required: bool = False
     """Whether this deployment requires an explicit reasoning effort on its wire."""
     reports_refusals: bool = False
@@ -252,10 +254,19 @@ class GatewayDeploymentCapabilities(ContractModel):
             raise ValueError("supported_reasoning_efforts cannot repeat values")
         if indexes != tuple(sorted(indexes)):
             raise ValueError("supported_reasoning_efforts must use canonical order")
+        if (
+            self.reasoning_default_effort is not None
+            and self.reasoning_default_effort not in self.supported_reasoning_efforts
+        ):
+            raise ValueError(
+                "reasoning_default_effort must be one of the supported reasoning efforts"
+            )
         if self.reasoning_effort_required and not self.supported_reasoning_efforts:
             raise ValueError(
                 "reasoning_effort_required needs at least one supported reasoning effort"
             )
+        if self.reasoning_effort_required and self.reasoning_default_effort is None:
+            raise ValueError("reasoning_effort_required needs reasoning_default_effort")
         return self
 
 

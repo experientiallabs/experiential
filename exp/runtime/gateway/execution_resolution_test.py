@@ -127,6 +127,7 @@ def test_profile_resolution_applies_exact_gateway_reasoning_values() -> None:
     )
     gateway_capabilities = GatewayDeploymentCapabilities(
         supported_reasoning_efforts=("low", "high", "max"),
+        reasoning_default_effort="high",
         reasoning_effort_required=True,
     )
 
@@ -136,6 +137,7 @@ def test_profile_resolution_applies_exact_gateway_reasoning_values() -> None:
     )
 
     assert resolved.supported_reasoning_efforts == ("low", "high", "max")
+    assert resolved.reasoning_effort == "high"
     assert resolved.reasoning_effort_required is True
 
 

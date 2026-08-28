@@ -298,6 +298,7 @@ def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) ->
                         supports_streaming=True,
                         supports_streaming_tool_arguments=True,
                         supported_reasoning_efforts=("low", "high", "max"),
+                        reasoning_default_effort="max",
                         reasoning_effort_required=True,
                     ),
                     prices=GatewayTokenPrices(
@@ -340,6 +341,24 @@ def test_required_gateway_reasoning_effort_needs_supported_values() -> None:
     """A mandatory wire parameter cannot omit its provider value domain."""
     with pytest.raises(ValueError, match="at least one supported reasoning effort"):
         GatewayDeploymentCapabilities(reasoning_effort_required=True)
+
+
+def test_required_gateway_reasoning_effort_needs_an_explicit_default() -> None:
+    """A mandatory wire parameter cannot force admission to guess its value."""
+    with pytest.raises(ValueError, match="needs reasoning_default_effort"):
+        GatewayDeploymentCapabilities(
+            supported_reasoning_efforts=("low", "high"),
+            reasoning_effort_required=True,
+        )
+
+
+def test_gateway_reasoning_default_must_be_supported() -> None:
+    """A provider default outside the exact domain fails catalog loading."""
+    with pytest.raises(ValueError, match="must be one of the supported"):
+        GatewayDeploymentCapabilities(
+            supported_reasoning_efforts=("low", "high"),
+            reasoning_default_effort="max",
+        )
 
 
 def test_model_catalog_rejects_credential_values_and_embedded_url_credentials(

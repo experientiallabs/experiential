@@ -79,6 +79,9 @@ def _resolved_wire_profile(
                 gateway_capabilities.supported_reasoning_efforts
                 or profile.supported_reasoning_efforts
             ),
+            reasoning_effort=(
+                gateway_capabilities.reasoning_default_effort or profile.reasoning_effort
+            ),
             reasoning_effort_required=(
                 gateway_capabilities.reasoning_effort_required or profile.reasoning_effort_required
             ),
