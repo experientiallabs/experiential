@@ -220,6 +220,27 @@ def test_model_inference_canonicalizes_redundant_resource_path_separators() -> N
     )
 
 
+def test_classic_surface_preserves_endpoint_path_authority() -> None:
+    """Classic custom endpoint paths remain byte-distinct from collapsed credentials."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "deployment-name"),
+        endpoint="https://gateway.example.test/tenant-a//azure",
+        api_key=_SECRET,
+        api_version="v1",
+        api_surface="openai_deployments",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    assert transport.requests[0][0] == (
+        "https://gateway.example.test/tenant-a//azure/openai/v1/chat/completions"
+    )
+
+
 def test_model_inference_rejects_v1_without_a_supported_api_version_query() -> None:
     """The model-inference surface never silently omits its required api-version query."""
     with pytest.raises(ValueError, match="dated api_version"):

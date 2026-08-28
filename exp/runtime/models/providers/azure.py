@@ -111,11 +111,12 @@ def _azure_base_url(
     Returns:
         Absolute request root. The root never includes a credential or query string.
     """
-    parsed = urlsplit(endpoint)
-    path = "/".join(part for part in parsed.path.split("/") if part)
-    normalized_path = f"/{path}" if path else ""
-    root = urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+    root = endpoint.rstrip("/")
     if api_surface == "model_inference":
+        parsed = urlsplit(endpoint)
+        path = "/".join(part for part in parsed.path.split("/") if part)
+        normalized_path = f"/{path}" if path else ""
+        root = urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
         if root.lower().endswith("/models"):
             return f"{root[:-7]}/models"
         return f"{root}/models"
