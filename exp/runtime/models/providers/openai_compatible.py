@@ -217,6 +217,8 @@ def openai_compatible_response(
         parse_openai_wire_tool_call(value, index) for index, value in enumerate(tool_call_values)
     )
     reasoning_content = message.get("reasoning_content")
+    if reasoning_content is not None and not isinstance(reasoning_content, str):
+        raise OpenAICompatibleResponseError("Fireworks reasoning_content must be text when present")
     provider_reasoning = (
         (
             OpaqueReasoningContentBlock(

@@ -19,7 +19,6 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
-from exp.runtime.models.providers.fireworks import decode_reasoning_content
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.streaming import (
     ChatSseEncoder,
@@ -197,6 +196,7 @@ def test_chat_sse_emits_one_opaque_fireworks_carrier_for_completed_tool_calls(
             model=model,
             created_at=123,
             include_usage=False,
+            reasoning_content_carrier="authenticated-carrier-v2",
         ),
         events,
     )
@@ -209,9 +209,7 @@ def test_chat_sse_emits_one_opaque_fireworks_carrier_for_completed_tool_calls(
     ]
 
     assert len(carriers) == 1
-    block = decode_reasoning_content(str(carriers[0]))
-    assert block.route_sha256 == _FIREWORKS_ROUTE
-    assert block.content == "first private reasoning:\nZürich"
+    assert carriers == ["authenticated-carrier-v2"]
     carrier_index = next(
         index
         for index, payload in enumerate(payloads)
@@ -399,6 +397,113 @@ def test_responses_sse_preserves_reasoning_summary_items() -> None:
             "status": "completed",
         }
     ]
+
+
+def test_responses_sse_round_trips_fireworks_carrier_without_plaintext() -> None:
+    """Responses emits only the sealed carrier on the completed reasoning item."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="weather"),),
+        stream=True,
+        include_encrypted_reasoning=True,
+    )
+    encoder = ResponsesSseEncoder(
+        request_id="request-fireworks",
+        model="coding",
+        created_at=123.0,
+        request=request,
+    )
+    encoder.set_reasoning_content_carrier("authenticated-carrier-v2")
+    frames = list(encoder.start())
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_CONTENT_DELTA,
+            sequence_number=0,
+            text_delta="hidden provider reasoning",
+            reasoning_content_route_sha256=_FIREWORKS_ROUTE,
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=1,
+            tool_call_index=0,
+            tool_call_id="call-one",
+            tool_name="weather",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=2,
+            tool_call_index=0,
+            raw_arguments_delta="{}",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=3,
+            tool_call_index=0,
+            tool_call=ToolCall(call_id="call-one", name="weather", arguments={}),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=4),
+    )
+    for event in events:
+        frames.extend(encoder.feed(event))
+
+    assert "hidden provider reasoning" not in "".join(frames)
+    terminal = cast("JsonObject", _responses_payload(frames[-1])["response"])
+    output = cast("list[JsonObject]", terminal["output"])
+    reasoning = next(item for item in output if item["type"] == "reasoning")
+    assert reasoning["encrypted_content"] == "authenticated-carrier-v2"
+
+
+def test_responses_sse_fails_closed_when_fireworks_carrier_is_not_sealed() -> None:
+    """A completed Fireworks tool turn cannot terminate without its carrier."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="weather"),),
+        stream=True,
+        include_encrypted_reasoning=True,
+    )
+    encoder = ResponsesSseEncoder(
+        request_id="request-fireworks-missing",
+        model="coding",
+        created_at=123.0,
+        request=request,
+    )
+    encoder.start()
+    for event in (
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_CONTENT_DELTA,
+            sequence_number=0,
+            text_delta="hidden",
+            reasoning_content_route_sha256=_FIREWORKS_ROUTE,
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=1,
+            tool_call_index=0,
+            tool_call_id="call-one",
+            tool_name="weather",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=2,
+            tool_call_index=0,
+            raw_arguments_delta="{}",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=3,
+            tool_call_index=0,
+            tool_call=ToolCall(call_id="call-one", name="weather", arguments={}),
+        ),
+    ):
+        encoder.feed(event)
+
+    with pytest.raises(OpenAIProtocolError, match="not sealed"):
+        encoder.feed(
+            GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=4,
+            )
+        )
 
 
 def test_responses_failure_closes_visible_content_then_emits_one_failed_terminal() -> None:

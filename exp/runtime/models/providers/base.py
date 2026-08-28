@@ -146,8 +146,13 @@ class GatewayWireProfile:
     reasoning_effort: str | None = None
     """Optional provider default used when the wire requires an explicit effort."""
 
-    supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
-    """Exact caller values declared by this deployment, in canonical order."""
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] | None = None
+    """Exact caller values declared by this deployment, in canonical order.
+
+    ``None`` means the provider supplied no constraint. An explicitly empty
+    tuple is a real, fail-closed constraint and must never recover inferred
+    model defaults.
+    """
 
     reasoning_effort_required: bool = False
     """Whether dispatch must put an explicit reasoning effort on this wire."""
@@ -193,21 +198,16 @@ class GatewayWireProfile:
             raise ValueError("reasoning support requires a concrete wire format")
         if self.reasoning_effort is not None and not self.supports_reasoning:
             raise ValueError("a configured reasoning effort requires reasoning support")
-        if self.supported_reasoning_efforts and not self.supports_reasoning:
+        efforts = self.supported_reasoning_efforts or ()
+        if efforts and not self.supports_reasoning:
             raise ValueError("supported reasoning efforts require reasoning support")
         effort_order = ("none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max")
-        effort_indexes = tuple(
-            effort_order.index(effort) for effort in self.supported_reasoning_efforts
-        )
-        if len(set(self.supported_reasoning_efforts)) != len(self.supported_reasoning_efforts):
+        effort_indexes = tuple(effort_order.index(effort) for effort in efforts)
+        if len(set(efforts)) != len(efforts):
             raise ValueError("supported reasoning efforts cannot repeat values")
         if effort_indexes != tuple(sorted(effort_indexes)):
             raise ValueError("supported reasoning efforts must use canonical order")
-        if (
-            self.reasoning_effort is not None
-            and self.supported_reasoning_efforts
-            and self.reasoning_effort not in self.supported_reasoning_efforts
-        ):
+        if self.reasoning_effort is not None and efforts and self.reasoning_effort not in efforts:
             raise ValueError("the configured reasoning effort is not supported by this route")
         if self.reasoning_effort_required and self.reasoning_effort is None:
             raise ValueError("a required reasoning effort needs a configured provider default")

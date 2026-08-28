@@ -45,6 +45,8 @@ def encode_chat_fixture(
     created_at: int,
     include_usage: bool,
     events_json: str,
+    ignored_parameters: list[str] = ...,
+    reasoning_content_carrier: str | None = ...,
 ) -> list[str]: ...
 def encode_responses_fixture(
     request_id: str,

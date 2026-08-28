@@ -245,6 +245,14 @@ class OpaqueReasoningContentBlock(ContractModel):
     kind: Literal["reasoning_content"] = "reasoning_content"
     route_sha256: Sha256
     content: str = Field(min_length=1, max_length=64_000_000)
+    carrier_size_bytes: int = Field(default=0, ge=0, exclude=True)
+    """Original authenticated carrier bytes counted by gateway admission.
+
+    Direct provider clients create plaintext blocks and leave this at zero. A
+    public gateway continuation sets it only after authenticated decryption so
+    request-size policy accounts for the complete caller-supplied envelope as
+    well as the hidden provider content.
+    """
 
 
 class AssistantAction(ContractModel):
@@ -262,6 +270,9 @@ class AssistantAction(ContractModel):
             raise ValueError("an assistant action accepts at most one reasoning-content carrier")
         if self.provider_reasoning and not self.tool_calls:
             raise ValueError("reasoning-content carriers require assistant tool calls")
+        call_ids = tuple(call.call_id for call in self.tool_calls)
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("assistant tool call IDs must be unique")
         return self
 
 

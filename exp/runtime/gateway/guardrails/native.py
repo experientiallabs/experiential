@@ -79,8 +79,12 @@ def parse_output_payload(data: JsonObject) -> GuardrailCompletion:
             arguments = item.get("arguments") or item.get("raw_arguments") or ""
             if isinstance(call_id, str) and isinstance(name, str) and isinstance(arguments, str):
                 calls.append(GuardrailToolCall(call_id=call_id, name=name, arguments=arguments))
+    reasoning_content = data.get("reasoning_content", "")
+    if not isinstance(reasoning_content, str):
+        raise ValueError("native reasoning_content must be text")
     return GuardrailCompletion(
         text=str(data.get("text") or ""),
+        reasoning_content=reasoning_content,
         refusal=bool(data.get("refusal")),
         tool_calls=tuple(calls),
     )

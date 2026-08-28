@@ -3,74 +3,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::encode::{compact_json, stable_public_id};
 use crate::errors::{Failure, PublicError};
 use crate::events::{CompletedToolCall, Event, Usage};
+pub use crate::responses_envelope::ResponsesEnvelope;
 
 fn invalid_provider_stream(message: &str) -> PublicError {
     PublicError::new(502, "invalid_provider_stream", message, "api_error")
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_tool_choice() -> Value {
-    Value::String("auto".to_string())
-}
-
-fn default_tools() -> Value {
-    Value::Array(Vec::new())
-}
-
-fn default_reasoning() -> Value {
-    json!({"effort": Value::Null, "summary": Value::Null})
-}
-
-/// Request-reflecting envelope fields built by the control plane from the
-/// canonical execution request, embedded verbatim in every response object.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ResponsesEnvelope {
-    #[serde(default)]
-    pub metadata: Value,
-    #[serde(default = "default_true")]
-    pub parallel_tool_calls: bool,
-    #[serde(default)]
-    pub temperature: Value,
-    #[serde(default)]
-    pub top_p: Value,
-    #[serde(default = "default_reasoning")]
-    pub reasoning: Value,
-    #[serde(default)]
-    pub ignored_parameters: Vec<String>,
-    #[serde(default = "default_tool_choice")]
-    pub tool_choice: Value,
-    #[serde(default = "default_tools")]
-    pub tools: Value,
-    #[serde(default)]
-    pub max_output_tokens: Value,
-    #[serde(default)]
-    pub previous_response_id: Value,
-}
-
-impl Default for ResponsesEnvelope {
-    fn default() -> Self {
-        Self {
-            metadata: Value::Null,
-            parallel_tool_calls: true,
-            temperature: Value::Null,
-            top_p: Value::Null,
-            reasoning: default_reasoning(),
-            ignored_parameters: Vec::new(),
-            tool_choice: default_tool_choice(),
-            tools: default_tools(),
-            max_output_tokens: Value::Null,
-            previous_response_id: Value::Null,
-        }
-    }
 }
 
 /// One accumulated Responses function call with stable item and output indices.
@@ -136,6 +77,7 @@ enum OutputSlot {
     Message,
     Tool(u32),
     Reasoning(u32),
+    FireworksReasoning,
 }
 
 /// Incremental Responses lifecycle encoder with one monotonic terminal event,
@@ -152,6 +94,9 @@ pub struct ResponsesSseEncoder {
     output_order: Vec<OutputSlot>,
     tools: HashMap<u32, ToolState>,
     reasoning: HashMap<u32, ReasoningState>,
+    fireworks_reasoning: Option<ReasoningState>,
+    fireworks_reasoning_route_sha256: Option<String>,
+    reasoning_content_carrier: Option<String>,
     message_output_index: Option<usize>,
     text: String,
     refusal: String,
@@ -179,6 +124,9 @@ impl ResponsesSseEncoder {
             output_order: Vec::new(),
             tools: HashMap::new(),
             reasoning: HashMap::new(),
+            fireworks_reasoning: None,
+            fireworks_reasoning_route_sha256: None,
+            reasoning_content_carrier: None,
             message_output_index: None,
             text: String::new(),
             refusal: String::new(),
@@ -232,9 +180,11 @@ impl ResponsesSseEncoder {
             // redacted payloads are dropped deliberately, since this surface
             // cannot round-trip them.
             Event::ThinkingDelta { index, delta } => self.reasoning_summary_delta(*index, 0, delta),
-            Event::ThinkingSignature { .. }
-            | Event::RedactedThinking { .. }
-            | Event::ReasoningContentDelta { .. } => Ok(Vec::new()),
+            Event::ThinkingSignature { .. } | Event::RedactedThinking { .. } => Ok(Vec::new()),
+            Event::ReasoningContentDelta {
+                route_sha256,
+                delta,
+            } => self.fireworks_reasoning(route_sha256, delta),
             Event::EncryptedReasoning {
                 output_index,
                 encrypted_content,
@@ -252,14 +202,25 @@ impl ResponsesSseEncoder {
                 }
                 Ok(Vec::new())
             }
-            Event::Completed => Ok(self.finish("completed", None)),
-            Event::Incomplete => Ok(self.finish("incomplete", None)),
-            Event::Failed(failure) => Ok(self.finish("failed", Some(failure))),
+            Event::Completed => self.finish("completed", None),
+            Event::Incomplete => self.finish("incomplete", None),
+            Event::Failed(failure) => self.finish("failed", Some(failure)),
         }
     }
 
     pub fn saw_terminal(&self) -> bool {
         self.terminal
+    }
+
+    /// Attach the authenticated Fireworks carrier before terminal encoding.
+    pub fn set_reasoning_content_carrier(&mut self, carrier: String) -> Result<(), PublicError> {
+        if carrier.is_empty() {
+            return Err(invalid_provider_stream(
+                "Responses reasoning carrier must not be empty.",
+            ));
+        }
+        self.reasoning_content_carrier = Some(carrier);
+        Ok(())
     }
 
     /// Start one output message/content part as needed and emit its delta.
@@ -388,6 +349,42 @@ impl ResponsesSseEncoder {
             .expect("reasoning state just ensured");
         state.encrypted_content = Some(encrypted_content.to_string());
         Ok(frames)
+    }
+
+    /// Open one opaque reasoning item without exposing provider plaintext.
+    fn fireworks_reasoning(
+        &mut self,
+        route_sha256: &str,
+        _delta: &str,
+    ) -> Result<Vec<String>, PublicError> {
+        if let Some(existing) = &self.fireworks_reasoning_route_sha256 {
+            if existing != route_sha256 {
+                return Err(invalid_provider_stream(
+                    "Responses Fireworks reasoning changed provider route.",
+                ));
+            }
+        } else {
+            self.fireworks_reasoning_route_sha256 = Some(route_sha256.to_string());
+        }
+        if self.fireworks_reasoning.is_some() {
+            return Ok(Vec::new());
+        }
+        let state = ReasoningState {
+            item_id: stable_public_id("rs", &format!("{}:fireworks", self.response_id)),
+            output_index: self.output_order.len(),
+            parts: BTreeMap::new(),
+            encrypted_content: None,
+        };
+        let frame = self.event(
+            "response.output_item.added",
+            json!({
+                "output_index": state.output_index,
+                "item": state.item(false),
+            }),
+        );
+        self.fireworks_reasoning = Some(state);
+        self.output_order.push(OutputSlot::FireworksReasoning);
+        Ok(vec![frame])
     }
 
     /// Start one reasoning item/summary part as needed and emit its text delta.
@@ -549,7 +546,24 @@ impl ResponsesSseEncoder {
     }
 
     /// Close open items and emit exactly one Responses terminal lifecycle event.
-    fn finish(&mut self, status: &str, failure: Option<&Failure>) -> Vec<String> {
+    fn finish(
+        &mut self,
+        status: &str,
+        failure: Option<&Failure>,
+    ) -> Result<Vec<String>, PublicError> {
+        if status == "completed" && !self.tools.is_empty() && self.fireworks_reasoning.is_some() {
+            let carrier = self.reasoning_content_carrier.clone().ok_or_else(|| {
+                invalid_provider_stream(
+                    "Responses Fireworks reasoning was not sealed by gateway authority.",
+                )
+            })?;
+            if self.envelope.include_encrypted_reasoning {
+                self.fireworks_reasoning
+                    .as_mut()
+                    .expect("Fireworks reasoning state is present")
+                    .encrypted_content = Some(carrier);
+            }
+        }
         let mut frames = Vec::new();
         for slot in self.output_order.clone() {
             match slot {
@@ -558,6 +572,9 @@ impl ResponsesSseEncoder {
                     frames.extend(self.close_tool(index));
                 }
                 OutputSlot::Reasoning(index) => frames.extend(self.close_reasoning(index)),
+                OutputSlot::FireworksReasoning => {
+                    frames.extend(self.close_fireworks_reasoning());
+                }
                 OutputSlot::Tool(_) => {}
             }
         }
@@ -568,7 +585,7 @@ impl ResponsesSseEncoder {
             json!({"response": self.response(status, failure)}),
         );
         frames.push(frame);
-        frames
+        Ok(frames)
     }
 
     /// Complete every summary part and its containing reasoning item.
@@ -611,6 +628,19 @@ impl ResponsesSseEncoder {
             json!({"output_index": output_index, "item": item}),
         ));
         frames
+    }
+
+    /// Complete the gateway-issued Fireworks reasoning item.
+    fn close_fireworks_reasoning(&mut self) -> Vec<String> {
+        let Some(state) = self.fireworks_reasoning.as_ref() else {
+            return Vec::new();
+        };
+        let output_index = state.output_index;
+        let item = state.item(true);
+        vec![self.event(
+            "response.output_item.done",
+            json!({"output_index": output_index, "item": item}),
+        )]
     }
 
     /// Emit content and output completion for the one assistant message.
@@ -706,6 +736,11 @@ impl ResponsesSseEncoder {
                 OutputSlot::Message => self.message_item(completed),
                 OutputSlot::Tool(index) => self.tools[index].item(completed),
                 OutputSlot::Reasoning(index) => self.reasoning[index].item(completed),
+                OutputSlot::FireworksReasoning => self
+                    .fireworks_reasoning
+                    .as_ref()
+                    .expect("Fireworks output slot has state")
+                    .item(completed),
             })
             .collect();
         let error = if status == "failed" {
@@ -810,6 +845,18 @@ pub fn completed_responses_body(
     envelope: ResponsesEnvelope,
     events: &[Event],
 ) -> Result<AggregatedResponses, PublicError> {
+    completed_responses_body_with_carrier(request_id, model, created_at, envelope, events, None)
+}
+
+/// Build a non-streaming Responses result with one authenticated Fireworks carrier.
+pub fn completed_responses_body_with_carrier(
+    request_id: &str,
+    model: &str,
+    created_at: f64,
+    envelope: ResponsesEnvelope,
+    events: &[Event],
+    reasoning_content_carrier: Option<&str>,
+) -> Result<AggregatedResponses, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
         Some(event) => event,
@@ -868,6 +915,9 @@ pub fn completed_responses_body(
         });
     }
     let mut encoder = ResponsesSseEncoder::new(request_id, model, created_at, envelope);
+    if let Some(carrier) = reasoning_content_carrier {
+        encoder.set_reasoning_content_carrier(carrier.to_string())?;
+    }
     encoder.start()?;
     let mut terminal_frames: Vec<String> = Vec::new();
     for event in events {

@@ -60,14 +60,33 @@ def _resolved_wire_profile(
         )
         reasoning_effort = gateway_capabilities.reasoning_default_effort or profile.reasoning_effort
         if profile.fireworks_reasoning_route_sha256 is not None:
-            exact_efforts = fireworks_reasoning_efforts(
-                profile.model_id or runtime_model.snapshot.model_id,
-                explicit_efforts=supported_reasoning_efforts or None,
+            model_id = profile.model_id or runtime_model.snapshot.model_id
+            exact_efforts = fireworks_reasoning_efforts(model_id)
+            constraints = tuple(
+                constraint
+                for constraint in (
+                    profile.supported_reasoning_efforts,
+                    gateway_capabilities.supported_reasoning_efforts or None,
+                )
+                if constraint is not None
             )
+            for constraint in constraints:
+                normalized = fireworks_reasoning_efforts(
+                    model_id,
+                    explicit_efforts=constraint,
+                )
+                if exact_efforts is not None and normalized is not None:
+                    exact_efforts = tuple(
+                        effort for effort in exact_efforts if effort in normalized
+                    )
             if exact_efforts is not None:
+                if constraints and not exact_efforts:
+                    raise GatewayWireContractError(
+                        "catalog and provider reasoning efforts have no exact intersection"
+                    )
                 supported_reasoning_efforts = exact_efforts
             reasoning_effort = normalized_fireworks_default(
-                profile.model_id or runtime_model.snapshot.model_id,
+                model_id,
                 reasoning_effort,
             )
         return replace(

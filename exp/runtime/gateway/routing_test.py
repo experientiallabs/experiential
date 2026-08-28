@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING, cast
+
+import pytest
 
 from exp.common.models.catalog import (
     GatewayDeploymentMetadata,
@@ -15,7 +18,20 @@ from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
 )
 from exp.common.models.model import ModelCapabilities
-from exp.runtime.gateway.routing import CatalogRouteResolver
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayApiSurface,
+    ProjectTarget,
+)
+from exp.runtime.gateway.interfaces import ProjectTargetResolver
+from exp.runtime.gateway.routing import (
+    CatalogRouteResolver,
+    GatewayRoutingError,
+    RouterProjectTargetResolver,
+)
+
+if TYPE_CHECKING:
+    from exp.runtime.router.runtime import RouterRuntime
 
 _REVISION = "revision-one"
 
@@ -228,3 +244,87 @@ def test_published_metadata_stays_closed_when_the_revision_has_no_direct_pool() 
         )
         is None
     )
+
+
+def _project_authorization(digest: str) -> AuthorizationSnapshot:
+    """Build one frozen hosted-project authority for replay tests."""
+    return AuthorizationSnapshot(
+        request_id="request-one",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        virtual_key_id="key-one",
+        alias="coding",
+        alias_revision_id=_REVISION,
+        target=ProjectTarget(
+            project_ref="project-one",
+            activation_ref="activation-one",
+            catalog_sha256=digest,
+        ),
+        surface=GatewayApiSurface.RESPONSES,
+        catalog_sha256=digest,
+        canonical_request_sha256="d" * 64,
+        deadline_monotonic=10.0,
+    )
+
+
+def test_hosted_project_resolver_authorizes_exact_candidate_deployment_hint() -> None:
+    """Built-in project replay accepts only a candidate of the frozen activation."""
+    deployment = _deployment(deployment_id="deployment-one", source_alias="candidate-one")
+    catalog, digest = _catalog(
+        (deployment,),
+        (
+            ExactModelPool(
+                pool_id="pool-one",
+                exact_model_id="exact-one",
+                deployment_ids=(deployment.deployment_id,),
+            ),
+        ),
+    )
+    project = RouterProjectTargetResolver(
+        {("project-one", "activation-one", digest): cast("RouterRuntime", object())},
+        {
+            ("project-one", "activation-one", digest, "candidate-one"): "exact-one",
+        },
+    )
+    resolver = CatalogRouteResolver(
+        {(_REVISION, digest): catalog},
+        project_resolver=project,
+    )
+
+    route = resolver.resolve_deployment_hint(
+        _project_authorization(digest),
+        deployment.deployment_id,
+    )
+
+    assert route.deployment == deployment
+    assert route.route_reason == "reasoning_continuation"
+    with pytest.raises(GatewayRoutingError, match="not a project activation candidate"):
+        project.authorize_deployment_hint(
+            target=cast("ProjectTarget", _project_authorization(digest).target),
+            deployment=deployment.model_copy(update={"source_alias": "not-a-candidate"}),
+        )
+
+
+def test_project_deployment_hint_fails_closed_for_third_party_resolver_without_seam() -> None:
+    """A legacy third-party selector cannot bypass project candidate membership."""
+    deployment = _deployment(deployment_id="deployment-one", source_alias="candidate-one")
+    catalog, digest = _catalog(
+        (deployment,),
+        (
+            ExactModelPool(
+                pool_id="pool-one",
+                exact_model_id="exact-one",
+                deployment_ids=(deployment.deployment_id,),
+            ),
+        ),
+    )
+    resolver = CatalogRouteResolver(
+        {(_REVISION, digest): catalog},
+        project_resolver=cast("ProjectTargetResolver", object()),
+    )
+
+    with pytest.raises(GatewayRoutingError, match="cannot authenticate"):
+        resolver.resolve_deployment_hint(
+            _project_authorization(digest),
+            deployment.deployment_id,
+        )

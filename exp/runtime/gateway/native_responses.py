@@ -22,6 +22,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.reasoning_carrier import parse_reasoning_content_carrier
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
     ContinuationState,
@@ -157,10 +158,17 @@ def remember_turn(
     )
     if not text and not tool_calls:
         return
+    carrier = data.get("reasoning_content_carrier")
+    provider_reasoning = ()
+    if carrier is not None:
+        if not isinstance(carrier, str):
+            raise ValueError("Responses reasoning carrier must be text")
+        provider_reasoning = (parse_reasoning_content_carrier(carrier),)
     message = GatewayMessage(
         role="assistant",
         content=text or None,
         tool_calls=tool_calls,
+        provider_reasoning=provider_reasoning,
     )
     continuations.remember_now(
         namespace=context.namespace,
@@ -208,4 +216,5 @@ def responses_envelope(request: GatewayRequest) -> JsonObject:
         ],
         "max_output_tokens": request.maximum_output_tokens,
         "previous_response_id": request.previous_response_id,
+        "include_encrypted_reasoning": request.include_encrypted_reasoning,
     }

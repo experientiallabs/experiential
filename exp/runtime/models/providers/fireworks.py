@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Sequence
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import Sha256, sha256_json
@@ -12,14 +13,14 @@ from exp.common.models import (
     OpaqueReasoningContentBlock,
     ReasoningEffort,
 )
-from exp.runtime.gateway.contracts import GatewayMessage
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
 
-FIREWORKS_REASONING_CONTENT_PREFIX = "x-experiential-fireworks-reasoning-v1:"
-"""Opaque public carrier prefix for a route-bound Fireworks reasoning payload."""
+if TYPE_CHECKING:
+    from exp.runtime.models.providers.base import GatewayWireProfile
 
 _FIREWORKS_REASONING_EFFORTS: dict[str, tuple[ReasoningEffort, ...]] = {
     "deepseek-v4-flash-0731": ("none", "high", "max"),
@@ -36,6 +37,28 @@ _EFFORT_ORDER: tuple[ReasoningEffort, ...] = (
     "ultra",
     "max",
 )
+
+
+def require_responses_continuation_channel(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> None:
+    """Reject Fireworks Responses when neither continuation channel is available."""
+    if (
+        request.surface == GatewayApiSurface.RESPONSES
+        and request.response_store is False
+        and not request.include_encrypted_reasoning
+        and any(profile.fireworks_reasoning_route_sha256 is not None for profile in profiles)
+    ):
+        raise ProviderParameterError(
+            message=(
+                "Fireworks Responses tool continuations require either gateway storage or "
+                "include=['reasoning.encrypted_content']. Enable one continuation channel or "
+                "choose another provider route."
+            ),
+            param="include",
+            code="unsupported_parameter",
+        )
 
 
 def is_fireworks_base_url(base_url: str) -> bool:
@@ -66,35 +89,6 @@ def reasoning_content_route_sha256(model: ModelSnapshot) -> Sha256:
     )
 
 
-def encode_reasoning_content(block: OpaqueReasoningContentBlock) -> str:
-    """Encode one provider payload as a deterministic caller-opaque Chat string."""
-    return f"{FIREWORKS_REASONING_CONTENT_PREFIX}{block.route_sha256}:{block.content}"
-
-
-def decode_reasoning_content(value: str) -> OpaqueReasoningContentBlock:
-    """Decode and validate one caller-opaque Fireworks Chat carrier.
-
-    Args:
-        value: Exact ``reasoning_content`` string echoed by the caller.
-
-    Returns:
-        The route-bound provider payload.
-
-    Raises:
-        ValueError: The string is not a complete gateway-issued carrier.
-    """
-    if not value.startswith(FIREWORKS_REASONING_CONTENT_PREFIX):
-        raise ValueError("reasoning_content is not a gateway-issued Fireworks carrier")
-    encoded = value.removeprefix(FIREWORKS_REASONING_CONTENT_PREFIX)
-    route_sha256, separator, content = encoded.partition(":")
-    if not separator or not content:
-        raise ValueError("reasoning_content is not a complete Fireworks carrier")
-    try:
-        return OpaqueReasoningContentBlock(route_sha256=route_sha256, content=content)
-    except ValueError as exc:
-        raise ValueError("reasoning_content has invalid Fireworks carrier identity") from exc
-
-
 def fireworks_reasoning_efforts(
     model_id: str,
     *,
@@ -112,9 +106,12 @@ def fireworks_reasoning_efforts(
         return None
     if explicit_efforts is None:
         return supported
-    return tuple(
-        effort for effort in _EFFORT_ORDER if effort in supported and effort in explicit_efforts
-    )
+    normalized = {
+        normalized_effort
+        for effort in explicit_efforts
+        if (normalized_effort := normalized_fireworks_default(model_id, effort)) is not None
+    }
+    return tuple(effort for effort in _EFFORT_ORDER if effort in supported and effort in normalized)
 
 
 def fireworks_reasoning_effort(model_id: str, effort: str) -> str:
@@ -280,6 +277,8 @@ def _require_active_model_carrier(
 def _require_complete_gateway_tool_results(messages: Sequence[GatewayMessage]) -> None:
     """Require every active assistant call to receive a result before continuation."""
     pending: set[str] = set()
+    active_call_ids: set[str] = set()
+    completed_call_ids: set[str] = set()
     for message in messages:
         if message.role == "assistant":
             if pending:
@@ -287,9 +286,21 @@ def _require_complete_gateway_tool_results(messages: Sequence[GatewayMessage]) -
                     "Fireworks reasoning_content tool calls need complete tool results."
                 )
             if any(block.kind == "reasoning_content" for block in message.provider_reasoning):
-                pending = {call.call_id for call in message.tool_calls}
-        elif message.role == "tool" and message.tool_call_id in pending:
-            pending.remove(message.tool_call_id)
+                call_ids = tuple(call.call_id for call in message.tool_calls)
+                if len(call_ids) != len(set(call_ids)) or active_call_ids.intersection(call_ids):
+                    raise _reasoning_parameter_error(
+                        "Fireworks reasoning_content tool-call IDs must be unique."
+                    )
+                pending = set(call_ids)
+                active_call_ids.update(call_ids)
+        elif message.role == "tool" and active_call_ids:
+            call_id = message.tool_call_id
+            if call_id not in active_call_ids or call_id in completed_call_ids:
+                raise _reasoning_parameter_error(
+                    "Fireworks reasoning_content requires exactly one result per tool call."
+                )
+            pending.remove(call_id)
+            completed_call_ids.add(call_id)
     if pending or messages[-1].role != "tool":
         raise _reasoning_parameter_error(
             "Fireworks reasoning_content can replay only in a completed tool continuation."
@@ -299,6 +310,8 @@ def _require_complete_gateway_tool_results(messages: Sequence[GatewayMessage]) -
 def _require_complete_model_tool_results(messages: Sequence[ModelMessage]) -> None:
     """Require complete direct-client tool results after every active carrier."""
     pending: set[str] = set()
+    active_call_ids: set[str] = set()
+    completed_call_ids: set[str] = set()
     for message in messages:
         action = message.assistant_action
         if message.role == "assistant":
@@ -307,9 +320,21 @@ def _require_complete_model_tool_results(messages: Sequence[ModelMessage]) -> No
                     "Fireworks reasoning_content tool calls need complete tool results."
                 )
             if action is not None and action.provider_reasoning:
-                pending = {call.call_id for call in action.tool_calls}
-        elif message.role == "tool" and message.tool_call_id in pending:
-            pending.remove(message.tool_call_id)
+                call_ids = tuple(call.call_id for call in action.tool_calls)
+                if len(call_ids) != len(set(call_ids)) or active_call_ids.intersection(call_ids):
+                    raise _reasoning_parameter_error(
+                        "Fireworks reasoning_content tool-call IDs must be unique."
+                    )
+                pending = set(call_ids)
+                active_call_ids.update(call_ids)
+        elif message.role == "tool" and active_call_ids:
+            call_id = message.tool_call_id
+            if call_id not in active_call_ids or call_id in completed_call_ids:
+                raise _reasoning_parameter_error(
+                    "Fireworks reasoning_content requires exactly one result per tool call."
+                )
+            pending.remove(call_id)
+            completed_call_ids.add(call_id)
     if pending or messages[-1].role != "tool":
         raise _reasoning_parameter_error(
             "Fireworks reasoning_content can replay only in a completed tool continuation."

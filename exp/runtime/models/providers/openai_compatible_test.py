@@ -346,3 +346,30 @@ def test_openai_compatible_refusal_is_typed_without_exposing_content() -> None:
 
     assert error.value.signal is ProviderRefusalSignal.CONTENT_POLICY
     assert canary not in str(error.value)
+
+
+def test_non_streaming_reasoning_content_rejects_malformed_provider_type() -> None:
+    """Buffered conversion matches native streaming's text-only reasoning contract."""
+    with pytest.raises(OpenAICompatibleResponseError, match="reasoning_content must be text"):
+        openai_compatible_response(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": None,
+                            "reasoning_content": {"forged": "value"},
+                            "tool_calls": [
+                                {
+                                    "id": "call-one",
+                                    "function": {"name": "lookup", "arguments": "{}"},
+                                }
+                            ],
+                        },
+                    }
+                ]
+            },
+            configured_model=_snapshot(provider="fireworks"),
+            latency_seconds=0.1,
+            fireworks_reasoning_route_sha256="a" * 64,
+        )

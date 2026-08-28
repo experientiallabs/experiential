@@ -57,6 +57,85 @@ fn thinking_deltas_project_onto_reasoning_summary_parts() {
         .is_empty());
 }
 
+fn fireworks_tool_events() -> Vec<Event> {
+    vec![
+        Event::ReasoningContentDelta {
+            route_sha256: "a".repeat(64),
+            delta: "hidden provider reasoning".to_string(),
+        },
+        Event::ToolCallStarted {
+            index: 0,
+            call_id: "call-one".to_string(),
+            name: "weather".to_string(),
+        },
+        Event::ToolArgumentsDelta {
+            index: 0,
+            delta: "{}".to_string(),
+        },
+        Event::ToolCallCompleted {
+            index: 0,
+            call: CompletedToolCall {
+                call_id: "call-one".to_string(),
+                name: "weather".to_string(),
+                raw_arguments: "{}".to_string(),
+            },
+        },
+        Event::Completed,
+    ]
+}
+
+#[test]
+fn fireworks_reasoning_round_trips_as_encrypted_content() {
+    let events = fireworks_tool_events();
+    let envelope = ResponsesEnvelope {
+        include_encrypted_reasoning: true,
+        ..ResponsesEnvelope::default()
+    };
+    let mut encoder =
+        ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000.0, envelope.clone());
+    encoder.start().expect("stream start must encode");
+    encoder
+        .set_reasoning_content_carrier("authenticated-carrier-v2".to_string())
+        .expect("carrier must attach");
+    let mut frames = Vec::new();
+    for event in &events {
+        frames.extend(encoder.feed(event).expect("Responses event must encode"));
+    }
+    let public = frames.join("");
+    assert!(!public.contains("hidden provider reasoning"));
+    assert!(public.contains("\"encrypted_content\":\"authenticated-carrier-v2\""));
+
+    let completed = completed_responses_body_with_carrier(
+        "request-1",
+        "coding",
+        1_700_000_000.0,
+        envelope,
+        &events,
+        Some("authenticated-carrier-v2"),
+    )
+    .expect("completed body must preserve carrier");
+    assert_eq!(
+        completed.body["output"][0]["encrypted_content"],
+        json!("authenticated-carrier-v2")
+    );
+    assert!(!completed
+        .body
+        .to_string()
+        .contains("hidden provider reasoning"));
+}
+
+#[test]
+fn fireworks_reasoning_fails_closed_without_a_sealed_carrier() {
+    assert!(completed_responses_body(
+        "request-1",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+        &fireworks_tool_events(),
+    )
+    .is_err());
+}
+
 #[test]
 fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
     let completed = completed_responses_body(

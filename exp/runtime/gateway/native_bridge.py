@@ -75,6 +75,10 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_observability import NativeObservabilityMixin
+from exp.runtime.gateway.native_reasoning import (
+    has_active_reasoning_content,
+    unseal_reasoning_history,
+)
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continued_request,
@@ -83,6 +87,12 @@ from exp.runtime.gateway.native_responses import (
 )
 from exp.runtime.gateway.native_settlement import (
     optional_text,
+)
+from exp.runtime.gateway.reasoning_carrier import (
+    ReasoningCarrierAuthority,
+    parse_reasoning_carrier_tool_calls,
+    reasoning_carrier_authority,
+    seal_reasoning_content,
 )
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers import (
@@ -103,7 +113,11 @@ from exp.runtime.models.providers.streaming_requests import (
     dialect_stream_payload,
     route_generation_parameter_requests,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
+from exp.runtime.openai_protocol.errors import (
+    OpenAIProtocolError,
+    invalid_field,
+    public_failure_error,
+)
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -305,6 +319,20 @@ class NativeControlPlane(NativeObservabilityMixin):
             except OpenAIProtocolError as exc:
                 raise NativeBridgeError(exc) from exc
 
+        pinned_reasoning_route: GatewayRoute | None = None
+        try:
+            request, pinned_reasoning_route = unseal_reasoning_history(
+                self._components,
+                authorization,
+                request,
+            )
+        except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
+            error = invalid_field(
+                "messages.reasoning_content",
+                "'messages.reasoning_content' must be an authentic continuation for this route.",
+            )
+            raise NativeBridgeError(error) from exc
+
         policy = None
         try:
             request, policy = enforce_native_input(
@@ -315,6 +343,8 @@ class NativeControlPlane(NativeObservabilityMixin):
             )
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
+        if pinned_reasoning_route is not None and not has_active_reasoning_content(request):
+            pinned_reasoning_route = None
 
         # The ledger accepts the logical request before route selection, so a
         # keyed operation whose durable terminal already exists (or whose key
@@ -334,7 +364,7 @@ class NativeControlPlane(NativeObservabilityMixin):
         route: GatewayRoute | None = None
         resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
         try:
-            route = self._resolve_route(
+            route = pinned_reasoning_route or self._resolve_route(
                 authorization,
                 request,
                 continuation=continuation_context,
@@ -428,6 +458,7 @@ class NativeControlPlane(NativeObservabilityMixin):
             wire_route: list[JsonObject] = []
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
+            carrier_authorities: list[ReasoningCarrierAuthority | None] = []
             for deployment, (profile, client) in zip(
                 route.deployments, resolved_wires, strict=True
             ):
@@ -455,6 +486,15 @@ class NativeControlPlane(NativeObservabilityMixin):
                     else FrozenDispatchBinding(
                         url=profile.url,
                         body_sha256=sha256_bytes(upstream_body.encode("utf-8")),
+                    )
+                )
+                carrier_authorities.append(
+                    reasoning_carrier_authority(
+                        authorization=authorization,
+                        exact_model_id=route.snapshot.exact_model_id,
+                        pool_id=route.snapshot.pool_id,
+                        deployment=deployment,
+                        profile=profile,
                     )
                 )
         except ProviderParameterError as exc:
@@ -487,6 +527,7 @@ class NativeControlPlane(NativeObservabilityMixin):
                 policy=policy,
                 signers=tuple(signers),
                 dispatch_bindings=tuple(dispatch_bindings),
+                reasoning_carrier_authorities=tuple(carrier_authorities),
             )
         )
         response: JsonObject = {
@@ -628,6 +669,60 @@ class NativeControlPlane(NativeObservabilityMixin):
             argument,
             deadline_monotonic=deadline,
         )
+
+    def seal_reasoning_content(self, argument: str) -> str:
+        """Seal one winning Fireworks turn before terminal settlement."""
+        try:
+            data = json.loads(argument)
+            if not isinstance(data, dict):
+                raise ValueError("reasoning carrier argument must be an object")
+            request_id = data.get("request_id")
+            route_depth = data.get("route_depth")
+            assistant_content = data.get("assistant_content")
+            raw_tool_calls = data.get("tool_calls")
+            route_sha256 = data.get("route_sha256")
+            content = data.get("content")
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or isinstance(route_depth, bool)
+                or not isinstance(route_depth, int)
+                or (assistant_content is not None and not isinstance(assistant_content, str))
+                or not isinstance(route_sha256, str)
+                or not isinstance(content, str)
+            ):
+                raise ValueError("reasoning carrier argument has invalid field types")
+            tool_calls = parse_reasoning_carrier_tool_calls(raw_tool_calls)
+            entry = self._accounting.entry(request_id)
+            if (
+                entry is None
+                or entry.active_attempt_id is None
+                or entry.attempt_depths.get(entry.active_attempt_id) != route_depth
+                or route_depth < 0
+                or route_depth >= len(entry.reasoning_carrier_authorities)
+            ):
+                raise ValueError("reasoning carrier attempt is not active")
+            authority = entry.reasoning_carrier_authorities[route_depth]
+            if authority is None or authority.reasoning_route_sha256 != route_sha256:
+                raise ValueError("reasoning carrier route differs from the active attempt")
+            carrier = seal_reasoning_content(
+                authority,
+                issuing_request_id=request_id,
+                issuing_route_depth=route_depth,
+                assistant_content=assistant_content,
+                tool_calls=tool_calls,
+                content=content,
+            )
+        except Exception as exc:  # noqa: BLE001 - never disclose authority or content.
+            raise NativeBridgeError(
+                public_failure_error(
+                    GatewayFailure(
+                        failure_class=GatewayFailureClass.MALFORMED_RESPONSE,
+                        safe_message="the provider returned malformed reasoning continuation data",
+                    )
+                )
+            ) from exc
+        return json.dumps({"carrier": carrier}, separators=(",", ":"))
 
     def claim_scope(self, argument: str) -> str:
         """Resolve the replay-store scope for one keyed request.

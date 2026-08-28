@@ -253,6 +253,22 @@ def test_fireworks_history_narrows_waterfall_to_the_exact_issuing_route(
     assert raised.value.param == "messages.reasoning_content"
 
 
+def test_fireworks_gateway_history_rejects_duplicate_active_tool_results() -> None:
+    """Gateway dispatch requires exactly one result for the carrier's active call."""
+    request = _fireworks_history_request(_FIREWORKS_ROUTE)
+    duplicate = request.model_copy(
+        update={
+            "messages": (
+                *request.messages,
+                GatewayMessage(role="tool", content="duplicate", tool_call_id="call-one"),
+            )
+        }
+    )
+
+    with pytest.raises(ProviderParameterError, match="exactly one result"):
+        dialect_stream_payload(_fireworks_profile(_FIREWORKS_MODELS[0]), duplicate)
+
+
 def test_fireworks_history_before_the_last_user_is_removed_from_every_wire() -> None:
     """A completed older turn cannot leak reasoning into a new provider selection."""
     active = _fireworks_history_request(_FIREWORKS_ROUTE)
@@ -624,6 +640,91 @@ def test_explicit_provider_effort_set_accepts_exact_values_and_rejects_others() 
             _chat_request().model_copy(update={"reasoning_effort": "medium"}),
         )
     assert "Supported values: 'low', 'high', 'max'." in str(raised.value)
+
+
+def test_fireworks_waterfall_rejects_disjoint_exact_effort_authority() -> None:
+    """One unsupported fallback prevents a caller effort from entering the waterfall."""
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://api.fireworks.ai/inference/v1/chat/completions",
+            model_id="accounts/fireworks/models/deepseek-v4-flash-0731",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning_effort",
+            supported_reasoning_efforts=("high",),
+            fireworks_reasoning_route_sha256="a" * 64,
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://api.fireworks.ai/inference/v1/chat/completions",
+            model_id="accounts/fireworks/models/kimi-k2p7-code",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning_effort",
+            supported_reasoning_efforts=("low",),
+            fireworks_reasoning_route_sha256="b" * 64,
+        ),
+    )
+
+    with pytest.raises(UnsupportedReasoningEffortError):
+        route_generation_parameter_requests(
+            profiles,
+            _chat_request().model_copy(update={"reasoning_effort": "high"}),
+        )
+
+
+def test_explicit_empty_fireworks_efforts_fail_closed() -> None:
+    """An empty provider/catalog intersection cannot recover built-in Kimi efforts."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        model_id="accounts/fireworks/models/kimi-k2p7-code",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=(),
+        fireworks_reasoning_route_sha256="a" * 64,
+    )
+
+    with pytest.raises(UnsupportedReasoningEffortError):
+        route_generation_parameter_requests(
+            (profile,),
+            _chat_request().model_copy(update={"reasoning_effort": "high"}),
+        )
+
+
+def test_responses_requires_a_fireworks_continuation_channel() -> None:
+    """Store-disabled Responses excludes Fireworks unless the carrier is public."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        model_id="accounts/fireworks/models/deepseek-v4-flash-0731",
+        fireworks_reasoning_route_sha256="a" * 64,
+    )
+    request = _chat_request().model_copy(
+        update={
+            "surface": GatewayApiSurface.RESPONSES,
+            "response_store": False,
+        }
+    )
+
+    with pytest.raises(ProviderParameterError, match="continuation"):
+        route_generation_parameter_requests((profile,), request)
+
+    generic = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://compatible.example/v1/chat/completions",
+        model_id="compatible-model",
+    )
+    assert compatible_generation_parameter_profile_indexes((profile, generic), request) == (1,)
+
+    public_carrier = request.model_copy(update={"include_encrypted_reasoning": True})
+    route_generation_parameter_requests((profile,), public_carrier)
+    assert dialect_stream_payload(profile, public_carrier)["stream"] is True
+
+    with pytest.raises(ProviderParameterError, match="not supported by every deployment"):
+        route_generation_parameter_requests((generic,), public_carrier)
+
+    stored = request.model_copy(update={"response_store": True})
+    route_generation_parameter_requests((profile,), stored)
 
 
 def test_explicit_effort_authority_is_preserved_during_wire_translation() -> None:

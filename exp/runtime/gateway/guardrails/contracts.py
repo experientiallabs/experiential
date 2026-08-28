@@ -135,13 +135,18 @@ class GuardrailCompletion(ContractModel):
     """Winning normalized completion inspected once before any caller delivery."""
 
     text: str = ""
+    reasoning_content: str = ""
     refusal: bool = False
     tool_calls: tuple[GuardrailToolCall, ...] = ()
 
     def content_bytes(self) -> int:
         """Return UTF-8 size of text, refusal flag, and raw tool arguments."""
         tool_bytes = sum(len(call.arguments.encode("utf-8")) for call in self.tool_calls)
-        return len(self.text.encode("utf-8")) + tool_bytes
+        return (
+            len(self.text.encode("utf-8"))
+            + len(self.reasoning_content.encode("utf-8"))
+            + tool_bytes
+        )
 
 
 class ClassifierVerdict(ContractModel):
@@ -182,7 +187,33 @@ def request_content_bytes(request: GatewayRequest) -> int:
     Returns:
         Byte count of the compact UTF-8 JSON subject.
     """
-    return len(canonical_json_bytes(request))
+    carrier_bytes = sum(
+        block.carrier_size_bytes
+        if block.kind == "reasoning_content"
+        else len(block.carrier.encode("ascii"))
+        if block.kind == "sealed_reasoning_content"
+        else 0
+        for message in request.messages
+        for block in message.provider_reasoning
+    )
+    return len(canonical_json_bytes(guardrail_request_subject(request))) + carrier_bytes
+
+
+def guardrail_request_subject(request: GatewayRequest) -> JsonObject:
+    """Return the classifier subject including authenticated hidden reasoning."""
+    subject = request.model_dump(mode="json", by_alias=True, exclude_none=False)
+    messages: list[JsonObject] = []
+    for message in request.messages:
+        item = message.model_dump(mode="json", by_alias=True, exclude_none=False)
+        if message.provider_reasoning:
+            item["provider_reasoning"] = [
+                block.model_dump(mode="json", by_alias=True, exclude_none=False)
+                for block in message.provider_reasoning
+                if block.kind != "sealed_reasoning_content"
+            ]
+        messages.append(item)
+    subject["messages"] = messages
+    return subject
 
 
 def guardrail_failure(*, action: GuardrailAction, check_id: str | None = None) -> GatewayFailure:

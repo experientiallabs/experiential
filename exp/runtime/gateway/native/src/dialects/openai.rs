@@ -473,6 +473,31 @@ mod tests {
     }
 
     #[test]
+    fn compatible_fireworks_reasoning_content_rejects_non_text_values() {
+        let frame = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"reasoning_content": {"forged": "value"}},
+                    "finish_reason": null,
+                }]
+            })
+            .to_string(),
+        };
+        let mut normalizer = Normalizer::new_with_reasoning_content_route(
+            Dialect::OpenAiCompatible,
+            Some("a".repeat(64)),
+        );
+
+        let failure = normalizer
+            .feed(&frame)
+            .expect_err("malformed reasoning content must fail closed");
+
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    }
+
+    #[test]
     fn responses_reasoning_summary_is_normalized_and_verified() {
         let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
         let delta = SseEvent {

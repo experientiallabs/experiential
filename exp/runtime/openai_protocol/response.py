@@ -6,7 +6,7 @@ import json
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import AssistantAction, OpaqueReasoningContentBlock
+from exp.common.models import OpaqueReasoningContentBlock
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
@@ -15,7 +15,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
-from exp.runtime.models.providers.fireworks import encode_reasoning_content
+from exp.runtime.gateway.reasoning_carrier import parse_reasoning_content_carrier
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.streaming import (
     ResponsesSseEncoder,
@@ -39,6 +39,7 @@ def completed_body(
     model: str,
     created_at: float,
     events: tuple[GatewayEvent, ...],
+    reasoning_content_carrier: str | None = None,
 ) -> JsonObject:
     """Build one non-streaming public result from bounded normalized events.
 
@@ -52,6 +53,8 @@ def completed_body(
             created_at=created_at,
             request=request,
         )
+        if reasoning_content_carrier is not None:
+            encoder.set_reasoning_content_carrier(reasoning_content_carrier)
         encoder.start()
         frames: tuple[str, ...] = ()
         for event in events:
@@ -95,7 +98,14 @@ def completed_body(
     }
     reasoning_content = _reasoning_content_block(events)
     if reasoning_content is not None and tool_calls and terminal.kind == GatewayEventKind.COMPLETED:
-        message["reasoning_content"] = encode_reasoning_content(reasoning_content)
+        if reasoning_content_carrier is None:
+            raise OpenAIProtocolError(
+                status_code=502,
+                code="invalid_provider_stream",
+                message="Chat reasoning content was not sealed by the gateway authority.",
+                error_type="api_error",
+            )
+        message["reasoning_content"] = reasoning_content_carrier
     usage = next(
         (
             event.usage
@@ -156,7 +166,11 @@ def _ignored_parameters_extension(request: GatewayRequest) -> JsonObject:
     return {"x-experiential-ignored-parameters": list(request.ignored_parameters)}
 
 
-def assistant_message(events: tuple[GatewayEvent, ...]) -> GatewayMessage | None:
+def assistant_message(
+    events: tuple[GatewayEvent, ...],
+    *,
+    reasoning_content_carrier: str | None = None,
+) -> GatewayMessage | None:
     """Build continuation history without converting typed refusals into assistant text."""
     if any(event.kind == GatewayEventKind.REFUSAL_DELTA for event in events):
         return None
@@ -170,25 +184,27 @@ def assistant_message(events: tuple[GatewayEvent, ...]) -> GatewayMessage | None
     )
     terminal = next((event for event in reversed(events) if is_terminal(event)), None)
     reasoning_content = _reasoning_content_block(events)
-    provider_reasoning = (
-        (reasoning_content,)
-        if reasoning_content is not None
+    provider_reasoning = ()
+    if (
+        reasoning_content is not None
         and tool_calls
         and terminal is not None
         and terminal.kind == GatewayEventKind.COMPLETED
-        else ()
-    )
+    ):
+        if reasoning_content_carrier is None:
+            raise OpenAIProtocolError(
+                status_code=502,
+                code="invalid_provider_stream",
+                message="Responses reasoning content was not sealed by gateway authority.",
+                error_type="api_error",
+            )
+        provider_reasoning = (parse_reasoning_content_carrier(reasoning_content_carrier),)
     if not text and not tool_calls:
         return None
-    action = AssistantAction(
-        content=text or None,
-        tool_calls=tool_calls,
-        provider_reasoning=provider_reasoning,
-    )
     return GatewayMessage(
         role="assistant",
-        content=action.content,
-        tool_calls=action.tool_calls,
+        content=text or None,
+        tool_calls=tool_calls,
         provider_reasoning=provider_reasoning,
     )
 

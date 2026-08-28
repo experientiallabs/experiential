@@ -19,19 +19,22 @@ use crate::admission::{
     acquire_permit, apply_output_guardrail, commit_dependent, commit_independent, new_guard,
     wire_drift_response, Admission,
 };
-use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
-use crate::encode::compact_json;
-use crate::encode_responses::{completed_responses_body, ResponsesSseEncoder};
+use crate::encode::{compact_json, reasoning_carrier_candidate};
+use crate::encode_responses::{
+    completed_responses_body, completed_responses_body_with_carrier, ResponsesSseEncoder,
+};
 use crate::errors::{Failure, FailureClass, PublicError};
-use crate::events::{CompletedToolCall, Event, Usage};
+use crate::events::{Event, Usage};
 use crate::metrics::{classify_escalation, METRICS};
-use crate::relay::{collect_committed, collection_public_error, event_retained_bytes, track_event};
+use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, capture_frame, complete_visible_refusal, error_response,
     escalation_error, finish_stream_terminal, json_response, latin1_header, read_body,
     send_bounded, settle_stream_end, sse_body_response,
 };
+use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
+use crate::route_responses_carrier::{remember_continuation, ResponsesRetention};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::waterfall::{acquire_attempt, CommittedAttempt, SettledAttempt, WaterfallContext, Won};
@@ -263,81 +266,6 @@ pub(crate) async fn responses(
     }
 }
 
-/// Aggregated assistant output tracked while relaying one Responses stream,
-/// mirroring `assistant_message` inputs for continuation retention.
-#[derive(Default)]
-struct ResponsesRetention {
-    text: String,
-    refusal: bool,
-    tool_calls: Vec<CompletedToolCall>,
-    retained_bytes: usize,
-    overflowed: bool,
-}
-
-impl ResponsesRetention {
-    fn track(&mut self, event: &Event) {
-        if self.overflowed {
-            return;
-        }
-        self.retained_bytes = self
-            .retained_bytes
-            .saturating_add(event_retained_bytes(event));
-        if self.retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
-            // Retention is bounded like the python service's aggregation:
-            // the stream keeps flowing but nothing oversize is remembered.
-            self.overflowed = true;
-            self.text.clear();
-            self.tool_calls.clear();
-            return;
-        }
-        match event {
-            Event::TextDelta(delta) => self.text.push_str(delta),
-            Event::RefusalDelta(_) => self.refusal = true,
-            Event::ToolCallCompleted { call, .. } => self.tool_calls.push(call.clone()),
-            _ => {}
-        }
-    }
-}
-
-/// Build the retention payload consumed by the control plane's `remember`.
-fn remember_argument(request_id: &str, retention: &ResponsesRetention) -> String {
-    compact_json(&json!({
-        "request_id": request_id,
-        "text": retention.text,
-        "refusal": retention.refusal,
-        "tool_calls": retention
-            .tool_calls
-            .iter()
-            .map(|call| json!({
-                "call_id": call.call_id,
-                "name": call.name,
-                "arguments": call.raw_arguments,
-            }))
-            .collect::<Vec<Value>>(),
-    }))
-}
-
-/// Retain one completed Responses continuation before the terminal frames
-/// flush, mirroring the python service's ordering. Returns the public error
-/// when bounded retention fails closed.
-async fn remember_continuation(
-    state: &AppState,
-    request_id: &str,
-    retention: &ResponsesRetention,
-) -> Result<(), PublicError> {
-    if retention.overflowed
-        || retention.refusal
-        || (retention.text.is_empty() && retention.tool_calls.is_empty())
-    {
-        return Ok(());
-    }
-    state
-        .bridge
-        .call("remember", remember_argument(request_id, retention))
-        .await
-        .map(|_| ())
-}
-
 /// Answer one Responses attempt that the waterfall already settled: a
 /// successful terminal with no semantic output, or an exhausted ladder
 /// flushing withheld refusal output ahead of the failing terminal.
@@ -362,7 +290,7 @@ async fn settled_responses_response(
     let mut headers = commit_independent(admission, client_request_id.as_deref());
     headers.extend(commit_dependent(admission, settled.depth));
     if admission.stream {
-        let body = match encode_responses_sse(admission, created_at, &events) {
+        let body = match encode_responses_sse(admission, created_at, &events, None) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
@@ -440,13 +368,28 @@ async fn respond_from_responses_events(
     stream_body: bool,
 ) -> Response {
     let refusal_completed = complete_visible_refusal(&mut events);
+    let reasoning_content_carrier =
+        match seal_reasoning_events(&guard.bridge, &admission.request_id, depth, &events).await {
+            Ok(carrier) => carrier,
+            Err(failure) => {
+                let failure = failure.boundary();
+                guard
+                    .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
+                    .await;
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
+                return error_response(&failure.public_error());
+            }
+        };
     let envelope = admission.envelope.clone().unwrap_or_default();
-    let aggregated = match completed_responses_body(
+    let aggregated = match completed_responses_body_with_carrier(
         &admission.request_id,
         &admission.alias,
         created_at,
         envelope,
         &events,
+        reasoning_content_carrier.as_deref(),
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
@@ -497,7 +440,13 @@ async fn respond_from_responses_events(
         tool_calls: aggregated.tool_calls.clone(),
         ..ResponsesRetention::default()
     };
-    let remembered = remember_continuation(state, &admission.request_id, &retention).await;
+    let remembered = remember_continuation(
+        state,
+        &admission.request_id,
+        &retention,
+        reasoning_content_carrier.as_deref(),
+    )
+    .await;
     let settled = if let Some(refusal) = &refusal_completed {
         guard
             .settle(
@@ -542,7 +491,12 @@ async fn respond_from_responses_events(
     let mut headers = commit_independent(&admission, client_request_id.as_deref());
     headers.extend(commit_dependent(&admission, depth));
     if stream_body {
-        let body = match encode_responses_sse(&admission, created_at, &events) {
+        let body = match encode_responses_sse(
+            &admission,
+            created_at,
+            &events,
+            reasoning_content_carrier.as_deref(),
+        ) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
@@ -634,6 +588,7 @@ fn encode_responses_sse(
     admission: &Admission,
     created_at: f64,
     events: &[Event],
+    reasoning_content_carrier: Option<&str>,
 ) -> Result<Vec<u8>, PublicError> {
     let envelope = admission.envelope.clone().unwrap_or_default();
     let mut encoder = ResponsesSseEncoder::new(
@@ -642,6 +597,9 @@ fn encode_responses_sse(
         created_at,
         envelope,
     );
+    if let Some(carrier) = reasoning_content_carrier {
+        encoder.set_reasoning_content_carrier(carrier.to_string())?;
+    }
     let mut body = Vec::new();
     for frame in encoder.start()? {
         body.extend_from_slice(frame.as_bytes());
@@ -766,6 +724,7 @@ async fn stream_responses(
         let mut visible_refusal = committed.visible_refusal;
         let mut terminal: Option<Event> = None;
         let mut retention = ResponsesRetention::default();
+        let mut reasoning_content_carrier: Option<String> = None;
         // Terminal frames are withheld until continuation retention lands,
         // mirroring the python stream body's ordering.
         let terminal_frames: Vec<String>;
@@ -839,6 +798,40 @@ async fn stream_responses(
             // provider's outcome instead of as a cancellation.
             if event.is_terminal() {
                 terminal = Some(event.clone());
+                if matches!(event, Event::Completed) {
+                    let candidate = match reasoning_carrier_candidate(&retention.carrier_events) {
+                        Ok(candidate) => candidate,
+                        Err(_) => {
+                            fail_stream!(Failure::new(
+                                FailureClass::MalformedResponse,
+                                "provider returned malformed reasoning continuation data",
+                            ))
+                        }
+                    };
+                    match seal_reasoning_candidate(
+                        &guard.bridge,
+                        &request_id,
+                        committed.depth,
+                        candidate,
+                    )
+                    .await
+                    {
+                        Ok(Some(carrier)) => {
+                            if encoder
+                                .set_reasoning_content_carrier(carrier.clone())
+                                .is_err()
+                            {
+                                fail_stream!(Failure::new(
+                                    FailureClass::MalformedResponse,
+                                    "provider reasoning continuation could not be authenticated",
+                                ))
+                            }
+                            reasoning_content_carrier = Some(carrier);
+                        }
+                        Ok(None) => {}
+                        Err(failure) => fail_stream!(failure),
+                    }
+                }
             }
             let encoded = match encoder.feed(&outward) {
                 Ok(encoded) => encoded,
@@ -877,8 +870,13 @@ async fn stream_responses(
         // same observable behavior as the python service.
         let retainable = !matches!(terminal, Some(Event::Failed(_)));
         if retainable {
-            if let Err(_error) =
-                remember_continuation(&state, &admission.request_id, &retention).await
+            if let Err(_error) = remember_continuation(
+                &state,
+                &admission.request_id,
+                &retention,
+                reasoning_content_carrier.as_deref(),
+            )
+            .await
             {
                 settle_stream_end(
                     &mut guard,

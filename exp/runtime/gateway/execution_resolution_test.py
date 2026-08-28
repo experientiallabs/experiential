@@ -197,6 +197,95 @@ def test_fireworks_profile_resolution_narrows_overbroad_catalog_efforts(
     assert resolved.reasoning_effort == expected_default
 
 
+def test_fireworks_profile_resolution_normalizes_before_intersection() -> None:
+    """Provider and catalog aliases that mean high intersect as exact high."""
+    capabilities = ModelCapabilities(supports_reasoning=True, reasoning_effort="high")
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        model_id="accounts/fireworks/models/deepseek-v4-flash-0731",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("low",),
+        fireworks_reasoning_route_sha256="c" * 64,
+    )
+    gateway = GatewayDeploymentCapabilities(supported_reasoning_efforts=("high",))
+
+    resolved = _resolved_wire_profile(
+        _deployment(capabilities, gateway),
+        _resolved(_NativeClient(profile), capabilities),
+    )
+
+    assert resolved.supported_reasoning_efforts == ("high",)
+
+
+@pytest.mark.parametrize(
+    ("model_id", "profile_efforts"),
+    (
+        ("accounts/fireworks/models/deepseek-v4-flash-0731", ("ultra",)),
+        ("accounts/fireworks/models/glm-5p2", ("minimal",)),
+        ("accounts/fireworks/models/kimi-k2p7-code", ("xhigh",)),
+        ("accounts/fireworks/models/kimi-k2p7-code", ()),
+    ),
+)
+def test_fireworks_profile_resolution_rejects_empty_exact_intersection(
+    model_id: str,
+    profile_efforts: tuple[ReasoningEffort, ...],
+) -> None:
+    """Disjoint and explicitly empty provider authority never restores built-ins."""
+    capabilities = ModelCapabilities(supports_reasoning=True)
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=profile_efforts,
+        fireworks_reasoning_route_sha256="c" * 64,
+    )
+
+    with pytest.raises(GatewayWireContractError, match="no exact intersection"):
+        _resolved_wire_profile(
+            _deployment(capabilities),
+            _resolved(_NativeClient(profile), capabilities),
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_id", "profile_efforts", "catalog_efforts"),
+    (
+        ("accounts/fireworks/models/deepseek-v4-flash-0731", ("low",), ("max",)),
+        ("accounts/fireworks/models/glm-5p2", ("medium",), ("max",)),
+        ("accounts/fireworks/models/kimi-k2p7-code", ("low",), ("high",)),
+    ),
+)
+def test_fireworks_profile_resolution_rejects_disjoint_catalog_provider_efforts(
+    model_id: str,
+    profile_efforts: tuple[ReasoningEffort, ...],
+    catalog_efforts: tuple[ReasoningEffort, ...],
+) -> None:
+    """Normalized catalog and provider authorities must retain one common tier."""
+    capabilities = ModelCapabilities(supports_reasoning=True)
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=profile_efforts,
+        fireworks_reasoning_route_sha256="c" * 64,
+    )
+    gateway = GatewayDeploymentCapabilities(
+        supported_reasoning_efforts=catalog_efforts,
+    )
+
+    with pytest.raises(GatewayWireContractError, match="no exact intersection"):
+        _resolved_wire_profile(
+            _deployment(capabilities, gateway),
+            _resolved(_NativeClient(profile), capabilities),
+        )
+
+
 def test_profile_resolution_rejects_provider_reasoning_contract_conflict() -> None:
     """A provider profile cannot silently weaken frozen gateway reasoning metadata."""
     capabilities = ModelCapabilities(supports_reasoning=True)

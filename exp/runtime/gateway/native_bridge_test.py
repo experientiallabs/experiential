@@ -182,6 +182,206 @@ def _admit_started(
     return _flatten_started(control, admission)
 
 
+def test_fireworks_carrier_is_sealed_before_settlement_and_validates_cross_replica(
+    tmp_path: Path,
+) -> None:
+    """A second replica decrypts the exact rung; credential rotation rejects it."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.fireworks.ai/inference/v1",
+        capabilities=ModelCapabilities(supports_tools=True),
+    )
+    first_components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "shared-fireworks-secret"},
+    )
+    first_control = NativeControlPlane(first_components)
+    initial = _admit_started(first_control, raw_key, _chat_body())
+    hidden = "private provider reasoning that must stay opaque"
+    seal_argument = json.dumps(
+        {
+            "request_id": initial["request_id"],
+            "route_depth": initial["route_depth"],
+            "route_sha256": initial["fireworks_reasoning_route_sha256"],
+            "content": hidden,
+            "assistant_content": None,
+            "tool_calls": [{"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}],
+        }
+    )
+    sealed = json.loads(first_control.seal_reasoning_content(seal_argument))["carrier"]
+    assert hidden not in sealed
+    assert "shared-fireworks-secret" not in sealed
+    assert (
+        first_control.settle(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "attempt_id": initial["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                    "tool_names": ["lookup"],
+                    "failure": None,
+                }
+            )
+        )
+        == "{}"
+    )
+    with pytest.raises(NativeBridgeError):
+        first_control.seal_reasoning_content(seal_argument)
+    continuation_body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "Use a tool"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+
+    replica = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-fireworks-secret"},
+        )
+    )
+    continued = _admit(replica, raw_key, continuation_body)
+    route = cast("list[JsonObject]", continued["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert messages[1]["reasoning_content"] == hidden
+
+    modified_turn = json.loads(continuation_body)
+    modified_turn["messages"][1]["tool_calls"][0]["function"]["arguments"] = '{"tampered":true}'
+    with pytest.raises(NativeBridgeError) as modified:
+        _admit(replica, raw_key, json.dumps(modified_turn))
+    assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+
+    rotated = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "rotated-fireworks-secret"},
+        )
+    )
+    with pytest.raises(NativeBridgeError) as rejected:
+        _admit(rotated, raw_key, continuation_body)
+    public_error = json.loads(rejected.value.public_error_json)
+    assert public_error["status_code"] == 400
+    assert public_error["param"] == "messages.reasoning_content"
+
+
+def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: Path) -> None:
+    """A fallback-issued carrier cannot replay to the lead or another same-origin key."""
+    _manager, raw_key = _configured_pool_gateway(
+        tmp_path,
+        base_urls=(
+            "https://api.fireworks.ai/inference/v1",
+            "https://api.fireworks.ai/inference/v1",
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-fireworks-secret"},
+        )
+    )
+    admission = _admit(control, raw_key, _chat_body())
+    first = _start_first(control, admission)
+    failure = {
+        "failure_class": "provider_internal",
+        "safe_message": "provider service failed",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "attempt_id": first["attempt_id"],
+                    "outcome": "failed",
+                    "usage": None,
+                    "tool_names": [],
+                    "failure": failure,
+                    "finalize": False,
+                }
+            )
+        )
+        == "{}"
+    )
+    second = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": failure,
+                }
+            )
+        )
+    )
+    assert second["route_depth"] == 1
+    route = cast("list[JsonObject]", admission["route"])
+    carrier = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "route_depth": 1,
+                    "route_sha256": route[1]["fireworks_reasoning_route_sha256"],
+                    "content": "fallback-private-reasoning",
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    continuation = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": "Use a tool"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": carrier,
+                        "tool_calls": [
+                            {
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+                ],
+            }
+        ),
+    )
+
+    continued_route = cast("list[JsonObject]", continuation["route"])
+    assert [item["deployment_id"] for item in continued_route] == [route[1]["deployment_id"]]
+    assert continued_route[0]["model_id"] == "beta-model-exact"
+
+
 def test_bridge_error_payload_is_openai_shaped() -> None:
     """The boundary error carries the exact public error representation."""
     error = NativeBridgeError(
@@ -1524,6 +1724,7 @@ def test_rust_chat_sse_fireworks_carrier_matches_python() -> None:
     from exp.runtime.openai_protocol.streaming import ChatSseEncoder
 
     route_sha256 = "a" * 64
+    carrier = "authenticated-opaque-carrier-v2"
     events = [
         GatewayEvent(
             kind=GatewayEventKind.REASONING_CONTENT_DELTA,
@@ -1568,6 +1769,7 @@ def test_rust_chat_sse_fireworks_carrier_matches_python() -> None:
         model="accounts/fireworks/models/deepseek-v4-flash-0731",
         created_at=1_700_000_000,
         include_usage=False,
+        reasoning_content_carrier=carrier,
     )
     expected = list(encoder.start())
     for event in events:
@@ -1601,6 +1803,8 @@ def test_rust_chat_sse_fireworks_carrier_matches_python() -> None:
         1_700_000_000,
         False,
         json.dumps(fixture),
+        [],
+        carrier,
     )
 
     assert list(actual) == expected

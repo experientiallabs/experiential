@@ -13,6 +13,9 @@ dependencies = [
     "typer>=0.16",
     "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
     "pydantic>=2.6",
+    # Gateway-issued provider continuations use authenticated encryption. Declare the
+    # primitive directly rather than relying on google-auth's transitive dependency.
+    "cryptography>=46,<51",
     "numpy>=1.26",
     "httpx>=0.27",
     "rich>=14.1",

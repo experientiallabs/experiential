@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ChatMaxTokensField
 from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
     GatewayNamedToolChoice,
     GatewayRequest,
 )
@@ -22,6 +23,7 @@ from exp.runtime.models.providers.fireworks import (
     fireworks_reasoning_effort,
     fireworks_reasoning_efforts,
     prepare_gateway_reasoning_history,
+    require_responses_continuation_channel,
 )
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.reasoning_compat import (
@@ -72,6 +74,13 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
+    if (
+        provider_request.surface == GatewayApiSurface.RESPONSES
+        and profile.fireworks_reasoning_route_sha256 is not None
+        and provider_request.response_store is False
+        and not provider_request.include_encrypted_reasoning
+    ):
+        raise ProviderCapabilityError(capability="responses_fireworks_reasoning_carrier")
     required_reasoning_effort = (
         profile.reasoning_effort if profile.reasoning_effort_required else None
     )
@@ -89,7 +98,7 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
-            explicit_reasoning_efforts=profile.supported_reasoning_efforts,
+            explicit_reasoning_efforts=profile.supported_reasoning_efforts or (),
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
         )
     if profile.dialect == "anthropic_messages":
@@ -106,7 +115,7 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
-            explicit_reasoning_efforts=profile.supported_reasoning_efforts,
+            explicit_reasoning_efforts=profile.supported_reasoning_efforts or (),
         )
     if profile.dialect == "gemini_generate_content":
         return gemini_generate_content_stream_payload(
@@ -122,7 +131,7 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
-            explicit_reasoning_efforts=profile.supported_reasoning_efforts,
+            explicit_reasoning_efforts=profile.supported_reasoning_efforts or (),
         )
     if profile.dialect == "bedrock_converse_stream":
         return bedrock_converse_stream_payload(
@@ -153,7 +162,7 @@ def dialect_stream_payload(
             supports_reasoning=profile.supports_reasoning,
             reasoning_wire_format=profile.reasoning_wire_format,
             reasoning_effort=required_reasoning_effort,
-            explicit_reasoning_efforts=profile.supported_reasoning_efforts,
+            explicit_reasoning_efforts=profile.supported_reasoning_efforts or (),
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
             fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
         )
@@ -188,6 +197,8 @@ def route_generation_parameter_requests(
     """
     if not profiles:
         raise ValueError("generation parameter shaping requires at least one wire profile")
+
+    require_responses_continuation_channel(profiles, request)
 
     ignored = list(request.ignored_parameters)
     provider_updates: dict[str, object] = {}
@@ -322,6 +333,21 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
+    if request.include_encrypted_reasoning and not all(
+        profile.dialect == "openai_responses"
+        or profile.fireworks_reasoning_route_sha256 is not None
+        for profile in profiles
+    ):
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'reasoning.encrypted_content' is not supported by every "
+                "deployment in this model route. Remove the include selector or choose a "
+                "native Responses or authenticated Fireworks route."
+            ),
+            param="include",
+            code="unsupported_parameter",
+        )
+
     if (
         request.structured_text is not None
         and not request.structured_text.strict
@@ -372,7 +398,7 @@ def route_generation_parameter_requests(
             param="thinking",
             code="unsupported_parameter",
         )
-    encrypted_reasoning_present = request.include_encrypted_reasoning or any(
+    encrypted_reasoning_present = any(
         block.kind == "encrypted_reasoning"
         for message in request.messages
         for block in message.provider_reasoning
@@ -503,7 +529,7 @@ def _profile_reasoning_efforts(profile: GatewayWireProfile) -> tuple[str, ...]:
     if profile.fireworks_reasoning_route_sha256 is not None:
         exact = fireworks_reasoning_efforts(
             profile.model_id,
-            explicit_efforts=profile.supported_reasoning_efforts or None,
+            explicit_efforts=profile.supported_reasoning_efforts,
         )
         if exact is not None:
             return exact
@@ -511,7 +537,7 @@ def _profile_reasoning_efforts(profile: GatewayWireProfile) -> tuple[str, ...]:
         profile.model_id,
         profile.reasoning_wire_format,
         configured_effort=profile.reasoning_effort,
-        explicit_efforts=profile.supported_reasoning_efforts or None,
+        explicit_efforts=profile.supported_reasoning_efforts,
     )
 
 

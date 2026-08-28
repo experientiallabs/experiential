@@ -7,7 +7,6 @@ import json
 from collections.abc import Iterable
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import OpaqueReasoningContentBlock
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -16,7 +15,6 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
-from exp.runtime.models.providers.fireworks import encode_reasoning_content
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 
 
@@ -45,6 +43,7 @@ class ChatSseEncoder:
         created_at: int,
         include_usage: bool,
         ignored_parameters: tuple[str, ...] = (),
+        reasoning_content_carrier: str | None = None,
     ) -> None:
         """Initialize one response stream identity and empty event state."""
         self.completion_id = stable_public_id("chatcmpl", request_id)
@@ -57,9 +56,17 @@ class ChatSseEncoder:
         self._last_provider_sequence = -1
         self._tool_indices: dict[int, tuple[str, str]] = {}
         self._tool_arguments: dict[int, str] = {}
+        self._completed_tool_indexes: set[int] = set()
         self._usage: GatewayUsage | None = None
         self._reasoning_content: list[str] = []
         self._reasoning_content_route_sha256: str | None = None
+        self._reasoning_content_carrier = reasoning_content_carrier
+
+    def set_reasoning_content_carrier(self, carrier: str) -> None:
+        """Attach the authenticated Fireworks carrier before Chat terminal encoding."""
+        if not carrier:
+            raise self._state_error("Chat reasoning carrier must not be empty.")
+        self._reasoning_content_carrier = carrier
 
     def start(self) -> tuple[str, ...]:
         """Emit the single initial assistant-role chunk."""
@@ -114,6 +121,8 @@ class ChatSseEncoder:
             identity = (_required_text(event.tool_call_id), _required_text(event.tool_name))
             if index in self._tool_indices:
                 raise self._state_error("A Chat tool-call index was started twice.")
+            if any(call_id == identity[0] for call_id, _name in self._tool_indices.values()):
+                raise self._state_error("A Chat tool-call ID was started twice.")
             self._tool_indices[index] = identity
             self._tool_arguments[index] = ""
             return (
@@ -154,13 +163,14 @@ class ChatSseEncoder:
             index = _required_index(event)
             call = event.tool_call
             identity = self._tool_indices.get(index)
-            if call is None or identity is None:
+            if call is None or identity is None or index in self._completed_tool_indexes:
                 raise self._state_error("Chat tool completion omitted its started tool call.")
             if (
                 identity != (call.call_id, call.name)
                 or self._tool_arguments[index].encode() != call.arguments_json().encode()
             ):
                 raise self._state_error("Chat tool completion changed streamed identity or bytes.")
+            self._completed_tool_indexes.add(index)
             return ()
         if event.kind == GatewayEventKind.USAGE:
             return ()
@@ -177,6 +187,8 @@ class ChatSseEncoder:
             )
             frames.append(_chat_data(public_failure_error(failure).json_body()))
         else:
+            if self._tool_indices.keys() != self._completed_tool_indexes:
+                raise self._state_error("Chat terminal arrived before every tool call completed.")
             finish_reason = (
                 "length"
                 if event.kind == GatewayEventKind.INCOMPLETE
@@ -190,17 +202,12 @@ class ChatSseEncoder:
                 and self._reasoning_content
                 and self._reasoning_content_route_sha256 is not None
             ):
-                frames.append(
-                    self._chunk(
-                        delta={
-                            "reasoning_content": encode_reasoning_content(
-                                OpaqueReasoningContentBlock(
-                                    route_sha256=self._reasoning_content_route_sha256,
-                                    content="".join(self._reasoning_content),
-                                )
-                            )
-                        }
+                if self._reasoning_content_carrier is None:
+                    raise self._state_error(
+                        "Chat reasoning content was not sealed by the gateway authority."
                     )
+                frames.append(
+                    self._chunk(delta={"reasoning_content": self._reasoning_content_carrier})
                 )
             frames.append(self._chunk(delta={}, finish_reason=finish_reason))
             if self.include_usage and self._usage is not None:
@@ -342,6 +349,14 @@ class ResponsesSseEncoder:
         self._text_started = False
         self._refusal_started = False
         self._usage: GatewayUsage | None = None
+        self._reasoning_content_route_sha256: str | None = None
+        self._reasoning_content_carrier: str | None = None
+
+    def set_reasoning_content_carrier(self, carrier: str) -> None:
+        """Attach the authenticated Fireworks carrier before Responses termination."""
+        if not carrier:
+            raise self._state_error("Responses reasoning carrier must not be empty.")
+        self._reasoning_content_carrier = carrier
 
     def start(self) -> tuple[str, ...]:
         """Emit required created and in-progress lifecycle events once."""
@@ -377,9 +392,10 @@ class ResponsesSseEncoder:
         if event.kind in {
             GatewayEventKind.THINKING_SIGNATURE,
             GatewayEventKind.REDACTED_THINKING,
-            GatewayEventKind.REASONING_CONTENT_DELTA,
         }:
             return ()
+        if event.kind == GatewayEventKind.REASONING_CONTENT_DELTA:
+            return self._fireworks_reasoning(event)
         if event.kind == GatewayEventKind.ENCRYPTED_REASONING:
             return self._encrypted_reasoning(event)
         if event.kind == GatewayEventKind.TOOL_CALL_STARTED:
@@ -536,6 +552,21 @@ class ResponsesSseEncoder:
         state.encrypted_content = event.encrypted_content
         return tuple(frames)
 
+    def _fireworks_reasoning(self, event: GatewayEvent) -> tuple[str, ...]:
+        """Open one opaque reasoning item without exposing provider plaintext."""
+        route_sha256 = event.reasoning_content_route_sha256
+        if route_sha256 is None or event.text_delta is None:
+            raise self._state_error("Responses Fireworks reasoning omitted route identity or text.")
+        if (
+            self._reasoning_content_route_sha256 is not None
+            and self._reasoning_content_route_sha256 != route_sha256
+        ):
+            raise self._state_error("Responses Fireworks reasoning changed provider route.")
+        self._reasoning_content_route_sha256 = route_sha256
+        frames: list[str] = []
+        self._ensure_reasoning_state(-1, frames)
+        return tuple(frames)
+
     def _reasoning_summary_text(
         self, provider_output_index: int, summary_index: int, delta: str
     ) -> tuple[str, ...]:
@@ -625,6 +656,14 @@ class ResponsesSseEncoder:
 
     def _finish(self, event: GatewayEvent) -> tuple[str, ...]:
         """Close open items and emit exactly one Responses terminal lifecycle event."""
+        fireworks = self._reasoning.get(-1)
+        if fireworks is not None and event.kind == GatewayEventKind.COMPLETED and self._tools:
+            if self._reasoning_content_carrier is None:
+                raise self._state_error(
+                    "Responses Fireworks reasoning was not sealed by gateway authority."
+                )
+            if self.request.include_encrypted_reasoning:
+                fireworks.encrypted_content = self._reasoning_content_carrier
         frames: list[str] = []
         for kind, index in self._output_order:
             if kind == "message":

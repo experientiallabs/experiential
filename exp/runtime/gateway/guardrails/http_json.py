@@ -24,6 +24,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailCheckStage,
     GuardrailCompletion,
+    guardrail_request_subject,
 )
 
 _logger = logging.getLogger(__name__)
@@ -316,7 +317,7 @@ def _inspect_payload(
         "stage": check.stage.value,
     }
     if request is not None:
-        payload["request"] = request.model_dump(mode="json", by_alias=True, exclude_none=False)
+        payload["request"] = guardrail_request_subject(request)
         return payload
     if completion is None:
         raise ClassifierProtocolError("classifier inspect requires exactly one subject")

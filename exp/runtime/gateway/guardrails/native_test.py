@@ -139,12 +139,14 @@ def test_native_output_payload_round_trips_tool_calls() -> None:
     completion = parse_output_payload(
         {
             "text": "hello",
+            "reasoning_content": "hidden provider reasoning",
             "refusal": False,
             "tool_calls": [{"call_id": "call-1", "name": "lookup", "arguments": '{"q":"x"}'}],
         }
     )
 
     assert completion.tool_calls[0].arguments == '{"q":"x"}'
+    assert completion.reasoning_content == "hidden provider reasoning"
 
 
 def test_native_output_block_returns_sanitized_failure_json() -> None:

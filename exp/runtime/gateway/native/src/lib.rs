@@ -20,9 +20,11 @@ mod metrics;
 mod relay;
 mod replay;
 mod respond;
+mod responses_envelope;
 mod route_chat;
 mod route_messages;
 mod route_responses;
+mod route_responses_carrier;
 mod server;
 mod settlement;
 mod sse;
@@ -83,7 +85,7 @@ fn shutdown_handle() -> ShutdownHandle {
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
 /// `start_attempt`, `sign_dispatch`, `settle`, `abandon`, `remember`,
-/// `enforce_output`, `models`, `model_detail`, `usage_json`, `usage_page`,
+/// `enforce_output`, `seal_reasoning_content`, `models`, `model_detail`, `usage_json`, `usage_page`,
 /// `metrics_json`, `metrics_text`, `readiness`, and
 /// `close_thread_resources`, each taking and returning one JSON string.
 /// `config_json` carries host, port, and concurrency bounds.
@@ -120,7 +122,15 @@ fn serve(
 /// `ignored_parameters` names route-shaped controls disclosed on the final
 /// chunk.
 #[pyfunction]
-#[pyo3(signature = (request_id, model, created_at, include_usage, events_json, ignored_parameters=Vec::new()))]
+#[pyo3(signature = (
+    request_id,
+    model,
+    created_at,
+    include_usage,
+    events_json,
+    ignored_parameters=Vec::new(),
+    reasoning_content_carrier=None,
+))]
 fn encode_chat_fixture(
     request_id: &str,
     model: &str,
@@ -128,6 +138,7 @@ fn encode_chat_fixture(
     include_usage: bool,
     events_json: &str,
     ignored_parameters: Vec<String>,
+    reasoning_content_carrier: Option<String>,
 ) -> PyResult<Vec<String>> {
     let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
     let mut encoder = encode::ChatSseEncoder::new_with_ignored(
@@ -137,6 +148,9 @@ fn encode_chat_fixture(
         include_usage,
         ignored_parameters,
     );
+    if let Some(carrier) = reasoning_content_carrier {
+        encoder.set_reasoning_content_carrier(carrier);
+    }
     let mut frames = encoder
         .start()
         .map_err(|error| PyValueError::new_err(error_payload(&error)))?;

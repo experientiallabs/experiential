@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
 
-const FIREWORKS_REASONING_CONTENT_PREFIX: &str = "x-experiential-fireworks-reasoning-v1:";
+const MAXIMUM_REASONING_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Derive one replay-stable public object ID, mirroring `stable_public_id`.
 pub fn stable_public_id(prefix: &str, request_id: &str) -> String {
@@ -20,6 +20,135 @@ pub fn stable_public_id(prefix: &str, request_id: &str) -> String {
 
 fn invalid_provider_stream(message: &str) -> PublicError {
     PublicError::new(502, "invalid_provider_stream", message, "api_error")
+}
+
+/// Hidden reasoning plus exact completed tool identities awaiting AEAD sealing.
+pub struct ReasoningCarrierCandidate {
+    pub route_sha256: String,
+    pub content: String,
+    pub assistant_content: Option<String>,
+    pub tool_calls: Vec<ReasoningCarrierToolCall>,
+}
+
+/// One exact provider-issued tool call bound into the issuing-turn digest.
+pub struct ReasoningCarrierToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub raw_arguments: String,
+}
+
+#[derive(Default)]
+struct ReasoningCarrierState {
+    route_sha256: Option<String>,
+    content: String,
+    assistant_content: String,
+    tool_ids: HashMap<u32, (String, String)>,
+    completed: HashMap<u32, crate::events::CompletedToolCall>,
+}
+
+impl ReasoningCarrierState {
+    fn observe(&mut self, event: &Event) -> Result<(), PublicError> {
+        match event {
+            Event::TextDelta(delta) => self.assistant_content.push_str(delta),
+            Event::ReasoningContentDelta {
+                route_sha256,
+                delta,
+            } => {
+                if self
+                    .route_sha256
+                    .as_ref()
+                    .is_some_and(|current| current != route_sha256)
+                {
+                    return Err(invalid_provider_stream(
+                        "Chat reasoning content changed provider route.",
+                    ));
+                }
+                if self.content.len().saturating_add(delta.len()) > MAXIMUM_REASONING_CONTENT_BYTES
+                {
+                    return Err(invalid_provider_stream(
+                        "Chat reasoning content exceeded the gateway carrier bound.",
+                    ));
+                }
+                self.route_sha256 = Some(route_sha256.clone());
+                self.content.push_str(delta);
+            }
+            Event::ToolCallStarted {
+                index,
+                call_id,
+                name,
+            } => {
+                if self.tool_ids.contains_key(index)
+                    || self
+                        .tool_ids
+                        .values()
+                        .any(|(existing, _name)| existing == call_id)
+                {
+                    return Err(invalid_provider_stream(
+                        "A Chat tool-call ID was started twice.",
+                    ));
+                }
+                self.tool_ids
+                    .insert(*index, (call_id.clone(), name.clone()));
+            }
+            Event::ToolCallCompleted { index, call } => {
+                if self.tool_ids.get(index) != Some(&(call.call_id.clone(), call.name.clone()))
+                    || self.completed.insert(*index, call.clone()).is_some()
+                {
+                    return Err(invalid_provider_stream(
+                        "Chat tool completion changed or duplicated its identity.",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn candidate(&self) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
+        if self.content.is_empty() {
+            return Ok(None);
+        }
+        if self.tool_ids.is_empty() {
+            return Ok(None);
+        }
+        if self.completed.len() != self.tool_ids.len() {
+            return Err(invalid_provider_stream(
+                "Chat reasoning content requires complete unique tool calls.",
+            ));
+        }
+        let route_sha256 = self.route_sha256.clone().ok_or_else(|| {
+            invalid_provider_stream("Chat reasoning content omitted provider route identity.")
+        })?;
+        let mut ordered: Vec<u32> = self.tool_ids.keys().copied().collect();
+        ordered.sort_unstable();
+        Ok(Some(ReasoningCarrierCandidate {
+            route_sha256,
+            content: self.content.clone(),
+            assistant_content: (!self.assistant_content.is_empty())
+                .then(|| self.assistant_content.clone()),
+            tool_calls: ordered
+                .into_iter()
+                .map(|index| {
+                    let call = &self.completed[&index];
+                    ReasoningCarrierToolCall {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        raw_arguments: call.raw_arguments.clone(),
+                    }
+                })
+                .collect(),
+        }))
+    }
+}
+
+pub fn reasoning_carrier_candidate(
+    events: &[Event],
+) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
+    let mut state = ReasoningCarrierState::default();
+    for event in events {
+        state.observe(event)?;
+    }
+    state.candidate()
 }
 
 /// Stateful Chat Completions SSE encoder with stable tool indices and one
@@ -35,8 +164,8 @@ pub struct ChatSseEncoder {
     tool_indices: HashMap<u32, (String, String)>,
     tool_arguments: HashMap<u32, String>,
     usage: Option<Usage>,
-    reasoning_content_route_sha256: Option<String>,
-    reasoning_content: String,
+    reasoning: ReasoningCarrierState,
+    reasoning_content_carrier: Option<String>,
 }
 
 impl ChatSseEncoder {
@@ -59,9 +188,19 @@ impl ChatSseEncoder {
             tool_indices: HashMap::new(),
             tool_arguments: HashMap::new(),
             usage: None,
-            reasoning_content_route_sha256: None,
-            reasoning_content: String::new(),
+            reasoning: ReasoningCarrierState::default(),
+            reasoning_content_carrier: None,
         }
+    }
+
+    pub fn set_reasoning_content_carrier(&mut self, carrier: String) {
+        self.reasoning_content_carrier = Some(carrier);
+    }
+
+    pub fn reasoning_carrier_candidate(
+        &self,
+    ) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
+        self.reasoning.candidate()
     }
 
     /// Emit the single initial assistant-role chunk.
@@ -87,26 +226,11 @@ impl ChatSseEncoder {
                 "Chat stream received an event after its terminal.",
             ));
         }
+        self.reasoning.observe(event)?;
         match event {
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
-            Event::ReasoningContentDelta {
-                route_sha256,
-                delta,
-            } => {
-                if self
-                    .reasoning_content_route_sha256
-                    .as_ref()
-                    .is_some_and(|current| current != route_sha256)
-                {
-                    return Err(invalid_provider_stream(
-                        "Chat reasoning content changed provider route.",
-                    ));
-                }
-                self.reasoning_content_route_sha256 = Some(route_sha256.clone());
-                self.reasoning_content.push_str(delta);
-                Ok(Vec::new())
-            }
+            Event::ReasoningContentDelta { .. } => Ok(Vec::new()),
             // The Chat wire has no reasoning representation, so provider
             // reasoning follows the summary path and is deliberately dropped.
             Event::ReasoningSummaryDelta { .. }
@@ -188,21 +312,13 @@ impl ChatSseEncoder {
                     "stop"
                 };
                 let mut frames = Vec::new();
-                if matches!(event, Event::Completed)
-                    && !self.tool_indices.is_empty()
-                    && !self.reasoning_content.is_empty()
-                {
-                    if let Some(route_sha256) = &self.reasoning_content_route_sha256 {
-                        frames.push(self.chunk(
-                            json!({
-                                "reasoning_content": opaque_reasoning_content(
-                                    route_sha256,
-                                    &self.reasoning_content,
-                                )
-                            }),
-                            None,
-                        ));
-                    }
+                if matches!(event, Event::Completed) && self.reasoning.candidate()?.is_some() {
+                    let carrier = self.reasoning_content_carrier.as_ref().ok_or_else(|| {
+                        invalid_provider_stream(
+                            "Chat reasoning content was not sealed by the gateway authority.",
+                        )
+                    })?;
+                    frames.push(self.chunk(json!({"reasoning_content": carrier}), None));
                 }
                 frames.push(self.chunk(json!({}), Some(finish_reason)));
                 if self.include_usage {
@@ -265,11 +381,6 @@ impl ChatSseEncoder {
         });
         chat_data(&payload)
     }
-}
-
-/// Wrap provider reasoning in the caller-opaque route-bound Chat carrier.
-fn opaque_reasoning_content(route_sha256: &str, content: &str) -> String {
-    format!("{FIREWORKS_REASONING_CONTENT_PREFIX}{route_sha256}:{content}")
 }
 
 /// Frame one compact UTF-8-preserving Chat SSE data event.
@@ -337,6 +448,7 @@ pub fn completed_chat_body_with_ignored(
     created_at: i64,
     events: &[Event],
     ignored_parameters: &[String],
+    reasoning_content_carrier: Option<&str>,
 ) -> Result<AggregatedCompletion, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
@@ -401,25 +513,7 @@ pub fn completed_chat_body_with_ignored(
             _ => None,
         })
         .collect();
-    let mut reasoning_content_route_sha256: Option<&str> = None;
-    let mut reasoning_content = String::new();
-    for event in events {
-        if let Event::ReasoningContentDelta {
-            route_sha256,
-            delta,
-        } = event
-        {
-            if reasoning_content_route_sha256
-                .is_some_and(|current| current != route_sha256.as_str())
-            {
-                return Err(invalid_provider_stream(
-                    "Chat reasoning content changed provider route.",
-                ));
-            }
-            reasoning_content_route_sha256 = Some(route_sha256);
-            reasoning_content.push_str(delta);
-        }
-    }
+    let reasoning = reasoning_carrier_candidate(events)?;
     let incomplete = matches!(terminal, Event::Incomplete);
     let finish_reason = if incomplete {
         "length"
@@ -435,16 +529,19 @@ pub fn completed_chat_body_with_ignored(
         "refusal": if refusal.is_empty() { Value::Null } else { Value::String(refusal) },
         "tool_calls": if tool_calls.is_empty() { Value::Null } else { Value::Array(tool_calls) },
     });
-    if matches!(terminal, Event::Completed) && has_tool_calls && !reasoning_content.is_empty() {
-        if let Some(route_sha256) = reasoning_content_route_sha256 {
-            message
-                .as_object_mut()
-                .expect("chat message is an object")
-                .insert(
-                    "reasoning_content".to_string(),
-                    Value::String(opaque_reasoning_content(route_sha256, &reasoning_content)),
-                );
-        }
+    if matches!(terminal, Event::Completed) && has_tool_calls && reasoning.is_some() {
+        let carrier = reasoning_content_carrier.ok_or_else(|| {
+            invalid_provider_stream(
+                "Chat reasoning content was not sealed by the gateway authority.",
+            )
+        })?;
+        message
+            .as_object_mut()
+            .expect("chat message is an object")
+            .insert(
+                "reasoning_content".to_string(),
+                Value::String(carrier.to_string()),
+            );
     }
     let mut body = json!({
         "id": stable_public_id("chatcmpl", request_id),
@@ -516,10 +613,7 @@ mod tests {
     #[test]
     fn completed_tool_reasoning_is_carried_in_streaming_and_buffered_chat() {
         let events = completed_tool_events();
-        let expected = format!(
-            "{FIREWORKS_REASONING_CONTENT_PREFIX}{}:first private reasoning",
-            "a".repeat(64)
-        );
+        let expected = "authenticated-opaque-carrier-v2";
         let mut stream = ChatSseEncoder::new_with_ignored(
             "request-1",
             "coding",
@@ -527,6 +621,7 @@ mod tests {
             false,
             Vec::new(),
         );
+        stream.set_reasoning_content_carrier(expected.to_string());
         let mut frames = stream.start().expect("stream start must encode");
         for event in &events {
             frames.extend(stream.feed(event).expect("event must encode"));
@@ -540,13 +635,61 @@ mod tests {
         );
         assert!(frames.iter().any(|frame| frame.contains(&expected)));
 
-        let completed =
-            completed_chat_body_with_ignored("request-1", "coding", 1_700_000_000, &events, &[])
-                .expect("completed body must encode");
+        let completed = completed_chat_body_with_ignored(
+            "request-1",
+            "coding",
+            1_700_000_000,
+            &events,
+            &[],
+            Some(expected),
+        )
+        .expect("completed body must encode");
         assert_eq!(
             completed.body["choices"][0]["message"]["reasoning_content"],
             expected
         );
+    }
+
+    #[test]
+    fn reasoning_carrier_requires_unique_calls_and_one_completion_each() {
+        let mut duplicate_id = completed_tool_events();
+        duplicate_id.insert(
+            3,
+            Event::ToolCallStarted {
+                index: 1,
+                call_id: "call-one".to_string(),
+                name: "other".to_string(),
+            },
+        );
+        assert!(reasoning_carrier_candidate(&duplicate_id).is_err());
+
+        let mut duplicate_result = completed_tool_events();
+        let repeated_completion = duplicate_result[4].clone();
+        duplicate_result.insert(5, repeated_completion);
+        assert!(reasoning_carrier_candidate(&duplicate_result).is_err());
+
+        let mut missing_result = completed_tool_events();
+        missing_result.remove(4);
+        assert!(reasoning_carrier_candidate(&missing_result).is_err());
+    }
+
+    #[test]
+    fn reasoning_carrier_candidate_binds_visible_turn_and_exact_tool_fields() {
+        let mut events = completed_tool_events();
+        events.insert(0, Event::TextDelta("visible assistant text".to_string()));
+
+        let candidate = reasoning_carrier_candidate(&events)
+            .expect("candidate must validate")
+            .expect("reasoning tool turn must produce a carrier candidate");
+
+        assert_eq!(
+            candidate.assistant_content.as_deref(),
+            Some("visible assistant text")
+        );
+        assert_eq!(candidate.tool_calls.len(), 1);
+        assert_eq!(candidate.tool_calls[0].call_id, "call-one");
+        assert_eq!(candidate.tool_calls[0].name, "lookup");
+        assert_eq!(candidate.tool_calls[0].raw_arguments, "{}");
     }
 
     #[test]
@@ -569,6 +712,7 @@ mod tests {
             1_700_000_000,
             &[Event::Completed],
             &ignored,
+            None,
         )
         .expect("completed body must encode");
         assert_eq!(

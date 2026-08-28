@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
-from exp.common.core.artifacts import canonical_json_bytes
-from exp.common.models import ToolCall
+from exp.common.core.artifacts import JsonObject, canonical_json_bytes
+from exp.common.models import OpaqueReasoningContentBlock, ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -20,6 +22,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCompletion,
     GuardrailPolicy,
     GuardrailToolCall,
+    guardrail_request_subject,
     request_content_bytes,
 )
 
@@ -158,3 +161,31 @@ def test_request_content_bytes_count_the_compact_json_subject() -> None:
     assert request_content_bytes(request) == len(canonical_json_bytes(request))
     assert request_content_bytes(request) > len("hi") + len('{"q":"ab"}')
     assert completion.content_bytes() == len("ok") + len('{"q":"ab"}')
+
+
+def test_hidden_reasoning_and_original_carrier_bytes_join_guardrail_bounds() -> None:
+    """Authenticated hidden content is inspected and cannot shrink request admission."""
+    block = OpaqueReasoningContentBlock(
+        route_sha256="a" * 64,
+        content="hidden provider reasoning",
+        carrier_size_bytes=777,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(ToolCall(call_id="call-1", name="lookup", arguments={}),),
+                provider_reasoning=(block,),
+            ),
+        ),
+    )
+    subject = guardrail_request_subject(request)
+    messages = cast("list[JsonObject]", subject["messages"])
+    reasoning = cast("list[JsonObject]", messages[0]["provider_reasoning"])
+
+    assert reasoning[0]["content"] == block.content
+    assert request_content_bytes(request) == len(canonical_json_bytes(subject)) + 777
+    assert GuardrailCompletion(reasoning_content=block.content).content_bytes() == len(
+        block.content
+    )

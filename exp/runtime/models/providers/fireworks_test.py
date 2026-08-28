@@ -22,8 +22,6 @@ from exp.runtime.models.providers.errors import (
     UnsupportedReasoningEffortError,
 )
 from exp.runtime.models.providers.fireworks import (
-    decode_reasoning_content,
-    encode_reasoning_content,
     fireworks_reasoning_effort,
     fireworks_reasoning_efforts,
     is_fireworks_base_url,
@@ -266,17 +264,24 @@ def test_active_multi_step_history_requires_every_tool_result() -> None:
         )
 
 
-def test_reasoning_carrier_round_trip_is_byte_exact_and_closed() -> None:
-    """The carrier preserves arbitrary provider text and rejects non-gateway strings."""
-    block = OpaqueReasoningContentBlock(
-        route_sha256=_ROUTE_SHA256,
-        content="line one:\nZürich \N{SNOWMAN}",
+def test_active_history_rejects_duplicate_tool_results() -> None:
+    """Each active Fireworks call must receive exactly one linked tool result."""
+    messages = (
+        ModelMessage(role="user", content="Use a tool"),
+        ModelMessage(
+            role="assistant",
+            assistant_action=_action(
+                route_sha256=_ROUTE_SHA256,
+                content="private reasoning",
+                call_id="call-one",
+            ),
+        ),
+        ModelMessage(role="tool", content="first", tool_call_id="call-one"),
+        ModelMessage(role="tool", content="duplicate", tool_call_id="call-one"),
     )
 
-    assert decode_reasoning_content(encode_reasoning_content(block)) == block
-    for invalid in ("raw provider text", "x-experiential-fireworks-reasoning-v1:"):
-        with pytest.raises(ValueError):
-            decode_reasoning_content(invalid)
+    with pytest.raises(ProviderParameterError, match="exactly one result"):
+        prepare_model_reasoning_history(messages, route_sha256=_ROUTE_SHA256)
 
 
 def test_fireworks_endpoint_detection_rejects_spoofed_or_legacy_roots() -> None:

@@ -110,8 +110,26 @@ class EncryptedReasoningBlock(ContractModel):
     encrypted_content: str = Field(min_length=1)
 
 
+class SealedReasoningContentBlock(ContractModel):
+    """One bounded, still-encrypted Fireworks Chat continuation carrier.
+
+    Public decoding retains only the authenticated envelope and its routing
+    hint. The native control plane replaces this block with an internal
+    :class:`OpaqueReasoningContentBlock` only after authorization and AEAD
+    verification against the exact resolved provider credential.
+    """
+
+    kind: Literal["sealed_reasoning_content"] = "sealed_reasoning_content"
+    carrier: str = Field(min_length=1)
+    deployment_hint: str = Field(min_length=1, max_length=256)
+
+
 ProviderReasoningBlock = Annotated[
-    ThinkingBlock | RedactedThinkingBlock | EncryptedReasoningBlock | OpaqueReasoningContentBlock,
+    ThinkingBlock
+    | RedactedThinkingBlock
+    | EncryptedReasoningBlock
+    | OpaqueReasoningContentBlock
+    | SealedReasoningContentBlock,
     Field(discriminator="kind"),
 ]
 
@@ -170,6 +188,9 @@ class GatewayMessage(ContractModel):
             raise ValueError("tool_call_id is valid only for tool messages")
         if self.role != "tool" and self.tool_is_error:
             raise ValueError("tool_is_error is valid only for tool messages")
+        call_ids = tuple(call.call_id for call in self.tool_calls)
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("assistant tool call IDs must be unique")
         return self
 
 

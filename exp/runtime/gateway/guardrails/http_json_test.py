@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from typing import cast
 
 import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject, canonical_json_bytes
+from exp.common.models import OpaqueReasoningContentBlock, ToolCall
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
@@ -180,6 +182,52 @@ def test_outbound_request_subject_matches_request_content_bytes() -> None:
 
     assert canonical_json_bytes(captured["request"]) == canonical_json_bytes(request)
     assert request_content_bytes(request) == len(canonical_json_bytes(request))
+
+
+def test_authenticated_hidden_reasoning_reaches_input_and_output_classifiers() -> None:
+    """Safety adapters inspect decrypted provider state on both policy stages."""
+    captured: list[JsonObject] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Capture classifier subjects without logging them."""
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"flagged": False})
+
+    adapter, _client = _classifier(httpx.MockTransport(handler))
+    hidden = "authenticated hidden provider reasoning"
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(ToolCall(call_id="call-1", name="lookup", arguments={}),),
+                provider_reasoning=(
+                    OpaqueReasoningContentBlock(
+                        route_sha256="a" * 64,
+                        content=hidden,
+                        carrier_size_bytes=512,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    async def inspect_both_stages() -> None:
+        """Inspect the two policy stages through one client event loop."""
+        await adapter.inspect_input(request=request, check=_input_check())
+        await adapter.inspect_output(
+            completion=GuardrailCompletion(reasoning_content=hidden),
+            check=_output_check(),
+        )
+
+    asyncio.run(inspect_both_stages())
+
+    input_subject = cast("JsonObject", captured[0]["request"])
+    input_messages = cast("list[JsonObject]", input_subject["messages"])
+    provider_reasoning = cast("list[JsonObject]", input_messages[0]["provider_reasoning"])
+    output_subject = cast("JsonObject", captured[1]["completion"])
+    assert provider_reasoning[0]["content"] == hidden
+    assert output_subject["reasoning_content"] == hidden
 
 
 def test_bearer_env_sends_authorization_without_embedding_the_value() -> None:

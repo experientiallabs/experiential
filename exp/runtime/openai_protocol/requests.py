@@ -20,7 +20,7 @@ from pydantic import (
 )
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models.model import OpaqueReasoningContentBlock, ReasoningEffort, ToolCall
+from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.gateway.contracts import (
     CompatibilityDisposition,
     CompatibilityManifest,
@@ -30,9 +30,14 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
     GatewayToolDefinition,
+    SealedReasoningContentBlock,
     StructuredTextFormat,
 )
-from exp.runtime.models.providers.fireworks import decode_reasoning_content
+from exp.runtime.gateway.reasoning_carrier import (
+    FIREWORKS_REASONING_CONTENT_PREFIX,
+    MAXIMUM_REASONING_CARRIER_BYTES,
+    parse_reasoning_content_carrier,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
@@ -117,7 +122,10 @@ class _Message(_WireModel):
     annotations: tuple[()] | None = None
     audio: None = None
     function_call: None = None
-    reasoning_content: str | None = None
+    reasoning_content: str | None = Field(
+        default=None,
+        max_length=MAXIMUM_REASONING_CARRIER_BYTES,
+    )
 
     @property
     def history_tool_calls(self) -> tuple[_AssistantToolCall, ...]:
@@ -137,6 +145,9 @@ class _Message(_WireModel):
             raise ValueError("tool_calls are valid only for assistant messages")
         if self.role != "assistant" and self.reasoning_content is not None:
             raise ValueError("reasoning_content is valid only for assistant messages")
+        call_ids = tuple(call.id for call in self.history_tool_calls)
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("assistant tool call IDs must be unique")
         return self
 
 
@@ -728,10 +739,10 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             _tool_call(call, f"{prefix}.{message_index}.tool_calls.{call_index}.function.arguments")
             for call_index, call in enumerate(message.history_tool_calls)
         )
-        provider_reasoning: tuple[OpaqueReasoningContentBlock, ...] = ()
+        provider_reasoning: tuple[SealedReasoningContentBlock, ...] = ()
         if message.reasoning_content is not None:
             try:
-                provider_reasoning = (decode_reasoning_content(message.reasoning_content),)
+                provider_reasoning = (parse_reasoning_content_carrier(message.reasoning_content),)
             except ValueError as exc:
                 param = f"{prefix}.{message_index}.reasoning_content"
                 raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
@@ -890,15 +901,30 @@ def _response_input_messages(
     if isinstance(value, str):
         return (GatewayMessage(role="user", content=value),)
     messages: list[GatewayMessage] = []
-    pending_reasoning: list[EncryptedReasoningBlock] = []
+    pending_reasoning: list[EncryptedReasoningBlock | SealedReasoningContentBlock] = []
+    pending_calls: list[ToolCall] = []
 
-    def take_reasoning(role: str) -> tuple[EncryptedReasoningBlock, ...]:
+    def take_reasoning(
+        role: str,
+    ) -> tuple[EncryptedReasoningBlock | SealedReasoningContentBlock, ...]:
         """Hand pending reasoning blocks to one assistant successor."""
         if role != "assistant" or not pending_reasoning:
             return ()
         taken = tuple(pending_reasoning)
         pending_reasoning.clear()
         return taken
+
+    def flush_calls() -> None:
+        """Group contiguous function-call items into their one assistant turn."""
+        if pending_calls:
+            messages.append(
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=tuple(pending_calls),
+                    provider_reasoning=take_reasoning("assistant"),
+                )
+            )
+            pending_calls.clear()
 
     def flush_orphaned_reasoning() -> None:
         """Emit reasoning that has no assistant successor as its own turn."""
@@ -909,10 +935,32 @@ def _response_input_messages(
 
     for index, item in enumerate(value):
         if isinstance(item, _ResponseReasoningItem):
-            pending_reasoning.append(
-                EncryptedReasoningBlock(id=item.id, encrypted_content=item.encrypted_content)
-            )
+            flush_calls()
+            if item.encrypted_content.startswith(FIREWORKS_REASONING_CONTENT_PREFIX):
+                try:
+                    carrier = parse_reasoning_content_carrier(item.encrypted_content)
+                except ValueError as exc:
+                    raise invalid_field(
+                        f"input.{index}.encrypted_content",
+                        "Responses encrypted_content must be an authentic gateway carrier.",
+                    ) from exc
+                if (
+                    messages
+                    and messages[-1].role == "assistant"
+                    and messages[-1].tool_calls
+                    and not messages[-1].provider_reasoning
+                ):
+                    messages[-1] = messages[-1].model_copy(
+                        update={"provider_reasoning": (carrier,)}
+                    )
+                else:
+                    pending_reasoning.append(carrier)
+            else:
+                pending_reasoning.append(
+                    EncryptedReasoningBlock(id=item.id, encrypted_content=item.encrypted_content)
+                )
         elif isinstance(item, _ResponseMessage):
+            flush_calls()
             if item.role != "assistant":
                 flush_orphaned_reasoning()
             converted = _messages((item,), f"input.{index}")
@@ -929,17 +977,13 @@ def _response_input_messages(
                 id=item.call_id,
                 function=_FunctionCall(name=item.name, arguments=item.arguments),
             )
-            messages.append(
-                GatewayMessage(
-                    role="assistant",
-                    tool_calls=(_tool_call(wire_call, f"input.{index}.arguments"),),
-                    provider_reasoning=take_reasoning("assistant"),
-                )
-            )
+            pending_calls.append(_tool_call(wire_call, f"input.{index}.arguments"))
         else:
+            flush_calls()
             flush_orphaned_reasoning()
             messages.append(
                 GatewayMessage(role="tool", content=item.output, tool_call_id=item.call_id)
             )
+    flush_calls()
     flush_orphaned_reasoning()
     return tuple(messages)

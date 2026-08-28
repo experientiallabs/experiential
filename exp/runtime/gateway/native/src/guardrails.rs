@@ -43,11 +43,13 @@ fn decision_failure(decision: &OutputDecision) -> Failure {
 /// Project collected events into the JSON payload Python inspects once.
 pub fn output_argument(request_id: &str, events: &[Event]) -> String {
     let mut text = String::new();
+    let mut reasoning_content = String::new();
     let mut refusal = false;
     let mut tool_calls: Vec<Value> = Vec::new();
     for event in events {
         match event {
             Event::TextDelta(delta) => text.push_str(delta),
+            Event::ReasoningContentDelta { delta, .. } => reasoning_content.push_str(delta),
             Event::RefusalDelta(_) => refusal = true,
             Event::ToolCallCompleted { call, .. } => {
                 tool_calls.push(json!({
@@ -62,6 +64,7 @@ pub fn output_argument(request_id: &str, events: &[Event]) -> String {
     crate::encode::compact_json(&json!({
         "request_id": request_id,
         "text": text,
+        "reasoning_content": reasoning_content,
         "refusal": refusal,
         "tool_calls": tool_calls,
     }))
@@ -144,6 +147,10 @@ mod tests {
     fn output_argument_is_content_shaped_and_request_keyed() {
         let events = vec![
             Event::TextDelta("hello".to_string()),
+            Event::ReasoningContentDelta {
+                route_sha256: "a".repeat(64),
+                delta: "hidden reasoning".to_string(),
+            },
             Event::ToolCallCompleted {
                 index: 0,
                 call: CompletedToolCall {
@@ -157,6 +164,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&output_argument("req-1", &events)).unwrap();
         assert_eq!(payload["request_id"], "req-1");
         assert_eq!(payload["text"], "hello");
+        assert_eq!(payload["reasoning_content"], "hidden reasoning");
         assert_eq!(payload["refusal"], false);
         assert_eq!(payload["tool_calls"][0]["name"], "lookup");
         assert_eq!(payload["tool_calls"][0]["arguments"], "{\"q\":\"x\"}");
