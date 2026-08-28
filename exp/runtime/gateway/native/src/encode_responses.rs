@@ -551,17 +551,18 @@ impl ResponsesSseEncoder {
         status: &str,
         failure: Option<&Failure>,
     ) -> Result<Vec<String>, PublicError> {
-        if status == "completed" && !self.tools.is_empty() && self.fireworks_reasoning.is_some() {
+        if let ("completed", false, Some(reasoning)) = (
+            status,
+            self.tools.is_empty(),
+            self.fireworks_reasoning.as_mut(),
+        ) {
             let carrier = self.reasoning_content_carrier.clone().ok_or_else(|| {
                 invalid_provider_stream(
                     "Responses Fireworks reasoning was not sealed by gateway authority.",
                 )
             })?;
             if self.envelope.include_encrypted_reasoning {
-                self.fireworks_reasoning
-                    .as_mut()
-                    .expect("Fireworks reasoning state is present")
-                    .encrypted_content = Some(carrier);
+                reasoning.encrypted_content = Some(carrier);
             }
         }
         let mut frames = Vec::new();

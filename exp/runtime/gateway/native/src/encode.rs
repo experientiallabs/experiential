@@ -1,7 +1,7 @@
 //! Public Chat Completions encoding, the Rust mirror of `ChatSseEncoder` and
 //! the chat branch of `completed_body`.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -91,12 +91,23 @@ impl ReasoningCarrierState {
                     .insert(*index, (call_id.clone(), name.clone()));
             }
             Event::ToolCallCompleted { index, call } => {
-                if self.tool_ids.get(index) != Some(&(call.call_id.clone(), call.name.clone()))
-                    || self.completed.insert(*index, call.clone()).is_some()
-                {
-                    return Err(invalid_provider_stream(
-                        "Chat tool completion changed or duplicated its identity.",
-                    ));
+                match self.tool_ids.get(index) {
+                    Some((call_id, name)) if call_id == &call.call_id && name == &call.name => {}
+                    _ => {
+                        return Err(invalid_provider_stream(
+                            "Chat tool completion changed or duplicated its identity.",
+                        ));
+                    }
+                }
+                match self.completed.entry(*index) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(call.clone());
+                    }
+                    Entry::Occupied(_) => {
+                        return Err(invalid_provider_stream(
+                            "Chat tool completion changed or duplicated its identity.",
+                        ));
+                    }
                 }
             }
             _ => {}
