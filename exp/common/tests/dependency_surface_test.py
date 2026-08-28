@@ -35,6 +35,8 @@ def test_forbidden_provider_imports_are_absent() -> None:
             ("runtime/models/providers/bedrock.py", "botocore.awsrequest"),
             ("runtime/models/providers/bedrock.py", "botocore.config"),
             ("runtime/models/providers/bedrock.py", "botocore.configprovider"),
+            ("runtime/models/providers/bedrock.py", "botocore.loaders"),
+            ("runtime/models/providers/bedrock.py", "botocore.regions"),
             ("runtime/models/providers/bedrock.py", "botocore"),
             ("runtime/models/providers/bedrock.py", "botocore.session"),
             ("runtime/models/providers/bedrock.py", "botocore.tokens"),
