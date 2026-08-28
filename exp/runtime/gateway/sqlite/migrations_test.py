@@ -473,6 +473,7 @@ def test_v6_migration_preserves_billing_and_adds_physical_ordinal(tmp_path: Path
         assert row == ("attempt-one", 0, 3, "host_managed")
     finally:
         migrated.close()
+
     prior = sqlite3.connect(backup)
     try:
         assert prior.execute("PRAGMA user_version").fetchone()[0] == 5
@@ -1030,7 +1031,9 @@ def test_v13_preserves_a_valid_older_explicit_pair_authority(
     reported_version: int,
 ) -> None:
     """Locator-based schema-11 and local schema-12 pairs migrate and stay active."""
-    path = tmp_path / "gateway.db"
+    manager = GatewayManagement(tmp_path, organization_id="org")
+    manager.state_dir.mkdir(parents=True)
+    path = manager.database_path
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
     connection = connect_database(path)
@@ -1080,6 +1083,28 @@ def test_v13_preserves_a_valid_older_explicit_pair_authority(
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         migrated.close()
+
+    canonical_pair = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="AWS_SECRET_ACCESS_KEY",
+        region="us-west-2",
+        aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+        bedrock_auth_mode="access_key_pair",
+    )
+    changed, replayed = manager.upsert_provider_connection(
+        connection_id="conn",
+        config=canonical_pair,
+    )
+    assert not changed
+    assert replayed.revision_id == "rev"
+    assert manager.disable_provider_connection(connection_id="conn")
+    restored, authority = manager.upsert_provider_connection(
+        connection_id="conn",
+        config=canonical_pair,
+    )
+    assert restored
+    assert authority.active
+    assert authority.revision_id == "rev"
 
 
 @pytest.mark.parametrize("auth_mode", ("access_key_pair", "api_key"))

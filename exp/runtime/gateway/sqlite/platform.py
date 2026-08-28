@@ -190,15 +190,13 @@ class SQLiteGatewayPlatform:
             require_gateway_servable_provider(
                 connection_id=command.connection_id, provider=command.provider
             )
-            changed, authority = self.control.upsert_provider_connection(
+            changed, _authority = self.control.upsert_provider_connection(
                 organization_id=command.organization_id,
                 connection_id=command.connection_id,
                 revision_id=command.revision_id,
                 config=sqlite_connection_config(command),
                 replace=command.replace,
             )
-            if not changed and authority.revision_id != command.revision_id:
-                raise ValueError("provider connection replay names a different immutable revision")
             action = NaturalMutationAction.UPSERT_PROVIDER_CONNECTION
         else:
             changed = self.control.disable_provider_connection(

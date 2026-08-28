@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ContractModel, stable_id
+from exp.common.core.artifacts import ContractModel
 from exp.common.models import (
     GATEWAY_EXCLUDED_PROVIDERS,
     ConnectionConfig,
@@ -23,6 +23,7 @@ from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionAuthority,
     ProviderConnectionBinding,
     ProviderConnectionMutation,
+    provider_connection_revision_id,
 )
 from exp.runtime.gateway.sqlite.store import GatewayStoreError, SQLiteGatewayStore
 from exp.runtime.models import SUPPORTED_PROVIDERS
@@ -185,7 +186,7 @@ class GatewayManagement:
             connection_id=connection_id,
             provider=config.provider,
         )
-        revision_id = _provider_connection_revision_id(connection_id, config)
+        revision_id = provider_connection_revision_id(connection_id, config)
         return self.require_initialized().upsert_provider_connection(
             organization_id=self.organization_id,
             connection_id=connection_id,
@@ -224,7 +225,7 @@ class GatewayManagement:
         mutations = tuple(
             ProviderConnectionMutation(
                 connection_id=connection_id,
-                revision_id=_provider_connection_revision_id(connection_id, config),
+                revision_id=provider_connection_revision_id(connection_id, config),
                 config=config,
             )
             for connection_id, config in sorted(provider_connections.items())
@@ -280,7 +281,7 @@ class GatewayManagement:
         mutations = tuple(
             ProviderConnectionMutation(
                 connection_id=connection_id,
-                revision_id=_provider_connection_revision_id(connection_id, config),
+                revision_id=provider_connection_revision_id(connection_id, config),
                 config=config,
             )
             for connection_id, config in sorted(provider_connections.items())
@@ -919,21 +920,6 @@ class GatewayManagement:
 def _datetime(value: object) -> datetime | None:
     """Parse one optional stored UTC timestamp."""
     return None if value is None else datetime.fromisoformat(str(value))
-
-
-def _provider_connection_revision_id(
-    connection_id: str,
-    config: ConnectionConfig,
-) -> str:
-    """Derive one immutable revision from canonical serving authority."""
-    canonical = config.canonicalized()
-    return stable_id(
-        "provider-connection-revision",
-        {
-            "connection_id": connection_id,
-            "config": canonical.model_dump(mode="json", exclude_none=False),
-        },
-    )
 
 
 def _required_datetime(value: object) -> datetime:

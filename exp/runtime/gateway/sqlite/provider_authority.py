@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Literal, cast
 
-from exp.common.core.artifacts import ContractModel, Sha256
+from exp.common.core.artifacts import ContractModel, Sha256, stable_id
 from exp.common.models import ConnectionConfig
 
 
@@ -38,6 +38,18 @@ class ProviderConnectionAuthority(ContractModel):
     connection_sha256: Sha256
     config: ConnectionConfig
     active: bool = True
+
+
+def provider_connection_revision_id(connection_id: str, config: ConnectionConfig) -> str:
+    """Derive one immutable revision from canonical serving authority."""
+    canonical = config.canonicalized()
+    return stable_id(
+        "provider-connection-revision",
+        {
+            "connection_id": connection_id,
+            "config": canonical.model_dump(mode="json", exclude_none=False),
+        },
+    )
 
 
 def upsert_provider_connection(
@@ -78,9 +90,22 @@ def upsert_provider_connection(
         authority = _authority(current)
         if authority.config == config and authority.connection_sha256 == digest:
             if authority.revision_id != revision_id:
-                raise ProviderAuthorityError(
-                    "provider connection replay names a different immutable revision"
+                canonical_revision_id = provider_connection_revision_id(connection_id, config)
+                revision_owner = connection.execute(
+                    "SELECT 1 FROM provider_connection_revisions WHERE revision_id = ?",
+                    (revision_id,),
+                ).fetchone()
+                migrated_pair = (
+                    config.provider == "bedrock" and config.bedrock_auth_mode == "access_key_pair"
                 )
+                if (
+                    not migrated_pair
+                    or revision_id != canonical_revision_id
+                    or revision_owner is not None
+                ):
+                    raise ProviderAuthorityError(
+                        "provider connection replay names a different immutable revision"
+                    )
             if authority.active:
                 return False, authority
             connection.execute(

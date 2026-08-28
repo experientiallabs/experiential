@@ -28,6 +28,7 @@ from exp.runtime.gateway.sqlite.alias_activation import (
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderAuthorityError,
     ProviderConnectionBinding,
+    provider_connection_revision_id,
 )
 from exp.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
@@ -1205,6 +1206,13 @@ def test_disabled_provider_connection_reuses_its_stable_id(tmp_path: Path) -> No
             organization_id="org-one",
             connection_id="primary",
             revision_id="other-tenant-revision",
+            config=config,
+        )
+    with pytest.raises(ProviderAuthorityError, match="different immutable revision"):
+        store.upsert_provider_connection(
+            organization_id="org-one",
+            connection_id="primary",
+            revision_id=provider_connection_revision_id("primary", config),
             config=config,
         )
     assert store.provider_connections(organization_id="org-one") == ()
