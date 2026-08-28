@@ -69,6 +69,7 @@ SETUP_PROVIDER_LABELS = {
     "anthropic": "anthropic",
     "gemini": "gemini",
     "openrouter": "openrouter",
+    "trustedrouter": "trustedrouter",
     "openai-compatible": "openai-compatible",
     "azure": "azure",
     "bedrock": "bedrock",

@@ -19,7 +19,7 @@ def test_provider_matrix_is_complete_deterministic_and_secret_free() -> None:
     """Every launch-provider cell is labeled and the artifact round-trips exactly."""
     matrix = PROVIDER_CERTIFICATION_MATRIX
 
-    assert len(matrix.cells) == 8 * len(ProviderCapability)
+    assert len(matrix.cells) == 9 * len(ProviderCapability)
     assert {cell.provider for cell in matrix.cells} == {
         "anthropic",
         "azure",
@@ -28,6 +28,7 @@ def test_provider_matrix_is_complete_deterministic_and_secret_free() -> None:
         "openai",
         "openai-compatible",
         "openrouter",
+        "trustedrouter",
         "vertex",
     }
     assert {cell.client_sdk for cell in matrix.cells} == {"openai==3.0.0"}
@@ -64,6 +65,7 @@ def test_provider_matrix_does_not_claim_unperformed_live_credentials() -> None:
         "openai",
         "openai-compatible",
         "openrouter",
+        "trustedrouter",
         "vertex",
     }
     assert all(

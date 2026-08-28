@@ -28,6 +28,7 @@ SETUP_PROVIDERS = frozenset(
         "openai",
         "openai-compatible",
         "openrouter",
+        "trustedrouter",
         "vertex",
     }
 )

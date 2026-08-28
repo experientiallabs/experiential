@@ -75,9 +75,9 @@ def test_gateway_setup_uses_the_shared_provider_setup_seams() -> None:
         ("1", "experiential-cloud"),
         ("2", "openai"),
         ("3", "anthropic"),
-        ("6", "openai-compatible"),
-        ("7", "azure"),
-        ("8", "bedrock"),
+        ("7", "openai-compatible"),
+        ("8", "azure"),
+        ("9", "bedrock"),
     ),
 )
 def test_gateway_provider_selector_exposes_primary_and_legacy_providers(
@@ -108,7 +108,7 @@ def test_gateway_provider_selector_exposes_primary_and_legacy_providers(
 
 def test_gateway_provider_selector_accepts_multiple_providers() -> None:
     """The gateway uses the builder's multi-select semantics instead of forcing one provider."""
-    console = ScriptedConsole("1,2,6,7\n\n")
+    console = ScriptedConsole("1,2,7,8\n\n")
 
     selected = provider_picker.select_providers(
         provider_picker.SetupSession(),
@@ -123,7 +123,7 @@ def test_gateway_provider_selector_uses_the_builder_keyboard_picker() -> None:
     """The gateway selector accepts the same Up, Down, and Enter interaction as the builder."""
     keys = iter(
         (
-            *(PickerKey.DOWN for _ in range(5)),
+            *(PickerKey.DOWN for _ in range(6)),
             PickerKey.ENTER,
             *(PickerKey.DOWN for _ in range(3)),
             PickerKey.ENTER,

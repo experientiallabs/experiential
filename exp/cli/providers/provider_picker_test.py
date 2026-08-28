@@ -187,7 +187,7 @@ def test_keyboard_provider_list_selects_without_typed_numbers() -> None:
             PickerKey.ENTER,
             PickerKey.DOWN,
             PickerKey.ENTER,
-            *(PickerKey.DOWN for _ in range(6)),
+            *(PickerKey.DOWN for _ in range(7)),
             PickerKey.ENTER,
         )
     )
@@ -1093,7 +1093,7 @@ def test_release_tty_walk_selects_azure_then_completes() -> None:
     """The installed-wheel provider walk still lands on Azure, then Complete."""
     keys = iter(
         (
-            *(PickerKey.DOWN for _ in range(6)),
+            *(PickerKey.DOWN for _ in range(7)),
             PickerKey.ENTER,
             *(PickerKey.DOWN for _ in range(2)),
             PickerKey.ENTER,
@@ -1114,7 +1114,7 @@ def test_release_tty_walk_selects_azure_then_completes() -> None:
 
 def test_azure_and_bedrock_force_explicit_manual_model_declaration() -> None:
     """Providers without a safe listing API make the manual model row available explicitly."""
-    console = ScriptedConsole("7,8\n\n")
+    console = ScriptedConsole("8,9\n\n")
 
     selection = select_providers(SetupSession(), console=console, environment={})
 

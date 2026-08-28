@@ -22,6 +22,7 @@ from exp.runtime.models.providers.openai_compatible import (
     OPENROUTER_BASE_URL,
     OPENROUTER_REFERER,
     OPENROUTER_TITLE,
+    TRUSTEDROUTER_BASE_URL,
 )
 from exp.runtime.models.providers.reasoning_compat import default_reasoning_effort
 from exp.runtime.models.providers.transport import (
@@ -112,6 +113,8 @@ class HttpProviderModelLister:
             models = self._anthropic_models(endpoint)
         elif endpoint.provider == "openrouter":
             models = self._openrouter_models(endpoint)
+        elif endpoint.provider == "trustedrouter":
+            models = self._trustedrouter_models(endpoint)
         elif endpoint.provider == "openai":
             models = self._openai_models(endpoint)
         elif endpoint.provider == "openai-compatible":
@@ -195,6 +198,22 @@ class HttpProviderModelLister:
             if identity is None:
                 continue
             models.append(_openrouter_model(endpoint.provider, identity, entry))
+        return models
+
+    def _trustedrouter_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
+        """List TrustedRouter models, which publish roles, context limits, and prices."""
+        base_url = _base_url(endpoint, default=TRUSTEDROUTER_BASE_URL)
+        body = self._read(
+            endpoint,
+            f"{base_url}/models",
+            {"Authorization": f"Bearer {endpoint.api_key}"},
+        )
+        models = []
+        for entry in _entries(endpoint.provider, body.get("data")):
+            identity = _text(entry.get("id"))
+            if identity is None:
+                continue
+            models.append(_trustedrouter_model(endpoint.provider, identity, entry))
         return models
 
     def _gemini_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
@@ -324,6 +343,41 @@ def _openrouter_model(provider: str, identity: str, entry: JsonObject) -> Discov
         cache_write_cost_per_million_tokens_usd=_million_token_price(
             prices.get("input_cache_write")
         ),
+    )
+
+
+def _trustedrouter_model(provider: str, identity: str, entry: JsonObject) -> DiscoveredModel:
+    """Build one discovered model from a TrustedRouter catalog entry.
+
+    The catalog is OpenRouter-shaped but publishes no ``supported_parameters`` array, so
+    sampling, tool, and reasoning support stay unknown rather than being inferred from a
+    neighboring field. Roles, context window, and token prices are published and are kept.
+
+    Args:
+        provider: Setup provider kind, always ``trustedrouter``.
+        identity: Provider-published model ID.
+        entry: One object from the ``data`` array.
+
+    Returns:
+        The identity plus the roles, limits, and prices TrustedRouter actually declares.
+    """
+    pricing = entry.get("pricing")
+    prices: JsonObject = cast(JsonObject, pricing) if isinstance(pricing, dict) else {}
+    routing = entry.get("trustedrouter")
+    route: JsonObject = cast(JsonObject, routing) if isinstance(routing, dict) else {}
+    supports_chat = route.get("supports_chat")
+    supports_embeddings = route.get("supports_embeddings")
+    return DiscoveredModel(
+        provider=provider,
+        model=identity,
+        supports_completions=supports_chat if isinstance(supports_chat, bool) else None,
+        supports_embeddings=(
+            supports_embeddings if isinstance(supports_embeddings, bool) else None
+        ),
+        chat_max_tokens_field="max_tokens",
+        context_window_tokens=_positive_int(entry.get("context_length")),
+        input_cost_per_million_tokens_usd=_million_token_price(prices.get("prompt")),
+        output_cost_per_million_tokens_usd=_million_token_price(prices.get("completion")),
     )
 
 

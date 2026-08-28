@@ -47,6 +47,7 @@ from exp.runtime.models.providers.reasoning_compat import (
 from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+TRUSTEDROUTER_BASE_URL = "https://api.trustedrouter.com/v1"
 OPENROUTER_REFERER = "https://github.com/experientiallabs/experiential"
 OPENROUTER_TITLE = "experiential"
 

@@ -33,6 +33,7 @@ from exp.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
 from exp.runtime.models.providers.openai import OPENAI_BASE_URL, OpenAIClient
 from exp.runtime.models.providers.openai_compatible import (
     OPENROUTER_BASE_URL,
+    TRUSTEDROUTER_BASE_URL,
     OpenAICompatibleClient,
     OpenRouterClient,
 )
@@ -374,7 +375,7 @@ class RuntimeModelCatalog:
             "base_url": base_url,
             "transport": self._transport_factory(),
         }
-        if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
+        if provider in {"anthropic", "gemini", "openrouter", "trustedrouter", "openai-compatible"}:
             http_kwargs.update(
                 {
                     "supports_temperature": capabilities.supports_temperature,
@@ -383,16 +384,16 @@ class RuntimeModelCatalog:
                     "supports_logprobs": _supports_flag(capabilities, "supports_logprobs"),
                 }
             )
-        if provider in {"openrouter", "openai-compatible"}:
+        if provider in {"openrouter", "trustedrouter", "openai-compatible"}:
             http_kwargs["chat_max_tokens_field"] = capabilities.chat_max_tokens_field
-        if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
+        if provider in {"anthropic", "gemini", "openrouter", "trustedrouter", "openai-compatible"}:
             http_kwargs.update(
                 {
                     "supports_reasoning": capabilities.supports_reasoning,
                     "reasoning_effort": capabilities.reasoning_effort,
                 }
             )
-        if provider in {"openrouter", "openai-compatible"}:
+        if provider in {"openrouter", "trustedrouter", "openai-compatible"}:
             http_kwargs["sampling_requires_reasoning_none"] = (
                 capabilities.sampling_requires_reasoning_none
             )
@@ -484,6 +485,7 @@ _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
     "gemini": (GeminiClient, GEMINI_BASE_URL),
     "openai-compatible": (OpenAICompatibleClient, None),
     "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
+    "trustedrouter": (OpenAICompatibleClient, TRUSTEDROUTER_BASE_URL),
 }
 
 SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {

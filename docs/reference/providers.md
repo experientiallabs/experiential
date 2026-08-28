@@ -8,7 +8,7 @@ Configure connections with `exp config providers` or the first `exp build` on a 
 An interactive terminal opens a provider list: Up and Down move focus, Enter selects or deselects
 the focused provider, and the Complete row submits the selection. Agents skip that list with
 repeatable `--provider` flags (`experiential-cloud`, `openai`, `anthropic`, `gemini`, `openrouter`,
-`openai-compatible`, `azure`, `bedrock`). Unsupported or duplicate values
+`trustedrouter`, `openai-compatible`, `azure`, `bedrock`). Unsupported or duplicate values
 fail before any catalog write. Azure and Bedrock still require manual model IDs. Other selected
 providers use account model discovery when credentials are available.
 
@@ -55,6 +55,7 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 |---|---|---|---|
 | OpenAI | `openai` | `api_key_env` (suggested `OPENAI_API_KEY`) | Official OpenAI origin |
 | OpenRouter | `openrouter` | `api_key_env` (suggested `OPENROUTER_API_KEY`) | Official OpenRouter origin |
+| TrustedRouter | `trustedrouter` | `api_key_env` (suggested `TRUSTEDROUTER_API_KEY`) | Official TrustedRouter origin |
 | Anthropic | `anthropic` | `api_key_env` (suggested `ANTHROPIC_API_KEY`) | Official Anthropic origin |
 | Gemini | `gemini` | `api_key_env` (suggested `GEMINI_API_KEY`) | Official Gemini origin |
 | OpenAI-compatible | `openai-compatible` | `api_key_env` plus explicit `base_url` | Catalog `base_url` |
@@ -66,6 +67,17 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 
 Native fixed-origin providers reject a custom `base_url`. Use `openai-compatible` for a trusted
 third-party OpenAI-compatible host.
+
+## TrustedRouter listing metadata
+
+`trustedrouter` lists an OpenRouter-shaped catalog from its own origin. Setup keeps the fields it
+publishes: the completion and embedding roles from `trustedrouter.supports_chat` and
+`trustedrouter.supports_embeddings`, `context_length`, and the `pricing.prompt` and
+`pricing.completion` per-token prices. The catalog publishes no `supported_parameters` array, so
+tool, structured-output, sampling, and reasoning support stay unknown and the operator declares the
+minimum fields for a selected role, the same way an identity-only OpenAI-compatible model does. A
+model that reports a non-positive `context_length` keeps an unknown context window rather than
+borrowing one from a neighboring field.
 
 ## OpenAI-compatible listing metadata
 

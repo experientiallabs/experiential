@@ -68,6 +68,7 @@ class ProviderCertificationMatrix(ContractModel):
             "openai",
             "openai-compatible",
             "openrouter",
+            "trustedrouter",
             "vertex",
         }
         expected = {
@@ -96,6 +97,7 @@ _PROVIDER_API_SURFACES = {
     "openai": "responses SSE",
     "openai-compatible": "chat.completions SSE",
     "openrouter": "chat.completions SSE",
+    "trustedrouter": "chat.completions SSE",
     "vertex": "streamGenerateContent SSE",
 }
 _GEMINI_EVIDENCE = ("exp/runtime/gateway/tests/native_dialect_parity_test.py",)
@@ -211,7 +213,7 @@ def _compatible_provider_cells(provider: str) -> tuple[ProviderCertificationCell
     """Return inherited compatible-stream results without claiming a live run.
 
     Args:
-        provider: Azure or OpenRouter provider identifier.
+        provider: Identifier of a provider served by the generic compatible adapter.
 
     Returns:
         Complete capability cells for the compatible adapter.
@@ -276,6 +278,7 @@ PROVIDER_CERTIFICATION_MATRIX = ProviderCertificationMatrix(
                 *_native_provider_cells("bedrock", _BEDROCK_EVIDENCE),
                 *_compatible_provider_cells("azure"),
                 *_compatible_provider_cells("openrouter"),
+                *_compatible_provider_cells("trustedrouter"),
             ),
             key=lambda cell: (cell.provider, cell.capability.value),
         )

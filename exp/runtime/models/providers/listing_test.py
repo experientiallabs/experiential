@@ -319,6 +319,82 @@ def test_openrouter_listing_reads_capabilities_limits_and_prices() -> None:
     assert model.cache_write_cost_per_million_tokens_usd is None
 
 
+def test_trustedrouter_listing_reads_roles_limits_and_prices() -> None:
+    """TrustedRouter publishes roles, context length, and per-token prices."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [
+                    {
+                        "id": "anthropic/claude-opus-4.5",
+                        "name": "Anthropic: Claude Opus 4.5",
+                        "context_length": 200000,
+                        "pricing": {
+                            "prompt": "0.000005275",
+                            "completion": "0.000026375",
+                        },
+                        "top_provider": {"max_completion_tokens": None},
+                        "trustedrouter": {
+                            "provider": "anthropic",
+                            "supports_chat": True,
+                            "supports_embeddings": False,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    models = _lister(transport).list_models(
+        ProviderEndpoint(provider="trustedrouter", api_key="secret-key")
+    )
+
+    assert len(models) == 1
+    model = models[0]
+    assert model.model == "anthropic/claude-opus-4.5"
+    assert model.supports_completions is True
+    assert model.supports_embeddings is False
+    assert model.chat_max_tokens_field == "max_tokens"
+    assert model.context_window_tokens == 200000
+    assert model.input_cost_per_million_tokens_usd == pytest.approx(5.275)
+    assert model.output_cost_per_million_tokens_usd == pytest.approx(26.375)
+    request = transport.requests[0]
+    assert request.url == "https://api.trustedrouter.com/v1/models"
+    assert request.headers["Authorization"] == "Bearer secret-key"
+
+
+def test_trustedrouter_listing_leaves_undeclared_capabilities_unknown() -> None:
+    """The catalog publishes no ``supported_parameters``, so nothing is inferred for it."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [
+                    {
+                        "id": "trustedrouter/auto",
+                        "name": "TrustedRouter Auto",
+                        "context_length": 200000,
+                        "pricing": {"prompt": "0.0000000844", "completion": "0.0000001899"},
+                        "trustedrouter": {"provider": "trustedrouter", "supports_chat": True},
+                    }
+                ]
+            }
+        )
+    )
+
+    model = _lister(transport).list_models(
+        ProviderEndpoint(provider="trustedrouter", api_key="secret-key")
+    )[0]
+
+    assert model.supports_tools is None
+    assert model.supports_structured_output is None
+    assert model.supports_temperature is None
+    assert model.supports_top_p is None
+    assert model.supports_reasoning is None
+    assert model.supports_embeddings is None
+    assert model.maximum_output_tokens is None
+    assert model.cached_input_cost_per_million_tokens_usd is None
+
+
 def test_gemini_listing_follows_pages_and_drops_the_resource_prefix() -> None:
     """Gemini paginates its model resources and prefixes each identity with ``models/``."""
     transport = _transport(

@@ -14,6 +14,7 @@ CANONICAL_API_KEY_ENV = {
     "azure": "AZURE_OPENAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+    "trustedrouter": "TRUSTEDROUTER_API_KEY",
     "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
     "tinker": "TINKER_API_KEY",
 }

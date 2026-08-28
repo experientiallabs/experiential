@@ -2491,7 +2491,7 @@ def _installed_release_driver() -> None:
             "Providers",
             # Experiential Cloud is first, then openai through openai-compatible and Azure;
             # Complete is after Bedrock.
-            (down * 6) + enter + (down * 2) + enter,
+            (down * 7) + enter + (down * 2) + enter,
         ),
         ("azure base URL", azure_endpoint),
         ("Azure OpenAI API version", ""),
