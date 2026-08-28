@@ -105,7 +105,7 @@ pub fn transport_failure(status: Option<u16>) -> Failure {
 fn open_timeout_failure() -> Failure {
     Failure::new(
         FailureClass::Timeout,
-        "provider did not send response headers in time; failing over to the next deployment",
+        "provider did not send response headers in time",
     )
     .with_retry(false, true)
 }

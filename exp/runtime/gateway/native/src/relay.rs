@@ -69,7 +69,7 @@ pub fn stream_timeout_failure(deadline: Instant) -> Failure {
 pub fn first_byte_timeout_failure() -> Failure {
     Failure::new(
         FailureClass::Timeout,
-        "provider did not send the first token in time; failing over to the next deployment",
+        "provider did not send the first token in time",
     )
     .with_retry(false, true)
 }
