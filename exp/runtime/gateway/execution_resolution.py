@@ -10,6 +10,10 @@ from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.protocol import NativeWireClient
 
 
+class GatewayWireContractError(ValueError):
+    """A resolved provider profile contradicts the frozen gateway contract."""
+
+
 def _resolved_wire_profile(
     deployment: ExactModelDeployment,
     runtime_model: ResolvedModel,
@@ -25,12 +29,20 @@ def _resolved_wire_profile(
         intersected against the deployment's catalog capabilities.
 
     Raises:
+        GatewayWireContractError: Catalog reasoning metadata contradicts the
+            resolved model or provider wire profile.
         TypeError: The resolved client exposes no native wire profile.
     """
     capabilities = runtime_model.capabilities
     gateway_capabilities = deployment.gateway.capabilities
     if isinstance(runtime_model.client, NativeWireClient):
         profile = runtime_model.client.gateway_wire_profile()
+        if gateway_capabilities.declares_reasoning_contract and (
+            not capabilities.supports_reasoning or not profile.supports_reasoning
+        ):
+            raise GatewayWireContractError(
+                "gateway reasoning metadata conflicts with the resolved provider wire profile"
+            )
         output_limits = tuple(
             limit
             for limit in (

@@ -408,6 +408,8 @@ class ModelCapabilities(ContractModel):
         for name, minimum, maximum in ranges:
             if minimum is not None and maximum is not None and minimum > maximum:
                 raise ValueError(f"minimum_{name} cannot exceed maximum_{name}")
+        if self.reasoning_effort is not None and not self.supports_reasoning:
+            raise ValueError("reasoning_effort requires reasoning support")
         if self.sampling_requires_reasoning_none and not self.supports_reasoning:
             raise ValueError("conditional sampling requires reasoning support")
         return self

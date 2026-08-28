@@ -37,6 +37,17 @@ class ExactModelDeployment(ContractModel):
     capabilities: ModelCapabilities | None = None
     gateway: GatewayDeploymentMetadata = Field(default_factory=GatewayDeploymentMetadata)
 
+    @model_validator(mode="after")
+    def _require_consistent_reasoning_contract(self) -> ExactModelDeployment:
+        """Reject a gateway reasoning override that the frozen model cannot support."""
+        if self.gateway.capabilities.declares_reasoning_contract and (
+            self.capabilities is None or not self.capabilities.supports_reasoning
+        ):
+            raise ValueError(
+                "gateway reasoning metadata requires model capabilities.supports_reasoning=true"
+            )
+        return self
+
 
 class ExactModelPool(ContractModel):
     """An ordered set of deployments certified as one exact logical model."""

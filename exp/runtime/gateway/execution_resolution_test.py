@@ -14,6 +14,7 @@ from exp.common.models.catalog import (
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.execution_resolution import (
+    GatewayWireContractError,
     _require_deployment_identity,
     _resolved_wire_profile,
 )
@@ -139,6 +140,26 @@ def test_profile_resolution_applies_exact_gateway_reasoning_values() -> None:
     assert resolved.supported_reasoning_efforts == ("low", "high", "max")
     assert resolved.reasoning_effort == "high"
     assert resolved.reasoning_effort_required is True
+
+
+def test_profile_resolution_rejects_provider_reasoning_contract_conflict() -> None:
+    """A provider profile cannot silently weaken frozen gateway reasoning metadata."""
+    capabilities = ModelCapabilities(supports_reasoning=True)
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://example.test/v1/chat/completions",
+    )
+    gateway_capabilities = GatewayDeploymentCapabilities(
+        supported_reasoning_efforts=("medium",),
+        reasoning_default_effort="medium",
+        reasoning_effort_required=True,
+    )
+
+    with pytest.raises(GatewayWireContractError, match="reasoning metadata conflicts"):
+        _resolved_wire_profile(
+            _deployment(capabilities, gateway_capabilities),
+            _resolved(_NativeClient(profile), capabilities),
+        )
 
 
 def test_profile_resolution_requires_a_native_wire_client() -> None:

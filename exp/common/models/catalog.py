@@ -245,6 +245,15 @@ class GatewayDeploymentCapabilities(ContractModel):
     reports_cached_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
 
+    @property
+    def declares_reasoning_contract(self) -> bool:
+        """Whether this metadata overrides provider-family reasoning behavior."""
+        return bool(
+            self.supported_reasoning_efforts
+            or self.reasoning_default_effort is not None
+            or self.reasoning_effort_required
+        )
+
     @model_validator(mode="after")
     def _require_valid_reasoning_contract(self) -> GatewayDeploymentCapabilities:
         """Reject ambiguous or non-canonical reasoning declarations."""
@@ -355,6 +364,15 @@ class ModelRecord(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_model_identity(self) -> ModelRecord:
+        """Reject contradictory reasoning metadata and credential-bearing identity fields."""
+        if (
+            self.gateway is not None
+            and self.gateway.capabilities.declares_reasoning_contract
+            and (self.capabilities is None or not self.capabilities.supports_reasoning)
+        ):
+            raise ValueError(
+                "gateway reasoning metadata requires model capabilities.supports_reasoning=true"
+            )
         if (
             self.sft_provenance is not None
             and self.sft_provenance.sampling_handle_sha256

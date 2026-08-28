@@ -314,3 +314,84 @@ def test_native_serving_blockers_name_dialectless_providers(
     assert blockers[0].startswith("escalated: ")
     assert "gemini" in blockers[0]
     assert "native dialect" in blockers[0]
+
+
+def test_native_serving_blockers_name_reasoning_wire_contract_conflicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rust startup rejects catalog reasoning metadata the provider profile cannot carry."""
+    from dataclasses import replace
+
+    from exp.common.models import (
+        GatewayDeploymentCapabilities,
+        GatewayTokenPrices,
+        ModelCapabilities,
+    )
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+    from exp.runtime.gateway.lifecycle import load_gateway_components
+    from exp.runtime.gateway.lifecycle_test import _configured_gateway
+    from exp.runtime.gateway.native_execution import native_serving_blockers
+    from exp.runtime.models.providers.base import GatewayWireProfile
+    from exp.runtime.models.providers.gemini import GeminiClient
+
+    original_wire_profile = GeminiClient.gateway_wire_profile
+
+    def _profile_without_reasoning(self: GeminiClient) -> GatewayWireProfile:
+        """Return a valid profile that contradicts the authored reasoning contract."""
+        return replace(
+            original_wire_profile(self),
+            supports_reasoning=False,
+            reasoning_wire_format="none",
+        )
+
+    monkeypatch.setattr(GeminiClient, "gateway_wire_profile", _profile_without_reasoning)
+
+    manager, _raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="reasoning",
+        connection_name="gemini-main",
+        provider_model="gemini-model-exact",
+        exact_model_id="gemini-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(supports_reasoning=True),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supported_reasoning_efforts=("medium",),
+            reasoning_default_effort="medium",
+            reasoning_effort_required=True,
+        ),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="reasoning",
+        alias_name="reasoning",
+        revision_id="revision-reasoning",
+        pool_id="reasoning",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="reasoning")
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_GEMINI_KEY": "gemini-secret-canary"},
+    )
+
+    blockers = native_serving_blockers(components)
+
+    assert len(blockers) == 1
+    assert blockers[0].startswith("reasoning: ")
+    assert "invalid reasoning wire contract" in blockers[0]

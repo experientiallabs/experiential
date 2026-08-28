@@ -282,7 +282,7 @@ def test_connections_only_catalog_round_trips_without_optimizer_roles(tmp_path: 
 def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) -> None:
     """Gateway protocol and integer pricing metadata persist outside frozen capabilities."""
     path = tmp_path / "models.toml"
-    capabilities = ModelCapabilities(supports_tools=True)
+    capabilities = ModelCapabilities(supports_tools=True, supports_reasoning=True)
     original_identity = capabilities.identity_sha256()
     catalog = ModelCatalog(
         connections={"openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")},
@@ -358,6 +358,25 @@ def test_gateway_reasoning_default_must_be_supported() -> None:
         GatewayDeploymentCapabilities(
             supported_reasoning_efforts=("low", "high"),
             reasoning_default_effort="max",
+        )
+
+
+@pytest.mark.parametrize("capabilities", (None, ModelCapabilities()))
+def test_gateway_reasoning_metadata_requires_model_reasoning_support(
+    capabilities: ModelCapabilities | None,
+) -> None:
+    """Authored reasoning metadata cannot contradict the model capability contract."""
+    with pytest.raises(ValueError, match="supports_reasoning=true"):
+        ModelRecord(
+            connection="openai",
+            model="gpt-coding",
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            capabilities=capabilities,
+            gateway=GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(
+                    supported_reasoning_efforts=("medium",),
+                )
+            ),
         )
 
 

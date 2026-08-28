@@ -163,6 +163,12 @@ def test_completion_support_preserves_provider_identity_for_existing_traces() ->
         )
 
 
+def test_reasoning_effort_requires_explicit_reasoning_support() -> None:
+    """A pinned effort cannot create reasoning support by implication."""
+    with pytest.raises(ValidationError, match="reasoning_effort requires reasoning support"):
+        ModelCapabilities(reasoning_effort="high")
+
+
 def test_routed_candidate_payload_serializes_explicit_billing_source() -> None:
     """Automatic capability freezing retains the model billing source byte for byte."""
     payload = {

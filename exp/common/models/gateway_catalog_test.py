@@ -11,6 +11,7 @@ from exp.common.core.artifacts import ArtifactInput, sha256_json
 from exp.common.models.catalog import (
     BillingSource,
     ConnectionConfig,
+    GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayEquivalenceCertification,
     GatewayPoolRecord,
@@ -154,6 +155,29 @@ def test_legacy_normalized_deployment_defaults_to_customer_managed_billing() -> 
     )
 
     assert deployment.billing_source == BillingSource.CUSTOMER_MANAGED
+
+
+def test_normalized_deployment_rejects_inconsistent_reasoning_metadata() -> None:
+    """Persisted snapshots cannot combine required reasoning with unsupported models."""
+    with pytest.raises(ValidationError, match="supports_reasoning=true"):
+        ExactModelDeployment(
+            deployment_id="coding",
+            source_alias="coding",
+            exact_model_id="exact-coding",
+            connection="openai",
+            provider="openai",
+            provider_model="gpt-coding",
+            connection_sha256="a" * 64,
+            capabilities_sha256="b" * 64,
+            capabilities=ModelCapabilities(),
+            gateway=GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(
+                    supported_reasoning_efforts=("medium",),
+                    reasoning_default_effort="medium",
+                    reasoning_effort_required=True,
+                )
+            ),
+        )
 
 
 def test_tinker_and_sft_records_are_not_gateway_deployments() -> None:

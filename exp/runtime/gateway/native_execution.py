@@ -25,6 +25,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.execution_resolution import (
+    GatewayWireContractError,
     _require_deployment_identity,
     _resolved_wire_profile,
 )
@@ -347,12 +348,17 @@ def native_serving_blockers(components: LocalGatewayComponents) -> tuple[str, ..
                 reasons.append(f"provider {deployment.provider!r} has no native wire profile")
                 continue
             try:
-                client.gateway_wire_profile()
+                _resolved_wire_profile(deployment, resolved)
             except ProviderCapabilityError as exc:
                 if exc.capability != "native_data_plane":
                     raise
                 reasons.append(
                     f"provider {deployment.provider!r} has no native dialect implementation"
+                )
+            except GatewayWireContractError:
+                reasons.append(
+                    f"deployment {deployment.deployment_id!r} has an invalid "
+                    "reasoning wire contract"
                 )
         if reasons:
             unique = ", ".join(dict.fromkeys(reasons))
