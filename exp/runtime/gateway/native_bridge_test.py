@@ -76,7 +76,7 @@ _PublicErrorType = Literal[
         ),
         ("stop_sequences", "stop", None, "stop_sequences"),
         ("streaming", "stream", "stream", "stream"),
-        ("streaming_tool_arguments", "stream", "stream", "stream"),
+        ("streaming_tool_arguments", "tools", "tools", "tools"),
         ("strict_tools", "tools", "tools", "tools"),
         ("structured_output", "response_format", "text.format", None),
         ("structured_text", "response_format", "text.format", None),
@@ -94,19 +94,18 @@ def test_public_capability_params_name_real_surface_fields(
     assert _public_capability_param(capability, GatewayApiSurface.MESSAGES) == messages_param
 
 
-def test_internal_tool_streaming_failure_names_the_public_tools_field() -> None:
-    """A transport detail never blames stream when the caller requested non-streaming tools."""
+def test_tool_argument_streaming_failure_names_the_public_tools_field() -> None:
+    """Tool argument transport failures identify the tool request that activated them."""
     for surface in GatewayApiSurface:
-        for capability in ("streaming", "streaming_tool_arguments"):
-            assert (
-                _public_capability_param(
-                    capability,
-                    surface,
-                    public_stream=False,
-                    public_tools=True,
-                )
-                == "tools"
+        assert (
+            _public_capability_param(
+                "streaming_tool_arguments",
+                surface,
+                public_stream=False,
+                public_tools=True,
             )
+            == "tools"
+        )
 
 
 def test_internal_text_streaming_failure_has_no_fake_public_field() -> None:
@@ -145,8 +144,8 @@ def test_public_capability_error_never_exposes_internal_labels() -> None:
     assert "tinker_gateway_execution" not in error.detail.message
 
 
-def test_public_capability_error_attributes_forced_streaming_to_tools() -> None:
-    """An internal streaming requirement identifies the tools field that activated it."""
+def test_forced_streaming_deficit_names_the_model_route() -> None:
+    """Removing caller fields cannot cure a route that lacks required transport streaming."""
     error = _public_capability_error(
         ProviderCapabilityError(capability="streaming"),
         GatewayApiSurface.CHAT_COMPLETIONS,
@@ -154,8 +153,8 @@ def test_public_capability_error_attributes_forced_streaming_to_tools() -> None:
         public_tools=True,
     )
 
-    assert error.detail.param == "tools"
-    assert "'tools'" in error.detail.message
+    assert error.detail.param == "model"
+    assert "different model alias" in error.detail.message
     assert "streaming" not in error.detail.message
 
 
@@ -1221,8 +1220,8 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
     assert "internal" not in error["code"]
 
 
-def test_non_streaming_tool_transport_failure_names_tools_not_stream(tmp_path: Path) -> None:
-    """Internally forced streaming attributes incompatibility to the declared tools field."""
+def test_non_streaming_transport_failure_names_the_model_route(tmp_path: Path) -> None:
+    """A retry cannot remove the gateway's internally required streaming transport."""
     unsupported = GatewayDeploymentCapabilities(supports_strict_tools=True)
     control, raw_key = _pool_control_plane(
         tmp_path,
@@ -1253,7 +1252,8 @@ def test_non_streaming_tool_transport_failure_names_tools_not_stream(tmp_path: P
 
     error = json.loads(raised.value.public_error_json)
     assert error["code"] == "unsupported_capability"
-    assert error["param"] == "tools"
+    assert error["param"] == "model"
+    assert "different model alias" in error["message"]
 
 
 def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Path) -> None:

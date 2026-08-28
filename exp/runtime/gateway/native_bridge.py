@@ -159,10 +159,10 @@ def _public_capability_param(
     public_tools: bool = False,
 ) -> str | None:
     """Translate an internal capability label to the caller's request field."""
-    if capability == "streaming_tool_arguments" and not public_stream:
+    if capability == "streaming_tool_arguments":
         return "tools"
     if capability == "streaming" and not public_stream:
-        return "tools" if public_tools else None
+        return None
     return _PUBLIC_REQUEST_CAPABILITY_PARAMS[surface].get(capability)
 
 
