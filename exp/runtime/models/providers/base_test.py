@@ -314,7 +314,12 @@ def test_complete_passes_the_derived_timeout_to_the_transport() -> None:
     client.complete(ModelRequest(messages=(message,), maximum_output_tokens=16_000))
     client.complete(ModelRequest(messages=(message,)))
 
-    assert transport.timeouts == [
-        pytest.approx(480.0),
-        pytest.approx(DEFAULT_TIMEOUT_SECONDS),
-    ]
+    # Each attempt is bounded by the derived timeout minus the wall time
+    # already spent under the request deadline, so scheduling jitter legally
+    # lands the observed value slightly below the exact derivation. The
+    # contract under test is WHICH timeout reached the transport (the
+    # token-scaled one, then the configured default), so a whole second of
+    # slack still distinguishes 480.0 from 60.0 unambiguously.
+    assert len(transport.timeouts) == 2
+    for observed, derived in zip(transport.timeouts, (480.0, DEFAULT_TIMEOUT_SECONDS), strict=True):
+        assert derived - 1.0 < observed <= derived
