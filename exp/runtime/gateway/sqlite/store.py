@@ -606,19 +606,14 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         now = utc_text(self._clock.now())
         with self._transaction() as connection:
             connection.execute(
-                """
-                DELETE FROM project_activation_bindings
-                WHERE organization_id = ? AND alias_id = ? AND revision_id = ?
-                """,
+                "DELETE FROM project_activation_bindings WHERE organization_id = ? "
+                "AND alias_id = ? AND revision_id = ?",
                 (organization_id, alias_id, revision_id),
             )
             result = connection.execute(
-                """
-                UPDATE gateway_aliases
-                SET active = 0, active_revision_id = NULL, updated_at = ?
-                WHERE organization_id = ? AND alias_id = ?
-                  AND active = 1 AND active_revision_id = ?
-                """,
+                "UPDATE gateway_aliases SET active = 0, active_revision_id = NULL, "
+                "updated_at = ? WHERE organization_id = ? AND alias_id = ? "
+                "AND active = 1 AND active_revision_id = ?",
                 (now, organization_id, alias_id, revision_id),
             )
         return result.rowcount == 1
