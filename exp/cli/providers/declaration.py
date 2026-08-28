@@ -1,7 +1,8 @@
 """Operator-declared capability and price metadata for discovered model identities.
 
-Discovery may list an OpenAI-compatible identity before any capability or price is proven.
-This module collects only the minimum fields a selected build role needs, confirms published
+Discovery may list an identity before any capability or price is proven, either from an
+OpenAI-compatible endpoint or from a router whose catalog omits the parameter array. This
+module collects only the minimum fields a selected build role needs, confirms published
 values when they exist, and never infers tools, structured output, token limits, or prices.
 """
 
@@ -13,6 +14,7 @@ from rich.console import Console
 from rich.prompt import Confirm, IntPrompt
 
 from exp.cli.providers.provider_picker import (
+    OPERATOR_DECLARED_PROVIDERS,
     UNKNOWN_METADATA_LABEL,
     AvailableModel,
     SetupCancelled,
@@ -64,9 +66,10 @@ def can_declare_role(item: AvailableModel, role: SetupRole) -> bool:
         role: Build role the operator selected.
 
     Returns:
-        ``True`` only for OpenAI-compatible identities that do not already prove the role.
+        ``True`` only for a provider whose listing can leave a model unknown, and only when
+        that model does not already prove the role.
     """
-    if item.provider != "openai-compatible":
+    if item.provider not in OPERATOR_DECLARED_PROVIDERS:
         return False
     return item.capabilities is None or not serves_role(item.capabilities, role)
 

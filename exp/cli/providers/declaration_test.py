@@ -1,4 +1,4 @@
-"""Operator declaration tests for identity-only OpenAI-compatible models."""
+"""Operator declaration tests for identities a listing left unproven."""
 
 from __future__ import annotations
 
@@ -9,7 +9,11 @@ from exp.cli.providers.declaration import (
     merge_declared_models,
     role_row_detail,
 )
-from exp.cli.providers.provider_picker import UNKNOWN_METADATA_LABEL, AvailableModel
+from exp.cli.providers.provider_picker import (
+    OPERATOR_DECLARED_PROVIDERS,
+    UNKNOWN_METADATA_LABEL,
+    AvailableModel,
+)
 from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.models import (
     DiscoveredModel,
@@ -180,6 +184,29 @@ def test_official_models_are_not_declarable() -> None:
 
     assert not can_declare_role(item, SetupRole.WORLD_MODEL)
     assert not eligible_for_role(item, SetupRole.WORLD_MODEL)
+
+
+def test_router_identities_without_a_parameter_array_stay_declarable() -> None:
+    """A TrustedRouter model whose catalog omits its parameters is declarable, not excluded."""
+    item = AvailableModel(
+        alias="opus",
+        connection="trustedrouter",
+        provider="trustedrouter",
+        model="anthropic/claude-opus-4.5",
+        capabilities=None,
+        pricing_source=PricingSource.UNKNOWN,
+        configured=False,
+    )
+
+    assert role_row_detail(item) == UNKNOWN_METADATA_LABEL
+    assert can_declare_role(item, SetupRole.WORLD_MODEL)
+    assert can_declare_role(item, SetupRole.JUDGE)
+    assert eligible_for_role(item, SetupRole.ROUTER_CANDIDATE)
+
+
+def test_operator_declared_providers_are_exactly_the_unknown_capable_listings() -> None:
+    """Only listings that can return an unproven model open the declaration questionnaire."""
+    assert OPERATOR_DECLARED_PROVIDERS == {"openai-compatible", "trustedrouter"}
 
 
 def test_merge_declared_models_replaces_the_same_alias() -> None:

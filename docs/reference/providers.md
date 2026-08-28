@@ -77,10 +77,11 @@ with the same vocabulary. Setup keeps the completion and embedding roles from
 
 `supported_parameters` is read the way OpenRouter's is when a model publishes it. The array is
 optional: a model that omits it keeps tool, structured-output, sampling, and reasoning support
-**unknown** rather than reporting them as unsupported, and the operator declares the minimum
-fields for a selected role the same way an identity-only OpenAI-compatible model does. A model
-that reports a non-positive `context_length` keeps an unknown context window rather than borrowing
-one from a neighboring field.
+**unknown** rather than reporting them as unsupported. Because that listing can return an unproven
+model, `trustedrouter` joins `openai-compatible` in the operator-declaration path, so such a model
+stays visible and the operator declares the minimum fields a selected role needs instead of the
+model being dropped from the role choices. A model that reports a non-positive `context_length`
+keeps an unknown context window rather than borrowing one from a neighboring field.
 
 ## OpenAI-compatible listing metadata
 

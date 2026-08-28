@@ -76,7 +76,8 @@ SETUP_PROVIDER_LABELS = {
 }
 CANONICAL_CREDENTIAL_ENV = CANONICAL_API_KEY_ENV
 _MANUAL_MODEL_PROVIDERS = frozenset({"azure", "bedrock"})
-_OPERATOR_DECLARED_PROVIDERS = frozenset({"openai-compatible"})
+OPERATOR_DECLARED_PROVIDERS = frozenset({"openai-compatible", "trustedrouter"})
+"""Providers whose listing can leave a model unknown for the operator to declare."""
 _CONFIGURED_ONLY = "configured-models-only"
 UNKNOWN_METADATA_LABEL = "unknown capabilities/prices"
 _RECOVERY_RETRY = "retry"
@@ -780,7 +781,7 @@ def _discover_models(
             tuple(model for model in resolved if not served_roles(model.capabilities)),
             provider=runtime_provider,
         )
-        if runtime_provider not in _OPERATOR_DECLARED_PROVIDERS:
+        if runtime_provider not in OPERATOR_DECLARED_PROVIDERS:
             unknown = ()
         if not verified and not unknown:
             console.print(f"[yellow]{label} published no model with verified metadata.[/yellow]")
