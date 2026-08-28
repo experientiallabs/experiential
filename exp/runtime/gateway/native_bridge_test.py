@@ -2919,3 +2919,59 @@ def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -
         "request-abc", "coding", 1_700_000_000.0, "{}", fixture
     )
     assert body == _parity_golden("responses_encrypted_reasoning_body")
+
+
+def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
+    """A caller operation key reused with different replayed reasoning is a
+    conflict: opaque carriers are digest-excluded for artifact stability, so
+    replay identity must fold them back in through canonical_request_sha256."""
+    control, raw_key = _control_plane(tmp_path)
+
+    def reasoning_body(encrypted_content: str) -> str:
+        """Return one Responses body replaying encrypted reasoning."""
+        return json.dumps(
+            {
+                "model": "coding",
+                "input": [
+                    {"type": "message", "role": "user", "content": "go"},
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [],
+                        "encrypted_content": encrypted_content,
+                    },
+                    {"type": "message", "role": "assistant", "content": "done"},
+                    {"type": "message", "role": "user", "content": "continue"},
+                ],
+            }
+        )
+
+    def admit_keyed(body: str) -> JsonObject:
+        """Admit one keyed Responses request."""
+        return json.loads(
+            control.admit(
+                json.dumps(
+                    {
+                        "raw_key": raw_key,
+                        "body": body,
+                        "surface": "responses",
+                        "idempotency_key": "reasoning-op",
+                    }
+                )
+            )
+        )
+
+    # The seeded route is OpenAI-compatible, so the carrier is rejected at
+    # parameter admission; the accepted request still lands a durable keyed
+    # terminal, which is exactly what replay identity is checked against.
+    with pytest.raises(NativeBridgeError) as first:
+        admit_keyed(reasoning_body("blob-one=="))
+    assert json.loads(first.value.public_error_json)["code"] == "unsupported_parameter"
+
+    with pytest.raises(NativeBridgeError) as changed:
+        admit_keyed(reasoning_body("blob-two=="))
+    assert json.loads(changed.value.public_error_json)["code"] == "idempotency_conflict"
+
+    with pytest.raises(NativeBridgeError) as repeated:
+        admit_keyed(reasoning_body("blob-one=="))
+    assert json.loads(repeated.value.public_error_json)["code"] != "idempotency_conflict"

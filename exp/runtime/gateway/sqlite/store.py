@@ -28,6 +28,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayTarget,
     ProjectTarget,
+    canonical_request_sha256,
 )
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.sqlite import key_delivery
@@ -709,7 +710,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             alias_revision_id=str(row["active_revision_id"]),
             target=target,
             catalog_sha256=str(row["catalog_sha256"]),
-            canonical_request_sha256=sha256_json(request),
+            canonical_request_sha256=canonical_request_sha256(request),
             deadline_monotonic=deadline_monotonic,
             surface=request.surface,
             caller_operation_sha256=caller_operation,

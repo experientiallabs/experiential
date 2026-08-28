@@ -228,6 +228,29 @@ def test_provider_reasoning_carrier_is_ordered_assistant_only_and_digest_free() 
     assert carried.messages[0].provider_reasoning == blocks
     assert carried.model_dump(mode="json") == bare.model_dump(mode="json")
     assert sha256_json(carried) == sha256_json(bare)
+    # Plain digests stay byte-identical (immutable artifacts, pre-carrier
+    # requests), but replay identity distinguishes reasoning content so a
+    # reused caller operation key with different reasoning conflicts.
+    from exp.runtime.gateway.contracts import canonical_request_sha256
+
+    assert canonical_request_sha256(bare) == sha256_json(bare)
+    assert canonical_request_sha256(carried) != canonical_request_sha256(bare)
+    recarried = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="assistant", content="done", provider_reasoning=blocks),),
+    )
+    assert canonical_request_sha256(recarried) == canonical_request_sha256(carried)
+    changed = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(
+                role="assistant",
+                content="done",
+                provider_reasoning=(ThinkingBlock(text="step one", signature="sig-2"),),
+            ),
+        ),
+    )
+    assert canonical_request_sha256(changed) != canonical_request_sha256(carried)
 
     # A thinking-only assistant turn is legal history (e.g. a turn cut off
     # mid-thinking), so the carrier alone satisfies message coherence.

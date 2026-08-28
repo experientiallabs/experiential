@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
+from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelId,
@@ -141,8 +141,11 @@ class GatewayMessage(ContractModel):
     encrypted reasoning items exist only on the OpenAI Responses wire. Route
     admission therefore requires every waterfall rung to speak the one
     dialect that can replay them, mirroring ``tool_is_error``. Like that
-    flag, the carrier is excluded from model serialization so request
-    digests, replay identity, and immutable artifacts are unaffected by it.
+    flag, the carrier is excluded from model serialization so immutable
+    artifacts and carrier-free request digests are unperturbed; requests that
+    do carry it join replay identity through
+    :func:`canonical_request_sha256`, so a caller operation key reused with
+    different reasoning is a rejected conflict, never a silent replay.
     """
 
     @model_validator(mode="after")
@@ -202,8 +205,9 @@ class GatewayRequest(ContractModel):
     The object is opaque to the gateway: it is validated against the closed
     wire profile at decode time and then forwarded byte-for-byte to the
     Anthropic upstream, overriding the catalog's adaptive default. Excluded
-    from serialization like the other Anthropic-only carriers so digests and
-    replay identity are unperturbed.
+    from serialization like the other Anthropic-only carriers so
+    config-free digests are unperturbed; a present config joins replay
+    identity through :func:`canonical_request_sha256`.
     """
     response_store: bool | None = None
     """Caller ``store`` selector from the Responses surface.
@@ -299,6 +303,42 @@ class GatewayRequest(ContractModel):
         if len(set(self.reasoning_summary_parameters)) != len(self.reasoning_summary_parameters):
             raise ValueError("reasoning summary parameter paths must not repeat")
         return self
+
+
+def canonical_request_sha256(request: GatewayRequest) -> Sha256:
+    """Digest one canonical request including its opaque reasoning carriers.
+
+    The carriers are excluded from model serialization so immutable artifacts
+    and pre-existing request digests stay byte-identical, but they are
+    provider-significant input: a caller operation key reused with different
+    replayed reasoning must be a rejected conflict, never a silent replay of
+    the earlier response. A request with no carrier digests exactly as its
+    plain serialization, so every request decoded before the carriers existed
+    keeps its identity.
+
+    Args:
+        request: Canonical gateway request as decoded from the public wire.
+
+    Returns:
+        The stable canonical request digest.
+    """
+    carriers: list[JsonObject] = [
+        {
+            "message_index": index,
+            "blocks": [block.model_dump(mode="json") for block in message.provider_reasoning],
+        }
+        for index, message in enumerate(request.messages)
+        if message.provider_reasoning
+    ]
+    if not carriers and request.provider_thinking_config is None:
+        return sha256_json(request)
+    return sha256_json(
+        {
+            "request_sha256": sha256_json(request),
+            "provider_reasoning": carriers,
+            "provider_thinking_config": request.provider_thinking_config,
+        }
+    )
 
 
 class GatewayUsage(ContractModel):
