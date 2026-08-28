@@ -211,5 +211,29 @@ jobs:
           pattern: native-dist-*
           path: dist
           merge-multiple: true
+      - name: Drop files whose exact filename is already on PyPI
+        # A release can carry a native package whose version did not change
+        # (for example an experiential-only bump). The native build is not
+        # byte-reproducible, so a rebuilt wheel with an already-published
+        # filename would fail uv publish's hash check. PyPI treats filenames
+        # as immutable, so the published copy is authoritative; drop the
+        # local duplicate and let --check-url verify everything that remains.
+        shell: bash
+        run: |
+          for file in dist/*; do
+            name="$(basename "$file")"
+            project="$(echo "$name" | cut -d- -f1 | tr '_' '-')"
+            if curl -fsSL "https://pypi.org/simple/$project/" | grep -qF "$name"; then
+              echo "Dropping $name: already published to $project"
+              rm "$file"
+            fi
+          done
+          ls dist/
       - name: Publish to PyPI with trusted publishing
-        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
+        shell: bash
+        run: |
+          if [ -z "$(ls -A dist)" ]; then
+            echo "Nothing to publish: every built file is already on PyPI"
+            exit 0
+          fi
+          uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
