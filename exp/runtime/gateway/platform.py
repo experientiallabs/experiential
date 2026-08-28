@@ -143,6 +143,7 @@ class ProviderConnectionRevision(ContractModel):
     provider: str = Field(min_length=1, max_length=128)
     base_url: str | None = Field(default=None, max_length=2_048)
     api_version: str | None = Field(default=None, max_length=256)
+    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=256)
     secret_reference: OpaqueSecretReference | None = None
     connection_sha256: Sha256
@@ -558,6 +559,7 @@ class UpsertProviderConnectionCommand(ContractModel):
     provider: str = Field(min_length=1, max_length=128)
     base_url: str | None = Field(default=None, max_length=2_048)
     api_version: str | None = Field(default=None, max_length=256)
+    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=256)
     secret_reference: OpaqueSecretReference | None = None
     replace: bool = False

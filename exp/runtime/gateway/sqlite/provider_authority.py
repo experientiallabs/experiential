@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Literal, cast
 
 from exp.common.core.artifacts import ContractModel, Sha256
 from exp.common.models import ConnectionConfig
@@ -113,9 +114,9 @@ def upsert_provider_connection(
         """
         INSERT INTO provider_connection_revisions (
             revision_id, organization_id, connection_id, revision_number,
-            provider, base_url, api_key_env, api_version, region,
+            provider, base_url, api_key_env, api_version, azure_api_surface, region,
             connection_sha256, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             revision_id,
@@ -126,6 +127,7 @@ def upsert_provider_connection(
             config.base_url,
             config.api_key_env,
             config.api_version,
+            config.azure_api_surface,
             config.region,
             digest,
             now,
@@ -179,7 +181,8 @@ def bound_provider_connections(
     rows = connection.execute(
         """
         SELECT c.connection_id, r.revision_id, r.revision_number,
-               r.provider, r.base_url, r.api_key_env, r.api_version, r.region,
+               r.provider, r.base_url, r.api_key_env, r.api_version,
+               r.azure_api_surface, r.region,
                r.connection_sha256, c.active
         FROM alias_revision_provider_connections AS b
         JOIN provider_connections AS c
@@ -308,6 +311,10 @@ def _authority(row: sqlite3.Row) -> ProviderConnectionAuthority:
         base_url=None if row["base_url"] is None else str(row["base_url"]),
         api_key_env=None if row["api_key_env"] is None else str(row["api_key_env"]),
         api_version=None if row["api_version"] is None else str(row["api_version"]),
+        azure_api_surface=cast(
+            Literal["openai_deployments", "model_inference"] | None,
+            None if row["azure_api_surface"] is None else str(row["azure_api_surface"]),
+        ),
         region=None if row["region"] is None else str(row["region"]),
     )
     digest = str(row["connection_sha256"])
@@ -325,7 +332,8 @@ def _authority(row: sqlite3.Row) -> ProviderConnectionAuthority:
 
 _SELECT_AUTHORITY = """
 SELECT c.connection_id, r.revision_id, r.revision_number,
-       r.provider, r.base_url, r.api_key_env, r.api_version, r.region,
+       r.provider, r.base_url, r.api_key_env, r.api_version,
+       r.azure_api_surface, r.region,
        r.connection_sha256, c.active
 FROM provider_connections AS c
 JOIN provider_connection_revisions AS r

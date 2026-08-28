@@ -488,6 +488,29 @@ def test_revision_reads_forward_existing_sqlite_authority(tmp_path: Path) -> Non
         )[0].remaining_micro_usd
         == 1_000
     )
+
+
+def test_natural_provider_replay_preserves_azure_api_surface(tmp_path: Path) -> None:
+    """The storage-neutral command and revision view round-trip the Foundry selector."""
+    platform = _platform(tmp_path)
+    command = UpsertProviderConnectionCommand(
+        organization_id="org-one",
+        connection_id="foundry",
+        revision_id="foundry-revision-one",
+        provider="azure",
+        base_url="https://resource.services.ai.azure.com",
+        api_version="2024-05-01-preview",
+        azure_api_surface="model_inference",
+        secret_reference=OpaqueSecretReference(
+            scheme=OpaqueSecretScheme.ENVIRONMENT,
+            reference="AZURE_FOUNDRY_API_KEY",
+        ),
+    )
+
+    assert platform.mutate_provider_connection(command).changed
+    assert not platform.mutate_provider_connection(command).changed
+    (revision,) = platform.provider_connection_revisions(organization_id="org-one")
+    assert revision.azure_api_surface == "model_inference"
     assert platform.alias_revisions(organization_id="org-two") == ()
 
 

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class GatewaySchemaError(RuntimeError):
@@ -586,6 +586,12 @@ _MIGRATION_10 = (
     "DROP TABLE gateway_schema_refresh_v10",
 )
 
+_MIGRATION_11 = (
+    "ALTER TABLE provider_connection_revisions ADD COLUMN azure_api_surface TEXT "
+    "CHECK (azure_api_surface IS NULL OR azure_api_surface IN "
+    "('openai_deployments', 'model_inference'))",
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -597,6 +603,7 @@ _MIGRATIONS = {
     8: _MIGRATION_8,
     9: _MIGRATION_9,
     10: _MIGRATION_10,
+    11: _MIGRATION_11,
 }
 
 

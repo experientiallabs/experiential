@@ -90,3 +90,27 @@ def test_upsert_provider_connection_accepts_registry_supported_providers(
     assert native_authority.config.provider == "anthropic"
     assert "anthropic" in SUPPORTED_PROVIDERS
     assert "openai-compatible" in SUPPORTED_PROVIDERS
+
+
+def test_azure_model_inference_surface_survives_management_restart(tmp_path: Path) -> None:
+    """SQLite replay retains the Foundry surface that participates in connection identity."""
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+    config = ConnectionConfig(
+        provider="azure",
+        base_url="https://resource.services.ai.azure.com",
+        api_key_env="AZURE_FOUNDRY_API_KEY",
+        api_version="2024-05-01-preview",
+        azure_api_surface="model_inference",
+    )
+
+    changed, authority = manager.upsert_provider_connection(
+        connection_id="foundry",
+        config=config,
+    )
+    (reloaded,) = GatewayManagement(tmp_path).provider_connections()
+
+    assert changed
+    assert authority.config == config
+    assert reloaded.config == config
+    assert reloaded.connection_sha256 == config.identity_sha256()

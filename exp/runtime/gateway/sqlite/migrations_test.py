@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.models import ConnectionConfig
 from exp.runtime.gateway.sqlite import migrations
 from exp.runtime.gateway.sqlite.migrations import (
     _MIGRATION_1,
@@ -847,5 +848,72 @@ def test_v10_migration_widens_api_surface_and_preserves_rows(tmp_path: Path) -> 
         # The child attempt still resolves its rewritten parent's foreign key.
         migrated.execute("DELETE FROM gateway_attempts WHERE attempt_id = 'att-1'")
         migrated.execute("DELETE FROM gateway_requests WHERE request_id = 'req-1'")
+    finally:
+        migrated.close()
+
+
+def test_v11_migration_adds_azure_surface_without_rewriting_existing_authority(
+    tmp_path: Path,
+) -> None:
+    """Existing v10 provider revisions migrate with the classic Azure default intact."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = connect_database(path)
+    config = ConnectionConfig(
+        provider="azure",
+        base_url="https://resource.openai.azure.com",
+        api_key_env="AZURE_OPENAI_API_KEY",
+        api_version="v1",
+    )
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for version in range(1, 11):
+            for statement in migrations._MIGRATIONS[version]:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 10")
+        connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
+        connection.execute(
+            """
+            INSERT INTO provider_connections (
+                connection_id, organization_id, active, created_at, updated_at
+            ) VALUES ('azure', 'org', 1, 't', 't')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_connection_revisions (
+                revision_id, organization_id, connection_id, revision_number,
+                provider, base_url, api_key_env, api_version, region,
+                connection_sha256, created_at
+            ) VALUES ('rev', 'org', 'azure', 1, 'azure', ?, ?, 'v1', NULL, ?, 't')
+            """,
+            (config.base_url, config.api_key_env, config.identity_sha256()),
+        )
+        connection.execute(
+            "UPDATE provider_connections SET active_revision_id = 'rev' "
+            "WHERE connection_id = 'azure'"
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    backup = initialize_database(path)
+
+    assert backup is not None and backup.exists()
+    migrated = connect_database(path)
+    try:
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        row = migrated.execute(
+            "SELECT azure_api_surface, connection_sha256 "
+            "FROM provider_connection_revisions WHERE revision_id = 'rev'"
+        ).fetchone()
+        assert row["azure_api_surface"] is None
+        assert row["connection_sha256"] == config.identity_sha256()
+        with pytest.raises(sqlite3.IntegrityError):
+            migrated.execute(
+                "UPDATE provider_connection_revisions SET azure_api_surface = 'bogus' "
+                "WHERE revision_id = 'rev'"
+            )
     finally:
         migrated.close()

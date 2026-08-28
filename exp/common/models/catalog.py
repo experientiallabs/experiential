@@ -117,6 +117,11 @@ class ConnectionConfig(ContractModel):
                     "azure api_version must be 'v1' or a dated Azure OpenAI version such as "
                     "2024-10-21"
                 )
+            if self.azure_api_surface == "model_inference" and self.api_version == "v1":
+                raise ValueError(
+                    "azure model_inference requires a dated api_version for the mandatory "
+                    "api-version query parameter"
+                )
             if self.region is not None:
                 raise ValueError("region is only accepted for provider='bedrock'")
         elif self.provider == "bedrock":

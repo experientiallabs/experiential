@@ -159,6 +159,8 @@ class AzureClient(OpenAICompatibleClient):
             raise ValueError("Azure clients require an explicit api_version")
         if api_surface not in {"openai_deployments", "model_inference"}:
             raise ValueError("Azure clients require a supported api_surface")
+        if api_surface == "model_inference" and api_version == _V1_API_VERSION:
+            raise ValueError("Azure model_inference requires a dated api_version")
         super().__init__(
             model=model,
             api_key=api_key,
@@ -181,6 +183,7 @@ class AzureClient(OpenAICompatibleClient):
             sampling_requires_reasoning_none=sampling_requires_reasoning_none,
         )
         self._api_version = api_version
+        self._api_surface = api_surface
 
     def _headers(self) -> dict[str, str]:
         """Return Azure ``api-key`` authentication headers without a Bearer token."""
@@ -198,7 +201,7 @@ class AzureClient(OpenAICompatibleClient):
         Returns:
             Wire path with the configured API version when required.
         """
-        if self._api_version != _V1_API_VERSION:
+        if self._api_surface == "model_inference" or self._api_version != _V1_API_VERSION:
             path = f"{path}?api-version={self._api_version}"
         return path
 

@@ -507,6 +507,14 @@ def test_azure_connection_requires_endpoint_key_and_api_version() -> None:
     )
     with pytest.raises(ValueError, match="azure_api_surface"):
         ConnectionConfig(provider="openai", azure_api_surface="model_inference")
+    with pytest.raises(ValueError, match="dated api_version"):
+        ConnectionConfig(
+            provider="azure",
+            base_url="https://resource.services.ai.azure.com",
+            api_key_env="AZURE_FOUNDRY_API_KEY",
+            api_version="v1",
+            azure_api_surface="model_inference",
+        )
 
     assert (
         connection.identity_sha256()

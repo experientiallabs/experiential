@@ -178,6 +178,18 @@ def test_model_inference_appends_models_to_a_resource_root() -> None:
     )
 
 
+def test_model_inference_rejects_v1_without_a_supported_api_version_query() -> None:
+    """The model-inference surface never silently omits its required api-version query."""
+    with pytest.raises(ValueError, match="dated api_version"):
+        AzureClient(
+            model=_snapshot("azure", "DeepSeek-V4-Flash"),
+            endpoint="https://resource.services.ai.azure.com",
+            api_key=_SECRET,
+            api_version="v1",
+            api_surface="model_inference",
+        )
+
+
 def test_embeddings_use_the_configured_deployment_alias() -> None:
     """Embedding aliases send their own deployment ID rather than a guessed base model."""
     transport = ScriptedJsonTransport(
