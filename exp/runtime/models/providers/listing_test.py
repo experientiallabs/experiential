@@ -363,8 +363,8 @@ def test_trustedrouter_listing_reads_roles_limits_and_prices() -> None:
     assert request.headers["Authorization"] == "Bearer secret-key"
 
 
-def test_trustedrouter_listing_leaves_undeclared_capabilities_unknown() -> None:
-    """The catalog publishes no ``supported_parameters``, so nothing is inferred for it."""
+def test_trustedrouter_listing_leaves_an_absent_parameter_array_unknown() -> None:
+    """A model that publishes no ``supported_parameters`` stays unknown, not unsupported."""
     transport = _transport(
         _ok(
             {
@@ -393,6 +393,57 @@ def test_trustedrouter_listing_leaves_undeclared_capabilities_unknown() -> None:
     assert model.supports_embeddings is None
     assert model.maximum_output_tokens is None
     assert model.cached_input_cost_per_million_tokens_usd is None
+
+
+def test_trustedrouter_listing_reads_a_published_parameter_array() -> None:
+    """TrustedRouter names parameters with the OpenRouter vocabulary, so they are read."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [
+                    {
+                        "id": "openai/gpt-5.1",
+                        "name": "OpenAI: GPT-5.1",
+                        "context_length": 400000,
+                        "supported_parameters": [
+                            "tools",
+                            "structured_outputs",
+                            "temperature",
+                            "top_p",
+                            "top_k",
+                            "reasoning",
+                            "logprobs",
+                        ],
+                        "top_provider": {"max_completion_tokens": 128000},
+                        "pricing": {
+                            "prompt": "0.00000125",
+                            "completion": "0.00001",
+                            "input_cache_read": "0.000000125",
+                        },
+                        "trustedrouter": {"provider": "openai", "supports_chat": True},
+                    }
+                ]
+            }
+        )
+    )
+
+    model = _lister(transport).list_models(
+        ProviderEndpoint(provider="trustedrouter", api_key="secret-key")
+    )[0]
+
+    assert model.supports_tools is True
+    assert model.supports_structured_output is True
+    assert model.supports_temperature is True
+    assert model.supports_top_p is True
+    assert model.supports_top_k is True
+    assert model.supports_reasoning is True
+    assert model.supports_logprobs is True
+    assert model.maximum_temperature == 2.0
+    assert model.maximum_top_p == 1.0
+    assert model.minimum_top_k == 1
+    assert model.maximum_output_tokens == 128000
+    assert model.cached_input_cost_per_million_tokens_usd == pytest.approx(0.125)
+    assert model.cache_write_cost_per_million_tokens_usd is None
 
 
 def test_gemini_listing_follows_pages_and_drops_the_resource_prefix() -> None:

@@ -349,9 +349,11 @@ def _openrouter_model(provider: str, identity: str, entry: JsonObject) -> Discov
 def _trustedrouter_model(provider: str, identity: str, entry: JsonObject) -> DiscoveredModel:
     """Build one discovered model from a TrustedRouter catalog entry.
 
-    The catalog is OpenRouter-shaped but publishes no ``supported_parameters`` array, so
-    sampling, tool, and reasoning support stay unknown rather than being inferred from a
-    neighboring field. Roles, context window, and token prices are published and are kept.
+    The catalog is OpenRouter-shaped and names its parameters with the same vocabulary, so
+    a published ``supported_parameters`` array is read the way OpenRouter's is. The array
+    is optional: when it is absent or wrongly typed, sampling, tool, and reasoning support
+    stay unknown rather than being reported as unsupported. Roles, context window, and
+    token prices are always published and are kept.
 
     Args:
         provider: Setup provider kind, always ``trustedrouter``.
@@ -359,7 +361,7 @@ def _trustedrouter_model(provider: str, identity: str, entry: JsonObject) -> Dis
         entry: One object from the ``data`` array.
 
     Returns:
-        The identity plus the roles, limits, and prices TrustedRouter actually declares.
+        The identity plus the roles, limits, prices, and any declared parameter support.
     """
     pricing = entry.get("pricing")
     prices: JsonObject = cast(JsonObject, pricing) if isinstance(pricing, dict) else {}
@@ -367,6 +369,23 @@ def _trustedrouter_model(provider: str, identity: str, entry: JsonObject) -> Dis
     route: JsonObject = cast(JsonObject, routing) if isinstance(routing, dict) else {}
     supports_chat = route.get("supports_chat")
     supports_embeddings = route.get("supports_embeddings")
+    parameters = entry.get("supported_parameters")
+    supported = (
+        frozenset(value.casefold() for value in parameters if isinstance(value, str))
+        if isinstance(parameters, list)
+        else None
+    )
+
+    def declared(*names: str) -> bool | None:
+        """Report a parameter only when the model published its parameter array."""
+        if supported is None:
+            return None
+        return any(name in supported for name in names)
+
+    temperature = declared("temperature")
+    top_p = declared("top_p")
+    top_k = declared("top_k")
+    reasoning = declared("reasoning", "reasoning_effort")
     return DiscoveredModel(
         provider=provider,
         model=identity,
@@ -374,11 +393,38 @@ def _trustedrouter_model(provider: str, identity: str, entry: JsonObject) -> Dis
         supports_embeddings=(
             supports_embeddings if isinstance(supports_embeddings, bool) else None
         ),
+        supports_tools=declared("tools", "tool_choice"),
+        supports_structured_output=declared("structured_outputs", "response_format"),
+        supports_temperature=temperature,
+        supports_top_p=top_p,
+        supports_top_k=top_k,
+        supports_logprobs=declared("logprobs", "top_logprobs"),
+        supports_reasoning=reasoning,
+        reasoning_effort=default_reasoning_effort(identity, "reasoning") if reasoning else None,
         chat_max_tokens_field="max_tokens",
+        minimum_temperature=0.0 if temperature else None,
+        maximum_temperature=2.0 if temperature else None,
+        minimum_top_p=0.0 if top_p else None,
+        maximum_top_p=1.0 if top_p else None,
+        minimum_top_k=1 if top_k else None,
         context_window_tokens=_positive_int(entry.get("context_length")),
+        maximum_output_tokens=_positive_int(
+            _mapping(entry.get("top_provider")).get("max_completion_tokens")
+        ),
         input_cost_per_million_tokens_usd=_million_token_price(prices.get("prompt")),
         output_cost_per_million_tokens_usd=_million_token_price(prices.get("completion")),
+        cached_input_cost_per_million_tokens_usd=_million_token_price(
+            prices.get("input_cache_read")
+        ),
+        cache_write_cost_per_million_tokens_usd=_million_token_price(
+            prices.get("input_cache_write")
+        ),
     )
+
+
+def _mapping(value: object) -> JsonObject:
+    """Return one nested catalog object, or an empty mapping when it is absent."""
+    return cast(JsonObject, value) if isinstance(value, dict) else {}
 
 
 def _gemini_model(provider: str, identity: str, entry: JsonObject) -> DiscoveredModel:

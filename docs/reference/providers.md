@@ -70,14 +70,17 @@ third-party OpenAI-compatible host.
 
 ## TrustedRouter listing metadata
 
-`trustedrouter` lists an OpenRouter-shaped catalog from its own origin. Setup keeps the fields it
-publishes: the completion and embedding roles from `trustedrouter.supports_chat` and
-`trustedrouter.supports_embeddings`, `context_length`, and the `pricing.prompt` and
-`pricing.completion` per-token prices. The catalog publishes no `supported_parameters` array, so
-tool, structured-output, sampling, and reasoning support stay unknown and the operator declares the
-minimum fields for a selected role, the same way an identity-only OpenAI-compatible model does. A
-model that reports a non-positive `context_length` keeps an unknown context window rather than
-borrowing one from a neighboring field.
+`trustedrouter` lists an OpenRouter-shaped catalog from its own origin and names its parameters
+with the same vocabulary. Setup keeps the completion and embedding roles from
+`trustedrouter.supports_chat` and `trustedrouter.supports_embeddings`, `context_length`,
+`top_provider.max_completion_tokens`, and the `pricing` per-token prices.
+
+`supported_parameters` is read the way OpenRouter's is when a model publishes it. The array is
+optional: a model that omits it keeps tool, structured-output, sampling, and reasoning support
+**unknown** rather than reporting them as unsupported, and the operator declares the minimum
+fields for a selected role the same way an identity-only OpenAI-compatible model does. A model
+that reports a non-positive `context_length` keeps an unknown context window rather than borrowing
+one from a neighboring field.
 
 ## OpenAI-compatible listing metadata
 
