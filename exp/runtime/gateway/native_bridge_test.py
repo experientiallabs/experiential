@@ -109,17 +109,23 @@ def test_internal_tool_streaming_failure_names_the_public_tools_field() -> None:
             )
 
 
-def test_internal_text_streaming_failure_names_the_public_model_field() -> None:
-    """An internal text transport deficit is attributed to route selection, not stream."""
+def test_internal_text_streaming_failure_has_no_fake_public_field() -> None:
+    """An internal text transport deficit has no caller-removable request field."""
     for surface in GatewayApiSurface:
-        assert (
-            _public_capability_param(
-                "streaming",
-                surface,
-                public_stream=False,
-            )
-            == "model"
+        assert _public_capability_param(
+            "streaming",
+            surface,
+            public_stream=False,
+        ) is None
+
+        error = _public_capability_error(
+            ProviderCapabilityError(capability="streaming"),
+            surface,
+            public_stream=False,
+            public_tools=False,
         )
+        assert error.detail.param == "model"
+        assert "Choose a different model alias" in error.detail.message
 
 
 def test_public_capability_error_never_exposes_internal_labels() -> None:

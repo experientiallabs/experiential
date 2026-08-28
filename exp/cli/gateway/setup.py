@@ -11,6 +11,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.prompt import Confirm
 from rich.table import Table
 from rich.text import Text
 
@@ -203,6 +204,28 @@ def interactive_gateway_setup(
                 "reasoning_effort": model_selection.reasoning_effort,
             }
         )
+    selected_connections = {
+        item.connection_id: item.config
+        for item in (manager.provider_connections() if manager.initialized else ())
+    }
+    for endpoint in session.endpoints:
+        selected_connections[endpoint.connection.name] = endpoint.connection.catalog_config()
+    selected_provider = selected_connections[selected.connection].provider
+    supports_streaming_tool_arguments = provider_has_certified_capability(
+        selected_provider,
+        ProviderCapability.TOOL_ARGUMENT_STREAM,
+    )
+    if selected.connection == HOSTED_SETUP_PICKER:
+        supports_streaming_tool_arguments = True
+    elif selected_provider == "openai-compatible" and capabilities.supports_tools:
+        try:
+            supports_streaming_tool_arguments = Confirm.ask(
+                "Does this custom endpoint stream tool-call arguments?",
+                default=False,
+                console=console,
+            )
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise typer.Abort from exc
     total_steps = len(session.endpoints) + 8
     completed_steps = 0
 
@@ -249,13 +272,7 @@ def interactive_gateway_setup(
                         capabilities=capabilities,
                         gateway_capabilities=GatewayDeploymentCapabilities(
                             supports_streaming=True,
-                            supports_streaming_tool_arguments=(
-                                bool(capabilities.supports_tools)
-                                and provider_has_certified_capability(
-                                    serving_connections[selected.connection].provider,
-                                    ProviderCapability.TOOL_ARGUMENT_STREAM,
-                                )
-                            ),
+                            supports_streaming_tool_arguments=supports_streaming_tool_arguments,
                         ),
                         prices=GatewayTokenPrices(),
                         pricing_source=None,

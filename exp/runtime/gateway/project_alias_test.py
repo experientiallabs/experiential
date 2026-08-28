@@ -96,6 +96,11 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
                 billing_source=BillingSource.CUSTOMER_MANAGED,
                 capabilities=ModelCapabilities(supports_tools=True),
             ),
+            "legacy-unknown": ModelRecord(
+                connection="provider",
+                model="legacy-unknown-model",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+            ),
             "explicit": ModelRecord(
                 connection="provider",
                 model="explicit-model",
@@ -136,6 +141,7 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
         tmp_path,
         aliases=(
             "legacy",
+            "legacy-unknown",
             "legacy-gemini",
             "legacy-custom",
             "explicit",
@@ -146,6 +152,12 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
 
     assert changed is True
     assert migrated.models["legacy"].gateway == GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    assert migrated.models["legacy-unknown"].gateway == GatewayDeploymentMetadata(
         capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
             supports_streaming_tool_arguments=True,
@@ -171,6 +183,7 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
             tmp_path,
             aliases=(
                 "legacy",
+                "legacy-unknown",
                 "legacy-gemini",
                 "legacy-custom",
                 "explicit",

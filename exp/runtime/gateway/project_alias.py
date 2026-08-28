@@ -160,10 +160,9 @@ def _migrate_legacy_project_gateway_metadata(
         if record is None:
             continue
         provider = catalog.connections[record.connection].provider
-        supports_streaming_tool_arguments = (
-            record.capabilities is not None
-            and bool(record.capabilities.supports_tools)
-            and provider_has_certified_capability(provider, ProviderCapability.TOOL_ARGUMENT_STREAM)
+        supports_streaming_tool_arguments = provider_has_certified_capability(
+            provider,
+            ProviderCapability.TOOL_ARGUMENT_STREAM,
         )
         if record.gateway is not None:
             if provider == "openai-compatible":

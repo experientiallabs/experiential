@@ -162,7 +162,7 @@ def _public_capability_param(
     if capability == "streaming_tool_arguments" and not public_stream:
         return "tools"
     if capability == "streaming" and not public_stream:
-        return "tools" if public_tools else "model"
+        return "tools" if public_tools else None
     return _PUBLIC_REQUEST_CAPABILITY_PARAMS[surface].get(capability)
 
 

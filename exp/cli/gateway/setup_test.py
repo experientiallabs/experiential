@@ -191,6 +191,56 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
     assert load_settings(tmp_path).commands.maximum_cost_usd == 50.0
 
 
+def test_gateway_setup_collects_custom_endpoint_tool_streaming_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interactive custom setup records endpoint truth instead of provider-family inference."""
+    connection = ProviderConnection(
+        name="custom",
+        provider="openai-compatible",
+        base_url="https://custom.example.test/v1",
+        api_key_env="CUSTOM_API_KEY",
+    )
+    endpoint = provider_picker.PreparedEndpoint(
+        connection=connection,
+        api_key="secret",
+        configured=True,
+    )
+    model = provider_picker.AvailableModel(
+        alias="custom-tools",
+        connection="custom",
+        provider="openai-compatible",
+        model="custom-tools",
+        capabilities=ModelCapabilities(supports_completions=True, supports_tools=True),
+        pricing_source=PricingSource.UNKNOWN,
+        configured=True,
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai-compatible",), False),
+    )
+    monkeypatch.setattr(
+        setup,
+        "prepare_providers",
+        lambda *_args, **_kwargs: ((endpoint,), (model,)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(model, None),
+    )
+    console = ScriptedConsole("\ny\n")
+
+    setup.interactive_gateway_setup(tmp_path, console=console)
+
+    authored = load_model_catalog(tmp_path / "models.toml").models["custom-tools"]
+    assert authored.gateway is not None
+    assert authored.gateway.capabilities.supports_streaming_tool_arguments
+    assert "Does this custom endpoint stream tool-call arguments?" in console.output
+
+
 def test_gateway_setup_marks_experiential_deployment_as_host_managed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

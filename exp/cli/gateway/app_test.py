@@ -217,6 +217,21 @@ def test_direct_alias_uses_provider_certification_for_tool_streaming(
             "gateway",
             "provider",
             "add",
+            "custom",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://custom.example.test/v1",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
             "google",
             "--provider",
             "gemini",
@@ -255,12 +270,87 @@ def test_direct_alias_uses_provider_certification_for_tool_streaming(
             ],
         )
         assert result.exit_code == 0, result.output
+    custom = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "create",
+            "custom-tools",
+            "--deployment",
+            "custom:custom-fixture",
+            "--exact-model",
+            "custom-tools",
+            "--supports-tools",
+            "--supports-streaming-tool-arguments",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert custom.exit_code == 0, custom.output
+    updated = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "update",
+            "custom-tools",
+            "--deployment",
+            "custom:custom-fixture",
+            "--exact-model",
+            "custom-tools",
+            "--supports-tools",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert updated.exit_code == 0, updated.output
 
     catalog = load_model_catalog(tmp_path / "models.toml")
     assert catalog.models["oai-tools"].gateway is not None
     assert catalog.models["gemini-tools"].gateway is not None
+    assert catalog.models["custom-tools"].gateway is not None
     assert catalog.models["oai-tools"].gateway.capabilities.supports_streaming_tool_arguments
     assert not catalog.models["gemini-tools"].gateway.capabilities.supports_streaming_tool_arguments
+    assert catalog.models["custom-tools"].gateway.capabilities.supports_streaming_tool_arguments
+
+
+def test_direct_alias_rejects_an_unknown_provider_connection_cleanly(tmp_path: Path) -> None:
+    """A deployment typo is a stable CLI usage error, never an unhandled mapping failure."""
+    runner = CliRunner()
+    initialized = runner.invoke(
+        app,
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+    )
+    assert initialized.exit_code == 0, initialized.output
+
+    result = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "create",
+            "typo",
+            "--deployment",
+            "missing:model",
+            "--exact-model",
+            "model",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "unknown provider connection 'missing'" in result.output
 
 
 def test_noninteractive_pool_certification_activates_ordered_alias_with_receipt(
