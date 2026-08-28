@@ -101,6 +101,33 @@ def test_fresh_resolver_reads_the_store_written_by_another_instance(tmp_path: Pa
     assert api_key == _SECRET
 
 
+def test_azure_model_inference_root_and_models_path_share_stored_credential(
+    tmp_path: Path,
+) -> None:
+    """Equivalent Foundry endpoint spellings retain the same bound credential."""
+    resource_root = ConnectionConfig(
+        provider="azure",
+        base_url="https://resource.services.ai.azure.com",
+        api_key_env="AZURE_FOUNDRY_API_KEY",
+        api_version="2024-05-01-preview",
+        azure_api_surface="model_inference",
+    )
+    explicit_models = resource_root.model_copy(
+        update={"base_url": "https://resource.services.ai.azure.com/MODELS"}
+    )
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put("foundry", _SECRET, binding=_binding(resource_root))
+
+    api_key = read_connection_api_key(
+        explicit_models,
+        connection_id="foundry",
+        environment={},
+        store=store,
+    )
+
+    assert api_key == _SECRET
+
+
 def test_store_resolves_when_the_connection_omits_an_env_name(tmp_path: Path) -> None:
     """A stored key is enough when the catalog has no environment override name."""
     store = ProviderAuthStore(tmp_path / "auth.json")
