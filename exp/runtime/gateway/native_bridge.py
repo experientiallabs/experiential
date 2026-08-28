@@ -342,7 +342,11 @@ class NativeControlPlane(NativeObservabilityMixin):
             # connection) is skipped so a live fallback still serves the
             # request instead of the whole request failing on a dead lead.
             dispatchable = dispatchable_route_profiles(self._components.runtime_catalogs, route)
-            self._record_dead_admission_rungs(authorization, dispatchable.dead)
+            self._record_dead_admission_rungs(
+                authorization,
+                dispatchable.dead,
+                fallback_available=bool(dispatchable.indexes),
+            )
             if not dispatchable.indexes:
                 # Every certified rung was operationally dead at admission;
                 # there is nothing live to serve, so the accepted request is
@@ -743,6 +747,8 @@ class NativeControlPlane(NativeObservabilityMixin):
         self,
         authorization: AuthorizationSnapshot,
         dead: tuple[DeadRung, ...],
+        *,
+        fallback_available: bool,
     ) -> None:
         """Feed each admission-dead rung into its health circuit and surface it.
 
@@ -752,11 +758,14 @@ class NativeControlPlane(NativeObservabilityMixin):
         automatically when it heals; it is never permanently blacklisted. A
         skipped lead rung is logged and counted so a persistently dead lead
         reaches a human instead of being silently masked behind a healthy
-        fallback forever.
+        fallback forever. That masking signal only exists when a live
+        fallback actually serves: a total route outage escalates loudly on
+        its own path and must not read as one more fallback-served request.
 
         Args:
             authorization: Frozen authority for the accepted request.
             dead: Every rung skipped as operationally dead, in route order.
+            fallback_available: Whether any live rung remains to serve.
         """
         if not dead:
             return
@@ -764,8 +773,9 @@ class NativeControlPlane(NativeObservabilityMixin):
         for rung in dead:
             health.failed(deployment_health_key(authorization, rung.deployment), rung.failure)
         lead = next((rung for rung in dead if rung.index == 0), None)
-        self._accounting.record_admission_rung_skips(len(dead), lead_skipped=lead is not None)
-        if lead is not None:
+        lead_masked = lead is not None and fallback_available
+        self._accounting.record_admission_rung_skips(len(dead), lead_skipped=lead_masked)
+        if lead is not None and fallback_available:
             _logger.warning(
                 "gateway admission skipped the lead rung for alias %r: served off a "
                 "fallback because deployment %r (provider %r) was dead at admission",

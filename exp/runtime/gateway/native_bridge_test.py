@@ -961,7 +961,9 @@ def test_admit_escalates_when_every_rung_is_dead(tmp_path: Path) -> None:
     assert "escalate" in admission
     control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
     assert control_plane["admission_dead_rungs_skipped"] == 2
-    assert control_plane["admission_lead_rungs_skipped"] == 1
+    # A total outage escalates on its own path; the lead-skip counter means
+    # "a fallback served while the lead was dead" and must stay silent here.
+    assert control_plane["admission_lead_rungs_skipped"] == 0
 
 
 def test_admit_keeps_a_fully_resolvable_route_and_never_skips(tmp_path: Path) -> None:
