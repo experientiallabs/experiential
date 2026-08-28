@@ -144,18 +144,16 @@ def test_public_capability_error_never_exposes_internal_labels() -> None:
     assert "tinker_gateway_execution" not in error.detail.message
 
 
-def test_forced_streaming_deficit_names_the_model_route() -> None:
-    """Removing caller fields cannot cure a route that lacks required transport streaming."""
+def test_forced_streaming_tool_deficit_names_the_public_tools_field() -> None:
+    """An internally streamed tool deficit names the tool request that caused it."""
     error = _public_capability_error(
-        ProviderCapabilityError(capability="streaming"),
+        ProviderCapabilityError(capability="streaming_tool_arguments"),
         GatewayApiSurface.CHAT_COMPLETIONS,
         public_stream=False,
         public_tools=True,
     )
 
-    assert error.detail.param == "model"
-    assert "different model alias" in error.detail.message
-    assert "streaming" not in error.detail.message
+    assert error.detail.param == "tools"
 
 
 def _parity_golden(name: str) -> object:
@@ -1220,8 +1218,8 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
     assert "internal" not in error["code"]
 
 
-def test_non_streaming_transport_failure_names_the_model_route(tmp_path: Path) -> None:
-    """A retry cannot remove the gateway's internally required streaming transport."""
+def test_non_streaming_tool_transport_failure_names_tools(tmp_path: Path) -> None:
+    """A buffered tool request identifies the feature that requires streaming."""
     unsupported = GatewayDeploymentCapabilities(supports_strict_tools=True)
     control, raw_key = _pool_control_plane(
         tmp_path,
@@ -1252,8 +1250,8 @@ def test_non_streaming_transport_failure_names_the_model_route(tmp_path: Path) -
 
     error = json.loads(raised.value.public_error_json)
     assert error["code"] == "unsupported_capability"
-    assert error["param"] == "model"
-    assert "different model alias" in error["message"]
+    assert error["param"] == "tools"
+    assert "Remove the field" in error["message"]
 
 
 def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Path) -> None:

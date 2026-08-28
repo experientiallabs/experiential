@@ -210,6 +210,24 @@ def test_preflight_requires_streaming_tool_argument_support() -> None:
     )
 
 
+def test_preflight_attributes_forced_streaming_to_tool_arguments_first() -> None:
+    """Internally streamed tool requests report the tool transport deficit first."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        stream=True,
+    )
+
+    with pytest.raises(ProviderCapabilityError, match="streaming_tool_arguments"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(),
+            model_capabilities=ModelCapabilities(supports_tools=True),
+            public_stream=False,
+        )
+
+
 def test_preflight_rejects_over_limit_stop_list_with_a_named_parameter_error() -> None:
     """An over-cap stop list fails locally instead of surfacing the provider's opaque 4xx."""
     request = GatewayRequest(
