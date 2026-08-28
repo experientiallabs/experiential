@@ -778,3 +778,97 @@ def test_messages_stream_zero_output_keeps_real_input_tokens(
         "output_tokens": 0,
         "cache_read_input_tokens": 2,
     }
+
+
+def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
+    engine: _ServingEngine,
+) -> None:
+    """Thinking config and history need an Anthropic-only route; the seeded
+    OpenAI-compatible route rejects both in the Anthropic envelope with no
+    upstream dispatch."""
+    with _SseUpstream.payloads_lock:
+        dispatched_before = len(_SseUpstream.payloads)
+
+    config = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json={
+            **_messages_body("must-not-dispatch"),
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+        },
+        timeout=10.0,
+    )
+    assert config.status_code == 400
+    assert config.json()["error"]["type"] == "invalid_request_error"
+    assert "thinking" in config.json()["error"]["message"]
+
+    history = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json={
+            **_messages_body("must-not-dispatch"),
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "private", "signature": "sig=="},
+                        {"type": "text", "text": "done"},
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        },
+        timeout=10.0,
+    )
+    assert history.status_code == 400
+    assert "thinking" in history.json()["error"]["message"]
+
+    with _SseUpstream.payloads_lock:
+        assert len(_SseUpstream.payloads) == dispatched_before
+
+
+def test_encrypted_reasoning_include_rejects_non_responses_routes(
+    engine: _ServingEngine,
+) -> None:
+    """The encrypted reasoning include selector needs a native Responses route."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "input": "fast-token",
+            "include": ["reasoning.encrypted_content"],
+        },
+        timeout=10.0,
+    )
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["param"] == "include"
+    assert body["error"]["code"] == "unsupported_parameter"
+
+
+def test_store_false_responses_cannot_be_continued(engine: _ServingEngine) -> None:
+    """store:false answers normally but its response ID is never retained."""
+    first = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": "fast-token", "store": False},
+        timeout=30.0,
+    )
+    assert first.status_code == 200
+    body = first.json()
+    assert body["status"] == "completed"
+
+    continued = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "input": "fast-token",
+            "previous_response_id": body["id"],
+        },
+        timeout=30.0,
+    )
+    assert continued.status_code == 400
+    assert continued.json()["error"]["code"] == "continuation_unavailable"

@@ -157,6 +157,24 @@ impl Normalizer {
             "response.function_call_arguments.done" | "response.output_item.done" => {
                 let index = require_u64(&payload, "output_index", "OpenAI output_index")
                     .map_err(|message| malformed(&message))? as u32;
+                if event_type == "response.output_item.done" {
+                    if let Some(item) = payload.get("item").and_then(Value::as_object) {
+                        // Requested encrypted reasoning arrives whole on the
+                        // completed reasoning item; pass the opaque payload
+                        // through under the shared retained-output budget.
+                        if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                            if let Some(Value::String(encrypted)) = item.get("encrypted_content") {
+                                if !encrypted.is_empty() {
+                                    self.reserve_summary_bytes(encrypted.len())?;
+                                    events.push(Event::EncryptedReasoning {
+                                        output_index: index,
+                                        encrypted_content: encrypted.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 let pending = self.tools.get(&index).is_some_and(|tool| !tool.completed);
                 if pending {
                     let mut final_arguments = payload
@@ -481,5 +499,45 @@ mod tests {
             .expect_err("entry above ceiling must fail");
         assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
         assert_eq!(failure.safe_message, OUTPUT_OVERFLOW_MESSAGE);
+    }
+
+    #[test]
+    fn completed_reasoning_items_pass_encrypted_content_through() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let done = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "rs_provider",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "blob==",
+                    "status": "completed",
+                },
+            })
+            .to_string(),
+        };
+        let events = normalizer.feed(&done).expect("reasoning item completes");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::EncryptedReasoning {
+                output_index: 0,
+                encrypted_content,
+            }] if encrypted_content == "blob=="
+        ));
+
+        // A reasoning item without the requested include stays silent.
+        let bare = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {"id": "rs_2", "type": "reasoning", "summary": []},
+            })
+            .to_string(),
+        };
+        assert!(normalizer.feed(&bare).expect("bare item").is_empty());
     }
 }

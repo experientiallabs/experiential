@@ -94,6 +94,16 @@ fn error_frame(failure: &Failure) -> String {
     event_frame("error", &anthropic_error_body(&failure.public_error()))
 }
 
+/// The block families one Messages stream schedules, with their provider
+/// grouping index where content arrives incrementally.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Text,
+    Tool(u32),
+    Thinking(u32),
+    Redacted,
+}
+
 /// One scheduled content block, buffered until it can stream in order.
 ///
 /// Anthropic SSE streams content blocks strictly sequentially and a closed
@@ -102,10 +112,26 @@ fn error_frame(failure: &Failure) -> String {
 /// start order: the earliest block streams live, later blocks accumulate
 /// their content in `pending` until every earlier block has closed.
 struct PendingBlock {
-    /// `None` for a text block, or the gateway tool-call index.
-    tool_index: Option<u32>,
+    kind: BlockKind,
     pending: String,
+    /// Thinking only: the opaque signature flushes as one `signature_delta`
+    /// immediately before the block closes.
+    pending_signature: String,
+    /// Redacted only: the whole opaque payload travels in the start frame.
+    redacted_data: Option<String>,
     anthropic_index: Option<u32>,
+}
+
+impl PendingBlock {
+    fn new(kind: BlockKind) -> Self {
+        Self {
+            kind,
+            pending: String::new(),
+            pending_signature: String::new(),
+            redacted_data: None,
+            anthropic_index: None,
+        }
+    }
 }
 
 /// Stateful Anthropic Messages SSE encoder with one open block and one
@@ -209,7 +235,15 @@ impl MessagesSseEncoder {
                 self.refusal_seen = true;
                 Ok(Vec::new())
             }
-            Event::ReasoningSummaryDelta { .. } => Ok(Vec::new()),
+            // OpenAI-only reasoning shapes have no Messages representation.
+            Event::ReasoningSummaryDelta { .. } | Event::EncryptedReasoning { .. } => {
+                Ok(Vec::new())
+            }
+            Event::ThinkingDelta { index, delta } => self.thinking_delta(*index, delta),
+            Event::ThinkingSignature { index, signature } => {
+                self.thinking_signature(*index, signature)
+            }
+            Event::RedactedThinking { data, .. } => self.redacted_thinking(data),
             Event::ToolCallStarted {
                 index,
                 call_id,
@@ -282,21 +316,71 @@ impl MessagesSseEncoder {
     /// Schedule one text delta on the last text block, buffering as needed.
     fn text_delta(&mut self, delta: &str) -> Result<Vec<String>, PublicError> {
         let needs_new_block = match self.blocks.last() {
-            Some(block) => block.tool_index.is_some(),
+            Some(block) => block.kind != BlockKind::Text,
             None => true,
         };
         if needs_new_block {
-            self.blocks.push(PendingBlock {
-                tool_index: None,
-                pending: String::new(),
-                anthropic_index: None,
-            });
+            self.blocks.push(PendingBlock::new(BlockKind::Text));
         }
         let position = self.blocks.len() - 1;
         self.buffer(position, delta)?;
         let mut frames = self.advance();
         self.flush_open(&mut frames);
         Ok(frames)
+    }
+
+    /// Schedule one thinking text delta on its provider-indexed block.
+    fn thinking_delta(&mut self, index: u32, delta: &str) -> Result<Vec<String>, PublicError> {
+        let position = self.thinking_position(index);
+        self.buffer(position, delta)?;
+        let mut frames = self.advance();
+        self.flush_open(&mut frames);
+        Ok(frames)
+    }
+
+    /// Retain one opaque signature fragment; it flushes at block close.
+    fn thinking_signature(
+        &mut self,
+        index: u32,
+        signature: &str,
+    ) -> Result<Vec<String>, PublicError> {
+        let position = self.thinking_position(index);
+        self.buffered_bytes = self.buffered_bytes.saturating_add(signature.len());
+        if self.buffered_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
+            return Err(invalid_provider_stream(
+                "Messages stream buffered blocks exceeded the gateway response limit.",
+            ));
+        }
+        self.blocks[position].pending_signature.push_str(signature);
+        Ok(self.advance())
+    }
+
+    /// Schedule one complete redacted-thinking block at its arrival position.
+    fn redacted_thinking(&mut self, data: &str) -> Result<Vec<String>, PublicError> {
+        self.buffered_bytes = self.buffered_bytes.saturating_add(data.len());
+        if self.buffered_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
+            return Err(invalid_provider_stream(
+                "Messages stream buffered blocks exceeded the gateway response limit.",
+            ));
+        }
+        let mut block = PendingBlock::new(BlockKind::Redacted);
+        block.redacted_data = Some(data.to_string());
+        self.blocks.push(block);
+        Ok(self.advance())
+    }
+
+    /// Find or schedule the thinking block for one provider index.
+    fn thinking_position(&mut self, index: u32) -> usize {
+        if let Some(position) = self
+            .blocks
+            .iter()
+            .position(|block| block.kind == BlockKind::Thinking(index))
+        {
+            return position;
+        }
+        self.blocks
+            .push(PendingBlock::new(BlockKind::Thinking(index)));
+        self.blocks.len() - 1
     }
 
     /// Schedule one tool_use block at its start position.
@@ -315,11 +399,8 @@ impl MessagesSseEncoder {
             .insert(tool_index, (call_id.to_string(), name.to_string()));
         self.tool_arguments.insert(tool_index, String::new());
         self.saw_tool_use = true;
-        self.blocks.push(PendingBlock {
-            tool_index: Some(tool_index),
-            pending: String::new(),
-            anthropic_index: None,
-        });
+        self.blocks
+            .push(PendingBlock::new(BlockKind::Tool(tool_index)));
         Ok(self.advance())
     }
 
@@ -346,7 +427,7 @@ impl MessagesSseEncoder {
         let position = self
             .blocks
             .iter()
-            .position(|block| block.tool_index == Some(tool_index))
+            .position(|block| block.kind == BlockKind::Tool(tool_index))
             .expect("started tool has a scheduled block");
         self.buffer(position, delta)?;
         let mut frames = self.advance();
@@ -379,13 +460,15 @@ impl MessagesSseEncoder {
                 let block = &self.blocks[position];
                 let last = position == self.blocks.len() - 1;
                 let closable = self.draining
-                    || match block.tool_index {
-                        None => !last,
-                        Some(tool_index) => self.tool_completed.contains(&tool_index),
+                    || match block.kind {
+                        BlockKind::Text | BlockKind::Thinking(_) | BlockKind::Redacted => !last,
+                        BlockKind::Tool(tool_index) => self.tool_completed.contains(&tool_index),
                     };
                 if !closable {
                     return frames;
                 }
+                self.flush_signature(position, &mut frames);
+                let block = &self.blocks[position];
                 frames.push(event_frame(
                     "content_block_stop",
                     &json!({"type": "content_block_stop", "index": block.anthropic_index}),
@@ -403,9 +486,19 @@ impl MessagesSseEncoder {
             self.next_block_index += 1;
             let block = &mut self.blocks[position];
             block.anthropic_index = Some(anthropic_index);
-            let content_block = match block.tool_index {
-                None => json!({"type": "text", "text": ""}),
-                Some(tool_index) => {
+            let content_block = match block.kind {
+                BlockKind::Text => json!({"type": "text", "text": ""}),
+                // The SDK thinking block type requires both fields, so the
+                // start frame carries their empty forms like the provider.
+                BlockKind::Thinking(_) => {
+                    json!({"type": "thinking", "thinking": "", "signature": ""})
+                }
+                BlockKind::Redacted => {
+                    let data = block.redacted_data.take().unwrap_or_default();
+                    self.buffered_bytes = self.buffered_bytes.saturating_sub(data.len());
+                    json!({"type": "redacted_thinking", "data": data})
+                }
+                BlockKind::Tool(tool_index) => {
                     let identity = self
                         .tool_identities
                         .get(&tool_index)
@@ -430,6 +523,26 @@ impl MessagesSseEncoder {
         }
     }
 
+    /// Emit one closing `signature_delta` for a thinking block, if retained.
+    fn flush_signature(&mut self, position: usize, frames: &mut Vec<String>) {
+        let block = &mut self.blocks[position];
+        if !matches!(block.kind, BlockKind::Thinking(_)) || block.pending_signature.is_empty() {
+            return;
+        }
+        frames.push(event_frame(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": block.anthropic_index,
+                "delta": {"type": "signature_delta", "signature": block.pending_signature},
+            }),
+        ));
+        self.buffered_bytes = self
+            .buffered_bytes
+            .saturating_sub(block.pending_signature.len());
+        block.pending_signature.clear();
+    }
+
     /// Emit the open block's buffered content as one delta, if any.
     fn flush_open(&mut self, frames: &mut Vec<String>) {
         let Some(position) = self.open_position else {
@@ -439,9 +552,15 @@ impl MessagesSseEncoder {
         if block.pending.is_empty() {
             return;
         }
-        let delta = match block.tool_index {
-            None => json!({"type": "text_delta", "text": block.pending}),
-            Some(_) => json!({"type": "input_json_delta", "partial_json": block.pending}),
+        let delta = match block.kind {
+            BlockKind::Text => json!({"type": "text_delta", "text": block.pending}),
+            BlockKind::Thinking(_) => json!({"type": "thinking_delta", "thinking": block.pending}),
+            // Redacted blocks carry their payload in the start frame and
+            // never buffer deltas.
+            BlockKind::Redacted => return,
+            BlockKind::Tool(_) => {
+                json!({"type": "input_json_delta", "partial_json": block.pending})
+            }
         };
         frames.push(event_frame(
             "content_block_delta",
@@ -531,7 +650,23 @@ pub fn completed_messages_body(
     // sentinel, after later text.
     let mut slots: Vec<Option<Value>> = Vec::new();
     let mut tool_positions: HashMap<u32, usize> = HashMap::new();
+    let mut thinking_positions: HashMap<u32, usize> = HashMap::new();
     let mut saw_tool_use = false;
+    // Resolve one thinking slot per provider index, creating the block with
+    // the SDK-required empty fields on first use.
+    fn thinking_slot<'a>(
+        slots: &'a mut Vec<Option<Value>>,
+        positions: &mut HashMap<u32, usize>,
+        index: u32,
+    ) -> &'a mut Value {
+        let position = *positions.entry(index).or_insert_with(|| {
+            slots.push(Some(
+                json!({"type": "thinking", "thinking": "", "signature": ""}),
+            ));
+            slots.len() - 1
+        });
+        slots[position].as_mut().expect("thinking slot is filled")
+    }
     for event in events {
         match event {
             Event::TextDelta(delta) if !delta.is_empty() => {
@@ -549,6 +684,21 @@ pub fn completed_messages_body(
                 if !appended {
                     slots.push(Some(json!({"type": "text", "text": delta})));
                 }
+            }
+            Event::ThinkingDelta { index, delta } if !delta.is_empty() => {
+                let block = thinking_slot(&mut slots, &mut thinking_positions, *index);
+                if let Some(Value::String(text)) = block.get_mut("thinking") {
+                    text.push_str(delta);
+                }
+            }
+            Event::ThinkingSignature { index, signature } => {
+                let block = thinking_slot(&mut slots, &mut thinking_positions, *index);
+                if let Some(Value::String(text)) = block.get_mut("signature") {
+                    text.push_str(signature);
+                }
+            }
+            Event::RedactedThinking { data, .. } => {
+                slots.push(Some(json!({"type": "redacted_thinking", "data": data})));
             }
             Event::ToolCallStarted { index, .. } => {
                 tool_positions.insert(*index, slots.len());
@@ -595,255 +745,4 @@ pub fn completed_messages_body(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::events::CompletedToolCall;
-
-    #[test]
-    fn usage_reports_cached_reads_out_of_the_input_total() {
-        let usage = Usage {
-            input_tokens: Some(10),
-            output_tokens: Some(4),
-            cached_input_tokens: Some(3),
-            reasoning_tokens: None,
-        };
-        assert_eq!(
-            messages_usage(Some(&usage)),
-            json!({"input_tokens": 7, "output_tokens": 4, "cache_read_input_tokens": 3})
-        );
-        assert_eq!(
-            messages_usage(None),
-            json!({"input_tokens": 0, "output_tokens": 0})
-        );
-    }
-
-    #[test]
-    fn error_body_folds_param_and_maps_status_first() {
-        let mut error = PublicError::new(
-            400,
-            "invalid_parameter",
-            "Invalid value.",
-            "invalid_request_error",
-        );
-        error.param = Some("top_k".to_string());
-        assert_eq!(
-            anthropic_error_body(&error),
-            json!({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "Invalid value. (param: top_k)",
-                },
-            })
-        );
-        let throttled = PublicError::new(429, "unavailable_route", "Throttled.", "api_error");
-        assert_eq!(
-            anthropic_error_body(&throttled)["error"]["type"],
-            json!("rate_limit_error")
-        );
-    }
-
-    #[test]
-    fn completed_body_orders_text_before_tool_use_blocks() {
-        let events = vec![
-            Event::TextDelta("hi".to_string()),
-            Event::ToolCallStarted {
-                index: 0,
-                call_id: "call-1".to_string(),
-                name: "search".to_string(),
-            },
-            Event::ToolArgumentsDelta {
-                index: 0,
-                delta: "{\"b\":1,\"a\":2}".to_string(),
-            },
-            Event::ToolCallCompleted {
-                index: 0,
-                call: CompletedToolCall {
-                    call_id: "call-1".to_string(),
-                    name: "search".to_string(),
-                    raw_arguments: "{\"b\":1,\"a\":2}".to_string(),
-                },
-            },
-            Event::Completed,
-        ];
-        let aggregated =
-            completed_messages_body("request-abc", "coding", &events).expect("aggregates");
-        assert!(aggregated.failure.is_none());
-        assert_eq!(aggregated.body["stop_reason"], json!("tool_use"));
-        assert_eq!(aggregated.body["content"][0]["type"], json!("text"));
-        // preserve_order keeps the provider's key order in the parsed input.
-        assert_eq!(
-            compact_json(&aggregated.body["content"][1]["input"]),
-            "{\"b\":1,\"a\":2}"
-        );
-        assert_eq!(aggregated.tool_names, vec!["search".to_string()]);
-    }
-
-    #[test]
-    fn completed_body_preserves_interleaved_block_order() {
-        let events = vec![
-            Event::ToolCallStarted {
-                index: 0,
-                call_id: "call-1".to_string(),
-                name: "search".to_string(),
-            },
-            Event::ToolCallCompleted {
-                index: 0,
-                call: CompletedToolCall {
-                    call_id: "call-1".to_string(),
-                    name: "search".to_string(),
-                    raw_arguments: "{}".to_string(),
-                },
-            },
-            Event::TextDelta("after ".to_string()),
-            Event::TextDelta("the tool".to_string()),
-            Event::Completed,
-        ];
-        let aggregated =
-            completed_messages_body("request-abc", "coding", &events).expect("aggregates");
-        assert_eq!(aggregated.body["content"][0]["type"], json!("tool_use"));
-        assert_eq!(
-            aggregated.body["content"][1],
-            json!({"type": "text", "text": "after the tool"})
-        );
-    }
-
-    #[test]
-    fn deferred_tool_completion_keeps_the_started_block_position() {
-        // OpenAI-compatible streams complete every tool only at [DONE], so
-        // text may arrive between the tool's arguments and its completion.
-        let events = vec![
-            Event::ToolCallStarted {
-                index: 0,
-                call_id: "call-1".to_string(),
-                name: "search".to_string(),
-            },
-            Event::ToolArgumentsDelta {
-                index: 0,
-                delta: "{}".to_string(),
-            },
-            Event::TextDelta("after".to_string()),
-            Event::ToolCallCompleted {
-                index: 0,
-                call: CompletedToolCall {
-                    call_id: "call-1".to_string(),
-                    name: "search".to_string(),
-                    raw_arguments: "{}".to_string(),
-                },
-            },
-            Event::Completed,
-        ];
-        let aggregated =
-            completed_messages_body("request-abc", "coding", &events).expect("aggregates");
-        assert_eq!(aggregated.body["content"][0]["type"], json!("tool_use"));
-        assert_eq!(
-            aggregated.body["content"][1],
-            json!({"type": "text", "text": "after"})
-        );
-        let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
-        let mut frames = encoder.start().expect("starts");
-        for event in &events {
-            frames.extend(
-                encoder
-                    .feed(event)
-                    .expect("streams the deferred completion"),
-            );
-        }
-        assert!(frames.last().expect("terminal").contains("message_stop"));
-    }
-
-    #[test]
-    fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
-        // Tool A streams live through the interleaving; tool B's fragment
-        // buffers and flushes as one delta after A's block closes.
-        let events = vec![
-            Event::ToolCallStarted {
-                index: 0,
-                call_id: "call-a".to_string(),
-                name: "alpha".to_string(),
-            },
-            Event::ToolArgumentsDelta {
-                index: 0,
-                delta: "{\"a\": ".to_string(),
-            },
-            Event::ToolCallStarted {
-                index: 1,
-                call_id: "call-b".to_string(),
-                name: "beta".to_string(),
-            },
-            Event::ToolArgumentsDelta {
-                index: 1,
-                delta: "{\"b\": 2}".to_string(),
-            },
-            Event::ToolArgumentsDelta {
-                index: 0,
-                delta: "1}".to_string(),
-            },
-            Event::ToolCallCompleted {
-                index: 0,
-                call: CompletedToolCall {
-                    call_id: "call-a".to_string(),
-                    name: "alpha".to_string(),
-                    raw_arguments: "{\"a\": 1}".to_string(),
-                },
-            },
-            Event::ToolCallCompleted {
-                index: 1,
-                call: CompletedToolCall {
-                    call_id: "call-b".to_string(),
-                    name: "beta".to_string(),
-                    raw_arguments: "{\"b\": 2}".to_string(),
-                },
-            },
-            Event::Completed,
-        ];
-        let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
-        let mut frames = encoder.start().expect("starts");
-        for event in &events {
-            frames.extend(encoder.feed(event).expect("streams the interleaving"));
-        }
-        let names: Vec<&str> = frames
-            .iter()
-            .map(|frame| {
-                frame
-                    .lines()
-                    .next()
-                    .and_then(|line| line.strip_prefix("event: "))
-                    .expect("named frame")
-            })
-            .collect();
-        assert_eq!(
-            names,
-            vec![
-                "message_start",
-                "ping",
-                "content_block_start",
-                "content_block_delta",
-                "content_block_delta",
-                "content_block_stop",
-                "content_block_start",
-                "content_block_delta",
-                "content_block_stop",
-                "message_delta",
-                "message_stop",
-            ]
-        );
-        // The buffered tool-B fragment flushes as one input_json_delta on
-        // Anthropic block index 1 after block 0 closes.
-        assert!(frames[7].contains("\"index\":1"));
-        assert!(frames[7].contains("{\\\"b\\\": 2}"));
-        let aggregated =
-            completed_messages_body("request-abc", "coding", &events).expect("aggregates");
-        assert_eq!(aggregated.body["content"][0]["id"], json!("call-a"));
-        assert_eq!(aggregated.body["content"][1]["id"], json!("call-b"));
-    }
-
-    #[test]
-    fn refusal_content_aggregates_as_a_sanitized_failure() {
-        let events = vec![Event::RefusalDelta("no".to_string()), Event::Completed];
-        let aggregated =
-            completed_messages_body("request-abc", "coding", &events).expect("aggregates");
-        let failure = aggregated.failure.expect("refusal failure");
-        assert_eq!(failure.failure_class, FailureClass::Refusal);
-    }
-}
+mod tests;

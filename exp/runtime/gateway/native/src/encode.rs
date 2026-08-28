@@ -84,7 +84,13 @@ impl ChatSseEncoder {
         match event {
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
-            Event::ReasoningSummaryDelta { .. } => Ok(Vec::new()),
+            // The Chat wire has no reasoning representation, so provider
+            // reasoning follows the summary path and is deliberately dropped.
+            Event::ReasoningSummaryDelta { .. }
+            | Event::ThinkingDelta { .. }
+            | Event::ThinkingSignature { .. }
+            | Event::RedactedThinking { .. }
+            | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
             Event::ToolCallStarted {
                 index,
                 call_id,

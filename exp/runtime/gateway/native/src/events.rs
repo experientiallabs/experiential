@@ -39,6 +39,28 @@ pub enum Event {
         summary_index: u32,
         delta: String,
     },
+    /// Verbatim Anthropic extended-thinking text for one provider block.
+    ThinkingDelta {
+        index: u32,
+        delta: String,
+    },
+    /// Opaque cryptographic signature closing one Anthropic thinking block;
+    /// it must round-trip byte-exact or the provider rejects the replay.
+    ThinkingSignature {
+        index: u32,
+        signature: String,
+    },
+    /// One complete opaque Anthropic redacted-thinking block.
+    RedactedThinking {
+        index: u32,
+        data: String,
+    },
+    /// One opaque OpenAI Responses encrypted reasoning payload, keyed by its
+    /// provider output-item index.
+    EncryptedReasoning {
+        output_index: u32,
+        encrypted_content: String,
+    },
     ToolCallStarted {
         index: u32,
         call_id: String,
@@ -83,6 +105,29 @@ pub fn simplified_event(event: &Event) -> Value {
             "output_index": output_index,
             "summary_index": summary_index,
             "text": delta,
+        }),
+        Event::ThinkingDelta { index, delta } => serde_json::json!({
+            "kind": "thinking_delta",
+            "index": index,
+            "text": delta,
+        }),
+        Event::ThinkingSignature { index, signature } => serde_json::json!({
+            "kind": "thinking_signature",
+            "index": index,
+            "signature": signature,
+        }),
+        Event::RedactedThinking { index, data } => serde_json::json!({
+            "kind": "redacted_thinking",
+            "index": index,
+            "data": data,
+        }),
+        Event::EncryptedReasoning {
+            output_index,
+            encrypted_content,
+        } => serde_json::json!({
+            "kind": "encrypted_reasoning",
+            "output_index": output_index,
+            "encrypted_content": encrypted_content,
         }),
         Event::ToolCallStarted {
             index,

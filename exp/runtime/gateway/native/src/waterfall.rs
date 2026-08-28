@@ -132,6 +132,10 @@ fn is_semantic(event: &Event) -> bool {
         Event::TextDelta(_)
             | Event::RefusalDelta(_)
             | Event::ReasoningSummaryDelta { .. }
+            | Event::ThinkingDelta { .. }
+            | Event::ThinkingSignature { .. }
+            | Event::RedactedThinking { .. }
+            | Event::EncryptedReasoning { .. }
             | Event::ToolCallStarted { .. }
             | Event::ToolArgumentsDelta { .. }
             | Event::ToolCallCompleted { .. }

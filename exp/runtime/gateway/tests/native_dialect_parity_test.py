@@ -374,3 +374,90 @@ def test_native_bedrock_normalizer_fails_corrupt_and_truncated_frames() -> None:
     failure = truncated["failure"]
     assert isinstance(failure, dict)
     assert failure["failure_class"] == "malformed_response"
+
+
+ANTHROPIC_THINKING_CHUNKS: tuple[bytes, ...] = (
+    _sse(
+        {
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 6, "cache_read_input_tokens": 2}},
+        }
+    ),
+    _sse(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+        }
+    ),
+    _sse(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "step one"},
+        }
+    ),
+    _sse(
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "c2ln"},
+        }
+    ),
+    _sse({"type": "content_block_stop", "index": 0}),
+    _sse(
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "redacted_thinking", "data": "b3BhcXVl"},
+        }
+    ),
+    _sse({"type": "content_block_stop", "index": 1}),
+    _sse(
+        {
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {"type": "text", "text": ""},
+        }
+    ),
+    _sse(
+        {
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "text_delta", "text": "Hi"},
+        }
+    ),
+    _sse({"type": "content_block_stop", "index": 2}),
+    _sse(
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 9},
+        }
+    ),
+    _sse({"type": "message_stop"}),
+)
+
+ANTHROPIC_THINKING_EVENTS: tuple[JsonObject, ...] = (
+    {"kind": "thinking_delta", "index": 0, "text": "step one"},
+    {"kind": "thinking_signature", "index": 0, "signature": "c2ln"},
+    {"kind": "redacted_thinking", "index": 1, "data": "b3BhcXVl"},
+    {"kind": "text_delta", "text": "Hi"},
+    {
+        "kind": "usage",
+        "input_tokens": 8,
+        "output_tokens": 9,
+        "cached_input_tokens": 2,
+        # Anthropic reports thinking inside output_tokens with no separate
+        # count, so the reasoning subset stays unknown.
+        "reasoning_tokens": None,
+    },
+    {"kind": "completed"},
+)
+
+
+def test_native_anthropic_normalizer_emits_thinking_events() -> None:
+    """Extended-thinking frames normalize to dedicated events, never silence."""
+    result = _native_normalized("anthropic_messages", ANTHROPIC_THINKING_CHUNKS)
+    assert result["failure"] is None
+    assert result["events"] == list(ANTHROPIC_THINKING_EVENTS)

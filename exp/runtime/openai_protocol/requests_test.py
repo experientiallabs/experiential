@@ -743,3 +743,25 @@ def test_responses_decoder_rejects_unknown_include_paths() -> None:
                 "input": [{"type": "reasoning", "id": "rs_1", "summary": []}],
             }
         )
+
+
+def test_chat_decoder_accepts_the_ultra_reasoning_effort() -> None:
+    """The wire model owns effort validation ahead of the installed SDK literal."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "ultra",
+        }
+    )
+    assert decoded.request.reasoning_effort == "ultra"
+
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "extreme",
+            }
+        )
+    assert raised.value.detail.param == "reasoning_effort"

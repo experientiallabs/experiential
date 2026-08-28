@@ -376,7 +376,9 @@ def decode_chat(
     """
     payload = _drop_opencode_cache_control(payload)
     _validate_manifest(payload, CHAT_MANIFEST)
-    _validate_official(_CHAT_OFFICIAL, payload, extension_fields={"top_k"})
+    # The installed SDK's effort literal lags the newest provider tier
+    # ("ultra"), so the strict wire model owns reasoning validation.
+    _validate_official(_CHAT_OFFICIAL, payload, extension_fields={"top_k", "reasoning_effort"})
     request = _validate_wire(_ChatRequest, payload)
     operation = _caller_operation(idempotency_key, client_request_id)
     maximum = request.max_completion_tokens or request.max_tokens

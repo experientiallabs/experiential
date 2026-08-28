@@ -1,7 +1,7 @@
-//! Anthropic Messages frame mapping, mirroring the python event mapper:
-//! usage legs accumulate across the message lifecycle and fold at
-//! `message_stop`, refusal blocks and refusal stop reasons mark the stream,
-//! and extended-thinking blocks are skipped rather than rejected.
+//! Anthropic Messages frame mapping: usage legs accumulate across the
+//! message lifecycle and fold at `message_stop`, refusal blocks and refusal
+//! stop reasons mark the stream, and extended-thinking blocks normalize to
+//! dedicated thinking events so callers receive the reasoning they pay for.
 
 use serde_json::Value;
 
@@ -95,8 +95,19 @@ impl Normalizer {
                             "Anthropic refusal",
                         )?));
                     }
-                    // Blocks with no gateway-visible output (extended thinking)
-                    // are skipped rather than rejected.
+                    Some("thinking") => {
+                        let text = optional_text(block, "thinking", "Anthropic initial thinking")?;
+                        if !text.is_empty() {
+                            events.push(Event::ThinkingDelta { index, delta: text });
+                        }
+                    }
+                    Some("redacted_thinking") => {
+                        // Redacted thinking arrives whole in the start frame.
+                        let data = optional_text(block, "data", "Anthropic redacted thinking")?;
+                        events.push(Event::RedactedThinking { index, data });
+                    }
+                    // Unknown block kinds with no gateway-visible output are
+                    // skipped rather than rejected.
                     _ => {}
                 }
             }
@@ -135,7 +146,19 @@ impl Normalizer {
                             "Anthropic refusal delta",
                         )?));
                     }
-                    // thinking_delta and signature_delta are skipped.
+                    Some("thinking_delta") => {
+                        let text = optional_text(delta, "thinking", "Anthropic thinking delta")?;
+                        if !text.is_empty() {
+                            events.push(Event::ThinkingDelta { index, delta: text });
+                        }
+                    }
+                    Some("signature_delta") => {
+                        let signature =
+                            optional_text(delta, "signature", "Anthropic signature delta")?;
+                        if !signature.is_empty() {
+                            events.push(Event::ThinkingSignature { index, signature });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -187,6 +210,9 @@ impl Normalizer {
                     input_tokens: Some(input_tokens),
                     output_tokens: Some(self.output_tokens),
                     cached_input_tokens: Some(self.cache_read),
+                    // Anthropic reports thinking inside output_tokens and
+                    // publishes no separate count, so the reasoning subset
+                    // stays unknown instead of being invented.
                     reasoning_tokens: None,
                 }));
                 if self.refusal_seen || self.stop_reason.as_deref() == Some("refusal") {
@@ -206,5 +232,63 @@ impl Normalizer {
             }
         }
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dialects::{Dialect, Normalizer};
+    use crate::events::Event;
+    use crate::sse::SseEvent;
+
+    fn frame(payload: serde_json::Value) -> SseEvent {
+        SseEvent {
+            event: None,
+            data: payload.to_string(),
+        }
+    }
+
+    #[test]
+    fn thinking_blocks_normalize_to_dedicated_events() {
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        let start = frame(serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+        }));
+        assert!(normalizer.feed(&start).expect("start").is_empty());
+
+        let delta = frame(serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "step one"},
+        }));
+        let events = normalizer.feed(&delta).expect("thinking delta");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ThinkingDelta { index: 0, delta }] if delta == "step one"
+        ));
+
+        let signature = frame(serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "sig=="},
+        }));
+        let events = normalizer.feed(&signature).expect("signature delta");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ThinkingSignature { index: 0, signature }] if signature == "sig=="
+        ));
+
+        let redacted = frame(serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "redacted_thinking", "data": "opaque=="},
+        }));
+        let events = normalizer.feed(&redacted).expect("redacted block");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::RedactedThinking { index: 1, data }] if data == "opaque=="
+        ));
     }
 }

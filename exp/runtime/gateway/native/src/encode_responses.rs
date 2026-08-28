@@ -97,11 +97,13 @@ impl ToolState {
     }
 }
 
-/// One accumulated reasoning item with provider-indexed summary parts.
+/// One accumulated reasoning item with provider-indexed summary parts and
+/// an optional opaque encrypted payload the caller replays verbatim.
 struct ReasoningState {
     item_id: String,
     output_index: usize,
     parts: BTreeMap<u32, String>,
+    encrypted_content: Option<String>,
 }
 
 impl ReasoningState {
@@ -114,12 +116,18 @@ impl ReasoningState {
         } else {
             Vec::new()
         };
-        json!({
+        let mut item = json!({
             "id": self.item_id,
             "type": "reasoning",
             "summary": summary,
             "status": if completed { "completed" } else { "in_progress" },
-        })
+        });
+        if let Some(encrypted) = &self.encrypted_content {
+            item.as_object_mut()
+                .expect("reasoning item is an object")
+                .insert("encrypted_content".to_string(), json!(encrypted));
+        }
+        item
     }
 }
 
@@ -219,6 +227,16 @@ impl ResponsesSseEncoder {
                 summary_index,
                 delta,
             } => self.reasoning_summary_delta(*output_index, *summary_index, delta),
+            // Lossy projection: Anthropic thinking text streams as a summary
+            // part so callers receive what they pay for. Signatures and
+            // redacted payloads are dropped deliberately, since this surface
+            // cannot round-trip them.
+            Event::ThinkingDelta { index, delta } => self.reasoning_summary_delta(*index, 0, delta),
+            Event::ThinkingSignature { .. } | Event::RedactedThinking { .. } => Ok(Vec::new()),
+            Event::EncryptedReasoning {
+                output_index,
+                encrypted_content,
+            } => self.encrypted_reasoning(*output_index, encrypted_content),
             Event::ToolCallStarted {
                 index,
                 call_id,
@@ -326,6 +344,50 @@ impl ResponsesSseEncoder {
         index
     }
 
+    /// Create one stable reasoning output item on first use.
+    fn ensure_reasoning(&mut self, provider_output_index: u32, frames: &mut Vec<String>) {
+        if self.reasoning.contains_key(&provider_output_index) {
+            return;
+        }
+        let state = ReasoningState {
+            item_id: stable_public_id(
+                "rs",
+                &format!("{}:{}", self.response_id, provider_output_index),
+            ),
+            output_index: self.output_order.len(),
+            parts: BTreeMap::new(),
+            encrypted_content: None,
+        };
+        let frame = self.event(
+            "response.output_item.added",
+            json!({
+                "output_index": state.output_index,
+                "item": state.item(false),
+            }),
+        );
+        self.reasoning.insert(provider_output_index, state);
+        self.output_order
+            .push(OutputSlot::Reasoning(provider_output_index));
+        frames.push(frame);
+    }
+
+    /// Retain one opaque encrypted reasoning payload on its output item; the
+    /// payload surfaces on the item's completion frames rather than a delta.
+    fn encrypted_reasoning(
+        &mut self,
+        provider_output_index: u32,
+        encrypted_content: &str,
+    ) -> Result<Vec<String>, PublicError> {
+        let mut frames = Vec::new();
+        self.ensure_reasoning(provider_output_index, &mut frames);
+        let state = self
+            .reasoning
+            .get_mut(&provider_output_index)
+            .expect("reasoning state just ensured");
+        state.encrypted_content = Some(encrypted_content.to_string());
+        Ok(frames)
+    }
+
     /// Start one reasoning item/summary part as needed and emit its text delta.
     fn reasoning_summary_delta(
         &mut self,
@@ -334,27 +396,7 @@ impl ResponsesSseEncoder {
         delta: &str,
     ) -> Result<Vec<String>, PublicError> {
         let mut frames = Vec::new();
-        if !self.reasoning.contains_key(&provider_output_index) {
-            let state = ReasoningState {
-                item_id: stable_public_id(
-                    "rs",
-                    &format!("{}:{}", self.response_id, provider_output_index),
-                ),
-                output_index: self.output_order.len(),
-                parts: BTreeMap::new(),
-            };
-            let frame = self.event(
-                "response.output_item.added",
-                json!({
-                    "output_index": state.output_index,
-                    "item": state.item(false),
-                }),
-            );
-            self.reasoning.insert(provider_output_index, state);
-            self.output_order
-                .push(OutputSlot::Reasoning(provider_output_index));
-            frames.push(frame);
-        }
+        self.ensure_reasoning(provider_output_index, &mut frames);
         let (item_id, output_index, new_part) = {
             let state = self
                 .reasoning
@@ -866,31 +908,4 @@ pub fn completed_responses_body(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ignored_generation_controls_are_disclosed_by_responses_encoder() {
-        let envelope = ResponsesEnvelope {
-            ignored_parameters: vec!["top_k".to_string()],
-            ..ResponsesEnvelope::default()
-        };
-        let mut encoder =
-            ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000.0, envelope.clone());
-        let frames = encoder.start().expect("stream start must encode");
-        assert!(frames[0].contains("\"x-experiential-ignored-parameters\":[\"top_k\"]"));
-
-        let completed = completed_responses_body(
-            "request-1",
-            "coding",
-            1_700_000_000.0,
-            envelope,
-            &[Event::Completed],
-        )
-        .expect("completed body must encode");
-        assert_eq!(
-            completed.body["x-experiential-ignored-parameters"],
-            json!(["top_k"])
-        );
-    }
-}
+mod tests;

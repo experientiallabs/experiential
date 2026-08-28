@@ -181,10 +181,16 @@ are accumulated in original order and validated only at the complete-call bounda
 `POST /v1/messages` for Anthropic SDK callers over the same canonical gateway request. Callers
 authenticate with `x-api-key` (the Anthropic SDK default) or a standard Bearer header; both carry
 the same virtual key, and every failure on this surface is rendered in the Anthropic error
-envelope `{"type": "error", "error": {...}}`. The decoder translates text, `tool_use`, and
-`tool_result` blocks faithfully, requires `max_tokens`, validates and drops `thinking` and
-`cache_control` (the gateway has no extended-thinking or prompt-caching channel), and rejects
-image and document blocks loudly because the surface is text-only. Streaming emits the Anthropic
+envelope `{"type": "error", "error": {...}}`. The decoder translates text, `tool_use`,
+`tool_result`, `thinking`, and `redacted_thinking` blocks faithfully (thinking history rides an
+opaque provider-reasoning carrier with byte-exact signatures, and a caller `thinking`
+configuration is forwarded verbatim, overriding the catalog's adaptive default), requires
+`max_tokens`, validates and drops `cache_control` (the gateway has no prompt-caching channel),
+and rejects image and document blocks loudly because the surface is text-only. Thinking carriers
+replay only on the Anthropic wire, so route admission requires every waterfall rung to speak the
+`anthropic_messages` dialect; on OpenAI-shaped surfaces over Anthropic routes, thinking text is
+projected onto the reasoning-summary channel (signatures deliberately dropped) so callers receive
+the reasoning they pay for. Streaming emits the Anthropic
 lifecycle (`message_start`, `ping`, content blocks, `message_delta` with the mapped stop reason
 and usage, `message_stop`, or one terminal `error` event); the non-streaming body is the
 Anthropic message object. Completed streams stop with `end_turn` (`tool_use` when tool calls are
@@ -210,7 +216,10 @@ calendar-month reset boundary in the error message.
 OpenAI `3.0.0` `OpenAI` and `AsyncOpenAI` clients are release-certified for Chat Completions and
 Responses in synchronous and asynchronous, streaming and non-streaming forms. Responses
 continuation and duplicate replay retain content only in bounded, process-local, tenant and
-alias-revision-scoped stores. Replay is opt-in through an idempotency or client request key. Restart
+alias-revision-scoped stores. A `store: false` request skips continuation retention entirely
+(continuing from its ID answers `continuation_unavailable`), and
+`include: ["reasoning.encrypted_content"]` forwards the encrypted reasoning request to native
+OpenAI Responses routes, whose opaque payloads replay verbatim from the caller's input. Replay is opt-in through an idempotency or client request key. Restart
 or eviction returns an explicit unavailable error and never reconstructs content from SQLite.
 
 ## Content-free observability and lifecycle

@@ -2857,3 +2857,65 @@ def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
         "assistant",
         "user",
     ]
+
+
+def _thinking_fixture_json() -> str:
+    """Return the Rust fixture-event JSON for the thinking Messages stream."""
+    return json.dumps(
+        [
+            {"kind": "thinking_delta", "index": 0, "text": "Let me "},
+            {"kind": "thinking_delta", "index": 0, "text": "check."},
+            {"kind": "thinking_signature", "index": 0, "signature": "c2lnbmF0dXJl"},
+            {"kind": "redacted_thinking", "index": 1, "data": "b3BhcXVl"},
+            {"kind": "text_delta", "text": "Hello"},
+            {"kind": "usage", "input_tokens": 12, "output_tokens": 7, "cached_input_tokens": 2},
+            {"kind": "completed"},
+        ]
+    )
+
+
+def test_rust_messages_thinking_stream_matches_the_hand_authored_goldens() -> None:
+    """Thinking blocks stream and aggregate exactly as the Anthropic spec fixes.
+
+    The golden frames were hand-authored against the public Messages
+    streaming contract: the thinking block opens with empty fields, streams
+    thinking_delta fragments, closes with one signature_delta, redacted
+    thinking travels whole in its start frame, and the non-streaming body
+    carries the same blocks in order with the byte-exact signature.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+
+    frames = native.encode_messages_fixture("request-abc", "coding", _thinking_fixture_json())
+    assert list(frames) == _parity_golden("messages_thinking_frames")
+    body = native.completed_messages_fixture("request-abc", "coding", _thinking_fixture_json())
+    assert body == _parity_golden("messages_thinking_body")
+
+
+def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -> None:
+    """Requested encrypted reasoning lands verbatim on the reasoning item."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    fixture = json.dumps(
+        [
+            {
+                "kind": "reasoning_summary_delta",
+                "output_index": 0,
+                "summary_index": 0,
+                "text": "planned",
+            },
+            {"kind": "encrypted_reasoning", "output_index": 0, "encrypted_content": "ZW5jcnlwdGVk"},
+            {"kind": "text_delta", "text": "Hello"},
+            {
+                "kind": "usage",
+                "input_tokens": 12,
+                "output_tokens": 9,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 4,
+            },
+            {"kind": "completed"},
+        ]
+    )
+    body = native.completed_responses_fixture(
+        "request-abc", "coding", 1_700_000_000.0, "{}", fixture
+    )
+    assert body == _parity_golden("responses_encrypted_reasoning_body")

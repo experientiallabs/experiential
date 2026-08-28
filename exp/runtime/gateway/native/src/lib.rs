@@ -337,6 +337,34 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .unwrap_or(0) as u32,
                 delta: text,
             },
+            "thinking_delta" => events::Event::ThinkingDelta { index, delta: text },
+            "thinking_signature" => events::Event::ThinkingSignature {
+                index,
+                signature: object
+                    .get("signature")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "redacted_thinking" => events::Event::RedactedThinking {
+                index,
+                data: object
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "encrypted_reasoning" => events::Event::EncryptedReasoning {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                encrypted_content: object
+                    .get("encrypted_content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
             "tool_call_started" => events::Event::ToolCallStarted {
                 index,
                 call_id: object

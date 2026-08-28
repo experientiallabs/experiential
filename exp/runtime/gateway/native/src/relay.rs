@@ -35,6 +35,12 @@ pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
         Event::TextDelta(text) | Event::RefusalDelta(text) => text.len(),
         Event::ReasoningSummaryDelta { delta, .. } => delta.len(),
+        Event::ThinkingDelta { delta, .. } => delta.len(),
+        Event::ThinkingSignature { signature, .. } => signature.len(),
+        Event::RedactedThinking { data, .. } => data.len(),
+        Event::EncryptedReasoning {
+            encrypted_content, ..
+        } => encrypted_content.len(),
         Event::ToolArgumentsDelta { delta, .. } => delta.len(),
         Event::ToolCallCompleted { call, .. } => call.raw_arguments.len().max(64),
         _ => 64,
