@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ChatMaxTokensField
 from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
     GatewayNamedToolChoice,
     GatewayRequest,
 )
@@ -53,6 +55,26 @@ _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
 )
 
 
+def _fireworks_continuation_required(
+    profile: GatewayWireProfile,
+    request: GatewayRequest,
+) -> bool:
+    """Return whether a Fireworks Responses turn can emit an unretained tool call."""
+    return (
+        request.surface == GatewayApiSurface.RESPONSES
+        and _is_fireworks_profile(profile)
+        and request.response_store is False
+        and not request.include_encrypted_reasoning
+        and bool(request.tools)
+        and request.tool_choice != "none"
+    )
+
+
+def _is_fireworks_profile(profile: GatewayWireProfile) -> bool:
+    """Return whether one wire profile targets the public Fireworks API."""
+    return (urlsplit(profile.url).hostname or "").lower() == "api.fireworks.ai"
+
+
 def dialect_stream_payload(
     profile: GatewayWireProfile,
     provider_request: GatewayRequest,
@@ -70,6 +92,8 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
+    if _fireworks_continuation_required(profile, provider_request):
+        raise ProviderCapabilityError(capability="responses_fireworks_reasoning_continuation")
     required_reasoning_effort = (
         profile.reasoning_effort if profile.reasoning_effort_required else None
     )
@@ -181,6 +205,16 @@ def route_generation_parameter_requests(
     """
     if not profiles:
         raise ValueError("generation parameter shaping requires at least one wire profile")
+    if any(_fireworks_continuation_required(profile, request) for profile in profiles):
+        raise ProviderParameterError(
+            message=(
+                "Fireworks Responses tool continuations require gateway storage or encrypted "
+                "reasoning. Enable one continuation channel, set tool_choice to 'none', or "
+                "choose another provider route."
+            ),
+            param="tool_choice",
+            code="unsupported_parameter",
+        )
 
     ignored = list(request.ignored_parameters)
     provider_updates: dict[str, object] = {}
