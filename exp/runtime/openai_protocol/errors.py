@@ -195,6 +195,19 @@ def public_failure_error(
         if param is None and isinstance(detail_param, str):
             param = detail_param
     message = failure.safe_message
+    if failure.failure_class is GatewayFailureClass.UNSUPPORTED_CAPABILITY and isinstance(
+        failure.safe_details.get("capability"), str
+    ):
+        if param is None:
+            message = (
+                "The requested capability is not supported by this model route. "
+                "Remove the unsupported field or choose a different model."
+            )
+        else:
+            message = (
+                f"The capability '{param}' is not supported by this model route. "
+                "Remove the field or choose a different model."
+            )
     retry_after_seconds: int | None = None
     if failure.failure_class is GatewayFailureClass.THROTTLED:
         retry_after_seconds = THROTTLED_RETRY_AFTER_SECONDS

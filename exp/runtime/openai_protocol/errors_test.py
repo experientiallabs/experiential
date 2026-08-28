@@ -140,6 +140,29 @@ def test_invalid_route_parameter_preserves_field_specific_error() -> None:
     assert error.detail.param == "max_completion_tokens"
 
 
+@pytest.mark.parametrize("param", (None, "tools"))
+def test_unsupported_capability_never_exposes_internal_identifiers(
+    param: str | None,
+) -> None:
+    """Generic public mapping ignores internal capability names and messages."""
+    error = public_failure_error(
+        GatewayFailure(
+            failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
+            safe_message="internal tinker_gateway_execution capability failed",
+            safe_details={"capability": "tinker_gateway_execution"},
+        ),
+        param=param,
+    )
+
+    assert error.status_code == 400
+    assert error.detail.code == "unsupported_capability"
+    assert error.detail.param == param
+    assert "tinker_gateway_execution" not in error.detail.message
+    assert "internal" not in error.detail.message
+    if param is not None:
+        assert param in error.detail.message
+
+
 def test_retry_after_must_be_positive() -> None:
     """A non-positive advertised wait is a programming error, not a response."""
     with pytest.raises(ValueError, match="retry_after_seconds must be positive"):

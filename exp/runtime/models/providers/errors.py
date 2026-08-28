@@ -148,14 +148,15 @@ def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
             },
         )
     if isinstance(exception, ProviderCapabilityError):
-        # The capability is a stable internal literal (never request content),
-        # and naming it is what makes the 400 triageable for the caller.
+        # Keep the internal literal for operator diagnostics, but never put it in
+        # the public-safe message. Protocol boundaries translate known literals
+        # to real request fields when they have the API-surface context required
+        # to do so.
         return GatewayFailure(
             failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
             safe_message=(
-                "provider deployment cannot preserve the requested capability: "
-                f"{exception.capability}. Remove the unsupported field or request "
-                "a different model alias"
+                "provider deployment cannot preserve a requested capability; "
+                "remove the unsupported field or request a different model alias"
             ),
             safe_details={"capability": exception.capability},
         )

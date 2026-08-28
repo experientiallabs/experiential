@@ -119,13 +119,13 @@ def test_refusal_and_capability_failures_keep_only_safe_signals() -> None:
     assert refusal.safe_details == {"signal": "safety"}
     assert capability.failure_class is GatewayFailureClass.UNSUPPORTED_CAPABILITY
     assert capability.safe_details == {"capability": "strict_tools"}
-    # The message names the capability literal and nothing else, so a 400 is
-    # triageable without ever carrying request content.
+    # Internal capability literals remain operator metadata and never cross the
+    # public-safe message boundary.
     assert capability.safe_message == (
-        "provider deployment cannot preserve the requested capability: "
-        "strict_tools. Remove the unsupported field or request "
-        "a different model alias"
+        "provider deployment cannot preserve a requested capability; "
+        "remove the unsupported field or request a different model alias"
     )
+    assert "strict_tools" not in capability.safe_message
 
 
 def test_parameter_failure_preserves_only_public_code_and_path() -> None:
