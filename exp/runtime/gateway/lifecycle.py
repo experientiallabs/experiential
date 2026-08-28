@@ -659,18 +659,15 @@ def _load_snapshot(
         alias_id=alias.alias_id,
         alias_revision_id=revision_id,
     )
-    if (
-        not existing_bindings
-        and legacy_bearer_snapshot
-        and normalize_gateway_catalog(authored_catalog) != normalized
-    ):
+    if not existing_bindings and normalize_gateway_catalog(authored_catalog) != normalized:
         manager.require_initialized().invalidate_alias_revision(
             organization_id=manager.organization_id,
             alias_id=alias.alias_id,
             revision_id=revision_id,
         )
+        legacy_kind = "Bedrock bearer" if legacy_bearer_snapshot else "provider"
         raise GatewayLifecycleError(
-            f"alias {alias.alias_name!r} snapshot predates explicit Bedrock bearer authority; "
+            f"alias {alias.alias_name!r} snapshot predates current {legacy_kind} authority; "
             "the stale revision was disabled and must be activated as a new revision"
         )
     authorities = manager.ensure_alias_provider_bindings(

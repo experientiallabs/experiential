@@ -1230,6 +1230,38 @@ def test_disabled_provider_connection_reuses_its_stable_id(tmp_path: Path) -> No
     assert store.provider_connections(organization_id="org-one") == (restored,)
 
 
+def test_non_migrated_bedrock_pair_rejects_a_canonical_revision_alias(tmp_path: Path) -> None:
+    """Only migration-proven pair rows may accept a canonical revision alias."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    config = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="AWS_SECRET_ACCESS_KEY",
+        region="us-west-2",
+        aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+        bedrock_auth_mode="access_key_pair",
+    )
+    store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="bedrock",
+        revision_id="operator-supplied-revision",
+        config=config,
+    )
+    assert store.disable_provider_connection(
+        organization_id="org-one",
+        connection_id="bedrock",
+    )
+
+    with pytest.raises(ProviderAuthorityError, match="different immutable revision"):
+        store.upsert_provider_connection(
+            organization_id="org-one",
+            connection_id="bedrock",
+            revision_id=provider_connection_revision_id("bedrock", config),
+            config=config,
+        )
+    assert store.provider_connections(organization_id="org-one") == ()
+
+
 def test_alias_activation_rejects_stale_provider_binding_atomically(tmp_path: Path) -> None:
     """A stale connection revision cannot create either an alias or a partial binding."""
     store = SQLiteGatewayStore(tmp_path / "gateway.db")

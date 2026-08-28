@@ -90,19 +90,11 @@ def upsert_provider_connection(
         authority = _authority(current)
         if authority.config == config and authority.connection_sha256 == digest:
             if authority.revision_id != revision_id:
-                canonical_revision_id = provider_connection_revision_id(connection_id, config)
                 revision_owner = connection.execute(
                     "SELECT 1 FROM provider_connection_revisions WHERE revision_id = ?",
                     (revision_id,),
                 ).fetchone()
-                migrated_pair = (
-                    config.provider == "bedrock" and config.bedrock_auth_mode == "access_key_pair"
-                )
-                if (
-                    not migrated_pair
-                    or revision_id != canonical_revision_id
-                    or revision_owner is not None
-                ):
+                if revision_id != current["migration_revision_alias"] or revision_owner is not None:
                     raise ProviderAuthorityError(
                         "provider connection replay names a different immutable revision"
                     )
@@ -379,7 +371,7 @@ _SELECT_AUTHORITY = """
 SELECT c.connection_id, r.revision_id, r.revision_number,
        r.provider, r.base_url, r.api_key_env, r.api_version, r.region,
        r.aws_access_key_id_env, r.bedrock_auth_mode,
-       r.connection_sha256, c.active
+       r.connection_sha256, r.migration_revision_alias, c.active
 FROM provider_connections AS c
 JOIN provider_connection_revisions AS r
   ON r.organization_id = c.organization_id

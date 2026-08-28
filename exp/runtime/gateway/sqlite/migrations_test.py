@@ -30,7 +30,10 @@ from exp.runtime.gateway.sqlite.migrations import (
     persistent_connection,
 )
 from exp.runtime.gateway.sqlite.platform import SQLiteGatewayPlatform
-from exp.runtime.gateway.sqlite.provider_authority import active_provider_connections
+from exp.runtime.gateway.sqlite.provider_authority import (
+    active_provider_connections,
+    provider_connection_revision_id,
+)
 
 
 def test_persistent_connection_reuses_one_idle_connection_per_thread(tmp_path: Path) -> None:
@@ -1079,6 +1082,11 @@ def test_v13_preserves_a_valid_older_explicit_pair_authority(
         assert authorities[0].config.bedrock_auth_mode == "access_key_pair"
         assert authorities[0].config.aws_access_key_id_env == "AWS_ACCESS_KEY_ID"
         assert authorities[0].connection_sha256 == authorities[0].config.identity_sha256()
+        migration_alias = migrated.execute(
+            "SELECT migration_revision_alias FROM provider_connection_revisions "
+            "WHERE revision_id = 'rev'"
+        ).fetchone()[0]
+        assert migration_alias == provider_connection_revision_id("conn", authorities[0].config)
         assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:

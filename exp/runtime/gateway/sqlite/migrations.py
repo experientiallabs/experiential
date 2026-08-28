@@ -16,6 +16,7 @@ from exp.common.models import ConnectionConfig
 from exp.runtime.gateway.sqlite.migration_repairs import (
     deactivate_aliases_with_inferred_bedrock_auth,
 )
+from exp.runtime.gateway.sqlite.provider_authority import provider_connection_revision_id
 
 SCHEMA_VERSION = 13
 
@@ -651,6 +652,18 @@ def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
                 "ALTER TABLE provider_connection_revisions ADD COLUMN bedrock_auth_mode TEXT "
                 "CHECK (bedrock_auth_mode IN ('access_key_pair', 'api_key'))"
             )
+        if "migration_revision_alias" not in columns:
+            connection.execute(
+                "ALTER TABLE provider_connection_revisions ADD COLUMN migration_revision_alias TEXT"
+            )
+        connection.execute(
+            """
+            UPDATE provider_connection_revisions
+            SET migration_revision_alias = '__pending_canonical_pair__'
+            WHERE provider = 'bedrock' AND api_key_env IS NOT NULL
+              AND aws_access_key_id_env IS NOT NULL AND bedrock_auth_mode IS NULL
+            """
+        )
         deactivate_aliases_with_inferred_bedrock_auth(connection)
         if "aws_access_key_id" in columns:
             # The short-lived schema-11 prototype persisted the identifier itself.
@@ -700,7 +713,7 @@ def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
             """
             SELECT organization_id, connection_id, revision_id, provider, base_url,
                    api_key_env, api_version, region, aws_access_key_id_env,
-                   bedrock_auth_mode
+                   bedrock_auth_mode, migration_revision_alias
             FROM provider_connection_revisions
             """
         ).fetchall()
@@ -726,10 +739,16 @@ def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
                 ),
             ).canonicalized()
             digest = config.identity_sha256()
+            migration_alias = (
+                provider_connection_revision_id(str(row["connection_id"]), config)
+                if row["migration_revision_alias"] == "__pending_canonical_pair__"
+                else None
+            )
             connection.execute(
-                "UPDATE provider_connection_revisions SET connection_sha256 = ? "
+                "UPDATE provider_connection_revisions "
+                "SET connection_sha256 = ?, migration_revision_alias = ? "
                 "WHERE revision_id = ?",
-                (digest, row["revision_id"]),
+                (digest, migration_alias, row["revision_id"]),
             )
     for statement in _MIGRATIONS[version]:
         connection.execute(statement)

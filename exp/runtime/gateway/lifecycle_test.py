@@ -330,6 +330,14 @@ def test_unbound_legacy_bedrock_bearer_alias_is_invalidated_on_load(tmp_path: Pa
     (alias,) = manager.aliases()
     assert not alias.active
     assert alias.revision_id is None
+    assert (
+        manager.require_initialized().alias_provider_connections(
+            organization_id=manager.organization_id,
+            alias_id=alias.alias_id,
+            alias_revision_id="legacy-revision",
+        )
+        == ()
+    )
 
 
 def test_unbound_legacy_bearer_is_invalidated_with_an_unrelated_connection(
@@ -355,8 +363,8 @@ def test_unbound_legacy_bearer_is_invalidated_with_an_unrelated_connection(
     assert manager.aliases()[0].revision_id is None
 
 
-def test_unbound_legacy_bedrock_pair_alias_remains_loadable(tmp_path: Path) -> None:
-    """Historical pair snapshots retain their already-stable canonical identity."""
+def test_unbound_legacy_bedrock_pair_alias_binds_when_identity_is_stable(tmp_path: Path) -> None:
+    """Historical pair syntax binds when its normalized identity remains unchanged."""
     manager = _configured_legacy_bedrock_alias(tmp_path, auth_mode="access_key_pair")
 
     components = load_gateway_components(
@@ -367,8 +375,19 @@ def test_unbound_legacy_bedrock_pair_alias_remains_loadable(tmp_path: Path) -> N
         },
     )
 
+    alias = manager.aliases()[0]
+    assert alias.active
     assert len(components.readiness) == 1
-    assert manager.aliases()[0].active
+    assert (
+        len(
+            manager.require_initialized().alias_provider_connections(
+                organization_id=manager.organization_id,
+                alias_id=alias.alias_id,
+                alias_revision_id="legacy-revision",
+            )
+        )
+        == 1
+    )
 
 
 def test_unbound_openai_alias_ignores_unrelated_bedrock_authority(tmp_path: Path) -> None:
