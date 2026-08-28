@@ -52,6 +52,7 @@ class DecodedGatewayRequest(ContractModel):
 
     alias: str = Field(min_length=1, max_length=256)
     request: GatewayRequest
+    developer_messages_param: str | None = None
 
 
 class _WireModel(BaseModel):
@@ -540,7 +541,25 @@ def decode_responses(
         )
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
-    return DecodedGatewayRequest(alias=request.model, request=canonical)
+    developer_messages_param = None
+    if request.instructions is not None:
+        developer_messages_param = "instructions"
+    elif not isinstance(request.input, str):
+        developer_index = next(
+            (
+                index
+                for index, item in enumerate(request.input)
+                if isinstance(item, _ResponseMessage) and item.role == "developer"
+            ),
+            None,
+        )
+        if developer_index is not None:
+            developer_messages_param = f"input.{developer_index}.role"
+    return DecodedGatewayRequest(
+        alias=request.model,
+        request=canonical,
+        developer_messages_param=developer_messages_param,
+    )
 
 
 def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:

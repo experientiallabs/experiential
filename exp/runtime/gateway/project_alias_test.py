@@ -11,6 +11,7 @@ from exp.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
+    ModelCapabilities,
     ModelCatalog,
     ModelRecord,
     PricingSnapshot,
@@ -89,11 +90,13 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
                 connection="provider",
                 model="legacy-model",
                 billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_tools=True),
             ),
             "explicit": ModelRecord(
                 connection="provider",
                 model="explicit-model",
                 billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_tools=True),
                 gateway=GatewayDeploymentMetadata(
                     capabilities=GatewayDeploymentCapabilities(supports_strict_tools=True)
                 ),
@@ -102,6 +105,7 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
                 connection="gemini",
                 model="gemini-legacy-model",
                 billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_tools=True),
             ),
         },
     )
@@ -123,7 +127,12 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
     assert migrated.models["legacy-gemini"].gateway == GatewayDeploymentMetadata(
         capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
     )
-    assert migrated.models["explicit"].gateway == catalog.models["explicit"].gateway
+    assert migrated.models["explicit"].gateway == GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_strict_tools=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
     assert (
         _migrate_legacy_project_gateway_metadata(
             tmp_path,

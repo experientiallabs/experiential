@@ -3627,8 +3627,14 @@ def test_capability_rejection_names_the_public_request_field(tmp_path: Path) -> 
     body = json.dumps(
         {
             "model": "coding",
-            "instructions": "Follow the sync-lane policy canary-instructions.",
-            "input": "hello canary-input",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": "Follow the sync-lane policy canary-instructions.",
+                },
+                {"type": "message", "role": "user", "content": "hello canary-input"},
+            ],
         }
     )
     with pytest.raises(NativeBridgeError) as raised:
@@ -3637,8 +3643,8 @@ def test_capability_rejection_names_the_public_request_field(tmp_path: Path) -> 
     assert payload["status_code"] == 400
     assert payload["code"] == "unsupported_capability"
     assert payload["error_type"] == "invalid_request_error"
-    assert payload["param"] == "instructions"
-    assert "'instructions'" in payload["message"]
+    assert payload["param"] == "input.0.role"
+    assert "'input.0.role'" in payload["message"]
     assert "developer_messages" not in payload["message"]
     assert "canary" not in json.dumps(payload)
 

@@ -85,6 +85,14 @@ class ProviderCertificationMatrix(ContractModel):
         return sha256_json(self)
 
 
+_CERTIFIED_RESULTS = frozenset(
+    {
+        ProviderCertificationResult.PROVIDER_FIXTURE_PASS,
+        ProviderCertificationResult.INHERITED_COMPATIBLE_FIXTURE_PASS,
+    }
+)
+
+
 _EVALUATED_AT = datetime(2026, 8, 25, tzinfo=UTC)
 _CLIENT_SDK = "openai==3.0.0"
 _GATEWAY_API_SURFACES = ("chat.completions", "responses")
@@ -281,3 +289,16 @@ PROVIDER_CERTIFICATION_MATRIX = ProviderCertificationMatrix(
         )
     )
 )
+
+
+def provider_has_certified_capability(
+    provider: str,
+    capability: ProviderCapability,
+) -> bool:
+    """Return whether deterministic evidence certifies one provider behavior."""
+    return any(
+        cell.provider == provider
+        and cell.capability is capability
+        and cell.result in _CERTIFIED_RESULTS
+        for cell in PROVIDER_CERTIFICATION_MATRIX.cells
+    )

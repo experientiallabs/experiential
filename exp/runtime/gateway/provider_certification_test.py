@@ -11,6 +11,7 @@ from exp.runtime.gateway.provider_certification import (
     ProviderCapability,
     ProviderCertificationMatrix,
     ProviderCertificationResult,
+    provider_has_certified_capability,
 )
 from exp.runtime.models import SUPPORTED_PROVIDERS
 
@@ -88,6 +89,8 @@ def test_google_raw_argument_limit_is_explicit_while_bedrock_is_certified() -> N
         cells[("bedrock", ProviderCapability.TOOL_ARGUMENT_STREAM)].result
         is ProviderCertificationResult.PROVIDER_FIXTURE_PASS
     )
+    assert provider_has_certified_capability("openai", ProviderCapability.TOOL_ARGUMENT_STREAM)
+    assert not provider_has_certified_capability("gemini", ProviderCapability.TOOL_ARGUMENT_STREAM)
 
 
 def test_anthropic_text_stream_cell_names_exact_native_fixture() -> None:

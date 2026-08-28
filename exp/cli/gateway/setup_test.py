@@ -53,6 +53,7 @@ def _prepared_gateway_models() -> tuple[
         model="gpt-5.6-luna",
         capabilities=ModelCapabilities(
             supports_completions=True,
+            supports_tools=True,
             supports_reasoning=True,
             reasoning_effort="medium",
         ),
@@ -184,6 +185,9 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
         "anthropic",
     }
     assert {item.alias_id for item in manager.aliases()} == {"gpt-5-6-luna"}
+    authored = load_model_catalog(tmp_path / "models.toml").models["gpt-5-6-luna"]
+    assert authored.gateway is not None
+    assert authored.gateway.capabilities.supports_streaming_tool_arguments
     assert load_settings(tmp_path).commands.maximum_cost_usd == 50.0
 
 

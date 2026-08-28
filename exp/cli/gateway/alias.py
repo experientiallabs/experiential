@@ -26,6 +26,10 @@ from exp.runtime.gateway.catalog_authority import (
     upsert_singleton_deployment,
 )
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.provider_certification import (
+    ProviderCapability,
+    provider_has_certified_capability,
+)
 
 alias_app = typer.Typer(help="Manage public gateway model aliases.", no_args_is_help=True)
 _JSON_OPTION = typer.Option(False, "--json")
@@ -263,6 +267,7 @@ def _activate(
         if exact_model is None:
             raise ValueError("direct aliases require --exact-model")
         connection, provider_model = parse_deployment(deployment)
+        provider = serving_connections[connection].provider
         normalized, snapshot, _catalog_changed = upsert_singleton_deployment(
             root,
             deployment_alias=alias,
@@ -277,7 +282,13 @@ def _activate(
             ),
             gateway_capabilities=GatewayDeploymentCapabilities(
                 supports_streaming=True,
-                supports_streaming_tool_arguments=supports_tools,
+                supports_streaming_tool_arguments=(
+                    supports_tools
+                    and provider_has_certified_capability(
+                        provider,
+                        ProviderCapability.TOOL_ARGUMENT_STREAM,
+                    )
+                ),
                 supports_developer_messages=supports_developer_messages,
                 supports_strict_tools=supports_strict_tools,
                 supports_parallel_tool_calls=supports_parallel_tool_calls,

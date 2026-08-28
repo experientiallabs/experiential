@@ -20,9 +20,8 @@ from exp.runtime.gateway.project_activation import (
     require_project_activation_authority,
 )
 from exp.runtime.gateway.provider_certification import (
-    PROVIDER_CERTIFICATION_MATRIX,
     ProviderCapability,
-    ProviderCertificationResult,
+    provider_has_certified_capability,
 )
 from exp.runtime.models import RuntimeModelCatalog
 
@@ -36,18 +35,6 @@ class ProjectGatewayAlias:
     identity_id: str
     policy_id: str
     changed: bool
-
-
-_CERTIFIED_STREAMING_TOOL_PROVIDERS = frozenset(
-    cell.provider
-    for cell in PROVIDER_CERTIFICATION_MATRIX.cells
-    if cell.capability == ProviderCapability.TOOL_ARGUMENT_STREAM
-    and cell.result
-    in {
-        ProviderCertificationResult.PROVIDER_FIXTURE_PASS,
-        ProviderCertificationResult.INHERITED_COMPATIBLE_FIXTURE_PASS,
-    }
-)
 
 
 def prepare_project_gateway_alias(
@@ -170,17 +157,41 @@ def _migrate_legacy_project_gateway_metadata(
     changed = False
     for alias in aliases:
         record = models.get(alias)
-        if record is None or record.gateway is not None:
+        if record is None:
+            continue
+        provider = catalog.connections[record.connection].provider
+        supports_streaming_tool_arguments = (
+            record.capabilities is not None
+            and bool(record.capabilities.supports_tools)
+            and provider_has_certified_capability(provider, ProviderCapability.TOOL_ARGUMENT_STREAM)
+        )
+        if record.gateway is not None:
+            existing = record.gateway.capabilities
+            if existing.supports_streaming_tool_arguments == supports_streaming_tool_arguments:
+                continue
+            models[alias] = record.model_copy(
+                update={
+                    "gateway": record.gateway.model_copy(
+                        update={
+                            "capabilities": existing.model_copy(
+                                update={
+                                    "supports_streaming_tool_arguments": (
+                                        supports_streaming_tool_arguments
+                                    )
+                                }
+                            )
+                        }
+                    )
+                }
+            )
+            changed = True
             continue
         models[alias] = record.model_copy(
             update={
                 "gateway": GatewayDeploymentMetadata(
                     capabilities=GatewayDeploymentCapabilities(
                         supports_streaming=True,
-                        supports_streaming_tool_arguments=(
-                            catalog.connections[record.connection].provider
-                            in _CERTIFIED_STREAMING_TOOL_PROVIDERS
-                        ),
+                        supports_streaming_tool_arguments=supports_streaming_tool_arguments,
                     )
                 )
             }

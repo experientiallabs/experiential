@@ -190,6 +190,79 @@ def test_noninteractive_management_story_emits_stable_secret_safe_json(
     assert raw_key.encode() not in durable
 
 
+def test_direct_alias_uses_provider_certification_for_tool_streaming(
+    tmp_path: Path,
+) -> None:
+    """Alias authoring never infers raw argument streaming from model tool support alone."""
+    runner = CliRunner()
+    commands = (
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "oai",
+            "--provider",
+            "openai",
+            "--credential-env",
+            "OPENAI_API_KEY",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "google",
+            "--provider",
+            "gemini",
+            "--credential-env",
+            "GEMINI_API_KEY",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+    for alias, deployment in (
+        ("oai-tools", "oai:gpt-fixture"),
+        ("gemini-tools", "google:gemini-fixture"),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "alias",
+                "create",
+                alias,
+                "--deployment",
+                deployment,
+                "--exact-model",
+                alias,
+                "--supports-tools",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    assert catalog.models["oai-tools"].gateway is not None
+    assert catalog.models["gemini-tools"].gateway is not None
+    assert catalog.models["oai-tools"].gateway.capabilities.supports_streaming_tool_arguments
+    assert not catalog.models["gemini-tools"].gateway.capabilities.supports_streaming_tool_arguments
+
+
 def test_noninteractive_pool_certification_activates_ordered_alias_with_receipt(
     tmp_path: Path,
 ) -> None:

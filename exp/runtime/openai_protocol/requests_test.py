@@ -178,6 +178,7 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
     )
 
     request = decoded.request
+    assert decoded.developer_messages_param == "instructions"
     assert request.surface == GatewayApiSurface.RESPONSES
     assert tuple(message.role for message in request.messages) == (
         "developer",
@@ -199,6 +200,21 @@ def test_responses_decoder_preserves_continuation_and_distinct_wire_shapes() -> 
     assert request.maximum_output_tokens_parameter == "max_output_tokens"
     assert request.structured_text is not None
     assert request.client_request_id == "operation-two"
+
+
+def test_responses_decoder_tracks_developer_input_origin() -> None:
+    """Capability errors can identify an input developer role without inventing instructions."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "hello"},
+                {"type": "message", "role": "developer", "content": "follow policy"},
+            ],
+        }
+    )
+
+    assert decoded.developer_messages_param == "input.1.role"
 
 
 def test_responses_decoder_rejects_conflicting_reasoning_summary_aliases() -> None:

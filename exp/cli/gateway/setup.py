@@ -55,6 +55,10 @@ from exp.runtime.gateway.catalog_authority import (
     rollback_singleton_deployment_update,
 )
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.provider_certification import (
+    ProviderCapability,
+    provider_has_certified_capability,
+)
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 from exp.runtime.models.providers import HttpProviderModelLister, ProviderModelLister
 
@@ -243,7 +247,16 @@ def interactive_gateway_setup(
                         exact_model_id=_gateway_exact_model_id(selected),
                         revision=None,
                         capabilities=capabilities,
-                        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                        gateway_capabilities=GatewayDeploymentCapabilities(
+                            supports_streaming=True,
+                            supports_streaming_tool_arguments=(
+                                bool(capabilities.supports_tools)
+                                and provider_has_certified_capability(
+                                    serving_connections[selected.connection].provider,
+                                    ProviderCapability.TOOL_ARGUMENT_STREAM,
+                                )
+                            ),
+                        ),
                         prices=GatewayTokenPrices(),
                         pricing_source=None,
                         billing_source=(

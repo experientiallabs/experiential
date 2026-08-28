@@ -172,6 +172,7 @@ def _public_capability_error(
     *,
     public_stream: bool,
     public_tools: bool,
+    developer_messages_param: str | None = None,
 ) -> OpenAIProtocolError:
     """Translate one internal admission label into a stable public 400.
 
@@ -180,11 +181,15 @@ def _public_capability_error(
     the field that activated them. Internal route requirements fail against
     ``model`` without exposing implementation details.
     """
-    param = _public_capability_param(
-        error.capability,
-        surface,
-        public_stream=public_stream,
-        public_tools=public_tools,
+    param = (
+        developer_messages_param
+        if error.capability == "developer_messages" and developer_messages_param is not None
+        else _public_capability_param(
+            error.capability,
+            surface,
+            public_stream=public_stream,
+            public_tools=public_tools,
+        )
     )
     if param is not None:
         return unsupported_field(param, capability=True)
@@ -555,6 +560,7 @@ class NativeControlPlane(NativeObservabilityMixin):
                     provider_request.surface,
                     public_stream=public_request.stream,
                     public_tools=bool(public_request.tools),
+                    developer_messages_param=decoded.developer_messages_param,
                 )
                 if isinstance(exc, ProviderCapabilityError)
                 else public_failure_error(failure, param=exc.param)
