@@ -77,6 +77,45 @@ class GatewayNamedToolChoice(ContractModel):
     name: str = Field(min_length=1, max_length=256)
 
 
+class ThinkingBlock(ContractModel):
+    """One verbatim Anthropic extended-thinking block from assistant history.
+
+    ``signature`` is an opaque cryptographic value the provider issued with
+    the block; it must round-trip byte-exact or the provider rejects the
+    replayed turn, so it is never normalized or re-encoded.
+    """
+
+    kind: Literal["thinking"] = "thinking"
+    text: str = ""
+    signature: str | None = None
+
+
+class RedactedThinkingBlock(ContractModel):
+    """One opaque Anthropic redacted-thinking block from assistant history."""
+
+    kind: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str
+
+
+class EncryptedReasoningBlock(ContractModel):
+    """One opaque OpenAI Responses reasoning item replayed with the input.
+
+    ``encrypted_content`` is the provider-issued opaque payload a stateless
+    caller (``store: false``) replays so the model can resume its own prior
+    reasoning; it must reach the provider byte-exact.
+    """
+
+    kind: Literal["encrypted_reasoning"] = "encrypted_reasoning"
+    id: str | None = Field(default=None, min_length=1, max_length=256)
+    encrypted_content: str = Field(min_length=1)
+
+
+ProviderReasoningBlock = Annotated[
+    ThinkingBlock | RedactedThinkingBlock | EncryptedReasoningBlock,
+    Field(discriminator="kind"),
+]
+
+
 class GatewayMessage(ContractModel):
     """One canonical gateway message preserving developer and tool-call identity."""
 
@@ -95,6 +134,16 @@ class GatewayMessage(ContractModel):
     serialization so request digests, replay identity, and immutable
     artifacts are unaffected by it.
     """
+    provider_reasoning: tuple[ProviderReasoningBlock, ...] = Field(default=(), exclude=True)
+    """Ordered opaque provider-reasoning blocks carried on assistant turns.
+
+    Thinking and redacted-thinking blocks exist only on the Anthropic wire;
+    encrypted reasoning items exist only on the OpenAI Responses wire. Route
+    admission therefore requires every waterfall rung to speak the one
+    dialect that can replay them, mirroring ``tool_is_error``. Like that
+    flag, the carrier is excluded from model serialization so request
+    digests, replay identity, and immutable artifacts are unaffected by it.
+    """
 
     @model_validator(mode="after")
     def _require_role_coherence(self) -> GatewayMessage:
@@ -106,10 +155,12 @@ class GatewayMessage(ContractModel):
         Raises:
             ValueError: Content, tool linkage, or assistant calls are incoherent.
         """
-        if self.content is None and not self.tool_calls:
-            raise ValueError("gateway messages need content or assistant tool calls")
+        if self.content is None and not self.tool_calls and not self.provider_reasoning:
+            raise ValueError("gateway messages need content, tool calls, or reasoning blocks")
         if self.role != "assistant" and self.tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
+        if self.role != "assistant" and self.provider_reasoning:
+            raise ValueError("provider reasoning blocks are valid only for assistant messages")
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
@@ -145,6 +196,23 @@ class GatewayRequest(ContractModel):
         Literal["reasoning.generate_summary", "reasoning.summary"], ...
     ] = Field(default=(), exclude=True)
     """Exact caller selector paths normalized into ``reasoning_summary``."""
+    provider_thinking_config: JsonObject | None = Field(default=None, exclude=True)
+    """Verbatim caller ``thinking`` configuration from the Messages surface.
+
+    The object is opaque to the gateway: it is validated against the closed
+    wire profile at decode time and then forwarded byte-for-byte to the
+    Anthropic upstream, overriding the catalog's adaptive default. Excluded
+    from serialization like the other Anthropic-only carriers so digests and
+    replay identity are unperturbed.
+    """
+    response_store: bool | None = None
+    """Caller ``store`` selector from the Responses surface.
+
+    ``False`` skips gateway-side continuation retention for the produced
+    response; ``True`` and absent keep the default retention behavior.
+    """
+    include_encrypted_reasoning: bool = False
+    """Whether the caller asked for ``include=["reasoning.encrypted_content"]``."""
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
@@ -218,6 +286,12 @@ class GatewayRequest(ContractModel):
             raise ValueError("include_usage is valid only for streaming requests")
         if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("reasoning_summary is valid only for Responses requests")
+        if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("response_store is valid only for Responses requests")
+        if self.include_encrypted_reasoning and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("include_encrypted_reasoning is valid only for Responses requests")
+        if self.provider_thinking_config is not None and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("provider_thinking_config is valid only for Messages requests")
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
             raise ValueError("maximum output parameter requires a maximum output value")
         if self.reasoning_summary_parameters and self.reasoning_summary is None:
@@ -270,6 +344,10 @@ class GatewayEventKind(StrEnum):
     TEXT_DELTA = "text_delta"
     REFUSAL_DELTA = "refusal_delta"
     REASONING_SUMMARY_DELTA = "reasoning_summary_delta"
+    THINKING_DELTA = "thinking_delta"
+    THINKING_SIGNATURE = "thinking_signature"
+    REDACTED_THINKING = "redacted_thinking"
+    ENCRYPTED_REASONING = "encrypted_reasoning"
     TOOL_CALL_STARTED = "tool_call_started"
     TOOL_ARGUMENTS_DELTA = "tool_arguments_delta"
     TOOL_CALL_COMPLETED = "tool_call_completed"
@@ -287,6 +365,11 @@ class GatewayEvent(ContractModel):
     text_delta: str | None = None
     reasoning_summary_output_index: int | None = Field(default=None, ge=0)
     reasoning_summary_index: int | None = Field(default=None, ge=0)
+    reasoning_block_index: int | None = Field(default=None, ge=0)
+    """Provider content-block (or output-item) index grouping reasoning events."""
+    thinking_signature: str | None = None
+    redacted_thinking_data: str | None = None
+    encrypted_content: str | None = None
     tool_call_index: int | None = Field(default=None, ge=0)
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
     tool_name: str | None = Field(default=None, min_length=1, max_length=256)
@@ -315,6 +398,18 @@ class GatewayEvent(ContractModel):
                 or self.reasoning_summary_index is None
             ):
                 raise ValueError("reasoning summary deltas require output, summary, and text")
+        elif self.kind == GatewayEventKind.THINKING_DELTA:
+            if self.text_delta is None or self.reasoning_block_index is None:
+                raise ValueError("thinking deltas require block index and text")
+        elif self.kind == GatewayEventKind.THINKING_SIGNATURE:
+            if self.thinking_signature is None or self.reasoning_block_index is None:
+                raise ValueError("thinking signatures require block index and signature")
+        elif self.kind == GatewayEventKind.REDACTED_THINKING:
+            if self.redacted_thinking_data is None or self.reasoning_block_index is None:
+                raise ValueError("redacted thinking requires block index and data")
+        elif self.kind == GatewayEventKind.ENCRYPTED_REASONING:
+            if self.encrypted_content is None or self.reasoning_block_index is None:
+                raise ValueError("encrypted reasoning requires block index and content")
         elif self.kind == GatewayEventKind.TOOL_CALL_STARTED:
             if self.tool_call_index is None or self.tool_call_id is None or self.tool_name is None:
                 raise ValueError("tool-call start requires index, ID, and name")

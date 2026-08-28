@@ -145,6 +145,13 @@ def anthropic_messages_response(
             )
         elif block_type == "tool_use":
             tool_calls.append(_anthropic_tool_call(block, index))
+        elif block_type in {"thinking", "redacted_thinking"}:
+            # Extended-thinking blocks are expected whenever the route pins a
+            # reasoning effort. The typed client contract carries final
+            # content and tool calls only, and thinking tokens are already a
+            # priced subset of the reported output usage, so the blocks are
+            # accepted and not surfaced here.
+            continue
         else:
             raise ProviderResponseError(
                 f"Anthropic content[{index}] has unsupported type {block_type!r}"

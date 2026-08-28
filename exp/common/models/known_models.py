@@ -34,9 +34,9 @@ class KnownModel:
     supports_top_k: bool | None = None
     supports_logprobs: bool | None = None
     supports_reasoning_effort: bool = False
-    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = (
-        None
-    )
+    reasoning_effort: (
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] | None
+    ) = None
     sampling_requires_reasoning_none: bool = False
     chat_max_tokens_field: Literal["max_tokens", "max_completion_tokens"] | None = None
     minimum_temperature: float | None = None
@@ -67,7 +67,7 @@ def _chat(
     supports_logprobs: bool = False,
     supports_structured_output: bool = True,
     supports_reasoning_effort: bool = False,
-    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]
     | None = None,
     sampling_requires_reasoning_none: bool = False,
     chat_max_tokens_field: Literal["max_tokens", "max_completion_tokens"] | None = None,

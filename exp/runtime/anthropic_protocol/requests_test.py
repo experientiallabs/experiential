@@ -7,7 +7,12 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.requests import decode_messages
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayNamedToolChoice
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayNamedToolChoice,
+    RedactedThinkingBlock,
+    ThinkingBlock,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
@@ -129,28 +134,83 @@ def test_decode_drops_only_nonsemantic_cache_control() -> None:
     assert decoded.request.metadata == {}
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        {"thinking": {"type": "enabled", "budget_tokens": 1024}},
-        {"output_config": {"effort": "high"}},
-    ],
-)
-def test_reasoning_controls_are_rejected_instead_of_silently_dropped(field: JsonObject) -> None:
-    """Native Messages reasoning controls fail until their semantics can be preserved."""
+def test_output_config_is_rejected_instead_of_silently_dropped() -> None:
+    """The Anthropic output_config control fails until its semantics can be preserved."""
     with pytest.raises(OpenAIProtocolError) as excinfo:
-        decode_messages(_body(**field))
-    assert excinfo.value.detail.param in field
+        decode_messages(_body(output_config={"effort": "high"}))
+    assert excinfo.value.detail.param == "output_config"
 
 
-def test_thinking_history_blocks_are_rejected_instead_of_dropped() -> None:
-    """Assistant reasoning history cannot disappear during canonical translation."""
-    with pytest.raises(OpenAIProtocolError, match="thinking history blocks are not supported"):
+def test_thinking_config_is_carried_verbatim() -> None:
+    """The caller's thinking object survives byte-for-byte on the canonical request."""
+    config: JsonObject = {"type": "enabled", "budget_tokens": 1024}
+    decoded = decode_messages(_body(thinking=config))
+    assert decoded.request.provider_thinking_config == config
+    assert decode_messages(_body()).request.provider_thinking_config is None
+
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(_body(thinking={"type": "enabled"}))
+    assert excinfo.value.detail.param == "thinking"
+    with pytest.raises(OpenAIProtocolError):
+        decode_messages(_body(thinking={"type": "adaptive", "budget_tokens": 64}))
+
+
+def test_thinking_history_blocks_ride_the_opaque_carrier_in_order() -> None:
+    """Assistant reasoning history translates losslessly with byte-exact signatures."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "private", "signature": "sig=="},
+                        {"type": "redacted_thinking", "data": "opaque=="},
+                        {"type": "text", "text": "done"},
+                        {
+                            "type": "tool_use",
+                            "id": "call-1",
+                            "name": "search",
+                            "input": {},
+                        },
+                    ],
+                },
+            ]
+        )
+    )
+    assistant = decoded.request.messages[1]
+    assert assistant.content == "done"
+    assert assistant.tool_calls[0].call_id == "call-1"
+    blocks = assistant.provider_reasoning
+    assert [block.kind for block in blocks] == ["thinking", "redacted_thinking"]
+    thinking, redacted = blocks
+    assert isinstance(thinking, ThinkingBlock)
+    assert thinking.text == "private"
+    assert thinking.signature == "sig=="
+    assert isinstance(redacted, RedactedThinkingBlock)
+    assert redacted.data == "opaque=="
+
+    # A thinking-only assistant turn (cut off mid-thinking) is legal history.
+    only = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "partial"}],
+                },
+                {"role": "user", "content": "continue"},
+            ]
+        )
+    )
+    assert only.request.messages[1].provider_reasoning[0].kind == "thinking"
+
+    with pytest.raises(OpenAIProtocolError, match="only valid in assistant messages"):
         decode_messages(
             _body(
                 messages=[
                     {
-                        "role": "assistant",
+                        "role": "user",
                         "content": [{"type": "thinking", "thinking": "private"}],
                     }
                 ]

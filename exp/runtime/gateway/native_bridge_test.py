@@ -1744,11 +1744,14 @@ def _responses_body(
     previous_response_id: str | None = None,
     with_tools: bool = False,
     reasoning_summary: str | None = None,
+    store: bool | None = None,
 ) -> str:
     """Return one raw Responses API request body."""
     payload: JsonObject = {"model": model, "input": [{"role": "user", "content": "hi"}]}
     if stream:
         payload["stream"] = True
+    if store is not None:
+        payload["store"] = store
     if previous_response_id is not None:
         payload["previous_response_id"] = previous_response_id
     if reasoning_summary is not None:
@@ -2804,3 +2807,53 @@ def test_rust_messages_interleaved_parallel_tools_match_the_goldens() -> None:
     assert list(actual_frames) == _parity_golden("messages_interleaved_frames")
     actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
     assert actual_body == _parity_golden("messages_interleaved_body")
+
+
+def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
+    """A store:false response is never remembered, so continuing from it fails
+    closed with the shared continuation_unavailable error."""
+    control, raw_key = _control_plane(tmp_path)
+    first = _admit_responses(control, raw_key, _responses_body(store=False))
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": first["request_id"],
+                    "text": "The answer is 42.",
+                    "refusal": False,
+                    "tool_calls": [],
+                }
+            )
+        )
+        == "{}"
+    )
+    response_id = stable_public_id("resp", _admitted_request_id(first))
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit_responses(control, raw_key, _responses_body(previous_response_id=response_id))
+    payload = json.loads(raised.value.public_error_json)
+    assert payload["code"] == "continuation_unavailable"
+
+    # An explicit store:true keeps the default retention behavior.
+    stored = _admit_responses(control, raw_key, _responses_body(store=True))
+    control.remember(
+        json.dumps(
+            {
+                "request_id": stored["request_id"],
+                "text": "kept",
+                "refusal": False,
+                "tool_calls": [],
+            }
+        )
+    )
+    continued = _admit_responses(
+        control,
+        raw_key,
+        _responses_body(
+            previous_response_id=stable_public_id("resp", _admitted_request_id(stored))
+        ),
+    )
+    assert [message["role"] for message in _payload_messages(continued)] == [
+        "user",
+        "assistant",
+        "user",
+    ]

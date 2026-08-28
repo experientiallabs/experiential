@@ -257,7 +257,7 @@ class GatewayDeploymentCapabilities(ContractModel):
     @model_validator(mode="after")
     def _require_valid_reasoning_contract(self) -> GatewayDeploymentCapabilities:
         """Reject ambiguous or non-canonical reasoning declarations."""
-        order = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+        order = ("none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max")
         indexes = tuple(order.index(effort) for effort in self.supported_reasoning_efforts)
         if len(set(self.supported_reasoning_efforts)) != len(self.supported_reasoning_efforts):
             raise ValueError("supported_reasoning_efforts cannot repeat values")

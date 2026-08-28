@@ -1,12 +1,13 @@
 """Decode Anthropic Messages bodies into canonical serving requests.
 
 The decoder is strict and lossless for supported content: text, ``tool_use``,
-and ``tool_result`` blocks translate faithfully; ``cache_control`` annotations
-are validated and dropped because they do not change model semantics;
-``thinking``, ``redacted_thinking``, ``image``, and ``document`` blocks are
-rejected loudly because the serving surface cannot preserve them. Unknown or
-unsupported fields are rejected with a field-specific error, never silently
-dropped. Errors raise
+``tool_result``, ``thinking``, and ``redacted_thinking`` blocks translate
+faithfully (thinking history rides the opaque provider-reasoning carrier with
+byte-exact signatures); ``cache_control`` annotations are validated and
+dropped because they do not change model semantics; ``image`` and
+``document`` blocks are rejected loudly because the serving surface cannot
+preserve them. Unknown or unsupported fields are rejected with a
+field-specific error, never silently dropped. Errors raise
 :class:`OpenAIProtocolError` so the shared boundary stays single-authority;
 the HTTP layer renders them in the Anthropic envelope.
 """
@@ -16,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
@@ -29,6 +30,9 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
     GatewayToolDefinition,
+    ProviderReasoningBlock,
+    RedactedThinkingBlock,
+    ThinkingBlock,
 )
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
@@ -39,8 +43,6 @@ from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 
 _REJECTED_BLOCK_HINTS = {
-    "thinking": "thinking history blocks are not supported by this gateway",
-    "redacted_thinking": "redacted thinking blocks are not supported by this gateway",
     "image": "image blocks are not supported: this gateway surface is text-only",
     "document": "document blocks are not supported: this gateway surface is text-only",
     "server_tool_use": "server tools are not supported by this gateway",
@@ -70,7 +72,7 @@ class _TextBlock(_WireModel):
 
 
 class _ThinkingBlock(_WireModel):
-    """Extended-thinking history block recognized for a targeted rejection."""
+    """Extended-thinking assistant history block, carried verbatim."""
 
     type: Literal["thinking"]
     thinking: str = ""
@@ -78,7 +80,7 @@ class _ThinkingBlock(_WireModel):
 
 
 class _RedactedThinkingBlock(_WireModel):
-    """Redacted-thinking history block recognized for a targeted rejection."""
+    """Redacted-thinking assistant history block, carried verbatim."""
 
     type: Literal["redacted_thinking"]
     data: str = ""
@@ -149,10 +151,19 @@ class _Metadata(_WireModel):
 
 
 class _ThinkingConfig(_WireModel):
-    """Extended-thinking configuration retained only for closed wire validation."""
+    """Extended-thinking configuration validated closed, then forwarded verbatim."""
 
-    type: Literal["enabled", "disabled"]
+    type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _require_budget_only_when_enabled(self) -> _ThinkingConfig:
+        """Bind the token budget to the one mode Anthropic defines it for."""
+        if self.type == "enabled" and self.budget_tokens is None:
+            raise ValueError("thinking.budget_tokens is required when thinking is enabled")
+        if self.type != "enabled" and self.budget_tokens is not None:
+            raise ValueError("thinking.budget_tokens is valid only when thinking is enabled")
+        return self
 
 
 class _MessagesRequest(_WireModel):
@@ -216,6 +227,11 @@ def decode_messages(payload: JsonObject) -> DecodedGatewayRequest:
             stream=request.stream,
             include_usage=request.stream,
             metadata=_gateway_metadata(request.metadata),
+            # The raw payload value, not the re-serialized wire model, so the
+            # provider receives the caller's thinking config byte-for-byte.
+            provider_thinking_config=(
+                cast(JsonObject, payload["thinking"]) if request.thinking is not None else None
+            ),
         )
     except ValidationError as exc:
         raise _validation_error(exc.errors(include_url=False)[0]) from exc
@@ -361,23 +377,38 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
     out: list[GatewayMessage] = []
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
+    reasoning: list[ProviderReasoningBlock] = []
 
     def flush() -> None:
-        """Emit the pending text and tool calls as one canonical message."""
+        """Emit the pending text, tool calls, and reasoning as one canonical message."""
         content = "".join(text_parts) if text_parts else None
-        if content is None and not tool_calls:
+        if content is None and not tool_calls and not reasoning:
             return
-        out.append(GatewayMessage(role=message.role, content=content, tool_calls=tuple(tool_calls)))
+        out.append(
+            GatewayMessage(
+                role=message.role,
+                content=content,
+                tool_calls=tuple(tool_calls),
+                provider_reasoning=tuple(reasoning),
+            )
+        )
         text_parts.clear()
         tool_calls.clear()
+        reasoning.clear()
 
     for block_index, block in enumerate(message.content):
         if isinstance(block, _TextBlock):
             text_parts.append(block.text)
         elif isinstance(block, (_ThinkingBlock, _RedactedThinkingBlock)):
-            raise invalid_field(
-                f"{param}.content.{block_index}",
-                "thinking history blocks are not supported by this gateway.",
+            if message.role != "assistant":
+                raise invalid_field(
+                    f"{param}.content.{block_index}",
+                    "thinking blocks are only valid in assistant messages.",
+                )
+            reasoning.append(
+                ThinkingBlock(text=block.thinking, signature=block.signature)
+                if isinstance(block, _ThinkingBlock)
+                else RedactedThinkingBlock(data=block.data)
             )
         elif isinstance(block, _ToolUseBlock):
             if message.role != "assistant":
@@ -414,7 +445,8 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
     if not out:
         raise invalid_field(
             f"{param}.content",
-            f"{message.role} message must contain text, tool_use, or tool_result content.",
+            f"{message.role} message must contain text, thinking, tool_use, "
+            "or tool_result content.",
         )
     return out
 

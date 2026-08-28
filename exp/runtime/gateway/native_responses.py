@@ -42,6 +42,13 @@ class ContinuationContext:
     episode_key: str
     response_id: str
     messages: tuple[GatewayMessage, ...]
+    retain: bool = True
+    """Whether the completed turn may be remembered for later continuation.
+
+    ``store: false`` callers keep episode identity (a continued request still
+    joins its original selection episode) but the produced response is never
+    retained, so its ID can never be continued from.
+    """
 
 
 def continued_request(
@@ -70,6 +77,7 @@ def continued_request(
         identity_id=authorization.identity_id,
         alias_revision_id=authorization.alias_revision_id,
     )
+    retain = request.response_store is not False
     if request.previous_response_id is None:
         episode = episode_namespace(
             namespace=namespace,
@@ -83,6 +91,7 @@ def continued_request(
                 episode_key=episode[-1],
                 response_id=stable_public_id("resp", authorization.request_id),
                 messages=request.messages,
+                retain=retain,
             ),
         )
     continuation = continuations.resolve_now(
@@ -99,6 +108,7 @@ def continued_request(
             episode_key=continuation.episode_key,
             response_id=stable_public_id("resp", authorization.request_id),
             messages=execution_request.messages,
+            retain=retain,
         ),
     )
 
@@ -127,6 +137,11 @@ def remember_turn(
         ValueError: A completed tool call carried malformed fields.
         KeyError: A completed tool call omitted a required field.
     """
+    if not context.retain:
+        # A store:false caller opted out of server-side continuation state;
+        # a later previous_response_id naming this response answers the
+        # shared continuation_unavailable error because it was never stored.
+        return
     if bool(data.get("refusal")):
         return
     text = str(data.get("text") or "")

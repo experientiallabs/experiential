@@ -23,7 +23,7 @@ from exp.common.tasks import ToolSchema
 ModelAlias = ArtifactId
 _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 
-ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]
 ChatMaxTokensField = Literal["max_tokens", "max_completion_tokens"]
 
 DEFAULT_REASONING_EFFORT: Final[ReasoningEffort] = "medium"

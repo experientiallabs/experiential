@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ChatMaxTokensField
 from exp.runtime.gateway.contracts import (
-    GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
 )
@@ -26,6 +25,12 @@ from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
     supported_reasoning_efforts,
+)
+from exp.runtime.models.providers.wire_messages import (
+    add_openai_tools,
+    anthropic_blocks,
+    openai_chat_message,
+    responses_items,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
@@ -338,6 +343,42 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
+    # Opaque provider-reasoning carriers replay only on the one wire that
+    # issued them, so a mixed waterfall is rejected instead of dropping them.
+    anthropic_reasoning_present = request.provider_thinking_config is not None or any(
+        block.kind in {"thinking", "redacted_thinking"}
+        for message in request.messages
+        for block in message.provider_reasoning
+    )
+    if anthropic_reasoning_present and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'thinking' is not supported by this model route. "
+                "Remove extended-thinking content or choose a native Anthropic-only route."
+            ),
+            param="thinking",
+            code="unsupported_parameter",
+        )
+    encrypted_reasoning_present = request.include_encrypted_reasoning or any(
+        block.kind == "encrypted_reasoning"
+        for message in request.messages
+        for block in message.provider_reasoning
+    )
+    if encrypted_reasoning_present and not all(
+        profile.dialect == "openai_responses" for profile in profiles
+    ):
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'reasoning.encrypted_content' is not supported by this "
+                "model route. Remove encrypted reasoning or choose a native OpenAI "
+                "Responses-only route."
+            ),
+            param="include",
+            code="unsupported_parameter",
+        )
+
     # Tool-selection controls have no semantics without tool definitions and
     # several provider APIs reject the otherwise harmless combination.
     if not request.tools:
@@ -515,16 +556,22 @@ def openai_responses_stream_payload(
                 raise ProviderResponseError("instruction messages require text")
             instructions.append(message.content)
         else:
-            items.extend(_responses_items(message))
+            items.extend(responses_items(message))
+    # Upstream storage stays disabled regardless of the caller's `store`
+    # selector: continuation state is gateway-owned, the gateway never
+    # references a provider-stored response, and disabled storage is what
+    # makes the provider return encrypted reasoning content.
     payload: JsonObject = {
         "model": model_id,
         "input": items,
         "store": False,
         "stream": True,
     }
+    if request.include_encrypted_reasoning:
+        payload["include"] = ["reasoning.encrypted_content"]
     if instructions:
         payload["instructions"] = "\n\n".join(instructions)
-    _add_openai_tools(payload, request, responses=True)
+    add_openai_tools(payload, request, responses=True)
     if request.parallel_tool_calls is not None:
         payload["parallel_tool_calls"] = request.parallel_tool_calls
     if request.structured_text is not None:
@@ -602,7 +649,7 @@ def anthropic_messages_stream_payload(
                 raise ProviderResponseError("instruction messages require text")
             system_parts.append(message.content)
             continue
-        role, blocks = _anthropic_blocks(message)
+        role, blocks = anthropic_blocks(message)
         if messages and messages[-1].get("role") == role:
             existing = messages[-1].get("content")
             if not isinstance(existing, list):
@@ -650,7 +697,12 @@ def anthropic_messages_stream_payload(
         payload["top_k"] = request.top_k
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     output_config: JsonObject = {}
-    if supports_reasoning and effective_reasoning_effort is not None:
+    if request.provider_thinking_config is not None:
+        # The caller's exact thinking configuration wins over the catalog's
+        # adaptive default and travels verbatim, so budget semantics are
+        # never reinterpreted by the gateway.
+        payload["thinking"] = request.provider_thinking_config
+    elif supports_reasoning and effective_reasoning_effort is not None:
         payload["thinking"] = {"type": "adaptive"}
         output_config["effort"] = anthropic_reasoning_effort(model_id, effective_reasoning_effort)
     if request.structured_text is not None:
@@ -801,11 +853,11 @@ def openai_compatible_stream_payload(
     """
     payload: JsonObject = {
         "model": model_id,
-        "messages": [_openai_message(message) for message in request.messages],
+        "messages": [openai_chat_message(message) for message in request.messages],
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    _add_openai_tools(payload, request, responses=False)
+    add_openai_tools(payload, request, responses=False)
     if request.parallel_tool_calls is not None:
         payload["parallel_tool_calls"] = request.parallel_tool_calls
     if request.structured_text is not None:
@@ -846,131 +898,3 @@ def openai_compatible_stream_payload(
                 model_id, effective_reasoning_effort
             )
     return payload
-
-
-def _responses_items(message: GatewayMessage) -> list[JsonObject]:
-    """Translate one non-instruction gateway message to Responses input items."""
-    if message.role == "tool":
-        return [
-            {
-                "type": "function_call_output",
-                "call_id": message.tool_call_id or "",
-                "output": message.content or "",
-            }
-        ]
-    if message.role == "user":
-        return [{"role": "user", "content": message.content or ""}]
-    if message.role != "assistant":
-        raise ProviderResponseError("unsupported Responses message role")
-    items: list[JsonObject] = []
-    if message.content is not None:
-        items.append({"role": "assistant", "content": message.content})
-    items.extend(
-        {
-            "type": "function_call",
-            "call_id": call.call_id,
-            "name": call.name,
-            "arguments": call.arguments_json(),
-        }
-        for call in message.tool_calls
-    )
-    return items
-
-
-def _anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
-    """Translate one non-instruction gateway message to Anthropic content blocks."""
-    if message.role == "tool":
-        result: JsonObject = {
-            "type": "tool_result",
-            "tool_use_id": message.tool_call_id or "",
-            "content": message.content or "",
-        }
-        # Only the Anthropic wire can express a failed tool invocation; the
-        # marker is emitted solely when set so existing payloads are unchanged.
-        if message.tool_is_error:
-            result["is_error"] = True
-        return ("user", [result])
-    if message.role == "user":
-        return "user", [{"type": "text", "text": message.content or ""}]
-    if message.role != "assistant":
-        raise ProviderResponseError("unsupported Anthropic message role")
-    blocks: list[JsonObject] = []
-    if message.content is not None:
-        blocks.append({"type": "text", "text": message.content})
-    blocks.extend(
-        {
-            "type": "tool_use",
-            "id": call.call_id,
-            "name": call.name,
-            "input": call.arguments,
-        }
-        for call in message.tool_calls
-    )
-    return "assistant", blocks
-
-
-def _openai_message(message: GatewayMessage) -> JsonObject:
-    """Translate one gateway message to OpenAI Chat wire JSON."""
-    if message.role == "tool":
-        return {
-            "role": "tool",
-            "content": message.content or "",
-            "tool_call_id": message.tool_call_id or "",
-        }
-    payload: JsonObject = {"role": message.role, "content": message.content or ""}
-    if message.tool_calls:
-        payload["tool_calls"] = [
-            {
-                "id": call.call_id,
-                "type": "function",
-                "function": {"name": call.name, "arguments": call.arguments_json()},
-            }
-            for call in message.tool_calls
-        ]
-    return payload
-
-
-def _add_openai_tools(
-    payload: JsonObject,
-    request: GatewayRequest,
-    *,
-    responses: bool,
-) -> None:
-    """Add Responses-native or Chat-native tools and tool choice in place."""
-    if request.tools:
-        if responses:
-            payload["tools"] = [
-                {
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                    "strict": tool.strict,
-                }
-                for tool in request.tools
-            ]
-        else:
-            payload["tools"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                        "strict": tool.strict,
-                    },
-                }
-                for tool in request.tools
-            ]
-    if request.tool_choice is not None:
-        if isinstance(request.tool_choice, GatewayNamedToolChoice):
-            payload["tool_choice"] = (
-                {"type": "function", "name": request.tool_choice.name}
-                if responses
-                else {
-                    "type": "function",
-                    "function": {"name": request.tool_choice.name},
-                }
-            )
-        else:
-            payload["tool_choice"] = request.tool_choice

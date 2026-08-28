@@ -83,7 +83,15 @@ class ChatSseEncoder:
             return (self._chunk(delta={"content": event.text_delta}),)
         if event.kind == GatewayEventKind.REFUSAL_DELTA:
             return (self._chunk(delta={"refusal": event.text_delta}),)
-        if event.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
+        if event.kind in {
+            GatewayEventKind.REASONING_SUMMARY_DELTA,
+            # The Chat wire has no reasoning representation, so provider
+            # reasoning is deliberately dropped here like summary deltas.
+            GatewayEventKind.THINKING_DELTA,
+            GatewayEventKind.THINKING_SIGNATURE,
+            GatewayEventKind.REDACTED_THINKING,
+            GatewayEventKind.ENCRYPTED_REASONING,
+        }:
             return ()
         if event.kind == GatewayEventKind.TOOL_CALL_STARTED:
             index = _required_index(event)
@@ -251,10 +259,11 @@ class _ResponseReasoningState:
         self.item_id = item_id
         self.output_index = output_index
         self.parts: dict[int, str] = {}
+        self.encrypted_content: str | None = None
 
     def item(self, *, completed: bool) -> JsonObject:
         """Return the current official Responses reasoning item."""
-        return {
+        item: JsonObject = {
             "id": self.item_id,
             "type": "reasoning",
             "summary": (
@@ -264,6 +273,9 @@ class _ResponseReasoningState:
             ),
             "status": "completed" if completed else "in_progress",
         }
+        if self.encrypted_content is not None:
+            item["encrypted_content"] = self.encrypted_content
+        return item
 
 
 class ResponsesSseEncoder:
@@ -319,6 +331,22 @@ class ResponsesSseEncoder:
             return self._content_delta("refusal", _required_text(event.text_delta))
         if event.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
             return self._reasoning_summary_delta(event)
+        if event.kind == GatewayEventKind.THINKING_DELTA:
+            # Lossy projection: Anthropic thinking text streams as a summary
+            # part so callers receive what they pay for. Signatures are
+            # dropped deliberately, since this surface cannot round-trip them.
+            if event.reasoning_block_index is None:
+                raise self._state_error("Responses thinking delta omitted its block index.")
+            return self._reasoning_summary_text(
+                event.reasoning_block_index, 0, _required_text(event.text_delta)
+            )
+        if event.kind in {
+            GatewayEventKind.THINKING_SIGNATURE,
+            GatewayEventKind.REDACTED_THINKING,
+        }:
+            return ()
+        if event.kind == GatewayEventKind.ENCRYPTED_REASONING:
+            return self._encrypted_reasoning(event)
         if event.kind == GatewayEventKind.TOOL_CALL_STARTED:
             return self._tool_started(event)
         if event.kind == GatewayEventKind.TOOL_ARGUMENTS_DELTA:
@@ -437,7 +465,14 @@ class ResponsesSseEncoder:
         summary_index = event.reasoning_summary_index
         if provider_output_index is None or summary_index is None:
             raise self._state_error("Responses reasoning delta omitted its indices.")
-        frames: list[str] = []
+        return self._reasoning_summary_text(
+            provider_output_index, summary_index, _required_text(event.text_delta)
+        )
+
+    def _ensure_reasoning_state(
+        self, provider_output_index: int, frames: list[str]
+    ) -> _ResponseReasoningState:
+        """Create one stable reasoning output item on first use."""
         state = self._reasoning.get(provider_output_index)
         if state is None:
             state = _ResponseReasoningState(
@@ -455,6 +490,23 @@ class ResponsesSseEncoder:
                     },
                 )
             )
+        return state
+
+    def _encrypted_reasoning(self, event: GatewayEvent) -> tuple[str, ...]:
+        """Retain one opaque encrypted reasoning payload on its output item."""
+        if event.reasoning_block_index is None or event.encrypted_content is None:
+            raise self._state_error("Responses encrypted reasoning omitted its payload.")
+        frames: list[str] = []
+        state = self._ensure_reasoning_state(event.reasoning_block_index, frames)
+        state.encrypted_content = event.encrypted_content
+        return tuple(frames)
+
+    def _reasoning_summary_text(
+        self, provider_output_index: int, summary_index: int, delta: str
+    ) -> tuple[str, ...]:
+        """Emit one summary text delta, opening its item and part as needed."""
+        frames: list[str] = []
+        state = self._ensure_reasoning_state(provider_output_index, frames)
         if summary_index not in state.parts:
             state.parts[summary_index] = ""
             frames.append(
@@ -468,7 +520,6 @@ class ResponsesSseEncoder:
                     },
                 )
             )
-        delta = _required_text(event.text_delta)
         state.parts[summary_index] += delta
         frames.append(
             self._event(

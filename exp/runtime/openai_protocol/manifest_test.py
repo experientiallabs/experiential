@@ -40,7 +40,8 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert chat["top_p"] == CompatibilityDisposition.SUPPORTED
     assert responses["background"] == CompatibilityDisposition.UNSUPPORTED
     assert responses["conversation"] == CompatibilityDisposition.UNSUPPORTED
-    assert responses["include"] == CompatibilityDisposition.UNSUPPORTED
+    assert responses["include"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    assert responses["store"] == CompatibilityDisposition.SUPPORTED
     assert responses["top_p"] == CompatibilityDisposition.SUPPORTED
     assert responses["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["top_logprobs"] == CompatibilityDisposition.UNSUPPORTED

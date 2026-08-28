@@ -192,7 +192,7 @@ class GatewayWireProfile:
             raise ValueError("a configured reasoning effort requires reasoning support")
         if self.supported_reasoning_efforts and not self.supports_reasoning:
             raise ValueError("supported reasoning efforts require reasoning support")
-        effort_order = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+        effort_order = ("none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max")
         effort_indexes = tuple(
             effort_order.index(effort) for effort in self.supported_reasoning_efforts
         )

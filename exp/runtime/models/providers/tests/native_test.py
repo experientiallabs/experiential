@@ -631,3 +631,24 @@ def test_native_provider_refusals_are_typed_without_exposing_refusal_text() -> N
         )
     assert gemini_error.value.signal is ProviderRefusalSignal.SAFETY
     assert "gemini-refusal-canary" not in str(gemini_error.value)
+
+
+def test_anthropic_completed_thinking_blocks_are_accepted() -> None:
+    """A pinned-effort route returns thinking blocks; the typed client keeps
+    final content and tool calls without raising."""
+    response = anthropic_messages_response(
+        {
+            "content": [
+                {"type": "thinking", "thinking": "private", "signature": "sig=="},
+                {"type": "redacted_thinking", "data": "opaque=="},
+                {"type": "text", "text": "final answer"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 9},
+        },
+        configured_model=_snapshot("anthropic", "claude-fable-5"),
+        latency_seconds=0.1,
+    )
+    assert response.output is not None
+    assert response.output.content == "final answer"
+    assert response.output.tool_calls == ()

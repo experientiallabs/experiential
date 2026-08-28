@@ -19,6 +19,6 @@ def test_required_protocol_and_sampling_fields_are_supported() -> None:
     for path in ("model", "messages", "max_tokens", "system", "stream", "stop_sequences"):
         assert decisions[path] == CompatibilityDisposition.SUPPORTED
     assert decisions["tools"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
-    assert decisions["thinking"] == CompatibilityDisposition.UNSUPPORTED
+    assert decisions["thinking"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert decisions["output_config"] == CompatibilityDisposition.UNSUPPORTED
     assert decisions["top_k"] == CompatibilityDisposition.SUPPORTED

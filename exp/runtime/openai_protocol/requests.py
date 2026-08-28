@@ -24,6 +24,7 @@ from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.gateway.contracts import (
     CompatibilityDisposition,
     CompatibilityManifest,
+    EncryptedReasoningBlock,
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
@@ -249,6 +250,27 @@ class _ResponseFunctionOutput(_WireModel):
     output: str
 
 
+class _ReasoningSummaryPart(_WireModel):
+    """One display-only summary part replayed inside a reasoning input item."""
+
+    type: Literal["summary_text"]
+    text: str
+
+
+class _ResponseReasoningItem(_WireModel):
+    """One opaque reasoning item a stateless caller replays with its input.
+
+    ``encrypted_content`` is the round-trip payload; the display-only
+    ``summary`` parts are validated and dropped because the provider derives
+    the model-visible reasoning from the encrypted payload alone.
+    """
+
+    type: Literal["reasoning"]
+    id: str | None = Field(default=None, min_length=1, max_length=256)
+    encrypted_content: str = Field(min_length=1)
+    summary: tuple[_ReasoningSummaryPart, ...] = ()
+
+
 class _ResponseFormat(_WireModel):
     """Supported Responses text format."""
 
@@ -296,13 +318,20 @@ class _ResponseReasoning(_WireModel):
         return self
 
 
+_ResponsesInputItem = (
+    _ResponseMessage | _ResponseFunctionCall | _ResponseFunctionOutput | _ResponseReasoningItem
+)
+
+
 class _ResponsesRequest(_WireModel):
     """Closed gateway Responses request profile."""
 
     model: str = Field(min_length=1, max_length=256)
-    input: str | tuple[_ResponseMessage | _ResponseFunctionCall | _ResponseFunctionOutput, ...]
+    input: str | tuple[_ResponsesInputItem, ...]
     instructions: str | None = None
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
+    store: bool | None = None
+    include: tuple[str, ...] | None = None
     tools: tuple[_ResponseTool, ...] = ()
     tool_choice: JsonValue = None
     parallel_tool_calls: bool | None = None
@@ -417,8 +446,11 @@ def decode_responses(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     _validate_manifest(payload, RESPONSES_MANIFEST)
-    _validate_official(_RESPONSES_OFFICIAL, payload, extension_fields={"top_k"})
+    # The installed SDK's effort literal lags the newest provider tier
+    # ("ultra"), so the strict wire model owns reasoning validation.
+    _validate_official(_RESPONSES_OFFICIAL, payload, extension_fields={"top_k", "reasoning"})
     request = _validate_wire(_ResponsesRequest, payload)
+    include_encrypted_reasoning = _include_encrypted_reasoning(request.include)
     operation = _caller_operation(idempotency_key, client_request_id)
     messages = list(_response_input_messages(request.input))
     if request.instructions is not None:
@@ -458,6 +490,8 @@ def decode_responses(
                 if request.reasoning is not None
                 else ()
             ),
+            response_store=request.store,
+            include_encrypted_reasoning=include_encrypted_reasoning,
             stream=request.stream,
             previous_response_id=request.previous_response_id,
             metadata=request.metadata,
@@ -781,16 +815,77 @@ def _responses_structured_text(value: _ResponseText | None) -> StructuredTextFor
     )
 
 
+def _include_encrypted_reasoning(include: tuple[str, ...] | None) -> bool:
+    """Validate the closed ``include`` selector list.
+
+    Args:
+        include: Raw caller include paths.
+
+    Returns:
+        Whether the caller asked for ``reasoning.encrypted_content``.
+
+    Raises:
+        OpenAIProtocolError: An include path is not supported by this gateway.
+    """
+    if include is None:
+        return False
+    for path in include:
+        if path != "reasoning.encrypted_content":
+            raise invalid_field(
+                "include",
+                f"The include path {path!r} is not supported by this gateway. "
+                "Only 'reasoning.encrypted_content' is available.",
+            )
+    return bool(include)
+
+
 def _response_input_messages(
-    value: str | tuple[_ResponseMessage | _ResponseFunctionCall | _ResponseFunctionOutput, ...],
+    value: str | tuple[_ResponsesInputItem, ...],
 ) -> tuple[GatewayMessage, ...]:
-    """Convert Responses input items into ordered canonical history."""
+    """Convert Responses input items into ordered canonical history.
+
+    A replayed reasoning item precedes the assistant action it belongs to on
+    the official wire, so pending reasoning blocks attach to the next
+    assistant message or function call; trailing or orphaned reasoning stays
+    a standalone assistant turn carrying only the opaque blocks.
+    """
     if isinstance(value, str):
         return (GatewayMessage(role="user", content=value),)
     messages: list[GatewayMessage] = []
+    pending_reasoning: list[EncryptedReasoningBlock] = []
+
+    def take_reasoning(role: str) -> tuple[EncryptedReasoningBlock, ...]:
+        """Hand pending reasoning blocks to one assistant successor."""
+        if role != "assistant" or not pending_reasoning:
+            return ()
+        taken = tuple(pending_reasoning)
+        pending_reasoning.clear()
+        return taken
+
+    def flush_orphaned_reasoning() -> None:
+        """Emit reasoning that has no assistant successor as its own turn."""
+        if pending_reasoning:
+            messages.append(
+                GatewayMessage(role="assistant", provider_reasoning=take_reasoning("assistant"))
+            )
+
     for index, item in enumerate(value):
-        if isinstance(item, _ResponseMessage):
-            messages.extend(_messages((item,), f"input.{index}"))
+        if isinstance(item, _ResponseReasoningItem):
+            pending_reasoning.append(
+                EncryptedReasoningBlock(id=item.id, encrypted_content=item.encrypted_content)
+            )
+        elif isinstance(item, _ResponseMessage):
+            if item.role != "assistant":
+                flush_orphaned_reasoning()
+            converted = _messages((item,), f"input.{index}")
+            if converted and item.role == "assistant":
+                converted = (
+                    converted[0].model_copy(
+                        update={"provider_reasoning": take_reasoning("assistant")}
+                    ),
+                    *converted[1:],
+                )
+            messages.extend(converted)
         elif isinstance(item, _ResponseFunctionCall):
             wire_call = _AssistantToolCall(
                 id=item.call_id,
@@ -800,10 +895,13 @@ def _response_input_messages(
                 GatewayMessage(
                     role="assistant",
                     tool_calls=(_tool_call(wire_call, f"input.{index}.arguments"),),
+                    provider_reasoning=take_reasoning("assistant"),
                 )
             )
         else:
+            flush_orphaned_reasoning()
             messages.append(
                 GatewayMessage(role="tool", content=item.output, tool_call_id=item.call_id)
             )
+    flush_orphaned_reasoning()
     return tuple(messages)

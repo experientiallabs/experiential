@@ -202,3 +202,138 @@ def test_tool_error_marker_never_reaches_serialization_or_request_digests() -> N
 
     with pytest.raises(ValidationError, match="tool_is_error is valid only for tool messages"):
         GatewayMessage(role="user", content="hi", tool_is_error=True)
+
+
+def test_provider_reasoning_carrier_is_ordered_assistant_only_and_digest_free() -> None:
+    """Opaque reasoning blocks ride assistant turns without perturbing digests."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.contracts import (
+        EncryptedReasoningBlock,
+        RedactedThinkingBlock,
+        ThinkingBlock,
+    )
+
+    blocks = (
+        ThinkingBlock(text="step one", signature="sig-1"),
+        RedactedThinkingBlock(data="opaque"),
+    )
+    carried = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="assistant", content="done", provider_reasoning=blocks),),
+    )
+    bare = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="assistant", content="done"),),
+    )
+    assert carried.messages[0].provider_reasoning == blocks
+    assert carried.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(carried) == sha256_json(bare)
+
+    # A thinking-only assistant turn is legal history (e.g. a turn cut off
+    # mid-thinking), so the carrier alone satisfies message coherence.
+    reasoning_only = GatewayMessage(
+        role="assistant",
+        provider_reasoning=(EncryptedReasoningBlock(id="rs_1", encrypted_content="blob"),),
+    )
+    assert reasoning_only.content is None
+
+    with pytest.raises(ValidationError, match="valid only for assistant messages"):
+        GatewayMessage(
+            role="user",
+            content="hi",
+            provider_reasoning=(ThinkingBlock(text="x", signature=None),),
+        )
+
+
+def test_reasoning_carrier_request_fields_are_surface_scoped() -> None:
+    """store, include, and verbatim thinking config bind to their one surface."""
+    messages = (GatewayMessage(role="user", content="hi"),)
+    stored = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=messages,
+        response_store=False,
+        include_encrypted_reasoning=True,
+    )
+    assert stored.response_store is False
+    assert stored.include_encrypted_reasoning is True
+
+    thinking = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=messages,
+        provider_thinking_config={"type": "enabled", "budget_tokens": 2048},
+    )
+    assert thinking.provider_thinking_config == {"type": "enabled", "budget_tokens": 2048}
+    # The verbatim config is authority-visible only, never in digests.
+    assert "provider_thinking_config" not in thinking.model_dump(mode="json")
+
+    with pytest.raises(ValidationError, match="response_store is valid only"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            response_store=True,
+        )
+    with pytest.raises(ValidationError, match="include_encrypted_reasoning is valid only"):
+        GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=messages,
+            include_encrypted_reasoning=True,
+        )
+    with pytest.raises(ValidationError, match="provider_thinking_config is valid only"):
+        GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=messages,
+            provider_thinking_config={"type": "enabled"},
+        )
+
+
+def test_reasoning_stream_events_require_their_payloads() -> None:
+    """Each new reasoning event kind carries its block index and payload."""
+    thinking = GatewayEvent(
+        kind=GatewayEventKind.THINKING_DELTA,
+        sequence_number=0,
+        reasoning_block_index=0,
+        text_delta="because",
+    )
+    assert thinking.reasoning_block_index == 0
+    signature = GatewayEvent(
+        kind=GatewayEventKind.THINKING_SIGNATURE,
+        sequence_number=1,
+        reasoning_block_index=0,
+        thinking_signature="sig",
+    )
+    assert signature.thinking_signature == "sig"
+    redacted = GatewayEvent(
+        kind=GatewayEventKind.REDACTED_THINKING,
+        sequence_number=2,
+        reasoning_block_index=1,
+        redacted_thinking_data="opaque",
+    )
+    assert redacted.redacted_thinking_data == "opaque"
+    encrypted = GatewayEvent(
+        kind=GatewayEventKind.ENCRYPTED_REASONING,
+        sequence_number=3,
+        reasoning_block_index=0,
+        encrypted_content="blob",
+    )
+    assert encrypted.encrypted_content == "blob"
+
+    with pytest.raises(ValidationError, match="thinking deltas require"):
+        GatewayEvent(kind=GatewayEventKind.THINKING_DELTA, sequence_number=0, text_delta="x")
+    with pytest.raises(ValidationError, match="thinking signatures require"):
+        GatewayEvent(
+            kind=GatewayEventKind.THINKING_SIGNATURE,
+            sequence_number=0,
+            reasoning_block_index=0,
+        )
+    with pytest.raises(ValidationError, match="redacted thinking requires"):
+        GatewayEvent(
+            kind=GatewayEventKind.REDACTED_THINKING,
+            sequence_number=0,
+            reasoning_block_index=0,
+        )
+    with pytest.raises(ValidationError, match="encrypted reasoning requires"):
+        GatewayEvent(
+            kind=GatewayEventKind.ENCRYPTED_REASONING,
+            sequence_number=0,
+            encrypted_content="blob",
+        )

@@ -39,6 +39,7 @@ MESSAGES_MANIFEST = CompatibilityManifest(
         ),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
+        _field("thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "extended_thinking"),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
@@ -48,7 +49,6 @@ MESSAGES_MANIFEST = CompatibilityManifest(
                 "mcp_servers",
                 "output_config",
                 "service_tier",
-                "thinking",
             )
         ),
     ),

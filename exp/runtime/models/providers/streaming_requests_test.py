@@ -1235,3 +1235,187 @@ def test_dialect_dispatch_builds_the_bedrock_payload() -> None:
 
     assert "modelId" not in payload
     assert payload["messages"] == [{"role": "user", "content": [{"text": "hello"}]}]
+
+
+def _thinking_history_request(**overrides: object) -> GatewayRequest:
+    """Build one Messages request replaying thinking history blocks."""
+    from exp.runtime.gateway.contracts import RedactedThinkingBlock, ThinkingBlock
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="assistant",
+                content="done",
+                provider_reasoning=(
+                    ThinkingBlock(text="private", signature="sig=="),
+                    RedactedThinkingBlock(data="opaque=="),
+                ),
+            ),
+            GatewayMessage(role="user", content="continue"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    return request.model_copy(update=dict(overrides)) if overrides else request
+
+
+def test_anthropic_payload_carries_verbatim_thinking_config_over_adaptive() -> None:
+    """The caller's exact thinking object wins over the catalog effort default."""
+    config: JsonObject = {"type": "enabled", "budget_tokens": 2048}
+    request = _thinking_history_request(provider_thinking_config=config)
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5",
+        request,
+        supports_reasoning=True,
+        reasoning_effort="high",
+    )
+    assert payload["thinking"] == config
+    # The adaptive default and its effort stay off the wire under an
+    # explicit caller configuration.
+    assert "output_config" not in payload
+
+    adaptive = anthropic_messages_stream_payload(
+        "claude-fable-5",
+        _thinking_history_request(),
+        supports_reasoning=True,
+        reasoning_effort="high",
+    )
+    assert adaptive["thinking"] == {"type": "adaptive"}
+    assert adaptive["output_config"] == {"effort": "high"}
+
+
+def test_anthropic_payload_replays_thinking_blocks_first_and_verbatim() -> None:
+    """Thinking history leads the assistant turn with byte-exact signatures."""
+    payload = anthropic_messages_stream_payload("claude-fable-5", _thinking_history_request())
+    messages = cast(list[JsonObject], payload["messages"])
+    assistant_blocks = cast(list[JsonObject], messages[1]["content"])
+    assert assistant_blocks[0] == {
+        "type": "thinking",
+        "thinking": "private",
+        "signature": "sig==",
+    }
+    assert assistant_blocks[1] == {"type": "redacted_thinking", "data": "opaque=="}
+    assert assistant_blocks[2] == {"type": "text", "text": "done"}
+
+
+def test_route_rejects_thinking_outside_native_anthropic() -> None:
+    """Thinking carriers require every waterfall rung to speak the Anthropic wire."""
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        reasoning_wire_format="anthropic_adaptive",
+    )
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
+
+    for request in (
+        _thinking_history_request(),
+        _chat_request().model_copy(
+            update={
+                "surface": GatewayApiSurface.MESSAGES,
+                "provider_thinking_config": {"type": "enabled", "budget_tokens": 1024},
+            }
+        ),
+    ):
+        route_generation_parameter_requests((anthropic,), request)
+        with pytest.raises(ProviderParameterError) as raised:
+            route_generation_parameter_requests((anthropic, fallback), request)
+        assert raised.value.param == "thinking"
+        assert raised.value.code == "unsupported_parameter"
+
+
+def _encrypted_reasoning_request() -> GatewayRequest:
+    """Build one Codex-shaped Responses request with encrypted reasoning replay."""
+    from exp.runtime.gateway.contracts import EncryptedReasoningBlock
+
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="assistant",
+                content="done",
+                provider_reasoning=(
+                    EncryptedReasoningBlock(id="rs_1", encrypted_content="blob=="),
+                ),
+            ),
+            GatewayMessage(role="user", content="continue"),
+        ),
+        response_store=False,
+        include_encrypted_reasoning=True,
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_responses_payload_forwards_include_and_replays_reasoning_items() -> None:
+    """Encrypted reasoning replays ahead of its assistant message, store stays false."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        _encrypted_reasoning_request(),
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert payload["store"] is False
+    assert payload["include"] == ["reasoning.encrypted_content"]
+    items = cast(list[JsonObject], payload["input"])
+    assert items[1] == {
+        "type": "reasoning",
+        "summary": [],
+        "encrypted_content": "blob==",
+        "id": "rs_1",
+    }
+    assert items[2] == {"role": "assistant", "content": "done"}
+
+
+def test_route_rejects_encrypted_reasoning_outside_native_responses() -> None:
+    """Encrypted reasoning requires every waterfall rung to speak native Responses."""
+    responses = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://openai.test",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+    )
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
+    request = _encrypted_reasoning_request()
+
+    route_generation_parameter_requests((responses,), request)
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((responses, fallback), request)
+    assert raised.value.param == "include"
+    assert raised.value.code == "unsupported_parameter"
+
+
+def test_ultra_effort_is_admitted_only_where_the_family_documents_it() -> None:
+    """The gpt-5.6 family accepts ultra; other routes reject it before dispatch."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        reasoning_effort="ultra",
+    )
+    codex = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://openai.test",
+        model_id="gpt-5.6-sol",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+    )
+    route_generation_parameter_requests((codex,), request)
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert payload["reasoning"] == {"effort": "ultra"}
+
+    older = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://openai.test",
+        model_id="gpt-5.2",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+    )
+    with pytest.raises(UnsupportedReasoningEffortError):
+        route_generation_parameter_requests((older,), request)

@@ -98,9 +98,11 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "temperature",
                 "top_p",
                 "stream",
+                "store",
             )
         ),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
+        _field("include", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "encrypted_reasoning"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field(
             "parallel_tool_calls",
@@ -122,11 +124,9 @@ RESPONSES_MANIFEST = CompatibilityManifest(
             for path in (
                 "background",
                 "conversation",
-                "include",
                 "max_tool_calls",
                 "prompt",
                 "service_tier",
-                "store",
                 "stream_options",
                 "truncation",
             )

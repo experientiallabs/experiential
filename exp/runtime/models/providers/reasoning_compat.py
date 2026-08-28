@@ -19,6 +19,7 @@ REASONING_EFFORTS = (
     "medium",
     "high",
     "xhigh",
+    "ultra",
     "max",
 )
 _EFFORT_ORDER = REASONING_EFFORTS
@@ -181,7 +182,9 @@ def _openai_supported_efforts(model_id: str) -> Collection[str] | None:
     elif identity in {"gpt-5.2-pro", "gpt-5.4-pro", "gpt-5.5-pro"}:
         supported = ("medium", "high", "xhigh")
     elif identity.startswith("gpt-5.6-"):
-        supported = ("low", "medium", "high", "xhigh")
+        # The gpt-5.6 family is the first to document the "ultra" tier
+        # (Codex sends it by default at its highest setting).
+        supported = ("low", "medium", "high", "xhigh", "ultra")
     elif identity in {
         "gpt-5.2",
         "gpt-5.4",

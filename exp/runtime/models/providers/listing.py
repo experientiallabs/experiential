@@ -442,6 +442,8 @@ def _reasoning_effort(value: object) -> ReasoningEffort | None:
         return "high"
     if value == "xhigh":
         return "xhigh"
+    if value == "ultra":
+        return "ultra"
     if value == "max":
         return "max"
     return None

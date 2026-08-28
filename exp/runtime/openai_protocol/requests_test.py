@@ -655,3 +655,91 @@ def test_responses_decoder_captures_end_user_attribution() -> None:
     assert request.safety_identifier == "sid-9"
     assert request.prompt_cache_key == "pck-1"
     assert request.attribution_label == "sid-9"
+
+
+def test_responses_decoder_accepts_the_codex_request_shape() -> None:
+    """store:false, include, ultra effort, and replayed reasoning all decode."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": {"effort": "ultra", "summary": "auto"},
+            "prompt_cache_key": "codex-session-1",
+            "input": [
+                {"type": "message", "role": "user", "content": "run the tool"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "planned"}],
+                    "encrypted_content": "blob==",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "search",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call-1", "output": "found"},
+            ],
+        }
+    )
+    request = decoded.request
+    assert request.response_store is False
+    assert request.include_encrypted_reasoning is True
+    assert request.reasoning_effort == "ultra"
+    assert request.reasoning_summary == "auto"
+    assert request.prompt_cache_key == "codex-session-1"
+    assistant = request.messages[1]
+    assert assistant.role == "assistant"
+    assert assistant.tool_calls[0].call_id == "call-1"
+    blocks = assistant.provider_reasoning
+    assert len(blocks) == 1
+    assert blocks[0].kind == "encrypted_reasoning"
+    assert blocks[0].id == "rs_1"
+    assert blocks[0].encrypted_content == "blob=="
+
+
+def test_responses_decoder_keeps_orphaned_reasoning_as_its_own_turn() -> None:
+    """Trailing reasoning with no assistant successor stays a standalone turn."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "go"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [],
+                    "encrypted_content": "blob==",
+                },
+            ],
+        }
+    )
+    trailing = decoded.request.messages[-1]
+    assert trailing.role == "assistant"
+    assert trailing.content is None
+    block = trailing.provider_reasoning[0]
+    assert block.kind == "encrypted_reasoning"
+    assert block.encrypted_content == "blob=="
+
+
+def test_responses_decoder_rejects_unknown_include_paths() -> None:
+    """Only the encrypted reasoning include selector is honored."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses(
+            {
+                "model": "coding",
+                "include": ["message.output_text.logprobs"],
+                "input": "hi",
+            }
+        )
+    assert raised.value.detail.param == "include"
+
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [{"type": "reasoning", "id": "rs_1", "summary": []}],
+            }
+        )
