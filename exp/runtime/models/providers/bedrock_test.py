@@ -1274,10 +1274,22 @@ def test_sign_gateway_dispatch_prefers_the_explicit_bearer() -> None:
     assert headers["authorization"] == "Bearer explicit-bedrock-bearer"
 
 
-def test_ambient_bearer_does_not_isolate_the_sdk_credential_chain(
+@pytest.mark.parametrize(
+    "environment",
+    (
+        {AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bedrock-bearer"},
+        {
+            AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bedrock-bearer",
+            "AWS_ACCESS_KEY_ID": "AKIAAMBIENTKEY0001",
+            "AWS_SECRET_ACCESS_KEY": "ambient-secret-access-key",
+        },
+    ),
+)
+def test_ambient_bearer_is_shared_by_buffered_and_native_paths(
     monkeypatch: pytest.MonkeyPatch,
+    environment: Mapping[str, str],
 ) -> None:
-    """Ambient API-key dispatch leaves ordinary boto SDK construction ambient."""
+    """Ambient bearer auth stays authoritative even when ambient access keys also exist."""
     runtime = _FakeBedrockRuntime()
     seen: dict[str, object] = {}
 
@@ -1303,17 +1315,22 @@ def test_ambient_bearer_does_not_isolate_the_sdk_credential_chain(
     client = BedrockClient(
         model=_snapshot(),
         region="us-west-2",
-        environment={AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bedrock-bearer"},
+        environment=environment,
         runtime_factory=None,
     )
 
     assert client._runtime() is runtime  # noqa: SLF001
+    headers = client.sign_gateway_dispatch(
+        url=client.converse_stream_url(),
+        body='{"messages":[]}',
+    )
     assert seen == {
         "region_name": "us-west-2",
         "aws_access_key_id": None,
         "aws_secret_access_key": None,
-        "bearer_token": None,
+        "bearer_token": "ambient-bedrock-bearer",
     }
+    assert headers["authorization"] == "Bearer ambient-bedrock-bearer"
 
 
 def test_bounded_client_wire_profile_marks_the_body_for_signing() -> None:

@@ -398,6 +398,7 @@ class BedrockClient:
             environment: Process or injected environment mapping used for region lookup.
             aws_access_key_id: Optional non-secret access-key identifier.
             aws_secret_access_key: Optional secret access key resolved from the credential seam.
+            bearer_token: Optional bearer resolved from the credential seam.
             runtime_factory: Optional deterministic factory used by tests.
             retry_policy: Bounded same-region retry policy applied outside botocore.
         """
@@ -410,7 +411,10 @@ class BedrockClient:
             raise ValueError("Bedrock bearer auth cannot be combined with access-key credentials")
         self._aws_access_key_id = aws_access_key_id
         self._aws_secret_access_key = aws_secret_access_key
-        self._bearer_token = bearer_token
+        effective_bearer = bearer_token
+        if effective_bearer is None and aws_access_key_id is None:
+            effective_bearer = (environment.get(AWS_BEARER_TOKEN_BEDROCK_ENV) or "").strip() or None
+        self._bearer_token = effective_bearer
         self._runtime_factory = runtime_factory
         self._retry_policy = retry_policy
         self._supports_temperature = supports_temperature
@@ -631,14 +635,9 @@ class BedrockClient:
             raise ProviderTransportError(
                 "Bedrock dispatch URL differs from the admitted regional model endpoint"
             )
-        bearer_token = self._bearer_token
-        if bearer_token is None and self._aws_access_key_id is None:
-            bearer_token = (
-                self._environment.get(AWS_BEARER_TOKEN_BEDROCK_ENV) or ""
-            ).strip() or None
-        if bearer_token is not None:
+        if self._bearer_token is not None:
             return {
-                "authorization": f"Bearer {bearer_token}",
+                "authorization": f"Bearer {self._bearer_token}",
                 "content-type": "application/json",
                 "accept": "application/vnd.amazon.eventstream",
             }

@@ -26,6 +26,8 @@ _BEDROCK_AUTH_MODE_OPTION = typer.Option(None, "--bedrock-auth-mode")
 _API_VERSION_OPTION = typer.Option(None, "--api-version")
 _AZURE_API_SURFACE_OPTION = typer.Option(None, "--azure-api-surface")
 _REGION_OPTION = typer.Option(None, "--region")
+_CLEAR_CREDENTIALS_OPTION = typer.Option(False, "--clear-credentials")
+_CLEAR_REGION_OPTION = typer.Option(False, "--clear-region")
 
 
 class GatewayProviderView(ContractModel):
@@ -40,6 +42,50 @@ class GatewayProviderView(ContractModel):
     api_version: str | None = None
     azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = None
+
+
+def _updated_credentials(
+    *,
+    current: ConnectionConfig,
+    provider: str,
+    credential_env: str | None,
+    access_key_id_env: str | None,
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None,
+    clear_credentials: bool,
+) -> tuple[str | None, str | None, Literal["access_key_pair", "api_key"] | None]:
+    """Resolve update credential metadata without changing an old locator's meaning."""
+    supplied = (credential_env, access_key_id_env, bedrock_auth_mode)
+    if clear_credentials:
+        if any(value is not None for value in supplied):
+            raise ValueError(
+                "--clear-credentials cannot be combined with credential or auth-mode options"
+            )
+        return None, None, None
+    if current.provider != provider:
+        return credential_env, access_key_id_env, bedrock_auth_mode
+    mode_changed = bedrock_auth_mode is not None and bedrock_auth_mode != current.bedrock_auth_mode
+    if mode_changed:
+        if credential_env is None:
+            raise ValueError("changing Bedrock auth mode requires --credential-env")
+        if bedrock_auth_mode == "api_key":
+            if access_key_id_env is not None:
+                raise ValueError("Bedrock api_key auth forbids --access-key-id-env")
+            return credential_env, None, bedrock_auth_mode
+        if access_key_id_env is None:
+            raise ValueError(
+                "changing to Bedrock access_key_pair auth requires --access-key-id-env"
+            )
+        return credential_env, access_key_id_env, bedrock_auth_mode
+    effective_mode = current.bedrock_auth_mode if bedrock_auth_mode is None else bedrock_auth_mode
+    effective_credential = current.api_key_env if credential_env is None else credential_env
+    effective_access_key_id = (
+        current.aws_access_key_id_env if access_key_id_env is None else access_key_id_env
+    )
+    if effective_mode == "api_key":
+        if access_key_id_env is not None:
+            raise ValueError("Bedrock api_key auth forbids --access-key-id-env")
+        effective_access_key_id = None
+    return effective_credential, effective_access_key_id, effective_mode
 
 
 @provider_app.command("list")
@@ -125,6 +171,8 @@ def provider_update(
         _AZURE_API_SURFACE_OPTION
     ),
     region: str | None = _REGION_OPTION,
+    clear_credentials: bool = _CLEAR_CREDENTIALS_OPTION,
+    clear_region: bool = _CLEAR_REGION_OPTION,
     non_interactive: bool = _NON_INTERACTIVE_OPTION,
     json_output: bool = _JSON_OPTION,
 ) -> None:
@@ -138,23 +186,26 @@ def provider_update(
             raise ValueError(f"provider connection {name!r} does not exist")
     current = authorities[name].config
     same_provider = current.provider == provider
+    with usage_error(ValueError):
+        if clear_region and region is not None:
+            raise ValueError("--clear-region cannot be combined with --region")
+        updated_credential_env, updated_access_key_id_env, updated_bedrock_auth_mode = (
+            _updated_credentials(
+                current=current,
+                provider=provider,
+                credential_env=credential_env,
+                access_key_id_env=access_key_id_env,
+                bedrock_auth_mode=bedrock_auth_mode,
+                clear_credentials=clear_credentials,
+            )
+        )
     provider_add(
         name=name,
         provider=provider,
         root=root,
-        credential_env=(
-            current.api_key_env if credential_env is None and same_provider else credential_env
-        ),
-        access_key_id_env=(
-            current.aws_access_key_id_env
-            if access_key_id_env is None and same_provider and provider == "bedrock"
-            else access_key_id_env
-        ),
-        bedrock_auth_mode=(
-            current.bedrock_auth_mode
-            if bedrock_auth_mode is None and same_provider and provider == "bedrock"
-            else bedrock_auth_mode
-        ),
+        credential_env=updated_credential_env,
+        access_key_id_env=updated_access_key_id_env,
+        bedrock_auth_mode=updated_bedrock_auth_mode,
         base_url=current.base_url if base_url is None and same_provider else base_url,
         api_version=current.api_version if api_version is None and same_provider else api_version,
         azure_api_surface=(
@@ -162,7 +213,13 @@ def provider_update(
             if azure_api_surface is None and same_provider and provider == "azure"
             else azure_api_surface
         ),
-        region=current.region if region is None and same_provider else region,
+        region=(
+            None
+            if clear_region
+            else current.region
+            if region is None and same_provider
+            else region
+        ),
         replace=True,
         non_interactive=non_interactive,
         json_output=json_output,

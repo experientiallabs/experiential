@@ -307,3 +307,172 @@ def test_provider_update_preserves_explicit_bedrock_credentials(tmp_path: Path) 
     assert item["credential_env"] == "AWS_SECRET_ACCESS_KEY"
     assert item["access_key_id_env"] == "AWS_ACCESS_KEY_ID"
     assert item["bedrock_auth_mode"] == "access_key_pair"
+
+
+def test_provider_update_switches_bedrock_pair_to_api_key_without_stale_access_key(
+    tmp_path: Path,
+) -> None:
+    """Changing auth mode drops the access-key locator from bearer configuration."""
+    root = _initialized_root(tmp_path)
+    added = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "bedrock-production",
+            "--provider",
+            "bedrock",
+            "--credential-env",
+            "BEDROCK_SECRET_ACCESS_KEY",
+            "--access-key-id-env",
+            "BEDROCK_ACCESS_KEY_ID",
+            "--bedrock-auth-mode",
+            "access_key_pair",
+            "--region",
+            "us-west-2",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+    updated = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "update",
+            "bedrock-production",
+            "--provider",
+            "bedrock",
+            "--credential-env",
+            "BEDROCK_API_KEY",
+            "--bedrock-auth-mode",
+            "api_key",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert added.exit_code == 0
+    assert updated.exit_code == 0, updated.output
+    (authority,) = GatewayManagement(root).provider_connections()
+    assert authority.config.api_key_env == "BEDROCK_API_KEY"
+    assert authority.config.aws_access_key_id_env is None
+    assert authority.config.bedrock_auth_mode == "api_key"
+    assert authority.config.region == "us-west-2"
+
+
+def test_provider_update_does_not_reinterpret_a_stale_secret_locator_as_an_api_key(
+    tmp_path: Path,
+) -> None:
+    """A mode switch requires a fresh credential locator instead of changing its meaning."""
+    root = _initialized_root(tmp_path)
+    added = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "bedrock-production",
+            "--provider",
+            "bedrock",
+            "--credential-env",
+            "BEDROCK_SECRET_ACCESS_KEY",
+            "--access-key-id-env",
+            "BEDROCK_ACCESS_KEY_ID",
+            "--bedrock-auth-mode",
+            "access_key_pair",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+    rejected = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "update",
+            "bedrock-production",
+            "--provider",
+            "bedrock",
+            "--bedrock-auth-mode",
+            "api_key",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert added.exit_code == 0
+    assert rejected.exit_code != 0
+    assert "requires --credential-env" in _plain_output(rejected.output)
+    (authority,) = GatewayManagement(root).provider_connections()
+    assert authority.config.api_key_env == "BEDROCK_SECRET_ACCESS_KEY"
+    assert authority.config.aws_access_key_id_env == "BEDROCK_ACCESS_KEY_ID"
+    assert authority.config.bedrock_auth_mode == "access_key_pair"
+
+
+def test_provider_update_can_clear_bedrock_auth_and_region_to_ambient(tmp_path: Path) -> None:
+    """Explicit clear flags remove every credential locator and the pinned region."""
+    root = _initialized_root(tmp_path)
+    added = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "bedrock-production",
+            "--provider",
+            "bedrock",
+            "--credential-env",
+            "BEDROCK_SECRET_ACCESS_KEY",
+            "--access-key-id-env",
+            "BEDROCK_ACCESS_KEY_ID",
+            "--bedrock-auth-mode",
+            "access_key_pair",
+            "--region",
+            "us-west-2",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+    updated = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "update",
+            "bedrock-production",
+            "--provider",
+            "bedrock",
+            "--clear-credentials",
+            "--clear-region",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert added.exit_code == 0
+    assert updated.exit_code == 0, updated.output
+    (authority,) = GatewayManagement(root).provider_connections()
+    assert authority.config.api_key_env is None
+    assert authority.config.aws_access_key_id_env is None
+    assert authority.config.bedrock_auth_mode is None
+    assert authority.config.region is None
