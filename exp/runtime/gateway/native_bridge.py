@@ -147,8 +147,15 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
 }
 
 
-def _public_capability_param(capability: str, surface: GatewayApiSurface) -> str | None:
+def _public_capability_param(
+    capability: str,
+    surface: GatewayApiSurface,
+    *,
+    public_stream: bool = True,
+) -> str | None:
     """Translate an internal capability label to the caller's request field."""
+    if capability == "streaming_tool_arguments" and not public_stream:
+        return "tools"
     return _PUBLIC_REQUEST_CAPABILITY_PARAMS[surface].get(capability)
 
 
@@ -503,7 +510,11 @@ class NativeControlPlane(NativeObservabilityMixin):
             failure = normalized_provider_failure(exc)
             self._accounting.finish_request_quietly(authorization, failure)
             failure_param = (
-                _public_capability_param(exc.capability, provider_request.surface)
+                _public_capability_param(
+                    exc.capability,
+                    provider_request.surface,
+                    public_stream=public_request.stream,
+                )
                 if isinstance(exc, ProviderCapabilityError)
                 else exc.param
             )

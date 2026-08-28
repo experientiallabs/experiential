@@ -92,6 +92,19 @@ def test_public_capability_params_name_real_surface_fields(
     assert _public_capability_param(capability, GatewayApiSurface.MESSAGES) == messages_param
 
 
+def test_internal_tool_streaming_failure_names_the_public_tools_field() -> None:
+    """A transport detail never blames stream when the caller requested non-streaming tools."""
+    for surface in GatewayApiSurface:
+        assert (
+            _public_capability_param(
+                "streaming_tool_arguments",
+                surface,
+                public_stream=False,
+            )
+            == "tools"
+        )
+
+
 def _parity_golden(name: str) -> object:
     """Load one committed golden fixture the Rust encoders must reproduce.
 
@@ -1132,6 +1145,44 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
     assert error["code"] == "unsupported_capability"
     assert error["param"] == "tools"
     assert "internal" not in error["code"]
+
+
+def test_non_streaming_tool_transport_failure_names_tools_not_stream(tmp_path: Path) -> None:
+    """Internally forced streaming attributes incompatibility to the declared tools field."""
+    unsupported = GatewayDeploymentCapabilities(
+        supports_streaming=True,
+        supports_strict_tools=True,
+    )
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(unsupported, unsupported),
+        model_capabilities=(
+            ModelCapabilities(supports_tools=True),
+            ModelCapabilities(supports_tools=True),
+        ),
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, body)
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["code"] == "unsupported_capability"
+    assert error["param"] == "tools"
 
 
 def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Path) -> None:
