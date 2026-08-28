@@ -67,13 +67,20 @@ pub fn output_argument(request_id: &str, events: &[Event]) -> String {
     }))
 }
 
-/// Replace text deltas with one rewritten delta. Refusal deltas are dropped.
+/// Replace text deltas with one rewritten delta. Refusal deltas are dropped,
+/// and so is every provider-reasoning event: rewritten output must not leak
+/// the redacted content through the model's own reasoning channel.
 pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event> {
     let mut rewritten = Vec::with_capacity(events.len());
     let mut inserted = false;
     for event in events {
         match event {
-            Event::RefusalDelta(_) => {}
+            Event::RefusalDelta(_)
+            | Event::ReasoningSummaryDelta { .. }
+            | Event::ThinkingDelta { .. }
+            | Event::ThinkingSignature { .. }
+            | Event::RedactedThinking { .. }
+            | Event::EncryptedReasoning { .. } => {}
             Event::TextDelta(_) => {
                 if inserted {
                     continue;
@@ -152,6 +159,37 @@ mod tests {
         assert_eq!(payload["refusal"], false);
         assert_eq!(payload["tool_calls"][0]["name"], "lookup");
         assert_eq!(payload["tool_calls"][0]["arguments"], "{\"q\":\"x\"}");
+    }
+
+    #[test]
+    fn text_replacement_drops_every_reasoning_channel() {
+        // A rewritten output must not leak the redacted content through the
+        // model's own reasoning stream.
+        let events = vec![
+            Event::ThinkingDelta {
+                index: 0,
+                delta: "secret plan".to_string(),
+            },
+            Event::ThinkingSignature {
+                index: 0,
+                signature: "sig==".to_string(),
+            },
+            Event::RedactedThinking {
+                index: 1,
+                data: "opaque==".to_string(),
+            },
+            Event::EncryptedReasoning {
+                output_index: 0,
+                encrypted_content: "blob==".to_string(),
+            },
+            Event::TextDelta("disallowed".to_string()),
+            Event::Completed,
+        ];
+        let rewritten = apply_text_replacement(&events, "[redacted]");
+        assert!(matches!(
+            rewritten.as_slice(),
+            [Event::TextDelta(text), Event::Completed] if text == "[redacted]"
+        ));
     }
 
     #[test]
