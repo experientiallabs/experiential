@@ -623,8 +623,7 @@ def openai_responses_stream_payload(
             instructions.append(message.content)
         else:
             items.extend(responses_items(message))
-    # Upstream storage stays disabled regardless of the caller's `store`
-    # selector: continuation state is gateway-owned, the gateway never
+    # Upstream storage stays disabled: continuation state is gateway-owned, the gateway never
     # references a provider-stored response, and disabled storage is what
     # makes the provider return encrypted reasoning content.
     payload: JsonObject = {

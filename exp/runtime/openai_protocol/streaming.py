@@ -108,8 +108,7 @@ class ChatSseEncoder:
             return ()
         if event.kind in {
             GatewayEventKind.REASONING_SUMMARY_DELTA,
-            # The Chat wire has no reasoning representation, so provider
-            # reasoning is deliberately dropped here like summary deltas.
+            # The Chat wire deliberately drops provider reasoning like summary deltas.
             GatewayEventKind.THINKING_DELTA,
             GatewayEventKind.THINKING_SIGNATURE,
             GatewayEventKind.REDACTED_THINKING,
@@ -381,9 +380,7 @@ class ResponsesSseEncoder:
         if event.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
             return self._reasoning_summary_delta(event)
         if event.kind == GatewayEventKind.THINKING_DELTA:
-            # Lossy projection: Anthropic thinking text streams as a summary
-            # part so callers receive what they pay for. Signatures are
-            # dropped deliberately, since this surface cannot round-trip them.
+            # Anthropic thinking text streams as a summary; signatures cannot round-trip.
             if event.reasoning_block_index is None:
                 raise self._state_error("Responses thinking delta omitted its block index.")
             return self._reasoning_summary_text(
