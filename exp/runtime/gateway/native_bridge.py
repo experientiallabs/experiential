@@ -113,6 +113,16 @@ from exp.runtime.openai_protocol.state import (
 )
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
+_PUBLIC_REQUEST_CAPABILITY_PARAMS = frozenset(
+    {
+        "developer_messages",
+        "function_tools",
+        "parallel_tool_calls",
+        "streaming",
+        "strict_tools",
+        "structured_text",
+    }
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -464,7 +474,13 @@ class NativeControlPlane(NativeObservabilityMixin):
             # request feature the route cannot preserve.
             failure = normalized_provider_failure(exc)
             self._accounting.finish_request_quietly(authorization, failure)
-            raise NativeBridgeError(public_failure_error(failure)) from exc
+            capability_param = (
+                exc.capability
+                if isinstance(exc, ProviderCapabilityError)
+                and exc.capability in _PUBLIC_REQUEST_CAPABILITY_PARAMS
+                else None
+            )
+            raise NativeBridgeError(public_failure_error(failure, param=capability_param)) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             error = _authority_error(exc)
             failure = GatewayFailure(

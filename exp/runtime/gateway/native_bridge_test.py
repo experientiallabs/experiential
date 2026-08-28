@@ -792,6 +792,7 @@ def _configured_pool_gateway(
     base_urls: tuple[str, str] = ("http://127.0.0.1:9/v1", "http://127.0.0.1:10/v1"),
     gateway_capabilities: tuple[GatewayDeploymentCapabilities, GatewayDeploymentCapabilities]
     | None = None,
+    model_capabilities: tuple[ModelCapabilities, ModelCapabilities] | None = None,
     api_key_envs: tuple[str, str] = ("TEST_PROVIDER_KEY", "TEST_PROVIDER_KEY"),
 ) -> tuple[GatewayManagement, str]:
     """Create one certified two-deployment pool alias, grant, and key.
@@ -801,6 +802,7 @@ def _configured_pool_gateway(
         refusal_failover: Whether the alias revision opts into refusal failover.
         base_urls: One provider endpoint per ordered deployment.
         gateway_capabilities: Optional protocol contract for each deployment.
+        model_capabilities: Optional semantic model contract for each deployment.
         api_key_envs: One credential environment-variable name per ordered
             deployment, so a test can make one rung's credential resolvable
             while another is absent.
@@ -826,8 +828,17 @@ def _configured_pool_gateway(
         GatewayDeploymentCapabilities(supports_streaming=True),
         GatewayDeploymentCapabilities(supports_streaming=True),
     )
-    for alias, base_url, gateway_capability, api_key_env in zip(
-        ("alpha", "beta"), base_urls, declared_gateway_capabilities, api_key_envs, strict=True
+    declared_model_capabilities = model_capabilities or (
+        ModelCapabilities(),
+        ModelCapabilities(),
+    )
+    for alias, base_url, gateway_capability, model_capability, api_key_env in zip(
+        ("alpha", "beta"),
+        base_urls,
+        declared_gateway_capabilities,
+        declared_model_capabilities,
+        api_key_envs,
+        strict=True,
     ):
         upsert_connection(
             root,
@@ -846,7 +857,7 @@ def _configured_pool_gateway(
             provider_model=f"{alias}-model-exact",
             exact_model_id="model-revision-exact",
             revision=None,
-            capabilities=ModelCapabilities(),
+            capabilities=model_capability,
             gateway_capabilities=gateway_capability,
             prices=GatewayTokenPrices(),
             pricing_source=None,
@@ -889,12 +900,14 @@ def _pool_control_plane(
     refusal_failover: bool = False,
     gateway_capabilities: tuple[GatewayDeploymentCapabilities, GatewayDeploymentCapabilities]
     | None = None,
+    model_capabilities: tuple[ModelCapabilities, ModelCapabilities] | None = None,
 ) -> tuple[NativeControlPlane, str]:
     """Load the native control plane over one certified two-deployment pool."""
     _manager, raw_key = _configured_pool_gateway(
         root,
         refusal_failover=refusal_failover,
         gateway_capabilities=gateway_capabilities,
+        model_capabilities=model_capabilities,
     )
     components = load_gateway_components(
         root,
@@ -967,6 +980,123 @@ def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
     assert [item["model_id"] for item in route] == ["beta-model-exact"]
     upstream = cast("JsonObject", route[0]["upstream_payload"])
     assert upstream["stop"] == ["DONE"]
+
+
+@pytest.mark.parametrize(
+    ("body_update", "lead", "fallback", "model_capabilities"),
+    (
+        (
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object"},
+                            "strict": True,
+                        },
+                    }
+                ]
+            },
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                supports_strict_tools=True,
+            ),
+            (ModelCapabilities(supports_tools=True), ModelCapabilities(supports_tools=True)),
+        ),
+        (
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": {"type": "object"},
+                        "strict": True,
+                    },
+                }
+            },
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                supports_structured_text=True,
+            ),
+            (
+                ModelCapabilities(supports_structured_output=True),
+                ModelCapabilities(supports_structured_output=True),
+            ),
+        ),
+        (
+            {"stream": True},
+            GatewayDeploymentCapabilities(),
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            (ModelCapabilities(), ModelCapabilities()),
+        ),
+    ),
+)
+def test_admit_filters_each_protocol_capability_before_selection(
+    tmp_path: Path,
+    body_update: JsonObject,
+    lead: GatewayDeploymentCapabilities,
+    fallback: GatewayDeploymentCapabilities,
+    model_capabilities: tuple[ModelCapabilities, ModelCapabilities],
+) -> None:
+    """Tools, structured output, and streaming retain only a capable rung."""
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(lead, fallback),
+        model_capabilities=model_capabilities,
+    )
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        **body_update,
+    }
+
+    admission = _admit(control, raw_key, json.dumps(body))
+
+    route = cast("list[JsonObject]", admission["route"])
+    assert [item["model_id"] for item in route] == ["beta-model-exact"]
+
+
+def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
+    tmp_path: Path,
+) -> None:
+    """An all-incompatible tool route names strict_tools and never reports internal."""
+    unsupported = GatewayDeploymentCapabilities(supports_streaming=True)
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(unsupported, unsupported),
+        model_capabilities=(
+            ModelCapabilities(supports_tools=True),
+            ModelCapabilities(supports_tools=True),
+        ),
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                        "strict": True,
+                    },
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, body)
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_capability"
+    assert error["param"] == "strict_tools"
+    assert "internal" not in error["code"]
 
 
 def _partial_pool_control_plane(
