@@ -19,6 +19,11 @@ from exp.runtime.gateway.project_activation import (
     ProjectActivationRepository,
     require_project_activation_authority,
 )
+from exp.runtime.gateway.provider_certification import (
+    PROVIDER_CERTIFICATION_MATRIX,
+    ProviderCapability,
+    ProviderCertificationResult,
+)
 from exp.runtime.models import RuntimeModelCatalog
 
 
@@ -31,6 +36,18 @@ class ProjectGatewayAlias:
     identity_id: str
     policy_id: str
     changed: bool
+
+
+_CERTIFIED_STREAMING_TOOL_PROVIDERS = frozenset(
+    cell.provider
+    for cell in PROVIDER_CERTIFICATION_MATRIX.cells
+    if cell.capability == ProviderCapability.TOOL_ARGUMENT_STREAM
+    and cell.result
+    in {
+        ProviderCertificationResult.PROVIDER_FIXTURE_PASS,
+        ProviderCertificationResult.INHERITED_COMPATIBLE_FIXTURE_PASS,
+    }
+)
 
 
 def prepare_project_gateway_alias(
@@ -158,7 +175,13 @@ def _migrate_legacy_project_gateway_metadata(
         models[alias] = record.model_copy(
             update={
                 "gateway": GatewayDeploymentMetadata(
-                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+                    capabilities=GatewayDeploymentCapabilities(
+                        supports_streaming=True,
+                        supports_streaming_tool_arguments=(
+                            catalog.connections[record.connection].provider
+                            in _CERTIFIED_STREAMING_TOOL_PROVIDERS
+                        ),
+                    )
                 )
             }
         )

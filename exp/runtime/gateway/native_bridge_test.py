@@ -1167,8 +1167,8 @@ def test_admit_returns_a_field_specific_400_when_no_rung_supports_tools(
     assert "internal" not in error["code"]
 
 
-def test_non_streaming_tools_do_not_require_public_streaming_transport(tmp_path: Path) -> None:
-    """Internally forced streaming does not invent a caller transport requirement."""
+def test_non_streaming_tool_transport_failure_names_tools_not_stream(tmp_path: Path) -> None:
+    """Internally forced streaming attributes incompatibility to the declared tools field."""
     unsupported = GatewayDeploymentCapabilities(
         supports_streaming=True,
         supports_strict_tools=True,
@@ -1197,13 +1197,12 @@ def test_non_streaming_tools_do_not_require_public_streaming_transport(tmp_path:
         }
     )
 
-    admission = _admit(control, raw_key, body)
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, body)
 
-    route = cast("list[JsonObject]", admission["route"])
-    assert [item["model_id"] for item in route] == [
-        "alpha-model-exact",
-        "beta-model-exact",
-    ]
+    error = json.loads(raised.value.public_error_json)
+    assert error["code"] == "unsupported_capability"
+    assert error["param"] == "tools"
 
 
 def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Path) -> None:

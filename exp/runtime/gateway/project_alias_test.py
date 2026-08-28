@@ -74,11 +74,16 @@ def _activation(*, project_ref: str, activation_ref: str) -> ProjectActivation:
     )
 
 
-def test_legacy_project_candidates_gain_only_shared_streaming_transport(tmp_path: Path) -> None:
-    """Upgrade absent gateway metadata without overriding explicit declarations."""
+def test_legacy_project_candidates_gain_only_certified_streaming_transport(
+    tmp_path: Path,
+) -> None:
+    """Upgrade transport facts from adapter certification, never model tool support."""
     catalog = ModelCatalog(
         schema_version=2,
-        connections={"provider": ConnectionConfig(provider="openai")},
+        connections={
+            "provider": ConnectionConfig(provider="openai"),
+            "gemini": ConnectionConfig(provider="gemini", api_key_env="GEMINI_API_KEY"),
+        },
         models={
             "legacy": ModelRecord(
                 connection="provider",
@@ -93,25 +98,36 @@ def test_legacy_project_candidates_gain_only_shared_streaming_transport(tmp_path
                     capabilities=GatewayDeploymentCapabilities(supports_strict_tools=True)
                 ),
             ),
+            "legacy-gemini": ModelRecord(
+                connection="gemini",
+                model="gemini-legacy-model",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+            ),
         },
     )
     write_model_catalog(tmp_path / "models.toml", catalog)
 
     changed = _migrate_legacy_project_gateway_metadata(
         tmp_path,
-        aliases=("legacy", "explicit"),
+        aliases=("legacy", "legacy-gemini", "explicit"),
     )
     migrated = load_model_catalog(tmp_path / "models.toml")
 
     assert changed is True
     assert migrated.models["legacy"].gateway == GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    assert migrated.models["legacy-gemini"].gateway == GatewayDeploymentMetadata(
         capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
     )
     assert migrated.models["explicit"].gateway == catalog.models["explicit"].gateway
     assert (
         _migrate_legacy_project_gateway_metadata(
             tmp_path,
-            aliases=("legacy", "explicit"),
+            aliases=("legacy", "legacy-gemini", "explicit"),
         )
         is False
     )

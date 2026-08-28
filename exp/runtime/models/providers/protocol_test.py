@@ -209,13 +209,6 @@ def test_preflight_requires_streaming_tool_argument_support() -> None:
         model_capabilities=model_capabilities,
     )
 
-    preflight_gateway_request(
-        request,
-        GatewayDeploymentCapabilities(supports_streaming=True),
-        model_capabilities=model_capabilities,
-        requested_stream=False,
-    )
-
 
 def test_preflight_rejects_over_limit_stop_list_with_a_named_parameter_error() -> None:
     """An over-cap stop list fails locally instead of surfacing the provider's opaque 4xx."""
