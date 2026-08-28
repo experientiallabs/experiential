@@ -84,6 +84,10 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
         connections={
             "provider": ConnectionConfig(provider="openai"),
             "gemini": ConnectionConfig(provider="gemini", api_key_env="GEMINI_API_KEY"),
+            "custom": ConnectionConfig(
+                provider="openai-compatible",
+                base_url="https://custom.example.test/v1",
+            ),
         },
         models={
             "legacy": ModelRecord(
@@ -107,13 +111,36 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
                 billing_source=BillingSource.CUSTOMER_MANAGED,
                 capabilities=ModelCapabilities(supports_tools=True),
             ),
+            "legacy-custom": ModelRecord(
+                connection="custom",
+                model="custom-legacy-model",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_tools=True),
+            ),
+            "explicit-custom": ModelRecord(
+                connection="custom",
+                model="custom-explicit-model",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_tools=True),
+                gateway=GatewayDeploymentMetadata(
+                    capabilities=GatewayDeploymentCapabilities(
+                        supports_streaming_tool_arguments=True
+                    )
+                ),
+            ),
         },
     )
     write_model_catalog(tmp_path / "models.toml", catalog)
 
     changed = _migrate_legacy_project_gateway_metadata(
         tmp_path,
-        aliases=("legacy", "legacy-gemini", "explicit"),
+        aliases=(
+            "legacy",
+            "legacy-gemini",
+            "legacy-custom",
+            "explicit",
+            "explicit-custom",
+        ),
     )
     migrated = load_model_catalog(tmp_path / "models.toml")
 
@@ -127,6 +154,12 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
     assert migrated.models["legacy-gemini"].gateway == GatewayDeploymentMetadata(
         capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
     )
+    assert migrated.models["legacy-custom"].gateway == GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    assert migrated.models["explicit-custom"].gateway == GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming_tool_arguments=True)
+    )
     assert migrated.models["explicit"].gateway == GatewayDeploymentMetadata(
         capabilities=GatewayDeploymentCapabilities(
             supports_strict_tools=True,
@@ -136,7 +169,13 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
     assert (
         _migrate_legacy_project_gateway_metadata(
             tmp_path,
-            aliases=("legacy", "legacy-gemini", "explicit"),
+            aliases=(
+                "legacy",
+                "legacy-gemini",
+                "legacy-custom",
+                "explicit",
+                "explicit-custom",
+            ),
         )
         is False
     )

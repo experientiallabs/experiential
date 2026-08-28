@@ -90,6 +90,9 @@ def test_google_raw_argument_limit_is_explicit_while_bedrock_is_certified() -> N
         is ProviderCertificationResult.PROVIDER_FIXTURE_PASS
     )
     assert provider_has_certified_capability("openai", ProviderCapability.TOOL_ARGUMENT_STREAM)
+    assert not provider_has_certified_capability(
+        "openai-compatible", ProviderCapability.TOOL_ARGUMENT_STREAM
+    )
     assert not provider_has_certified_capability("gemini", ProviderCapability.TOOL_ARGUMENT_STREAM)
 
 

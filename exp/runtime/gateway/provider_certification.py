@@ -262,6 +262,15 @@ def _launch_provider_cells(
         if capability is ProviderCapability.CREDENTIAL_GATED_LIVE:
             result = ProviderCertificationResult.NOT_RUN_REQUIRES_CREDENTIALS
             limitation = "No provider credential was available in the deterministic lane."
+        elif (
+            provider == "openai-compatible"
+            and capability is ProviderCapability.TOOL_ARGUMENT_STREAM
+        ):
+            result = ProviderCertificationResult.UNSUPPORTED
+            limitation = (
+                "A generic adapter fixture cannot certify streamed tool arguments for an "
+                "arbitrary custom endpoint; deployments must declare that endpoint fact."
+            )
         else:
             result = ProviderCertificationResult.PROVIDER_FIXTURE_PASS
             limitation = None

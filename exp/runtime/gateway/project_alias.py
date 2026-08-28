@@ -166,6 +166,10 @@ def _migrate_legacy_project_gateway_metadata(
             and provider_has_certified_capability(provider, ProviderCapability.TOOL_ARGUMENT_STREAM)
         )
         if record.gateway is not None:
+            if provider == "openai-compatible":
+                # Generic endpoint families have no transport-wide truth. Preserve an explicit
+                # deployment declaration and otherwise leave the conservative default intact.
+                continue
             existing = record.gateway.capabilities
             if existing.supports_streaming_tool_arguments == supports_streaming_tool_arguments:
                 continue
