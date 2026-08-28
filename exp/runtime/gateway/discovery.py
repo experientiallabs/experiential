@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -12,20 +11,6 @@ from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 AliasAuthority = tuple[str, str, str]
 """Granted alias name, active revision, and catalog digest."""
-
-
-class AliasMetadataLookup(Protocol):
-    """Look up catalog-backed listing fields for one granted alias."""
-
-    def __call__(
-        self,
-        *,
-        alias: str,
-        revision_id: str,
-        catalog_sha256: str,
-    ) -> PublishedAliasMetadata | None:
-        """Return declared listing fields, or ``None`` when the alias is not unique."""
-        ...
 
 
 @dataclass(frozen=True)
@@ -158,27 +143,6 @@ def published_alias_metadata(
             prices.cached_input_micro_usd_per_million_tokens
         ),
     )
-
-
-def listing_metadata_by_alias(
-    authorities: tuple[AliasAuthority, ...],
-    lookup: AliasMetadataLookup,
-) -> dict[str, PublishedAliasMetadata]:
-    """Collect catalog-backed listing fields for granted aliases that have them.
-
-    Args:
-        authorities: Granted alias, revision, and catalog digest triples.
-        lookup: Keyword lookup of ``alias``, ``revision_id``, and ``catalog_sha256``.
-
-    Returns:
-        Metadata keyed by alias for every unique active catalog deployment.
-    """
-    published: dict[str, PublishedAliasMetadata] = {}
-    for alias, revision, digest in authorities:
-        metadata = lookup(alias=alias, revision_id=revision, catalog_sha256=digest)
-        if metadata is not None:
-            published[alias] = metadata
-    return published
 
 
 def public_model_object(

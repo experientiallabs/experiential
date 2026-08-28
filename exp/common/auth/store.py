@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Literal
 
 from exp.common.auth.paths import default_auth_path
-from exp.common.core.artifacts import SECRET_REDACTION_PLACEHOLDER, ContractModel, Sha256
+from exp.common.core.artifacts import ContractModel, Sha256
 from exp.common.core.files import fsync_directory_best_effort
 from exp.common.core.locks import file_write_lock
 
@@ -389,8 +389,3 @@ def _malformed_message(path: Path) -> str:
         f"provider credential file {path} is malformed; move or delete it, then run "
         "'exp config providers'"
     )
-
-
-def redacted_secret() -> str:
-    """Return the shared secret placeholder used in public summaries."""
-    return SECRET_REDACTION_PLACEHOLDER

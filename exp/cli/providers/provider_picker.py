@@ -18,7 +18,7 @@ from functools import partial
 from getpass import getpass
 
 from rich.console import Console
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import Prompt
 
 from exp.cli.providers.experiential_cloud import (
     SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
@@ -944,28 +944,6 @@ def ask_text(label: str, *, console: Console, default: str | None = None) -> str
         return Prompt.ask(label, default="", console=console).strip()
     except (EOFError, KeyboardInterrupt) as exc:
         raise SetupCancelled from exc
-
-
-def ask_positive_int(label: str, *, console: Console) -> int | None:
-    """Read one optional positive integer under the advanced path.
-
-    Args:
-        label: Prompt text.
-        console: Terminal used for the prompt.
-
-    Returns:
-        The positive value, or ``None`` when the field is left unknown.
-
-    Raises:
-        SetupCancelled: The prompt reached end of input.
-    """
-    try:
-        if not Confirm.ask(f"Record {label.casefold()}?", default=False, console=console):
-            return None
-        value = IntPrompt.ask(label, console=console)
-    except (EOFError, KeyboardInterrupt) as exc:
-        raise SetupCancelled from exc
-    return value if value > 0 else None
 
 
 def ask_price(label: str, *, console: Console, default: str = "0") -> float:

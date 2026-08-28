@@ -891,21 +891,6 @@ def configured_models(
     return tuple(records)
 
 
-def _serves_or_retains(item: AvailableModel, role: SetupRole) -> bool:
-    """Report whether verified metadata serves a role or the exact prior binding retains it.
-
-    Args:
-        item: Selected model with optional verified capabilities and prior role bindings.
-        role: Role being assigned.
-
-    Returns:
-        ``True`` for verified compatibility or an exact retain-only prior assignment.
-    """
-    return (
-        item.capabilities is not None and serves_role(item.capabilities, role)
-    ) or role in item.retainable_roles
-
-
 def render_summary(
     result: ProviderSetupResult,
     *,
