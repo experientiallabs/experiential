@@ -921,16 +921,23 @@ def _estimated_cost(
     output_rate: int | None,
     reasoning_rate: int | None,
 ) -> int | None:
-    """Compute attributed integer micro-USD or preserve unknown pricing."""
+    """Compute attributed integer micro-USD or preserve unknown pricing.
+
+    Cached-input and reasoning counts are subsets of their total token counts. Price the
+    differently priced subsets at their effective rates and the fresh remainders at the base
+    rates, clamping malformed detail counts to the corresponding total.
+    """
     if usage is None or not usage.has_token_counts:
         return None
     assert usage.input_tokens is not None
     assert usage.output_tokens is not None
+    cached_input_tokens = min(usage.cached_input_tokens or 0, usage.input_tokens)
+    reasoning_tokens = min(usage.reasoning_tokens or 0, usage.output_tokens)
     dimensions = (
-        (usage.input_tokens, input_rate),
-        (usage.cached_input_tokens or 0, cached_input_rate),
-        (usage.output_tokens, output_rate),
-        (usage.reasoning_tokens or 0, reasoning_rate),
+        (usage.input_tokens - cached_input_tokens, input_rate),
+        (cached_input_tokens, cached_input_rate if cached_input_rate is not None else input_rate),
+        (usage.output_tokens - reasoning_tokens, output_rate),
+        (reasoning_tokens, reasoning_rate if reasoning_rate is not None else output_rate),
     )
     if any(tokens > 0 and rate is None for tokens, rate in dimensions):
         return None

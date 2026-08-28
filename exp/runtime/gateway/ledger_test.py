@@ -189,7 +189,7 @@ def test_attempt_usage_and_integer_cost_are_content_free(tmp_path: Path) -> None
     assert len(usage) == 1
     assert usage[0].requests == 1
     assert usage[0].attempts == 1
-    assert usage[0].known_estimated_cost_micro_usd == 4_350
+    assert usage[0].known_estimated_cost_micro_usd == 3_950
     assert usage[0].unknown_cost_attempts == 0
     assert 124 <= usage[0].total_latency_ms <= 126
     assert usage[0].average_latency_ms is not None

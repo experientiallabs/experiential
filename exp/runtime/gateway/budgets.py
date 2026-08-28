@@ -526,9 +526,11 @@ def maximum_attempt_cost_micro_usd(
     """Return a conservative integer micro-USD ceiling for one physical call.
 
     Canonical UTF-8 bytes conservatively upper-bound input tokens. The caller's output ceiling
-    wins when present, otherwise the frozen deployment limit is required. Optional cache and
-    reasoning dimensions participate only when the deployment declares that it reports them.
-    Unknown required prices produce ``None`` so an applicable hard limit fails closed.
+    wins when present, otherwise the frozen deployment limit is required. Cached-input and
+    reasoning counts are subsets of the total input and output counts, so the worst case uses
+    the highest applicable rate in each direction rather than adding subset rates to the same
+    token ceiling. Unknown required prices produce ``None`` so an applicable hard limit fails
+    closed.
     """
     input_tokens = len(canonical_json_bytes(request))
     output_tokens = request.maximum_output_tokens
@@ -560,16 +562,24 @@ def maximum_attempt_cost_micro_usd(
         required_rates.append(prices.reasoning_micro_usd_per_million_tokens)
     if any(rate is None for rate in required_rates):
         return None
-    input_rates = (
-        prices.input_micro_usd_per_million_tokens,
-        prices.cached_input_micro_usd_per_million_tokens,
+    input_rate = max(
+        rate
+        for rate in (
+            prices.input_micro_usd_per_million_tokens,
+            prices.cached_input_micro_usd_per_million_tokens,
+        )
+        if rate is not None
     )
-    output_rates = (
-        prices.output_micro_usd_per_million_tokens,
-        prices.reasoning_micro_usd_per_million_tokens,
+    output_rate = max(
+        rate
+        for rate in (
+            prices.output_micro_usd_per_million_tokens,
+            prices.reasoning_micro_usd_per_million_tokens,
+        )
+        if rate is not None
     )
-    numerator = input_tokens * sum(rate or 0 for rate in input_rates)
-    numerator += output_tokens * sum(rate or 0 for rate in output_rates)
+    numerator = input_tokens * input_rate
+    numerator += output_tokens * output_rate
     maximum = (numerator + 999_999) // 1_000_000
     return maximum if maximum <= MAXIMUM_MICRO_USD else None
 

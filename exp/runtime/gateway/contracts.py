@@ -230,6 +230,10 @@ class GatewayRequest(ContractModel):
 class GatewayUsage(ContractModel):
     """Normalized token counts and invoked tool names from one provider attempt.
 
+    Cached-input and reasoning counts are subsets of the total input and output counts when
+    present. They identify differently priced portions of those totals and must not be added a
+    second time by callers.
+
     A terminal event may carry only ``tool_names`` when the provider omits token usage. In that
     case both token totals remain unknown instead of being represented as zero.
     """
