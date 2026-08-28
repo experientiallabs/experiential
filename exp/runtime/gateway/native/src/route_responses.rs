@@ -358,7 +358,9 @@ async fn remember_continuation(
 ) -> Result<(), PublicError> {
     if retention.overflowed
         || retention.refusal
-        || (retention.text.is_empty() && retention.tool_calls.is_empty())
+        || (retention.text.is_empty()
+            && retention.tool_calls.is_empty()
+            && retention.encrypted_reasoning.is_empty())
     {
         return Ok(());
     }

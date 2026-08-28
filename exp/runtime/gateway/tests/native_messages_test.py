@@ -258,6 +258,12 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
             isinstance(item, dict) and item.get("type") == "function_call_output"
             for item in input_items
         )
+        reasoning_only = any(
+            isinstance(item, dict)
+            and item.get("role") == "user"
+            and item.get("content") == "reason-only"
+            for item in input_items
+        )
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
@@ -271,6 +277,22 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
                             "item_id": "msg_provider_continued",
                             "content_index": 0,
                             "delta": "continued-ok",
+                        }
+                    )
+                )
+            elif reasoning_only:
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": {
+                                "id": "rs_reason_only",
+                                "type": "reasoning",
+                                "summary": [],
+                                "encrypted_content": "reason-only-opaque-state",
+                                "status": "completed",
+                            },
                         }
                     )
                 )
@@ -1210,6 +1232,49 @@ def test_native_openai_responses_retains_hidden_reasoning_for_tool_continuation(
             "output": "tool-result",
         },
     ]
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_native_openai_responses_retains_reasoning_only_continuations(
+    responses_engine: _ServingEngine,
+    stream: bool,
+) -> None:
+    """Encrypted reasoning alone makes a completed response continuable."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    headers = {"authorization": f"Bearer {responses_engine.raw_key}"}
+    first = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={"model": "responses", "input": "reason-only", "stream": stream},
+        timeout=30.0,
+    )
+    first_body, _first_events = _responses_result(first, stream=stream)
+
+    second = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "previous_response_id": first_body["id"],
+            "input": "continue",
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    second_body, _second_events = _responses_result(second, stream=stream)
+    assert second_body["status"] == "completed"
+
+    with _ResponsesUpstream.payloads_lock:
+        upstream = tuple(_ResponsesUpstream.payloads)
+    assert len(upstream) == 2
+    replay = cast(list[JsonObject], upstream[1]["input"])
+    assert replay[-2] == {
+        "type": "reasoning",
+        "id": "rs_reason_only",
+        "summary": [],
+        "encrypted_content": "reason-only-opaque-state",
+    }
 
 
 def test_store_false_responses_cannot_be_continued(engine: _ServingEngine) -> None:
