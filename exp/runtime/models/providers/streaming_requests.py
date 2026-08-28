@@ -83,6 +83,7 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
+            explicit_reasoning_efforts=profile.supported_reasoning_efforts,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
         )
     if profile.dialect == "anthropic_messages":
@@ -144,6 +145,7 @@ def dialect_stream_payload(
             supports_reasoning=profile.supports_reasoning,
             reasoning_wire_format=profile.reasoning_wire_format,
             reasoning_effort=required_reasoning_effort,
+            explicit_reasoning_efforts=profile.supported_reasoning_efforts,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")
@@ -479,6 +481,23 @@ def _profile_reasoning_efforts(profile: GatewayWireProfile) -> tuple[str, ...]:
     )
 
 
+def _openai_wire_reasoning_effort(
+    model_id: str,
+    effort: str,
+    explicit_efforts: Sequence[str],
+) -> str:
+    """Return an effort admitted by the same authority used for route validation."""
+    if explicit_efforts:
+        if effort not in explicit_efforts:
+            raise UnsupportedReasoningEffortError(
+                effort=effort,
+                supported_efforts=tuple(explicit_efforts),
+                param="reasoning_effort",
+            )
+        return effort
+    return openai_reasoning_effort(model_id, effort)
+
+
 def _require_route_numeric_parameter(
     profiles: Sequence[GatewayWireProfile],
     *,
@@ -528,6 +547,7 @@ def openai_responses_stream_payload(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    explicit_reasoning_efforts: Sequence[str] = (),
     sampling_requires_reasoning_none: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Responses JSON.
@@ -606,7 +626,11 @@ def openai_responses_stream_payload(
     del supports_logprobs
     reasoning: JsonObject = {}
     if supports_reasoning and effective_reasoning_effort is not None:
-        reasoning["effort"] = openai_reasoning_effort(model_id, effective_reasoning_effort)
+        reasoning["effort"] = _openai_wire_reasoning_effort(
+            model_id,
+            effective_reasoning_effort,
+            explicit_reasoning_efforts,
+        )
     if supports_reasoning and request.reasoning_summary is not None:
         reasoning["summary"] = request.reasoning_summary
     if reasoning:
@@ -833,6 +857,7 @@ def openai_compatible_stream_payload(
     supports_reasoning: bool = False,
     reasoning_wire_format: str = "reasoning_effort",
     reasoning_effort: str | None = None,
+    explicit_reasoning_efforts: Sequence[str] = (),
     sampling_requires_reasoning_none: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
@@ -894,7 +919,9 @@ def openai_compatible_stream_payload(
         if reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
         elif reasoning_wire_format == "reasoning_effort":
-            payload["reasoning_effort"] = openai_reasoning_effort(
-                model_id, effective_reasoning_effort
+            payload["reasoning_effort"] = _openai_wire_reasoning_effort(
+                model_id,
+                effective_reasoning_effort,
+                explicit_reasoning_efforts,
             )
     return payload

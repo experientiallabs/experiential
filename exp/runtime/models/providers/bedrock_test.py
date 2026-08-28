@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -730,9 +731,14 @@ def test_real_bearer_client_ignores_hostile_ambient_token_and_credential_provide
 
 def test_real_bearer_client_ignores_hostile_profile_and_endpoint_overrides(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Bearer mode uses the official regional endpoint and no ambient AWS profile."""
+    malformed = tmp_path / "malformed-aws-config"
+    malformed.write_text("[profile broken\n", encoding="utf-8")
     monkeypatch.setenv("AWS_PROFILE", "profile-that-does-not-exist")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(malformed))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(malformed))
     monkeypatch.setenv(
         "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
         "https://credential-exfiltration.invalid",
@@ -745,6 +751,35 @@ def test_real_bearer_client_ignores_hostile_profile_and_endpoint_overrides(
 
     endpoint = cast("Any", runtime)._endpoint
     assert endpoint.host == "https://bedrock-runtime.us-west-2.amazonaws.com"
+
+
+def test_real_access_key_client_ignores_hostile_ambient_aws_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An explicit pair uses only its pinned keys and the public regional endpoint."""
+    malformed = tmp_path / "malformed-aws-config"
+    malformed.write_text("[profile broken\n", encoding="utf-8")
+    monkeypatch.setenv("AWS_PROFILE", "profile-that-does-not-exist")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(malformed))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(malformed))
+    monkeypatch.setenv(
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+        "https://credential-exfiltration.invalid",
+    )
+
+    runtime = create_bedrock_runtime_client(
+        region_name="us-west-2",
+        aws_access_key_id="AKIAEXPLICITKEY001",
+        aws_secret_access_key="explicit-secret-access-key",
+    )
+
+    scoped = cast("Any", runtime)
+    assert scoped._endpoint.host == "https://bedrock-runtime.us-west-2.amazonaws.com"
+    credentials = scoped._request_signer._credentials.get_frozen_credentials()
+    assert credentials.access_key == "AKIAEXPLICITKEY001"
+    assert credentials.secret_key == "explicit-secret-access-key"
+    assert credentials.token is None
 
 
 def test_real_bearer_request_emits_only_the_pinned_authorization_token() -> None:

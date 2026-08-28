@@ -29,6 +29,7 @@ from exp.runtime.gateway.sqlite.migrations import (
     initialize_database,
     persistent_connection,
 )
+from exp.runtime.gateway.sqlite.platform import SQLiteGatewayPlatform
 from exp.runtime.gateway.sqlite.provider_authority import active_provider_connections
 
 
@@ -1083,12 +1084,12 @@ def test_v13_preserves_a_valid_older_explicit_pair_authority(
 
 @pytest.mark.parametrize("auth_mode", ("access_key_pair", "api_key"))
 @pytest.mark.parametrize("has_provider_binding", (False, True))
-def test_v13_deactivates_schema_12_aliases_with_inferred_bedrock_auth(
+def test_v13_deactivates_only_bound_schema_12_aliases_with_inferred_bedrock_auth(
     tmp_path: Path,
     auth_mode: str,
     has_provider_binding: bool,
 ) -> None:
-    """A schema-12 alias cannot restart against a pre-auth-mode immutable snapshot."""
+    """Only an alias proven to bind a repaired Bedrock revision fails closed."""
     manager = GatewayManagement(tmp_path, organization_id="org")
     manager.state_dir.mkdir(parents=True)
     descriptor = os.open(manager.database_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1237,7 +1238,7 @@ def test_v13_deactivates_schema_12_aliases_with_inferred_bedrock_auth(
         alias_active = migrated.execute(
             "SELECT active FROM gateway_aliases WHERE alias_id = 'alias'"
         ).fetchone()[0]
-        assert alias_active == 0
+        assert alias_active == (0 if has_provider_binding else 1)
         safe_alias_active = migrated.execute(
             "SELECT active FROM gateway_aliases WHERE alias_id = 'safe-alias'"
         ).fetchone()[0]
@@ -1248,7 +1249,25 @@ def test_v13_deactivates_schema_12_aliases_with_inferred_bedrock_auth(
             if item.config.provider == "bedrock"
         )
         assert authority.config.bedrock_auth_mode == auth_mode
+        if has_provider_binding:
+            frozen_binding = migrated.execute(
+                """
+                SELECT connection_sha256
+                FROM alias_revision_provider_connections
+                WHERE alias_revision_id = 'alias-rev'
+                """
+            ).fetchone()[0]
+            assert frozen_binding == "a" * 64
+            assert frozen_binding != authority.connection_sha256
     finally:
         migrated.close()
-    with pytest.raises(GatewayLifecycleError, match="no granted active alias"):
-        load_gateway_components(tmp_path, environment={})
+    if has_provider_binding:
+        platform = SQLiteGatewayPlatform(manager.database_path)
+        with pytest.raises(ValueError, match="no longer active and current"):
+            platform._reactivate_alias_revision(  # noqa: SLF001 - migration safety assertion
+                organization_id="org",
+                alias_id="alias",
+                revision_id="alias-rev",
+            )
+        with pytest.raises(GatewayLifecycleError, match="no granted active alias"):
+            load_gateway_components(tmp_path, environment={})

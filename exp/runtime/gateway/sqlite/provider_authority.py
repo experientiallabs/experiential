@@ -68,7 +68,7 @@ def upsert_provider_connection(
         ProviderAuthorityError: Identity, replacement, or revision invariants conflict.
     """
     config = config.canonicalized()
-    current = _active_row(
+    current = _current_row(
         connection,
         organization_id=organization_id,
         connection_id=connection_id,
@@ -77,7 +77,17 @@ def upsert_provider_connection(
     if current is not None:
         authority = _authority(current)
         if authority.config == config and authority.connection_sha256 == digest:
-            return False, authority
+            if authority.active:
+                return False, authority
+            connection.execute(
+                """
+                UPDATE provider_connections
+                SET active = 1, updated_at = ?
+                WHERE organization_id = ? AND connection_id = ? AND active = 0
+                """,
+                (now, organization_id, connection_id),
+            )
+            return True, authority.model_copy(update={"active": True})
         if not replace:
             raise ProviderAuthorityError(
                 "provider connection already exists with different metadata; pass --replace"
@@ -290,17 +300,17 @@ def disable_provider_connection(
     return result.rowcount == 1
 
 
-def _active_row(
+def _current_row(
     connection: sqlite3.Connection,
     *,
     organization_id: str,
     connection_id: str,
 ) -> sqlite3.Row | None:
-    """Read one current provider authority inside the caller transaction."""
+    """Read one current provider authority, including a disabled parent row."""
     return connection.execute(
         f"""
         {_SELECT_AUTHORITY}
-        WHERE c.organization_id = ? AND c.connection_id = ? AND c.active = 1
+        WHERE c.organization_id = ? AND c.connection_id = ?
         """,
         (organization_id, connection_id),
     ).fetchone()

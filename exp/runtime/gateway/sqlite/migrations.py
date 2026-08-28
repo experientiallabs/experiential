@@ -731,15 +731,6 @@ def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
                 "WHERE revision_id = ?",
                 (digest, row["revision_id"]),
             )
-            connection.execute(
-                """
-                UPDATE alias_revision_provider_connections
-                SET connection_sha256 = ?
-                WHERE organization_id = ? AND connection_id = ?
-                  AND connection_revision_id = ?
-                """,
-                (digest, row["organization_id"], row["connection_id"], row["revision_id"]),
-            )
     for statement in _MIGRATIONS[version]:
         connection.execute(statement)
 

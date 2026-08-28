@@ -8,6 +8,7 @@ from typing import Literal
 _BEDROCK_BEARER_ENV = "AWS_BEARER_TOKEN_BEDROCK"
 _AWS_ACCESS_KEY_ID_ENV = "AWS_ACCESS_KEY_ID"
 _AWS_SECRET_ACCESS_KEY_ENV = "AWS_SECRET_ACCESS_KEY"
+_AWS_SESSION_TOKEN_ENV = "AWS_SESSION_TOKEN"
 
 
 def infer_bedrock_auth(
@@ -18,6 +19,11 @@ def infer_bedrock_auth(
         return None, None, None
     if environment.get(_BEDROCK_BEARER_ENV, "").strip():
         return _BEDROCK_BEARER_ENV, None, "api_key"
+    if environment.get(_AWS_SESSION_TOKEN_ENV, "").strip():
+        # Temporary STS credentials are a three-part contract. The explicit
+        # pair authority deliberately stores only two locators, so leave this
+        # request on botocore's ambient chain where the session token survives.
+        return None, None, None
     if (
         environment.get(_AWS_ACCESS_KEY_ID_ENV, "").strip()
         and environment.get(_AWS_SECRET_ACCESS_KEY_ENV, "").strip()

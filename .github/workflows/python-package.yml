@@ -130,6 +130,10 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Build the EXP distribution
         run: uv build --package experiential --no-sources
+      - name: Verify built archive contract
+        env:
+          EXP_BUILT_DIST_DIR: dist
+        run: uv run --extra dev pytest -q exp/tests/release_test.py::test_built_archives_match_current_package_contract
       - uses: actions/download-artifact@v4
         with:
           name: native-dist-linux-x86_64

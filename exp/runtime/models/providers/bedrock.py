@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -119,6 +120,17 @@ class _BotocoreSession(Protocol):
     def get_component(self, name: str) -> object:
         """Return one already-registered botocore session component."""
 
+    def set_config_variable(self, logical_name: str, value: object) -> None:
+        """Override one ambient configuration source for this session only."""
+
+    def set_credentials(
+        self,
+        access_key: str,
+        secret_key: str,
+        token: str | None = None,
+    ) -> None:
+        """Bind an exact credential triple to this isolated session."""
+
 
 class _ConfigValueStore(Protocol):
     """Botocore configuration store used to replace ambient profile lookup."""
@@ -184,23 +196,32 @@ def create_bedrock_runtime_client(
     ):
         raise ValueError("Bedrock bearer auth cannot be combined with access-key credentials")
     session_kwargs = _explicit_session_kwargs(aws_access_key_id, aws_secret_access_key)
-    if bearer_token is None:
-        session = boto3.Session(**session_kwargs)
-    else:
+    explicit_auth = bearer_token is not None or bool(session_kwargs)
+    if explicit_auth:
         botocore_session = _import_isolated_botocore_session()
+        if session_kwargs:
+            botocore_session.set_credentials(
+                session_kwargs["aws_access_key_id"],
+                session_kwargs["aws_secret_access_key"],
+            )
         session = boto3.Session(botocore_session=botocore_session)
+    else:
+        session = boto3.Session()
     config_kwargs: dict[str, object] = {
         "connect_timeout": CONNECT_TIMEOUT_SECONDS,
         "read_timeout": READ_TIMEOUT_SECONDS,
         "retries": {"max_attempts": 1, "mode": "standard"},
         "tcp_keepalive": True,
     }
+    if explicit_auth:
+        # Explicit credentials are pinned to the public regional endpoint and
+        # cannot inherit process-wide endpoint/profile configuration.
+        config_kwargs["ignore_configured_endpoint_urls"] = True
     if bearer_token is not None:
         # UNSIGNED prevents client construction from touching the ambient AWS
         # credential chain. The isolated per-client bearer signer is installed
         # immediately after construction.
         config_kwargs["signature_version"] = _import_botocore_unsigned()
-        config_kwargs["ignore_configured_endpoint_urls"] = True
     with _CLIENT_CONSTRUCTION_LOCK:
         client = session.client(
             "bedrock-runtime",
@@ -716,13 +737,15 @@ def _import_botocore_unsigned() -> object:
 
 
 def _import_isolated_botocore_session() -> _BotocoreSession:
-    """Create a botocore session whose token provider cannot consult ambient login state."""
+    """Create a botocore session that cannot consult ambient AWS configuration."""
     try:
         from botocore.configprovider import ConstantProvider
         from botocore.session import get_session
     except ImportError as exc:
         raise RuntimeError("Bedrock requires botocore; install experiential") from exc
     session = cast("_BotocoreSession", get_session())
+    session.set_config_variable("config_file", os.devnull)
+    session.set_config_variable("credentials_file", os.devnull)
     config_store = cast("_ConfigValueStore", session.get_component("config_store"))
     config_store.set_config_provider("profile", ConstantProvider(None))
     session.register_component("token_provider", _NoAmbientTokenProvider())

@@ -451,6 +451,23 @@ def test_explicit_provider_effort_set_accepts_exact_values_and_rejects_others() 
     assert "Supported values: 'low', 'high', 'max'." in str(raised.value)
 
 
+def test_explicit_effort_authority_is_preserved_during_wire_translation() -> None:
+    """Payload construction honors the exact effort set used by admission."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://azure.example.test/openai/deployments/custom/chat/completions",
+        model_id="gpt-5.6-sol",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("ultra",),
+    )
+    request = _chat_request().model_copy(update={"reasoning_effort": "ultra"})
+
+    _public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert dialect_stream_payload(profile, provider)["reasoning_effort"] == "ultra"
+
+
 def test_required_reasoning_default_is_sent_but_optional_default_is_not() -> None:
     """Only a provider-mandated default may add an omitted reasoning field."""
     required = GatewayWireProfile(

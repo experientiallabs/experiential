@@ -33,7 +33,9 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "boto3",
         "botocore",
         "click",
+        "exp-gateway-native",
         "filelock",
+        "google-auth",
         "httpx",
         "numpy",
         "openai",
@@ -74,6 +76,7 @@ REQUIRED_WHEEL_MODULES = frozenset(
 )
 REQUIRED_SDIST_MEMBERS = frozenset(
     {
+        "LICENSE",
         "README.md",
         "assets/experiential-workflow.png",
         "docs/reference/gateway-architecture.md",
@@ -226,6 +229,7 @@ def _tracked_sdist_members() -> frozenset[str]:
             "git",
             "ls-files",
             ".gitignore",
+            "LICENSE",
             "README.md",
             "assets",
             "docs/reference/gateway-architecture.md",

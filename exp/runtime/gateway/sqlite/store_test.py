@@ -1177,6 +1177,35 @@ def test_legacy_bedrock_pair_replay_is_semantically_idempotent(tmp_path: Path) -
     assert second.config.bedrock_auth_mode == "access_key_pair"
 
 
+def test_disabled_provider_connection_reuses_its_stable_id(tmp_path: Path) -> None:
+    """Re-enabling unchanged authority restores its current immutable revision."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    config = ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")
+    _, created = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id="provider-revision-one",
+        config=config,
+    )
+    assert store.disable_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+    )
+
+    changed, restored = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id="unused-restoration-revision",
+        config=config,
+    )
+
+    assert changed
+    assert restored.active
+    assert restored.revision_id == created.revision_id
+    assert store.provider_connections(organization_id="org-one") == (restored,)
+
+
 def test_alias_activation_rejects_stale_provider_binding_atomically(tmp_path: Path) -> None:
     """A stale connection revision cannot create either an alias or a partial binding."""
     store = SQLiteGatewayStore(tmp_path / "gateway.db")
