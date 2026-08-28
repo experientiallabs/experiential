@@ -447,15 +447,12 @@ class NativeControlPlane(NativeObservabilityMixin):
                     )
                 )
                 signers.append(dispatch_signer)
-        except ProviderParameterError as exc:
+        except (ProviderParameterError, ProviderCapabilityError) as exc:
+            # One shared normalizer keeps both pre-dispatch rejections
+            # field-specific: the parameter path names the parameter and the
+            # capability path names the capability, so a triager sees which
+            # request feature the route cannot preserve.
             failure = normalized_provider_failure(exc)
-            self._accounting.finish_request_quietly(authorization, failure)
-            raise NativeBridgeError(public_failure_error(failure)) from exc
-        except ProviderCapabilityError as exc:
-            failure = GatewayFailure(
-                failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
-                safe_message="the resolved deployment does not support the requested capability",
-            )
             self._accounting.finish_request_quietly(authorization, failure)
             raise NativeBridgeError(public_failure_error(failure)) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
