@@ -42,6 +42,8 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
         port=8080,
         max_active_requests=23,
         graceful_timeout_seconds=45.0,
+        connect_timeout_seconds=4.0,
+        time_to_first_byte_seconds=12.0,
         native_usage_enabled=False,
     )
 
@@ -53,6 +55,8 @@ def test_host_passes_the_serve_configuration(monkeypatch: pytest.MonkeyPatch) ->
     assert config["max_active_requests"] == 23
     assert config["request_timeout_seconds"] == 37.0
     assert config["graceful_timeout_seconds"] == 45.0
+    assert config["connect_timeout_seconds"] == 4.0
+    assert config["time_to_first_byte_seconds"] == 12.0
     assert config["native_usage_enabled"] is False
 
 

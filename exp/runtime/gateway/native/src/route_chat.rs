@@ -199,6 +199,7 @@ pub(crate) async fn chat(
         route: &admission.route,
         policy: admission.policy(),
         deadline,
+        time_to_first_byte: state.time_to_first_byte,
     };
     let won = acquire_attempt(&context, &mut guard).await;
 

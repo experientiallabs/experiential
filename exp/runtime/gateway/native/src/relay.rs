@@ -56,6 +56,24 @@ pub fn stream_timeout_failure(deadline: Instant) -> Failure {
     }
 }
 
+/// Classify a provider that accepted the connection but did not stream its
+/// first byte within the fail-fast time-to-first-byte bound. A stalled lead
+/// deployment must not hold the request for its full per-chunk timeout, so
+/// this is a transient, capacity-shaped failure that is failover-eligible.
+///
+/// It is deliberately *not* same-deployment retryable: a lane that accepted
+/// the connection but never answered is the clearest dead-lane signal, and
+/// redialing it would only stall again for another window. Skipping the redial
+/// and advancing straight to the next certified deployment is what keeps a
+/// fresh pod's cost on a dead lane near one fail-fast window instead of several.
+pub fn first_byte_timeout_failure() -> Failure {
+    Failure::new(
+        FailureClass::Timeout,
+        "provider did not send the first token in time; failing over to the next deployment",
+    )
+    .with_retry(false, true)
+}
+
 /// The synthesized failure for a provider stream that closed without a
 /// terminal event, matching the python executor's classification.
 pub(crate) fn ended_without_terminal() -> Failure {
@@ -93,17 +111,39 @@ pub struct UpstreamRelay {
     pending: VecDeque<Event>,
     eof: bool,
     first_byte_recorded: bool,
+    /// Fail-fast bound for the very first provider byte. Once the first byte
+    /// arrives (`first_byte_recorded`), subsequent reads use the deployment's
+    /// per-chunk timeout instead, so a slow reasoning model can stream for a
+    /// long time after it has started answering.
+    first_byte_deadline: Instant,
 }
 
 impl UpstreamRelay {
-    pub fn new(response: reqwest::Response, dialect: Dialect) -> Self {
+    pub fn new(
+        response: reqwest::Response,
+        dialect: Dialect,
+        first_byte_deadline: Instant,
+    ) -> Self {
+        Self::from_stream(
+            response.bytes_stream().boxed(),
+            dialect,
+            first_byte_deadline,
+        )
+    }
+
+    fn from_stream(
+        stream: BoxStream<'static, reqwest::Result<Bytes>>,
+        dialect: Dialect,
+        first_byte_deadline: Instant,
+    ) -> Self {
         Self {
-            stream: response.bytes_stream().boxed(),
+            stream,
             decoder: FrameDecoder::new(dialect),
             normalizer: Normalizer::new(dialect),
             pending: VecDeque::new(),
             eof: false,
             first_byte_recorded: false,
+            first_byte_deadline,
         }
     }
 
@@ -124,7 +164,15 @@ impl UpstreamRelay {
             if self.eof {
                 return Ok(None);
             }
-            let bound = remaining(deadline).min(phase_timeout);
+            // Before the first byte the fail-fast time-to-first-byte bound
+            // applies; after it, each chunk is paced by the deployment's own
+            // per-chunk timeout so long-running generation is never capped.
+            let waiting_for_first_byte = !self.first_byte_recorded;
+            let bound = if waiting_for_first_byte {
+                remaining(deadline).min(remaining(self.first_byte_deadline))
+            } else {
+                remaining(deadline).min(phase_timeout)
+            };
             let chunk = match tokio::time::timeout(bound, self.stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(Some(Err(_))) => {
@@ -149,7 +197,17 @@ impl UpstreamRelay {
                     }
                     continue;
                 }
-                Err(_) => return Err(stream_timeout_failure(deadline)),
+                Err(_) => {
+                    // A first-byte stall while the request deadline still has
+                    // budget is the fail-fast case: classify it as a
+                    // failover-eligible transient so the next rung is tried at
+                    // once. A later chunk stall, or an exhausted request
+                    // deadline, keeps the existing transport/deadline mapping.
+                    if waiting_for_first_byte && !remaining(deadline).is_zero() {
+                        return Err(first_byte_timeout_failure());
+                    }
+                    return Err(stream_timeout_failure(deadline));
+                }
             };
             if !self.first_byte_recorded {
                 METRICS
@@ -211,5 +269,54 @@ pub async fn collect_committed(
             }
             None => return Err(ended_without_terminal()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::stream;
+
+    #[test]
+    fn a_first_byte_stall_fails_over_without_redialing_the_dead_lane() {
+        let failure = first_byte_timeout_failure();
+        assert_eq!(failure.failure_class, FailureClass::Timeout);
+        assert!(failure.failover_eligible);
+        // A stalled lane is skipped, not redialed: redialing it would only
+        // stall again for another window.
+        assert!(!failure.retryable_same_deployment);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_first_byte_trips_the_ttft_bound_not_the_chunk_timeout() {
+        // A provider that opened the stream but never sends a byte must fail
+        // over in about the time-to-first-byte window, not the (far larger)
+        // per-chunk deployment timeout.
+        let never = stream::pending::<reqwest::Result<Bytes>>().boxed();
+        let time_to_first_byte = Duration::from_millis(80);
+        let mut relay = UpstreamRelay::from_stream(
+            never,
+            Dialect::OpenAiCompatible,
+            Instant::now() + time_to_first_byte,
+        );
+        let request_deadline = Instant::now() + Duration::from_secs(120);
+        let per_chunk_timeout = Duration::from_secs(35);
+
+        let started = Instant::now();
+        let outcome = relay
+            .next_event(request_deadline, per_chunk_timeout, started)
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected a fail-fast time-to-first-byte trip, waited {elapsed:?}"
+        );
+        let failure = outcome.expect_err("a never-yielding stream must not succeed");
+        assert_eq!(failure.failure_class, FailureClass::Timeout);
+        assert!(
+            failure.failover_eligible,
+            "a first-byte stall must advance to the next deployment"
+        );
     }
 }

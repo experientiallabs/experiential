@@ -88,6 +88,11 @@ pub struct WaterfallContext<'a> {
     pub route: &'a [DeploymentWire],
     pub policy: RoutePolicy,
     pub deadline: Instant,
+    /// Fail-fast bound on the wait for each physical attempt's first provider
+    /// byte. Applied per attempt (each redial and each failover advance gets a
+    /// fresh window); it bounds the connect/header/first-byte phase only and
+    /// never caps generation once the provider has started answering.
+    pub time_to_first_byte: Duration,
 }
 
 /// The winning outcome of one waterfall run.
@@ -405,10 +410,16 @@ async fn run_attempt(
             };
         }
     };
-    // The connection's raw timeout bounds each transport phase (open, then
-    // every chunk read), exactly like the python streaming path.
+    // The connection's raw timeout bounds each chunk read, exactly like the
+    // python streaming path. The open phase is additionally bounded by the
+    // fail-fast time-to-first-byte window (fresh per attempt) so a dead lane
+    // that never answers is abandoned in seconds, not after the full
+    // per-deployment timeout.
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
-    let open_bound = remaining(ctx.deadline).min(phase_timeout);
+    let first_byte_deadline = Instant::now() + ctx.time_to_first_byte;
+    let open_bound = remaining(ctx.deadline)
+        .min(phase_timeout)
+        .min(remaining(first_byte_deadline));
     let response = match open_stream(
         ctx.http,
         &wire.url,
@@ -433,7 +444,7 @@ async fn run_attempt(
         }
     };
     guard.mark_opened();
-    let mut relay = UpstreamRelay::new(response, dialect);
+    let mut relay = UpstreamRelay::new(response, dialect, first_byte_deadline);
     let mut usage: Option<Usage> = None;
     let mut tool_names: Vec<String> = Vec::new();
     let mut withheld: Vec<Event> = Vec::new();
