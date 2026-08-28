@@ -182,6 +182,7 @@ def route_generation_parameter_requests(
     provider_updates: dict[str, object] = {}
 
     def ignore(field: str, public_path: str | None = None) -> None:
+        """Drop one provider field and record the public path reported as ignored."""
         provider_updates[field] = None
         path = public_path or field
         if path not in ignored:

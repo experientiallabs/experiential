@@ -561,6 +561,7 @@ def _hard_wall_timeout(deadline: _Deadline) -> Iterator[None]:
     previous_handler = signal.getsignal(signal.SIGALRM)
 
     def raise_timeout(_signum: int, _frame: object) -> None:
+        """Convert the expired main-thread timer into the sandbox time-limit failure."""
         raise SandboxTimeLimitError("sandbox episode exceeded maximum_time_seconds")
 
     signal.signal(signal.SIGALRM, raise_timeout)

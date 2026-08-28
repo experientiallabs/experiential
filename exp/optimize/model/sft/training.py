@@ -410,6 +410,7 @@ def _metrics_at_checkpoint(
             metrics_by_attempt.setdefault(event.attempt_id, []).append(event)
 
     def collect(attempt_id: int, through_step: int) -> tuple[TinkerSFTMetric, ...]:
+        """Gather one attempt's metrics through a step, including inherited resume history."""
         resume = resume_events.get(attempt_id)
         start_step = 0
         inherited: tuple[TinkerSFTMetric, ...] = ()

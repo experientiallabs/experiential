@@ -62,18 +62,26 @@ class _ProcessRecord:
 
 
 class _KqueueEvent(Protocol):
+    """One Darwin process notification delivered by the queue."""
+
     fflags: int
 
 
 class _Kqueue(Protocol):
     """The Darwin queue operations owned by one descendant tracker."""
 
-    def close(self) -> None: ...
+    def close(self) -> None:
+        """Release the kernel queue descriptor."""
+        ...
 
-    def control(self, changes: object, max_events: int, timeout: int) -> list[_KqueueEvent]: ...
+    def control(self, changes: object, max_events: int, timeout: int) -> list[_KqueueEvent]:
+        """Register changes and return the notifications available within the timeout."""
+        ...
 
 
 class _KqueueFactory(Protocol):
+    """Open one Darwin kernel queue."""
+
     def __call__(self) -> _Kqueue: ...
 
 
@@ -258,6 +266,7 @@ def _require_containment_support() -> _DarwinKqueueBindings:
         )
 
     def binding(name: str) -> object:
+        """Read one required Darwin-only ``select`` attribute."""
         return getattr(select, name)
 
     try:

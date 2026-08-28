@@ -181,6 +181,7 @@ class HumanScoreReview:
         selected: list[tuple[JsonObject, HumanScoreHistory]] = []
 
         def initialize(current: JsonValue | None) -> JsonObject:
+            """Seed the persisted review namespace with its current score history."""
             root = root_review_object(current)
             history = _history_from_root(root)
             root["human_score_history"] = history.model_dump(mode="json")
@@ -249,6 +250,7 @@ class HumanScoreReview:
         result: list[HumanScore] = []
 
         def update(current: JsonValue | None) -> JsonObject:
+            """Append or replay one idempotent score submission in the review namespace."""
             root = root_review_object(current)
             history = _history_from_root(root)
             submissions = _score_submissions_from_root(root)
@@ -347,6 +349,7 @@ class HumanScoreReview:
         result: list[HumanLabelSet] = []
 
         def transition(history: HumanScoreHistory) -> HumanScoreHistory:
+            """Freeze the latest persisted history into one immutable label set."""
             self._history = history
             result.append(
                 self._finalize(
@@ -446,6 +449,7 @@ class HumanScoreReview:
         selected: list[tuple[JsonObject, HumanScoreHistory]] = []
 
         def update(current: JsonValue | None) -> JsonObject:
+            """Apply the caller's history transition to the latest persisted namespace."""
             root = root_review_object(current)
             history = transition(_history_from_root(root))
             root["human_score_history"] = history.model_dump(mode="json")

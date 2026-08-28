@@ -150,6 +150,7 @@ class RubricReview:
         selected: list[RubricReviewDraft] = []
 
         def initialize(current: JsonValue | None) -> JsonObject:
+            """Create or reload the persisted rubric review draft for this task set."""
             root = root_review_object(current, error_type=RubricReviewError)
             saved = root.get("rubric_review")
             if saved is None:
@@ -428,6 +429,7 @@ class RubricReview:
         finalized: list[Rubric] = []
 
         def transition(review: RubricReview) -> None:
+            """Finalize the locked draft into one immutable approved rubric."""
             finalized.append(review._finalize())
 
         self._mutate(transition)
@@ -595,6 +597,7 @@ class RubricReview:
         selected: list[RubricReviewDraft] = []
 
         def update(current: JsonValue | None) -> JsonObject:
+            """Apply the caller's transition to the latest persisted review draft."""
             root = root_review_object(current, error_type=RubricReviewError)
             saved = root.get("rubric_review")
             if saved is None:
