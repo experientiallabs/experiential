@@ -112,3 +112,29 @@ def test_legacy_bedrock_snapshot_binds_to_canonical_pair_authority(tmp_path: Pat
     assert changed
     assert authority.config.bedrock_auth_mode == "access_key_pair"
     assert bindings[0].connection_sha256 == authority.connection_sha256
+
+
+def test_canonical_bedrock_pair_replay_restores_the_same_revision(tmp_path: Path) -> None:
+    """Legacy and explicit pair spellings share one deterministic revision identity."""
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+    legacy = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="AWS_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+        region="us-west-2",
+    )
+    _changed, created = manager.upsert_provider_connection(
+        connection_id="bedrock",
+        config=legacy,
+    )
+    assert manager.disable_provider_connection(connection_id="bedrock")
+
+    changed, restored = manager.upsert_provider_connection(
+        connection_id="bedrock",
+        config=legacy.model_copy(update={"bedrock_auth_mode": "access_key_pair"}),
+    )
+
+    assert changed
+    assert restored.active
+    assert restored.revision_id == created.revision_id
