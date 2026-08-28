@@ -332,6 +332,29 @@ def test_unbound_legacy_bedrock_bearer_alias_is_invalidated_on_load(tmp_path: Pa
     assert alias.revision_id is None
 
 
+def test_unbound_legacy_bearer_is_invalidated_with_an_unrelated_connection(
+    tmp_path: Path,
+) -> None:
+    """A sibling authority cannot bypass fail-closed legacy bearer invalidation."""
+    manager = _configured_legacy_bedrock_alias(tmp_path, auth_mode="api_key")
+    manager.upsert_provider_connection(
+        connection_id="unrelated-openai",
+        config=ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY"),
+    )
+
+    with pytest.raises(GatewayLifecycleError, match="stale revision was disabled"):
+        load_gateway_components(
+            tmp_path,
+            environment={
+                "AWS_BEARER_TOKEN_BEDROCK": "bearer-token",
+                "OPENAI_API_KEY": "openai-token",
+            },
+        )
+
+    assert not manager.aliases()[0].active
+    assert manager.aliases()[0].revision_id is None
+
+
 def test_unbound_legacy_bedrock_pair_alias_remains_loadable(tmp_path: Path) -> None:
     """Historical pair snapshots retain their already-stable canonical identity."""
     manager = _configured_legacy_bedrock_alias(tmp_path, auth_mode="access_key_pair")

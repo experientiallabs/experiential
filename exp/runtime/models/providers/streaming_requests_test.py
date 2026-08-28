@@ -468,6 +468,51 @@ def test_explicit_effort_authority_is_preserved_during_wire_translation() -> Non
     assert dialect_stream_payload(profile, provider)["reasoning_effort"] == "ultra"
 
 
+@pytest.mark.parametrize(
+    ("profile", "path", "expected"),
+    (
+        (
+            GatewayWireProfile(
+                dialect="anthropic_messages",
+                url="https://anthropic.test",
+                model_id="claude-sonnet-4-6",
+                supports_reasoning=True,
+                reasoning_wire_format="anthropic_adaptive",
+                supported_reasoning_efforts=("ultra",),
+            ),
+            "output_config",
+            {"effort": "ultra"},
+        ),
+        (
+            GatewayWireProfile(
+                dialect="gemini_generate_content",
+                url="https://gemini.test",
+                model_id="gemini-3.7-flash",
+                supports_reasoning=True,
+                reasoning_wire_format="gemini_thinking",
+                supported_reasoning_efforts=("ultra",),
+            ),
+            "generationConfig",
+            {"thinkingLevel": "ULTRA"},
+        ),
+    ),
+)
+def test_native_payloads_honor_explicit_reasoning_authority(
+    profile: GatewayWireProfile,
+    path: str,
+    expected: dict[str, str],
+) -> None:
+    """Anthropic and Gemini send the same explicit efforts admission accepts."""
+    request = _chat_request().model_copy(update={"reasoning_effort": "ultra"})
+
+    _public, provider = route_generation_parameter_requests((profile,), request)
+    payload = cast("dict[str, object]", dialect_stream_payload(profile, provider)[path])
+
+    if path == "generationConfig":
+        payload = cast("dict[str, object]", payload["thinkingConfig"])
+    assert payload == expected
+
+
 def test_required_reasoning_default_is_sent_but_optional_default_is_not() -> None:
     """Only a provider-mandated default may add an omitted reasoning field."""
     required = GatewayWireProfile(

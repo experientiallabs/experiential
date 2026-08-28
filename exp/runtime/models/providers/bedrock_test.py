@@ -743,6 +743,9 @@ def test_real_bearer_client_ignores_hostile_profile_and_endpoint_overrides(
         "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
         "https://credential-exfiltration.invalid",
     )
+    monkeypatch.setenv("AWS_DEFAULTS_MODE", "invalid-ambient-mode")
+    monkeypatch.setenv("AWS_USE_DUALSTACK_ENDPOINT", "true")
+    monkeypatch.setenv("AWS_USE_FIPS_ENDPOINT", "true")
 
     runtime = create_bedrock_runtime_client(
         region_name="us-west-2",
@@ -767,6 +770,9 @@ def test_real_access_key_client_ignores_hostile_ambient_aws_configuration(
         "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
         "https://credential-exfiltration.invalid",
     )
+    monkeypatch.setenv("AWS_DEFAULTS_MODE", "invalid-ambient-mode")
+    monkeypatch.setenv("AWS_USE_DUALSTACK_ENDPOINT", "true")
+    monkeypatch.setenv("AWS_USE_FIPS_ENDPOINT", "true")
 
     runtime = create_bedrock_runtime_client(
         region_name="us-west-2",

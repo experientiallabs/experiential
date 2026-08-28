@@ -659,18 +659,10 @@ def _load_snapshot(
         alias_id=alias.alias_id,
         alias_revision_id=revision_id,
     )
-    active_connections = {
-        item.connection_id: item.config for item in manager.provider_connections()
-    }
     if (
         not existing_bindings
         and legacy_bearer_snapshot
-        and {name: config.canonicalized() for name, config in authored_catalog.connections.items()}
-        == active_connections
-        and normalize_gateway_catalog(
-            authored_catalog.model_copy(update={"connections": active_connections})
-        )
-        != normalized
+        and normalize_gateway_catalog(authored_catalog) != normalized
     ):
         manager.require_initialized().invalidate_alias_revision(
             organization_id=manager.organization_id,

@@ -1171,8 +1171,10 @@ def test_v13_deactivates_only_bound_schema_12_aliases_with_inferred_bedrock_auth
             """
             INSERT INTO alias_revisions (
                 revision_id, organization_id, alias_id, revision_number,
-                target_kind, pool_id, catalog_sha256, snapshot_ref, created_at
-            ) VALUES ('alias-rev', 'org', 'alias', 1, 'direct', 'pool', ?, 'snap', 't')
+                target_kind, project_ref, activation_ref, catalog_sha256,
+                snapshot_ref, created_at
+            ) VALUES ('alias-rev', 'org', 'alias', 1, 'project', 'project',
+                      'activation', ?, 'snap', 't')
             """,
             ("b" * 64,),
         )
@@ -1181,6 +1183,10 @@ def test_v13_deactivates_only_bound_schema_12_aliases_with_inferred_bedrock_auth
         )
         connection.execute(
             "INSERT INTO identity_alias_grants VALUES ('org', 'identity', 'alias', 't')"
+        )
+        connection.execute(
+            "INSERT INTO project_activation_bindings VALUES "
+            "('org', 'project', 'activation', 'alias', 'alias-rev', 't')"
         )
         if has_provider_binding:
             connection.execute(
@@ -1243,6 +1249,13 @@ def test_v13_deactivates_only_bound_schema_12_aliases_with_inferred_bedrock_auth
             "SELECT active FROM gateway_aliases WHERE alias_id = 'safe-alias'"
         ).fetchone()[0]
         assert safe_alias_active == 1
+        project_bindings = [
+            str(row[0])
+            for row in migrated.execute(
+                "SELECT alias_id FROM project_activation_bindings"
+            ).fetchall()
+        ]
+        assert project_bindings == ([] if has_provider_binding else ["alias"])
         authority = next(
             item
             for item in active_provider_connections(migrated, organization_id="org")

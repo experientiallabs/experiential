@@ -217,6 +217,9 @@ def create_bedrock_runtime_client(
         # Explicit credentials are pinned to the public regional endpoint and
         # cannot inherit process-wide endpoint/profile configuration.
         config_kwargs["ignore_configured_endpoint_urls"] = True
+        config_kwargs["defaults_mode"] = "legacy"
+        config_kwargs["use_dualstack_endpoint"] = False
+        config_kwargs["use_fips_endpoint"] = False
     if bearer_token is not None:
         # UNSIGNED prevents client construction from touching the ambient AWS
         # credential chain. The isolated per-client bearer signer is installed

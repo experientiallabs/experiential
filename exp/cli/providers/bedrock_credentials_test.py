@@ -1,15 +1,18 @@
 """Tests for interactive Bedrock credential-mode inference."""
 
+import pytest
+
 from exp.cli.providers.bedrock_credentials import infer_bedrock_auth
 
 
-def test_temporary_aws_credentials_stay_on_the_ambient_chain() -> None:
+@pytest.mark.parametrize("session_token_env", ("AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"))
+def test_temporary_aws_credentials_stay_on_the_ambient_chain(session_token_env: str) -> None:
     """A three-part STS credential is never truncated into explicit pair mode."""
     assert infer_bedrock_auth(
         {
             "AWS_ACCESS_KEY_ID": "AKIAEXAMPLEKEY0001",
             "AWS_SECRET_ACCESS_KEY": "temporary-secret",
-            "AWS_SESSION_TOKEN": "temporary-session-token",
+            session_token_env: "temporary-session-token",
         }
     ) == (None, None, None)
 

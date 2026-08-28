@@ -9,12 +9,16 @@ builders import it without creating a cycle through the streaming stack.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Literal
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
-from exp.runtime.models.providers.reasoning_compat import gemini_thinking_level
+from exp.runtime.models.providers.reasoning_compat import (
+    authority_reasoning_effort,
+    gemini_thinking_level,
+)
 
 
 def gemini_model_path(model_id: str) -> str:
@@ -39,6 +43,7 @@ def gemini_generate_request(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    explicit_reasoning_efforts: Sequence[str] = (),
     stop_sequences: tuple[str, ...] = (),
     response_json_schema: JsonObject | None = None,
 ) -> JsonObject:
@@ -108,7 +113,12 @@ def gemini_generate_request(
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning and effective_reasoning_effort is not None:
         generation["thinkingConfig"] = {
-            "thinkingLevel": gemini_thinking_level(model_id, effective_reasoning_effort).upper()
+            "thinkingLevel": authority_reasoning_effort(
+                model_id,
+                effective_reasoning_effort,
+                explicit_reasoning_efforts,
+                gemini_thinking_level,
+            ).upper()
         }
     # The normalized gateway response has no logprob representation. Keep the
     # route flag for shared capability plumbing, but ignore these controls so

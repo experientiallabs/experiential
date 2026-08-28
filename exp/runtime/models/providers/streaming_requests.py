@@ -22,6 +22,7 @@ from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
     anthropic_reasoning_effort,
+    authority_reasoning_effort,
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
     supported_reasoning_efforts,
@@ -100,6 +101,7 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
+            explicit_reasoning_efforts=profile.supported_reasoning_efforts,
         )
     if profile.dialect == "gemini_generate_content":
         return gemini_generate_content_stream_payload(
@@ -115,6 +117,7 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
+            explicit_reasoning_efforts=profile.supported_reasoning_efforts,
         )
     if profile.dialect == "bedrock_converse_stream":
         return bedrock_converse_stream_payload(
@@ -648,6 +651,7 @@ def anthropic_messages_stream_payload(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    explicit_reasoning_efforts: Sequence[str] = (),
 ) -> JsonObject:
     """Translate one canonical request to native streaming Messages JSON.
 
@@ -728,7 +732,12 @@ def anthropic_messages_stream_payload(
         payload["thinking"] = request.provider_thinking_config
     elif supports_reasoning and effective_reasoning_effort is not None:
         payload["thinking"] = {"type": "adaptive"}
-        output_config["effort"] = anthropic_reasoning_effort(model_id, effective_reasoning_effort)
+        output_config["effort"] = authority_reasoning_effort(
+            model_id,
+            effective_reasoning_effort,
+            explicit_reasoning_efforts,
+            anthropic_reasoning_effort,
+        )
     if request.structured_text is not None:
         output_config["format"] = {
             "type": "json_schema",
@@ -751,6 +760,7 @@ def gemini_generate_content_stream_payload(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    explicit_reasoning_efforts: Sequence[str] = (),
 ) -> JsonObject:
     """Translate one canonical request to the native streamGenerateContent JSON.
 
@@ -781,6 +791,7 @@ def gemini_generate_content_stream_payload(
             supports_logprobs=supports_logprobs,
             supports_reasoning=supports_reasoning,
             reasoning_effort=reasoning_effort,
+            explicit_reasoning_efforts=explicit_reasoning_efforts,
             stop_sequences=request.stop,
             response_json_schema=(
                 request.structured_text.json_schema if request.structured_text is not None else None

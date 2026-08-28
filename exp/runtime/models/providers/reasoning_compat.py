@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from typing import cast
 
 from exp.common.models.known_models import canonical_model_id
@@ -129,6 +129,18 @@ def anthropic_reasoning_effort(model_id: str, effort: str) -> str:
 def gemini_thinking_level(model_id: str, effort: str) -> str:
     """Return one exact Gemini thinking level or reject it before dispatch."""
     return _require_exact_effort(model_id, effort, _gemini_supported_efforts(model_id))
+
+
+def authority_reasoning_effort(
+    model_id: str,
+    effort: str,
+    explicit_efforts: Collection[str],
+    fallback: Callable[[str, str], str],
+) -> str:
+    """Resolve one effort through explicit deployment authority or provider defaults."""
+    if explicit_efforts:
+        return _require_exact_effort(model_id, effort, explicit_efforts)
+    return fallback(model_id, effort)
 
 
 def _gemini_supported_efforts(model_id: str) -> Collection[str]:
