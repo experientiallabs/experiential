@@ -439,6 +439,97 @@ def test_alias_reactivation_requires_current_provider_bindings(tmp_path: Path) -
         platform.mutate_alias(alias)
 
 
+def test_bedrock_auth_modes_survive_management_restart_and_alias_binding(
+    tmp_path: Path,
+) -> None:
+    """Ambient, explicit-pair, and bearer authorities round-trip without ambiguity."""
+    platform = _platform(tmp_path)
+    secret = OpaqueSecretReference(
+        scheme=OpaqueSecretScheme.ENVIRONMENT,
+        reference="AWS_SECRET_ACCESS_KEY",
+    )
+    access_key_id = OpaqueSecretReference(
+        scheme=OpaqueSecretScheme.ENVIRONMENT,
+        reference="AWS_ACCESS_KEY_ID",
+    )
+    commands = (
+        UpsertProviderConnectionCommand(
+            organization_id="org-one",
+            connection_id="bedrock-ambient",
+            revision_id="bedrock-ambient-revision",
+            provider="bedrock",
+            region="us-west-2",
+        ),
+        UpsertProviderConnectionCommand(
+            organization_id="org-one",
+            connection_id="bedrock-pair",
+            revision_id="bedrock-pair-revision",
+            provider="bedrock",
+            region="us-west-2",
+            secret_reference=secret,
+            access_key_id_reference=access_key_id,
+            bedrock_auth_mode="access_key_pair",
+        ),
+        UpsertProviderConnectionCommand(
+            organization_id="org-one",
+            connection_id="bedrock-bearer",
+            revision_id="bedrock-bearer-revision",
+            provider="bedrock",
+            region="us-west-2",
+            secret_reference=secret.model_copy(update={"reference": "BEDROCK_API_KEY"}),
+            bedrock_auth_mode="api_key",
+        ),
+    )
+    for command in commands:
+        assert platform.mutate_provider_connection(command).changed
+    pair = next(
+        revision
+        for revision in platform.provider_connection_revisions(organization_id="org-one")
+        if revision.connection_id == "bedrock-pair"
+    )
+    platform.control.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="catalog-one",
+        catalog_sha256=_DIGEST,
+    )
+    assert platform.mutate_alias(
+        ActivateAliasRevisionCommand(
+            organization_id="org-one",
+            alias_id="coding",
+            alias_name="coding",
+            revision_id="alias-revision-one",
+            target=DirectTarget(pool_id="coding-pool"),
+            snapshot_ref="catalog-one",
+            catalog_sha256=_DIGEST,
+            provider_connections=(
+                ProviderRevisionBinding(
+                    connection_id=pair.connection_id,
+                    connection_revision_id=pair.revision_id,
+                    connection_sha256=pair.connection_sha256,
+                ),
+            ),
+        )
+    ).changed
+
+    restarted = SQLiteGatewayPlatform(
+        platform.database_path,
+        budgets=SQLiteBudgetStore(platform.database_path),
+        attempts=SQLiteAttemptLedger(platform.database_path),
+        pool_revisions=_PoolRevisions(),
+    )
+    revisions = {
+        revision.connection_id: revision
+        for revision in restarted.provider_connection_revisions(organization_id="org-one")
+    }
+
+    assert revisions["bedrock-ambient"].bedrock_auth_mode is None
+    assert revisions["bedrock-pair"].bedrock_auth_mode == "access_key_pair"
+    assert revisions["bedrock-pair"].access_key_id_reference == access_key_id
+    assert revisions["bedrock-bearer"].bedrock_auth_mode == "api_key"
+    assert revisions["bedrock-bearer"].access_key_id_reference is None
+    assert restarted.alias_revisions(organization_id="org-one")[0].active
+
+
 def test_revision_reads_forward_existing_sqlite_authority(tmp_path: Path) -> None:
     """The adapter exposes exact provider, alias, and catalog-owned pool revisions."""
     platform = _platform(tmp_path)

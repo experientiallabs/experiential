@@ -502,6 +502,8 @@ def _resolve_endpoint(
         base_url=config.base_url,
         api_version=config.api_version,
         region=config.region,
+        aws_access_key_id_env=config.aws_access_key_id_env,
+        bedrock_auth_mode=config.bedrock_auth_mode,
     )
     configured = connection is not None
     if connection is None:
@@ -513,6 +515,8 @@ def _resolve_endpoint(
             base_url=config.base_url,
             api_version=config.api_version,
             region=config.region,
+            aws_access_key_id_env=config.aws_access_key_id_env,
+            bedrock_auth_mode=config.bedrock_auth_mode,
         )
     if provider == "bedrock":
         return PreparedEndpoint(connection=connection, api_key="", configured=configured)
@@ -537,20 +541,10 @@ def _reused_connection(
     base_url: str | None,
     api_version: str | None,
     region: str | None,
+    aws_access_key_id_env: str | None,
+    bedrock_auth_mode: str | None,
 ) -> ProviderConnection | None:
-    """Return the configured connection that already describes this exact endpoint.
-
-    Args:
-        existing_connections: Connections already configured in the catalog.
-        provider: Selected provider kind.
-        api_key_env: Canonical or collected environment override name, if any.
-        base_url: Optional collected endpoint.
-        api_version: Optional Azure API version.
-        region: Optional Bedrock region.
-
-    Returns:
-        The matching configured connection when exactly one exists, otherwise ``None``.
-    """
+    """Return the sole configured connection that exactly matches these fields."""
     matches: list[ProviderConnection] = []
     for connection in existing_connections:
         if (
@@ -558,6 +552,8 @@ def _reused_connection(
             or connection.base_url != base_url
             or connection.api_version != api_version
             or connection.region != region
+            or connection.aws_access_key_id_env != aws_access_key_id_env
+            or connection.bedrock_auth_mode != bedrock_auth_mode
         ):
             continue
         if api_key_env is not None and connection.api_key_env != api_key_env:

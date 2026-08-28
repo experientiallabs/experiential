@@ -286,8 +286,8 @@ def test_setup_accepts_each_supported_connection(
     assert connection.region == region
 
 
-def test_setup_rejects_bedrock_api_key_env() -> None:
-    """Bedrock setup cannot invent an API-key abstraction."""
+def test_setup_rejects_an_incomplete_bedrock_access_key_pair() -> None:
+    """Bedrock setup never accepts a secret reference without its access-key identifier."""
     with pytest.raises(ValueError, match="api_key_env"):
         ProviderConnection(
             name="bedrock",
@@ -295,3 +295,32 @@ def test_setup_rejects_bedrock_api_key_env() -> None:
             api_key_env="AWS_ACCESS_KEY_ID",
             region="us-east-1",
         )
+
+
+def test_setup_accepts_an_explicit_bedrock_access_key_pair() -> None:
+    """Stored Bedrock connections may pair a named secret with a non-secret key ID."""
+    connection = ProviderConnection(
+        name="bedrock",
+        provider="bedrock",
+        api_key_env="AWS_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="BEDROCK_ACCESS_KEY_ID",
+        bedrock_auth_mode="access_key_pair",
+        region="us-east-1",
+    )
+
+    assert connection.catalog_config().aws_access_key_id_env == "BEDROCK_ACCESS_KEY_ID"
+    assert connection.catalog_config().bedrock_auth_mode == "access_key_pair"
+
+
+def test_setup_accepts_a_bedrock_api_key_without_an_access_key_id() -> None:
+    """Bedrock bearer setup preserves its explicit authentication mode."""
+    connection = ProviderConnection(
+        name="bedrock",
+        provider="bedrock",
+        api_key_env="BEDROCK_API_KEY",
+        bedrock_auth_mode="api_key",
+        region="us-east-1",
+    )
+
+    assert connection.catalog_config().bedrock_auth_mode == "api_key"
+    assert connection.catalog_config().aws_access_key_id_env is None

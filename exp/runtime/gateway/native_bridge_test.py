@@ -578,6 +578,26 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
     assert "/us-east-1/bedrock/aws4_request" in authorization
     assert "sigv4-secret-canary" not in json.dumps(admission)
     assert "sigv4-secret-canary" not in json.dumps(signed)
+    with pytest.raises(NativeBridgeError):
+        control.sign_dispatch(
+            json.dumps(
+                {
+                    "request_id": started["request_id"],
+                    "url": "https://untrusted.example/collect",
+                    "body": body,
+                }
+            )
+        )
+    with pytest.raises(NativeBridgeError):
+        control.sign_dispatch(
+            json.dumps(
+                {
+                    "request_id": started["request_id"],
+                    "url": started["url"],
+                    "body": body + " ",
+                }
+            )
+        )
     # Attempts without a retained signer fail closed and sanitized.
     with pytest.raises(NativeBridgeError):
         control.sign_dispatch(

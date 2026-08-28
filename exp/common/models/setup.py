@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -46,9 +47,18 @@ class ProviderConnection(ContractModel):
     base_url: str | None = Field(default=None, max_length=2_048)
     api_version: str | None = Field(default=None, max_length=64)
     region: str | None = Field(default=None, max_length=64)
+    aws_access_key_id_env: str | None = Field(default=None, max_length=256)
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
 
     @model_validator(mode="after")
     def _require_supported_connection_shape(self) -> ProviderConnection:
+        if self.provider != "bedrock" and (
+            self.aws_access_key_id_env is not None or self.bedrock_auth_mode is not None
+        ):
+            raise ValueError(
+                "aws_access_key_id_env and bedrock_auth_mode are only accepted for "
+                "provider='bedrock'"
+            )
         if self.provider not in SETUP_PROVIDERS:
             choices = ", ".join(sorted(SETUP_PROVIDERS))
             raise ValueError(f"provider must be one of: {choices}")
@@ -62,9 +72,21 @@ class ProviderConnection(ContractModel):
             if self.api_version is None:
                 raise ValueError("azure requires an explicit api_version")
         elif self.provider == "bedrock":
-            if self.api_key_env is not None:
+            if self.bedrock_auth_mode == "api_key":
+                if self.api_key_env is None or self.aws_access_key_id_env is not None:
+                    raise ValueError(
+                        "bedrock api_key auth requires api_key_env and forbids "
+                        "aws_access_key_id_env"
+                    )
+            elif self.bedrock_auth_mode == "access_key_pair":
+                if self.api_key_env is None or self.aws_access_key_id_env is None:
+                    raise ValueError(
+                        "bedrock access_key_pair auth requires both credential environment names"
+                    )
+            elif (self.api_key_env is None) != (self.aws_access_key_id_env is None):
                 raise ValueError(
-                    "bedrock authenticates through the AWS credential chain and rejects api_key_env"
+                    "bedrock explicit access-key auth requires both api_key_env naming the "
+                    "secret access key and aws_access_key_id_env naming the access key id"
                 )
             if self.base_url is not None:
                 raise ValueError("bedrock does not accept base_url")
@@ -99,6 +121,8 @@ class ProviderConnection(ContractModel):
             api_key_env=self.api_key_env,
             api_version=self.api_version,
             region=self.region,
+            aws_access_key_id_env=self.aws_access_key_id_env,
+            bedrock_auth_mode=self.bedrock_auth_mode,
         )
         return self
 
@@ -110,6 +134,8 @@ class ProviderConnection(ContractModel):
             api_key_env=self.api_key_env,
             api_version=self.api_version,
             region=self.region,
+            aws_access_key_id_env=self.aws_access_key_id_env,
+            bedrock_auth_mode=self.bedrock_auth_mode,
         )
 
 

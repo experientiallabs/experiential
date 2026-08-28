@@ -216,6 +216,10 @@ class RuntimeModelCatalog:
                 current_connection["api_version"] = connection.api_version
             if connection.region is not None:
                 current_connection["region"] = connection.region
+            if connection.aws_access_key_id_env is not None:
+                current_connection["aws_access_key_id_env"] = connection.aws_access_key_id_env
+            if connection.bedrock_auth_mode is not None:
+                current_connection["bedrock_auth_mode"] = connection.bedrock_auth_mode
             current_connection_sha256 = sha256_json(current_connection)
             if provenance.connection_config_sha256 != current_connection_sha256:
                 raise ModelConnectionError(
@@ -224,10 +228,38 @@ class RuntimeModelCatalog:
                 )
         provider = connection.provider
         if provider == "bedrock":
+            bearer_token = None
+            access_key_id = (
+                None
+                if connection.aws_access_key_id_env is None
+                else self._environment.get(connection.aws_access_key_id_env)
+            )
+            if connection.aws_access_key_id_env is not None and not access_key_id:
+                raise ModelConnectionError(
+                    f"bedrock connection {record.connection!r} requires environment variable "
+                    f"{connection.aws_access_key_id_env!r}"
+                )
+            released_credential = (
+                None
+                if connection.api_key_env is None
+                else read_connection_api_key(
+                    connection,
+                    connection_id=record.connection,
+                    environment=self._environment,
+                )
+            )
+            if connection.bedrock_auth_mode == "api_key":
+                bearer_token = released_credential
+                secret_access_key = None
+            else:
+                secret_access_key = released_credential
             bedrock_client = BedrockClient(
                 model=snapshot,
                 region=connection.region,
                 environment=self._environment,
+                aws_access_key_id=access_key_id,
+                aws_secret_access_key=secret_access_key,
+                bearer_token=bearer_token,
                 runtime_factory=self._bedrock_runtime_factory,
                 supports_temperature=capabilities.supports_temperature,
                 supports_top_p=_supports_top_p(capabilities),

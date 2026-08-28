@@ -1270,7 +1270,9 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
         current.router_policy.spend_ledger,
     )
     build_entry = next(
-        item for item in build_ledger.entries if item.status != ProviderSpendStatus.NOT_INCURRED
+        item
+        for item in build_ledger.entries
+        if item.status != ProviderSpendStatus.NOT_INCURRED and item.evidence is None
     )
     prior_operation_id = build_entry.operation_id
     dropped_entries = complete_component_entries(
@@ -1317,7 +1319,7 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
         current.router_report.spend_ledger,
     )
     prior_entry = next(
-        item for item in policy_ledger.entries if item.status != ProviderSpendStatus.NOT_INCURRED
+        item for item in report_ledger.entries if item.operation_id == prior_operation_id
     )
     changed = ProviderSpendEntry.model_validate(
         {
@@ -1351,7 +1353,9 @@ def test_bundle_restore_rejects_dropped_or_changed_prior_spend(
         tmp_path / "changed-fit-spend.exp.zip",
         producer_revision=_REVISION,
     )
-    with pytest.raises(ProjectBundleError, match="drops or changes"):
+    # The dropped-entry case above isolates historical-ledger continuity. This
+    # changed inherited charge must independently fail its source-evidence guard.
+    with pytest.raises(ProjectBundleError, match="source-bearing evidence"):
         restore_project_bundle(
             changed_bundle.path,
             root=tmp_path / "rejected-changed-fit-spend",

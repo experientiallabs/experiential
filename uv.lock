@@ -652,7 +652,7 @@ sft = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.35,<2" },
-    { name = "botocore", specifier = ">=1.35,<2" },
+    { name = "botocore", specifier = ">=1.43.72,<2" },
     { name = "click", specifier = ">=8.2" },
     { name = "exp-gateway-native", directory = "exp/runtime/gateway/native" },
     { name = "experiential", extras = ["sft"], marker = "extra == 'dev'" },

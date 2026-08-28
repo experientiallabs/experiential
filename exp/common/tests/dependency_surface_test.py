@@ -34,6 +34,9 @@ def test_forbidden_provider_imports_are_absent() -> None:
             ("runtime/models/providers/bedrock.py", "botocore.auth"),
             ("runtime/models/providers/bedrock.py", "botocore.awsrequest"),
             ("runtime/models/providers/bedrock.py", "botocore.config"),
+            ("runtime/models/providers/bedrock.py", "botocore"),
+            ("runtime/models/providers/bedrock.py", "botocore.session"),
+            ("runtime/models/providers/bedrock.py", "botocore.tokens"),
         },
     )
     assert not violations, f"forbidden provider imports present: {violations}"

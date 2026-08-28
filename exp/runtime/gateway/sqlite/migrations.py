@@ -10,8 +10,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal, cast
 
-SCHEMA_VERSION = 10
+from exp.common.models import ConnectionConfig
+
+SCHEMA_VERSION = 13
 
 
 class GatewaySchemaError(RuntimeError):
@@ -586,6 +589,23 @@ _MIGRATION_10 = (
     "DROP TABLE gateway_schema_refresh_v10",
 )
 
+_MIGRATION_11 = (
+    """
+    ALTER TABLE provider_connection_revisions
+    ADD COLUMN aws_access_key_id_env TEXT
+    """,
+)
+
+# Compatibility repair for the short-lived schema-11 shape that stored an
+# ``aws_access_key_id`` column. Migration 12 adds the environment-name pointer
+# only when it is absent, so both that historical shape and the final schema-11
+# shape migrate safely.
+_MIGRATION_12: tuple[str, ...] = ()
+
+# Schema 13 persists the normalized Bedrock authentication mode and repairs
+# either published schema-11 shapes or short-lived local schema-12 databases.
+_MIGRATION_13: tuple[str, ...] = ()
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -597,7 +617,112 @@ _MIGRATIONS = {
     8: _MIGRATION_8,
     9: _MIGRATION_9,
     10: _MIGRATION_10,
+    11: _MIGRATION_11,
+    12: _MIGRATION_12,
+    13: _MIGRATION_13,
 }
+
+
+def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
+    """Apply one forward migration, including schema-11 compatibility repair."""
+    if version == 12:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(provider_connection_revisions)"
+            ).fetchall()
+        }
+        if "aws_access_key_id_env" not in columns:
+            connection.execute(
+                "ALTER TABLE provider_connection_revisions ADD COLUMN aws_access_key_id_env TEXT"
+            )
+    if version == 13:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(provider_connection_revisions)"
+            ).fetchall()
+        }
+        if "bedrock_auth_mode" not in columns:
+            connection.execute(
+                "ALTER TABLE provider_connection_revisions ADD COLUMN bedrock_auth_mode TEXT "
+                "CHECK (bedrock_auth_mode IN ('access_key_pair', 'api_key'))"
+            )
+        if "aws_access_key_id" in columns:
+            # The short-lived schema-11 prototype persisted the identifier itself.
+            # There is no safe way to infer the environment locator that should replace
+            # it, so fail closed: deactivate affected authorities, erase the value, and
+            # remove the obsolete column before the database can serve again.
+            connection.execute(
+                """
+                UPDATE provider_connections
+                SET active = 0
+                WHERE active_revision_id IN (
+                    SELECT revision_id FROM provider_connection_revisions
+                    WHERE aws_access_key_id IS NOT NULL
+                )
+                """
+            )
+            connection.execute("UPDATE provider_connection_revisions SET aws_access_key_id = NULL")
+            connection.execute(
+                "ALTER TABLE provider_connection_revisions DROP COLUMN aws_access_key_id"
+            )
+        connection.execute(
+            """
+            UPDATE provider_connection_revisions
+            SET bedrock_auth_mode = 'access_key_pair'
+            WHERE provider = 'bedrock'
+              AND api_key_env IS NOT NULL
+              AND aws_access_key_id_env IS NOT NULL
+              AND bedrock_auth_mode IS NULL
+            """
+        )
+        rows = connection.execute(
+            """
+            SELECT organization_id, connection_id, revision_id, provider, base_url,
+                   api_key_env, api_version, region, aws_access_key_id_env,
+                   bedrock_auth_mode
+            FROM provider_connection_revisions
+            """
+        ).fetchall()
+        for row in rows:
+            config = ConnectionConfig(
+                provider=str(row["provider"]),
+                base_url=None if row["base_url"] is None else str(row["base_url"]),
+                api_key_env=None if row["api_key_env"] is None else str(row["api_key_env"]),
+                api_version=(None if row["api_version"] is None else str(row["api_version"])),
+                region=None if row["region"] is None else str(row["region"]),
+                aws_access_key_id_env=(
+                    None
+                    if row["aws_access_key_id_env"] is None
+                    else str(row["aws_access_key_id_env"])
+                ),
+                bedrock_auth_mode=(
+                    None
+                    if row["bedrock_auth_mode"] is None
+                    else cast(
+                        'Literal["access_key_pair", "api_key"]',
+                        str(row["bedrock_auth_mode"]),
+                    )
+                ),
+            )
+            digest = config.identity_sha256()
+            connection.execute(
+                "UPDATE provider_connection_revisions SET connection_sha256 = ? "
+                "WHERE revision_id = ?",
+                (digest, row["revision_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE alias_revision_provider_connections
+                SET connection_sha256 = ?
+                WHERE organization_id = ? AND connection_id = ?
+                  AND connection_revision_id = ?
+                """,
+                (digest, row["organization_id"], row["connection_id"], row["revision_id"]),
+            )
+    for statement in _MIGRATIONS[version]:
+        connection.execute(statement)
 
 
 def connect_database(
@@ -726,8 +851,7 @@ def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | N
             if 0 < version < SCHEMA_VERSION:
                 backup = _backup_database(path, version)
             for next_version in range(version + 1, SCHEMA_VERSION + 1):
-                for statement in _MIGRATIONS[next_version]:
-                    connection.execute(statement)
+                _apply_migration(connection, next_version)
                 connection.execute(f"PRAGMA user_version = {next_version}")
             _require_schema_objects(connection)
             connection.execute("COMMIT")

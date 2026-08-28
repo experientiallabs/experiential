@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 from exp.cli.app import app
 from exp.cli.providers.setup import (
     ProviderSetupOptions,
+    existing_setup_connections,
     run_provider_setup,
 )
 from exp.cli.shared.picker_test import ScriptedConsole
@@ -30,6 +31,27 @@ from exp.common.models import (
 from exp.runtime.models.providers import ProviderEndpoint
 
 _RUNNER = CliRunner()
+
+
+def test_existing_setup_preserves_bedrock_explicit_auth_metadata() -> None:
+    """Re-running setup never converts an explicit Bedrock connection to ambient auth."""
+    catalog = ModelCatalog(
+        connections={
+            "bedrock": ConnectionConfig(
+                provider="bedrock",
+                region="us-west-2",
+                api_key_env="AWS_SECRET_ACCESS_KEY",
+                aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+                bedrock_auth_mode="access_key_pair",
+            )
+        },
+        models={},
+    )
+
+    connection = existing_setup_connections(catalog)[0]
+
+    assert connection.aws_access_key_id_env == "AWS_ACCESS_KEY_ID"
+    assert connection.bedrock_auth_mode == "access_key_pair"
 
 
 def _connection_json(name: str, provider: str, env: str) -> str:

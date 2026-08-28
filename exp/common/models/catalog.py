@@ -69,12 +69,14 @@ class ConnectionConfig(ContractModel):
     api_key_env: str | None = Field(default=None, max_length=256)
     api_version: str | None = Field(default=None, max_length=64)
     region: str | None = Field(default=None, max_length=64)
+    aws_access_key_id_env: str | None = Field(default=None, max_length=256)
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
 
-    @field_validator("api_key_env")
+    @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod
     def _require_environment_variable_name(cls, value: str | None) -> str | None:
         if value is not None and not _ENVIRONMENT_NAME.fullmatch(value):
-            raise ValueError("api_key_env must name one environment variable")
+            raise ValueError("credential environment fields must name environment variables")
         return value
 
     @field_validator("base_url")
@@ -94,6 +96,13 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        if self.provider != "bedrock" and (
+            self.aws_access_key_id_env is not None or self.bedrock_auth_mode is not None
+        ):
+            raise ValueError(
+                "aws_access_key_id_env and bedrock_auth_mode are only accepted for "
+                "provider='bedrock'"
+            )
         if self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
             raise ValueError(
                 f"native provider {self.provider!r} uses its built-in official endpoint; "
@@ -117,9 +126,21 @@ class ConnectionConfig(ContractModel):
             if self.region is not None:
                 raise ValueError("region is only accepted for provider='bedrock'")
         elif self.provider == "bedrock":
-            if self.api_key_env is not None:
+            if self.bedrock_auth_mode == "api_key":
+                if self.api_key_env is None or self.aws_access_key_id_env is not None:
+                    raise ValueError(
+                        "bedrock api_key auth requires api_key_env and forbids "
+                        "aws_access_key_id_env"
+                    )
+            elif self.bedrock_auth_mode == "access_key_pair":
+                if self.api_key_env is None or self.aws_access_key_id_env is None:
+                    raise ValueError(
+                        "bedrock access_key_pair auth requires both credential environment names"
+                    )
+            elif (self.api_key_env is None) != (self.aws_access_key_id_env is None):
                 raise ValueError(
-                    "bedrock authenticates through the AWS credential chain and rejects api_key_env"
+                    "bedrock explicit access-key auth requires both api_key_env naming the "
+                    "secret access key and aws_access_key_id_env naming the access key id"
                 )
             if self.base_url is not None:
                 raise ValueError("bedrock does not accept base_url")
@@ -168,6 +189,7 @@ class ConnectionConfig(ContractModel):
                     "base_url": self.base_url,
                     "api_version": self.api_version,
                     "region": self.region,
+                    "bedrock_auth_mode": self.bedrock_auth_mode,
                 }
             )
         except SecretBoundaryError as exc:
@@ -189,6 +211,16 @@ class ConnectionConfig(ContractModel):
             identity["api_version"] = self.api_version
         if self.region is not None:
             identity["region"] = self.region
+        effective_bedrock_auth_mode = self.bedrock_auth_mode
+        if (
+            self.provider == "bedrock"
+            and effective_bedrock_auth_mode is None
+            and self.api_key_env is not None
+            and self.aws_access_key_id_env is not None
+        ):
+            effective_bedrock_auth_mode = "access_key_pair"
+        if effective_bedrock_auth_mode is not None:
+            identity["bedrock_auth_mode"] = effective_bedrock_auth_mode
         return sha256_json(identity)
 
 

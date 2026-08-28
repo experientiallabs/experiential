@@ -66,8 +66,8 @@ def lookup_connection_credential(
 ) -> CredentialResolution | None:
     """Resolve one credential from the environment, then the stored connection record.
 
-    A non-empty environment value wins and does not rewrite the store. Bedrock connections
-    do not participate; they authenticate through the AWS credential chain.
+    A non-empty environment value wins and does not rewrite the store. Ambient Bedrock
+    connections do not participate; explicit Bedrock pairs resolve their secret access key here.
 
     Args:
         connection: Secret-free connection metadata.
@@ -81,7 +81,7 @@ def lookup_connection_credential(
     Raises:
         ProviderAuthStoreError: The local credential file exists but cannot be used.
     """
-    if connection.provider == "bedrock":
+    if connection.provider == "bedrock" and connection.api_key_env is None:
         return None
     values = os.environ if environment is None else environment
     if connection.api_key_env is not None:
@@ -113,7 +113,7 @@ def describe_connection_credential(
     Returns:
         Connection identity, provider, source, and environment-variable name.
     """
-    if connection.provider == "bedrock":
+    if connection.provider == "bedrock" and connection.api_key_env is None:
         return StoredCredentialStatus(
             connection_id=connection_id,
             provider=connection.provider,
@@ -190,10 +190,8 @@ def read_connection_api_key(
             environment variable and stored credential are absent.
         ProviderAuthStoreError: The local credential file exists but cannot be used.
     """
-    if connection.provider == "bedrock":
-        raise ModelCredentialError(
-            "bedrock authenticates through the AWS credential chain and has no stored API key"
-        )
+    if connection.provider == "bedrock" and connection.api_key_env is None:
+        raise ModelCredentialError("bedrock ambient authentication has no stored secret access key")
     try:
         resolved = lookup_connection_credential(
             connection,

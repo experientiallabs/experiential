@@ -276,6 +276,46 @@ def test_stored_key_is_rejected_when_the_endpoint_identity_changes(tmp_path: Pat
     assert store.get("acme") == _SECRET
 
 
+@pytest.mark.parametrize(
+    ("original_mode", "replacement_mode"),
+    (("access_key_pair", "api_key"), ("api_key", "access_key_pair")),
+)
+def test_bedrock_stored_credentials_never_cross_auth_modes(
+    tmp_path: Path,
+    original_mode: str,
+    replacement_mode: str,
+) -> None:
+    """A secret access key can never be replayed as a bearer, or vice versa."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+
+    def connection(mode: str) -> ConnectionConfig:
+        if mode == "api_key":
+            return ConnectionConfig(
+                provider="bedrock",
+                region="us-west-2",
+                api_key_env="BEDROCK_API_KEY",
+                bedrock_auth_mode="api_key",
+            )
+        return ConnectionConfig(
+            provider="bedrock",
+            region="us-west-2",
+            api_key_env="AWS_SECRET_ACCESS_KEY",
+            aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+            bedrock_auth_mode="access_key_pair",
+        )
+
+    original = connection(original_mode)
+    store.put("bedrock", _SECRET, binding=_binding(original))
+
+    with pytest.raises(ModelCredentialError, match="does not match"):
+        read_connection_api_key(
+            connection(replacement_mode),
+            connection_id="bedrock",
+            environment={},
+            store=store,
+        )
+
+
 def test_resolution_repr_never_includes_the_secret() -> None:
     """Public representations of a resolved credential stay redacted."""
     resolved = CredentialResolution(_SECRET, "stored")

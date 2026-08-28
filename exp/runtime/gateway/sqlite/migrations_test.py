@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.models import ConnectionConfig
 from exp.runtime.gateway.sqlite import migrations
 from exp.runtime.gateway.sqlite.migrations import (
     _MIGRATION_1,
@@ -26,6 +27,7 @@ from exp.runtime.gateway.sqlite.migrations import (
     initialize_database,
     persistent_connection,
 )
+from exp.runtime.gateway.sqlite.provider_authority import active_provider_connections
 
 
 def test_persistent_connection_reuses_one_idle_connection_per_thread(tmp_path: Path) -> None:
@@ -847,5 +849,136 @@ def test_v10_migration_widens_api_surface_and_preserves_rows(tmp_path: Path) -> 
         # The child attempt still resolves its rewritten parent's foreign key.
         migrated.execute("DELETE FROM gateway_attempts WHERE attempt_id = 'att-1'")
         migrated.execute("DELETE FROM gateway_requests WHERE request_id = 'req-1'")
+    finally:
+        migrated.close()
+
+
+def test_v13_repairs_historical_v11_access_key_column(tmp_path: Path) -> None:
+    """A populated historical schema 11 erases raw identifiers and fails closed."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = connect_database(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for version in range(1, 11):
+            for statement in migrations._MIGRATIONS[version]:
+                connection.execute(statement)
+        connection.execute(
+            "ALTER TABLE provider_connection_revisions ADD COLUMN aws_access_key_id TEXT"
+        )
+        connection.execute("PRAGMA user_version = 11")
+        connection.execute(
+            """
+            INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_connections (
+                connection_id, organization_id, active_revision_id,
+                active, created_at, updated_at
+            ) VALUES ('conn', 'org', NULL, 1, 't', 't')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_connection_revisions (
+                revision_id, organization_id, connection_id, revision_number,
+                provider, region, aws_access_key_id, connection_sha256, created_at
+            ) VALUES ('rev', 'org', 'conn', 1, 'bedrock', 'us-west-2',
+                      'AKIAHISTORICALVALUE', ?, 't')
+            """,
+            ("a" * 64,),
+        )
+        connection.execute(
+            "UPDATE provider_connections SET active_revision_id = 'rev' "
+            "WHERE connection_id = 'conn'"
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    backup = initialize_database(path)
+
+    assert backup is not None and backup.exists()
+    migrated = connect_database(path)
+    try:
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        columns = {
+            str(row[1])
+            for row in migrated.execute(
+                "PRAGMA table_info(provider_connection_revisions)"
+            ).fetchall()
+        }
+        assert "aws_access_key_id" not in columns
+        assert {"aws_access_key_id_env", "bedrock_auth_mode"} <= columns
+        row = migrated.execute(
+            "SELECT aws_access_key_id_env, bedrock_auth_mode, connection_sha256 "
+            "FROM provider_connection_revisions WHERE revision_id = 'rev'"
+        ).fetchone()
+        expected = ConnectionConfig(provider="bedrock", region="us-west-2").identity_sha256()
+        assert tuple(row) == (None, None, expected)
+        assert active_provider_connections(migrated, organization_id="org") == ()
+        assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        migrated.close()
+
+
+@pytest.mark.parametrize("reported_version", (11, 12))
+def test_v13_preserves_a_valid_older_explicit_pair_authority(
+    tmp_path: Path,
+    reported_version: int,
+) -> None:
+    """Locator-based schema-11 and local schema-12 pairs migrate and stay active."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = connect_database(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for version in range(1, 12):
+            for statement in migrations._MIGRATIONS[version]:
+                connection.execute(statement)
+        connection.execute(f"PRAGMA user_version = {reported_version}")
+        connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
+        connection.execute(
+            """
+            INSERT INTO provider_connections (
+                connection_id, organization_id, active_revision_id,
+                active, created_at, updated_at
+            ) VALUES ('conn', 'org', NULL, 1, 't', 't')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_connection_revisions (
+                revision_id, organization_id, connection_id, revision_number,
+                provider, api_key_env, region, aws_access_key_id_env,
+                connection_sha256, created_at
+            ) VALUES ('rev', 'org', 'conn', 1, 'bedrock', 'AWS_SECRET_ACCESS_KEY',
+                      'us-west-2', 'AWS_ACCESS_KEY_ID', ?, 't')
+            """,
+            ("a" * 64,),
+        )
+        connection.execute(
+            "UPDATE provider_connections SET active_revision_id = 'rev' "
+            "WHERE connection_id = 'conn'"
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    initialize_database(path)
+    migrated = connect_database(path)
+    try:
+        authorities = active_provider_connections(migrated, organization_id="org")
+        assert len(authorities) == 1
+        assert authorities[0].config.bedrock_auth_mode == "access_key_pair"
+        assert authorities[0].config.aws_access_key_id_env == "AWS_ACCESS_KEY_ID"
+        assert authorities[0].connection_sha256 == authorities[0].config.identity_sha256()
+        assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         migrated.close()
