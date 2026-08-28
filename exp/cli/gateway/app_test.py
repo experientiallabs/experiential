@@ -365,6 +365,101 @@ def test_direct_alias_uses_provider_certification_for_tool_streaming(
     assert not replaced_custom.gateway.capabilities.supports_streaming_tool_arguments
 
 
+def test_direct_alias_preserves_tool_streaming_across_credential_env_rotation(
+    tmp_path: Path,
+) -> None:
+    """Credential locator rotation retains the same endpoint's explicit declaration."""
+    runner = CliRunner()
+    commands = (
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "custom",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://custom.example.test/v1",
+            "--credential-env",
+            "OLD_CUSTOM_API_KEY",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+        [
+            "config",
+            "gateway",
+            "alias",
+            "create",
+            "custom-tools",
+            "--deployment",
+            "custom:custom-fixture",
+            "--exact-model",
+            "custom-tools",
+            "--supports-tools",
+            "--supports-streaming-tool-arguments",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+
+    rotated = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "update",
+            "custom",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://custom.example.test/v1",
+            "--credential-env",
+            "NEW_CUSTOM_API_KEY",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert rotated.exit_code == 0, rotated.output
+    updated = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "update",
+            "custom-tools",
+            "--deployment",
+            "custom:custom-fixture-v2",
+            "--exact-model",
+            "custom-tools",
+            "--supports-tools",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert updated.exit_code == 0, updated.output
+
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    custom = catalog.models["custom-tools"]
+    assert catalog.connections["custom"].api_key_env == "NEW_CUSTOM_API_KEY"
+    assert custom.gateway is not None
+    assert custom.gateway.capabilities.supports_streaming_tool_arguments
+
+
 def test_direct_alias_rejects_an_unknown_provider_connection_cleanly(tmp_path: Path) -> None:
     """A deployment typo is a stable CLI usage error, never an unhandled mapping failure."""
     runner = CliRunner()

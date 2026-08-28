@@ -49,7 +49,7 @@ def retained_streaming_tool_arguments(
         record is None
         or record.connection != connection_id
         or record.gateway is None
-        or snapshot.connections.get(connection_id) != connection
+        or snapshot.connections.get(connection_id) != bound.config
     ):
         return None
     return record.gateway.capabilities.supports_streaming_tool_arguments
