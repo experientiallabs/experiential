@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from exp.common.models import ConnectionConfig
+from exp.runtime.gateway.lifecycle import GatewayLifecycleError, load_gateway_components
+from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.sqlite import migrations
 from exp.runtime.gateway.sqlite.migrations import (
     _MIGRATION_1,
@@ -1077,3 +1079,176 @@ def test_v13_preserves_a_valid_older_explicit_pair_authority(
         assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         migrated.close()
+
+
+@pytest.mark.parametrize("auth_mode", ("access_key_pair", "api_key"))
+@pytest.mark.parametrize("has_provider_binding", (False, True))
+def test_v13_deactivates_schema_12_aliases_with_inferred_bedrock_auth(
+    tmp_path: Path,
+    auth_mode: str,
+    has_provider_binding: bool,
+) -> None:
+    """A schema-12 alias cannot restart against a pre-auth-mode immutable snapshot."""
+    manager = GatewayManagement(tmp_path, organization_id="org")
+    manager.state_dir.mkdir(parents=True)
+    descriptor = os.open(manager.database_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    connection = connect_database(manager.database_path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for version in range(1, 12):
+            for statement in migrations._MIGRATIONS[version]:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 12")
+        connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
+        connection.execute(
+            "INSERT INTO identities VALUES ('identity', 'org', 'Identity', NULL, 1, 't', 't')"
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_connections (
+                connection_id, organization_id, active_revision_id,
+                active, created_at, updated_at
+            ) VALUES ('conn', 'org', NULL, 1, 't', 't')
+            """
+        )
+        api_key_env = (
+            "AWS_SECRET_ACCESS_KEY"
+            if auth_mode == "access_key_pair"
+            else "AWS_BEARER_TOKEN_BEDROCK"
+        )
+        access_key_id_env = "AWS_ACCESS_KEY_ID" if auth_mode == "access_key_pair" else None
+        connection.execute(
+            """
+            INSERT INTO provider_connection_revisions (
+                revision_id, organization_id, connection_id, revision_number,
+                provider, api_key_env, region, aws_access_key_id_env,
+                connection_sha256, created_at
+            ) VALUES ('rev', 'org', 'conn', 1, 'bedrock', ?, 'us-west-2', ?, ?, 't')
+            """,
+            (api_key_env, access_key_id_env, "a" * 64),
+        )
+        connection.execute(
+            "UPDATE provider_connections SET active_revision_id = 'rev' "
+            "WHERE connection_id = 'conn'"
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_connections (
+                connection_id, organization_id, active_revision_id,
+                active, created_at, updated_at
+            ) VALUES ('safe-conn', 'org', NULL, 1, 't', 't')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_connection_revisions (
+                revision_id, organization_id, connection_id, revision_number,
+                provider, api_key_env, connection_sha256, created_at
+            ) VALUES ('safe-rev', 'org', 'safe-conn', 1, 'openai',
+                      'OPENAI_API_KEY', ?, 't')
+            """,
+            ("c" * 64,),
+        )
+        connection.execute(
+            "UPDATE provider_connections SET active_revision_id = 'safe-rev' "
+            "WHERE connection_id = 'safe-conn'"
+        )
+        connection.execute(
+            "INSERT INTO catalog_snapshot_refs VALUES ('snap', 'org', ?, 't')",
+            ("b" * 64,),
+        )
+        connection.execute(
+            """
+            INSERT INTO gateway_aliases (
+                alias_id, organization_id, alias_name, active_revision_id,
+                active, created_at, updated_at
+            ) VALUES ('alias', 'org', 'alias', NULL, 1, 't', 't')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO alias_revisions (
+                revision_id, organization_id, alias_id, revision_number,
+                target_kind, pool_id, catalog_sha256, snapshot_ref, created_at
+            ) VALUES ('alias-rev', 'org', 'alias', 1, 'direct', 'pool', ?, 'snap', 't')
+            """,
+            ("b" * 64,),
+        )
+        connection.execute(
+            "UPDATE gateway_aliases SET active_revision_id = 'alias-rev' WHERE alias_id = 'alias'"
+        )
+        connection.execute(
+            "INSERT INTO identity_alias_grants VALUES ('org', 'identity', 'alias', 't')"
+        )
+        if has_provider_binding:
+            connection.execute(
+                """
+                INSERT INTO alias_revision_provider_connections (
+                    organization_id, alias_id, alias_revision_id, connection_id,
+                    connection_revision_id, connection_sha256, created_at
+                ) VALUES ('org', 'alias', 'alias-rev', 'conn', 'rev', ?, 't')
+                """,
+                ("a" * 64,),
+            )
+        connection.execute(
+            "INSERT INTO catalog_snapshot_refs VALUES ('safe-snap', 'org', ?, 't')",
+            ("d" * 64,),
+        )
+        connection.execute(
+            """
+            INSERT INTO gateway_aliases (
+                alias_id, organization_id, alias_name, active_revision_id,
+                active, created_at, updated_at
+            ) VALUES ('safe-alias', 'org', 'safe-alias', NULL, 1, 't', 't')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO alias_revisions (
+                revision_id, organization_id, alias_id, revision_number,
+                target_kind, pool_id, catalog_sha256, snapshot_ref, created_at
+            ) VALUES ('safe-alias-rev', 'org', 'safe-alias', 1, 'direct',
+                      'safe-pool', ?, 'safe-snap', 't')
+            """,
+            ("d" * 64,),
+        )
+        connection.execute(
+            "UPDATE gateway_aliases SET active_revision_id = 'safe-alias-rev' "
+            "WHERE alias_id = 'safe-alias'"
+        )
+        connection.execute(
+            """
+            INSERT INTO alias_revision_provider_connections (
+                organization_id, alias_id, alias_revision_id, connection_id,
+                connection_revision_id, connection_sha256, created_at
+            ) VALUES ('org', 'safe-alias', 'safe-alias-rev', 'safe-conn',
+                      'safe-rev', ?, 't')
+            """,
+            ("c" * 64,),
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    initialize_database(manager.database_path)
+    migrated = connect_database(manager.database_path)
+    try:
+        alias_active = migrated.execute(
+            "SELECT active FROM gateway_aliases WHERE alias_id = 'alias'"
+        ).fetchone()[0]
+        assert alias_active == 0
+        safe_alias_active = migrated.execute(
+            "SELECT active FROM gateway_aliases WHERE alias_id = 'safe-alias'"
+        ).fetchone()[0]
+        assert safe_alias_active == 1
+        authority = next(
+            item
+            for item in active_provider_connections(migrated, organization_id="org")
+            if item.config.provider == "bedrock"
+        )
+        assert authority.config.bedrock_auth_mode == auth_mode
+    finally:
+        migrated.close()
+    with pytest.raises(GatewayLifecycleError, match="no granted active alias"):
+        load_gateway_components(tmp_path, environment={})

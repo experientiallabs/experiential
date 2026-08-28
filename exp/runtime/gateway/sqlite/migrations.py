@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Literal, cast
 
 from exp.common.models import ConnectionConfig
+from exp.runtime.gateway.sqlite.migration_repairs import (
+    deactivate_aliases_with_inferred_bedrock_auth,
+)
 
 SCHEMA_VERSION = 13
 
@@ -648,31 +651,12 @@ def _apply_migration(connection: sqlite3.Connection, version: int) -> None:
                 "ALTER TABLE provider_connection_revisions ADD COLUMN bedrock_auth_mode TEXT "
                 "CHECK (bedrock_auth_mode IN ('access_key_pair', 'api_key'))"
             )
+        deactivate_aliases_with_inferred_bedrock_auth(connection)
         if "aws_access_key_id" in columns:
             # The short-lived schema-11 prototype persisted the identifier itself.
             # There is no safe way to infer the environment locator that should replace
             # it, so fail closed: deactivate affected authorities, erase the value, and
             # remove the obsolete column before the database can serve again.
-            connection.execute(
-                """
-                UPDATE gateway_aliases
-                SET active = 0,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
-                WHERE active = 1
-                  AND EXISTS (
-                    SELECT 1
-                    FROM alias_revision_provider_connections AS bindings
-                    JOIN provider_connection_revisions AS revisions
-                      ON revisions.organization_id = bindings.organization_id
-                     AND revisions.connection_id = bindings.connection_id
-                     AND revisions.revision_id = bindings.connection_revision_id
-                    WHERE bindings.organization_id = gateway_aliases.organization_id
-                      AND bindings.alias_id = gateway_aliases.alias_id
-                      AND bindings.alias_revision_id = gateway_aliases.active_revision_id
-                      AND revisions.aws_access_key_id IS NOT NULL
-                  )
-                """
-            )
             connection.execute(
                 """
                 UPDATE provider_connections
