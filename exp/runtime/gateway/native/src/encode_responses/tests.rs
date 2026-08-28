@@ -208,4 +208,44 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
     .expect("internal reasoning must not break public encoding");
     assert_eq!(hidden.body["output"][0]["type"], json!("reasoning"));
     assert_eq!(hidden.body["output"][0]["encrypted_content"], Value::Null);
+
+    for (include_encrypted_reasoning, expected) in [(false, None), (true, Some("stream-opaque"))] {
+        let mut encoder = ResponsesSseEncoder::new(
+            "request-stream",
+            "coding",
+            1_700_000_000.0,
+            ResponsesEnvelope {
+                include_encrypted_reasoning,
+                ..ResponsesEnvelope::default()
+            },
+        );
+        encoder.start().expect("stream start must encode");
+        let mut frames = encoder
+            .feed(&Event::EncryptedReasoning {
+                output_index: 0,
+                encrypted_content: "stream-opaque".to_string(),
+            })
+            .expect("encrypted reasoning must encode");
+        frames.extend(
+            encoder
+                .feed(&Event::Completed)
+                .expect("terminal must encode"),
+        );
+        let payloads: Vec<Value> = frames
+            .iter()
+            .filter_map(|frame| frame.split_once("data: ").map(|(_, data)| data.trim()))
+            .map(|data| serde_json::from_str(data).expect("frame data must be JSON"))
+            .collect();
+        let done = payloads
+            .iter()
+            .find(|payload| payload["type"] == json!("response.output_item.done"))
+            .expect("reasoning item must complete");
+        let terminal = payloads.last().expect("response must terminate");
+        for item in [&done["item"], &terminal["response"]["output"][0]] {
+            match expected {
+                Some(value) => assert_eq!(item["encrypted_content"], json!(value)),
+                None => assert!(item.get("encrypted_content").is_none()),
+            }
+        }
+    }
 }

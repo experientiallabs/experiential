@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from unittest import mock
 
 import pytest
@@ -643,9 +643,14 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(tmp_path: Path
     assert report["totals"]["requests"] == 2
 
 
+@pytest.mark.parametrize(
+    "auth_mode",
+    ("ambient_pair", "ambient_bearer", "explicit_bearer", "explicit_pair"),
+)
 def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    auth_mode: str,
 ) -> None:
     """A Bedrock alias admits natively: the wire config carries the exact
     pre-serialized Converse body and SigV4 headers computed over it."""
@@ -660,15 +665,48 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         upsert_singleton_deployment,
     )
 
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sigv4-secret-canary")
-    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-token-canary")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
     monkeypatch.delenv("AWS_PROFILE", raising=False)
+    environment = {"TEST_PROVIDER_KEY": "provider-secret-canary"}
+    connection_kwargs: dict[str, Any] = {}
+    if auth_mode == "ambient_pair":
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sigv4-secret-canary")
+        monkeypatch.setenv("AWS_SESSION_TOKEN", "session-token-canary")
+    elif auth_mode == "ambient_bearer":
+        environment["AWS_BEARER_TOKEN_BEDROCK"] = "ambient-bearer-canary"
+    elif auth_mode == "explicit_bearer":
+        environment.update(
+            {
+                "AWS_BEARER_TOKEN_BEDROCK": "ambient-bearer-must-not-win",
+                "BEDROCK_API_KEY": "explicit-bearer-canary",
+            }
+        )
+        connection_kwargs.update(api_key_env="BEDROCK_API_KEY", bedrock_auth_mode="api_key")
+    else:
+        environment.update(
+            {
+                "AWS_BEARER_TOKEN_BEDROCK": "ambient-bearer-must-not-win",
+                "BEDROCK_ACCESS_KEY_ID": "AKIAEXPLICITKEY001",
+                "BEDROCK_SECRET_ACCESS_KEY": "explicit-secret-canary",
+            }
+        )
+        connection_kwargs.update(
+            api_key_env="BEDROCK_SECRET_ACCESS_KEY",
+            aws_access_key_id_env="BEDROCK_ACCESS_KEY_ID",
+        )
     manager, raw_key = _configured_gateway(tmp_path)
     upsert_connection(
         tmp_path,
         name="bedrock-main",
-        connection=ConnectionConfig(provider="bedrock", region="us-east-1"),
+        connection=ConnectionConfig(
+            provider="bedrock",
+            region="us-east-1",
+            **connection_kwargs,
+        ),
         replace=False,
     )
     normalized, snapshot, _changed = upsert_singleton_deployment(
@@ -703,7 +741,7 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
     manager.add_grant(identity_id="default", alias_id="bed")
     components = load_gateway_components(
         tmp_path,
-        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+        environment=environment,
     )
     control = NativeControlPlane(components)
     body_schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
@@ -780,13 +818,38 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         )
     )
     headers = signed["headers"]
-    assert headers["X-Amz-Security-Token"] == "session-token-canary"
-    authorization = headers["Authorization"]
+    authorization = headers.get("Authorization") or headers.get("authorization")
     assert isinstance(authorization, str)
-    assert authorization.startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")
-    assert "/us-east-1/bedrock/aws4_request" in authorization
-    assert "sigv4-secret-canary" not in json.dumps(admission)
-    assert "sigv4-secret-canary" not in json.dumps(signed)
+    if auth_mode in {"ambient_bearer", "explicit_bearer"}:
+        expected = (
+            "ambient-bearer-canary" if auth_mode == "ambient_bearer" else "explicit-bearer-canary"
+        )
+        assert authorization == f"Bearer {expected}"
+    else:
+        expected_key = "AKIDEXAMPLE" if auth_mode == "ambient_pair" else "AKIAEXPLICITKEY001"
+        assert authorization.startswith(f"AWS4-HMAC-SHA256 Credential={expected_key}/")
+        assert "/us-east-1/bedrock/aws4_request" in authorization
+        if auth_mode == "ambient_pair":
+            assert headers["X-Amz-Security-Token"] == "session-token-canary"
+    for secret in (
+        "sigv4-secret-canary",
+        "ambient-bearer-canary",
+        "ambient-bearer-must-not-win",
+        "explicit-bearer-canary",
+        "explicit-secret-canary",
+    ):
+        assert secret not in json.dumps(admission)
+    signed_json = json.dumps(signed)
+    if auth_mode in {"ambient_bearer", "explicit_bearer"}:
+        assert "ambient-bearer-must-not-win" not in signed_json
+        assert "explicit-secret-canary" not in signed_json
+    else:
+        for secret in (
+            "sigv4-secret-canary",
+            "ambient-bearer-must-not-win",
+            "explicit-secret-canary",
+        ):
+            assert secret not in signed_json
     with pytest.raises(NativeBridgeError):
         control.sign_dispatch(
             json.dumps(

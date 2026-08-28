@@ -482,11 +482,15 @@ def test_responses_sse_exposes_provider_encrypted_reasoning_only_when_requested(
         ),
     )
 
-    terminal = cast("JsonObject", _responses_payload(frames[-1])["response"])
-    reasoning = cast("list[JsonObject]", terminal["output"])[0]
-    assert reasoning.get("encrypted_content") == (
-        "provider-opaque" if include_encrypted_reasoning else None
-    )
+    payloads = tuple(_responses_payload(frame) for frame in frames)
+    done = next(payload for payload in payloads if payload["type"] == "response.output_item.done")
+    terminal = cast("JsonObject", payloads[-1]["response"])
+    items = (cast("JsonObject", done["item"]), cast("list[JsonObject]", terminal["output"])[0])
+    for reasoning in items:
+        if include_encrypted_reasoning:
+            assert cast("str", reasoning["encrypted_content"]).encode() == b"provider-opaque"
+        else:
+            assert "encrypted_content" not in reasoning
 
 
 def test_responses_sse_fails_closed_when_fireworks_carrier_is_not_sealed() -> None:

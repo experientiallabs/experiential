@@ -8,9 +8,15 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import EncryptedReasoningBlock
+from exp.runtime.gateway.contracts import (
+    EncryptedReasoningBlock,
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+)
 from exp.runtime.gateway.native_responses import ContinuationContext, remember_turn
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
+from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.state import BoundedContinuationStore, ProtocolNamespace
 
 
@@ -99,7 +105,13 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
                 {"output_index": 4, "encrypted_content": "second-opaque-item"},
                 {"output_index": 1, "encrypted_content": "first-opaque-item"},
             ],
-            "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
+            "tool_calls": [
+                {
+                    "call_id": "call-one",
+                    "name": "lookup",
+                    "arguments": '{ "query" : "λ" }',
+                }
+            ],
         },
     )
 
@@ -119,6 +131,42 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
         "first-opaque-item",
         "second-opaque-item",
     )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            *state.messages,
+            GatewayMessage(role="tool", tool_call_id="call-one", content="tool-result"),
+        ),
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    assert payload["input"] == [
+        {
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "first-opaque-item",
+        },
+        {
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "second-opaque-item",
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-one",
+            "name": "lookup",
+            "arguments": '{ "query" : "λ" }',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-one",
+            "output": "tool-result",
+        },
+    ]
 
 
 @pytest.mark.parametrize(
@@ -149,4 +197,29 @@ def test_remember_turn_rejects_malformed_openai_encrypted_reasoning(encrypted: o
                     "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
                 },
             ),
+        )
+
+
+def test_remember_turn_rejects_mixed_provider_reasoning_without_storage() -> None:
+    """One continuation cannot combine Fireworks and OpenAI authentication formats."""
+    store = BoundedContinuationStore()
+    context = _context()
+
+    with pytest.raises(ValueError, match="cannot mix provider reasoning formats"):
+        remember_turn(
+            store,
+            context=context,
+            data={
+                "text": "",
+                "refusal": False,
+                "reasoning_content_carrier": _carrier(),
+                "encrypted_reasoning": [{"output_index": 0, "encrypted_content": "openai-opaque"}],
+                "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
+            },
+        )
+
+    with pytest.raises(Exception, match="unavailable"):
+        store.resolve_now(
+            namespace=context.namespace,
+            previous_response_id=context.response_id,
         )

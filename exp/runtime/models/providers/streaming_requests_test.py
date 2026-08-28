@@ -720,6 +720,7 @@ def test_responses_requires_a_fireworks_continuation_channel() -> None:
         model_id="compatible-model",
     )
     assert compatible_generation_parameter_profile_indexes((profile, generic), request) == (1,)
+    assert compatible_generation_parameter_profile_indexes((profile, generic), text_only) == (0, 1)
 
     public_carrier = request.model_copy(update={"include_encrypted_reasoning": True})
     route_generation_parameter_requests((profile,), public_carrier)
@@ -1736,6 +1737,30 @@ def test_responses_payload_acquires_internal_reasoning_for_gateway_continuation(
         supports_reasoning=True,
     )
     assert "include" not in caller_opt_out
+
+    stored = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request.model_copy(update={"response_store": True}),
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert stored["include"] == ["reasoning.encrypted_content"]
+
+    caller_public = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request.model_copy(update={"response_store": False, "include_encrypted_reasoning": True}),
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert caller_public["include"] == ["reasoning.encrypted_content"]
+
+    non_reasoning = openai_responses_stream_payload(
+        "plain-model",
+        request,
+        supports_temperature=True,
+        supports_reasoning=False,
+    )
+    assert "include" not in non_reasoning
 
 
 def test_route_rejects_encrypted_reasoning_outside_native_responses() -> None:
