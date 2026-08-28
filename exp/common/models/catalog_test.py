@@ -487,6 +487,19 @@ def test_azure_connection_requires_endpoint_key_and_api_version() -> None:
         api_key_env="AZURE_OPENAI_API_KEY",
         api_version="v1",
     )
+    assert connection.azure_api_surface is None
+    inference = ConnectionConfig(
+        provider="azure",
+        base_url="https://resource.services.ai.azure.com/models",
+        api_key_env="AZURE_FOUNDRY_API_KEY",
+        api_version="2024-05-01-preview",
+        azure_api_surface="model_inference",
+    )
+    assert inference.identity_sha256() != connection.identity_sha256()
+    explicit_classic = connection.model_copy(update={"azure_api_surface": "openai_deployments"})
+    assert explicit_classic.identity_sha256() == connection.identity_sha256()
+    with pytest.raises(ValueError, match="azure_api_surface"):
+        ConnectionConfig(provider="openai", azure_api_surface="model_inference")
 
     assert (
         connection.identity_sha256()
