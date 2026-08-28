@@ -229,14 +229,20 @@ impl MessagesSseEncoder {
         }
         match event {
             Event::TextDelta(text) => self.text_delta(text),
+            Event::ProviderTextDelta { delta, .. } => self.text_delta(delta),
             Event::RefusalDelta(_) => {
                 // There is no Anthropic refusal block; the refusal is
                 // reported as one sanitized terminal error instead.
                 self.refusal_seen = true;
                 Ok(Vec::new())
             }
+            Event::ProviderRefusalDelta { .. } => {
+                self.refusal_seen = true;
+                Ok(Vec::new())
+            }
             // OpenAI-only reasoning shapes have no Messages representation.
             Event::ProviderOutputItemStarted { .. }
+            | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
             | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
             Event::ThinkingDelta { index, delta } => self.thinking_delta(*index, delta),
@@ -631,10 +637,12 @@ pub fn completed_messages_body(
         });
     }
     let incomplete = matches!(terminal, Event::Incomplete);
-    if events
-        .iter()
-        .any(|event| matches!(event, Event::RefusalDelta(_)))
-    {
+    if events.iter().any(|event| {
+        matches!(
+            event,
+            Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+        )
+    }) {
         return Ok(AggregatedMessage {
             body: Value::Null,
             failure: Some(refusal_failure()),
@@ -669,7 +677,9 @@ pub fn completed_messages_body(
     }
     for event in events {
         match event {
-            Event::TextDelta(delta) if !delta.is_empty() => {
+            Event::TextDelta(delta) | Event::ProviderTextDelta { delta, .. }
+                if !delta.is_empty() =>
+            {
                 let appended = match slots.last_mut() {
                     Some(Some(block)) if block["type"] == json!("text") => {
                         if let Some(Value::String(text)) = block.get_mut("text") {

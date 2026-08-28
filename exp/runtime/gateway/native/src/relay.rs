@@ -34,6 +34,9 @@ pub fn collection_public_error(failure: &Failure) -> PublicError {
 pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
         Event::TextDelta(text) | Event::RefusalDelta(text) => text.len(),
+        Event::ProviderTextDelta { delta, .. } | Event::ProviderRefusalDelta { delta, .. } => {
+            delta.len()
+        }
         Event::ReasoningSummaryDelta { delta, .. } => delta.len(),
         Event::ThinkingDelta { delta, .. } => delta.len(),
         Event::ThinkingSignature { signature, .. } => signature.len(),

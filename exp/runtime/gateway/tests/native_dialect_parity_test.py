@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import zlib
 from collections.abc import Sequence
+from typing import cast
 
 import pytest
 
@@ -576,3 +577,212 @@ def test_native_anthropic_normalizer_completes_a_zero_argument_tool_call() -> No
         },
         {"kind": "completed"},
     ]
+def test_native_responses_preserves_multi_message_status_phase_and_idless_call() -> None:
+    """OpenAI 3.x output item shapes survive normalization and public encoding."""
+    from openai.types.responses.response import Response
+    from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+    from openai.types.responses.response_output_item_done_event import (
+        ResponseOutputItemDoneEvent,
+    )
+    from openai.types.responses.response_output_message import ResponseOutputMessage
+
+    chunks = (
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "rs-incomplete",
+                    "type": "reasoning",
+                    "summary": [],
+                    "status": "in_progress",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "rs-incomplete",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                    "status": "incomplete",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "id": "msg-commentary",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "status": "in_progress",
+                    "phase": "commentary",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_text.delta",
+                "output_index": 1,
+                "item_id": "msg-commentary",
+                "content_index": 0,
+                "delta": "Checking.",
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "id": "msg-commentary",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Checking.",
+                            "annotations": [],
+                        }
+                    ],
+                    "status": "incomplete",
+                    "phase": "commentary",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call-required",
+                    "name": "lookup",
+                    "arguments": "",
+                    "status": "in_progress",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call-required",
+                    "name": "lookup",
+                    "arguments": '{"query":"x"}',
+                    "status": "incomplete",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 3,
+                "item": {
+                    "id": "msg-final",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "status": "in_progress",
+                    "phase": "final_answer",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_text.delta",
+                "output_index": 3,
+                "item_id": "msg-final",
+                "content_index": 0,
+                "delta": "Done.",
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": 3,
+                "item": {
+                    "id": "msg-final",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done.", "annotations": []}],
+                    "status": "completed",
+                    "phase": "final_answer",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                },
+            }
+        ),
+    )
+    normalized = _native_normalized("openai_responses", chunks)
+    assert normalized["failure"] is None
+    events = cast(list[JsonObject], normalized["events"])
+    completed = [event for event in events if event["kind"] == "provider_output_item_completed"]
+    completed_fields = [
+        (event["output_index"], event.get("status"), event.get("phase")) for event in completed
+    ]
+    assert completed_fields == [
+        (0, "incomplete", None),
+        (1, "incomplete", "commentary"),
+        (2, "incomplete", None),
+        (3, "completed", "final_answer"),
+    ]
+
+    native = pytest.importorskip("exp_gateway_native")
+    events_json = json.dumps(events)
+    body = json.loads(
+        native.completed_responses_fixture(
+            "request-official",
+            "gpt-5.6-sol",
+            1_700_000_000.0,
+            "{}",
+            events_json,
+        )
+    )
+    parsed = Response.model_validate(body)
+    assert [item.type for item in parsed.output] == [
+        "reasoning",
+        "message",
+        "function_call",
+        "message",
+    ]
+    commentary = cast(ResponseOutputMessage, parsed.output[1])
+    call = cast(ResponseFunctionToolCall, parsed.output[2])
+    final = cast(ResponseOutputMessage, parsed.output[3])
+    assert commentary.status == "incomplete"
+    assert commentary.phase == "commentary"
+    assert call.id is None
+    assert call.call_id == "call-required"
+    assert call.status == "incomplete"
+    assert final.phase == "final_answer"
+
+    frames = native.encode_responses_fixture(
+        "request-official",
+        "gpt-5.6-sol",
+        1_700_000_000.0,
+        "{}",
+        events_json,
+    )
+    payloads = [json.loads(frame.split("data: ", 1)[1]) for frame in frames if "data: " in frame]
+    done_payloads = [
+        payload for payload in payloads if payload["type"] == "response.output_item.done"
+    ]
+    for payload in done_payloads:
+        ResponseOutputItemDoneEvent.model_validate(payload)
+    assert not any(
+        payload["type"].startswith("response.function_call_arguments") for payload in payloads
+    )

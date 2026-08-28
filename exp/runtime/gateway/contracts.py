@@ -158,6 +158,11 @@ class GatewayMessage(ContractModel):
         default=None,
         exclude=True,
     )
+    provider_phase: Literal["commentary", "final_answer"] | None = Field(
+        default=None,
+        exclude=True,
+    )
+    """OpenAI Responses assistant-message phase retained for exact replay."""
 
     @model_validator(mode="after")
     def _require_role_coherence(self) -> GatewayMessage:
@@ -169,7 +174,12 @@ class GatewayMessage(ContractModel):
         Raises:
             ValueError: Content, tool linkage, or assistant calls are incoherent.
         """
-        if self.content is None and not self.tool_calls and not self.provider_reasoning:
+        if (
+            self.content is None
+            and not self.tool_calls
+            and not self.provider_reasoning
+            and self.provider_item_id is None
+        ):
             raise ValueError("gateway messages need content, tool calls, or reasoning blocks")
         if self.role != "assistant" and self.tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
@@ -179,12 +189,15 @@ class GatewayMessage(ContractModel):
             self.provider_item_id is not None
             or self.provider_output_index is not None
             or self.provider_status is not None
+            or self.provider_phase is not None
         ):
             raise ValueError("provider output identity is valid only for assistant messages")
         if (self.provider_item_id is None) != (self.provider_output_index is None):
             raise ValueError("provider item ID and output index must be retained together")
         if self.provider_status is not None and self.provider_item_id is None:
             raise ValueError("provider output status requires retained item identity")
+        if self.provider_phase is not None and self.provider_item_id is None:
+            raise ValueError("provider output phase requires retained item identity")
         call_ids = tuple(call.call_id for call in self.tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")
@@ -366,6 +379,7 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
             authority["provider_item_id"] = message.provider_item_id
             authority["provider_output_index"] = message.provider_output_index
             authority["provider_status"] = message.provider_status
+            authority["provider_phase"] = message.provider_phase
         if message.provider_reasoning:
             blocks: list[JsonObject] = []
             for block in message.provider_reasoning:

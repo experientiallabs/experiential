@@ -20,6 +20,7 @@ mod metrics;
 mod relay;
 mod replay;
 mod respond;
+mod responses_retention;
 mod route_chat;
 mod route_messages;
 mod route_responses;
@@ -323,28 +324,63 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
             .get("index")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32;
+        let output_index = object
+            .get("output_index")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let item_id = object
+            .get("item_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let status = match object.get("status") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) => Some(
+                events::ProviderOutputItemStatus::from_str(value)
+                    .ok_or_else(|| format!("unknown provider output item status: {value}"))?,
+            ),
+            Some(_) => return Err("provider output item status must be text".to_string()),
+        };
+        let phase = match object.get("phase") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) => Some(
+                events::ProviderAssistantMessagePhase::from_str(value)
+                    .ok_or_else(|| format!("unknown provider message phase: {value}"))?,
+            ),
+            Some(_) => return Err("provider message phase must be text".to_string()),
+        };
+        let provider_kind = || match object.get("item_type").and_then(serde_json::Value::as_str) {
+            Some("reasoning") => Ok(events::ProviderOutputItemKind::Reasoning),
+            Some("function_call") => Ok(events::ProviderOutputItemKind::FunctionCall),
+            Some("message") => Ok(events::ProviderOutputItemKind::Message),
+            Some(other) => Err(format!("unknown provider output item kind: {other}")),
+            None => Err("provider output item requires item_type".to_string()),
+        };
         let event = match kind {
             "text_delta" => events::Event::TextDelta(text),
             "refusal_delta" => events::Event::RefusalDelta(text),
+            "provider_text_delta" => events::Event::ProviderTextDelta {
+                output_index,
+                item_id: item_id.ok_or("provider text delta requires item_id")?,
+                delta: text,
+            },
+            "provider_refusal_delta" => events::Event::ProviderRefusalDelta {
+                output_index,
+                item_id: item_id.ok_or("provider refusal delta requires item_id")?,
+                delta: text,
+            },
             "provider_output_item_started" => events::Event::ProviderOutputItemStarted {
-                output_index: object
-                    .get("output_index")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as u32,
-                item_id: object
-                    .get("item_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                kind: match object.get("item_type").and_then(serde_json::Value::as_str) {
-                    Some("reasoning") => events::ProviderOutputItemKind::Reasoning,
-                    Some("function_call") => events::ProviderOutputItemKind::FunctionCall,
-                    Some("message") => events::ProviderOutputItemKind::Message,
-                    Some(other) => {
-                        return Err(format!("unknown provider output item kind: {other}"));
-                    }
-                    None => return Err("provider output item requires item_type".to_string()),
-                },
+                output_index,
+                item_id,
+                kind: provider_kind()?,
+                status,
+                phase,
+            },
+            "provider_output_item_completed" => events::Event::ProviderOutputItemCompleted {
+                output_index,
+                item_id,
+                kind: provider_kind()?,
+                status,
+                phase,
             },
             "reasoning_summary_delta" => events::Event::ReasoningSummaryDelta {
                 output_index: object
@@ -426,6 +462,7 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                         .get("item_id")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_string),
+                    provider_status: status,
                     raw_arguments: object
                         .get("raw_arguments")
                         .and_then(serde_json::Value::as_str)

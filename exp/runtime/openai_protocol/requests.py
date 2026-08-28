@@ -153,6 +153,7 @@ class _ResponseMessage(_Message):
     type: Literal["message"] = "message"
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
+    phase: Literal["commentary", "final_answer"] | None = None
 
     @model_validator(mode="after")
     def _require_output_identity_pair(self) -> _ResponseMessage:
@@ -161,6 +162,8 @@ class _ResponseMessage(_Message):
             raise ValueError("Responses output messages require both id and status")
         if self.id is not None and self.role != "assistant":
             raise ValueError("Responses output message identity requires role assistant")
+        if self.phase is not None and self.id is None:
+            raise ValueError("Responses output message phase requires output identity")
         return self
 
 
@@ -904,6 +907,7 @@ def _response_input_messages(
                             "provider_item_id": item.id,
                             "provider_output_index": index if item.id is not None else None,
                             "provider_status": item.status,
+                            "provider_phase": item.phase,
                         }
                     ),
                     *converted[1:],

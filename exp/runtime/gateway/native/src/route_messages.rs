@@ -525,7 +525,10 @@ async fn stream_messages(
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
-            if matches!(event, Event::RefusalDelta(_)) {
+            if matches!(
+                event,
+                Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+            ) {
                 visible_refusal = true;
             }
             // A typed refusal after visible refusal output completes

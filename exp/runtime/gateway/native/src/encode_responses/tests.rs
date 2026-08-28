@@ -181,13 +181,17 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
     let events = vec![
         Event::ProviderOutputItemStarted {
             output_index: 0,
-            item_id: "rs-provider-0".to_string(),
+            item_id: Some("rs-provider-0".to_string()),
             kind: ProviderOutputItemKind::Reasoning,
+            status: None,
+            phase: None,
         },
         Event::ProviderOutputItemStarted {
             output_index: 1,
-            item_id: "fc-provider-1".to_string(),
+            item_id: Some("fc-provider-1".to_string()),
             kind: ProviderOutputItemKind::FunctionCall,
+            status: None,
+            phase: None,
         },
         Event::ToolCallStarted {
             index: 1,
@@ -209,6 +213,7 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
                 call_id: "call-1".to_string(),
                 name: "lookup".to_string(),
                 provider_item_id: Some("fc-provider-1".to_string()),
+                provider_status: None,
                 raw_arguments: "{}".to_string(),
             },
         },
@@ -249,4 +254,136 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
     assert_eq!(added[0]["output_index"], json!(0));
     assert_eq!(added[1]["item"]["id"], json!("fc-provider-1"));
     assert_eq!(added[1]["output_index"], json!(1));
+}
+
+#[test]
+fn provider_items_preserve_multiple_messages_status_phase_and_idless_call() {
+    let events = vec![
+        Event::ProviderOutputItemStarted {
+            output_index: 0,
+            item_id: Some("rs-0".to_string()),
+            kind: ProviderOutputItemKind::Reasoning,
+            status: Some(ProviderOutputItemStatus::InProgress),
+            phase: None,
+        },
+        Event::EncryptedReasoning {
+            output_index: 0,
+            item_id: "rs-0".to_string(),
+            encrypted_content: "opaque".to_string(),
+        },
+        Event::ProviderOutputItemCompleted {
+            output_index: 0,
+            item_id: Some("rs-0".to_string()),
+            kind: ProviderOutputItemKind::Reasoning,
+            status: Some(ProviderOutputItemStatus::Incomplete),
+            phase: None,
+        },
+        Event::ProviderOutputItemStarted {
+            output_index: 1,
+            item_id: Some("msg-commentary".to_string()),
+            kind: ProviderOutputItemKind::Message,
+            status: Some(ProviderOutputItemStatus::InProgress),
+            phase: Some(ProviderAssistantMessagePhase::Commentary),
+        },
+        Event::ProviderTextDelta {
+            output_index: 1,
+            item_id: "msg-commentary".to_string(),
+            delta: "Checking.".to_string(),
+        },
+        Event::ProviderOutputItemCompleted {
+            output_index: 1,
+            item_id: Some("msg-commentary".to_string()),
+            kind: ProviderOutputItemKind::Message,
+            status: Some(ProviderOutputItemStatus::Incomplete),
+            phase: Some(ProviderAssistantMessagePhase::Commentary),
+        },
+        Event::ProviderOutputItemStarted {
+            output_index: 2,
+            item_id: None,
+            kind: ProviderOutputItemKind::FunctionCall,
+            status: Some(ProviderOutputItemStatus::InProgress),
+            phase: None,
+        },
+        Event::ToolCallStarted {
+            index: 2,
+            call_id: "call-required".to_string(),
+            name: "lookup".to_string(),
+        },
+        Event::ToolArgumentsDelta {
+            index: 2,
+            delta: "{}".to_string(),
+        },
+        Event::ProviderOutputItemCompleted {
+            output_index: 2,
+            item_id: None,
+            kind: ProviderOutputItemKind::FunctionCall,
+            status: Some(ProviderOutputItemStatus::Incomplete),
+            phase: None,
+        },
+        Event::ToolCallCompleted {
+            index: 2,
+            call: CompletedToolCall {
+                call_id: "call-required".to_string(),
+                name: "lookup".to_string(),
+                provider_item_id: None,
+                provider_status: Some(ProviderOutputItemStatus::Incomplete),
+                raw_arguments: "{}".to_string(),
+            },
+        },
+        Event::ProviderOutputItemStarted {
+            output_index: 3,
+            item_id: Some("msg-final".to_string()),
+            kind: ProviderOutputItemKind::Message,
+            status: Some(ProviderOutputItemStatus::InProgress),
+            phase: Some(ProviderAssistantMessagePhase::FinalAnswer),
+        },
+        Event::ProviderTextDelta {
+            output_index: 3,
+            item_id: "msg-final".to_string(),
+            delta: "Done.".to_string(),
+        },
+        Event::ProviderOutputItemCompleted {
+            output_index: 3,
+            item_id: Some("msg-final".to_string()),
+            kind: ProviderOutputItemKind::Message,
+            status: Some(ProviderOutputItemStatus::Completed),
+            phase: Some(ProviderAssistantMessagePhase::FinalAnswer),
+        },
+        Event::Incomplete,
+    ];
+    let completed = completed_responses_body(
+        "request-provider-fields",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope {
+            include_encrypted_reasoning: true,
+            ..ResponsesEnvelope::default()
+        },
+        &events,
+    )
+    .expect("provider fields must encode");
+    let output = completed.body["output"].as_array().expect("output array");
+    assert_eq!(output.len(), 4);
+    assert_eq!(output[0]["status"], json!("incomplete"));
+    assert_eq!(output[1]["phase"], json!("commentary"));
+    assert_eq!(output[1]["status"], json!("incomplete"));
+    assert!(output[2].get("id").is_none());
+    assert_eq!(output[2]["call_id"], json!("call-required"));
+    assert_eq!(output[2]["status"], json!("incomplete"));
+    assert_eq!(output[3]["phase"], json!("final_answer"));
+    assert_eq!(output[3]["status"], json!("completed"));
+
+    let mut encoder = ResponsesSseEncoder::new(
+        "request-provider-fields",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+    );
+    let mut frames = encoder.start().expect("stream starts");
+    for event in &events {
+        frames.extend(encoder.feed(event).expect("event encodes"));
+    }
+    assert!(!frames
+        .iter()
+        .any(|frame| frame.contains("response.function_call_arguments")));
 }

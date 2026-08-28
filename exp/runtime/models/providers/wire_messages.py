@@ -53,31 +53,33 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             items.append(item)
         else:
             indexed_items.append((block.output_index, item))
-    if message.content is not None:
+    if message.content is not None or message.provider_item_id is not None:
         if message.provider_output_index is None:
             items.append({"role": "assistant", "content": message.content})
         else:
             if message.provider_item_id is None:
                 raise ProviderResponseError("Responses assistant output omitted its provider ID")
-            indexed_items.append(
-                (
-                    message.provider_output_index,
-                    {
-                        "type": "message",
-                        "id": message.provider_item_id,
-                        "role": "assistant",
-                        "status": message.provider_status or "completed",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": message.content,
-                                "annotations": [],
-                                "logprobs": [],
-                            }
-                        ],
-                    },
-                )
-            )
+            output_message: JsonObject = {
+                "type": "message",
+                "id": message.provider_item_id,
+                "role": "assistant",
+                "status": message.provider_status or "completed",
+                "content": (
+                    [
+                        {
+                            "type": "output_text",
+                            "text": message.content,
+                            "annotations": [],
+                            "logprobs": [],
+                        }
+                    ]
+                    if message.content is not None
+                    else []
+                ),
+            }
+            if message.provider_phase is not None:
+                output_message["phase"] = message.provider_phase
+            indexed_items.append((message.provider_output_index, output_message))
     for call in message.tool_calls:
         item: JsonObject = {
             "type": "function_call",

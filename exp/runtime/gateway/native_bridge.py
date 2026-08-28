@@ -77,6 +77,7 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_observability import NativeObservabilityMixin
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
+    continuation_route_binding,
     continued_request,
     remember_turn,
     responses_envelope,
@@ -111,10 +112,58 @@ from exp.runtime.openai_protocol.errors import (
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
+    ContinuationRouteBinding,
     ProtocolNamespace,
     episode_namespace,
     replay_key,
 )
+
+
+def _continuation_binding_error() -> OpenAIProtocolError:
+    """Return the public fail-closed error for unavailable replay authority."""
+    return OpenAIProtocolError(
+        status_code=400,
+        code="continuation_unavailable",
+        message=(
+            "previous_response_id cannot be replayed on its original provider authority. "
+            "Resend the full conversation history in this request."
+        ),
+        param="previous_response_id",
+    )
+
+
+def _select_bound_continuation_route(
+    route: GatewayRoute,
+    binding: ContinuationRouteBinding | None,
+) -> GatewayRoute:
+    """Pin retained encrypted reasoning to its exact winning deployment."""
+    if binding is None:
+        return route
+    indexes = tuple(
+        index
+        for index, deployment in enumerate(route.deployments)
+        if deployment.deployment_id == binding.deployment_id
+        and deployment.connection_sha256 == binding.connection_sha256
+    )
+    if len(indexes) != 1:
+        raise _continuation_binding_error()
+    return select_route_deployments(route, indexes)
+
+
+def _require_bound_wire_authority(
+    binding: ContinuationRouteBinding | None,
+    route: GatewayRoute,
+    resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...],
+) -> None:
+    """Reject credential or wire drift for retained encrypted reasoning."""
+    if binding is None:
+        return
+    if len(route.deployments) != 1 or len(resolved_wires) != 1:
+        raise _continuation_binding_error()
+    observed = continuation_route_binding(route.deployment, resolved_wires[0][0])
+    if observed != binding:
+        raise _continuation_binding_error()
+
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
 _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
@@ -433,6 +482,12 @@ class NativeControlPlane(NativeObservabilityMixin):
                 request,
                 continuation=continuation_context,
             )
+            route = _select_bound_continuation_route(
+                route,
+                None
+                if continuation_context is None
+                else continuation_context.required_route_binding,
+            )
             # A rung that is dead at admission (a lost credential, a drifted
             # connection) is skipped so a live fallback still serves the
             # request instead of the whole request failing on a dead lead.
@@ -443,6 +498,11 @@ class NativeControlPlane(NativeObservabilityMixin):
                 fallback_available=bool(dispatchable.indexes),
             )
             if not dispatchable.indexes:
+                if (
+                    continuation_context is not None
+                    and continuation_context.required_route_binding is not None
+                ):
+                    raise _continuation_binding_error()
                 # Every certified rung was operationally dead at admission;
                 # there is nothing live to serve, so the accepted request is
                 # finished closed.
@@ -452,8 +512,24 @@ class NativeControlPlane(NativeObservabilityMixin):
                 )
             route = select_route_deployments(route, dispatchable.indexes)
             resolved_wires = dispatchable.resolved_wires
+            _require_bound_wire_authority(
+                None
+                if continuation_context is None
+                else continuation_context.required_route_binding,
+                route,
+                resolved_wires,
+            )
         except NativeDialectUnavailableError as exc:
             return self._escalate_accepted(authorization, str(exc))
+        except OpenAIProtocolError as exc:
+            self._accounting.finish_request_quietly(
+                authorization,
+                GatewayFailure(
+                    failure_class=GatewayFailureClass.INTERNAL,
+                    safe_message="retained provider continuation authority was unavailable",
+                ),
+            )
+            raise NativeBridgeError(exc) from exc
         except Exception as exc:  # noqa: BLE001 - raised after route packaging below.
             probe_failure = exc
         if route is not None and self._native_route_eligible is not None:
@@ -551,6 +627,15 @@ class NativeControlPlane(NativeObservabilityMixin):
                     else FrozenDispatchBinding(
                         url=profile.url,
                         body_sha256=sha256_bytes(upstream_body.encode("utf-8")),
+                    )
+                )
+            if continuation_context is not None:
+                continuation_context.route_bindings = tuple(
+                    continuation_route_binding(deployment, profile)
+                    for deployment, (profile, _client) in zip(
+                        route.deployments,
+                        resolved_wires,
+                        strict=True,
                     )
                 )
         except (ProviderParameterError, ProviderCapabilityError) as exc:
@@ -846,11 +931,21 @@ class NativeControlPlane(NativeObservabilityMixin):
         data = json.loads(argument)
         request_id = str(data["request_id"])
         entry = self._accounting.entry(request_id)
-        context = entry.continuation if entry is not None else None
-        if context is None:
+        if entry is None or entry.continuation is None:
             return "{}"
+        context = entry.continuation
+        route_binding = None
+        if entry.active_attempt_id is not None:
+            depth = entry.attempt_depths.get(entry.active_attempt_id)
+            if depth is not None and depth < len(context.route_bindings):
+                route_binding = context.route_bindings[depth]
         try:
-            remember_turn(self._continuations, context=context, data=data)
+            remember_turn(
+                self._continuations,
+                context=context,
+                data=data,
+                route_binding=route_binding,
+            )
         except OpenAIProtocolError as exc:
             raise NativeBridgeError(exc) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.

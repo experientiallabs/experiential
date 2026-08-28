@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import pytest
 from pydantic import ValidationError
 
@@ -349,6 +351,50 @@ def test_provider_replay_identity_hashes_exact_tool_and_message_state() -> None:
     assert canonical_request_sha256(original) != canonical_request_sha256(
         request(item_id="fc_1", raw_arguments='{"q":"x"}', output_index=3)
     )
+
+
+def test_provider_replay_identity_hashes_status_phase_and_idless_call_order() -> None:
+    """Excluded OpenAI item fields remain authenticated canonical authority."""
+    from exp.runtime.gateway.contracts import canonical_request_sha256
+
+    def request(
+        *,
+        message_status: Literal["in_progress", "completed", "incomplete"] = "incomplete",
+        phase: Literal["commentary", "final_answer"] = "commentary",
+        call_status: Literal["in_progress", "completed", "incomplete"] = "incomplete",
+    ) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="assistant",
+                    content="checking",
+                    provider_item_id="msg-commentary",
+                    provider_output_index=1,
+                    provider_status=message_status,
+                    provider_phase=phase,
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-required",
+                            name="lookup",
+                            arguments={},
+                            raw_arguments="{}",
+                            provider_output_index=2,
+                            provider_status=call_status,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    original = request()
+    other_phase = request(phase="final_answer")
+    other_message_status = request(message_status="completed")
+    other_call_status = request(call_status="completed")
+    assert original.model_dump(mode="json") == other_phase.model_dump(mode="json")
+    assert canonical_request_sha256(original) != canonical_request_sha256(other_phase)
+    assert canonical_request_sha256(original) != canonical_request_sha256(other_message_status)
+    assert canonical_request_sha256(original) != canonical_request_sha256(other_call_status)
 
 
 def test_reasoning_stream_events_require_their_payloads() -> None:

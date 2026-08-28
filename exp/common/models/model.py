@@ -228,8 +228,10 @@ class ToolCall(ContractModel):
                 raise ValueError("raw tool arguments must encode one JSON object") from exc
             if parsed != self.arguments:
                 raise ValueError("raw tool arguments must match parsed tool arguments")
-        if self.provider_status is not None and self.provider_item_id is None:
-            raise ValueError("provider tool-call status requires retained item identity")
+        if self.provider_item_id is not None and self.provider_output_index is None:
+            raise ValueError("provider tool-call item identity requires retained output order")
+        if self.provider_status is not None and self.provider_output_index is None:
+            raise ValueError("provider tool-call status requires retained output order")
         return self
 
     def arguments_json(self, *, sort_keys: bool = False, compact: bool = False) -> str:

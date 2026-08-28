@@ -14,7 +14,7 @@ from typing import Protocol
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ContractModel, Sha256
+from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
@@ -354,11 +354,20 @@ class BoundedReplayStore:
             self._response_bytes -= entry.size_bytes
 
 
+class ContinuationRouteBinding(ContractModel):
+    """Secret-free authority binding for retained encrypted reasoning."""
+
+    deployment_id: ArtifactId
+    connection_sha256: Sha256
+    wire_authority_sha256: Sha256
+
+
 class ContinuationState(ContractModel):
     """Bounded content-bearing Responses continuation retained only in memory."""
 
     episode_key: Sha256
     messages: tuple[GatewayMessage, ...]
+    route_binding: ContinuationRouteBinding | None = None
 
     @property
     def size_bytes(self) -> int:
@@ -371,6 +380,7 @@ class ContinuationState(ContractModel):
                 authority["provider_item_id"] = message.provider_item_id
                 authority["provider_output_index"] = message.provider_output_index
                 authority["provider_status"] = message.provider_status
+                authority["provider_phase"] = message.provider_phase
             if message.provider_reasoning:
                 blocks: list[dict[str, object]] = []
                 for block in message.provider_reasoning:

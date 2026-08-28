@@ -829,6 +829,98 @@ def test_responses_decoder_replays_output_message_in_provider_order() -> None:
     assert payload_input[2]["status"] == "completed"
 
 
+def test_responses_decoder_preserves_multiple_official_output_message_phases() -> None:
+    """Official SDK output messages keep distinct identity, status, phase, and order."""
+    from openai.types.responses.response_output_message import ResponseOutputMessage
+
+    commentary = ResponseOutputMessage.model_validate(
+        {
+            "type": "message",
+            "id": "msg_commentary",
+            "role": "assistant",
+            "status": "incomplete",
+            "phase": "commentary",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "I am checking.",
+                    "annotations": [],
+                }
+            ],
+        }
+    ).model_dump(mode="json", exclude_none=True)
+    final = ResponseOutputMessage.model_validate(
+        {
+            "type": "message",
+            "id": "msg_final",
+            "role": "assistant",
+            "status": "completed",
+            "phase": "final_answer",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "Done.",
+                    "annotations": [],
+                }
+            ],
+        }
+    ).model_dump(mode="json", exclude_none=True)
+
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                commentary,
+                {
+                    "type": "function_call",
+                    "call_id": "call-between",
+                    "name": "lookup",
+                    "arguments": "{}",
+                    "status": "incomplete",
+                },
+                final,
+            ],
+        }
+    )
+
+    assistant_messages = tuple(
+        message for message in decoded.request.messages if message.role == "assistant"
+    )
+    assert [message.provider_item_id for message in assistant_messages] == [
+        "msg_commentary",
+        None,
+        "msg_final",
+    ]
+    assert [message.provider_phase for message in assistant_messages] == [
+        "commentary",
+        None,
+        "final_answer",
+    ]
+    call = assistant_messages[1].tool_calls[0]
+    assert call.call_id == "call-between"
+    assert call.provider_item_id is None
+    assert call.provider_output_index == 1
+    assert call.provider_status == "incomplete"
+
+    payload = openai_responses_stream_payload(
+        "gpt-fixture",
+        decoded.request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    replay = cast(list[JsonObject], payload["input"])
+    assert [(item["type"], item.get("id")) for item in replay] == [
+        ("message", "msg_commentary"),
+        ("function_call", None),
+        ("message", "msg_final"),
+    ]
+    assert replay[0]["phase"] == "commentary"
+    assert replay[0]["status"] == "incomplete"
+    assert replay[1]["call_id"] == "call-between"
+    assert replay[1]["status"] == "incomplete"
+    assert replay[2]["phase"] == "final_answer"
+
+
 @pytest.mark.parametrize(
     ("item", "param"),
     (

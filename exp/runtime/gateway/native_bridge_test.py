@@ -890,8 +890,10 @@ def _configured_pool_gateway(
     base_urls: tuple[str, str] = ("http://127.0.0.1:9/v1", "http://127.0.0.1:10/v1"),
     gateway_capabilities: tuple[GatewayDeploymentCapabilities, GatewayDeploymentCapabilities]
     | None = None,
-    model_capabilities: tuple[ModelCapabilities, ModelCapabilities] | None = None,
     api_key_envs: tuple[str, str] = ("TEST_PROVIDER_KEY", "TEST_PROVIDER_KEY"),
+    provider: str = "openai-compatible",
+    provider_models: tuple[str, str] = ("alpha-model-exact", "beta-model-exact"),
+    model_capabilities: tuple[ModelCapabilities, ModelCapabilities] | None = None,
 ) -> tuple[GatewayManagement, str]:
     """Create one certified two-deployment pool alias, grant, and key.
 
@@ -904,6 +906,9 @@ def _configured_pool_gateway(
         api_key_envs: One credential environment-variable name per ordered
             deployment, so a test can make one rung's credential resolvable
             while another is absent.
+        provider: Provider implementation shared by both pool deployments.
+        provider_models: Exact provider model spelling for each deployment.
+        model_capabilities: Optional exact model capabilities per deployment.
 
     Returns:
         The management handle and the issued raw key.
@@ -930,20 +935,21 @@ def _configured_pool_gateway(
         ModelCapabilities(),
         ModelCapabilities(),
     )
-    for alias, base_url, gateway_capability, model_capability, api_key_env in zip(
+    for alias, base_url, gateway_capability, model_capability, api_key_env, provider_model in zip(
         ("alpha", "beta"),
         base_urls,
         declared_gateway_capabilities,
         declared_model_capabilities,
         api_key_envs,
+        provider_models,
         strict=True,
     ):
         upsert_connection(
             root,
             name=f"{alias}-provider",
             connection=ConnectionConfig(
-                provider="openai-compatible",
-                base_url=base_url,
+                provider=provider,
+                base_url=base_url if provider == "openai-compatible" else None,
                 api_key_env=api_key_env,
             ),
             replace=False,
@@ -952,7 +958,7 @@ def _configured_pool_gateway(
             root,
             deployment_alias=alias,
             connection_name=f"{alias}-provider",
-            provider_model=f"{alias}-model-exact",
+            provider_model=provider_model,
             exact_model_id="model-revision-exact",
             revision=None,
             capabilities=model_capability,
@@ -1356,6 +1362,144 @@ def _partial_pool_control_plane(
     )
     components = load_gateway_components(root, environment=environment)
     return NativeControlPlane(components), raw_key
+
+
+def _openai_responses_pool_control_plane(
+    root: Path,
+    environment: dict[str, str],
+) -> tuple[NativeControlPlane, str]:
+    """Load two native Responses rungs with independently mutable credentials."""
+    reasoning_capabilities = ModelCapabilities(
+        supports_reasoning=True,
+        supports_tools=True,
+        supports_temperature=False,
+    )
+    _manager, raw_key = _configured_pool_gateway(
+        root,
+        api_key_envs=("TEST_ALPHA_KEY", "TEST_BETA_KEY"),
+        provider="openai",
+        provider_models=("gpt-5.6-sol", "gpt-5.6-sol"),
+        model_capabilities=(reasoning_capabilities, reasoning_capabilities),
+    )
+    return NativeControlPlane(load_gateway_components(root, environment=environment)), raw_key
+
+
+@pytest.mark.parametrize("rotated_beta", (None, "beta-secret-rotated"))
+def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
+    tmp_path: Path,
+    rotated_beta: str | None,
+) -> None:
+    """Retained ciphertext can replay only on its exact winning authenticated wire."""
+    environment = {"TEST_ALPHA_KEY": "alpha-secret", "TEST_BETA_KEY": "beta-secret"}
+    control, raw_key = _openai_responses_pool_control_plane(tmp_path, environment)
+    first = _admit_responses(control, raw_key, _responses_body())
+    initial_route = cast("list[JsonObject]", first["route"])
+    assert [wire["deployment_id"] for wire in initial_route] == ["alpha", "beta"]
+
+    lead = _start_first(control, first)
+    assert lead["route_depth"] == 0
+    control.settle(
+        json.dumps(
+            {
+                "request_id": first["request_id"],
+                "attempt_id": lead["attempt_id"],
+                "outcome": "failed",
+                "usage": None,
+                "tool_names": [],
+                "failure": {
+                    "failure_class": "provider_internal",
+                    "safe_message": "provider service failed; retry after a short delay",
+                },
+                "finalize": False,
+                "opened": False,
+            }
+        )
+    )
+    fallback = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": first["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": {
+                        "failure_class": "provider_internal",
+                        "safe_message": "provider service failed; retry after a short delay",
+                        "retryable_same_deployment": False,
+                        "failover_eligible": True,
+                    },
+                }
+            )
+        )
+    )
+    assert fallback["route_depth"] == 1
+    entry = control._accounting.entry(_admitted_request_id(first))  # noqa: SLF001
+    assert entry is not None and entry.continuation is not None
+    namespace = entry.continuation.namespace
+    control.remember(
+        json.dumps(
+            {
+                "request_id": first["request_id"],
+                "text": "",
+                "refusal": False,
+                "encrypted_reasoning": [
+                    {
+                        "output_index": 0,
+                        "item_id": "rs-beta",
+                        "encrypted_content": "beta-bound-ciphertext",
+                        "status": "completed",
+                    }
+                ],
+                "tool_calls": [],
+            }
+        )
+    )
+    response_id = stable_public_id("resp", _admitted_request_id(first))
+    retained = control._continuations.resolve_now(  # noqa: SLF001
+        namespace=namespace,
+        previous_response_id=response_id,
+    )
+    assert retained.route_binding is not None
+    assert retained.route_binding.deployment_id == "beta"
+    assert "beta-secret" not in retained.model_dump_json()
+    control.settle(
+        json.dumps(
+            {
+                "request_id": first["request_id"],
+                "attempt_id": fallback["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 5, "output_tokens": 3},
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+
+    pinned = _admit_responses(
+        control,
+        raw_key,
+        _responses_body(previous_response_id=response_id),
+    )
+    pinned_route = cast("list[JsonObject]", pinned["route"])
+    assert [wire["deployment_id"] for wire in pinned_route] == ["beta"]
+
+    if rotated_beta is None:
+        del environment["TEST_BETA_KEY"]
+    else:
+        environment["TEST_BETA_KEY"] = rotated_beta
+    assert environment["TEST_ALPHA_KEY"] == "alpha-secret"
+    with pytest.raises(NativeBridgeError) as rejected:
+        _admit_responses(
+            control,
+            raw_key,
+            _responses_body(previous_response_id=response_id),
+        )
+    error = json.loads(rejected.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "continuation_unavailable"
+    assert error["param"] == "previous_response_id"
 
 
 def test_admit_skips_a_dead_lead_rung_and_serves_the_fallback(tmp_path: Path) -> None:

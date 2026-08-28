@@ -47,8 +47,10 @@ pub fn output_argument(request_id: &str, events: &[Event]) -> String {
     let mut tool_calls: Vec<Value> = Vec::new();
     for event in events {
         match event {
-            Event::TextDelta(delta) => text.push_str(delta),
-            Event::RefusalDelta(_) => refusal = true,
+            Event::TextDelta(delta) | Event::ProviderTextDelta { delta, .. } => {
+                text.push_str(delta);
+            }
+            Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. } => refusal = true,
             Event::ToolCallCompleted { call, .. } => {
                 tool_calls.push(json!({
                     "call_id": call.call_id,
@@ -76,13 +78,15 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
     for event in events {
         match event {
             Event::RefusalDelta(_)
+            | Event::ProviderRefusalDelta { .. }
             | Event::ProviderOutputItemStarted { .. }
+            | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
             | Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
             | Event::EncryptedReasoning { .. } => {}
-            Event::TextDelta(_) => {
+            Event::TextDelta(_) | Event::ProviderTextDelta { .. } => {
                 if inserted {
                     continue;
                 }
@@ -150,6 +154,7 @@ mod tests {
                     call_id: "call-1".to_string(),
                     name: "lookup".to_string(),
                     provider_item_id: None,
+                    provider_status: None,
                     raw_arguments: "{\"q\":\"x\"}".to_string(),
                 },
             },
@@ -206,6 +211,7 @@ mod tests {
                     call_id: "call-1".to_string(),
                     name: "lookup".to_string(),
                     provider_item_id: None,
+                    provider_status: None,
                     raw_arguments: "{}".to_string(),
                 },
             },

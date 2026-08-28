@@ -3,102 +3,58 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::encode::{compact_json, stable_public_id};
 use crate::errors::{Failure, PublicError};
-use crate::events::{CompletedToolCall, Event, ProviderOutputItemKind, Usage};
+use crate::events::{
+    CompletedToolCall, Event, ProviderAssistantMessagePhase, ProviderOutputItemKind,
+    ProviderOutputItemStatus, Usage,
+};
 
+mod aggregate;
+mod envelope;
 mod provider;
+
+pub use aggregate::completed_responses_body;
+pub use envelope::ResponsesEnvelope;
 
 fn invalid_provider_stream(message: &str) -> PublicError {
     PublicError::new(502, "invalid_provider_stream", message, "api_error")
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn default_tool_choice() -> Value {
-    Value::String("auto".to_string())
-}
-
-fn default_tools() -> Value {
-    Value::Array(Vec::new())
-}
-
-fn default_reasoning() -> Value {
-    json!({"effort": Value::Null, "summary": Value::Null})
-}
-
-/// Request-reflecting envelope fields built by the control plane from the
-/// canonical execution request, embedded verbatim in every response object.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ResponsesEnvelope {
-    #[serde(default)]
-    pub metadata: Value,
-    #[serde(default = "default_true")]
-    pub parallel_tool_calls: bool,
-    #[serde(default)]
-    pub temperature: Value,
-    #[serde(default)]
-    pub top_p: Value,
-    #[serde(default = "default_reasoning")]
-    pub reasoning: Value,
-    #[serde(default)]
-    pub ignored_parameters: Vec<String>,
-    #[serde(default = "default_tool_choice")]
-    pub tool_choice: Value,
-    #[serde(default = "default_tools")]
-    pub tools: Value,
-    #[serde(default)]
-    pub max_output_tokens: Value,
-    #[serde(default)]
-    pub previous_response_id: Value,
-    #[serde(default)]
-    pub include_encrypted_reasoning: bool,
-}
-
-impl Default for ResponsesEnvelope {
-    fn default() -> Self {
-        Self {
-            metadata: Value::Null,
-            parallel_tool_calls: true,
-            temperature: Value::Null,
-            top_p: Value::Null,
-            reasoning: default_reasoning(),
-            ignored_parameters: Vec::new(),
-            tool_choice: default_tool_choice(),
-            tools: default_tools(),
-            max_output_tokens: Value::Null,
-            previous_response_id: Value::Null,
-            include_encrypted_reasoning: false,
-        }
-    }
-}
-
 /// One accumulated Responses function call with stable item and output indices.
 struct ToolState {
-    item_id: String,
+    item_id: Option<String>,
     output_index: usize,
     call_id: String,
     name: String,
     arguments: String,
+    status: Option<ProviderOutputItemStatus>,
     done: bool,
 }
 
 impl ToolState {
     /// The current official Responses function-call item.
-    fn item(&self, completed: bool) -> Value {
-        json!({
-            "id": self.item_id,
-            "type": "function_call",
-            "call_id": self.call_id,
-            "name": self.name,
-            "arguments": self.arguments,
-            "status": if completed { "completed" } else { "in_progress" },
-        })
+    fn item(&self, fallback_status: ProviderOutputItemStatus) -> Value {
+        if let Some(item_id) = &self.item_id {
+            json!({
+                "id": item_id,
+                "type": "function_call",
+                "call_id": self.call_id,
+                "name": self.name,
+                "arguments": self.arguments,
+                "status": self.status.unwrap_or(fallback_status).as_str(),
+            })
+        } else {
+            json!({
+                "type": "function_call",
+                "call_id": self.call_id,
+                "name": self.name,
+                "arguments": self.arguments,
+                "status": self.status.unwrap_or(fallback_status).as_str(),
+            })
+        }
     }
 }
 
@@ -109,11 +65,18 @@ struct ReasoningState {
     output_index: usize,
     parts: BTreeMap<u32, String>,
     encrypted_content: Option<String>,
+    status: Option<ProviderOutputItemStatus>,
+    done: bool,
 }
 
 impl ReasoningState {
-    fn item(&self, completed: bool, include_encrypted_content: bool) -> Value {
-        let summary: Vec<Value> = if completed {
+    fn item(
+        &self,
+        include_content: bool,
+        fallback_status: ProviderOutputItemStatus,
+        include_encrypted_content: bool,
+    ) -> Value {
+        let summary: Vec<Value> = if include_content {
             self.parts
                 .values()
                 .map(|text| json!({"type": "summary_text", "text": text}))
@@ -125,7 +88,7 @@ impl ReasoningState {
             "id": self.item_id,
             "type": "reasoning",
             "summary": summary,
-            "status": if completed { "completed" } else { "in_progress" },
+            "status": self.status.unwrap_or(fallback_status).as_str(),
         });
         if include_encrypted_content {
             if let Some(encrypted) = &self.encrypted_content {
@@ -140,14 +103,62 @@ impl ReasoningState {
 
 /// Provider-owned output item reserved before its content-bearing event.
 struct ProviderOutputStart {
-    item_id: String,
+    item_id: Option<String>,
     kind: ProviderOutputItemKind,
     output_index: usize,
+    status: Option<ProviderOutputItemStatus>,
+    phase: Option<ProviderAssistantMessagePhase>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MessageKey {
+    Synthetic,
+    Provider(u32),
+}
+
+/// One independently addressable assistant message output item.
+struct MessageState {
+    item_id: String,
+    output_index: usize,
+    status: Option<ProviderOutputItemStatus>,
+    phase: Option<ProviderAssistantMessagePhase>,
+    text: String,
+    refusal: String,
+    text_started: bool,
+    refusal_started: bool,
+    done: bool,
+}
+
+impl MessageState {
+    fn item(&self, include_content: bool, fallback_status: ProviderOutputItemStatus) -> Value {
+        let mut content = Vec::new();
+        if include_content && self.text_started {
+            content.push(json!({
+                "type": "output_text",
+                "text": self.text,
+                "annotations": [],
+            }));
+        }
+        if include_content && self.refusal_started {
+            content.push(json!({"type": "refusal", "refusal": self.refusal}));
+        }
+        let mut item = json!({
+            "id": self.item_id,
+            "type": "message",
+            "role": "assistant",
+            "status": self.status.unwrap_or(fallback_status).as_str(),
+            "content": content,
+        });
+        if let Some(phase) = self.phase {
+            item["phase"] = json!(phase.as_str());
+        }
+        item
+    }
 }
 
 #[derive(Clone, Copy)]
 enum OutputSlot {
-    Message,
+    Message(MessageKey),
     Tool(u32),
     Reasoning(u32),
 }
@@ -156,7 +167,7 @@ enum OutputSlot {
 /// emitting byte-identical frames to the Python `ResponsesSseEncoder`.
 pub struct ResponsesSseEncoder {
     response_id: String,
-    message_id: String,
+    synthetic_message_id: String,
     model: String,
     created_at: f64,
     envelope: ResponsesEnvelope,
@@ -166,12 +177,8 @@ pub struct ResponsesSseEncoder {
     output_order: Vec<OutputSlot>,
     tools: HashMap<u32, ToolState>,
     reasoning: HashMap<u32, ReasoningState>,
+    messages: HashMap<MessageKey, MessageState>,
     provider_output_starts: HashMap<u32, ProviderOutputStart>,
-    message_output_index: Option<usize>,
-    text: String,
-    refusal: String,
-    text_started: bool,
-    refusal_started: bool,
     usage: Option<Usage>,
 }
 
@@ -184,7 +191,7 @@ impl ResponsesSseEncoder {
     ) -> Self {
         Self {
             response_id: stable_public_id("resp", request_id),
-            message_id: stable_public_id("msg", request_id),
+            synthetic_message_id: stable_public_id("msg", request_id),
             model: model.to_string(),
             created_at,
             envelope,
@@ -194,12 +201,8 @@ impl ResponsesSseEncoder {
             output_order: Vec::new(),
             tools: HashMap::new(),
             reasoning: HashMap::new(),
+            messages: HashMap::new(),
             provider_output_starts: HashMap::new(),
-            message_output_index: None,
-            text: String::new(),
-            refusal: String::new(),
-            text_started: false,
-            refusal_started: false,
             usage: None,
         }
     }
@@ -236,13 +239,56 @@ impl ResponsesSseEncoder {
             ));
         }
         match event {
-            Event::TextDelta(delta) => self.content_delta(true, delta),
-            Event::RefusalDelta(delta) => self.content_delta(false, delta),
+            Event::TextDelta(delta) => self.content_delta(MessageKey::Synthetic, None, true, delta),
+            Event::RefusalDelta(delta) => {
+                self.content_delta(MessageKey::Synthetic, None, false, delta)
+            }
+            Event::ProviderTextDelta {
+                output_index,
+                item_id,
+                delta,
+            } => self.content_delta(
+                MessageKey::Provider(*output_index),
+                Some(item_id),
+                true,
+                delta,
+            ),
+            Event::ProviderRefusalDelta {
+                output_index,
+                item_id,
+                delta,
+            } => self.content_delta(
+                MessageKey::Provider(*output_index),
+                Some(item_id),
+                false,
+                delta,
+            ),
             Event::ProviderOutputItemStarted {
                 output_index,
                 item_id,
                 kind,
-            } => self.provider_output_item_started(*output_index, item_id, *kind),
+                status,
+                phase,
+            } => self.provider_output_item_started(
+                *output_index,
+                item_id.as_deref(),
+                *kind,
+                *status,
+                *phase,
+            ),
+            Event::ProviderOutputItemCompleted {
+                output_index,
+                item_id,
+                kind,
+                status,
+                phase,
+            } => self.provider_output_item_completed(
+                *output_index,
+                item_id.as_deref(),
+                *kind,
+                *status,
+                *phase,
+            ),
             Event::ReasoningSummaryDelta {
                 output_index,
                 summary_index,
@@ -288,33 +334,62 @@ impl ResponsesSseEncoder {
     }
 
     /// Start one output message/content part as needed and emit its delta.
-    fn content_delta(&mut self, is_text: bool, delta: &str) -> Result<Vec<String>, PublicError> {
+    fn content_delta(
+        &mut self,
+        key: MessageKey,
+        provider_item_id: Option<&str>,
+        is_text: bool,
+        delta: &str,
+    ) -> Result<Vec<String>, PublicError> {
         let mut frames: Vec<String> = Vec::new();
-        let output_index = self.ensure_message(&mut frames);
+        self.ensure_message(key, provider_item_id, &mut frames)?;
         let content_index = 0;
-        if is_text {
-            if self.refusal_started {
+        let (item_id, output_index, start_part) = {
+            let state = self.messages.get_mut(&key).expect("message just ensured");
+            if state.done {
+                return Err(invalid_provider_stream(
+                    "Responses content arrived after message completion.",
+                ));
+            }
+            if is_text && state.refusal_started {
                 return Err(invalid_provider_stream(
                     "Responses output cannot mix text and refusal deltas.",
                 ));
             }
-            if !self.text_started {
-                self.text_started = true;
+            if !is_text && state.text_started {
+                return Err(invalid_provider_stream(
+                    "Responses output cannot mix text and refusal deltas.",
+                ));
+            }
+            let start_part = if is_text {
+                let start = !state.text_started;
+                state.text_started = true;
+                state.text.push_str(delta);
+                start
+            } else {
+                let start = !state.refusal_started;
+                state.refusal_started = true;
+                state.refusal.push_str(delta);
+                start
+            };
+            (state.item_id.clone(), state.output_index, start_part)
+        };
+        if is_text {
+            if start_part {
                 frames.push(self.event(
                     "response.content_part.added",
                     json!({
-                        "item_id": self.message_id,
+                        "item_id": item_id,
                         "output_index": output_index,
                         "content_index": content_index,
                         "part": {"type": "output_text", "text": "", "annotations": []},
                     }),
                 ));
             }
-            self.text.push_str(delta);
             frames.push(self.event(
                 "response.output_text.delta",
                 json!({
-                    "item_id": self.message_id,
+                    "item_id": item_id,
                     "output_index": output_index,
                     "content_index": content_index,
                     "delta": delta,
@@ -322,28 +397,21 @@ impl ResponsesSseEncoder {
                 }),
             ));
         } else {
-            if self.text_started {
-                return Err(invalid_provider_stream(
-                    "Responses output cannot mix text and refusal deltas.",
-                ));
-            }
-            if !self.refusal_started {
-                self.refusal_started = true;
+            if start_part {
                 frames.push(self.event(
                     "response.content_part.added",
                     json!({
-                        "item_id": self.message_id,
+                        "item_id": item_id,
                         "output_index": output_index,
                         "content_index": content_index,
                         "part": {"type": "refusal", "refusal": ""},
                     }),
                 ));
             }
-            self.refusal.push_str(delta);
             frames.push(self.event(
                 "response.refusal.delta",
                 json!({
-                    "item_id": self.message_id,
+                    "item_id": item_id,
                     "output_index": output_index,
                     "content_index": content_index,
                     "delta": delta,
@@ -354,21 +422,51 @@ impl ResponsesSseEncoder {
     }
 
     /// Create one stable assistant output item before its first content part.
-    fn ensure_message(&mut self, frames: &mut Vec<String>) -> usize {
-        if let Some(index) = self.message_output_index {
-            return index;
+    fn ensure_message(
+        &mut self,
+        key: MessageKey,
+        provider_item_id: Option<&str>,
+        frames: &mut Vec<String>,
+    ) -> Result<(), PublicError> {
+        if let Some(state) = self.messages.get(&key) {
+            if provider_item_id.is_none_or(|item_id| state.item_id == item_id) {
+                return Ok(());
+            }
+            return Err(invalid_provider_stream(
+                "Responses message item changed provider identity.",
+            ));
         }
         let index = self.output_order.len();
-        self.message_output_index = Some(index);
-        self.output_order.push(OutputSlot::Message);
+        let item_id = match key {
+            MessageKey::Synthetic => self.synthetic_message_id.clone(),
+            MessageKey::Provider(_) => provider_item_id
+                .ok_or_else(|| {
+                    invalid_provider_stream("Responses provider message omitted its item ID.")
+                })?
+                .to_string(),
+        };
+        let state = MessageState {
+            item_id,
+            output_index: index,
+            status: None,
+            phase: None,
+            text: String::new(),
+            refusal: String::new(),
+            text_started: false,
+            refusal_started: false,
+            done: false,
+        };
+        let item = state.item(false, ProviderOutputItemStatus::InProgress);
+        self.messages.insert(key, state);
+        self.output_order.push(OutputSlot::Message(key));
         frames.push(self.event(
             "response.output_item.added",
             json!({
                 "output_index": index,
-                "item": self.message_item(false),
+                "item": item,
             }),
         ));
-        index
+        Ok(())
     }
 
     /// Start one reasoning item/summary part as needed and emit its text delta.
@@ -435,11 +533,20 @@ impl ResponsesSseEncoder {
                 "Responses tool call reused a non-tool provider output item.",
             ));
         }
-        let (item_id, output_index, already_reserved) = match reserved {
-            Some(start) => (start.item_id.clone(), start.output_index, true),
+        let (item_id, output_index, status, already_reserved) = match reserved {
+            Some(start) => (
+                start.item_id.clone(),
+                start.output_index,
+                start.status,
+                true,
+            ),
             None => (
-                stable_public_id("fc", &format!("{}:{}", self.response_id, call_id)),
+                Some(stable_public_id(
+                    "fc",
+                    &format!("{}:{}", self.response_id, call_id),
+                )),
                 self.output_order.len(),
+                None,
                 false,
             ),
         };
@@ -449,13 +556,14 @@ impl ResponsesSseEncoder {
             call_id: call_id.to_string(),
             name: name.to_string(),
             arguments: String::new(),
+            status,
             done: false,
         };
         let frame = self.event(
             "response.output_item.added",
             json!({
                 "output_index": state.output_index,
-                "item": state.item(false),
+                "item": state.item(ProviderOutputItemStatus::InProgress),
             }),
         );
         self.tools.insert(index, state);
@@ -470,6 +578,12 @@ impl ResponsesSseEncoder {
         let state = self.open_tool(index)?;
         state.arguments.push_str(delta);
         let (item_id, output_index) = (state.item_id.clone(), state.output_index);
+        let Some(item_id) = item_id else {
+            // Official OpenAI 3.x function-argument stream events require an
+            // item ID. ID-less calls remain valid and surface their complete
+            // arguments on response.output_item.done instead.
+            return Ok(Vec::new());
+        };
         Ok(vec![self.event(
             "response.function_call_arguments.delta",
             json!({
@@ -491,15 +605,22 @@ impl ResponsesSseEncoder {
         if state.call_id != call.call_id
             || state.name != call.name
             || state.arguments != call.raw_arguments
-            || (provider_owned_identity
-                && call.provider_item_id.as_deref() != Some(state.item_id.as_str()))
+            || (provider_owned_identity && call.provider_item_id != state.item_id)
         {
             return Err(invalid_provider_stream(
                 "Responses tool completion changed streamed identity or bytes.",
             ));
         }
+        if let Some(status) = call.provider_status {
+            if state.status.is_some_and(|existing| existing != status) {
+                return Err(invalid_provider_stream(
+                    "Responses tool completion changed provider status.",
+                ));
+            }
+            state.status = Some(status);
+        }
         state.done = true;
-        Ok(self.close_tool(index))
+        Ok(self.close_tool(index, ProviderOutputItemStatus::Completed))
     }
 
     /// Resolve one already-started, still-open tool index.
@@ -516,50 +637,82 @@ impl ResponsesSseEncoder {
     }
 
     /// Emit one function arguments-done and output-item-done pair.
-    fn close_tool(&mut self, index: u32) -> Vec<String> {
+    fn close_tool(&mut self, index: u32, fallback_status: ProviderOutputItemStatus) -> Vec<String> {
         let (item_id, output_index, arguments, item) = {
             let state = match self.tools.get_mut(&index) {
                 Some(state) => state,
                 None => return Vec::new(),
             };
             state.done = true;
+            if matches!(
+                state.status,
+                None | Some(ProviderOutputItemStatus::InProgress)
+            ) {
+                state.status = Some(fallback_status);
+            }
             (
                 state.item_id.clone(),
                 state.output_index,
                 state.arguments.clone(),
-                state.item(true),
+                state.item(fallback_status),
             )
         };
-        vec![
-            self.event(
+        let mut frames = Vec::new();
+        if let Some(item_id) = item_id {
+            frames.push(self.event(
                 "response.function_call_arguments.done",
                 json!({
                     "item_id": item_id,
                     "output_index": output_index,
                     "arguments": arguments,
                 }),
-            ),
-            self.event(
-                "response.output_item.done",
-                json!({
-                    "output_index": output_index,
-                    "item": item,
-                }),
-            ),
-        ]
+            ));
+        }
+        frames.push(self.event(
+            "response.output_item.done",
+            json!({
+                "output_index": output_index,
+                "item": item,
+            }),
+        ));
+        frames
     }
 
     /// Close open items and emit exactly one Responses terminal lifecycle event.
     fn finish(&mut self, status: &str, failure: Option<&Failure>) -> Vec<String> {
         let mut frames = Vec::new();
+        let fallback_status = if status == "completed" {
+            ProviderOutputItemStatus::Completed
+        } else {
+            ProviderOutputItemStatus::Incomplete
+        };
         for slot in self.output_order.clone() {
             match slot {
-                OutputSlot::Message => frames.extend(self.close_message()),
-                OutputSlot::Tool(index) if !self.tools[&index].done => {
-                    frames.extend(self.close_tool(index));
+                OutputSlot::Message(key) if !self.messages[&key].done => {
+                    let item_status = if key == MessageKey::Synthetic {
+                        ProviderOutputItemStatus::Completed
+                    } else {
+                        fallback_status
+                    };
+                    frames.extend(self.close_message(key, item_status));
                 }
-                OutputSlot::Reasoning(index) => frames.extend(self.close_reasoning(index)),
-                OutputSlot::Tool(_) => {}
+                OutputSlot::Tool(index) if !self.tools[&index].done => {
+                    let item_status = if self.provider_output_starts.contains_key(&index) {
+                        fallback_status
+                    } else {
+                        ProviderOutputItemStatus::Completed
+                    };
+                    frames.extend(self.close_tool(index, item_status));
+                }
+                OutputSlot::Reasoning(index) if !self.reasoning[&index].done => {
+                    let item_status = if self.provider_output_starts.contains_key(&index) {
+                        fallback_status
+                    } else {
+                        ProviderOutputItemStatus::Completed
+                    };
+                    frames.extend(self.close_reasoning(index, item_status));
+                }
+                OutputSlot::Message(_) | OutputSlot::Tool(_) | OutputSlot::Reasoning(_) => {}
             }
         }
         self.terminal = true;
@@ -573,17 +726,35 @@ impl ResponsesSseEncoder {
     }
 
     /// Complete every summary part and its containing reasoning item.
-    fn close_reasoning(&mut self, provider_output_index: u32) -> Vec<String> {
+    fn close_reasoning(
+        &mut self,
+        provider_output_index: u32,
+        fallback_status: ProviderOutputItemStatus,
+    ) -> Vec<String> {
         let (item_id, output_index, parts, item) = {
-            let state = match self.reasoning.get(&provider_output_index) {
+            let state = match self.reasoning.get_mut(&provider_output_index) {
                 Some(state) => state,
                 None => return Vec::new(),
             };
+            if state.done {
+                return Vec::new();
+            }
+            state.done = true;
+            if matches!(
+                state.status,
+                None | Some(ProviderOutputItemStatus::InProgress)
+            ) {
+                state.status = Some(fallback_status);
+            }
             (
                 state.item_id.clone(),
                 state.output_index,
                 state.parts.clone(),
-                state.item(true, self.envelope.include_encrypted_reasoning),
+                state.item(
+                    true,
+                    fallback_status,
+                    self.envelope.include_encrypted_reasoning,
+                ),
             )
         };
         let mut frames = Vec::new();
@@ -614,31 +785,55 @@ impl ResponsesSseEncoder {
         frames
     }
 
-    /// Emit content and output completion for the one assistant message.
-    fn close_message(&mut self) -> Vec<String> {
-        let output_index = match self.message_output_index {
-            Some(index) => index,
-            None => return Vec::new(),
+    /// Emit content and output completion for one assistant message.
+    fn close_message(
+        &mut self,
+        key: MessageKey,
+        fallback_status: ProviderOutputItemStatus,
+    ) -> Vec<String> {
+        let (item_id, output_index, text, refusal, text_started, refusal_started, item) = {
+            let state = match self.messages.get_mut(&key) {
+                Some(state) => state,
+                None => return Vec::new(),
+            };
+            if state.done {
+                return Vec::new();
+            }
+            state.done = true;
+            if matches!(
+                state.status,
+                None | Some(ProviderOutputItemStatus::InProgress)
+            ) {
+                state.status = Some(fallback_status);
+            }
+            (
+                state.item_id.clone(),
+                state.output_index,
+                state.text.clone(),
+                state.refusal.clone(),
+                state.text_started,
+                state.refusal_started,
+                state.item(true, fallback_status),
+            )
         };
         let mut frames: Vec<String> = Vec::new();
         let mut content_index = 0;
-        if self.text_started {
-            let text = self.text.clone();
+        if text_started {
             frames.push(self.event(
                 "response.output_text.done",
                 json!({
-                    "item_id": self.message_id,
+                    "item_id": item_id,
                     "output_index": output_index,
                     "content_index": content_index,
                     "text": text,
                     "logprobs": [],
                 }),
             ));
-            let part = json!({"type": "output_text", "text": self.text, "annotations": []});
+            let part = json!({"type": "output_text", "text": text, "annotations": []});
             frames.push(self.event(
                 "response.content_part.done",
                 json!({
-                    "item_id": self.message_id,
+                    "item_id": item_id,
                     "output_index": output_index,
                     "content_index": content_index,
                     "part": part,
@@ -646,29 +841,27 @@ impl ResponsesSseEncoder {
             ));
             content_index += 1;
         }
-        if self.refusal_started {
-            let refusal = self.refusal.clone();
+        if refusal_started {
             frames.push(self.event(
                 "response.refusal.done",
                 json!({
-                    "item_id": self.message_id,
+                    "item_id": item_id,
                     "output_index": output_index,
                     "content_index": content_index,
                     "refusal": refusal,
                 }),
             ));
-            let part = json!({"type": "refusal", "refusal": self.refusal});
+            let part = json!({"type": "refusal", "refusal": refusal});
             frames.push(self.event(
                 "response.content_part.done",
                 json!({
-                    "item_id": self.message_id,
+                    "item_id": item_id,
                     "output_index": output_index,
                     "content_index": content_index,
                     "part": part,
                 }),
             ));
         }
-        let item = self.message_item(true);
         frames.push(self.event(
             "response.output_item.done",
             json!({
@@ -679,37 +872,29 @@ impl ResponsesSseEncoder {
         frames
     }
 
-    /// The current official Responses assistant-message item.
-    fn message_item(&self, completed: bool) -> Value {
-        let mut content: Vec<Value> = Vec::new();
-        if completed && self.text_started {
-            content.push(json!({"type": "output_text", "text": self.text, "annotations": []}));
-        }
-        if completed && self.refusal_started {
-            content.push(json!({"type": "refusal", "refusal": self.refusal}));
-        }
-        json!({
-            "id": self.message_id,
-            "type": "message",
-            "role": "assistant",
-            "status": if completed { "completed" } else { "in_progress" },
-            "content": content,
-        })
-    }
-
     /// Build one SDK-readable Responses envelope for the current lifecycle state.
     fn response(&self, status: &str, failure: Option<&Failure>) -> Value {
-        let completed = status != "in_progress";
-        let output: Vec<Value> =
-            self.output_order
-                .iter()
-                .map(|slot| match slot {
-                    OutputSlot::Message => self.message_item(completed),
-                    OutputSlot::Tool(index) => self.tools[index].item(completed),
-                    OutputSlot::Reasoning(index) => self.reasoning[index]
-                        .item(completed, self.envelope.include_encrypted_reasoning),
-                })
-                .collect();
+        let include_content = status != "in_progress";
+        let fallback_status = match status {
+            "in_progress" => ProviderOutputItemStatus::InProgress,
+            "completed" => ProviderOutputItemStatus::Completed,
+            _ => ProviderOutputItemStatus::Incomplete,
+        };
+        let output: Vec<Value> = self
+            .output_order
+            .iter()
+            .map(|slot| match slot {
+                OutputSlot::Message(key) => {
+                    self.messages[key].item(include_content, fallback_status)
+                }
+                OutputSlot::Tool(index) => self.tools[index].item(fallback_status),
+                OutputSlot::Reasoning(index) => self.reasoning[index].item(
+                    include_content,
+                    fallback_status,
+                    self.envelope.include_encrypted_reasoning,
+                ),
+            })
+            .collect();
         let error = if status == "failed" {
             json!({
                 "code": "server_error",
@@ -744,7 +929,11 @@ impl ResponsesSseEncoder {
             "tools": self.envelope.tools,
             "max_output_tokens": self.envelope.max_output_tokens,
             "previous_response_id": self.envelope.previous_response_id,
-            "usage": if completed { responses_usage(self.usage.as_ref()) } else { Value::Null },
+            "usage": if include_content {
+                aggregate::responses_usage(self.usage.as_ref())
+            } else {
+                Value::Null
+            },
         });
         if !self.envelope.ignored_parameters.is_empty() {
             response
@@ -772,118 +961,6 @@ impl ResponsesSseEncoder {
         let encoded = compact_json(&Value::Object(payload));
         format!("event: {event_type}\ndata: {encoded}\n\n")
     }
-}
-
-/// Usage shape from `exp.runtime.openai_protocol.streaming._responses_usage`.
-fn responses_usage(usage: Option<&Usage>) -> Value {
-    let usage = match usage {
-        Some(usage) if usage.has_token_counts() => usage,
-        _ => return Value::Null,
-    };
-    let input = usage.input_tokens.unwrap_or(0);
-    let output = usage.output_tokens.unwrap_or(0);
-    json!({
-        "input_tokens": input,
-        "input_tokens_details": {"cached_tokens": usage.cached_input_tokens.unwrap_or(0)},
-        "output_tokens": output,
-        "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
-        "total_tokens": input + output,
-    })
-}
-
-/// The aggregated non-streaming Responses outcome from one event stream.
-pub struct AggregatedResponses {
-    pub body: Value,
-    pub failure: Option<Failure>,
-    pub usage: Option<Usage>,
-    pub incomplete: bool,
-    pub tool_names: Vec<String>,
-}
-
-/// Build one non-streaming public Responses result from ordered events,
-/// mirroring the Responses branch of `completed_body`.
-pub fn completed_responses_body(
-    request_id: &str,
-    model: &str,
-    created_at: f64,
-    envelope: ResponsesEnvelope,
-    events: &[Event],
-) -> Result<AggregatedResponses, PublicError> {
-    let terminal = events.iter().rev().find(|event| event.is_terminal());
-    let terminal = match terminal {
-        Some(event) => event,
-        None => {
-            return Err(PublicError::new(
-                502,
-                "all_routes_failed",
-                "Provider stream ended without a terminal result.",
-                "api_error",
-            ))
-        }
-    };
-    let mut usage: Option<Usage> = None;
-    for event in events.iter().rev() {
-        if let Event::Usage(candidate) = event {
-            if candidate.has_token_counts() {
-                usage = Some(candidate.clone());
-                break;
-            }
-        }
-    }
-    let mut tool_names: Vec<String> = Vec::new();
-    for event in events {
-        if let Event::ToolCallCompleted { call, .. } = event {
-            if !tool_names.contains(&call.name) {
-                tool_names.push(call.name.clone());
-            }
-        }
-    }
-    if let Event::Failed(failure) = terminal {
-        return Ok(AggregatedResponses {
-            body: Value::Null,
-            failure: Some(failure.clone()),
-            usage,
-            incomplete: false,
-            tool_names,
-        });
-    }
-    let mut encoder = ResponsesSseEncoder::new(request_id, model, created_at, envelope);
-    encoder.start()?;
-    let mut terminal_frames: Vec<String> = Vec::new();
-    for event in events {
-        let produced = encoder.feed(event)?;
-        if event.is_terminal() {
-            terminal_frames = produced;
-        }
-        if encoder.saw_terminal() {
-            break;
-        }
-    }
-    let last = terminal_frames.last().ok_or_else(|| {
-        PublicError::new(
-            502,
-            "all_routes_failed",
-            "Responses encoding produced no terminal result.",
-            "api_error",
-        )
-    })?;
-    let data = last
-        .split_once("data: ")
-        .map(|(_, tail)| tail)
-        .unwrap_or_default();
-    let payload: Value =
-        serde_json::from_str(data.trim_end()).map_err(|_| PublicError::internal())?;
-    let body = payload
-        .get("response")
-        .cloned()
-        .ok_or_else(PublicError::internal)?;
-    Ok(AggregatedResponses {
-        body,
-        failure: None,
-        usage,
-        incomplete: matches!(terminal, Event::Incomplete),
-        tool_names,
-    })
 }
 
 #[cfg(test)]

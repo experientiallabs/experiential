@@ -131,7 +131,10 @@ fn is_semantic(event: &Event) -> bool {
         event,
         Event::TextDelta(_)
             | Event::RefusalDelta(_)
+            | Event::ProviderTextDelta { .. }
+            | Event::ProviderRefusalDelta { .. }
             | Event::ProviderOutputItemStarted { .. }
+            | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
             | Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }
@@ -482,7 +485,13 @@ async fn run_attempt(
             }
         };
         track_event(&event, &mut usage, &mut tool_names);
-        if let Event::RefusalDelta(text) = &event {
+        let refusal_text = match &event {
+            Event::RefusalDelta(text) | Event::ProviderRefusalDelta { delta: text, .. } => {
+                Some(text)
+            }
+            _ => None,
+        };
+        if let Some(text) = refusal_text {
             if ctx.policy.refusal_failover {
                 let event_bytes = text.len();
                 if withheld_bytes + event_bytes > MAXIMUM_WITHHELD_REFUSAL_BYTES
@@ -508,7 +517,11 @@ async fn run_attempt(
         if is_semantic(&event) {
             // First outward semantic output freezes this deployment; any
             // withheld refusals flush ahead of it.
-            let visible_refusal = !withheld.is_empty() || matches!(event, Event::RefusalDelta(_));
+            let visible_refusal = !withheld.is_empty()
+                || matches!(
+                    event,
+                    Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+                );
             let mut prefix = std::mem::take(&mut withheld);
             prefix.push(event);
             return AttemptEnd::Committed(Box::new(CommittedAttempt {

@@ -182,9 +182,12 @@ pub(crate) async fn send_bounded(
 /// output already reached (or is reaching) the caller, mirroring the python
 /// executor's committed-refusal rule. Returns the recorded refusal failure.
 pub(crate) fn complete_visible_refusal(events: &mut [Event]) -> Option<Failure> {
-    let visible = events
-        .iter()
-        .any(|event| matches!(event, Event::RefusalDelta(_)));
+    let visible = events.iter().any(|event| {
+        matches!(
+            event,
+            Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+        )
+    });
     if !visible {
         return None;
     }

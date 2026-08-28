@@ -14,17 +14,21 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import Literal, cast
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import ToolCall
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     EncryptedReasoningBlock,
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
+    ContinuationRouteBinding,
     ContinuationState,
     ProtocolNamespace,
     episode_namespace,
@@ -33,6 +37,25 @@ from exp.runtime.openai_protocol.streaming import (
     _responses_tool_choice,  # noqa: PLC2701 - the encoder's envelope rendering is shared.
     stable_public_id,
 )
+
+ProviderStatus = Literal["in_progress", "completed", "incomplete"]
+ProviderPhase = Literal["commentary", "final_answer"]
+
+
+def _provider_status(value: object, *, default: ProviderStatus) -> ProviderStatus:
+    if value is None:
+        return default
+    if value not in ("in_progress", "completed", "incomplete"):
+        raise ValueError("Responses output item status is invalid")
+    return cast(ProviderStatus, value)
+
+
+def _provider_phase(value: object) -> ProviderPhase | None:
+    if value is None:
+        return None
+    if value not in ("commentary", "final_answer"):
+        raise ValueError("Responses assistant message phase is invalid")
+    return cast(ProviderPhase, value)
 
 
 @dataclass
@@ -43,6 +66,8 @@ class ContinuationContext:
     episode_key: str
     response_id: str
     messages: tuple[GatewayMessage, ...]
+    required_route_binding: ContinuationRouteBinding | None = None
+    route_bindings: tuple[ContinuationRouteBinding, ...] = ()
     retain: bool = True
     """Whether the completed turn may be remembered for later continuation.
 
@@ -109,7 +134,41 @@ def continued_request(
             episode_key=continuation.episode_key,
             response_id=stable_public_id("resp", authorization.request_id),
             messages=execution_request.messages,
+            required_route_binding=continuation.route_binding,
             retain=retain,
+        ),
+    )
+
+
+def continuation_route_binding(
+    deployment: ExactModelDeployment,
+    profile: GatewayWireProfile,
+) -> ContinuationRouteBinding:
+    """Bind encrypted reasoning to one deployment and resolved wire authority.
+
+    The retained state stores only digests. Credential-bearing headers and the
+    resolved URL never leave the admission stack, while a credential rotation,
+    endpoint change, project-header change, or model-wire change invalidates a
+    later replay before dispatch.
+
+    Args:
+        deployment: Exact certified deployment selected for dispatch.
+        profile: Fully resolved authenticated provider wire.
+
+    Returns:
+        Secret-free binding retained beside encrypted reasoning.
+    """
+    return ContinuationRouteBinding(
+        deployment_id=deployment.deployment_id,
+        connection_sha256=deployment.connection_sha256,
+        wire_authority_sha256=sha256_json(
+            {
+                "version": "responses-continuation-wire-v1",
+                "dialect": profile.dialect,
+                "url": profile.url,
+                "headers": dict(profile.headers),
+                "model_id": profile.model_id,
+            }
         ),
     )
 
@@ -119,12 +178,15 @@ def remember_turn(
     *,
     context: ContinuationContext,
     data: JsonObject,
+    route_binding: ContinuationRouteBinding | None = None,
 ) -> None:
     """Retain one completed Responses continuation within strict bounds.
 
-    Retention is strict: refusal output and empty assistant turns are never
-    retained, and one oversize continuation fails closed with the shared
-    public error before the data plane flushes its terminal frames.
+    Retention is strict: refusal output and unidentifiable empty assistant
+    turns are never retained, while provider-identified message items retain
+    their exact lifecycle metadata even when their visible text is empty. One
+    oversize continuation fails closed with the shared public error before the
+    data plane flushes its terminal frames.
 
     Args:
         continuations: The gateway's shared bounded continuation store.
@@ -146,26 +208,60 @@ def remember_turn(
     if bool(data.get("refusal")):
         return
     text = str(data.get("text") or "")
-    raw_message_item_id = data.get("message_item_id")
-    raw_message_output_index = data.get("message_output_index")
-    message_item_id: str | None
-    message_output_index: int | None
-    if raw_message_item_id is None and raw_message_output_index is None:
-        message_item_id = None
-        message_output_index = None
-    elif (
-        isinstance(raw_message_item_id, str)
-        and bool(raw_message_item_id)
-        and isinstance(raw_message_output_index, int)
-        and not isinstance(raw_message_output_index, bool)
-        and raw_message_output_index >= 0
-    ):
-        message_item_id = raw_message_item_id
-        message_output_index = raw_message_output_index
-    else:
-        raise ValueError("Responses assistant message identity is invalid")
+    raw_messages = data.get("message_outputs")
+    if raw_messages is None:
+        raw_message_item_id = data.get("message_item_id")
+        raw_message_output_index = data.get("message_output_index")
+        if raw_message_item_id is None and raw_message_output_index is None:
+            raw_messages = []
+        else:
+            raw_messages = [
+                {
+                    "item_id": raw_message_item_id,
+                    "output_index": raw_message_output_index,
+                    "text": text,
+                    "status": "completed",
+                }
+            ]
+            text = ""
+    if not isinstance(raw_messages, list):
+        raise ValueError("Responses assistant message outputs must be an array")
+
+    message_outputs: list[tuple[int, GatewayMessage]] = []
+    indexes: set[int] = set()
+    for item in raw_messages:
+        if not isinstance(item, dict):
+            raise ValueError("Responses assistant message output must be an object")
+        item_id = item.get("item_id")
+        output_index = item.get("output_index")
+        message_text = item.get("text")
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or not isinstance(output_index, int)
+            or isinstance(output_index, bool)
+            or output_index < 0
+            or output_index in indexes
+            or not isinstance(message_text, str)
+        ):
+            raise ValueError("Responses assistant message identity is invalid")
+        indexes.add(output_index)
+        message_outputs.append(
+            (
+                output_index,
+                GatewayMessage(
+                    role="assistant",
+                    content=message_text or None,
+                    provider_item_id=item_id,
+                    provider_output_index=output_index,
+                    provider_status=_provider_status(item.get("status"), default="completed"),
+                    provider_phase=_provider_phase(item.get("phase")),
+                ),
+            )
+        )
     raw_calls = data.get("tool_calls")
-    tool_calls_list: list[ToolCall] = []
+    indexed_calls: list[tuple[int, ToolCall]] = []
+    unindexed_calls: list[ToolCall] = []
     for call in raw_calls if isinstance(raw_calls, list) else ():
         if not isinstance(call, dict):
             raise ValueError("Responses retained tool call must be an object")
@@ -175,34 +271,49 @@ def remember_turn(
             provider_item_id = None
             provider_output_index = None
         elif (
-            isinstance(item_id, str)
-            and bool(item_id)
+            (item_id is None or (isinstance(item_id, str) and bool(item_id)))
             and isinstance(output_index, int)
             and not isinstance(output_index, bool)
             and output_index >= 0
+            and output_index not in indexes
         ):
             provider_item_id = item_id
             provider_output_index = output_index
+            indexes.add(output_index)
         else:
             raise ValueError("Responses retained tool call identity is invalid")
-        raw_arguments = str(call["arguments"])
-        tool_calls_list.append(
-            ToolCall(
-                call_id=str(call["call_id"]),
-                name=str(call["name"]),
-                arguments=json.loads(raw_arguments),
-                raw_arguments=raw_arguments,
-                provider_item_id=provider_item_id,
-                provider_output_index=provider_output_index,
-                provider_status="completed" if provider_item_id is not None else None,
-            )
+        call_id = call["call_id"]
+        name = call["name"]
+        raw_arguments = call["arguments"]
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or not isinstance(name, str)
+            or not name
+            or not isinstance(raw_arguments, str)
+        ):
+            raise ValueError("Responses retained tool call fields are invalid")
+        parsed_call = ToolCall(
+            call_id=call_id,
+            name=name,
+            arguments=json.loads(raw_arguments),
+            raw_arguments=raw_arguments,
+            provider_item_id=provider_item_id,
+            provider_output_index=provider_output_index,
+            provider_status=(
+                _provider_status(call.get("status"), default="completed")
+                if provider_output_index is not None
+                else None
+            ),
         )
-    tool_calls = tuple(tool_calls_list)
+        if provider_output_index is None:
+            unindexed_calls.append(parsed_call)
+        else:
+            indexed_calls.append((provider_output_index, parsed_call))
     raw_encrypted = data.get("encrypted_reasoning", [])
     if not isinstance(raw_encrypted, list):
         raise ValueError("Responses encrypted reasoning must be an array")
     encrypted: list[tuple[int, EncryptedReasoningBlock]] = []
-    indexes: set[int] = set()
     for item in raw_encrypted:
         if not isinstance(item, dict):
             raise ValueError("Responses encrypted reasoning item must be an object")
@@ -228,40 +339,91 @@ def remember_turn(
                     id=item_id,
                     encrypted_content=encrypted_content,
                     output_index=output_index,
-                    status="completed",
+                    status=_provider_status(item.get("status"), default="completed"),
                 ),
             )
         )
-    encrypted.sort(key=lambda item: item[0])
-    provider_reasoning = tuple(block for _index, block in encrypted)
-    if provider_reasoning and any(
-        call.provider_item_id is None or call.provider_output_index is None for call in tool_calls
-    ):
-        raise ValueError("Responses retained tool calls require provider item identity and order")
-    indexed_output = bool(provider_reasoning) or any(
-        call.provider_output_index is not None for call in tool_calls
-    )
-    if text and indexed_output and message_output_index is None:
+    indexed_output = bool(encrypted or indexed_calls or message_outputs)
+    if text and indexed_output:
         raise ValueError(
             "Responses retained assistant text requires provider item identity and order"
         )
-    if not text and not tool_calls and not provider_reasoning:
+    if not text and not unindexed_calls and not indexed_output:
         return
-    message = GatewayMessage(
-        role="assistant",
-        content=text or None,
-        tool_calls=tool_calls,
-        provider_reasoning=provider_reasoning,
-        provider_item_id=message_item_id,
-        provider_output_index=message_output_index,
-        provider_status="completed" if message_item_id is not None else None,
+
+    output_items: list[tuple[int, str, object]] = [
+        *((index, "reasoning", block) for index, block in encrypted),
+        *((index, "call", call) for index, call in indexed_calls),
+        *((index, "message", message) for index, message in message_outputs),
+    ]
+    output_items.sort(key=lambda item: item[0])
+    retained_messages: list[GatewayMessage] = []
+    segment_reasoning: list[EncryptedReasoningBlock] = []
+    segment_calls: list[ToolCall] = []
+    segment_message: GatewayMessage | None = None
+
+    def flush_segment() -> None:
+        nonlocal segment_message
+        if segment_message is None and not segment_reasoning and not segment_calls:
+            return
+        retained_messages.append(
+            GatewayMessage(
+                role="assistant",
+                content=segment_message.content if segment_message is not None else None,
+                tool_calls=tuple(segment_calls),
+                provider_reasoning=tuple(segment_reasoning),
+                provider_item_id=(
+                    segment_message.provider_item_id if segment_message is not None else None
+                ),
+                provider_output_index=(
+                    segment_message.provider_output_index if segment_message is not None else None
+                ),
+                provider_status=(
+                    segment_message.provider_status if segment_message is not None else None
+                ),
+                provider_phase=(
+                    segment_message.provider_phase if segment_message is not None else None
+                ),
+            )
+        )
+        segment_reasoning.clear()
+        segment_calls.clear()
+        segment_message = None
+
+    for _output_index, kind, item in output_items:
+        if kind == "message":
+            if segment_message is not None:
+                flush_segment()
+            segment_message = cast(GatewayMessage, item)
+        elif kind == "reasoning":
+            segment_reasoning.append(cast(EncryptedReasoningBlock, item))
+        else:
+            segment_calls.append(cast(ToolCall, item))
+    flush_segment()
+    if text or unindexed_calls:
+        retained_messages.append(
+            GatewayMessage(
+                role="assistant",
+                content=text or None,
+                tool_calls=tuple(unindexed_calls),
+            )
+        )
+
+    messages = (*context.messages, *retained_messages)
+    has_encrypted_reasoning = any(
+        block.kind == "encrypted_reasoning"
+        for retained_message in messages
+        for block in retained_message.provider_reasoning
     )
+    if has_encrypted_reasoning and route_binding is None:
+        raise ValueError("Responses encrypted reasoning requires route authority binding")
     continuations.remember_now(
         namespace=context.namespace,
         response_id=context.response_id,
         state=ContinuationState(
             episode_key=context.episode_key,
-            messages=(*context.messages, message),
+            messages=messages,
+            route_binding=route_binding if has_encrypted_reasoning else None,
         ),
     )
 

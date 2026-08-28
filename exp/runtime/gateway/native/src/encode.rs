@@ -84,9 +84,16 @@ impl ChatSseEncoder {
         match event {
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
+            Event::ProviderTextDelta { delta, .. } => {
+                Ok(vec![self.chunk(json!({"content": delta}), None)])
+            }
+            Event::ProviderRefusalDelta { delta, .. } => {
+                Ok(vec![self.chunk(json!({"refusal": delta}), None)])
+            }
             // The Chat wire has no reasoning representation, so provider
             // reasoning follows the summary path and is deliberately dropped.
             Event::ProviderOutputItemStarted { .. }
+            | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
             | Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }
@@ -335,14 +342,18 @@ pub fn completed_chat_body_with_ignored(
     let text: String = events
         .iter()
         .filter_map(|event| match event {
-            Event::TextDelta(delta) => Some(delta.as_str()),
+            Event::TextDelta(delta) | Event::ProviderTextDelta { delta, .. } => {
+                Some(delta.as_str())
+            }
             _ => None,
         })
         .collect();
     let refusal: String = events
         .iter()
         .filter_map(|event| match event {
-            Event::RefusalDelta(delta) => Some(delta.as_str()),
+            Event::RefusalDelta(delta) | Event::ProviderRefusalDelta { delta, .. } => {
+                Some(delta.as_str())
+            }
             _ => None,
         })
         .collect();

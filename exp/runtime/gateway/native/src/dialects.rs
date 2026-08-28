@@ -12,7 +12,7 @@ mod bedrock;
 mod gemini;
 mod openai;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
@@ -167,7 +167,8 @@ pub struct Normalizer {
     accumulated_tool_bytes: usize,
     accumulated_summary_bytes: usize,
     reasoning_summaries: BTreeMap<(u32, u32), String>,
-    openai_output_items: BTreeMap<u32, (ProviderOutputItemKind, String)>,
+    openai_output_items: BTreeMap<u32, (ProviderOutputItemKind, Option<String>)>,
+    openai_completed_output_items: BTreeSet<u32>,
     // Anthropic accumulation.
     input_tokens: u64,
     output_tokens: u64,
@@ -194,6 +195,7 @@ impl Normalizer {
             accumulated_summary_bytes: 0,
             reasoning_summaries: BTreeMap::new(),
             openai_output_items: BTreeMap::new(),
+            openai_completed_output_items: BTreeSet::new(),
             input_tokens: 0,
             output_tokens: 0,
             cache_read: 0,
@@ -270,7 +272,7 @@ impl Normalizer {
         &mut self,
         output_index: u32,
         kind: ProviderOutputItemKind,
-        item_id: String,
+        item_id: Option<String>,
     ) -> Result<bool, Failure> {
         if let Some(existing) = self.openai_output_items.get(&output_index) {
             return if existing == &(kind, item_id) {
