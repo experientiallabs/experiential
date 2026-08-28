@@ -1533,6 +1533,7 @@ def _installed_release_driver() -> None:
             "--supports-developer-messages",
             "--supports-strict-tools",
             "--supports-parallel-tool-calls",
+            "--supports-streaming-tool-arguments",
             "--maximum-output-tokens",
             "4096",
             "--input-price",
