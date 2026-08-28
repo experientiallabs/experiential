@@ -142,7 +142,6 @@ def test_model_inference_route_keeps_deployment_in_body() -> None:
         api_version="2024-05-01-preview",
         api_surface="model_inference",
         transport=transport,
-        chat_max_tokens_field="max_tokens",
     )
 
     client.complete(_request())
@@ -155,6 +154,7 @@ def test_model_inference_route_keeps_deployment_in_body() -> None:
     assert headers["api-key"] == _SECRET
     assert payload["model"] == "DeepSeek-V4-Flash"
     assert payload["max_tokens"] == 128
+    assert "max_completion_tokens" not in payload
 
 
 def test_model_inference_appends_models_to_a_resource_root() -> None:
@@ -186,6 +186,27 @@ def test_model_inference_canonicalizes_terminal_models_path_case() -> None:
     client = AzureClient(
         model=_snapshot("azure", "DeepSeek-V4-Flash"),
         endpoint="https://resource.services.ai.azure.com/MODELS",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=transport,
+    )
+
+    client.complete(_request())
+
+    assert transport.requests[0][0].startswith(
+        "https://resource.services.ai.azure.com/models/chat/completions?"
+    )
+
+
+def test_model_inference_canonicalizes_redundant_resource_path_separators() -> None:
+    """An identity-equivalent root cannot emit a divergent double-slash wire path."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=_completion_response())]
+    )
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint="https://resource.services.ai.azure.com//models",
         api_key=_SECRET,
         api_version="2024-05-01-preview",
         api_surface="model_inference",

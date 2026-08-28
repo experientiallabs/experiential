@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import pytest
 
 from exp.common.core.artifacts import sha256_json
@@ -20,6 +22,7 @@ from exp.common.models import (
 )
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
+from exp.runtime.models.providers.azure import AzureClient
 from exp.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
     TinkerSample,
@@ -54,6 +57,7 @@ def _catalog(
     base_url: str | None = None,
     api_key_env: str | None = "FIXTURE_API_KEY",
     api_version: str | None = None,
+    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None,
     region: str | None = None,
     capabilities: ModelCapabilities | None = _DEFAULT_CAPABILITIES,
     served_model_id: str | None = None,
@@ -67,6 +71,7 @@ def _catalog(
                 base_url=base_url,
                 api_key_env=api_key_env,
                 api_version=api_version,
+                azure_api_surface=azure_api_surface,
                 region=region,
             )
         },
@@ -104,6 +109,26 @@ def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
         maximum_output_tokens=16_000,
     )
     assert snapshot.capabilities_sha256 == capabilities.identity_sha256()
+
+
+def test_foundry_catalog_resolution_uses_model_inference_token_field() -> None:
+    """A setup-shaped Foundry connection emits the API surface's max_tokens contract."""
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="azure",
+            base_url="https://resource.services.ai.azure.com",
+            api_version="2024-05-01-preview",
+            azure_api_surface="model_inference",
+            capabilities=ModelCapabilities(supports_completions=True),
+        ),
+        environment={"FIXTURE_API_KEY": "azure-secret"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    resolved = catalog.resolve("fixture-model")
+
+    assert isinstance(resolved.client, AzureClient)
+    assert resolved.client.gateway_wire_profile().token_limit_key == "max_tokens"
 
 
 def test_snapshots_preserve_per_model_billing_source_on_one_connection() -> None:

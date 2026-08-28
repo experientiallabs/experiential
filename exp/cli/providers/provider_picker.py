@@ -568,15 +568,18 @@ def _reused_connection(
     Returns:
         The matching configured connection when exactly one exists, otherwise ``None``.
     """
+    candidate = ConnectionConfig(
+        provider=provider,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        api_version=api_version,
+        azure_api_surface=azure_api_surface,
+        region=region,
+    )
     matches: list[ProviderConnection] = []
     for connection in existing_connections:
-        if (
-            connection.provider != provider
-            or connection.base_url != base_url
-            or connection.api_version != api_version
-            or connection.azure_api_surface != azure_api_surface
-            or connection.region != region
-        ):
+        configured = connection.catalog_config()
+        if configured.identity_sha256() != candidate.identity_sha256():
             continue
         if api_key_env is not None and connection.api_key_env != api_key_env:
             continue

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -1075,6 +1076,54 @@ def test_azure_prepares_explicit_model_inference_surface() -> None:
 
     assert connection is not None
     assert connection.azure_api_surface == "model_inference"
+
+
+@pytest.mark.parametrize(
+    ("configured_base_url", "configured_surface", "collected_base_url", "collected_surface"),
+    [
+        (
+            "https://resource.openai.azure.com",
+            None,
+            "https://resource.openai.azure.com/",
+            "openai_deployments",
+        ),
+        (
+            "https://resource.services.ai.azure.com",
+            "model_inference",
+            "https://resource.services.ai.azure.com/MODELS",
+            "model_inference",
+        ),
+    ],
+)
+def test_azure_reuses_identity_equivalent_connection_spellings(
+    configured_base_url: str,
+    configured_surface: Literal["openai_deployments", "model_inference"] | None,
+    collected_base_url: str,
+    collected_surface: Literal["openai_deployments", "model_inference"],
+) -> None:
+    """Setup reuses one credential locator across equivalent Azure endpoint spellings."""
+    existing = ProviderConnection(
+        name="azure-existing",
+        provider="azure",
+        api_key_env="AZURE_EXISTING_KEY",
+        base_url=configured_base_url,
+        api_version=(
+            "2024-05-01-preview" if collected_surface == "model_inference" else "v1"
+        ),
+        azure_api_surface=configured_surface,
+    )
+
+    reused = provider_picker._reused_connection(
+        (existing,),
+        provider="azure",
+        api_key_env="AZURE_EXISTING_KEY",
+        base_url=collected_base_url,
+        api_version=existing.api_version,
+        azure_api_surface=collected_surface,
+        region=None,
+    )
+
+    assert reused == existing
 
 
 def test_bedrock_prepares_credential_chain_without_listing_or_identity_invention() -> None:

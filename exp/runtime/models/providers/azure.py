@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import ClassVar
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from exp.common.models import ChatMaxTokensField, ModelSnapshot
 from exp.runtime.models.credentials import ModelCredentialError
@@ -111,7 +111,10 @@ def _azure_base_url(
     Returns:
         Absolute request root. The root never includes a credential or query string.
     """
-    root = endpoint.rstrip("/")
+    parsed = urlsplit(endpoint)
+    path = "/".join(part for part in parsed.path.split("/") if part)
+    normalized_path = f"/{path}" if path else ""
+    root = urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
     if api_surface == "model_inference":
         if root.lower().endswith("/models"):
             return f"{root[:-7]}/models"
@@ -176,6 +179,8 @@ class AzureClient(OpenAICompatibleClient):
             raise ValueError("Azure clients require a supported api_surface")
         if api_surface == "model_inference" and api_version == _V1_API_VERSION:
             raise ValueError("Azure model_inference requires a dated api_version")
+        if api_surface == "model_inference":
+            chat_max_tokens_field = "max_tokens"
         super().__init__(
             model=model,
             api_key=api_key,

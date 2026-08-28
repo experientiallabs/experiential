@@ -125,7 +125,7 @@ def provider_update(
         ),
         None,
     )
-    if azure_api_surface is None and existing is not None:
+    if azure_api_surface is None and existing is not None and provider == "azure":
         azure_api_surface = existing.azure_api_surface
     provider_add(
         name=name,

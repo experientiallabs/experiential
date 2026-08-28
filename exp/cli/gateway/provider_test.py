@@ -189,3 +189,58 @@ def test_azure_update_preserves_model_inference_surface_when_omitted(tmp_path: P
     (authority,) = GatewayManagement(root).provider_connections()
     assert authority.config.azure_api_surface == "model_inference"
     assert json.loads(listed.output)["items"][0]["azure_api_surface"] == "model_inference"
+
+
+def test_provider_update_drops_azure_surface_when_changing_provider(tmp_path: Path) -> None:
+    """A cross-provider update cannot carry an Azure-only discriminator forward."""
+    root = _initialized_root(tmp_path)
+    added = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "foundry",
+            "--provider",
+            "azure",
+            "--base-url",
+            "https://resource.services.ai.azure.com",
+            "--credential-env",
+            "AZURE_FOUNDRY_API_KEY",
+            "--api-version",
+            "2024-05-01-preview",
+            "--azure-api-surface",
+            "model_inference",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+    updated = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "update",
+            "foundry",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://gateway.example.test/v1",
+            "--credential-env",
+            "CUSTOM_API_KEY",
+            "--non-interactive",
+            "--json",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert added.exit_code == 0, added.output
+    assert updated.exit_code == 0, updated.output
+    (authority,) = GatewayManagement(root).provider_connections()
+    assert authority.config.provider == "openai-compatible"
+    assert authority.config.azure_api_surface is None
