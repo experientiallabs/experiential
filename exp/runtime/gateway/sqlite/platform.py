@@ -5,7 +5,6 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
 
 from exp.common.core.artifacts import stable_id
 from exp.common.models import ConnectionConfig
@@ -426,10 +425,7 @@ class SQLiteGatewayPlatform:
                 provider=str(row["provider"]),
                 base_url=None if row["base_url"] is None else str(row["base_url"]),
                 api_version=None if row["api_version"] is None else str(row["api_version"]),
-                azure_api_surface=cast(
-                    Literal["openai_deployments", "model_inference"] | None,
-                    None if row["azure_api_surface"] is None else str(row["azure_api_surface"]),
-                ),
+                azure_api_surface=row["azure_api_surface"],
                 region=None if row["region"] is None else str(row["region"]),
                 secret_reference=(
                     None
