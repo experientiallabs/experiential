@@ -20,13 +20,31 @@ from exp.runtime.gateway.guardrails.bounded import (
 from exp.runtime.gateway.guardrails.http_json import shared_http_json_client
 
 
-async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) -> None:
-    """Poll ``predicate`` without blocking the caller event loop."""
+async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 10.0) -> None:
+    """Poll ``predicate`` without blocking the caller event loop.
+
+    The deadline is sized for the worst loaded CI worker: polling returns on
+    the first success, so healthy runs stay fast, and only genuinely broken
+    code waits out the budget before the assertion fails.
+    """
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
         if asyncio.get_running_loop().time() >= deadline:
             break
         await asyncio.sleep(0.01)
+    assert predicate()
+
+
+def _wait_sync(predicate: Callable[[], bool], *, timeout: float = 10.0) -> None:
+    """Poll ``predicate`` from synchronous test code, then assert it holds.
+
+    Same worst-loaded-worker sizing as :func:`_wait_until`: detached-task
+    bookkeeping is scheduled asynchronously, so asserting it after a fixed
+    short sleep races the scheduler on a busy runner.
+    """
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert predicate()
 
 
@@ -42,7 +60,7 @@ def _block_until(hold: threading.Event, *, timeout: float = 5.0) -> None:
     hold.wait(timeout=timeout)
 
 
-def _wait_flag(flag: threading.Event, *, timeout: float = 1.0) -> None:
+def _wait_flag(flag: threading.Event, *, timeout: float = 5.0) -> None:
     """Wait for a worker-thread flag without spinning on the caller."""
     assert flag.wait(timeout=timeout)
 
@@ -318,12 +336,7 @@ def test_suppressed_cancellation_quarantines_only_that_adapter() -> None:
             assert bound.detached_inspect_count() == 1
         finally:
             hold.set()
-            deadline = asyncio.get_running_loop().time() + 1.0
-            while bound.detached_inspect_count() != 0:
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-                await asyncio.sleep(0.01)
-            assert bound.detached_inspect_count() == 0
+            await _wait_until(lambda: bound.detached_inspect_count() == 0)
 
     asyncio.run(scenario())
 
@@ -376,12 +389,7 @@ def test_concurrent_timeouts_keep_quarantine_until_every_detached_task_finishes(
         finally:
             for hold in holds:
                 hold.set()
-            deadline = asyncio.get_running_loop().time() + 1.0
-            while bound.detached_inspect_count() != 0:
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-                await asyncio.sleep(0.01)
-            assert bound.detached_inspect_count() == 0
+            await _wait_until(lambda: bound.detached_inspect_count() == 0)
 
     asyncio.run(scenario())
 
@@ -481,12 +489,7 @@ def test_delayed_cancel_does_not_cancel_the_next_inspect_on_a_reused_worker(
             if second_task is not None and not second_task.done():
                 second_task.cancel()
                 await asyncio.gather(second_task, return_exceptions=True)
-            deadline = asyncio.get_running_loop().time() + 1.0
-            while bound.detached_inspect_count() != 0:
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-                await asyncio.sleep(0.01)
-            assert bound.detached_inspect_count() == 0
+            await _wait_until(lambda: bound.detached_inspect_count() == 0)
 
     asyncio.run(scenario())
 
@@ -528,12 +531,7 @@ def test_blocking_before_first_await_times_out_without_freezing_the_caller_loop(
             assert bound.quarantined_adapter_ids() == frozenset({"blocked"})
         finally:
             hold.set()
-            deadline = asyncio.get_running_loop().time() + 1.0
-            while bound.detached_inspect_count() != 0:
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-                await asyncio.sleep(0.01)
-            assert bound.detached_inspect_count() == 0
+            await _wait_until(lambda: bound.detached_inspect_count() == 0)
 
     asyncio.run(scenario())
 
@@ -624,12 +622,7 @@ def test_concurrent_blocking_before_await_inspects_time_out_independently() -> N
         finally:
             holds[0].set()
             holds[1].set()
-            deadline = asyncio.get_running_loop().time() + 1.0
-            while bound.detached_inspect_count() != 0:
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-                await asyncio.sleep(0.01)
-            assert bound.detached_inspect_count() == 0
+            await _wait_until(lambda: bound.detached_inspect_count() == 0)
 
     asyncio.run(scenario())
 
@@ -673,12 +666,7 @@ def test_blocking_before_await_exhausts_isolation_capacity() -> None:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(first, second, return_exceptions=True)
-            deadline = asyncio.get_running_loop().time() + 1.0
-            while bound.detached_inspect_count() != 0:
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-                await asyncio.sleep(0.01)
-            assert bound.detached_inspect_count() == 0
+            await _wait_until(lambda: bound.detached_inspect_count() == 0)
 
     asyncio.run(scenario())
 
@@ -838,10 +826,7 @@ def test_native_loop_returns_while_a_quarantined_adapter_still_runs() -> None:
         with pytest.raises(ClassifierTimeoutError):
             run_on_native_loop(rogue_once())
         assert time.monotonic() - started < 0.5
-        deadline = time.monotonic() + 1.0
-        while bound.detached_inspect_count() != 1 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert bound.detached_inspect_count() == 1
+        _wait_sync(lambda: bound.detached_inspect_count() == 1)
         assert entries == 1
 
         started = time.monotonic()
@@ -856,10 +841,7 @@ def test_native_loop_returns_while_a_quarantined_adapter_still_runs() -> None:
         assert time.monotonic() - started < 0.2
     finally:
         hold.set()
-        deadline = time.monotonic() + 1.0
-        while bound.detached_inspect_count() != 0 and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert bound.detached_inspect_count() == 0
+        _wait_sync(lambda: bound.detached_inspect_count() == 0)
 
 
 def test_native_callback_returns_when_inspect_blocks_before_first_await() -> None:
@@ -883,12 +865,9 @@ def test_native_callback_returns_when_inspect_blocks_before_first_await() -> Non
         with pytest.raises(ClassifierTimeoutError):
             run_on_native_loop(rogue())
         assert time.monotonic() - started < 0.5
-        assert entered.wait(timeout=1.0)
+        assert entered.wait(timeout=5.0)
         assert bound.detached_inspect_count() == 1
         assert bound.isolation_worker_count() == 1
     finally:
         hold.set()
-        deadline = time.monotonic() + 1.0
-        while bound.detached_inspect_count() != 0 and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert bound.detached_inspect_count() == 0
+        _wait_sync(lambda: bound.detached_inspect_count() == 0)
