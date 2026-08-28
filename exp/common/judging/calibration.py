@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
+
+from pydantic import BaseModel
 
 from exp.common.core.artifacts import (
     ArtifactId,
@@ -392,44 +394,78 @@ class JudgeCalibrationService:
         return stored
 
 
-def _load_rubric(store: ProjectStore, rubric_id: ArtifactId) -> tuple[Rubric, ArtifactInput]:
-    """Load one completed rubric artifact as a verified report input."""
+def _load_identified_artifact[ModelT: BaseModel](
+    store: ProjectStore,
+    *,
+    artifact_id: ArtifactId,
+    expected_artifact_type: str,
+    relative_path: str,
+    model_type: type[ModelT],
+    record_id: Callable[[ModelT], ArtifactId],
+    unavailable_message: str,
+    identity_message: str,
+) -> tuple[ModelT, ArtifactInput]:
+    """Load one completed artifact whose record restates its own artifact identity.
+
+    Args:
+        store: Project store owning the immutable artifact directory.
+        artifact_id: Completed artifact directory to verify.
+        expected_artifact_type: Required stable manifest artifact type.
+        relative_path: Typed data file inside the artifact directory.
+        model_type: Contract the data file must parse into.
+        record_id: Reads the identity the parsed record claims for itself.
+        unavailable_message: Calibration error text when the evidence cannot be resolved.
+        identity_message: Calibration error text when the record identity disagrees.
+
+    Returns:
+        The parsed record and its canonical manifest input.
+
+    Raises:
+        CalibrationError: The evidence is unavailable or its identity disagrees.
+    """
     try:
-        rubric, rubric_input = read_artifact_json(
+        record, record_input = read_artifact_json(
             store,
-            artifact_id=rubric_id,
-            expected_artifact_type="rubric",
-            relative_path="rubric.json",
-            model_type=Rubric,
+            artifact_id=artifact_id,
+            expected_artifact_type=expected_artifact_type,
+            relative_path=relative_path,
+            model_type=model_type,
         )
     except JudgingProvenanceError as exc:
-        raise CalibrationError(
-            "calibration requires a completed immutable rubric artifact"
-        ) from exc
-    if rubric.rubric_id != rubric_id:
-        raise CalibrationError("stored rubric record does not match its artifact identity")
-    return rubric, rubric_input
+        raise CalibrationError(unavailable_message) from exc
+    if record_id(record) != artifact_id:
+        raise CalibrationError(identity_message)
+    return record, record_input
+
+
+def _load_rubric(store: ProjectStore, rubric_id: ArtifactId) -> tuple[Rubric, ArtifactInput]:
+    """Load one completed rubric artifact as a verified report input."""
+    return _load_identified_artifact(
+        store,
+        artifact_id=rubric_id,
+        expected_artifact_type="rubric",
+        relative_path="rubric.json",
+        model_type=Rubric,
+        record_id=lambda record: record.rubric_id,
+        unavailable_message="calibration requires a completed immutable rubric artifact",
+        identity_message="stored rubric record does not match its artifact identity",
+    )
 
 
 def _load_label_set(
     store: ProjectStore, label_set_id: ArtifactId
 ) -> tuple[HumanLabelSet, ArtifactInput]:
     """Load one completed human-label-set artifact as a verified report input."""
-    try:
-        label_set, label_set_input = read_artifact_json(
-            store,
-            artifact_id=label_set_id,
-            expected_artifact_type="human-label-set",
-            relative_path="labels.json",
-            model_type=HumanLabelSet,
-        )
-    except JudgingProvenanceError as exc:
-        raise CalibrationError(
-            "calibration requires a completed immutable human label set"
-        ) from exc
-    if label_set.label_set_id != label_set_id:
-        raise CalibrationError("stored human label-set record does not match its artifact identity")
-    return label_set, label_set_input
+    return _load_identified_artifact(
+        store,
+        artifact_id=label_set_id,
+        expected_artifact_type="human-label-set",
+        relative_path="labels.json",
+        model_type=HumanLabelSet,
+        record_id=lambda record: record.label_set_id,
+        unavailable_message="calibration requires a completed immutable human label set",
+        identity_message="stored human label-set record does not match its artifact identity",
+    )
 
 
 def _require_label_set_rubric_binding(
@@ -446,20 +482,16 @@ def _load_lineage_split(
     store: ProjectStore, split_id: ArtifactId
 ) -> tuple[RouterLineageSplit, ArtifactInput]:
     """Load one completed router-lineage split artifact as a verified report input."""
-    try:
-        split, split_input = read_artifact_json(
-            store,
-            artifact_id=split_id,
-            expected_artifact_type="router-lineage-split",
-            relative_path="split.json",
-            model_type=RouterLineageSplit,
-        )
-    except JudgingProvenanceError as exc:
-        raise CalibrationError(
-            "calibration requires a completed immutable router lineage split"
-        ) from exc
-    if split.split_id != split_id:
-        raise CalibrationError("stored router split record does not match its artifact identity")
+    split, split_input = _load_identified_artifact(
+        store,
+        artifact_id=split_id,
+        expected_artifact_type="router-lineage-split",
+        relative_path="split.json",
+        model_type=RouterLineageSplit,
+        record_id=lambda record: record.split_id,
+        unavailable_message="calibration requires a completed immutable router lineage split",
+        identity_message="stored router split record does not match its artifact identity",
+    )
     try:
         _task_set, task_set_input = resolve_artifact(
             store,
@@ -482,21 +514,16 @@ def _load_report(
     store: ProjectStore, report_id: ArtifactId
 ) -> tuple[CalibrationReport, ArtifactInput]:
     """Load one completed calibration report artifact and its canonical manifest reference."""
-    try:
-        report, report_input = read_artifact_json(
-            store,
-            artifact_id=report_id,
-            expected_artifact_type="judge-calibration-report",
-            relative_path="report.json",
-            model_type=CalibrationReport,
-        )
-    except JudgingProvenanceError as exc:
-        raise CalibrationError("completed calibration report is unavailable") from exc
-    if report.report_id != report_id:
-        raise CalibrationError(
-            "stored calibration report record does not match its artifact identity"
-        )
-    return report, report_input
+    return _load_identified_artifact(
+        store,
+        artifact_id=report_id,
+        expected_artifact_type="judge-calibration-report",
+        relative_path="report.json",
+        model_type=CalibrationReport,
+        record_id=lambda record: record.report_id,
+        unavailable_message="completed calibration report is unavailable",
+        identity_message="stored calibration report record does not match its artifact identity",
+    )
 
 
 def _resolve_observations(
