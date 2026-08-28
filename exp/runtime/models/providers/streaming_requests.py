@@ -18,6 +18,11 @@ from exp.runtime.models.providers.errors import (
     ProviderResponseError,
     UnsupportedReasoningEffortError,
 )
+from exp.runtime.models.providers.fireworks import (
+    fireworks_reasoning_effort,
+    fireworks_reasoning_efforts,
+    prepare_gateway_reasoning_history,
+)
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
@@ -150,6 +155,7 @@ def dialect_stream_payload(
             reasoning_effort=required_reasoning_effort,
             explicit_reasoning_efforts=profile.supported_reasoning_efforts,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
+            fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")
 
@@ -384,6 +390,24 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
+    route_hashes = {profile.fireworks_reasoning_route_sha256 for profile in profiles}
+    fireworks_route_sha256 = next(iter(route_hashes)) if len(route_hashes) == 1 else None
+    prepared_messages, active_fireworks_reasoning = prepare_gateway_reasoning_history(
+        request.messages,
+        route_sha256=fireworks_route_sha256,
+    )
+    if prepared_messages != request.messages:
+        provider_updates["messages"] = prepared_messages
+    if active_fireworks_reasoning and fireworks_route_sha256 is None:
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'messages.reasoning_content' belongs to a different provider "
+                "route. Continue on the exact Fireworks deployment that issued it."
+            ),
+            param="messages.reasoning_content",
+            code="unsupported_parameter",
+        )
+
     # Tool-selection controls have no semantics without tool definitions and
     # several provider APIs reject the otherwise harmless combination.
     if not request.tools:
@@ -476,6 +500,13 @@ def _profile_reasoning_efforts(profile: GatewayWireProfile) -> tuple[str, ...]:
     """Return exact accepted efforts for one deployment wire profile."""
     if not profile.supports_reasoning or profile.reasoning_wire_format == "none":
         return ()
+    if profile.fireworks_reasoning_route_sha256 is not None:
+        exact = fireworks_reasoning_efforts(
+            profile.model_id,
+            explicit_efforts=profile.supported_reasoning_efforts or None,
+        )
+        if exact is not None:
+            return exact
     return supported_reasoning_efforts(
         profile.model_id,
         profile.reasoning_wire_format,
@@ -870,6 +901,7 @@ def openai_compatible_stream_payload(
     reasoning_effort: str | None = None,
     explicit_reasoning_efforts: Sequence[str] = (),
     sampling_requires_reasoning_none: bool = False,
+    fireworks_reasoning_route_sha256: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -887,12 +919,24 @@ def openai_compatible_stream_payload(
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
     """
+    messages, active_fireworks_reasoning = prepare_gateway_reasoning_history(
+        request.messages,
+        route_sha256=fireworks_reasoning_route_sha256,
+    )
     payload: JsonObject = {
         "model": model_id,
-        "messages": [openai_chat_message(message) for message in request.messages],
+        "messages": [
+            openai_chat_message(
+                message,
+                fireworks_reasoning_route_sha256=fireworks_reasoning_route_sha256,
+            )
+            for message in messages
+        ],
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if active_fireworks_reasoning:
+        payload["reasoning_history"] = "interleaved"
     add_openai_tools(payload, request, responses=False)
     if request.parallel_tool_calls is not None:
         payload["parallel_tool_calls"] = request.parallel_tool_calls
@@ -930,9 +974,13 @@ def openai_compatible_stream_payload(
         if reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
         elif reasoning_wire_format == "reasoning_effort":
-            payload["reasoning_effort"] = _openai_wire_reasoning_effort(
-                model_id,
-                effective_reasoning_effort,
-                explicit_reasoning_efforts,
+            payload["reasoning_effort"] = (
+                fireworks_reasoning_effort(model_id, effective_reasoning_effort)
+                if fireworks_reasoning_route_sha256 is not None
+                else _openai_wire_reasoning_effort(
+                    model_id,
+                    effective_reasoning_effort,
+                    explicit_reasoning_efforts,
+                )
             )
     return payload

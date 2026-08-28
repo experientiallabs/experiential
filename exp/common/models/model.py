@@ -233,16 +233,35 @@ class ToolCall(ContractModel):
         return json.dumps(self.arguments, sort_keys=sort_keys, separators=separators)
 
 
+class OpaqueReasoningContentBlock(ContractModel):
+    """One route-bound Fireworks Chat reasoning payload.
+
+    ``content`` is provider-issued and has no gateway-visible semantics. The
+    route digest binds it to the exact model revision and connection that
+    issued it so a tool continuation cannot replay it to another provider or
+    waterfall rung.
+    """
+
+    kind: Literal["reasoning_content"] = "reasoning_content"
+    route_sha256: Sha256
+    content: str = Field(min_length=1, max_length=64_000_000)
+
+
 class AssistantAction(ContractModel):
     """One complete assistant output, including zero or more tool calls."""
 
     content: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
+    provider_reasoning: tuple[OpaqueReasoningContentBlock, ...] = Field(default=(), exclude=True)
 
     @model_validator(mode="after")
     def _require_content_or_tool_call(self) -> AssistantAction:
         if self.content is None and not self.tool_calls:
             raise ValueError("an assistant action needs content or at least one tool call")
+        if len(self.provider_reasoning) > 1:
+            raise ValueError("an assistant action accepts at most one reasoning-content carrier")
+        if self.provider_reasoning and not self.tool_calls:
+            raise ValueError("reasoning-content carriers require assistant tool calls")
         return self
 
 

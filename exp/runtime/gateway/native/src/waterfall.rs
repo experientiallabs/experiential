@@ -66,6 +66,8 @@ pub struct DeploymentWire {
     /// it.
     #[serde(default)]
     pub upstream_body: Option<String>,
+    #[serde(default)]
+    pub fireworks_reasoning_route_sha256: Option<String>,
     pub idempotency_key: String,
 }
 
@@ -136,6 +138,7 @@ fn is_semantic(event: &Event) -> bool {
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
             | Event::EncryptedReasoning { .. }
+            | Event::ReasoningContentDelta { .. }
             | Event::ToolCallStarted { .. }
             | Event::ToolArgumentsDelta { .. }
             | Event::ToolCallCompleted { .. }
@@ -448,7 +451,15 @@ async fn run_attempt(
         }
     };
     guard.mark_opened();
-    let mut relay = UpstreamRelay::new(response, dialect, first_byte_deadline);
+    let mut relay = match wire.fireworks_reasoning_route_sha256.clone() {
+        Some(route_sha256) => UpstreamRelay::new_with_reasoning_content_route(
+            response,
+            dialect,
+            first_byte_deadline,
+            Some(route_sha256),
+        ),
+        None => UpstreamRelay::new(response, dialect, first_byte_deadline),
+    };
     let mut usage: Option<Usage> = None;
     let mut tool_names: Vec<String> = Vec::new();
     let mut withheld: Vec<Event> = Vec::new();

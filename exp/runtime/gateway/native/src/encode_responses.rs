@@ -232,7 +232,9 @@ impl ResponsesSseEncoder {
             // redacted payloads are dropped deliberately, since this surface
             // cannot round-trip them.
             Event::ThinkingDelta { index, delta } => self.reasoning_summary_delta(*index, 0, delta),
-            Event::ThinkingSignature { .. } | Event::RedactedThinking { .. } => Ok(Vec::new()),
+            Event::ThinkingSignature { .. }
+            | Event::RedactedThinking { .. }
+            | Event::ReasoningContentDelta { .. } => Ok(Vec::new()),
             Event::EncryptedReasoning {
                 output_index,
                 encrypted_content,

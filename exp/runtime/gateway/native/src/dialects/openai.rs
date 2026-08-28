@@ -321,6 +321,22 @@ impl Normalizer {
             self.refusal_seen = true;
             events.push(Event::RefusalDelta(refusal.clone()));
         }
+        if let Some(reasoning_content) = delta.get("reasoning_content") {
+            if !reasoning_content.is_null() {
+                let content = reasoning_content
+                    .as_str()
+                    .ok_or_else(|| malformed("Fireworks reasoning_content delta must be text"))?;
+                if !content.is_empty() {
+                    if let Some(route_sha256) = self.reasoning_content_route_sha256.clone() {
+                        self.reserve_summary_bytes(content.len())?;
+                        events.push(Event::ReasoningContentDelta {
+                            route_sha256,
+                            delta: content.to_string(),
+                        });
+                    }
+                }
+            }
+        }
         if let Some(raw_tools) = delta.get("tool_calls") {
             if !raw_tools.is_null() {
                 let items = raw_tools
@@ -418,6 +434,42 @@ mod tests {
             })
             .to_string(),
         }
+    }
+
+    #[test]
+    fn compatible_reasoning_content_requires_fireworks_route_authority() {
+        let frame = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"reasoning_content": "provider private"},
+                    "finish_reason": null,
+                }]
+            })
+            .to_string(),
+        };
+        let route_sha256 = "a".repeat(64);
+        let mut authorized = Normalizer::new_with_reasoning_content_route(
+            Dialect::OpenAiCompatible,
+            Some(route_sha256.clone()),
+        );
+        let events = authorized
+            .feed(&frame)
+            .expect("authorized Fireworks reasoning must normalize");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ReasoningContentDelta {
+                route_sha256: route,
+                delta,
+            }] if route == &route_sha256 && delta == "provider private"
+        ));
+
+        let mut generic = Normalizer::new(Dialect::OpenAiCompatible);
+        assert!(generic
+            .feed(&frame)
+            .expect("generic compatible reasoning stays private")
+            .is_empty());
     }
 
     #[test]

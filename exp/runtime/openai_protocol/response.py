@@ -6,7 +6,7 @@ import json
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import AssistantAction
+from exp.common.models import AssistantAction, OpaqueReasoningContentBlock
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
@@ -15,6 +15,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.models.providers.fireworks import encode_reasoning_content
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.streaming import (
     ResponsesSseEncoder,
@@ -92,6 +93,9 @@ def completed_body(
         ]
         or None,
     }
+    reasoning_content = _reasoning_content_block(events)
+    if reasoning_content is not None and tool_calls and terminal.kind == GatewayEventKind.COMPLETED:
+        message["reasoning_content"] = encode_reasoning_content(reasoning_content)
     usage = next(
         (
             event.usage
@@ -164,11 +168,56 @@ def assistant_message(events: tuple[GatewayEvent, ...]) -> GatewayMessage | None
         for event in events
         if event.kind == GatewayEventKind.TOOL_CALL_COMPLETED and event.tool_call is not None
     )
+    terminal = next((event for event in reversed(events) if is_terminal(event)), None)
+    reasoning_content = _reasoning_content_block(events)
+    provider_reasoning = (
+        (reasoning_content,)
+        if reasoning_content is not None
+        and tool_calls
+        and terminal is not None
+        and terminal.kind == GatewayEventKind.COMPLETED
+        else ()
+    )
     if not text and not tool_calls:
         return None
-    action = AssistantAction(content=text or None, tool_calls=tool_calls)
+    action = AssistantAction(
+        content=text or None,
+        tool_calls=tool_calls,
+        provider_reasoning=provider_reasoning,
+    )
     return GatewayMessage(
         role="assistant",
         content=action.content,
         tool_calls=action.tool_calls,
+        provider_reasoning=provider_reasoning,
     )
+
+
+def _reasoning_content_block(
+    events: tuple[GatewayEvent, ...],
+) -> OpaqueReasoningContentBlock | None:
+    """Aggregate one route-stable opaque Fireworks reasoning payload."""
+    route_sha256: str | None = None
+    parts: list[str] = []
+    for event in events:
+        if event.kind != GatewayEventKind.REASONING_CONTENT_DELTA:
+            continue
+        if event.reasoning_content_route_sha256 is None or event.text_delta is None:
+            raise OpenAIProtocolError(
+                status_code=502,
+                code="invalid_provider_stream",
+                message="Chat reasoning content omitted route identity or text.",
+                error_type="api_error",
+            )
+        if route_sha256 is not None and route_sha256 != event.reasoning_content_route_sha256:
+            raise OpenAIProtocolError(
+                status_code=502,
+                code="invalid_provider_stream",
+                message="Chat reasoning content changed provider route.",
+                error_type="api_error",
+            )
+        route_sha256 = event.reasoning_content_route_sha256
+        parts.append(event.text_delta)
+    if route_sha256 is None or not parts:
+        return None
+    return OpaqueReasoningContentBlock(route_sha256=route_sha256, content="".join(parts))

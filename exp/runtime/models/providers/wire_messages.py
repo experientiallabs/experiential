@@ -108,12 +108,12 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
     return "assistant", blocks
 
 
-def openai_chat_message(message: GatewayMessage) -> JsonObject:
+def openai_chat_message(
+    message: GatewayMessage,
+    *,
+    fireworks_reasoning_route_sha256: str | None = None,
+) -> JsonObject:
     """Translate one gateway message to OpenAI Chat wire JSON."""
-    if message.provider_reasoning:
-        # No Chat wire field can replay any reasoning carrier; route
-        # admission rejects the combination before dispatch.
-        raise ProviderResponseError("reasoning carriers cannot replay on the Chat wire")
     if message.role == "tool":
         return {
             "role": "tool",
@@ -130,6 +130,18 @@ def openai_chat_message(message: GatewayMessage) -> JsonObject:
             }
             for call in message.tool_calls
         ]
+    if message.provider_reasoning:
+        if len(message.provider_reasoning) != 1:
+            raise ProviderResponseError("Chat reasoning history requires one Fireworks carrier")
+        block = message.provider_reasoning[0]
+        if block.kind != "reasoning_content":
+            raise ProviderResponseError("reasoning carriers cannot replay on this Chat wire")
+        if (
+            fireworks_reasoning_route_sha256 is None
+            or block.route_sha256 != fireworks_reasoning_route_sha256
+        ):
+            raise ProviderResponseError("reasoning_content belongs to a different provider route")
+        payload["reasoning_content"] = block.content
     return payload
 
 

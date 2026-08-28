@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import zlib
 from collections.abc import Sequence
+from typing import cast
 
 import pytest
 
@@ -122,7 +123,12 @@ GEMINI_INCOMPLETE_EVENTS: tuple[JsonObject, ...] = (
 )
 
 
-def _native_normalized(dialect: str, chunks: Sequence[bytes]) -> JsonObject:
+def _native_normalized(
+    dialect: str,
+    chunks: Sequence[bytes],
+    *,
+    reasoning_content_route_sha256: str | None = None,
+) -> JsonObject:
     """Run raw chunks through the Rust frame decoder and dialect normalizer.
 
     Args:
@@ -134,7 +140,15 @@ def _native_normalized(dialect: str, chunks: Sequence[bytes]) -> JsonObject:
     """
     native = pytest.importorskip("exp_gateway_native")
     argument = json.dumps([chunk.decode("latin-1") for chunk in chunks])
-    return json.loads(native.normalize_stream_fixture(dialect, argument))
+    if reasoning_content_route_sha256 is None:
+        return json.loads(native.normalize_stream_fixture(dialect, argument))
+    return json.loads(
+        native.normalize_stream_fixture(
+            dialect,
+            argument,
+            reasoning_content_route_sha256,
+        )
+    )
 
 
 def _simplified(event: GatewayEvent) -> JsonObject:
@@ -230,6 +244,106 @@ def test_native_gemini_normalizer_fails_streams_without_a_terminal() -> None:
     failure = result["failure"]
     assert isinstance(failure, dict)
     assert failure["failure_class"] == "malformed_response"
+
+
+FIREWORKS_TOOL_CHUNKS: tuple[bytes, ...] = (
+    _sse(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"reasoning_content": "first private "},
+                    "finish_reason": None,
+                }
+            ]
+        }
+    ),
+    _sse(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "reasoning_content": "reasoning",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": '{"q":'},
+                            }
+                        ],
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        }
+    ),
+    _sse(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": "1}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        }
+    ),
+    _sse(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+    ),
+    b"data: [DONE]\n\n",
+)
+
+
+def test_native_fireworks_normalizer_requires_route_authority_for_reasoning() -> None:
+    """Native streaming captures Fireworks reasoning only for a route-marked deployment."""
+    route_sha256 = "a" * 64
+    authorized = _native_normalized(
+        "openai_compatible",
+        FIREWORKS_TOOL_CHUNKS,
+        reasoning_content_route_sha256=route_sha256,
+    )
+
+    assert authorized["failure"] is None
+    assert authorized["events"] == [
+        {"kind": "reasoning_content_delta", "route_sha256": route_sha256, "text": "first private "},
+        {"kind": "reasoning_content_delta", "route_sha256": route_sha256, "text": "reasoning"},
+        {"kind": "tool_call_started", "index": 0, "call_id": "call-one", "name": "lookup"},
+        {"kind": "tool_arguments_delta", "index": 0, "text": '{"q":'},
+        {"kind": "tool_arguments_delta", "index": 0, "text": "1}"},
+        {
+            "kind": "tool_call_completed",
+            "index": 0,
+            "call_id": "call-one",
+            "name": "lookup",
+            "raw_arguments": '{"q":1}',
+        },
+        {"kind": "completed"},
+    ]
+
+    unauthorized = _native_normalized("openai_compatible", FIREWORKS_TOOL_CHUNKS)
+    assert unauthorized["failure"] is None
+    assert not any(
+        event["kind"] == "reasoning_content_delta"
+        for event in cast("list[JsonObject]", unauthorized["events"])
+    )
 
 
 def _eventstream_message(name: str, payload: JsonObject, *, exception: bool = False) -> bytes:

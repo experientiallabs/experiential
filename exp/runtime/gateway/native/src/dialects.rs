@@ -161,10 +161,20 @@ pub struct Normalizer {
     // provider supplies no tool index; assignment order mirrors the python
     // mapper's local counter.
     gemini_tool_index: u32,
+    // Fireworks-only route identity authorizing reasoning_content capture.
+    reasoning_content_route_sha256: Option<String>,
 }
 
 impl Normalizer {
+    #[cfg(test)]
     pub fn new(dialect: Dialect) -> Self {
+        Self::new_with_reasoning_content_route(dialect, None)
+    }
+
+    pub fn new_with_reasoning_content_route(
+        dialect: Dialect,
+        reasoning_content_route_sha256: Option<String>,
+    ) -> Self {
         Self {
             dialect,
             tools: BTreeMap::new(),
@@ -181,6 +191,7 @@ impl Normalizer {
             usage: None,
             finish_reason: None,
             gemini_tool_index: 0,
+            reasoning_content_route_sha256,
         }
     }
 
@@ -284,7 +295,16 @@ impl Normalizer {
 /// Shared by the parity-fixture entry point and the golden-fixture tests so
 /// exactly one drive loop mirrors the server.
 pub fn drain_stream_fixture(dialect: Dialect, chunks: &[Vec<u8>]) -> (Vec<Value>, Option<Failure>) {
-    let mut normalizer = Normalizer::new(dialect);
+    drain_stream_fixture_with_reasoning_route(dialect, chunks, None)
+}
+
+pub fn drain_stream_fixture_with_reasoning_route(
+    dialect: Dialect,
+    chunks: &[Vec<u8>],
+    reasoning_content_route_sha256: Option<String>,
+) -> (Vec<Value>, Option<Failure>) {
+    let mut normalizer =
+        Normalizer::new_with_reasoning_content_route(dialect, reasoning_content_route_sha256);
     let mut decoder = FrameDecoder::new(dialect);
     let mut simplified = Vec::new();
     for chunk in chunks {

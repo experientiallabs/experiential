@@ -272,7 +272,12 @@ fn anthropic_error_fixture(public_error_json: &str) -> PyResult<String> {
 /// order) and `failure` (the class and safe message that ended the stream, or
 /// null when it ended on its own terminal event).
 #[pyfunction]
-fn normalize_stream_fixture(dialect: &str, chunks_json: &str) -> PyResult<String> {
+#[pyo3(signature = (dialect, chunks_json, reasoning_content_route_sha256=None))]
+fn normalize_stream_fixture(
+    dialect: &str,
+    chunks_json: &str,
+    reasoning_content_route_sha256: Option<String>,
+) -> PyResult<String> {
     let dialect = dialects::Dialect::from_str(dialect)
         .ok_or_else(|| PyValueError::new_err(format!("unknown dialect: {dialect}")))?;
     let chunks: Vec<String> = serde_json::from_str(chunks_json)
@@ -281,7 +286,12 @@ fn normalize_stream_fixture(dialect: &str, chunks_json: &str) -> PyResult<String
         .iter()
         .map(|chunk| respond::latin1_bytes(chunk))
         .collect();
-    let (simplified, failure) = dialects::drain_stream_fixture(dialect, &bytes);
+    let (simplified, failure) = match reasoning_content_route_sha256 {
+        Some(route_sha256) => {
+            dialects::drain_stream_fixture_with_reasoning_route(dialect, &bytes, Some(route_sha256))
+        }
+        None => dialects::drain_stream_fixture(dialect, &bytes),
+    };
     let body = serde_json::json!({
         "events": simplified,
         "failure": failure.map(|failure| serde_json::json!({
@@ -364,6 +374,14 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+            },
+            "reasoning_content_delta" => events::Event::ReasoningContentDelta {
+                route_sha256: object
+                    .get("route_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                delta: text,
             },
             "tool_call_started" => events::Event::ToolCallStarted {
                 index,

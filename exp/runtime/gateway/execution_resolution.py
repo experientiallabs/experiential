@@ -7,6 +7,10 @@ from dataclasses import replace
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.models import ResolvedModel
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.fireworks import (
+    fireworks_reasoning_efforts,
+    normalized_fireworks_default,
+)
 from exp.runtime.models.providers.protocol import NativeWireClient
 
 
@@ -51,6 +55,21 @@ def _resolved_wire_profile(
             )
             if limit is not None
         )
+        supported_reasoning_efforts = (
+            gateway_capabilities.supported_reasoning_efforts or profile.supported_reasoning_efforts
+        )
+        reasoning_effort = gateway_capabilities.reasoning_default_effort or profile.reasoning_effort
+        if profile.fireworks_reasoning_route_sha256 is not None:
+            exact_efforts = fireworks_reasoning_efforts(
+                profile.model_id or runtime_model.snapshot.model_id,
+                explicit_efforts=supported_reasoning_efforts or None,
+            )
+            if exact_efforts is not None:
+                supported_reasoning_efforts = exact_efforts
+            reasoning_effort = normalized_fireworks_default(
+                profile.model_id or runtime_model.snapshot.model_id,
+                reasoning_effort,
+            )
         return replace(
             profile,
             model_id=profile.model_id or runtime_model.snapshot.model_id,
@@ -87,13 +106,8 @@ def _resolved_wire_profile(
                 else profile.maximum_top_k
             ),
             sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
-            supported_reasoning_efforts=(
-                gateway_capabilities.supported_reasoning_efforts
-                or profile.supported_reasoning_efforts
-            ),
-            reasoning_effort=(
-                gateway_capabilities.reasoning_default_effort or profile.reasoning_effort
-            ),
+            supported_reasoning_efforts=supported_reasoning_efforts,
+            reasoning_effort=reasoning_effort,
             reasoning_effort_required=(
                 gateway_capabilities.reasoning_effort_required or profile.reasoning_effort_required
             ),

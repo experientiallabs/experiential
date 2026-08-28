@@ -5,6 +5,7 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import OpaqueReasoningContentBlock, ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -33,6 +34,74 @@ from exp.runtime.models.providers.streaming_requests import (
     route_generation_parameter_requests,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request
+
+_FIREWORKS_MODELS = (
+    "accounts/fireworks/models/deepseek-v4-flash-0731",
+    "accounts/fireworks/models/glm-5p2",
+    "accounts/fireworks/models/kimi-k2p7-code",
+)
+_FIREWORKS_ROUTE = "a" * 64
+_OTHER_FIREWORKS_ROUTE = "b" * 64
+
+
+def _fireworks_profile(
+    model_id: str,
+    *,
+    route_sha256: str = _FIREWORKS_ROUTE,
+) -> GatewayWireProfile:
+    """Build one Fireworks profile with the currently over-broad Platform contract."""
+    return GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("none", "low", "medium", "high", "xhigh", "max"),
+        fireworks_reasoning_route_sha256=route_sha256,
+    )
+
+
+def _fireworks_history_request(
+    route_sha256: str,
+    *,
+    two_rounds: bool = False,
+) -> GatewayRequest:
+    """Build one active interleaved Fireworks tool history."""
+    messages = [
+        GatewayMessage(role="user", content="Use tools"),
+        GatewayMessage(
+            role="assistant",
+            tool_calls=(ToolCall(call_id="call-one", name="lookup", arguments={"q": 1}),),
+            provider_reasoning=(
+                OpaqueReasoningContentBlock(
+                    route_sha256=route_sha256,
+                    content="first private reasoning",
+                ),
+            ),
+        ),
+        GatewayMessage(role="tool", content="one", tool_call_id="call-one"),
+    ]
+    if two_rounds:
+        messages.extend(
+            (
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=(ToolCall(call_id="call-two", name="lookup", arguments={"q": 2}),),
+                    provider_reasoning=(
+                        OpaqueReasoningContentBlock(
+                            route_sha256=route_sha256,
+                            content="second private reasoning",
+                        ),
+                    ),
+                ),
+                GatewayMessage(role="tool", content="two", tool_call_id="call-two"),
+            )
+        )
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=tuple(messages),
+        stream=True,
+    )
 
 
 def _chat_request(
@@ -140,6 +209,112 @@ def test_openai_compatible_stream_payload_forwards_reasoning_with_route_capabili
     )
 
     assert payload["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize("model_id", _FIREWORKS_MODELS)
+def test_fireworks_streaming_agent_history_replays_every_active_tool_round(
+    model_id: str,
+) -> None:
+    """DeepSeek, GLM, and Kimi stream continuations replay raw history byte-exact."""
+    profile = _fireworks_profile(model_id)
+    request = _fireworks_history_request(_FIREWORKS_ROUTE, two_rounds=True)
+
+    public, provider = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider)
+
+    assert public.messages == request.messages
+    assert payload["reasoning_history"] == "interleaved"
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert messages[1]["reasoning_content"] == "first private reasoning"
+    assert messages[3]["reasoning_content"] == "second private reasoning"
+
+
+@pytest.mark.parametrize("model_id", _FIREWORKS_MODELS)
+def test_fireworks_history_narrows_waterfall_to_the_exact_issuing_route(
+    model_id: str,
+) -> None:
+    """An active carrier rejects generic and differently bound Fireworks fallbacks."""
+    exact = _fireworks_profile(model_id)
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://compatible.example/v1/chat/completions",
+            model_id=model_id,
+        ),
+        exact,
+        _fireworks_profile(model_id, route_sha256=_OTHER_FIREWORKS_ROUTE),
+    )
+    request = _fireworks_history_request(_FIREWORKS_ROUTE)
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((profiles[0], profiles[2]), request)
+    assert raised.value.param == "messages.reasoning_content"
+
+
+def test_fireworks_history_before_the_last_user_is_removed_from_every_wire() -> None:
+    """A completed older turn cannot leak reasoning into a new provider selection."""
+    active = _fireworks_history_request(_FIREWORKS_ROUTE)
+    request = active.model_copy(
+        update={
+            "messages": (
+                *active.messages,
+                GatewayMessage(role="user", content="Start a new turn"),
+            )
+        }
+    )
+    generic = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://compatible.example/v1/chat/completions",
+        model_id="other-provider-model",
+    )
+
+    public, provider = route_generation_parameter_requests((generic,), request)
+    payload = dialect_stream_payload(generic, provider)
+
+    assert public.messages[1].provider_reasoning
+    assert provider.messages[1].provider_reasoning == ()
+    assert "reasoning_history" not in payload
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert "reasoning_content" not in messages[1]
+
+
+@pytest.mark.parametrize(
+    ("model_id", "accepted", "rejected"),
+    (
+        (
+            _FIREWORKS_MODELS[0],
+            ("none", "high", "max"),
+            ("low", "medium", "xhigh"),
+        ),
+        (
+            _FIREWORKS_MODELS[1],
+            ("none", "high", "max"),
+            ("low", "medium", "xhigh"),
+        ),
+        (
+            _FIREWORKS_MODELS[2],
+            ("none", "low", "medium", "high", "max"),
+            ("xhigh",),
+        ),
+    ),
+)
+def test_fireworks_streaming_admission_defensively_narrows_platform_efforts(
+    model_id: str,
+    accepted: tuple[str, ...],
+    rejected: tuple[str, ...],
+) -> None:
+    """Over-broad catalog metadata cannot advertise silently collapsed effort aliases."""
+    profile = _fireworks_profile(model_id)
+    for effort in accepted:
+        request = _chat_request().model_copy(update={"reasoning_effort": effort})
+        _public, provider = route_generation_parameter_requests((profile,), request)
+        assert dialect_stream_payload(profile, provider)["reasoning_effort"] == effort
+    for effort in rejected:
+        request = _chat_request().model_copy(update={"reasoning_effort": effort})
+        with pytest.raises(UnsupportedReasoningEffortError):
+            route_generation_parameter_requests((profile,), request)
 
 
 def test_openai_compatible_stream_payload_honors_token_limit_key() -> None:

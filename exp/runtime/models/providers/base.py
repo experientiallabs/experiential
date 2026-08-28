@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar, Literal
 from uuid import uuid4
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, Sha256
 from exp.common.models import (
     ChatMaxTokensField,
     ModelRequest,
@@ -152,6 +152,9 @@ class GatewayWireProfile:
     reasoning_effort_required: bool = False
     """Whether dispatch must put an explicit reasoning effort on this wire."""
 
+    fireworks_reasoning_route_sha256: Sha256 | None = None
+    """Exact route allowed to replay Fireworks ``reasoning_content`` history."""
+
     sampling_requires_reasoning_none: bool = False
     """Whether sampling controls require an exact ``none`` reasoning effort."""
 
@@ -210,6 +213,11 @@ class GatewayWireProfile:
             raise ValueError("a required reasoning effort needs a configured provider default")
         if self.reasoning_effort_required and not self.supports_reasoning:
             raise ValueError("a required reasoning effort needs reasoning support")
+        if (
+            self.fireworks_reasoning_route_sha256 is not None
+            and self.dialect != "openai_compatible"
+        ):
+            raise ValueError("Fireworks reasoning history requires the Chat-compatible dialect")
         if self.sampling_requires_reasoning_none and not self.supports_reasoning:
             raise ValueError("conditional sampling requires reasoning support")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:

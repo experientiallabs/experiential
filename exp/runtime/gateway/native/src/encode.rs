@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
 
+const FIREWORKS_REASONING_CONTENT_PREFIX: &str = "x-experiential-fireworks-reasoning-v1:";
+
 /// Derive one replay-stable public object ID, mirroring `stable_public_id`.
 pub fn stable_public_id(prefix: &str, request_id: &str) -> String {
     let digest = Sha256::digest(request_id.as_bytes());
@@ -33,6 +35,8 @@ pub struct ChatSseEncoder {
     tool_indices: HashMap<u32, (String, String)>,
     tool_arguments: HashMap<u32, String>,
     usage: Option<Usage>,
+    reasoning_content_route_sha256: Option<String>,
+    reasoning_content: String,
 }
 
 impl ChatSseEncoder {
@@ -55,6 +59,8 @@ impl ChatSseEncoder {
             tool_indices: HashMap::new(),
             tool_arguments: HashMap::new(),
             usage: None,
+            reasoning_content_route_sha256: None,
+            reasoning_content: String::new(),
         }
     }
 
@@ -84,6 +90,23 @@ impl ChatSseEncoder {
         match event {
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
+            Event::ReasoningContentDelta {
+                route_sha256,
+                delta,
+            } => {
+                if self
+                    .reasoning_content_route_sha256
+                    .as_ref()
+                    .is_some_and(|current| current != route_sha256)
+                {
+                    return Err(invalid_provider_stream(
+                        "Chat reasoning content changed provider route.",
+                    ));
+                }
+                self.reasoning_content_route_sha256 = Some(route_sha256.clone());
+                self.reasoning_content.push_str(delta);
+                Ok(Vec::new())
+            }
             // The Chat wire has no reasoning representation, so provider
             // reasoning follows the summary path and is deliberately dropped.
             Event::ReasoningSummaryDelta { .. }
@@ -164,7 +187,24 @@ impl ChatSseEncoder {
                 } else {
                     "stop"
                 };
-                let mut frames = vec![self.chunk(json!({}), Some(finish_reason))];
+                let mut frames = Vec::new();
+                if matches!(event, Event::Completed)
+                    && !self.tool_indices.is_empty()
+                    && !self.reasoning_content.is_empty()
+                {
+                    if let Some(route_sha256) = &self.reasoning_content_route_sha256 {
+                        frames.push(self.chunk(
+                            json!({
+                                "reasoning_content": opaque_reasoning_content(
+                                    route_sha256,
+                                    &self.reasoning_content,
+                                )
+                            }),
+                            None,
+                        ));
+                    }
+                }
+                frames.push(self.chunk(json!({}), Some(finish_reason)));
                 if self.include_usage {
                     if let Some(usage) = &self.usage {
                         frames.push(self.usage_chunk(usage));
@@ -225,6 +265,11 @@ impl ChatSseEncoder {
         });
         chat_data(&payload)
     }
+}
+
+/// Wrap provider reasoning in the caller-opaque route-bound Chat carrier.
+fn opaque_reasoning_content(route_sha256: &str, content: &str) -> String {
+    format!("{FIREWORKS_REASONING_CONTENT_PREFIX}{route_sha256}:{content}")
 }
 
 /// Frame one compact UTF-8-preserving Chat SSE data event.
@@ -356,6 +401,25 @@ pub fn completed_chat_body_with_ignored(
             _ => None,
         })
         .collect();
+    let mut reasoning_content_route_sha256: Option<&str> = None;
+    let mut reasoning_content = String::new();
+    for event in events {
+        if let Event::ReasoningContentDelta {
+            route_sha256,
+            delta,
+        } = event
+        {
+            if reasoning_content_route_sha256
+                .is_some_and(|current| current != route_sha256.as_str())
+            {
+                return Err(invalid_provider_stream(
+                    "Chat reasoning content changed provider route.",
+                ));
+            }
+            reasoning_content_route_sha256 = Some(route_sha256);
+            reasoning_content.push_str(delta);
+        }
+    }
     let incomplete = matches!(terminal, Event::Incomplete);
     let finish_reason = if incomplete {
         "length"
@@ -364,12 +428,24 @@ pub fn completed_chat_body_with_ignored(
     } else {
         "stop"
     };
-    let message = json!({
+    let has_tool_calls = !tool_calls.is_empty();
+    let mut message = json!({
         "role": "assistant",
         "content": if text.is_empty() { Value::Null } else { Value::String(text) },
         "refusal": if refusal.is_empty() { Value::Null } else { Value::String(refusal) },
         "tool_calls": if tool_calls.is_empty() { Value::Null } else { Value::Array(tool_calls) },
     });
+    if matches!(terminal, Event::Completed) && has_tool_calls && !reasoning_content.is_empty() {
+        if let Some(route_sha256) = reasoning_content_route_sha256 {
+            message
+                .as_object_mut()
+                .expect("chat message is an object")
+                .insert(
+                    "reasoning_content".to_string(),
+                    Value::String(opaque_reasoning_content(route_sha256, &reasoning_content)),
+                );
+        }
+    }
     let mut body = json!({
         "id": stable_public_id("chatcmpl", request_id),
         "object": "chat.completion",
@@ -405,6 +481,73 @@ pub fn completed_chat_body_with_ignored(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completed_tool_events() -> Vec<Event> {
+        vec![
+            Event::ReasoningContentDelta {
+                route_sha256: "a".repeat(64),
+                delta: "first private ".to_string(),
+            },
+            Event::ReasoningContentDelta {
+                route_sha256: "a".repeat(64),
+                delta: "reasoning".to_string(),
+            },
+            Event::ToolCallStarted {
+                index: 0,
+                call_id: "call-one".to_string(),
+                name: "lookup".to_string(),
+            },
+            Event::ToolArgumentsDelta {
+                index: 0,
+                delta: "{}".to_string(),
+            },
+            Event::ToolCallCompleted {
+                index: 0,
+                call: crate::events::CompletedToolCall {
+                    call_id: "call-one".to_string(),
+                    name: "lookup".to_string(),
+                    raw_arguments: "{}".to_string(),
+                },
+            },
+            Event::Completed,
+        ]
+    }
+
+    #[test]
+    fn completed_tool_reasoning_is_carried_in_streaming_and_buffered_chat() {
+        let events = completed_tool_events();
+        let expected = format!(
+            "{FIREWORKS_REASONING_CONTENT_PREFIX}{}:first private reasoning",
+            "a".repeat(64)
+        );
+        let mut stream = ChatSseEncoder::new_with_ignored(
+            "request-1",
+            "coding",
+            1_700_000_000,
+            false,
+            Vec::new(),
+        );
+        let mut frames = stream.start().expect("stream start must encode");
+        for event in &events {
+            frames.extend(stream.feed(event).expect("event must encode"));
+        }
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.contains("reasoning_content"))
+                .count(),
+            1
+        );
+        assert!(frames.iter().any(|frame| frame.contains(&expected)));
+
+        let completed =
+            completed_chat_body_with_ignored("request-1", "coding", 1_700_000_000, &events, &[])
+                .expect("completed body must encode");
+        assert_eq!(
+            completed.body["choices"][0]["message"]["reasoning_content"],
+            expected
+        );
+    }
 
     #[test]
     fn ignored_generation_controls_are_disclosed_by_both_chat_encoders() {

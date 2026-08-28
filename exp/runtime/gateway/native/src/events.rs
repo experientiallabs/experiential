@@ -61,6 +61,11 @@ pub enum Event {
         output_index: u32,
         encrypted_content: String,
     },
+    /// Opaque Fireworks Chat reasoning, bound to the exact issuing route.
+    ReasoningContentDelta {
+        route_sha256: String,
+        delta: String,
+    },
     ToolCallStarted {
         index: u32,
         call_id: String,
@@ -128,6 +133,14 @@ pub fn simplified_event(event: &Event) -> Value {
             "kind": "encrypted_reasoning",
             "output_index": output_index,
             "encrypted_content": encrypted_content,
+        }),
+        Event::ReasoningContentDelta {
+            route_sha256,
+            delta,
+        } => serde_json::json!({
+            "kind": "reasoning_content_delta",
+            "route_sha256": route_sha256,
+            "text": delta,
         }),
         Event::ToolCallStarted {
             index,

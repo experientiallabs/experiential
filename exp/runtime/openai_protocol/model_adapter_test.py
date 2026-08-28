@@ -6,6 +6,7 @@ from exp.common.models import (
     ModelFinishReason,
     ModelResponse,
     ModelSnapshot,
+    OpaqueReasoningContentBlock,
     OperationEconomics,
     ToolCall,
     ToolChoice,
@@ -101,3 +102,34 @@ def test_model_response_events_preserve_tool_bytes_usage_and_terminal() -> None:
     assert events[2].raw_arguments_delta == '{ "q": 1 }'
     assert events[4].usage is not None
     assert events[4].usage.cached_input_tokens == 1
+
+
+def test_model_response_events_preserve_route_bound_fireworks_reasoning() -> None:
+    """Buffered provider reasoning enters the same canonical path as native streaming."""
+    route_sha256 = "a" * 64
+    response = ModelResponse(
+        output=AssistantAction(
+            tool_calls=(ToolCall(call_id="call-1", name="lookup", arguments={}),),
+            provider_reasoning=(
+                OpaqueReasoningContentBlock(
+                    route_sha256=route_sha256,
+                    content="provider private",
+                ),
+            ),
+        ),
+        model=ModelSnapshot(
+            provider="fireworks",
+            model_id="accounts/fireworks/models/deepseek-v4-flash-0731",
+            capabilities_sha256="0" * 64,
+            connection_sha256="1" * 64,
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+        ),
+        economics=OperationEconomics(),
+    )
+
+    events = model_response_events(response)
+
+    assert events[0].kind == GatewayEventKind.REASONING_CONTENT_DELTA
+    assert events[0].reasoning_content_route_sha256 == route_sha256
+    assert events[0].text_delta == "provider private"
+    assert events[-1].kind == GatewayEventKind.COMPLETED

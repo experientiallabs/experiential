@@ -80,7 +80,8 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
             | Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
-            | Event::EncryptedReasoning { .. } => {}
+            | Event::EncryptedReasoning { .. }
+            | Event::ReasoningContentDelta { .. } => {}
             Event::TextDelta(_) => {
                 if inserted {
                     continue;

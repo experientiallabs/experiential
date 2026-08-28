@@ -13,7 +13,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelId,
     ExactModelPoolId,
 )
-from exp.common.models.model import ReasoningEffort, ToolCall
+from exp.common.models.model import OpaqueReasoningContentBlock, ReasoningEffort, ToolCall
 
 GatewayAliasName = ArtifactId
 OrganizationId = ArtifactId
@@ -111,7 +111,7 @@ class EncryptedReasoningBlock(ContractModel):
 
 
 ProviderReasoningBlock = Annotated[
-    ThinkingBlock | RedactedThinkingBlock | EncryptedReasoningBlock,
+    ThinkingBlock | RedactedThinkingBlock | EncryptedReasoningBlock | OpaqueReasoningContentBlock,
     Field(discriminator="kind"),
 ]
 
@@ -388,6 +388,7 @@ class GatewayEventKind(StrEnum):
     THINKING_SIGNATURE = "thinking_signature"
     REDACTED_THINKING = "redacted_thinking"
     ENCRYPTED_REASONING = "encrypted_reasoning"
+    REASONING_CONTENT_DELTA = "reasoning_content_delta"
     TOOL_CALL_STARTED = "tool_call_started"
     TOOL_ARGUMENTS_DELTA = "tool_arguments_delta"
     TOOL_CALL_COMPLETED = "tool_call_completed"
@@ -410,6 +411,7 @@ class GatewayEvent(ContractModel):
     thinking_signature: str | None = None
     redacted_thinking_data: str | None = None
     encrypted_content: str | None = None
+    reasoning_content_route_sha256: Sha256 | None = None
     tool_call_index: int | None = Field(default=None, ge=0)
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
     tool_name: str | None = Field(default=None, min_length=1, max_length=256)
@@ -450,6 +452,9 @@ class GatewayEvent(ContractModel):
         elif self.kind == GatewayEventKind.ENCRYPTED_REASONING:
             if self.encrypted_content is None or self.reasoning_block_index is None:
                 raise ValueError("encrypted reasoning requires block index and content")
+        elif self.kind == GatewayEventKind.REASONING_CONTENT_DELTA:
+            if self.text_delta is None or self.reasoning_content_route_sha256 is None:
+                raise ValueError("reasoning-content deltas require route identity and text")
         elif self.kind == GatewayEventKind.TOOL_CALL_STARTED:
             if self.tool_call_index is None or self.tool_call_id is None or self.tool_name is None:
                 raise ValueError("tool-call start requires index, ID, and name")

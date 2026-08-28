@@ -1517,6 +1517,95 @@ def test_rust_chat_sse_frames_match_python_and_the_committed_golden() -> None:
     assert list(actual) == expected
 
 
+def test_rust_chat_sse_fireworks_carrier_matches_python() -> None:
+    """Native and Python streaming emit the same completed-tool reasoning carrier."""
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.common.models.model import ToolCall
+    from exp.runtime.openai_protocol.streaming import ChatSseEncoder
+
+    route_sha256 = "a" * 64
+    events = [
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_CONTENT_DELTA,
+            sequence_number=0,
+            text_delta="first private ",
+            reasoning_content_route_sha256=route_sha256,
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_CONTENT_DELTA,
+            sequence_number=1,
+            text_delta="reasoning",
+            reasoning_content_route_sha256=route_sha256,
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=2,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=3,
+            tool_call_index=0,
+            raw_arguments_delta="{}",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=4,
+            tool_call_index=0,
+            tool_call=ToolCall(
+                call_id="call-1",
+                name="search",
+                arguments={},
+                raw_arguments="{}",
+            ),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=5),
+    ]
+    encoder = ChatSseEncoder(
+        request_id="request-fireworks",
+        model="accounts/fireworks/models/deepseek-v4-flash-0731",
+        created_at=1_700_000_000,
+        include_usage=False,
+    )
+    expected = list(encoder.start())
+    for event in events:
+        expected.extend(encoder.feed(event))
+
+    fixture = [
+        {
+            "kind": "reasoning_content_delta",
+            "route_sha256": route_sha256,
+            "text": "first private ",
+        },
+        {
+            "kind": "reasoning_content_delta",
+            "route_sha256": route_sha256,
+            "text": "reasoning",
+        },
+        {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
+        {"kind": "tool_arguments_delta", "index": 0, "text": "{}"},
+        {
+            "kind": "tool_call_completed",
+            "index": 0,
+            "call_id": "call-1",
+            "name": "search",
+            "raw_arguments": "{}",
+        },
+        {"kind": "completed"},
+    ]
+    actual = native.encode_chat_fixture(
+        "request-fireworks",
+        "accounts/fireworks/models/deepseek-v4-flash-0731",
+        1_700_000_000,
+        False,
+        json.dumps(fixture),
+    )
+
+    assert list(actual) == expected
+
+
 def test_rust_chat_ignored_parameter_disclosure_matches_python_and_the_committed_golden() -> None:
     """Route-shaped controls are disclosed on the final Chat chunk, byte for byte.
 

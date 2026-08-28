@@ -457,6 +457,7 @@ def deployment_wire_entry(
         "url": profile.url,
         "headers": dict(profile.headers),
         "model_id": profile.model_id,
+        "fireworks_reasoning_route_sha256": profile.fireworks_reasoning_route_sha256,
         "timeout_seconds": profile.timeout_seconds,
         "upstream_payload": None if upstream_body is not None else upstream_payload,
         "upstream_body": upstream_body,

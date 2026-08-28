@@ -236,9 +236,9 @@ impl MessagesSseEncoder {
                 Ok(Vec::new())
             }
             // OpenAI-only reasoning shapes have no Messages representation.
-            Event::ReasoningSummaryDelta { .. } | Event::EncryptedReasoning { .. } => {
-                Ok(Vec::new())
-            }
+            Event::ReasoningSummaryDelta { .. }
+            | Event::EncryptedReasoning { .. }
+            | Event::ReasoningContentDelta { .. } => Ok(Vec::new()),
             Event::ThinkingDelta { index, delta } => self.thinking_delta(*index, delta),
             Event::ThinkingSignature { index, signature } => {
                 self.thinking_signature(*index, signature)

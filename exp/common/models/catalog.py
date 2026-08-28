@@ -68,7 +68,6 @@ class ConnectionConfig(ContractModel):
     base_url: str | None = Field(default=None, max_length=2_048)
     api_key_env: str | None = Field(default=None, max_length=256)
     api_version: str | None = Field(default=None, max_length=64)
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=64)
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
@@ -97,8 +96,6 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
-        if self.provider != "azure" and self.azure_api_surface is not None:
-            raise ValueError("azure_api_surface is only accepted for provider='azure'")
         if self.provider != "bedrock" and (
             self.aws_access_key_id_env is not None or self.bedrock_auth_mode is not None
         ):
@@ -191,7 +188,6 @@ class ConnectionConfig(ContractModel):
                     "provider": self.provider,
                     "base_url": self.base_url,
                     "api_version": self.api_version,
-                    "azure_api_surface": self.azure_api_surface,
                     "region": self.region,
                     "bedrock_auth_mode": self.bedrock_auth_mode,
                 }
@@ -213,8 +209,6 @@ class ConnectionConfig(ContractModel):
         }
         if self.api_version is not None:
             identity["api_version"] = self.api_version
-        if self.provider == "azure":
-            identity["azure_api_surface"] = self.azure_api_surface or "openai_deployments"
         if self.region is not None:
             identity["region"] = self.region
         effective_bedrock_auth_mode = self.bedrock_auth_mode

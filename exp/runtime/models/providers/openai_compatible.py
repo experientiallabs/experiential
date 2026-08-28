@@ -18,6 +18,7 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    OpaqueReasoningContentBlock,
     ToolCall,
     Usage,
 )
@@ -39,6 +40,13 @@ from exp.runtime.models.providers.errors import (
     require_integer,
     require_object,
     require_string,
+)
+from exp.runtime.models.providers.fireworks import (
+    fireworks_reasoning_effort,
+    is_fireworks_base_url,
+    normalized_fireworks_default,
+    prepare_model_reasoning_history,
+    reasoning_content_route_sha256,
 )
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
@@ -68,6 +76,7 @@ def openai_compatible_request(
     reasoning_effort: str | None = None,
     reasoning_wire_format: ReasoningWireFormat = "reasoning_effort",
     sampling_requires_reasoning_none: bool = False,
+    fireworks_reasoning_route_sha256: str | None = None,
 ) -> JsonObject:
     """Convert a EXP request into one non-streaming Chat Completions payload.
 
@@ -94,11 +103,23 @@ def openai_compatible_request(
     Raises:
         ValueError: A request message cannot be represented without losing tool context.
     """
+    messages, active_fireworks_reasoning = prepare_model_reasoning_history(
+        request.messages,
+        route_sha256=fireworks_reasoning_route_sha256,
+    )
     payload: JsonObject = {
         "model": model_id,
-        "messages": [_openai_message(message) for message in request.messages],
+        "messages": [
+            _openai_message(
+                message,
+                fireworks_reasoning_route_sha256=fireworks_reasoning_route_sha256,
+            )
+            for message in messages
+        ],
         "stream": False,
     }
+    if active_fireworks_reasoning:
+        payload["reasoning_history"] = "interleaved"
     if request.tools:
         payload["tools"] = [
             {
@@ -144,8 +165,10 @@ def openai_compatible_request(
         if reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
         elif reasoning_wire_format == "reasoning_effort":
-            payload["reasoning_effort"] = openai_reasoning_effort(
-                model_id, effective_reasoning_effort
+            payload["reasoning_effort"] = (
+                fireworks_reasoning_effort(model_id, effective_reasoning_effort)
+                if fireworks_reasoning_route_sha256 is not None
+                else openai_reasoning_effort(model_id, effective_reasoning_effort)
             )
     return payload
 
@@ -160,6 +183,7 @@ def openai_compatible_response(
     *,
     configured_model: ModelSnapshot,
     latency_seconds: float,
+    fireworks_reasoning_route_sha256: str | None = None,
 ) -> ModelResponse:
     """Convert one complete Chat Completions response into EXP's shared contract.
 
@@ -192,8 +216,26 @@ def openai_compatible_response(
     tool_calls = tuple(
         parse_openai_wire_tool_call(value, index) for index, value in enumerate(tool_call_values)
     )
+    reasoning_content = message.get("reasoning_content")
+    provider_reasoning = (
+        (
+            OpaqueReasoningContentBlock(
+                route_sha256=fireworks_reasoning_route_sha256,
+                content=reasoning_content,
+            ),
+        )
+        if fireworks_reasoning_route_sha256 is not None
+        and isinstance(reasoning_content, str)
+        and reasoning_content
+        and tool_calls
+        else ()
+    )
     try:
-        output = AssistantAction(content=content, tool_calls=tool_calls)
+        output = AssistantAction(
+            content=content,
+            tool_calls=tool_calls,
+            provider_reasoning=provider_reasoning,
+        )
     except ValueError as exc:
         raise OpenAICompatibleResponseError(
             "OpenAI-compatible response has neither text nor a complete tool call"
@@ -299,9 +341,16 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._supports_top_k = supports_top_k
         self._supports_logprobs = supports_logprobs
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
         self._token_limit_key: ChatMaxTokensField = chat_max_tokens_field or self.token_limit_key
         self._sampling_requires_reasoning_none = sampling_requires_reasoning_none
+        self._fireworks_reasoning_route_sha256 = (
+            reasoning_content_route_sha256(model) if is_fireworks_base_url(self._base_url) else None
+        )
+        self._reasoning_effort = (
+            normalized_fireworks_default(model.model_id, reasoning_effort)
+            if self._fireworks_reasoning_route_sha256 is not None
+            else reasoning_effort
+        )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
         """Return the Chat Completions wire profile for this connection."""
@@ -318,6 +367,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format=self.reasoning_wire_format,
             reasoning_effort=self._reasoning_effort,
+            fireworks_reasoning_route_sha256=self._fireworks_reasoning_route_sha256,
             token_limit_key=self._token_limit_key,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
         )
@@ -340,12 +390,16 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             reasoning_effort=self._reasoning_effort,
             reasoning_wire_format=self.reasoning_wire_format,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
+            fireworks_reasoning_route_sha256=self._fireworks_reasoning_route_sha256,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one Chat Completions payload into the shared response contract."""
         return openai_compatible_response(
-            payload, configured_model=self._model, latency_seconds=latency_seconds
+            payload,
+            configured_model=self._model,
+            latency_seconds=latency_seconds,
+            fireworks_reasoning_route_sha256=self._fireworks_reasoning_route_sha256,
         )
 
 
@@ -359,8 +413,12 @@ class OpenRouterClient(OpenAICompatibleClient):
     reasoning_wire_format: ClassVar[ReasoningWireFormat] = "reasoning"
 
 
-def _openai_message(message: ModelMessage) -> JsonObject:
-    """Convert one EXP message while retaining assistant tool history."""
+def _openai_message(
+    message: ModelMessage,
+    *,
+    fireworks_reasoning_route_sha256: str | None = None,
+) -> JsonObject:
+    """Convert one EXP message while retaining route-matched assistant history."""
     if message.role == "tool":
         return {
             "role": "tool",
@@ -385,6 +443,14 @@ def _openai_message(message: ModelMessage) -> JsonObject:
             }
             for call in action.tool_calls
         ]
+    if action is not None and action.provider_reasoning:
+        block = action.provider_reasoning[0]
+        if (
+            fireworks_reasoning_route_sha256 is None
+            or block.route_sha256 != fireworks_reasoning_route_sha256
+        ):
+            raise ValueError("reasoning_content belongs to a different provider route")
+        payload["reasoning_content"] = block.content
     return payload
 
 

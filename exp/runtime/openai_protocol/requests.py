@@ -20,7 +20,7 @@ from pydantic import (
 )
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models.model import ReasoningEffort, ToolCall
+from exp.common.models.model import OpaqueReasoningContentBlock, ReasoningEffort, ToolCall
 from exp.runtime.gateway.contracts import (
     CompatibilityDisposition,
     CompatibilityManifest,
@@ -32,6 +32,7 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
     StructuredTextFormat,
 )
+from exp.runtime.models.providers.fireworks import decode_reasoning_content
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
@@ -116,6 +117,7 @@ class _Message(_WireModel):
     annotations: tuple[()] | None = None
     audio: None = None
     function_call: None = None
+    reasoning_content: str | None = None
 
     @property
     def history_tool_calls(self) -> tuple[_AssistantToolCall, ...]:
@@ -133,6 +135,8 @@ class _Message(_WireModel):
             raise ValueError("tool_call_id is valid only for tool messages")
         if self.role != "assistant" and self.history_tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
+        if self.role != "assistant" and self.reasoning_content is not None:
+            raise ValueError("reasoning_content is valid only for assistant messages")
         return self
 
 
@@ -378,7 +382,11 @@ def decode_chat(
     _validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
-    _validate_official(_CHAT_OFFICIAL, payload, extension_fields={"top_k", "reasoning_effort"})
+    _validate_official(
+        _CHAT_OFFICIAL,
+        _without_chat_reasoning_content(payload),
+        extension_fields={"top_k", "reasoning_effort"},
+    )
     request = _validate_wire(_ChatRequest, payload)
     operation = _caller_operation(idempotency_key, client_request_id)
     maximum = request.max_completion_tokens or request.max_tokens
@@ -634,6 +642,26 @@ def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> 
             raise unsupported_field(field)
 
 
+def _without_chat_reasoning_content(payload: JsonObject) -> JsonObject:
+    """Hide the route-bound Chat extension from official OpenAI validation."""
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list):
+        return payload
+    changed = False
+    messages: list[JsonValue] = []
+    for raw_message in raw_messages:
+        if isinstance(raw_message, dict) and "reasoning_content" in raw_message:
+            messages.append(
+                {key: value for key, value in raw_message.items() if key != "reasoning_content"}
+            )
+            changed = True
+        else:
+            messages.append(raw_message)
+    if not changed:
+        return payload
+    return {**payload, "messages": messages}
+
+
 def _validate_official(
     adapter: TypeAdapter[object],
     payload: JsonObject,
@@ -700,12 +728,20 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             _tool_call(call, f"{prefix}.{message_index}.tool_calls.{call_index}.function.arguments")
             for call_index, call in enumerate(message.history_tool_calls)
         )
+        provider_reasoning: tuple[OpaqueReasoningContentBlock, ...] = ()
+        if message.reasoning_content is not None:
+            try:
+                provider_reasoning = (decode_reasoning_content(message.reasoning_content),)
+            except ValueError as exc:
+                param = f"{prefix}.{message_index}.reasoning_content"
+                raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
         converted.append(
             GatewayMessage(
                 role=message.role,
                 content=_content(message.content),
                 tool_call_id=message.tool_call_id,
                 tool_calls=calls,
+                provider_reasoning=provider_reasoning,
             )
         )
     return tuple(converted)

@@ -41,6 +41,7 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         Event::EncryptedReasoning {
             encrypted_content, ..
         } => encrypted_content.len(),
+        Event::ReasoningContentDelta { delta, .. } => delta.len(),
         Event::ToolArgumentsDelta { delta, .. } => delta.len(),
         Event::ToolCallCompleted { call, .. } => call.raw_arguments.len().max(64),
         _ => 64,
@@ -130,22 +131,45 @@ impl UpstreamRelay {
         dialect: Dialect,
         first_byte_deadline: Instant,
     ) -> Self {
-        Self::from_stream(
+        Self::new_with_reasoning_content_route(response, dialect, first_byte_deadline, None)
+    }
+
+    pub fn new_with_reasoning_content_route(
+        response: reqwest::Response,
+        dialect: Dialect,
+        first_byte_deadline: Instant,
+        reasoning_content_route_sha256: Option<String>,
+    ) -> Self {
+        Self::from_stream_with_reasoning_content_route(
             response.bytes_stream().boxed(),
             dialect,
             first_byte_deadline,
+            reasoning_content_route_sha256,
         )
     }
 
+    #[cfg(test)]
     fn from_stream(
         stream: BoxStream<'static, reqwest::Result<Bytes>>,
         dialect: Dialect,
         first_byte_deadline: Instant,
     ) -> Self {
+        Self::from_stream_with_reasoning_content_route(stream, dialect, first_byte_deadline, None)
+    }
+
+    fn from_stream_with_reasoning_content_route(
+        stream: BoxStream<'static, reqwest::Result<Bytes>>,
+        dialect: Dialect,
+        first_byte_deadline: Instant,
+        reasoning_content_route_sha256: Option<String>,
+    ) -> Self {
         Self {
             stream,
             decoder: FrameDecoder::new(dialect),
-            normalizer: Normalizer::new(dialect),
+            normalizer: Normalizer::new_with_reasoning_content_route(
+                dialect,
+                reasoning_content_route_sha256,
+            ),
             pending: VecDeque::new(),
             eof: false,
             first_byte_recorded: false,

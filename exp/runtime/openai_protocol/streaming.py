@@ -7,6 +7,7 @@ import json
 from collections.abc import Iterable
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import OpaqueReasoningContentBlock
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -15,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.models.providers.fireworks import encode_reasoning_content
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 
 
@@ -56,6 +58,8 @@ class ChatSseEncoder:
         self._tool_indices: dict[int, tuple[str, str]] = {}
         self._tool_arguments: dict[int, str] = {}
         self._usage: GatewayUsage | None = None
+        self._reasoning_content: list[str] = []
+        self._reasoning_content_route_sha256: str | None = None
 
     def start(self) -> tuple[str, ...]:
         """Emit the single initial assistant-role chunk."""
@@ -83,6 +87,18 @@ class ChatSseEncoder:
             return (self._chunk(delta={"content": event.text_delta}),)
         if event.kind == GatewayEventKind.REFUSAL_DELTA:
             return (self._chunk(delta={"refusal": event.text_delta}),)
+        if event.kind == GatewayEventKind.REASONING_CONTENT_DELTA:
+            route_sha256 = event.reasoning_content_route_sha256
+            if route_sha256 is None or event.text_delta is None:
+                raise self._state_error("Chat reasoning content omitted route identity or text.")
+            if (
+                self._reasoning_content_route_sha256 is not None
+                and self._reasoning_content_route_sha256 != route_sha256
+            ):
+                raise self._state_error("Chat reasoning content changed provider route.")
+            self._reasoning_content_route_sha256 = route_sha256
+            self._reasoning_content.append(event.text_delta)
+            return ()
         if event.kind in {
             GatewayEventKind.REASONING_SUMMARY_DELTA,
             # The Chat wire has no reasoning representation, so provider
@@ -168,6 +184,24 @@ class ChatSseEncoder:
                 if self._tool_indices
                 else "stop"
             )
+            if (
+                event.kind == GatewayEventKind.COMPLETED
+                and self._tool_indices
+                and self._reasoning_content
+                and self._reasoning_content_route_sha256 is not None
+            ):
+                frames.append(
+                    self._chunk(
+                        delta={
+                            "reasoning_content": encode_reasoning_content(
+                                OpaqueReasoningContentBlock(
+                                    route_sha256=self._reasoning_content_route_sha256,
+                                    content="".join(self._reasoning_content),
+                                )
+                            )
+                        }
+                    )
+                )
             frames.append(self._chunk(delta={}, finish_reason=finish_reason))
             if self.include_usage and self._usage is not None:
                 frames.append(self._usage_chunk(self._usage))
@@ -343,6 +377,7 @@ class ResponsesSseEncoder:
         if event.kind in {
             GatewayEventKind.THINKING_SIGNATURE,
             GatewayEventKind.REDACTED_THINKING,
+            GatewayEventKind.REASONING_CONTENT_DELTA,
         }:
             return ()
         if event.kind == GatewayEventKind.ENCRYPTED_REASONING:

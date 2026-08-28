@@ -8,6 +8,7 @@ from exp.common.models import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    OpaqueReasoningContentBlock,
     ToolChoice,
 )
 from exp.common.tasks import ToolSchema
@@ -33,7 +34,15 @@ def model_request(request: GatewayRequest) -> ModelRequest:
     for message in request.messages:
         role = "system" if message.role == "developer" else message.role
         action = (
-            AssistantAction(content=message.content, tool_calls=message.tool_calls)
+            AssistantAction(
+                content=message.content,
+                tool_calls=message.tool_calls,
+                provider_reasoning=tuple(
+                    block
+                    for block in message.provider_reasoning
+                    if isinstance(block, OpaqueReasoningContentBlock)
+                ),
+            )
             if message.role == "assistant"
             else None
         )
@@ -83,6 +92,16 @@ def model_response_events(response: ModelResponse) -> tuple[GatewayEvent, ...]:
     """
     events: list[GatewayEvent] = []
     sequence = 0
+    for block in response.output.provider_reasoning:
+        events.append(
+            GatewayEvent(
+                kind=GatewayEventKind.REASONING_CONTENT_DELTA,
+                sequence_number=sequence,
+                text_delta=block.content,
+                reasoning_content_route_sha256=block.route_sha256,
+            )
+        )
+        sequence += 1
     if response.output.content is not None:
         events.append(
             GatewayEvent(

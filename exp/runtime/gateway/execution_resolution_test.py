@@ -6,7 +6,7 @@ from typing import cast
 
 import pytest
 
-from exp.common.models import BillingSource, ModelCapabilities, ModelSnapshot
+from exp.common.models import BillingSource, ModelCapabilities, ModelSnapshot, ReasoningEffort
 from exp.common.models.catalog import (
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
@@ -140,6 +140,61 @@ def test_profile_resolution_applies_exact_gateway_reasoning_values() -> None:
     assert resolved.supported_reasoning_efforts == ("low", "high", "max")
     assert resolved.reasoning_effort == "high"
     assert resolved.reasoning_effort_required is True
+
+
+@pytest.mark.parametrize(
+    ("model_id", "catalog_default", "expected_efforts", "expected_default"),
+    (
+        (
+            "accounts/fireworks/models/deepseek-v4-flash-0731",
+            "low",
+            ("none", "high", "max"),
+            "high",
+        ),
+        (
+            "accounts/fireworks/models/glm-5p2",
+            "xhigh",
+            ("none", "high", "max"),
+            "max",
+        ),
+        (
+            "accounts/fireworks/models/kimi-k2p7-code",
+            "high",
+            ("none", "low", "medium", "high", "max"),
+            "high",
+        ),
+    ),
+)
+def test_fireworks_profile_resolution_narrows_overbroad_catalog_efforts(
+    model_id: str,
+    catalog_default: ReasoningEffort,
+    expected_efforts: tuple[str, ...],
+    expected_default: str,
+) -> None:
+    """Runtime advertises only distinct Fireworks tiers despite stale Platform metadata."""
+    capabilities = ModelCapabilities(supports_reasoning=True, reasoning_effort="high")
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        reasoning_effort="high",
+        fireworks_reasoning_route_sha256="c" * 64,
+    )
+    gateway_capabilities = GatewayDeploymentCapabilities(
+        supported_reasoning_efforts=("none", "low", "medium", "high", "xhigh", "max"),
+        reasoning_default_effort=catalog_default,
+        reasoning_effort_required=True,
+    )
+
+    resolved = _resolved_wire_profile(
+        _deployment(capabilities, gateway_capabilities),
+        _resolved(_NativeClient(profile), capabilities),
+    )
+
+    assert resolved.supported_reasoning_efforts == expected_efforts
+    assert resolved.reasoning_effort == expected_default
 
 
 def test_profile_resolution_rejects_provider_reasoning_contract_conflict() -> None:

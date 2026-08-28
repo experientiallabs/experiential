@@ -8,6 +8,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayNamedToolChoice
+from exp.runtime.models.providers.fireworks import FIREWORKS_REASONING_CONTENT_PREFIX
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.model_adapter import model_request
@@ -286,6 +287,77 @@ def test_chat_decoder_accepts_echoed_assistant_message_with_empty_sdk_fields() -
     assert decoded.request.messages[1].tool_calls[0].name == "weather"
     assert decoded.request.messages[3].content == "It is sunny."
     assert decoded.request.messages[3].tool_calls == ()
+
+
+def test_chat_decoder_preserves_only_a_gateway_issued_reasoning_carrier() -> None:
+    """A Fireworks continuation decodes route identity and provider content byte-exact."""
+    route_sha256 = "a" * 64
+    reasoning = "private: provider\nreasoning"
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "Use a tool"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": (
+                        f"{FIREWORKS_REASONING_CONTENT_PREFIX}{route_sha256}:{reasoning}"
+                    ),
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+
+    block = decoded.request.messages[1].provider_reasoning[0]
+    assert block.kind == "reasoning_content"
+    assert block.route_sha256 == route_sha256
+    assert block.content == reasoning
+    adapted = model_request(decoded.request)
+    assert adapted.messages[1].assistant_action is not None
+    assert adapted.messages[1].assistant_action.provider_reasoning == (block,)
+
+
+@pytest.mark.parametrize(
+    "reasoning_content",
+    (
+        "raw provider reasoning",
+        FIREWORKS_REASONING_CONTENT_PREFIX,
+        f"{FIREWORKS_REASONING_CONTENT_PREFIX}{'z' * 64}:payload",
+    ),
+)
+def test_chat_decoder_rejects_unbound_or_malformed_reasoning_content(
+    reasoning_content: str,
+) -> None:
+    """Callers cannot inject a raw or invalid provider reasoning payload."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "reasoning_content": reasoning_content,
+                        "tool_calls": [
+                            {
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    assert captured.value.detail.param == "messages.0.reasoning_content"
 
 
 def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> None:

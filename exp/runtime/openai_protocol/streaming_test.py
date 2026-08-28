@@ -19,6 +19,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.models.providers.fireworks import decode_reasoning_content
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.streaming import (
     ChatSseEncoder,
@@ -29,6 +30,12 @@ from exp.runtime.openai_protocol.streaming import (
 )
 
 _RAW_ARGUMENTS = '{ "city" : "Zürich" }'
+_FIREWORKS_MODELS = (
+    "accounts/fireworks/models/deepseek-v4-flash-0731",
+    "accounts/fireworks/models/glm-5p2",
+    "accounts/fireworks/models/kimi-k2p7-code",
+)
+_FIREWORKS_ROUTE = "a" * 64
 
 
 def _tool_events() -> tuple[GatewayEvent, ...]:
@@ -137,6 +144,148 @@ def test_chat_sse_exposes_ignored_compatibility_parameters() -> None:
     payload = _chat_payload(encoder.start()[0])
 
     assert payload["x-experiential-ignored-parameters"] == ["logprobs"]
+
+
+@pytest.mark.parametrize("model", _FIREWORKS_MODELS)
+def test_chat_sse_emits_one_opaque_fireworks_carrier_for_completed_tool_calls(
+    model: str,
+) -> None:
+    """DeepSeek, GLM, and Kimi reasoning fragments become one replay carrier."""
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_CONTENT_DELTA,
+            sequence_number=0,
+            text_delta="first private ",
+            reasoning_content_route_sha256=_FIREWORKS_ROUTE,
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_CONTENT_DELTA,
+            sequence_number=1,
+            text_delta="reasoning:\nZürich",
+            reasoning_content_route_sha256=_FIREWORKS_ROUTE,
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=2,
+            tool_call_index=0,
+            tool_call_id="call-one",
+            tool_name="weather",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=3,
+            tool_call_index=0,
+            raw_arguments_delta="{}",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=4,
+            tool_call_index=0,
+            tool_call=ToolCall(
+                call_id="call-one",
+                name="weather",
+                arguments={},
+                raw_arguments="{}",
+            ),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=5),
+    )
+
+    frames = encode_chat_events(
+        ChatSseEncoder(
+            request_id="request-reasoning",
+            model=model,
+            created_at=123,
+            include_usage=False,
+        ),
+        events,
+    )
+    payloads = tuple(_chat_payload(frame) for frame in frames if frame != "data: [DONE]\n\n")
+    carriers = [
+        delta["reasoning_content"]
+        for payload in payloads
+        for choice in cast("list[JsonObject]", payload["choices"])
+        if "reasoning_content" in (delta := cast("JsonObject", choice["delta"]))
+    ]
+
+    assert len(carriers) == 1
+    block = decode_reasoning_content(str(carriers[0]))
+    assert block.route_sha256 == _FIREWORKS_ROUTE
+    assert block.content == "first private reasoning:\nZürich"
+    carrier_index = next(
+        index
+        for index, payload in enumerate(payloads)
+        if any(
+            "reasoning_content" in cast("JsonObject", choice["delta"])
+            for choice in cast("list[JsonObject]", payload["choices"])
+        )
+    )
+    finish_index = next(
+        index
+        for index, payload in enumerate(payloads)
+        if any(
+            choice["finish_reason"] == "tool_calls"
+            for choice in cast("list[JsonObject]", payload["choices"])
+        )
+    )
+    assert carrier_index < finish_index
+
+
+@pytest.mark.parametrize("terminal", (GatewayEventKind.COMPLETED, GatewayEventKind.INCOMPLETE))
+def test_chat_sse_never_exposes_reasoning_without_a_completed_tool_action(
+    terminal: GatewayEventKind,
+) -> None:
+    """Text-only and incomplete outputs discard provider-private reasoning history."""
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_CONTENT_DELTA,
+            sequence_number=0,
+            text_delta="provider private",
+            reasoning_content_route_sha256=_FIREWORKS_ROUTE,
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=1, text_delta="answer"),
+        GatewayEvent(kind=terminal, sequence_number=2),
+    )
+
+    frames = encode_chat_events(
+        ChatSseEncoder(
+            request_id="request-no-carrier",
+            model="coding",
+            created_at=123,
+            include_usage=False,
+        ),
+        events,
+    )
+    assert not any("reasoning_content" in frame for frame in frames)
+
+
+def test_chat_sse_rejects_reasoning_that_changes_route_mid_stream() -> None:
+    """A malformed upstream cannot combine reasoning from two provider routes."""
+    encoder = ChatSseEncoder(
+        request_id="request-route-change",
+        model="coding",
+        created_at=123,
+        include_usage=False,
+    )
+    encoder.start()
+    encoder.feed(
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_CONTENT_DELTA,
+            sequence_number=0,
+            text_delta="first",
+            reasoning_content_route_sha256=_FIREWORKS_ROUTE,
+        )
+    )
+
+    with pytest.raises(OpenAIProtocolError, match="changed provider route"):
+        encoder.feed(
+            GatewayEvent(
+                kind=GatewayEventKind.REASONING_CONTENT_DELTA,
+                sequence_number=1,
+                text_delta="second",
+                reasoning_content_route_sha256="b" * 64,
+            )
+        )
 
 
 def test_responses_sse_emits_full_lifecycle_monotonic_sequence_and_exact_arguments() -> None:
