@@ -103,7 +103,11 @@ from exp.runtime.models.providers.streaming_requests import (
     dialect_stream_payload,
     route_generation_parameter_requests,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
+from exp.runtime.openai_protocol.errors import (
+    OpenAIProtocolError,
+    public_failure_error,
+    unsupported_field,
+)
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -160,6 +164,39 @@ def _public_capability_param(
     if capability == "streaming" and not public_stream:
         return "tools" if public_tools else "model"
     return _PUBLIC_REQUEST_CAPABILITY_PARAMS[surface].get(capability)
+
+
+def _public_capability_error(
+    error: ProviderCapabilityError,
+    surface: GatewayApiSurface,
+    *,
+    public_stream: bool,
+    public_tools: bool,
+) -> OpenAIProtocolError:
+    """Translate one internal admission label into a stable public 400.
+
+    Provider capability literals are useful for internal accounting but are
+    not part of the public request contract. Known request requirements name
+    the field that activated them. Internal route requirements fail against
+    ``model`` without exposing implementation details.
+    """
+    param = _public_capability_param(
+        error.capability,
+        surface,
+        public_stream=public_stream,
+        public_tools=public_tools,
+    )
+    if param is not None:
+        return unsupported_field(param, capability=True)
+    return OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_capability",
+        message=(
+            "The selected model route cannot serve this request. "
+            "Choose a different model alias and resend the request."
+        ),
+        param="model",
+    )
 
 
 _logger = logging.getLogger(__name__)
@@ -512,17 +549,17 @@ class NativeControlPlane(NativeObservabilityMixin):
             # request feature the route cannot preserve.
             failure = normalized_provider_failure(exc)
             self._accounting.finish_request_quietly(authorization, failure)
-            failure_param = (
-                _public_capability_param(
-                    exc.capability,
+            public_error = (
+                _public_capability_error(
+                    exc,
                     provider_request.surface,
                     public_stream=public_request.stream,
                     public_tools=bool(public_request.tools),
                 )
                 if isinstance(exc, ProviderCapabilityError)
-                else exc.param
+                else public_failure_error(failure, param=exc.param)
             )
-            raise NativeBridgeError(public_failure_error(failure, param=failure_param)) from exc
+            raise NativeBridgeError(public_error) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             error = _authority_error(exc)
             failure = GatewayFailure(

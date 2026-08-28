@@ -42,9 +42,11 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
+    _public_capability_error,
     _public_capability_param,
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -118,6 +120,34 @@ def test_internal_text_streaming_failure_names_the_public_model_field() -> None:
             )
             == "model"
         )
+
+
+def test_public_capability_error_never_exposes_internal_labels() -> None:
+    """Internal route requirements fail against model without leaking their names."""
+    error = _public_capability_error(
+        ProviderCapabilityError(capability="tinker_gateway_execution"),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        public_stream=False,
+        public_tools=False,
+    )
+
+    assert error.detail.param == "model"
+    assert error.detail.code == "unsupported_capability"
+    assert "tinker_gateway_execution" not in error.detail.message
+
+
+def test_public_capability_error_attributes_forced_streaming_to_tools() -> None:
+    """An internal streaming requirement identifies the tools field that activated it."""
+    error = _public_capability_error(
+        ProviderCapabilityError(capability="streaming"),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        public_stream=False,
+        public_tools=True,
+    )
+
+    assert error.detail.param == "tools"
+    assert "'tools'" in error.detail.message
+    assert "streaming" not in error.detail.message
 
 
 def _parity_golden(name: str) -> object:
@@ -3591,15 +3621,8 @@ def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
     assert json.loads(repeated.value.public_error_json)["code"] != "idempotency_conflict"
 
 
-def test_capability_rejection_names_the_unsupported_capability(tmp_path: Path) -> None:
-    """A pre-dispatch capability rejection names the exact capability.
-
-    A Responses request with instructions decodes to a developer message; a
-    route that cannot preserve developer messages must say so by name, not
-    with a flattened generic sentence, so a production 400 is triageable.
-    The message carries only the stable internal capability literal, never
-    request content.
-    """
+def test_capability_rejection_names_the_public_request_field(tmp_path: Path) -> None:
+    """A pre-dispatch capability rejection names the exact public field."""
     control, raw_key = _control_plane(tmp_path)
     body = json.dumps(
         {
@@ -3614,7 +3637,9 @@ def test_capability_rejection_names_the_unsupported_capability(tmp_path: Path) -
     assert payload["status_code"] == 400
     assert payload["code"] == "unsupported_capability"
     assert payload["error_type"] == "invalid_request_error"
-    assert "developer_messages" in payload["message"]
+    assert payload["param"] == "instructions"
+    assert "'instructions'" in payload["message"]
+    assert "developer_messages" not in payload["message"]
     assert "canary" not in json.dumps(payload)
 
 
