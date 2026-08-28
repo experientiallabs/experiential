@@ -23,7 +23,11 @@ from exp.common.models import (
     ModelRoles,
     write_model_catalog,
 )
-from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
+from exp.runtime.gateway.catalog_authority import (
+    authored_snapshot_path,
+    upsert_singleton_deployment,
+)
+from exp.runtime.gateway.management import GatewayManagement
 
 
 def _pooled_catalog(root: Path) -> Path:
@@ -109,3 +113,57 @@ def test_valid_singleton_deployment_still_persists_after_validation(tmp_path: Pa
     assert snapshot.exists()
     assert "extra" in {pool.pool_id for pool in normalized.pools}
     assert b"extra" in path.read_bytes()
+
+
+def test_same_mode_bedrock_credential_rotation_refreshes_authored_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A locator-only rotation rebinds without changing normalized route identity."""
+    manager = GatewayManagement(tmp_path)
+    manager.initialize()
+
+    def connection(secret_env: str, access_env: str) -> ConnectionConfig:
+        return ConnectionConfig(
+            provider="bedrock",
+            region="us-west-2",
+            api_key_env=secret_env,
+            aws_access_key_id_env=access_env,
+            bedrock_auth_mode="access_key_pair",
+        )
+
+    old = connection("OLD_SECRET", "OLD_ACCESS")
+    manager.upsert_provider_connection(connection_id="bedrock-main", config=old)
+
+    def upsert(config: ConnectionConfig, *, replace: bool) -> Path:
+        _normalized, snapshot, _changed = upsert_singleton_deployment(
+            tmp_path,
+            deployment_alias="bedrock",
+            connection_name="bedrock-main",
+            provider_model="amazon.nova-lite-v1:0",
+            exact_model_id="nova-lite",
+            revision=None,
+            capabilities=ModelCapabilities(supports_completions=True),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            prices=GatewayTokenPrices(),
+            pricing_source=None,
+            replace=replace,
+            serving_connections={"bedrock-main": config},
+        )
+        return snapshot
+
+    first_snapshot = upsert(old, replace=False)
+
+    new = connection("NEW_SECRET", "NEW_ACCESS")
+    manager.upsert_provider_connection(
+        connection_id="bedrock-main",
+        config=new,
+        replace=True,
+    )
+    second_snapshot = upsert(new, replace=True)
+
+    assert second_snapshot == first_snapshot
+    authored = ModelCatalog.model_validate_json(
+        authored_snapshot_path(second_snapshot).read_bytes()
+    )
+    assert authored.connections["bedrock-main"] == new
+    assert manager.provider_bindings(authored)

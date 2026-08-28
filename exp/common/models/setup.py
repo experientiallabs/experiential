@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, model_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.core.locks import file_write_lock
@@ -34,11 +34,6 @@ SETUP_PROVIDERS = frozenset(
 )
 
 
-def _exclude_absent(value: object) -> bool:
-    """Keep new optional Bedrock metadata out of legacy setup payloads."""
-    return value is None
-
-
 class ProviderSetupError(ValueError):
     """Provider setup cannot be applied without replacing or losing catalog state."""
 
@@ -53,15 +48,8 @@ class ProviderConnection(ContractModel):
     api_version: str | None = Field(default=None, max_length=64)
     azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=64)
-    aws_access_key_id_env: str | None = Field(
-        default=None,
-        max_length=256,
-        exclude_if=_exclude_absent,
-    )
-    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = Field(
-        default=None,
-        exclude_if=_exclude_absent,
-    )
+    aws_access_key_id_env: str | None = Field(default=None, max_length=256)
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
 
     @model_validator(mode="after")
     def _require_supported_connection_shape(self) -> ProviderConnection:
@@ -152,6 +140,19 @@ class ProviderConnection(ContractModel):
             aws_access_key_id_env=self.aws_access_key_id_env,
             bedrock_auth_mode=self.bedrock_auth_mode,
         )
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_absent_bedrock_metadata(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ) -> dict[str, object]:
+        """Preserve legacy setup payload bytes without requiring Pydantic 2.12."""
+        serialized: dict[str, object] = handler(self)
+        if self.aws_access_key_id_env is None:
+            serialized.pop("aws_access_key_id_env", None)
+        if self.bedrock_auth_mode is None:
+            serialized.pop("bedrock_auth_mode", None)
+        return serialized
 
 
 class ProviderModelSelection(ContractModel):

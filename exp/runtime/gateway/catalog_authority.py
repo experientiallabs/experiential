@@ -570,8 +570,12 @@ def _write_catalog_snapshot(
     """
     snapshot = root / "gateway" / "catalog-snapshots" / f"{normalized.identity_sha256()}.json"
     authored = authored_snapshot_path(snapshot)
-    if not authored.exists():
-        write_bytes_atomic(authored, canonical_json_bytes(catalog), follow_symlinks=False)
+    authored_bytes = canonical_json_bytes(catalog)
+    if not authored.exists() or authored.read_bytes() != authored_bytes:
+        # The normalized route identity intentionally excludes credential
+        # locators. Refresh its companion when those secret-free locators rotate
+        # so new alias revisions bind the current provider authority.
+        write_bytes_atomic(authored, authored_bytes, follow_symlinks=False)
         os.chmod(authored, 0o600)
     if not snapshot.exists():
         write_bytes_atomic(snapshot, canonical_json_bytes(normalized), follow_symlinks=False)
