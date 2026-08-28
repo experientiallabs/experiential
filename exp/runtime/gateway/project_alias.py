@@ -158,7 +158,12 @@ def _migrate_legacy_project_gateway_metadata(
         models[alias] = record.model_copy(
             update={
                 "gateway": GatewayDeploymentMetadata(
-                    capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+                    capabilities=GatewayDeploymentCapabilities(
+                        supports_streaming=True,
+                        supports_streaming_tool_arguments=bool(
+                            record.capabilities and record.capabilities.supports_tools
+                        ),
+                    )
                 )
             }
         )
