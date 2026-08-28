@@ -3258,6 +3258,15 @@ def test_zero_argument_tool_calls_encode_on_every_public_lane() -> None:
     frames = native.encode_messages_fixture("request-abc", "coding", fixture)
     assert any('"type":"tool_use"' in frame for frame in frames)
     assert frames[-1].startswith("event: message_stop")
+    streamed_input = "".join(
+        payload["delta"]["partial_json"]
+        for payload in (
+            json.loads(frame.split("data: ", 1)[1].strip()) for frame in frames if frame
+        )
+        if payload["type"] == "content_block_delta"
+        and payload["delta"]["type"] == "input_json_delta"
+    )
+    assert streamed_input == "{}"
     messages_body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
     assert messages_body["content"][0] == {
         "type": "tool_use",
@@ -3270,6 +3279,17 @@ def test_zero_argument_tool_calls_encode_on_every_public_lane() -> None:
     chat_frames = native.encode_chat_fixture("request-abc", "coding", 1_700_000_000, True, fixture)
     assert chat_frames[-1] == "data: [DONE]\n\n"
     assert any('"finish_reason":"tool_calls"' in frame for frame in chat_frames)
+    streamed_arguments = "".join(
+        call["function"]["arguments"]
+        for payload in (
+            json.loads(frame.split("data: ", 1)[1].strip())
+            for frame in chat_frames
+            if frame.startswith("data: {")
+        )
+        for choice in payload.get("choices", ())
+        for call in choice.get("delta", {}).get("tool_calls", ())
+    )
+    assert streamed_arguments == "{}"
     responses_body = json.loads(
         native.completed_responses_fixture("request-abc", "coding", 1_700_000_000.0, "{}", fixture)
     )
