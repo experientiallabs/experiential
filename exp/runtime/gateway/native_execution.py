@@ -236,6 +236,44 @@ def resolve_route_profiles(
     return tuple(resolved_wires)
 
 
+def select_route_deployments(
+    route: GatewayRoute,
+    indexes: tuple[int, ...],
+) -> GatewayRoute:
+    """Return a route narrowed to ordered compatible deployment indexes.
+
+    Args:
+        route: Frozen ordered deployment route selected for the request.
+        indexes: Strictly increasing indexes into the route deployments.
+
+    Returns:
+        The original route when every deployment remains, otherwise a new
+        execution snapshot naming exactly the compatible deployments.
+
+    Raises:
+        ValueError: The selection is empty, unordered, repeated, or out of range.
+    """
+    deployments = route.deployments
+    if not indexes:
+        raise ValueError("a narrowed route requires at least one deployment")
+    if indexes != tuple(sorted(set(indexes))):
+        raise ValueError("route deployment indexes must be unique and ordered")
+    if indexes[0] < 0 or indexes[-1] >= len(deployments):
+        raise ValueError("route deployment index is out of range")
+    if indexes == tuple(range(len(deployments))):
+        return route
+    selected = tuple(deployments[index] for index in indexes)
+    return GatewayRoute(
+        snapshot=route.snapshot.model_copy(
+            update={"deployment_ids": tuple(item.deployment_id for item in selected)}
+        ),
+        deployment=selected[0],
+        fallback_deployments=selected[1:],
+        route_reason=route.route_reason,
+        fallback_reason=route.fallback_reason,
+    )
+
+
 def deployment_wire_entry(
     route: GatewayRoute,
     deployment: ExactModelDeployment,

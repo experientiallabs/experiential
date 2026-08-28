@@ -195,16 +195,13 @@ Commit-independent headers are available before streaming begins. Route-dependen
 emitted only after an execution snapshot exists. Stable public IDs do not expose raw key,
 idempotency, request, or provider values.
 
-`GET /v1/models` lists only the aliases granted to the presented key, as OpenAI model objects
-enriched with an `exp` object carrying the alias revision and catalog digest of the granted
-authority. When that alias revision targets exactly one direct singleton pool, the same object
-also carries optional extension fields copied from that pool's deployment: `supports_completions`,
-`supports_tools`, `supports_structured_output`, `maximum_output_tokens`, `context_window_tokens`
-when the catalog declares a window, and a `pricing` object of configured micro-USD-per-million-token
-rates. The gateway never invents a context window or a cache-write price, and it never hard-codes
-hosted alias names. Its list envelope carries `exp.authority_schema_version`, including when `data` is
-empty, so caller-side key validation can distinguish this gateway from a generic OpenAI proxy.
-`GET /v1/models/{model_id}` describes one granted alias with the same object and
+`GET /v1/models` lists only the aliases granted to the presented key. The envelope contains
+only the OpenAI `object` and `data` fields, and every entry contains only `id`, `object`,
+`created`, and `owned_by`. Capability, pricing, revision, and catalog-digest metadata never
+ride this compatibility endpoint. Platform's separate `/api/models` catalog owns rich route
+metadata, including configured micro-USD-per-million-token prices.
+`GET /v1/models/{model_id}` describes one granted alias with
+the same exact OpenAI Model object and
 returns the identical `model_not_found` 404 for every other model ID, so the route never confirms
 whether an ungranted alias exists. Quota-exhausted and throttled 429 responses and the draining
 503 advertise a `Retry-After` wait, and monthly quota exhaustion reports its exact UTC

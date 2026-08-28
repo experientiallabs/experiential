@@ -35,7 +35,7 @@ exp config gateway provider add fireworks \
 
 Then bind one exact model as a direct alias. The capability flags are the template for a
 current Fireworks chat model: most support tools and structured output, and none require
-developer messages. Confirm the flags and the micro-USD-per-million-token prices against
+developer messages. Confirm the flags and the micro-USD prices per million tokens against
 the Fireworks model page before authoring, because the gateway treats both as frozen
 authority for routing and accounting.
 
@@ -109,13 +109,12 @@ interactive screens, or authors the same configured metadata with `--non-interac
 `--connection-json` / `--model-json` (or a hand-written `.exp/models.toml` record). Setup never
 infers tools, structured output, token limits, or prices.
 
-A hosted Experiential gateway is the same provider family and an optional richer listing. Point
-`base_url` at its `/v1` origin and present a granted virtual key. `GET /v1/models` keeps the
-OpenAI list shape and may publish per-alias completion capabilities, limits, and configured
-micro-USD prices from the active catalog. `exp config providers --provider openai-compatible`
-reads those optional fields, converts micro-USD prices to USD per million tokens, and leaves
-unknown any field the catalog did not declare. It does not treat official OpenAI listing
-metadata the same way.
+A hosted Experiential gateway is the same provider family. Point `base_url` at its `/v1` origin
+and present a granted virtual key. `GET /v1/models` is identity-only and contains no capability,
+limit, pricing, revision, or catalog extension fields. Hosted catalog metadata is available from
+the Platform `/api/models` surface. Other compatible providers may expose optional model-list
+extensions; setup can read those declarations but leaves unknown anything the provider omits.
+The hosted gateway never relies on such extensions in the OpenAI discovery response.
 
 ## Experiential Cloud
 

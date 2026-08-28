@@ -30,7 +30,6 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
-from exp.runtime.gateway.discovery import listing_metadata_by_alias
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import (
     LocalGatewayComponents,
@@ -705,6 +704,8 @@ def _configured_pool_gateway(
     *,
     refusal_failover: bool = False,
     base_urls: tuple[str, str] = ("http://127.0.0.1:9/v1", "http://127.0.0.1:10/v1"),
+    gateway_capabilities: tuple[GatewayDeploymentCapabilities, GatewayDeploymentCapabilities]
+    | None = None,
 ) -> tuple[GatewayManagement, str]:
     """Create one certified two-deployment pool alias, grant, and key.
 
@@ -712,18 +713,14 @@ def _configured_pool_gateway(
         root: Gateway root to initialize.
         refusal_failover: Whether the alias revision opts into refusal failover.
         base_urls: One provider endpoint per ordered deployment.
+        gateway_capabilities: Optional protocol contract for each deployment.
 
     Returns:
         The management handle and the issued raw key.
     """
     from datetime import UTC, datetime
 
-    from exp.common.models import (
-        GatewayDeploymentCapabilities,
-        GatewayEquivalenceCertification,
-        GatewayTokenPrices,
-        ModelCapabilities,
-    )
+    from exp.common.models import GatewayEquivalenceCertification
     from exp.runtime.gateway.catalog_authority import (
         ConnectionConfig,
         upsert_certified_pool,
@@ -735,7 +732,13 @@ def _configured_pool_gateway(
     manager.initialize()
     normalized = None
     snapshot = None
-    for alias, base_url in zip(("alpha", "beta"), base_urls, strict=True):
+    declared_gateway_capabilities = gateway_capabilities or (
+        GatewayDeploymentCapabilities(supports_streaming=True),
+        GatewayDeploymentCapabilities(supports_streaming=True),
+    )
+    for alias, base_url, gateway_capability in zip(
+        ("alpha", "beta"), base_urls, declared_gateway_capabilities, strict=True
+    ):
         upsert_connection(
             root,
             name=f"{alias}-provider",
@@ -754,7 +757,7 @@ def _configured_pool_gateway(
             exact_model_id="model-revision-exact",
             revision=None,
             capabilities=ModelCapabilities(),
-            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            gateway_capabilities=gateway_capability,
             prices=GatewayTokenPrices(),
             pricing_source=None,
             replace=False,
@@ -794,9 +797,15 @@ def _pool_control_plane(
     root: Path,
     *,
     refusal_failover: bool = False,
+    gateway_capabilities: tuple[GatewayDeploymentCapabilities, GatewayDeploymentCapabilities]
+    | None = None,
 ) -> tuple[NativeControlPlane, str]:
     """Load the native control plane over one certified two-deployment pool."""
-    _manager, raw_key = _configured_pool_gateway(root, refusal_failover=refusal_failover)
+    _manager, raw_key = _configured_pool_gateway(
+        root,
+        refusal_failover=refusal_failover,
+        gateway_capabilities=gateway_capabilities,
+    )
     components = load_gateway_components(
         root,
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
@@ -840,6 +849,34 @@ def test_admit_returns_the_full_ordered_route_without_starting_attempts(
             "select attempt_ordinal, route_depth, state from gateway_attempts"
         ).fetchall()
     assert rows == [(0, 0, "dispatched")]
+
+
+def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
+    """A supported stop request keeps the compatible rung instead of failing the pool."""
+    control, raw_key = _pool_control_plane(
+        tmp_path,
+        gateway_capabilities=(
+            GatewayDeploymentCapabilities(supports_streaming=True),
+            GatewayDeploymentCapabilities(
+                supports_streaming=True,
+                supports_stop_sequences=True,
+            ),
+        ),
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["DONE"],
+        }
+    )
+
+    admission = _admit(control, raw_key, body)
+
+    route = cast("list[JsonObject]", admission["route"])
+    assert [item["model_id"] for item in route] == ["beta-model-exact"]
+    upstream = cast("JsonObject", route[0]["upstream_payload"])
+    assert upstream["stop"] == ["DONE"]
 
 
 def test_pool_failover_records_ordinals_depths_and_one_finalize(tmp_path: Path) -> None:
@@ -1106,20 +1143,18 @@ def test_authenticate_rejects_an_invalid_key(tmp_path: Path) -> None:
     assert payload["code"] == "invalid_key"
 
 
-def test_models_and_detail_mirror_the_python_discovery_bodies(tmp_path: Path) -> None:
-    """Model discovery bodies match the shared discovery encoding with metadata."""
+def test_models_and_detail_are_exact_openai_discovery_bodies(tmp_path: Path) -> None:
+    """Model discovery emits no gateway-specific response fields."""
     control, raw_key = _control_plane(tmp_path)
-    components = control._components  # noqa: SLF001 - expected-body construction.
-    authorities = components.store.granted_alias_authorities(raw_key=raw_key)
-    metadata = listing_metadata_by_alias(authorities, components.routes.published_metadata)
-    assert "coding" in metadata
 
     models = json.loads(control.models(json.dumps({"raw_key": raw_key})))
-    assert [item["id"] for item in models["data"]] == ["coding"]
-    assert models["exp"]["authority_schema_version"] == 1
-    listed = models["data"][0]
-    for key, value in metadata["coding"].extension_fields().items():
-        assert listed[key] == value
+    listed = {
+        "id": "coding",
+        "object": "model",
+        "created": 0,
+        "owned_by": "exp",
+    }
+    assert models == {"object": "list", "data": [listed]}
     detail = json.loads(
         control.model_detail(json.dumps({"raw_key": raw_key, "model_id": "coding"}))
     )

@@ -61,6 +61,9 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
+    required_reasoning_effort = (
+        profile.reasoning_effort if profile.reasoning_effort_required else None
+    )
     if profile.dialect == "openai_responses":
         return openai_responses_stream_payload(
             profile.model_id,
@@ -74,7 +77,7 @@ def dialect_stream_payload(
             supports_top_k=profile.supports_top_k,
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
-            reasoning_effort=profile.reasoning_effort,
+            reasoning_effort=required_reasoning_effort,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
         )
     if profile.dialect == "anthropic_messages":
@@ -90,7 +93,7 @@ def dialect_stream_payload(
             supports_top_k=profile.supports_top_k,
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
-            reasoning_effort=profile.reasoning_effort,
+            reasoning_effort=required_reasoning_effort,
         )
     if profile.dialect == "gemini_generate_content":
         return gemini_generate_content_stream_payload(
@@ -105,7 +108,7 @@ def dialect_stream_payload(
             supports_top_k=profile.supports_top_k,
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
-            reasoning_effort=profile.reasoning_effort,
+            reasoning_effort=required_reasoning_effort,
         )
     if profile.dialect == "bedrock_converse_stream":
         return bedrock_converse_stream_payload(
@@ -135,7 +138,7 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_wire_format=profile.reasoning_wire_format,
-            reasoning_effort=profile.reasoning_effort,
+            reasoning_effort=required_reasoning_effort,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")
@@ -214,6 +217,8 @@ def route_generation_parameter_requests(
         request.reasoning_effort,
         param=effort_path,
     )
+    if request.reasoning_effort is None and effective_reasoning_effort is not None:
+        provider_updates["reasoning_effort"] = effective_reasoning_effort
 
     def sampling_supported(profile: GatewayWireProfile, *, top_p: bool = False) -> bool:
         """Return whether one rung accepts this request's sampling mode."""
@@ -262,6 +267,7 @@ def route_generation_parameter_requests(
                     profile.model_id,
                     profile.reasoning_wire_format,
                     configured_effort=profile.reasoning_effort,
+                    explicit_efforts=profile.supported_reasoning_efforts or None,
                 )
             )
         if effective_reasoning_effort not in portable_efforts:
@@ -413,16 +419,18 @@ def _effective_route_reasoning_effort(
     *,
     param: str,
 ) -> str | None:
-    """Return an explicit effort or one consistent route pin without changing it."""
+    """Return an explicit effort or one consistent required provider default."""
     if requested_effort is not None:
         return requested_effort
-    configured = {profile.reasoning_effort for profile in profiles}
-    if configured == {None}:
+    configured = {
+        profile.reasoning_effort for profile in profiles if profile.reasoning_effort_required
+    }
+    if not configured:
         return None
     if None in configured or len(configured) != 1:
         raise ProviderParameterError(
             message=(
-                "The model route has inconsistent configured reasoning efforts. "
+                "The model route has inconsistent required reasoning efforts. "
                 "The gateway operator must align every waterfall deployment before retrying."
             ),
             param=param,

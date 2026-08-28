@@ -72,6 +72,7 @@ def supported_reasoning_efforts(
     wire_format: str,
     *,
     configured_effort: str | None = None,
+    explicit_efforts: Collection[str] | None = None,
 ) -> tuple[str, ...]:
     """Return efforts a route can send without provider-side normalization.
 
@@ -84,10 +85,13 @@ def supported_reasoning_efforts(
         model_id: Exact provider model identifier.
         wire_format: Provider field used to carry reasoning effort.
         configured_effort: Optional operator-pinned effort proven by the catalog.
+        explicit_efforts: Exact provider-published values for this deployment.
 
     Returns:
         Canonically ordered efforts that preserve the caller's exact value.
     """
+    if explicit_efforts is not None:
+        return tuple(effort for effort in _EFFORT_ORDER if effort in explicit_efforts)
     supported: Collection[str] | None
     if wire_format in {"openai_responses", "reasoning_effort"}:
         supported = _openai_supported_efforts(model_id)

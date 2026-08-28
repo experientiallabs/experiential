@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -13,9 +12,6 @@ from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 AliasAuthority = tuple[str, str, str]
 """Granted alias name, active revision, and catalog digest."""
-
-MODEL_AUTHORITY_SCHEMA_VERSION = 1
-"""Version of the gateway-specific model-list authority envelope."""
 
 
 class AliasMetadataLookup(Protocol):
@@ -187,56 +183,38 @@ def listing_metadata_by_alias(
 
 def public_model_object(
     authority: AliasAuthority,
-    metadata: PublishedAliasMetadata | None = None,
 ) -> JsonObject:
-    """Build one OpenAI model object enriched with granted authority and catalog fields.
-
-    The four OpenAI keys keep their exact meaning for official clients. The ``exp``
-    object carries only authority metadata the gateway already exposes to callers
-    through response headers and grants, never provider or credential detail.
-    Optional capability, limit, and price fields are catalog copies, never guesses.
+    """Build one exact OpenAI Model object for a granted public alias.
 
     Args:
         authority: Granted alias, active revision, and catalog digest triple.
-        metadata: Catalog-backed extension fields for the granted alias, when unique.
 
     Returns:
-        JSON-compatible public model object.
+        JSON-compatible Model object with only fields defined by OpenAI.
     """
-    alias, revision, digest = authority
-    payload: JsonObject = {
+    alias, _revision, _digest = authority
+    return {
         "id": alias,
         "object": "model",
         "created": 0,
         "owned_by": "exp",
-        "exp": {"alias_revision_id": revision, "catalog_sha256": digest},
     }
-    if metadata is not None:
-        payload.update(metadata.extension_fields())
-    return payload
 
 
 def public_model_list(
     authorities: tuple[AliasAuthority, ...],
-    metadata_by_alias: Mapping[str, PublishedAliasMetadata] | None = None,
 ) -> JsonObject:
-    """Build a caller model list with an authority marker even when it is empty.
+    """Build an exact OpenAI model-list envelope for granted aliases.
 
     Args:
         authorities: Granted alias, revision, and catalog digest triples.
-        metadata_by_alias: Catalog-backed extension fields keyed by granted alias.
 
     Returns:
-        OpenAI-compatible model-list envelope with the gateway authority marker.
+        OpenAI model-list object with no gateway-specific response fields.
     """
-    published = {} if metadata_by_alias is None else metadata_by_alias
     return {
         "object": "list",
-        "data": [
-            public_model_object(authority, metadata=published.get(authority[0]))
-            for authority in authorities
-        ],
-        "exp": {"authority_schema_version": MODEL_AUTHORITY_SCHEMA_VERSION},
+        "data": [public_model_object(authority) for authority in authorities],
     }
 
 

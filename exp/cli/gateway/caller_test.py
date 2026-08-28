@@ -240,10 +240,10 @@ def test_unreachable_gateway_is_a_usage_error_naming_the_url(
     assert "start one with 'exp'" in normalized
 
 
-def test_models_prints_the_caller_view_with_granted_revisions(
+def test_models_prints_the_exact_openai_caller_view(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The live caller view lists each granted alias with its active revision."""
+    """The live caller view lists each granted alias without private metadata."""
     envelope = {
         "object": "list",
         "data": [
@@ -252,14 +252,12 @@ def test_models_prints_the_caller_view_with_granted_revisions(
                 "object": "model",
                 "created": 0,
                 "owned_by": "exp",
-                "exp": {"alias_revision_id": "revision-one", "catalog_sha256": "a" * 64},
             }
         ],
-        "exp": {"authority_schema_version": 1},
     }
 
     def respond(request: httpx.Request) -> httpx.Response:
-        """Serve the enriched discovery list for the authenticated caller."""
+        """Serve the exact discovery list for the authenticated caller."""
         assert request.url.path == "/v1/models"
         assert request.headers["Authorization"] == f"Bearer {_RAW_KEY}"
         return httpx.Response(200, json=envelope)
@@ -269,7 +267,7 @@ def test_models_prints_the_caller_view_with_granted_revisions(
     raw = CliRunner().invoke(app, ["config", "gateway", "models", "--key", _RAW_KEY, "--json"])
 
     assert human.exit_code == 0, human.output
-    assert human.output == "coding (revision revision-one)\n"
+    assert human.output == "coding\n"
     assert raw.exit_code == 0, raw.output
     assert json.loads(raw.stdout) == envelope
     assert len(seen) == 2
@@ -293,13 +291,8 @@ def test_key_check_reports_granted_aliases_without_echoing_the_key(
                         "object": "model",
                         "created": 0,
                         "owned_by": "exp",
-                        "exp": {
-                            "alias_revision_id": "revision-one",
-                            "catalog_sha256": "a" * 64,
-                        },
                     }
                 ],
-                "exp": {"authority_schema_version": 1},
             },
         )
 
@@ -327,15 +320,27 @@ def test_key_check_reports_granted_aliases_without_echoing_the_key(
     "envelope",
     (
         {"object": "list"},
-        {"object": "list", "data": []},
         {"object": "list", "data": [{"id": "generic-model", "object": "model"}]},
+        {
+            "object": "list",
+            "data": [
+                {
+                    "id": "coding",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "exp",
+                    "exp": {"alias_revision_id": "revision-one"},
+                }
+            ],
+        },
+        {"object": "list", "data": [], "exp": {"authority_schema_version": 1}},
     ),
 )
-def test_key_check_rejects_http_200_without_gateway_authority_shape(
+def test_key_check_rejects_http_200_without_exact_gateway_model_shape(
     monkeypatch: pytest.MonkeyPatch,
     envelope: dict[str, object],
 ) -> None:
-    """An unrelated HTTP 200 model list cannot validate a gateway key."""
+    """Malformed or extended model lists cannot validate a gateway key."""
 
     def respond(request: httpx.Request) -> httpx.Response:
         """Serve a malformed or generic OpenAI model-list response."""
@@ -354,15 +359,15 @@ def test_key_check_rejects_http_200_without_gateway_authority_shape(
         "operation": "key.check",
         "valid": False,
         "error_code": "invalid_gateway_response",
-        "message": "HTTP 200 did not contain the EXP gateway model-authority response shape.",
+        "message": "HTTP 200 did not contain the gateway's exact OpenAI model-list shape.",
     }
     assert _RAW_KEY not in result.output
 
 
-def test_key_check_accepts_a_gateway_authority_envelope_with_no_grants(
+def test_key_check_accepts_an_exact_empty_gateway_model_list(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A marked empty gateway list proves authentication without inventing grants."""
+    """A successful exact empty list proves authentication without inventing grants."""
 
     def respond(request: httpx.Request) -> httpx.Response:
         """Serve the gateway's authenticated no-grants envelope."""
@@ -372,7 +377,6 @@ def test_key_check_accepts_a_gateway_authority_envelope_with_no_grants(
             json={
                 "object": "list",
                 "data": [],
-                "exp": {"authority_schema_version": 1},
             },
         )
 

@@ -12,7 +12,13 @@ from typing import ClassVar, Literal
 from uuid import uuid4
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import ChatMaxTokensField, ModelRequest, ModelResponse, ModelSnapshot
+from exp.common.models import (
+    ChatMaxTokensField,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+    ReasoningEffort,
+)
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
     RequestDeadline,
@@ -138,7 +144,13 @@ class GatewayWireProfile:
     """Exact provider field used to carry normalized reasoning effort."""
 
     reasoning_effort: str | None = None
-    """Optional catalog-pinned reasoning effort."""
+    """Optional provider default used when the wire requires an explicit effort."""
+
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
+    """Exact caller values declared by this deployment, in canonical order."""
+
+    reasoning_effort_required: bool = False
+    """Whether dispatch must put an explicit reasoning effort on this wire."""
 
     sampling_requires_reasoning_none: bool = False
     """Whether sampling controls require an exact ``none`` reasoning effort."""
@@ -178,6 +190,26 @@ class GatewayWireProfile:
             raise ValueError("reasoning support requires a concrete wire format")
         if self.reasoning_effort is not None and not self.supports_reasoning:
             raise ValueError("a configured reasoning effort requires reasoning support")
+        if self.supported_reasoning_efforts and not self.supports_reasoning:
+            raise ValueError("supported reasoning efforts require reasoning support")
+        effort_order = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+        effort_indexes = tuple(
+            effort_order.index(effort) for effort in self.supported_reasoning_efforts
+        )
+        if len(set(self.supported_reasoning_efforts)) != len(self.supported_reasoning_efforts):
+            raise ValueError("supported reasoning efforts cannot repeat values")
+        if effort_indexes != tuple(sorted(effort_indexes)):
+            raise ValueError("supported reasoning efforts must use canonical order")
+        if (
+            self.reasoning_effort is not None
+            and self.supported_reasoning_efforts
+            and self.reasoning_effort not in self.supported_reasoning_efforts
+        ):
+            raise ValueError("the configured reasoning effort is not supported by this route")
+        if self.reasoning_effort_required and self.reasoning_effort is None:
+            raise ValueError("a required reasoning effort needs a configured provider default")
+        if self.reasoning_effort_required and not self.supports_reasoning:
+            raise ValueError("a required reasoning effort needs reasoning support")
         if self.sampling_requires_reasoning_none and not self.supports_reasoning:
             raise ValueError("conditional sampling requires reasoning support")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:

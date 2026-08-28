@@ -6,17 +6,72 @@ from pathlib import Path
 
 import pytest
 
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    DirectTarget,
+    ExecutionSnapshot,
+    GatewayApiSurface,
+    GatewayFailure,
+    GatewayFailureClass,
+)
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
     claim_route_from,
     next_route_candidate,
+    select_route_deployments,
 )
+from exp.runtime.gateway.routing import GatewayRoute
 
 _KEYS: tuple[DeploymentHealthKey, ...] = (
     ("catalog" + "0" * 57, "deployment-a", "connection-a"),
     ("catalog" + "0" * 57, "deployment-b", "connection-b"),
 )
+
+
+def _deployment(deployment_id: str) -> ExactModelDeployment:
+    """Build one exact deployment for route-narrowing tests."""
+    return ExactModelDeployment(
+        deployment_id=deployment_id,
+        source_alias=deployment_id,
+        exact_model_id="exact-one",
+        connection=f"connection-{deployment_id}",
+        provider="openai-compatible",
+        provider_model="provider-model",
+        connection_sha256="b" * 64,
+        capabilities_sha256="c" * 64,
+        gateway=GatewayDeploymentMetadata(),
+    )
+
+
+def _route() -> GatewayRoute:
+    """Build a three-rung exact-model route."""
+    deployments = tuple(_deployment(name) for name in ("one", "two", "three"))
+    authorization = AuthorizationSnapshot(
+        request_id="request-one",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        virtual_key_id="key-one",
+        alias="public-model",
+        alias_revision_id="revision-one",
+        target=DirectTarget(pool_id="pool-one"),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256="a" * 64,
+        canonical_request_sha256="d" * 64,
+        deadline_monotonic=1.0,
+    )
+    return GatewayRoute(
+        snapshot=ExecutionSnapshot(
+            authorization=authorization,
+            exact_model_id="exact-one",
+            pool_id="pool-one",
+            deployment_ids=tuple(item.deployment_id for item in deployments),
+        ),
+        deployment=deployments[0],
+        fallback_deployments=deployments[1:],
+        route_reason="direct",
+    )
 
 
 def _retryable() -> GatewayFailure:
@@ -36,6 +91,21 @@ def _failover_only() -> GatewayFailure:
         safe_message="provider throttled the request",
         failover_eligible=True,
     )
+
+
+def test_select_route_deployments_rebinds_the_execution_snapshot() -> None:
+    """Accounting and wire order name exactly the compatible deployment subset."""
+    selected = select_route_deployments(_route(), (1, 2))
+
+    assert tuple(item.deployment_id for item in selected.deployments) == ("two", "three")
+    assert selected.snapshot.deployment_ids == ("two", "three")
+
+
+@pytest.mark.parametrize("indexes", ((), (1, 0), (0, 0), (3,)))
+def test_select_route_deployments_rejects_invalid_indexes(indexes: tuple[int, ...]) -> None:
+    """An invalid compatibility selection cannot corrupt waterfall accounting."""
+    with pytest.raises(ValueError):
+        select_route_deployments(_route(), indexes)
 
 
 def test_claim_ladder_prefers_healthy_then_probe_then_forced() -> None:

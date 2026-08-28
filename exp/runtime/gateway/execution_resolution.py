@@ -28,6 +28,7 @@ def _resolved_wire_profile(
         TypeError: The resolved client exposes no native wire profile.
     """
     capabilities = runtime_model.capabilities
+    gateway_capabilities = deployment.gateway.capabilities
     if isinstance(runtime_model.client, NativeWireClient):
         profile = runtime_model.client.gateway_wire_profile()
         output_limits = tuple(
@@ -74,6 +75,13 @@ def _resolved_wire_profile(
                 else profile.maximum_top_k
             ),
             sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+            supported_reasoning_efforts=(
+                gateway_capabilities.supported_reasoning_efforts
+                or profile.supported_reasoning_efforts
+            ),
+            reasoning_effort_required=(
+                gateway_capabilities.reasoning_effort_required or profile.reasoning_effort_required
+            ),
             token_limit_key=capabilities.chat_max_tokens_field or profile.token_limit_key,
             maximum_output_tokens=min(output_limits) if output_limits else None,
         )

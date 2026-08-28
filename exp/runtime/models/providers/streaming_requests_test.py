@@ -20,6 +20,9 @@ from exp.runtime.models.providers.errors import (
     UnsupportedReasoningEffortError,
 )
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
+)
 from exp.runtime.models.providers.streaming_requests import (
     anthropic_messages_stream_payload,
     bedrock_converse_stream_payload,
@@ -378,6 +381,7 @@ def test_route_rejects_an_unsupported_configured_effort_without_clamping() -> No
                     supports_reasoning=True,
                     reasoning_wire_format="openai_responses",
                     reasoning_effort="minimal",
+                    reasoning_effort_required=True,
                 ),
             ),
             _chat_request(),
@@ -397,6 +401,7 @@ def test_route_rejects_inconsistent_configured_efforts_across_fallbacks() -> Non
             supports_reasoning=True,
             reasoning_wire_format="anthropic_adaptive",
             reasoning_effort="high",
+            reasoning_effort_required=True,
         ),
         GatewayWireProfile(
             dialect="anthropic_messages",
@@ -405,6 +410,7 @@ def test_route_rejects_inconsistent_configured_efforts_across_fallbacks() -> Non
             supports_reasoning=True,
             reasoning_wire_format="anthropic_adaptive",
             reasoning_effort="medium",
+            reasoning_effort_required=True,
         ),
     )
 
@@ -413,6 +419,89 @@ def test_route_rejects_inconsistent_configured_efforts_across_fallbacks() -> Non
 
     assert raised.value.code == "invalid_parameter"
     assert "gateway operator must align" in str(raised.value)
+
+
+def test_explicit_provider_effort_set_accepts_exact_values_and_rejects_others() -> None:
+    """Catalog-published OpenRouter values replace the unknown-family singleton."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://openrouter.test",
+        model_id="z-ai/glm-5.3",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="max",
+        supported_reasoning_efforts=("low", "high", "max"),
+        reasoning_effort_required=True,
+    )
+
+    _public, provider = route_generation_parameter_requests(
+        (profile,),
+        _chat_request().model_copy(update={"reasoning_effort": "high"}),
+    )
+    assert provider.reasoning_effort == "high"
+
+    with pytest.raises(UnsupportedReasoningEffortError) as raised:
+        route_generation_parameter_requests(
+            (profile,),
+            _chat_request().model_copy(update={"reasoning_effort": "medium"}),
+        )
+    assert "Supported values: 'low', 'high', 'max'." in str(raised.value)
+
+
+def test_required_reasoning_default_is_sent_but_optional_default_is_not() -> None:
+    """Only a provider-mandated default may add an omitted reasoning field."""
+    required = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://required.test",
+        model_id="z-ai/glm-5.3",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="max",
+        supported_reasoning_efforts=("low", "high", "max"),
+        reasoning_effort_required=True,
+    )
+    optional = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://optional.test",
+        model_id="deepseek/deepseek-v4-flash",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="high",
+        supported_reasoning_efforts=("high", "xhigh"),
+    )
+
+    public, provider = route_generation_parameter_requests((required,), _chat_request())
+    assert public.reasoning_effort is None
+    assert provider.reasoning_effort == "max"
+    assert dialect_stream_payload(required, provider)["reasoning"] == {"effort": "max"}
+    optional_public, optional_provider = route_generation_parameter_requests(
+        (optional,), _chat_request()
+    )
+    assert optional_public.reasoning_effort is None
+    assert optional_provider.reasoning_effort is None
+    assert "reasoning" not in dialect_stream_payload(optional, optional_provider)
+
+
+def test_generation_parameter_selection_skips_incompatible_fallbacks() -> None:
+    """An exact caller value keeps usable rungs instead of poisoning the waterfall."""
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://azure.test",
+            model_id="DeepSeek-V4-Flash",
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://openrouter.test",
+            model_id="deepseek/deepseek-v4-flash",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            supported_reasoning_efforts=("high", "xhigh"),
+        ),
+    )
+    request = _chat_request().model_copy(update={"reasoning_effort": "high"})
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
 
 
 def test_route_accepts_anthropic_max_effort_without_translation() -> None:

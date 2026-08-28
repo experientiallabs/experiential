@@ -100,12 +100,7 @@ def caller_models(
         typer.echo(response.text)
         return
     for model in _listed_models(response):
-        identity = str(model.get("id", ""))
-        authority = model.get("exp")
-        if isinstance(authority, dict) and "alias_revision_id" in authority:
-            typer.echo(f"{identity} (revision {authority['alias_revision_id']})")
-        else:
-            typer.echo(identity)
+        typer.echo(str(model.get("id", "")))
 
 
 def caller_key_check(
@@ -130,7 +125,7 @@ def caller_key_check(
     with _gateway_client(url, timeout=timeout) as client:
         response = _gateway_request(client, "GET", "/models", raw_key=raw_key, url=url)
     if response.status_code == 200:
-        models = _listed_authority_models(response)
+        models = _listed_gateway_models(response)
         if models is not None:
             aliases = [str(model["id"]) for model in models]
             if json_output:
@@ -154,7 +149,7 @@ def caller_key_check(
                 )
             return
         code = "invalid_gateway_response"
-        message = "HTTP 200 did not contain the EXP gateway model-authority response shape."
+        message = "HTTP 200 did not contain the gateway's exact OpenAI model-list shape."
     else:
         code, message = _error_detail(response)
     if json_output:
@@ -400,26 +395,24 @@ def _listed_models(response: httpx.Response) -> list[JsonObject]:
     return [cast(JsonObject, item) for item in payload["data"] if isinstance(item, dict)]
 
 
-def _listed_authority_models(response: httpx.Response) -> list[JsonObject] | None:
-    """Return a validated EXP gateway model-authority list.
+def _listed_gateway_models(response: httpx.Response) -> list[JsonObject] | None:
+    """Return a validated exact OpenAI model list from this gateway.
 
     Args:
         response: Successful response from the caller's ``GET /v1/models`` request.
 
     Returns:
-        Validated model objects, including an empty list when the authority marker is present,
-        or ``None`` when the response is not the EXP gateway authority shape.
+        Validated model objects, including an empty list, or ``None`` when the
+        response does not match the gateway's exact public discovery contract.
     """
     try:
         payload = response.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
-    if not isinstance(payload, dict) or payload.get("object") != "list":
-        return None
-    authority_marker = payload.get("exp")
     if (
-        not isinstance(authority_marker, dict)
-        or authority_marker.get("authority_schema_version") != 1
+        not isinstance(payload, dict)
+        or set(payload) != {"object", "data"}
+        or payload.get("object") != "list"
     ):
         return None
     data = payload.get("data")
@@ -430,34 +423,31 @@ def _listed_authority_models(response: httpx.Response) -> list[JsonObject] | Non
         if not isinstance(item, dict):
             return None
         model = cast(JsonObject, item)
-        if not _is_authority_model(model):
+        if not _is_gateway_model(model):
             return None
         models.append(model)
     return models
 
 
-def _is_authority_model(model: JsonObject) -> bool:
-    """Check the stable wire fields that identify an EXP authority model object.
+def _is_gateway_model(model: JsonObject) -> bool:
+    """Check one exact gateway-owned OpenAI Model object.
 
     Args:
         model: One decoded model object from a models-list response.
 
     Returns:
-        ``True`` only when the object carries the gateway authority metadata.
+        ``True`` only when the object has the four public Model fields and no
+        gateway-specific extensions.
     """
     if (
-        model.get("object") != "model"
+        set(model) != {"id", "object", "created", "owned_by"}
+        or model.get("object") != "model"
         or model.get("created") != 0
         or model.get("owned_by") != "exp"
     ):
         return False
     model_id = model.get("id")
-    authority = model.get("exp")
-    if not isinstance(model_id, str) or not model_id or not isinstance(authority, dict):
-        return False
-    revision = authority.get("alias_revision_id")
-    digest = authority.get("catalog_sha256")
-    return isinstance(revision, str) and bool(revision) and isinstance(digest, str) and bool(digest)
+    return isinstance(model_id, str) and bool(model_id)
 
 
 def _authorization(raw_key: str) -> dict[str, str]:

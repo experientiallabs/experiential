@@ -205,10 +205,48 @@ def test_gateway_wire_profile_rejects_malformed_generation_contracts() -> None:
             url="https://provider.test/v1/chat/completions",
             sampling_requires_reasoning_none=True,
         ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            supported_reasoning_efforts=("high", "low"),
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            supported_reasoning_efforts=("high",),
+            reasoning_effort="medium",
+        ),
+        lambda: GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://provider.test/v1/chat/completions",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            supported_reasoning_efforts=("high",),
+            reasoning_effort_required=True,
+        ),
     )
     for constructor in constructors:
         with pytest.raises(ValueError):
             constructor()
+
+
+def test_gateway_wire_profile_accepts_an_exact_required_reasoning_contract() -> None:
+    """A required provider default must be one member of its exact allowed set."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://provider.test/v1/chat/completions",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="max",
+        supported_reasoning_efforts=("low", "high", "max"),
+        reasoning_effort_required=True,
+    )
+
+    assert profile.reasoning_effort == "max"
 
 
 def test_complete_posts_bearer_headers_and_class_defaults_to_the_completion_route() -> None:

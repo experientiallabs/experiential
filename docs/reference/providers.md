@@ -98,17 +98,16 @@ required price or limit remains unknown.
 | `pricing.output_micro_usd_per_million_tokens` | integer `>= 0` | Configured output price in micro-USD per million tokens |
 | `pricing.cached_input_micro_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in micro-USD per million tokens |
 
-Micro-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000`. A
-hosted Experiential gateway publishes these fields from the granted alias revision's direct
-singleton pool. Project aliases and multi-deployment pools stay identity-only. Published
-completion, tool, structured-output, and input/output price fields are enough to assign
-world-model and judge roles without a questionnaire. Router-candidate setup still requires a
-published or operator-declared context window and both cache prices. The gateway never invents
-those values, and setup never infers them.
+Micro-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000`.
+When a trusted third-party compatible host publishes these fields, completion, tool,
+structured-output, and input/output price declarations can assign world-model and judge roles
+without a questionnaire. Router-candidate setup still requires a published or
+operator-declared context window and both cache prices. Setup never invents missing values.
 
-The hosted gateway `/v1/models` response keeps the standard OpenAI list shape (`object`, `data`,
-and the four OpenAI model keys) and only adds these extension fields plus the existing `exp`
-authority marker.
+The hosted gateway `/v1/models` response is the strict OpenAI discovery surface. Its list
+envelope contains only `object` and `data`; each model contains only `id`, `object`,
+`created`, and `owned_by`. Hosted capability and price discovery belongs to the platform
+catalog API, not to additive fields on the OpenAI endpoint.
 
 ## Azure
 

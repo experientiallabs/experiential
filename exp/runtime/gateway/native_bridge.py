@@ -47,7 +47,6 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.discovery import (
-    listing_metadata_by_alias,
     public_model_list,
     public_model_object,
     require_granted_authority,
@@ -75,6 +74,7 @@ from exp.runtime.gateway.native_execution import (
     NativeDialectUnavailableError,
     deployment_wire_entry,
     resolve_route_profiles,
+    select_route_deployments,
 )
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.native_responses import (
@@ -98,6 +98,9 @@ from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
     normalized_provider_failure,
+)
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
 )
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.models.providers.streaming_requests import (
@@ -361,6 +364,12 @@ class NativeControlPlane:
         try:
             if probe_failure is not None or route is None or resolved_wires is None:
                 raise probe_failure or GatewayRoutingError("authorized route did not resolve")
+            compatible_indexes = compatible_generation_parameter_profile_indexes(
+                tuple(profile for profile, _client in resolved_wires),
+                request,
+            )
+            route = select_route_deployments(route, compatible_indexes)
+            resolved_wires = tuple(resolved_wires[index] for index in compatible_indexes)
             public_request, provider_request = route_generation_parameter_requests(
                 tuple(profile for profile, _client in resolved_wires),
                 request,
@@ -368,6 +377,38 @@ class NativeControlPlane:
             provider_request = provider_request.model_copy(
                 update={"stream": True, "include_usage": True}
             )
+            protocol_indexes: list[int] = []
+            first_protocol_error: ProviderParameterError | ProviderCapabilityError | None = None
+            for index, (deployment, (profile, _client)) in enumerate(
+                zip(route.deployments, resolved_wires, strict=True)
+            ):
+                try:
+                    preflight_gateway_request(
+                        provider_request,
+                        deployment.gateway.capabilities,
+                        model_capabilities=deployment.capabilities,
+                    )
+                    dialect_stream_payload(profile, provider_request)
+                except (ProviderParameterError, ProviderCapabilityError) as exc:
+                    if first_protocol_error is None:
+                        first_protocol_error = exc
+                    continue
+                protocol_indexes.append(index)
+            if not protocol_indexes:
+                if first_protocol_error is None:
+                    raise GatewayRoutingError("authorized route has no compatible deployment")
+                raise first_protocol_error
+            if len(protocol_indexes) != len(route.deployments):
+                selected_indexes = tuple(protocol_indexes)
+                route = select_route_deployments(route, selected_indexes)
+                resolved_wires = tuple(resolved_wires[index] for index in selected_indexes)
+                public_request, provider_request = route_generation_parameter_requests(
+                    tuple(profile for profile, _client in resolved_wires),
+                    request,
+                )
+                provider_request = provider_request.model_copy(
+                    update={"stream": True, "include_usage": True}
+                )
             wire_route: list[JsonObject] = []
             signers: list[GatewayDispatchSigner | None] = []
             for deployment, (profile, client) in zip(
@@ -673,12 +714,7 @@ class NativeControlPlane:
         data = json.loads(argument)
         try:
             authorities = self._components.store.granted_alias_authorities(raw_key=data["raw_key"])
-            body = public_model_list(
-                authorities,
-                metadata_by_alias=listing_metadata_by_alias(
-                    authorities, self._components.routes.published_metadata
-                ),
-            )
+            body = public_model_list(authorities)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
         return json.dumps(body, separators=(",", ":"))
@@ -689,12 +725,7 @@ class NativeControlPlane:
         try:
             authorities = self._components.store.granted_alias_authorities(raw_key=data["raw_key"])
             authority = require_granted_authority(authorities, data["model_id"])
-            body = public_model_object(
-                authority,
-                metadata=listing_metadata_by_alias(
-                    (authority,), self._components.routes.published_metadata
-                ).get(authority[0]),
-            )
+            body = public_model_object(authority)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
         return json.dumps(body, separators=(",", ":"))
