@@ -1460,3 +1460,106 @@ def test_reasoning_context_passes_through_verbatim_and_narrows_per_rung() -> Non
         route_generation_parameter_requests((fallback,), request)
     assert raised.value.param == "reasoning.context"
     assert raised.value.code == "unsupported_parameter"
+
+
+def test_anthropic_tools_omit_an_absent_description() -> None:
+    """Anthropic 400s an explicit null description, so the key stays absent.
+
+    Live repro (2026-08-28): a tool without a description produced
+    "tools.0.custom.description: Input should be a valid string" and every
+    tools request on the route failed before streaming.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        tools=(
+            GatewayToolDefinition(name="bare", parameters={"type": "object"}),
+            GatewayToolDefinition(
+                name="described", description="Look up.", parameters={"type": "object"}
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    tools = cast(list[JsonObject], payload["tools"])
+    assert "description" not in tools[0]
+    assert tools[1]["description"] == "Look up."
+
+
+def _thinking_config_request(config: JsonObject) -> GatewayRequest:
+    """Build one Messages request carrying a verbatim thinking config."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        provider_thinking_config=config,
+        stream=True,
+        include_usage=True,
+    )
+
+
+def _anthropic_profile(model_id: str) -> GatewayWireProfile:
+    """Build one reasoning-capable Anthropic wire profile."""
+    return GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+        reasoning_effort="medium",
+    )
+
+
+def test_enabled_thinking_translates_to_adaptive_on_adaptive_only_models() -> None:
+    """The adaptive-only generation rejects caller enabled configs, so the
+    route translates to adaptive and DISCLOSES the dropped token budget
+    instead of silently mapping or silently failing."""
+    request = _thinking_config_request({"type": "enabled", "budget_tokens": 2048})
+    public, provider = route_generation_parameter_requests(
+        (_anthropic_profile("claude-fable-5"),), request
+    )
+    assert "thinking.budget_tokens" in public.ignored_parameters
+    assert provider.provider_thinking_config is None
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5",
+        provider,
+        supports_reasoning=True,
+        reasoning_effort="medium",
+    )
+    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["output_config"] == {"effort": "medium"}
+
+
+def test_enabled_thinking_stays_verbatim_on_budget_capable_models() -> None:
+    """The pre-adaptive generation still honors the caller's exact config."""
+    config: JsonObject = {"type": "enabled", "budget_tokens": 2048}
+    request = _thinking_config_request(config)
+    public, provider = route_generation_parameter_requests(
+        (_anthropic_profile("claude-haiku-4-5"),), request
+    )
+    assert "thinking.budget_tokens" not in public.ignored_parameters
+    assert provider.provider_thinking_config == config
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        provider,
+        supports_reasoning=True,
+        reasoning_effort="medium",
+    )
+    assert payload["thinking"] == config
+
+
+def test_disabled_thinking_rejects_by_name_on_adaptive_only_models() -> None:
+    """Thinking cannot be turned off on the adaptive generation; silently
+    letting the model think anyway would bill the caller for reasoning they
+    explicitly disabled."""
+    request = _thinking_config_request({"type": "disabled"})
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((_anthropic_profile("claude-sonnet-5"),), request)
+    assert raised.value.param == "thinking.type"
+    assert raised.value.code == "unsupported_parameter"
+
+    # The pre-adaptive generation still accepts an explicit disabled config.
+    _public, provider = route_generation_parameter_requests(
+        (_anthropic_profile("claude-opus-4-6"),), _thinking_config_request({"type": "disabled"})
+    )
+    assert provider.provider_thinking_config == {"type": "disabled"}

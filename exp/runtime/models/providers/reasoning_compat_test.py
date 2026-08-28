@@ -123,3 +123,22 @@ def test_default_effort_is_always_valid_for_the_exact_model() -> None:
     assert default_reasoning_effort("gpt-5-pro", "openai_responses") == "high"
     assert default_reasoning_effort("gemini-3-pro-preview", "gemini_thinking") == "high"
     assert default_reasoning_effort("vendor/reasoner", "reasoning") == "medium"
+
+
+def test_adaptive_only_thinking_families_match_the_live_api_boundary() -> None:
+    """The adaptive-only set was verified against the live API on 2026-08-28:
+    the xhigh generation rejects thinking.type.enabled while the 4.6/4.5 line
+    still honors budgeted thinking verbatim."""
+    from exp.runtime.models.providers.reasoning_compat import anthropic_adaptive_only_thinking
+
+    for model in (
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4.7",
+        "claude-sonnet-5",
+    ):
+        assert anthropic_adaptive_only_thinking(model), model
+    for model in ("claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5", "claude-haiku-4.5"):
+        assert not anthropic_adaptive_only_thinking(model), model

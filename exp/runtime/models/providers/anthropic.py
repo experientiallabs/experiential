@@ -79,14 +79,15 @@ def anthropic_messages_request(
     if system_parts:
         payload["system"] = "\n\n".join(system_parts)
     if request.tools:
-        payload["tools"] = [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema,
-            }
-            for tool in request.tools
-        ]
+        tools: list[JsonObject] = []
+        for tool in request.tools:
+            translated: JsonObject = {"name": tool.name, "input_schema": tool.input_schema}
+            # Anthropic rejects an explicit null description ("Input should
+            # be a valid string"), so an absent description stays absent.
+            if tool.description is not None:
+                translated["description"] = tool.description
+            tools.append(translated)
+        payload["tools"] = tools
     if request.tool_choice is not None:
         payload["tool_choice"] = _anthropic_tool_choice(request.tool_choice)
     if request.temperature is not None and supports_temperature:

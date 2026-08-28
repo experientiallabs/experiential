@@ -117,6 +117,37 @@ def supported_reasoning_efforts(
     return tuple(effort for effort in _EFFORT_ORDER if effort in supported)
 
 
+_ANTHROPIC_ADAPTIVE_ONLY_FAMILIES = (
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-sonnet-5",
+)
+
+
+def anthropic_adaptive_only_thinking(model_id: str) -> bool:
+    """Return whether one Anthropic model accepts only adaptive thinking.
+
+    The adaptive-thinking generation (verified against the live API on
+    2026-08-28) rejects ``thinking.type.enabled`` and
+    ``thinking.type.disabled`` outright; earlier families (sonnet-4-6,
+    opus-4-6, haiku-4-5, and older) still honor the budgeted ``enabled``
+    form verbatim. The family list matches the xhigh effort generation.
+
+    Args:
+        model_id: Exact Anthropic model identifier.
+
+    Returns:
+        ``True`` when the model rejects caller thinking configs other than
+        adaptive.
+    """
+    normalized = _normalized_model(model_id)
+    return any(family in normalized for family in _ANTHROPIC_ADAPTIVE_ONLY_FAMILIES)
+
+
 def anthropic_reasoning_effort(model_id: str, effort: str) -> str:
     """Return one exact Anthropic effort or reject it before provider dispatch."""
     return _require_exact_effort(

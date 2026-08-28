@@ -184,7 +184,11 @@ the same virtual key, and every failure on this surface is rendered in the Anthr
 envelope `{"type": "error", "error": {...}}`. The decoder translates text, `tool_use`,
 `tool_result`, `thinking`, and `redacted_thinking` blocks faithfully (thinking history rides an
 opaque provider-reasoning carrier with byte-exact signatures, and a caller `thinking`
-configuration is forwarded verbatim, overriding the catalog's adaptive default), requires
+configuration is forwarded verbatim on models that honor it, overriding the catalog's
+adaptive default; on the adaptive-only generation, which rejects `enabled`/`disabled`
+configs outright, an `enabled` config translates to adaptive with the dropped
+`thinking.budget_tokens` disclosed as ignored, and `disabled` is rejected by name
+because those models cannot turn thinking off), requires
 `max_tokens`, validates and drops `cache_control` (the gateway has no prompt-caching channel),
 and rejects image and document blocks loudly because the surface is text-only. Thinking carriers
 replay only on the Anthropic wire, so route admission requires every waterfall rung to speak the

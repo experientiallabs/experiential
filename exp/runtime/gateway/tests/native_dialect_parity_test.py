@@ -461,3 +461,62 @@ def test_native_anthropic_normalizer_emits_thinking_events() -> None:
     result = _native_normalized("anthropic_messages", ANTHROPIC_THINKING_CHUNKS)
     assert result["failure"] is None
     assert result["events"] == list(ANTHROPIC_THINKING_EVENTS)
+
+
+# Captured from a live api.anthropic.com tool_use stream (2026-08-28,
+# claude-haiku-4-5, ids neutralized): the real wire pads data lines with
+# trailing whitespace inside the JSON, opens tool_use blocks with a `caller`
+# object, nests a `cache_creation` breakdown in usage, carries
+# `stop_details`, and emits one empty leading `input_json_delta`.
+ANTHROPIC_LIVE_TOOL_FRAMES: tuple[bytes, ...] = (
+    b'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-haiku-4-5",'
+    b'"id":"msg_fixture","type":"message","role":"assistant","content":[],"stop_reason":null,'
+    b'"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":663,'
+    b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":'
+    b'{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":12,'
+    b'"service_tier":"standard","inference_geo":"not_available"}}       }\n\n',
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+    b'"content_block":{"type":"tool_use","id":"toolu_fixture","name":"get_weather",'
+    b'"input":{},"caller":{"type":"direct"}}     }\n\n',
+    b'event: ping\ndata: {"type": "ping"}\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"input_json_delta","partial_json":""}     }\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"input_json_delta","partial_json":"{\\"city\\""}   }\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"input_json_delta","partial_json":": \\"Paris\\"}"}           }\n\n',
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0          }\n\n',
+    b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use",'
+    b'"stop_sequence":null,"stop_details":null},"usage":{"input_tokens":663,'
+    b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":33}  }\n\n',
+    b'event: message_stop\ndata: {"type":"message_stop"           }\n\n',
+)
+
+ANTHROPIC_LIVE_TOOL_EVENTS: tuple[JsonObject, ...] = (
+    {"kind": "tool_call_started", "index": 0, "call_id": "toolu_fixture", "name": "get_weather"},
+    {"kind": "tool_arguments_delta", "index": 0, "text": ""},
+    {"kind": "tool_arguments_delta", "index": 0, "text": '{"city"'},
+    {"kind": "tool_arguments_delta", "index": 0, "text": ': "Paris"}'},
+    {
+        "kind": "tool_call_completed",
+        "index": 0,
+        "call_id": "toolu_fixture",
+        "name": "get_weather",
+        "raw_arguments": '{"city": "Paris"}',
+    },
+    {
+        "kind": "usage",
+        "input_tokens": 663,
+        "output_tokens": 33,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": None,
+    },
+    {"kind": "completed"},
+)
+
+
+def test_native_anthropic_normalizer_decodes_the_live_tool_use_wire() -> None:
+    """The real captured tool_use wire decodes to the canonical event stream."""
+    result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_TOOL_FRAMES)
+    assert result["failure"] is None
+    assert result["events"] == list(ANTHROPIC_LIVE_TOOL_EVENTS)

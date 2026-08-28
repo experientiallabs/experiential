@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,7 @@ from exp.runtime.models.providers.errors import (
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
+    anthropic_adaptive_only_thinking,
     anthropic_reasoning_effort,
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
@@ -36,6 +38,8 @@ from exp.runtime.openai_protocol.model_adapter import model_request as gateway_m
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
+
+_logger = logging.getLogger(__name__)
 
 _ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
 GATEWAY_GENERATION_PARAMETER_CONTRACT_VERSION = 2
@@ -373,6 +377,34 @@ def route_generation_parameter_requests(
             param="thinking",
             code="unsupported_parameter",
         )
+    if request.provider_thinking_config is not None:
+        # The adaptive-thinking generation rejects caller enabled/disabled
+        # configs outright, so verbatim forwarding is family-gated (a route
+        # is one exact-model pool, so the answer is uniform across rungs).
+        config_type = str(request.provider_thinking_config.get("type"))
+        adaptive_only = all(
+            anthropic_adaptive_only_thinking(profile.model_id) for profile in profiles
+        )
+        if adaptive_only and config_type == "enabled":
+            # Translate to the model's one supported mode. The token budget
+            # has no adaptive equivalent, so it is disclosed as ignored
+            # rather than silently mapped onto an effort level.
+            ignore("provider_thinking_config", "thinking.budget_tokens")
+            _logger.warning(
+                "translated a caller 'enabled' thinking config to adaptive for an "
+                "adaptive-only Anthropic route; thinking.budget_tokens was disclosed "
+                "as ignored"
+            )
+        elif adaptive_only and config_type == "disabled":
+            raise ProviderParameterError(
+                message=(
+                    "The parameter 'thinking.type' cannot be 'disabled' on this model: "
+                    "it always reasons adaptively. Remove the thinking field or choose "
+                    "a model that supports disabling thinking."
+                ),
+                param="thinking.type",
+                code="unsupported_parameter",
+            )
     encrypted_reasoning_present = request.include_encrypted_reasoning or any(
         block.kind == "encrypted_reasoning"
         for message in request.messages
@@ -686,9 +718,12 @@ def anthropic_messages_stream_payload(
         for tool in request.tools:
             translated: JsonObject = {
                 "name": tool.name,
-                "description": tool.description,
                 "input_schema": tool.parameters,
             }
+            # Anthropic rejects an explicit null description ("Input should
+            # be a valid string"), so an absent description stays absent.
+            if tool.description is not None:
+                translated["description"] = tool.description
             if tool.strict:
                 translated["strict"] = True
             tools.append(translated)
