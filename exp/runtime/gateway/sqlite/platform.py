@@ -5,9 +5,9 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import Literal, cast
 
 from exp.common.core.artifacts import stable_id
-from exp.common.models import ConnectionConfig
 from exp.common.models.gateway_catalog import NormalizedGatewayCatalog
 from exp.runtime.gateway.budgets import (
     BudgetScope,
@@ -85,6 +85,7 @@ from exp.runtime.gateway.sqlite.platform_records import (
 from exp.runtime.gateway.sqlite.platform_records import (
     reservation_record as _reservation_record,
 )
+from exp.runtime.gateway.sqlite.provider_commands import sqlite_connection_config
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
 
@@ -190,26 +191,11 @@ class SQLiteGatewayPlatform:
             require_gateway_servable_provider(
                 connection_id=command.connection_id, provider=command.provider
             )
-            secret_reference = command.secret_reference
-            if (
-                secret_reference is not None
-                and secret_reference.scheme is not OpaqueSecretScheme.ENVIRONMENT
-            ):
-                raise ValueError(
-                    "SQLite provider connections currently require an environment secret reference"
-                )
             changed, authority = self.control.upsert_provider_connection(
                 organization_id=command.organization_id,
                 connection_id=command.connection_id,
                 revision_id=command.revision_id,
-                config=ConnectionConfig(
-                    provider=command.provider,
-                    base_url=command.base_url,
-                    api_key_env=(None if secret_reference is None else secret_reference.reference),
-                    api_version=command.api_version,
-                    azure_api_surface=command.azure_api_surface,
-                    region=command.region,
-                ),
+                config=sqlite_connection_config(command),
                 replace=command.replace,
             )
             if not changed and authority.revision_id != command.revision_id:
@@ -433,6 +419,21 @@ class SQLiteGatewayPlatform:
                     else OpaqueSecretReference(
                         scheme=OpaqueSecretScheme.ENVIRONMENT,
                         reference=str(row["api_key_env"]),
+                    )
+                ),
+                access_key_id_reference=(
+                    None
+                    if row["aws_access_key_id_env"] is None
+                    else OpaqueSecretReference(
+                        scheme=OpaqueSecretScheme.ENVIRONMENT,
+                        reference=str(row["aws_access_key_id_env"]),
+                    )
+                ),
+                bedrock_auth_mode=(
+                    None
+                    if row["bedrock_auth_mode"] is None
+                    else cast(
+                        'Literal["access_key_pair", "api_key"]', str(row["bedrock_auth_mode"])
                     )
                 ),
                 connection_sha256=str(row["connection_sha256"]),

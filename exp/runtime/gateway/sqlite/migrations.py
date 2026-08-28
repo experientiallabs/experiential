@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 class GatewaySchemaError(RuntimeError):
@@ -592,6 +592,18 @@ _MIGRATION_11 = (
     "('openai_deployments', 'model_inference'))",
 )
 
+_MIGRATION_12 = (
+    "ALTER TABLE provider_connection_revisions ADD COLUMN aws_access_key_id_env TEXT",
+    """
+    ALTER TABLE provider_connection_revisions
+    ADD COLUMN bedrock_auth_mode TEXT
+    CHECK (
+        bedrock_auth_mode IS NULL
+        OR bedrock_auth_mode IN ('access_key_pair', 'api_key')
+    )
+    """,
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -604,6 +616,7 @@ _MIGRATIONS = {
     9: _MIGRATION_9,
     10: _MIGRATION_10,
     11: _MIGRATION_11,
+    12: _MIGRATION_12,
 }
 
 

@@ -52,6 +52,14 @@ class NativeDialectUnavailableError(RuntimeError):
     """The resolved provider has no native dialect, so the route cannot serve."""
 
 
+@dataclass(frozen=True)
+class FrozenDispatchBinding:
+    """Exact admitted destination and body identity for one signed route depth."""
+
+    url: str
+    body_sha256: str
+
+
 @dataclass
 class InflightRequest:
     """One admitted request awaiting its terminal settlement.
@@ -81,6 +89,7 @@ class InflightRequest:
     # One signer per route deployment, for body-signing dialects (Bedrock
     # SigV4); ``None`` at a depth whose dialect serializes its own payload.
     signers: tuple[GatewayDispatchSigner | None, ...] = ()
+    dispatch_bindings: tuple[FrozenDispatchBinding | None, ...] = ()
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""

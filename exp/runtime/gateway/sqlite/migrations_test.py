@@ -27,6 +27,7 @@ from exp.runtime.gateway.sqlite.migrations import (
     initialize_database,
     persistent_connection,
 )
+from exp.runtime.gateway.sqlite.provider_authority import active_provider_connections
 
 
 def test_persistent_connection_reuses_one_idle_connection_per_thread(tmp_path: Path) -> None:
@@ -915,5 +916,74 @@ def test_v11_migration_adds_azure_surface_without_rewriting_existing_authority(
                 "UPDATE provider_connection_revisions SET azure_api_surface = 'bogus' "
                 "WHERE revision_id = 'rev'"
             )
+    finally:
+        migrated.close()
+
+
+def test_v12_adds_bedrock_auth_locators_and_preserves_ambient_authority(
+    tmp_path: Path,
+) -> None:
+    """The current schema gains nullable Bedrock metadata without changing ambient identity."""
+    path = tmp_path / "gateway.db"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    ambient = ConnectionConfig(provider="bedrock", region="us-west-2")
+    connection = connect_database(path)
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for version in range(1, 12):
+            for statement in migrations._MIGRATIONS[version]:
+                connection.execute(statement)
+        connection.execute("PRAGMA user_version = 11")
+        connection.execute("INSERT INTO organizations VALUES ('org', 'org', 'Org', 1, 't', 't')")
+        connection.execute(
+            """
+            INSERT INTO provider_connections (
+                connection_id, organization_id, active_revision_id,
+                active, created_at, updated_at
+            ) VALUES ('bedrock', 'org', NULL, 1, 't', 't')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_connection_revisions (
+                revision_id, organization_id, connection_id, revision_number,
+                provider, region, azure_api_surface, connection_sha256, created_at
+            ) VALUES ('bedrock-revision', 'org', 'bedrock', 1,
+                      'bedrock', 'us-west-2', NULL, ?, 't')
+            """,
+            (ambient.identity_sha256(),),
+        )
+        connection.execute(
+            "UPDATE provider_connections SET active_revision_id = 'bedrock-revision' "
+            "WHERE connection_id = 'bedrock'"
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    backup = initialize_database(path)
+
+    assert backup is not None and backup.exists()
+    migrated = connect_database(path)
+    try:
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        columns = {
+            str(row[1])
+            for row in migrated.execute(
+                "PRAGMA table_info(provider_connection_revisions)"
+            ).fetchall()
+        }
+        assert {"aws_access_key_id_env", "bedrock_auth_mode"} <= columns
+        row = migrated.execute(
+            "SELECT aws_access_key_id_env, bedrock_auth_mode, connection_sha256 "
+            "FROM provider_connection_revisions WHERE revision_id = 'bedrock-revision'"
+        ).fetchone()
+        assert tuple(row) == (None, None, ambient.identity_sha256())
+        authorities = active_provider_connections(migrated, organization_id="org")
+        assert len(authorities) == 1
+        assert authorities[0].config == ambient
+        assert migrated.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert migrated.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         migrated.close()

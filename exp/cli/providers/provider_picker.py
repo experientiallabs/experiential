@@ -21,6 +21,11 @@ from typing import Literal, cast
 from rich.console import Console
 from rich.prompt import Prompt
 
+from exp.cli.providers.bedrock_credentials import (
+    infer_bedrock_auth,
+    requires_ambient_bedrock_auth,
+)
+from exp.cli.providers.connection_reuse import reused_connection
 from exp.cli.providers.experiential_cloud import (
     SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
 )
@@ -86,6 +91,8 @@ _CREDENTIAL_KEEP = "keep"
 _CREDENTIAL_REPLACE = "replace"
 _CREDENTIAL_REMOVE = "remove"
 _PROVIDER_VISIBLE_ROWS = 3
+
+_reused_connection = reused_connection
 
 
 class SetupCancelled(Exception):
@@ -354,6 +361,8 @@ def collect_provider_connection(
     api_version = None
     azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region = None
+    aws_access_key_id_env = None
+    bedrock_auth_mode = None
     if provider in ("openai-compatible", "azure"):
         base_url = ask_text(f"{SETUP_PROVIDER_LABELS[provider]} base URL", console=console)
         if not base_url:
@@ -383,6 +392,8 @@ def collect_provider_connection(
     api_key_env = (
         None if provider == "openai-compatible" else CANONICAL_CREDENTIAL_ENV.get(provider)
     )
+    if provider == "bedrock":
+        api_key_env, aws_access_key_id_env, bedrock_auth_mode = infer_bedrock_auth(environment)
     return ConnectionConfig(
         provider=provider,
         base_url=base_url,
@@ -390,6 +401,8 @@ def collect_provider_connection(
         api_version=api_version,
         azure_api_surface=azure_api_surface,
         region=region,
+        aws_access_key_id_env=aws_access_key_id_env,
+        bedrock_auth_mode=bedrock_auth_mode,
     )
 
 
@@ -516,6 +529,11 @@ def _resolve_endpoint(
         api_version=config.api_version,
         azure_api_surface=config.azure_api_surface,
         region=config.region,
+        aws_access_key_id_env=config.aws_access_key_id_env,
+        bedrock_auth_mode=config.bedrock_auth_mode,
+        require_ambient_bedrock_auth=(
+            provider == "bedrock" and requires_ambient_bedrock_auth(environment)
+        ),
     )
     configured = connection is not None
     if connection is None:
@@ -528,6 +546,8 @@ def _resolve_endpoint(
             api_version=config.api_version,
             azure_api_surface=config.azure_api_surface,
             region=config.region,
+            aws_access_key_id_env=config.aws_access_key_id_env,
+            bedrock_auth_mode=config.bedrock_auth_mode,
         )
     if provider == "bedrock":
         return PreparedEndpoint(connection=connection, api_key="", configured=configured)
@@ -542,51 +562,6 @@ def _resolve_endpoint(
     if api_key is None:
         return None
     return PreparedEndpoint(connection=connection, api_key=api_key, configured=configured)
-
-
-def _reused_connection(
-    existing_connections: tuple[ProviderConnection, ...],
-    *,
-    provider: str,
-    api_key_env: str | None,
-    base_url: str | None,
-    api_version: str | None,
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None,
-    region: str | None,
-) -> ProviderConnection | None:
-    """Return the configured connection that already describes this exact endpoint.
-
-    Args:
-        existing_connections: Connections already configured in the catalog.
-        provider: Selected provider kind.
-        api_key_env: Canonical or collected environment override name, if any.
-        base_url: Optional collected endpoint.
-        api_version: Optional Azure API version.
-        azure_api_surface: Optional Azure API surface discriminator.
-        region: Optional Bedrock region.
-
-    Returns:
-        The matching configured connection when exactly one exists, otherwise ``None``.
-    """
-    candidate = ConnectionConfig(
-        provider=provider,
-        base_url=base_url,
-        api_key_env=api_key_env,
-        api_version=api_version,
-        azure_api_surface=azure_api_surface,
-        region=region,
-    )
-    matches: list[ProviderConnection] = []
-    for connection in existing_connections:
-        configured = connection.catalog_config()
-        if configured.identity_sha256() != candidate.identity_sha256():
-            continue
-        if api_key_env is not None and connection.api_key_env != api_key_env:
-            continue
-        matches.append(connection)
-    if len(matches) == 1:
-        return matches[0]
-    return None
 
 
 def _stored_credential_action(

@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.auth import ProviderAuthStore, StoredCredentialBinding
+from exp.common.auth import (
+    ProviderAuthStore,
+    StoredCredentialBinding,
+    StoredCredentialEndpointMismatch,
+)
 from exp.common.models import ConnectionConfig
 from exp.runtime.models.credentials import (
     CredentialResolution,
@@ -126,6 +130,40 @@ def test_azure_model_inference_root_and_models_path_share_stored_credential(
     )
 
     assert api_key == _SECRET
+
+
+def test_bedrock_pair_secret_is_bound_to_both_credential_locators(tmp_path: Path) -> None:
+    """A stored secret-access key cannot be reused after both locator names change."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    original = ConnectionConfig(
+        provider="bedrock",
+        api_key_env="AWS_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+        region="us-west-2",
+        bedrock_auth_mode="access_key_pair",
+    )
+    resolve_or_prompt_connection_api_key(
+        original,
+        connection_id="bedrock",
+        environment={},
+        store=store,
+        prompt=lambda: _SECRET,
+        persist=True,
+    )
+    swapped = original.model_copy(
+        update={
+            "api_key_env": "SECONDARY_AWS_SECRET_ACCESS_KEY",
+            "aws_access_key_id_env": "SECONDARY_AWS_ACCESS_KEY_ID",
+        }
+    )
+
+    with pytest.raises(StoredCredentialEndpointMismatch):
+        lookup_connection_credential(
+            swapped,
+            connection_id="bedrock",
+            environment={},
+            store=store,
+        )
 
 
 def test_store_resolves_when_the_connection_omits_an_env_name(tmp_path: Path) -> None:
@@ -301,6 +339,46 @@ def test_stored_key_is_rejected_when_the_endpoint_identity_changes(tmp_path: Pat
 
     assert _SECRET not in str(captured.value)
     assert store.get("acme") == _SECRET
+
+
+@pytest.mark.parametrize(
+    ("original_mode", "replacement_mode"),
+    (("access_key_pair", "api_key"), ("api_key", "access_key_pair")),
+)
+def test_bedrock_stored_credentials_never_cross_auth_modes(
+    tmp_path: Path,
+    original_mode: str,
+    replacement_mode: str,
+) -> None:
+    """A secret access key can never be replayed as a bearer, or vice versa."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+
+    def connection(mode: str) -> ConnectionConfig:
+        if mode == "api_key":
+            return ConnectionConfig(
+                provider="bedrock",
+                region="us-west-2",
+                api_key_env="BEDROCK_API_KEY",
+                bedrock_auth_mode="api_key",
+            )
+        return ConnectionConfig(
+            provider="bedrock",
+            region="us-west-2",
+            api_key_env="AWS_SECRET_ACCESS_KEY",
+            aws_access_key_id_env="AWS_ACCESS_KEY_ID",
+            bedrock_auth_mode="access_key_pair",
+        )
+
+    original = connection(original_mode)
+    store.put("bedrock", _SECRET, binding=_binding(original))
+
+    with pytest.raises(ModelCredentialError, match="does not match"):
+        read_connection_api_key(
+            connection(replacement_mode),
+            connection_id="bedrock",
+            environment={},
+            store=store,
+        )
 
 
 def test_resolution_repr_never_includes_the_secret() -> None:

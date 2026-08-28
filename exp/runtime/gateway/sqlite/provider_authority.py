@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Literal, cast
 
-from exp.common.core.artifacts import ContractModel, Sha256
+from exp.common.core.artifacts import ContractModel, Sha256, stable_id
 from exp.common.models import ConnectionConfig
 
 
@@ -40,6 +40,18 @@ class ProviderConnectionAuthority(ContractModel):
     active: bool = True
 
 
+def provider_connection_revision_id(connection_id: str, config: ConnectionConfig) -> str:
+    """Derive one immutable revision from canonical serving authority."""
+    canonical = config.canonicalized()
+    return stable_id(
+        "provider-connection-revision",
+        {
+            "connection_id": connection_id,
+            "config": canonical.model_dump(mode="json", exclude_none=False),
+        },
+    )
+
+
 def upsert_provider_connection(
     connection: sqlite3.Connection,
     *,
@@ -67,6 +79,7 @@ def upsert_provider_connection(
     Raises:
         ProviderAuthorityError: Identity, replacement, or revision invariants conflict.
     """
+    config = config.canonicalized()
     current = _active_row(
         connection,
         organization_id=organization_id,
@@ -115,8 +128,8 @@ def upsert_provider_connection(
         INSERT INTO provider_connection_revisions (
             revision_id, organization_id, connection_id, revision_number,
             provider, base_url, api_key_env, api_version, azure_api_surface, region,
-            connection_sha256, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            aws_access_key_id_env, bedrock_auth_mode, connection_sha256, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             revision_id,
@@ -129,6 +142,8 @@ def upsert_provider_connection(
             config.api_version,
             config.azure_api_surface,
             config.region,
+            config.aws_access_key_id_env,
+            config.bedrock_auth_mode,
             digest,
             now,
         ),
@@ -183,6 +198,7 @@ def bound_provider_connections(
         SELECT c.connection_id, r.revision_id, r.revision_number,
                r.provider, r.base_url, r.api_key_env, r.api_version,
                r.azure_api_surface, r.region,
+               r.aws_access_key_id_env, r.bedrock_auth_mode,
                r.connection_sha256, c.active
         FROM alias_revision_provider_connections AS b
         JOIN provider_connections AS c
@@ -316,6 +332,14 @@ def _authority(row: sqlite3.Row) -> ProviderConnectionAuthority:
             None if row["azure_api_surface"] is None else str(row["azure_api_surface"]),
         ),
         region=None if row["region"] is None else str(row["region"]),
+        aws_access_key_id_env=(
+            None if row["aws_access_key_id_env"] is None else str(row["aws_access_key_id_env"])
+        ),
+        bedrock_auth_mode=(
+            None
+            if row["bedrock_auth_mode"] is None
+            else cast('Literal["access_key_pair", "api_key"]', str(row["bedrock_auth_mode"]))
+        ),
     )
     digest = str(row["connection_sha256"])
     if config.identity_sha256() != digest:
@@ -334,6 +358,7 @@ _SELECT_AUTHORITY = """
 SELECT c.connection_id, r.revision_id, r.revision_number,
        r.provider, r.base_url, r.api_key_env, r.api_version,
        r.azure_api_surface, r.region,
+       r.aws_access_key_id_env, r.bedrock_auth_mode,
        r.connection_sha256, c.active
 FROM provider_connections AS c
 JOIN provider_connection_revisions AS r

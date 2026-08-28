@@ -146,6 +146,8 @@ class ProviderConnectionRevision(ContractModel):
     azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=256)
     secret_reference: OpaqueSecretReference | None = None
+    access_key_id_reference: OpaqueSecretReference | None = None
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     connection_sha256: Sha256
     active: bool = True
     created_at: AwareDatetime
@@ -562,6 +564,8 @@ class UpsertProviderConnectionCommand(ContractModel):
     azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
     region: str | None = Field(default=None, max_length=256)
     secret_reference: OpaqueSecretReference | None = None
+    access_key_id_reference: OpaqueSecretReference | None = None
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
     replace: bool = False
 
 

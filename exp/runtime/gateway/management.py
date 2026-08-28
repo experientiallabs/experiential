@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ContractModel, stable_id
+from exp.common.core.artifacts import ContractModel
 from exp.common.models import (
     GATEWAY_EXCLUDED_PROVIDERS,
     ConnectionConfig,
@@ -23,6 +23,7 @@ from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionAuthority,
     ProviderConnectionBinding,
     ProviderConnectionMutation,
+    provider_connection_revision_id,
 )
 from exp.runtime.gateway.sqlite.store import GatewayStoreError, SQLiteGatewayStore
 from exp.runtime.models import SUPPORTED_PROVIDERS
@@ -185,18 +186,13 @@ class GatewayManagement:
             connection_id=connection_id,
             provider=config.provider,
         )
-        revision_id = stable_id(
-            "provider-connection-revision",
-            {
-                "connection_id": connection_id,
-                "config": config.model_dump(mode="json", exclude_none=False),
-            },
-        )
+        canonical = config.canonicalized()
+        revision_id = provider_connection_revision_id(connection_id, canonical)
         return self.require_initialized().upsert_provider_connection(
             organization_id=self.organization_id,
             connection_id=connection_id,
             revision_id=revision_id,
-            config=config,
+            config=canonical,
             replace=replace,
         )
 
@@ -230,14 +226,8 @@ class GatewayManagement:
         mutations = tuple(
             ProviderConnectionMutation(
                 connection_id=connection_id,
-                revision_id=stable_id(
-                    "provider-connection-revision",
-                    {
-                        "connection_id": connection_id,
-                        "config": config.model_dump(mode="json", exclude_none=False),
-                    },
-                ),
-                config=config,
+                revision_id=provider_connection_revision_id(connection_id, config),
+                config=config.canonicalized(),
             )
             for connection_id, config in sorted(provider_connections.items())
         )
@@ -292,14 +282,8 @@ class GatewayManagement:
         mutations = tuple(
             ProviderConnectionMutation(
                 connection_id=connection_id,
-                revision_id=stable_id(
-                    "provider-connection-revision",
-                    {
-                        "connection_id": connection_id,
-                        "config": config.model_dump(mode="json", exclude_none=False),
-                    },
-                ),
-                config=config,
+                revision_id=provider_connection_revision_id(connection_id, config),
+                config=config.canonicalized(),
             )
             for connection_id, config in sorted(provider_connections.items())
         )
@@ -364,7 +348,7 @@ class GatewayManagement:
         bindings: list[ProviderConnectionBinding] = []
         for connection_id, config in sorted(catalog.connections.items()):
             authority = authorities.get(connection_id)
-            if authority is None or authority.config != config:
+            if authority is None or authority.config != config.canonicalized():
                 raise GatewayStoreError(
                     f"provider connection {connection_id!r} differs from SQLite authority"
                 )

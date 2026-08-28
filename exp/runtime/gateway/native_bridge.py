@@ -37,7 +37,7 @@ import logging
 import time
 from collections.abc import Callable
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -65,6 +65,7 @@ from exp.runtime.gateway.native_execution import (
     MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     MAXIMUM_TOTAL_ATTEMPTS,
     DeadRung,
+    FrozenDispatchBinding,
     InflightRequest,
     NativeDialectUnavailableError,
     deployment_health_key,
@@ -426,6 +427,7 @@ class NativeControlPlane(NativeObservabilityMixin):
                 )
             wire_route: list[JsonObject] = []
             signers: list[GatewayDispatchSigner | None] = []
+            dispatch_bindings: list[FrozenDispatchBinding | None] = []
             for deployment, (profile, client) in zip(
                 route.deployments, resolved_wires, strict=True
             ):
@@ -447,6 +449,14 @@ class NativeControlPlane(NativeObservabilityMixin):
                     )
                 )
                 signers.append(dispatch_signer)
+                dispatch_bindings.append(
+                    None
+                    if dispatch_signer is None or upstream_body is None
+                    else FrozenDispatchBinding(
+                        url=profile.url,
+                        body_sha256=sha256_bytes(upstream_body.encode("utf-8")),
+                    )
+                )
         except (ProviderParameterError, ProviderCapabilityError) as exc:
             # One shared normalizer keeps both pre-dispatch rejections
             # field-specific: the parameter path names the parameter and the
@@ -473,6 +483,7 @@ class NativeControlPlane(NativeObservabilityMixin):
                 continuation=continuation_context,
                 policy=policy,
                 signers=tuple(signers),
+                dispatch_bindings=tuple(dispatch_bindings),
             )
         )
         response: JsonObject = {
@@ -519,15 +530,33 @@ class NativeControlPlane(NativeObservabilityMixin):
         data = json.loads(argument)
         entry = self._accounting.entry(str(data.get("request_id") or ""))
         signer = None
+        binding = None
         if entry is not None and entry.active_attempt_id is not None:
             depth = entry.attempt_depths.get(entry.active_attempt_id)
             if depth is not None and depth < len(entry.signers):
                 signer = entry.signers[depth]
+            if depth is not None and depth < len(entry.dispatch_bindings):
+                binding = entry.dispatch_bindings[depth]
         try:
+            url = str(data["url"])
+            body = str(data["body"])
+            if (
+                binding is None
+                or url != binding.url
+                or sha256_bytes(body.encode("utf-8")) != binding.body_sha256
+            ):
+                raise public_failure_error(
+                    GatewayFailure(
+                        failure_class=GatewayFailureClass.INTERNAL,
+                        safe_message=(
+                            "gateway dispatch differs from the admitted destination or frozen body"
+                        ),
+                    )
+                )
             headers = dispatch_signature_headers(
                 signer,
-                url=str(data["url"]),
-                body=str(data["body"]),
+                url=url,
+                body=body,
             )
         except OpenAIProtocolError as exc:
             raise NativeBridgeError(exc) from exc

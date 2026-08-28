@@ -1,9 +1,9 @@
 """Atomic, user-only ``auth.json`` store keyed by provider connection ID.
 
 The document follows the OpenCode ``auth.json`` shape: one object whose keys are connection
-IDs and whose values are ``{"type": "api", "key": "..."}`` records. Optional ``provider``
-and ``endpoint_sha256`` fields bind a key to one secret-free endpoint identity. Secret
-values never appear in ``repr``, ``str``, or raised messages.
+IDs and whose values are ``{"type": "api", "key": "..."}`` records. Optional provider,
+endpoint, and credential-locator fields bind a key to one secret-free connection identity.
+Secret values never appear in ``repr``, ``str``, or raised messages.
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ class StoredCredentialBinding(ContractModel):
 
     provider: str
     endpoint_sha256: Sha256
+    credential_locator_sha256: Sha256 | None = None
 
 
 class StoredCredentialEndpointMismatch(ProviderAuthStoreError):
@@ -304,6 +305,8 @@ def _record_payload(record: _StoredApiRecord) -> dict[str, str]:
     if record.binding is not None:
         payload["provider"] = record.binding.provider
         payload["endpoint_sha256"] = record.binding.endpoint_sha256
+        if record.binding.credential_locator_sha256 is not None:
+            payload["credential_locator_sha256"] = record.binding.credential_locator_sha256
     return payload
 
 
@@ -335,7 +338,13 @@ def _parse_document(payload: object, *, path: Path) -> dict[str, _StoredApiRecor
             fields[field] = value
         record_type = fields.get("type")
         key = fields.get("key")
-        extra = set(fields) - {"type", "key", "provider", "endpoint_sha256"}
+        extra = set(fields) - {
+            "type",
+            "key",
+            "provider",
+            "endpoint_sha256",
+            "credential_locator_sha256",
+        }
         if extra or record_type != "api" or not isinstance(key, str) or not key.strip():
             raise ProviderAuthStoreError(_malformed_message(path))
         records[raw_name] = _StoredApiRecord(
@@ -364,14 +373,23 @@ def _parse_binding(
     """
     provider = raw_record.get("provider")
     endpoint_sha256 = raw_record.get("endpoint_sha256")
-    if provider is None and endpoint_sha256 is None:
+    credential_locator_sha256 = raw_record.get("credential_locator_sha256")
+    if provider is None and endpoint_sha256 is None and credential_locator_sha256 is None:
         return None
     if not isinstance(provider, str) or not provider:
         raise ProviderAuthStoreError(_malformed_message(path))
     if not isinstance(endpoint_sha256, str) or not endpoint_sha256:
         raise ProviderAuthStoreError(_malformed_message(path))
+    if credential_locator_sha256 is not None and (
+        not isinstance(credential_locator_sha256, str) or not credential_locator_sha256
+    ):
+        raise ProviderAuthStoreError(_malformed_message(path))
     try:
-        return StoredCredentialBinding(provider=provider, endpoint_sha256=endpoint_sha256)
+        return StoredCredentialBinding(
+            provider=provider,
+            endpoint_sha256=endpoint_sha256,
+            credential_locator_sha256=credential_locator_sha256,
+        )
     except ValueError as exc:
         raise ProviderAuthStoreError(_malformed_message(path)) from exc
 

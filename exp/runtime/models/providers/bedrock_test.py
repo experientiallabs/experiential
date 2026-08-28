@@ -6,9 +6,12 @@ import asyncio
 import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
+import exp.runtime.models.providers.bedrock_endpoints as bedrock_endpoints
 from exp.common.models import (
     BillingSource,
     ConnectionConfig,
@@ -23,8 +26,10 @@ from exp.common.models import (
     ModelRoles,
     ModelSnapshot,
 )
+from exp.runtime.models.credentials import MissingModelCredentialError
 from exp.runtime.models.providers.async_transport import RequestDeadline
 from exp.runtime.models.providers.bedrock import (
+    AWS_BEARER_TOKEN_BEDROCK_ENV,
     AWS_DEFAULT_REGION_ENV,
     AWS_REGION_ENV,
     CONNECT_TIMEOUT_SECONDS,
@@ -115,7 +120,7 @@ def test_complete_sends_the_exact_model_id_and_preserves_cache_usage() -> None:
     client = BedrockClient(
         model=_snapshot("us.anthropic.claude-sonnet-4-5"),
         region="us-west-2",
-        environment={},
+        environment={"BEDROCK_ACCESS_KEY_ID": "AKIAEXAMPLEKEY0001"},
         runtime_factory=lambda *, region_name: runtime,
     )
 
@@ -313,8 +318,8 @@ def test_retries_stay_on_the_same_region_and_model() -> None:
     assert runtime.converse_calls[0]["modelId"] == "exact-model"
 
 
-def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None:
-    """Bedrock catalog records cannot carry api_key_env and resolve through RuntimeModelCatalog."""
+def test_catalog_requires_a_complete_bedrock_access_key_pair_and_resolves_ambient() -> None:
+    """Bedrock rejects half-configured credentials and preserves ambient-chain resolution."""
     with pytest.raises(ValueError, match="api_key_env"):
         ConnectionConfig(provider="bedrock", api_key_env="AWS_ACCESS_KEY_ID")
     runtime = _FakeBedrockRuntime()
@@ -369,6 +374,179 @@ def test_catalog_rejects_bedrock_api_key_env_and_resolves_without_http() -> None
     assert response.output.content == "ok"
     assert asyncio.run(complete_through_bounded_lane()) == "ok"
     assert vectors[0].values == (0.6, 0.8)
+
+
+def test_catalog_resolves_explicit_bedrock_access_key_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A named secret access key and non-secret key ID reach the default boto seam together."""
+    runtime = _FakeBedrockRuntime()
+    seen: dict[str, str | None] = {}
+
+    def create_runtime(
+        *,
+        region_name: str,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+    ) -> BedrockRuntime:
+        """Capture explicit credentials without exposing them in production diagnostics."""
+        seen.update(
+            region=region_name,
+            access_key_id=aws_access_key_id,
+            secret_access_key=aws_secret_access_key,
+        )
+        return runtime
+
+    monkeypatch.setattr(
+        "exp.runtime.models.providers.bedrock.create_bedrock_runtime_client", create_runtime
+    )
+    connection = ConnectionConfig(
+        provider="bedrock",
+        region="us-west-2",
+        api_key_env="BEDROCK_SECRET_ACCESS_KEY",
+        aws_access_key_id_env="BEDROCK_ACCESS_KEY_ID",
+    )
+    catalog = RuntimeModelCatalog(
+        ModelCatalog(
+            connections={"bedrock": connection},
+            models={
+                "claude": ModelRecord(
+                    billing_source=BillingSource.HOST_MANAGED,
+                    connection="bedrock",
+                    model="us.anthropic.claude-sonnet-4-5",
+                    capabilities=ModelCapabilities(supports_completions=True),
+                )
+            },
+            roles=ModelRoles(world_model="claude", judge="claude"),
+        ),
+        environment={
+            "BEDROCK_ACCESS_KEY_ID": "AKIAEXAMPLEKEY0001",
+            "BEDROCK_SECRET_ACCESS_KEY": "resolved-secret-access-key",
+        },
+    )
+
+    response = catalog.resolve("claude").client.complete(_request())
+
+    assert response.output.content == "ok"
+    assert seen == {
+        "region": "us-west-2",
+        "access_key_id": "AKIAEXAMPLEKEY0001",
+        "secret_access_key": "resolved-secret-access-key",
+    }
+
+
+def test_catalog_resolves_bedrock_api_key_without_sigv4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Bedrock API key stays a per-connection bearer through both runtime paths."""
+    runtime = _FakeBedrockRuntime()
+    seen: dict[str, str | None] = {}
+
+    def create_runtime(
+        *,
+        region_name: str,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        bearer_token: str | None = None,
+    ) -> BedrockRuntime:
+        seen.update(
+            region=region_name,
+            access_key_id=aws_access_key_id,
+            secret_access_key=aws_secret_access_key,
+            bearer_token=bearer_token,
+        )
+        return runtime
+
+    monkeypatch.setattr(
+        "exp.runtime.models.providers.bedrock.create_bedrock_runtime_client", create_runtime
+    )
+    connection = ConnectionConfig(
+        provider="bedrock",
+        region="us-west-2",
+        api_key_env="BEDROCK_API_KEY",
+        bedrock_auth_mode="api_key",
+    )
+    catalog = RuntimeModelCatalog(
+        ModelCatalog(
+            connections={"bedrock": connection},
+            models={
+                "claude": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="bedrock",
+                    model="us.anthropic.claude-sonnet-4-5",
+                    capabilities=ModelCapabilities(supports_completions=True),
+                )
+            },
+            roles=ModelRoles(world_model="claude", judge="claude"),
+        ),
+        environment={"BEDROCK_API_KEY": "bedrock-bearer-token"},
+    )
+
+    resolved = catalog.resolve("claude")
+    response = resolved.client.complete(_request())
+    assert isinstance(resolved.client, BoundedBedrockClient)
+    runtime_client = resolved.client._client  # noqa: SLF001
+    assert isinstance(runtime_client, BedrockClient)
+    headers = runtime_client.sign_gateway_dispatch(
+        url=(
+            "https://bedrock-runtime.us-west-2.amazonaws.com/model/"
+            "us.anthropic.claude-sonnet-4-5/converse-stream"
+        ),
+        body="{}",
+    )
+
+    assert response.output.content == "ok"
+    assert seen == {
+        "region": "us-west-2",
+        "access_key_id": None,
+        "secret_access_key": None,
+        "bearer_token": "bedrock-bearer-token",
+    }
+    assert headers["authorization"] == "Bearer bedrock-bearer-token"
+    with pytest.raises(ProviderTransportError, match="differs"):
+        runtime_client.sign_gateway_dispatch(
+            url="https://untrusted.example/collect",
+            body="{}",
+        )
+
+
+def test_catalog_fails_closed_when_explicit_bedrock_secret_is_missing() -> None:
+    """An explicit key ID never falls back to the ambient chain when its paired secret is absent."""
+    catalog = RuntimeModelCatalog(
+        ModelCatalog(
+            connections={
+                "bedrock": ConnectionConfig(
+                    provider="bedrock",
+                    region="us-east-1",
+                    api_key_env="BEDROCK_SECRET_ACCESS_KEY",
+                    aws_access_key_id_env="BEDROCK_ACCESS_KEY_ID",
+                )
+            },
+            models={
+                "claude": ModelRecord(
+                    billing_source=BillingSource.HOST_MANAGED,
+                    connection="bedrock",
+                    model="us.anthropic.claude-sonnet-4-5",
+                    capabilities=ModelCapabilities(supports_completions=True),
+                )
+            },
+            roles=ModelRoles(world_model="claude", judge="claude"),
+        ),
+        environment={"BEDROCK_ACCESS_KEY_ID": "AKIAEXAMPLEKEY0001"},
+    )
+
+    with pytest.raises(MissingModelCredentialError, match="BEDROCK_SECRET_ACCESS_KEY"):
+        catalog.resolve("claude")
+
+
+def test_low_level_bedrock_factory_rejects_a_half_explicit_pair() -> None:
+    """The lowest credential helper never falls through to ambient auth on a half pair."""
+    from exp.runtime.models.providers.bedrock import _explicit_session_kwargs
+
+    with pytest.raises(ValueError, match="both access-key fields"):
+        _explicit_session_kwargs("AKIAEXAMPLEKEY0001", None)
+    with pytest.raises(ValueError, match="both access-key fields"):
+        _explicit_session_kwargs(None, "secret-access-key")
 
 
 def test_snapshot_does_not_construct_a_bedrock_runtime() -> None:
@@ -471,6 +649,286 @@ def test_runtime_construction_uses_the_aws_session_chain(
     assert _Recorded.retries == {"max_attempts": 1, "mode": "standard"}
     assert _Recorded.tcp_keepalive is True
     assert runtime is not None
+
+
+def test_bearer_client_construction_never_resolves_ambient_aws_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bearer construction is unsigned until its isolated token signer is bound."""
+
+    class _FakeConfig:
+        """Capture the selected signature version."""
+
+        def __init__(self, **kwargs: object) -> None:
+            self.signature_version = kwargs.get("signature_version")
+
+    class _FakeSession:
+        """Reject any client that was not explicitly made unsigned."""
+
+        def client(self, service_name: str, *, region_name: str, config: object) -> object:
+            assert service_name == "bedrock-runtime"
+            assert region_name == "us-west-2"
+            assert isinstance(config, _FakeConfig)
+            assert config.signature_version is unsigned
+            return object()
+
+    class _FakeBoto3:
+        """Session construction itself carries no ambient credential lookup."""
+
+        def Session(self, **credentials: object) -> _FakeSession:
+            assert credentials == {"botocore_session": isolated_session}
+            return _FakeSession()
+
+    unsigned = object()
+    isolated_session = object()
+    bound: list[tuple[object, str]] = []
+    monkeypatch.setattr("exp.runtime.models.providers.bedrock._import_boto3", _FakeBoto3)
+    monkeypatch.setattr(
+        "exp.runtime.models.providers.bedrock._import_botocore_config", lambda: _FakeConfig
+    )
+    monkeypatch.setattr(
+        "exp.runtime.models.providers.bedrock._import_botocore_unsigned", lambda: unsigned
+    )
+    monkeypatch.setattr(
+        "exp.runtime.models.providers.bedrock._import_isolated_botocore_session",
+        lambda: isolated_session,
+    )
+    monkeypatch.setattr(
+        "exp.runtime.models.providers.bedrock._bind_bedrock_bearer",
+        lambda client, token: bound.append((client, token)),
+    )
+
+    runtime = create_bedrock_runtime_client(
+        region_name="us-west-2",
+        bearer_token="bedrock-bearer",
+    )
+
+    assert bound == [(runtime, "bedrock-bearer")]
+
+
+def test_real_bearer_client_ignores_hostile_ambient_token_and_credential_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real botocore constructs a token-only client without loading ambient auth."""
+    import botocore.credentials
+    import botocore.tokens
+
+    def forbidden(*_: object, **__: object) -> object:
+        raise AssertionError("ambient AWS authentication was consulted")
+
+    monkeypatch.setattr(
+        botocore.credentials.CredentialResolver,
+        "load_credentials",
+        forbidden,
+    )
+    monkeypatch.setattr(botocore.tokens.SSOTokenProvider, "load_token", forbidden)
+
+    runtime = create_bedrock_runtime_client(
+        region_name="us-west-2",
+        bearer_token="bedrock-bearer",
+    )
+
+    assert runtime is not None
+
+
+def test_real_bearer_client_ignores_hostile_profile_and_endpoint_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Bearer mode uses the official regional endpoint and no ambient AWS profile."""
+    malformed = tmp_path / "malformed-aws-config"
+    malformed.write_text("[profile broken\n", encoding="utf-8")
+    monkeypatch.setenv("AWS_PROFILE", "profile-that-does-not-exist")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(malformed))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(malformed))
+    monkeypatch.setenv(
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+        "https://credential-exfiltration.invalid",
+    )
+    monkeypatch.setenv("AWS_DEFAULTS_MODE", "invalid-ambient-mode")
+    monkeypatch.setenv("AWS_USE_DUALSTACK_ENDPOINT", "true")
+    monkeypatch.setenv("AWS_USE_FIPS_ENDPOINT", "true")
+
+    runtime = create_bedrock_runtime_client(
+        region_name="us-west-2",
+        bearer_token="bedrock-bearer",
+    )
+
+    endpoint = cast("Any", runtime)._endpoint
+    assert endpoint.host == "https://bedrock-runtime.us-west-2.amazonaws.com"
+
+
+def test_real_access_key_client_ignores_hostile_ambient_aws_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An explicit pair uses only its pinned keys and the public regional endpoint."""
+    malformed = tmp_path / "malformed-aws-config"
+    malformed.write_text("[profile broken\n", encoding="utf-8")
+    monkeypatch.setenv("AWS_PROFILE", "profile-that-does-not-exist")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(malformed))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(malformed))
+    monkeypatch.setenv(
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+        "https://credential-exfiltration.invalid",
+    )
+    monkeypatch.setenv("AWS_DEFAULTS_MODE", "invalid-ambient-mode")
+    monkeypatch.setenv("AWS_USE_DUALSTACK_ENDPOINT", "true")
+    monkeypatch.setenv("AWS_USE_FIPS_ENDPOINT", "true")
+
+    runtime = create_bedrock_runtime_client(
+        region_name="us-west-2",
+        aws_access_key_id="AKIAEXPLICITKEY001",
+        aws_secret_access_key="explicit-secret-access-key",
+    )
+
+    scoped = cast("Any", runtime)
+    assert scoped._endpoint.host == "https://bedrock-runtime.us-west-2.amazonaws.com"
+    credentials = scoped._request_signer._credentials.get_frozen_credentials()
+    assert credentials.access_key == "AKIAEXPLICITKEY001"
+    assert credentials.secret_key == "explicit-secret-access-key"
+    assert credentials.token is None
+
+
+@pytest.mark.parametrize("auth_mode", ("pair", "bearer"))
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    (
+        ("AWS_REQUEST_CHECKSUM_CALCULATION", "invalid-mode"),
+        ("AWS_REQUEST_MIN_COMPRESSION_SIZE_BYTES", "not-an-integer"),
+    ),
+)
+def test_real_explicit_clients_ignore_hostile_environment_client_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    auth_mode: str,
+    variable: str,
+    value: str,
+) -> None:
+    """Explicit pair and bearer clients ignore every environment config chain."""
+    monkeypatch.setenv(variable, value)
+    kwargs = (
+        {"bearer_token": "bedrock-bearer"}
+        if auth_mode == "bearer"
+        else {
+            "aws_access_key_id": "AKIAEXPLICITKEY001",
+            "aws_secret_access_key": "explicit-secret-access-key",
+        }
+    )
+
+    runtime = create_bedrock_runtime_client(region_name="us-west-2", **kwargs)
+
+    assert runtime is not None
+
+
+@pytest.mark.parametrize("auth_mode", ("pair", "bearer"))
+def test_explicit_clients_ignore_hostile_customer_endpoint_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    auth_mode: str,
+) -> None:
+    """Customer botocore models cannot redirect explicit credentials or signing."""
+    from botocore.loaders import Loader
+
+    customer_data = tmp_path / "models"
+    customer_data.mkdir()
+    built_in = Loader(
+        extra_search_paths=[Loader.BUILTIN_DATA_PATH],
+        include_default_search_paths=False,
+    ).load_data("endpoints")
+    aws_partition = next(
+        partition
+        for partition in cast("Any", built_in)["partitions"]
+        if partition["partition"] == "aws"
+    )
+    aws_partition["services"]["bedrock-runtime"] = {
+        "endpoints": {
+            "us-west-2": {
+                "hostname": "credential-exfiltration.invalid",
+                "protocols": ["https"],
+                "signatureVersions": ["v4"],
+            }
+        }
+    }
+    (customer_data / "endpoints.json").write_text(
+        json.dumps(built_in),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Loader, "CUSTOMER_DATA_PATH", str(customer_data))
+    bedrock_endpoints.resolve_bedrock_runtime_endpoint.cache_clear()
+    try:
+        if auth_mode == "bearer":
+            runtime = create_bedrock_runtime_client(
+                region_name="us-west-2",
+                bearer_token="bedrock-bearer",
+            )
+            native = BedrockClient(
+                model=_snapshot(),
+                region="us-west-2",
+                environment={},
+                runtime_factory=None,
+                bearer_token="bedrock-bearer",
+            )
+        else:
+            runtime = create_bedrock_runtime_client(
+                region_name="us-west-2",
+                aws_access_key_id="AKIAEXPLICITKEY001",
+                aws_secret_access_key="explicit-secret-access-key",
+            )
+            native = BedrockClient(
+                model=_snapshot(),
+                region="us-west-2",
+                environment={},
+                runtime_factory=None,
+                aws_access_key_id="AKIAEXPLICITKEY001",
+                aws_secret_access_key="explicit-secret-access-key",
+            )
+
+        assert cast("Any", runtime)._endpoint.host == (
+            "https://bedrock-runtime.us-west-2.amazonaws.com"
+        )
+        assert native.converse_stream_url().startswith(
+            "https://bedrock-runtime.us-west-2.amazonaws.com/"
+        )
+    finally:
+        bedrock_endpoints.resolve_bedrock_runtime_endpoint.cache_clear()
+
+
+def test_real_bearer_request_emits_only_the_pinned_authorization_token() -> None:
+    """A serialized Converse request carries the exact bearer before network dispatch."""
+
+    class _StopBeforeNetwork(Exception):
+        """Abort after botocore has serialized and signed the request."""
+
+    captured: dict[str, str] = {}
+    runtime = create_bedrock_runtime_client(
+        region_name="us-west-2",
+        bearer_token="bedrock-bearer",
+    )
+    pinned = cast("Any", runtime)._request_signer._auth_token
+    assert pinned.get_frozen_token().token == "bedrock-bearer"
+    assert "bedrock-bearer" not in repr(pinned)
+    assert "bedrock-bearer" not in str(pinned)
+
+    def capture(request: object, **_: object) -> None:
+        headers = cast("Any", request).headers
+        value = headers.get("Authorization")
+        captured["authorization"] = (
+            value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        )
+        raise _StopBeforeNetwork
+
+    cast("Any", runtime).meta.events.register(
+        "before-send.bedrock-runtime.Converse",
+        capture,
+    )
+
+    with pytest.raises(_StopBeforeNetwork):
+        runtime.converse(
+            modelId="amazon.nova-lite-v1:0",
+            messages=[{"role": "user", "content": [{"text": "ping"}]}],
+        )
+
+    assert captured == {"authorization": "Bearer bedrock-bearer"}
 
 
 def test_converse_response_normalizes_cache_legs_without_double_counting() -> None:
@@ -579,6 +1037,95 @@ def test_converse_stream_url_encodes_the_model_like_botocore() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("region", "suffix"),
+    (
+        ("cn-north-1", "amazonaws.com.cn"),
+        ("us-iso-east-1", "c2s.ic.gov"),
+        ("us-isob-east-1", "sc2s.sgov.gov"),
+    ),
+)
+def test_converse_stream_url_uses_the_region_partition_endpoint(
+    region: str,
+    suffix: str,
+) -> None:
+    """Native streaming derives China and isolated-partition DNS correctly."""
+    client = BedrockClient(
+        model=_snapshot(),
+        region=region,
+        environment={},
+        runtime_factory=None,
+    )
+
+    assert client.converse_stream_url().startswith(
+        f"https://bedrock-runtime.{region}.{suffix}/model/"
+    )
+
+
+@pytest.mark.parametrize("region", ("us-west-2-fips", "fips-us-west-2"))
+@pytest.mark.parametrize("auth_mode", ("pair", "bearer"))
+def test_native_fips_dispatch_uses_official_origin_and_canonical_signing_region(
+    region: str,
+    auth_mode: str,
+) -> None:
+    """Both FIPS spellings match boto endpoint and SigV4 behavior."""
+    if auth_mode == "bearer":
+        client = BedrockClient(
+            model=_snapshot(),
+            region=region,
+            environment={},
+            bearer_token="bedrock-bearer",
+            runtime_factory=None,
+        )
+    else:
+        client = BedrockClient(
+            model=_snapshot(),
+            region=region,
+            environment={},
+            aws_access_key_id="AKIAEXPLICITKEY001",
+            aws_secret_access_key="explicit-secret-access-key",
+            runtime_factory=None,
+        )
+    url = client.converse_stream_url()
+
+    assert url.startswith("https://bedrock-runtime-fips.us-west-2.amazonaws.com/model/")
+    headers = client.sign_gateway_dispatch(url=url, body='{"messages":[]}')
+    if auth_mode == "bearer":
+        assert headers["authorization"] == "Bearer bedrock-bearer"
+    else:
+        assert "/us-west-2/bedrock/aws4_request" in headers["Authorization"]
+
+
+def test_converse_stream_url_caches_bundled_endpoint_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated URL and signing checks do not reparse botocore endpoint data."""
+    real_loader = bedrock_endpoints.built_in_botocore_loader
+    calls = 0
+
+    def counted_loader() -> bedrock_endpoints.BotocoreLoader:
+        nonlocal calls
+        calls += 1
+        return real_loader()
+
+    monkeypatch.setattr(bedrock_endpoints, "built_in_botocore_loader", counted_loader)
+    bedrock_endpoints.resolve_bedrock_runtime_endpoint.cache_clear()
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-west-2",
+        environment={},
+        runtime_factory=None,
+    )
+    try:
+        first = client.converse_stream_url()
+        second = client.converse_stream_url()
+    finally:
+        bedrock_endpoints.resolve_bedrock_runtime_endpoint.cache_clear()
+
+    assert first == second
+    assert calls == 1
+
+
 def test_sign_gateway_dispatch_matches_an_independent_sigv4_computation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -648,6 +1195,125 @@ def test_sign_gateway_dispatch_forwards_the_session_token_and_binds_the_body(
     second = client.sign_gateway_dispatch(url=url, body='{"messages":[{}]}')
     if first["X-Amz-Date"] == second["X-Amz-Date"]:
         assert first["Authorization"] != second["Authorization"]
+
+
+def test_bedrock_dispatch_signing_rejects_every_non_admitted_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither SigV4 nor bearer credentials can be released to another origin."""
+    client = _signing_client(monkeypatch, token=None)
+
+    with pytest.raises(ProviderTransportError, match="differs"):
+        client.sign_gateway_dispatch(
+            url="https://untrusted.example/collect",
+            body='{"messages":[]}',
+        )
+
+
+def test_sign_gateway_dispatch_uses_the_explicit_access_key_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Native ConverseStream signing resolves the configured pair, not the ambient chain."""
+    malformed = tmp_path / "malformed-aws-config"
+    malformed.write_text("[profile broken\n", encoding="utf-8")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(malformed))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(malformed))
+    monkeypatch.setenv("AWS_PROFILE", "profile-that-does-not-exist")
+    monkeypatch.setenv("AWS_DEFAULTS_MODE", "invalid-ambient-mode")
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-west-2",
+        environment={AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bearer-must-not-win"},
+        aws_access_key_id="AKIAEXPLICITKEY001",
+        aws_secret_access_key="explicit-secret-access-key",
+        runtime_factory=None,
+    )
+
+    headers = client.sign_gateway_dispatch(
+        url=client.converse_stream_url(),
+        body='{"messages":[]}',
+    )
+
+    assert "Credential=AKIAEXPLICITKEY001/" in headers["Authorization"]
+
+
+def test_sign_gateway_dispatch_uses_the_ambient_bedrock_bearer() -> None:
+    """Ambient API-key auth reaches native dispatch without requiring access keys."""
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-west-2",
+        environment={AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bedrock-bearer"},
+        runtime_factory=None,
+    )
+
+    headers = client.sign_gateway_dispatch(
+        url=client.converse_stream_url(),
+        body='{"messages":[]}',
+    )
+
+    assert headers["authorization"] == "Bearer ambient-bedrock-bearer"
+    assert headers["content-type"] == "application/json"
+
+
+def test_sign_gateway_dispatch_prefers_the_explicit_bearer() -> None:
+    """A catalog-resolved bearer cannot be shadowed by ambient process state."""
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-west-2",
+        environment={AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bedrock-bearer"},
+        bearer_token="explicit-bedrock-bearer",
+        runtime_factory=None,
+    )
+
+    headers = client.sign_gateway_dispatch(
+        url=client.converse_stream_url(),
+        body='{"messages":[]}',
+    )
+
+    assert headers["authorization"] == "Bearer explicit-bedrock-bearer"
+
+
+def test_ambient_bearer_does_not_isolate_the_sdk_credential_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient API-key dispatch leaves ordinary boto SDK construction ambient."""
+    runtime = _FakeBedrockRuntime()
+    seen: dict[str, object] = {}
+
+    def create_runtime(
+        *,
+        region_name: str,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        bearer_token: str | None = None,
+    ) -> BedrockRuntime:
+        seen.update(
+            region_name=region_name,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            bearer_token=bearer_token,
+        )
+        return runtime
+
+    monkeypatch.setattr(
+        "exp.runtime.models.providers.bedrock.create_bedrock_runtime_client",
+        create_runtime,
+    )
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-west-2",
+        environment={AWS_BEARER_TOKEN_BEDROCK_ENV: "ambient-bedrock-bearer"},
+        runtime_factory=None,
+    )
+
+    assert client._runtime() is runtime  # noqa: SLF001
+    assert seen == {
+        "region_name": "us-west-2",
+        "aws_access_key_id": None,
+        "aws_secret_access_key": None,
+        "bearer_token": None,
+    }
 
 
 def test_bounded_client_wire_profile_marks_the_body_for_signing() -> None:

@@ -17,6 +17,7 @@ from exp.common.auth import (
     StoredCredentialEndpointMismatch,
     StoredCredentialStatus,
 )
+from exp.common.core.artifacts import sha256_json
 from exp.common.models import ConnectionConfig
 
 CredentialSource = Literal["environment", "stored", "prompt"]
@@ -66,8 +67,8 @@ def lookup_connection_credential(
 ) -> CredentialResolution | None:
     """Resolve one credential from the environment, then the stored connection record.
 
-    A non-empty environment value wins and does not rewrite the store. Bedrock connections
-    do not participate; they authenticate through the AWS credential chain.
+    A non-empty environment value wins and does not rewrite the store. Ambient Bedrock
+    connections do not participate; explicit Bedrock pairs resolve their secret access key here.
 
     Args:
         connection: Secret-free connection metadata.
@@ -81,7 +82,7 @@ def lookup_connection_credential(
     Raises:
         ProviderAuthStoreError: The local credential file exists but cannot be used.
     """
-    if connection.provider == "bedrock":
+    if connection.provider == "bedrock" and connection.api_key_env is None:
         return None
     values = os.environ if environment is None else environment
     if connection.api_key_env is not None:
@@ -113,7 +114,7 @@ def describe_connection_credential(
     Returns:
         Connection identity, provider, source, and environment-variable name.
     """
-    if connection.provider == "bedrock":
+    if connection.provider == "bedrock" and connection.api_key_env is None:
         return StoredCredentialStatus(
             connection_id=connection_id,
             provider=connection.provider,
@@ -190,10 +191,8 @@ def read_connection_api_key(
             environment variable and stored credential are absent.
         ProviderAuthStoreError: The local credential file exists but cannot be used.
     """
-    if connection.provider == "bedrock":
-        raise ModelCredentialError(
-            "bedrock authenticates through the AWS credential chain and has no stored API key"
-        )
+    if connection.provider == "bedrock" and connection.api_key_env is None:
+        raise ModelCredentialError("bedrock ambient authentication has no stored secret access key")
     try:
         resolved = lookup_connection_credential(
             connection,
@@ -265,15 +264,25 @@ def resolve_or_prompt_connection_api_key(
 
 
 def _credential_binding(connection: ConnectionConfig) -> StoredCredentialBinding:
-    """Return the secret-free endpoint identity stored with one API key.
+    """Return the secret-free endpoint and credential-locator identity for one key.
 
     Args:
         connection: Secret-free connection metadata.
 
     Returns:
-        Provider name plus the catalog endpoint digest.
+        Provider name, catalog endpoint digest, and Bedrock locator digest when needed.
     """
+    credential_locator_sha256 = None
+    if connection.provider == "bedrock" and connection.api_key_env is not None:
+        credential_locator_sha256 = sha256_json(
+            {
+                "api_key_env": connection.api_key_env,
+                "aws_access_key_id_env": connection.aws_access_key_id_env,
+                "bedrock_auth_mode": connection.canonicalized().bedrock_auth_mode,
+            }
+        )
     return StoredCredentialBinding(
         provider=connection.provider,
         endpoint_sha256=connection.identity_sha256(),
+        credential_locator_sha256=credential_locator_sha256,
     )

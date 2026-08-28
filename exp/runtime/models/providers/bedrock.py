@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -23,6 +24,11 @@ from exp.common.models import (
     Usage,
 )
 from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, GatewayWireProfile
+from exp.runtime.models.providers.bedrock_endpoints import (
+    bedrock_runtime_origin,
+    bedrock_signing_region,
+    built_in_botocore_loader,
+)
 from exp.runtime.models.providers.bedrock_requests import converse_request
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
@@ -43,6 +49,7 @@ from exp.runtime.models.providers.transport import (
 
 AWS_REGION_ENV = "AWS_REGION"
 AWS_DEFAULT_REGION_ENV = "AWS_DEFAULT_REGION"
+AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
 CONNECT_TIMEOUT_SECONDS = 15.0
 READ_TIMEOUT_SECONDS = 600.0
 _REGION_SOURCES = (
@@ -106,8 +113,47 @@ class _BotoSession(Protocol):
 class _Boto3Module(Protocol):
     """Lazy boto3 module surface used only at request time."""
 
-    def Session(self) -> _BotoSession:
-        """Return a boto session that reads the standard AWS chain."""
+    def Session(self, **credentials: object) -> _BotoSession:
+        """Return a boto session using explicit credentials or the standard AWS chain."""
+
+
+class _BotocoreSession(Protocol):
+    """Botocore session surface used to isolate bearer token providers."""
+
+    def register_component(self, name: str, component: object) -> None:
+        """Replace one lazy session component before client construction."""
+
+    def get_component(self, name: str) -> object:
+        """Return one already-registered botocore session component."""
+
+    def get_credentials(self) -> _ResolvableCredentials | None:
+        """Return credentials bound to this isolated session, when any."""
+
+    def set_config_variable(self, logical_name: str, value: object) -> None:
+        """Override one ambient configuration source for this session only."""
+
+    def set_credentials(
+        self,
+        access_key: str,
+        secret_key: str,
+        token: str | None = None,
+    ) -> None:
+        """Bind an exact credential triple to this isolated session."""
+
+
+class _ConfigValueStore(Protocol):
+    """Botocore configuration store used to replace ambient profile lookup."""
+
+    def set_config_provider(self, logical_name: str, provider: object) -> None:
+        """Replace one variable's entire provider chain."""
+
+
+class _NoAmbientTokenProvider:
+    """Token provider that deliberately ignores every ambient AWS login."""
+
+    def load_token(self, **_: object) -> None:
+        """Return no ambient token; the exact bearer is bound per client later."""
+        return None
 
 
 def resolve_bedrock_region(
@@ -134,7 +180,13 @@ def resolve_bedrock_region(
     return session_region
 
 
-def create_bedrock_runtime_client(*, region_name: str) -> BedrockRuntime:
+def create_bedrock_runtime_client(
+    *,
+    region_name: str,
+    aws_access_key_id: str | None = None,
+    aws_secret_access_key: str | None = None,
+    bearer_token: str | None = None,
+) -> BedrockRuntime:
     """Construct one ``bedrock-runtime`` client with bounded timeouts and no hidden retries.
 
     Args:
@@ -148,19 +200,105 @@ def create_bedrock_runtime_client(*, region_name: str) -> BedrockRuntime:
     """
     boto3 = _import_boto3()
     config_cls = _import_botocore_config()
-    session = boto3.Session()
+    if bearer_token is not None and (
+        aws_access_key_id is not None or aws_secret_access_key is not None
+    ):
+        raise ValueError("Bedrock bearer auth cannot be combined with access-key credentials")
+    session_kwargs = _explicit_session_kwargs(aws_access_key_id, aws_secret_access_key)
+    explicit_auth = bearer_token is not None or bool(session_kwargs)
+    if explicit_auth:
+        botocore_session = _import_isolated_botocore_session()
+        if session_kwargs:
+            botocore_session.set_credentials(
+                session_kwargs["aws_access_key_id"],
+                session_kwargs["aws_secret_access_key"],
+            )
+        session = boto3.Session(botocore_session=botocore_session)
+    else:
+        session = boto3.Session()
+    config_kwargs: dict[str, object] = {
+        "connect_timeout": CONNECT_TIMEOUT_SECONDS,
+        "read_timeout": READ_TIMEOUT_SECONDS,
+        "retries": {"max_attempts": 1, "mode": "standard"},
+        "tcp_keepalive": True,
+    }
+    if explicit_auth:
+        # Explicit credentials are pinned to the public regional endpoint and
+        # cannot inherit process-wide endpoint/profile configuration.
+        config_kwargs["ignore_configured_endpoint_urls"] = True
+        config_kwargs["defaults_mode"] = "legacy"
+        config_kwargs["use_dualstack_endpoint"] = False
+        config_kwargs["use_fips_endpoint"] = False
+    if bearer_token is not None:
+        # UNSIGNED prevents client construction from touching the ambient AWS
+        # credential chain. The isolated per-client bearer signer is installed
+        # immediately after construction.
+        config_kwargs["signature_version"] = _import_botocore_unsigned()
     with _CLIENT_CONSTRUCTION_LOCK:
         client = session.client(
             "bedrock-runtime",
             region_name=region_name,
-            config=config_cls(
-                connect_timeout=CONNECT_TIMEOUT_SECONDS,
-                read_timeout=READ_TIMEOUT_SECONDS,
-                retries={"max_attempts": 1, "mode": "standard"},
-                tcp_keepalive=True,
-            ),
+            config=config_cls(**config_kwargs),
         )
+        if bearer_token is not None:
+            _bind_bedrock_bearer(client, bearer_token)
     return cast("BedrockRuntime", client)
+
+
+class _BearerEvents(Protocol):
+    """Per-client botocore event registry used to select bearer signing."""
+
+    def register(self, event_name: str, handler: Callable[..., str]) -> None:
+        """Register one signer-selection callback."""
+
+
+class _BearerClientMeta(Protocol):
+    """Botocore client metadata carrying its isolated event registry."""
+
+    events: _BearerEvents
+
+
+class _BearerRequestSigner(Protocol):
+    """Narrow botocore request-signer token seam."""
+
+    _auth_token: object
+
+
+class _PinnedBearerToken:
+    """Opaque non-refreshing token provider compatible with supported botocore versions."""
+
+    __slots__ = ("_token",)
+
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    def get_frozen_token(self) -> object:
+        """Return botocore's immutable token shape without consulting ambient providers."""
+        from botocore.tokens import FrozenAuthToken
+
+        return FrozenAuthToken(self._token, expiration=None)
+
+    def __repr__(self) -> str:
+        """Keep the raw bearer out of diagnostics."""
+        return "_PinnedBearerToken([REDACTED])"
+
+    __str__ = __repr__
+
+
+class _BearerClient(Protocol):
+    """Dynamic botocore client fields required for bearer injection."""
+
+    meta: _BearerClientMeta
+    _request_signer: _BearerRequestSigner
+
+
+def _bind_bedrock_bearer(client: object, token: str) -> None:
+    """Pin one Bedrock API-key bearer to one botocore client."""
+    scoped = cast("_BearerClient", client)
+    events = scoped.meta.events
+    events.register("choose-signer.bedrock-runtime", lambda **_: "bearer")
+    events.register("choose-signer.bedrock", lambda **_: "bearer")
+    scoped._request_signer._auth_token = _PinnedBearerToken(token)  # noqa: SLF001
 
 
 class _FrozenCredentials(Protocol):
@@ -217,8 +355,24 @@ class _SigV4SignerFactory(Protocol):
         """Return one bound signer."""
 
 
+def _explicit_session_kwargs(
+    aws_access_key_id: str | None,
+    aws_secret_access_key: str | None,
+) -> dict[str, str]:
+    """Return boto Session kwargs only when an explicit access-key pair is configured."""
+    if (aws_access_key_id is None) != (aws_secret_access_key is None):
+        raise ValueError("explicit Bedrock credentials require both access-key fields")
+    if aws_access_key_id is None:
+        return {}
+    assert aws_secret_access_key is not None
+    return {
+        "aws_access_key_id": aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+    }
+
+
 class BedrockClient:
-    """Calls one Bedrock model or inference profile without failover or API-key auth."""
+    """Calls one Bedrock model or inference profile without provider failover."""
 
     def __init__(
         self,
@@ -226,6 +380,9 @@ class BedrockClient:
         model: ModelSnapshot,
         region: str | None,
         environment: Mapping[str, str],
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        bearer_token: str | None = None,
         runtime_factory: BedrockRuntimeFactory | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         supports_temperature: bool = True,
@@ -239,12 +396,21 @@ class BedrockClient:
             model: Resolved identity whose ``model_id`` is the exact Bedrock model ID.
             region: Optional catalog region. ``AWS_REGION`` and the boto chain follow it.
             environment: Process or injected environment mapping used for region lookup.
+            aws_access_key_id: Optional non-secret access-key identifier.
+            aws_secret_access_key: Optional secret access key resolved from the credential seam.
             runtime_factory: Optional deterministic factory used by tests.
             retry_policy: Bounded same-region retry policy applied outside botocore.
         """
         self._model = model
         self._configured_region = region
         self._environment = environment
+        if (aws_access_key_id is None) != (aws_secret_access_key is None):
+            raise ValueError("explicit Bedrock credentials require both access-key fields")
+        if bearer_token is not None and aws_access_key_id is not None:
+            raise ValueError("Bedrock bearer auth cannot be combined with access-key credentials")
+        self._aws_access_key_id = aws_access_key_id
+        self._aws_secret_access_key = aws_secret_access_key
+        self._bearer_token = bearer_token
         self._runtime_factory = runtime_factory
         self._retry_policy = retry_policy
         self._supports_temperature = supports_temperature
@@ -325,8 +491,20 @@ class BedrockClient:
             return existing
         with self._lock:
             if self._client is None:
-                factory = self._runtime_factory or create_bedrock_runtime_client
-                self._client = factory(region_name=self._region_name())
+                if self._runtime_factory is not None:
+                    self._client = self._runtime_factory(region_name=self._region_name())
+                else:
+                    if self._bearer_token is not None:
+                        self._client = create_bedrock_runtime_client(
+                            region_name=self._region_name(),
+                            bearer_token=self._bearer_token,
+                        )
+                    else:
+                        self._client = create_bedrock_runtime_client(
+                            region_name=self._region_name(),
+                            aws_access_key_id=self._aws_access_key_id,
+                            aws_secret_access_key=self._aws_secret_access_key,
+                        )
             return self._client
 
     def _region_name(self) -> str:
@@ -361,7 +539,18 @@ class BedrockClient:
         """
         with self._lock:
             if self._signing_credentials is None:
-                self._signing_credentials = _import_boto3().Session().get_credentials()
+                session_kwargs = _explicit_session_kwargs(
+                    self._aws_access_key_id, self._aws_secret_access_key
+                )
+                if session_kwargs:
+                    session = _import_isolated_botocore_session()
+                    session.set_credentials(
+                        session_kwargs["aws_access_key_id"],
+                        session_kwargs["aws_secret_access_key"],
+                    )
+                    self._signing_credentials = session.get_credentials()
+                else:
+                    self._signing_credentials = _import_boto3().Session().get_credentials()
             credentials = self._signing_credentials
         if credentials is None:
             raise ProviderTransportError(
@@ -410,9 +599,8 @@ class BedrockClient:
         """
         region = self._region_name()
         encoded_model = quote(self._model.model_id, safe="/~")
-        return (
-            f"https://bedrock-runtime.{region}.amazonaws.com/model/{encoded_model}/converse-stream"
-        )
+        origin = bedrock_runtime_origin(region)
+        return f"{origin}/model/{encoded_model}/converse-stream"
 
     def sign_gateway_dispatch(self, *, url: str, body: str) -> Mapping[str, str]:
         """Compute SigV4 headers for one frozen native-dispatch request body.
@@ -438,6 +626,22 @@ class BedrockClient:
             RuntimeError: ``boto3`` or ``botocore`` is not installed.
         """
         region = self._region_name()
+        expected_url = self.converse_stream_url()
+        if url != expected_url:
+            raise ProviderTransportError(
+                "Bedrock dispatch URL differs from the admitted regional model endpoint"
+            )
+        bearer_token = self._bearer_token
+        if bearer_token is None and self._aws_access_key_id is None:
+            bearer_token = (
+                self._environment.get(AWS_BEARER_TOKEN_BEDROCK_ENV) or ""
+            ).strip() or None
+        if bearer_token is not None:
+            return {
+                "authorization": f"Bearer {bearer_token}",
+                "content-type": "application/json",
+                "accept": "application/vnd.amazon.eventstream",
+            }
         auth_factory, request_factory = _import_botocore_signing()
         frozen = self._resolved_signing_credentials().get_frozen_credentials()
         request = request_factory(
@@ -449,7 +653,7 @@ class BedrockClient:
                 "accept": "application/vnd.amazon.eventstream",
             },
         )
-        auth_factory(frozen, "bedrock", region).add_auth(request)
+        auth_factory(frozen, "bedrock", bedrock_signing_region(region)).add_auth(request)
         return {str(name): str(value) for name, value in dict(request.headers).items()}
 
     def _call_with_retry(
@@ -560,6 +764,39 @@ def _import_botocore_config() -> type[object]:
     except ImportError as exc:
         raise RuntimeError("Bedrock requires botocore; install experiential") from exc
     return Config
+
+
+def _import_botocore_unsigned() -> object:
+    """Import botocore's sentinel that disables ambient SigV4 resolution."""
+    try:
+        from botocore import UNSIGNED
+    except ImportError as exc:
+        raise RuntimeError("Bedrock requires botocore; install experiential") from exc
+    return UNSIGNED
+
+
+def _import_isolated_botocore_session() -> _BotocoreSession:
+    """Create a botocore session that cannot consult ambient AWS configuration."""
+    try:
+        from botocore.configprovider import BOTOCORE_DEFAUT_SESSION_VARIABLES, ConstantProvider
+        from botocore.session import get_session
+    except ImportError as exc:
+        raise RuntimeError("Bedrock requires botocore; install experiential") from exc
+    session = cast("_BotocoreSession", get_session())
+    config_store = cast("_ConfigValueStore", session.get_component("config_store"))
+    for logical_name, (
+        _,
+        environment_name,
+        default,
+        _,
+    ) in BOTOCORE_DEFAUT_SESSION_VARIABLES.items():
+        if environment_name is not None:
+            config_store.set_config_provider(logical_name, ConstantProvider(default))
+    config_store.set_config_provider("config_file", ConstantProvider(os.devnull))
+    config_store.set_config_provider("credentials_file", ConstantProvider(os.devnull))
+    session.register_component("data_loader", built_in_botocore_loader())
+    session.register_component("token_provider", _NoAmbientTokenProvider())
+    return session
 
 
 def _import_botocore_signing() -> tuple[_SigV4SignerFactory, _AwsRequestFactory]:
