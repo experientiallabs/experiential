@@ -1107,9 +1107,7 @@ def test_azure_reuses_identity_equivalent_connection_spellings(
         provider="azure",
         api_key_env="AZURE_EXISTING_KEY",
         base_url=configured_base_url,
-        api_version=(
-            "2024-05-01-preview" if collected_surface == "model_inference" else "v1"
-        ),
+        api_version=("2024-05-01-preview" if collected_surface == "model_inference" else "v1"),
         azure_api_surface=configured_surface,
     )
 
