@@ -70,9 +70,12 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "functions",
                 "logit_bias",
                 "modalities",
+                "moderation",
                 "n",
                 "prediction",
                 "presence_penalty",
+                "prompt_cache_options",
+                "prompt_cache_retention",
                 "seed",
                 "service_tier",
                 "store",
@@ -123,9 +126,13 @@ RESPONSES_MANIFEST = CompatibilityManifest(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
                 "background",
+                "context_management",
                 "conversation",
                 "max_tool_calls",
+                "moderation",
                 "prompt",
+                "prompt_cache_options",
+                "prompt_cache_retention",
                 "service_tier",
                 "stream_options",
                 "truncation",
@@ -133,6 +140,49 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         ),
     ),
 )
+
+
+RESPONSES_REASONING_FIELDS_ACCEPTED = frozenset(
+    {"effort", "summary", "generate_summary", "context"}
+)
+"""Nested ``reasoning`` object fields the Responses decoder models."""
+
+RESPONSES_REASONING_FIELDS_REJECTED = frozenset({"mode"})
+"""Nested ``reasoning`` fields consciously rejected with a named 400.
+
+``mode`` selects provider-priced reasoning tiers ("standard"/"pro"); pricing
+authority lives in the catalog, so the gateway rejects the field until a
+priced route contract exists for it.
+"""
+
+RESPONSES_REASONING_EFFORTS_ACCEPTED = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"}
+)
+"""``reasoning.effort`` values the decoders accept (route support still applies)."""
+
+RESPONSES_REASONING_CONTEXTS_ACCEPTED = frozenset({"auto", "current_turn", "all_turns"})
+"""``reasoning.context`` values the Responses decoder accepts verbatim."""
+
+RESPONSES_REASONING_SUMMARIES_ACCEPTED = frozenset({"auto", "concise", "detailed"})
+"""``reasoning.summary`` and ``generate_summary`` values the decoder accepts."""
+
+RESPONSES_INCLUDE_PATHS_ACCEPTED = frozenset({"reasoning.encrypted_content"})
+"""``include`` selectors the gateway honors."""
+
+RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
+    {
+        "code_interpreter_call.outputs",
+        "computer_call_output.output.image_url",
+        "file_search_call.results",
+        "message.input_image.image_url",
+        "message.output_text.logprobs",
+        "web_search_call.action.sources",
+        "web_search_call.results",
+    }
+)
+"""``include`` selectors consciously rejected: each names a server-tool or
+multimodal surface this gateway does not serve, so honoring the selector is
+impossible and accepting it would be silent."""
 
 
 def disposition_map(manifest: CompatibilityManifest) -> dict[str, CompatibilityDisposition]:

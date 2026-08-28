@@ -3197,3 +3197,24 @@ def test_capability_rejection_names_the_unsupported_capability(tmp_path: Path) -
     assert payload["error_type"] == "invalid_request_error"
     assert "developer_messages" in payload["message"]
     assert "canary" not in json.dumps(payload)
+
+
+def test_reasoning_context_reflects_in_the_envelope_only_when_sent() -> None:
+    """The response envelope echoes reasoning.context, and only when present,
+    so context-free bodies stay byte-identical to the committed goldens."""
+    from exp.runtime.gateway.native_responses import responses_envelope
+
+    with_context = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "reasoning": {"effort": "high", "context": "all_turns"},
+        }
+    ).request
+    assert responses_envelope(with_context)["reasoning"] == {
+        "effort": "high",
+        "summary": None,
+        "context": "all_turns",
+    }
+    without = decode_responses({"model": "coding", "input": "hi"}).request
+    assert responses_envelope(without)["reasoning"] == {"effort": None, "summary": None}

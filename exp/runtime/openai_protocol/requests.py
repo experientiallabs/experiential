@@ -303,6 +303,7 @@ class _ResponseReasoning(_WireModel):
     """
 
     effort: ReasoningEffort | None = None
+    context: Literal["auto", "current_turn", "all_turns"] | None = None
     generate_summary: Literal["auto", "concise", "detailed"] | None = None
     summary: Literal["auto", "concise", "detailed"] | None = None
 
@@ -475,6 +476,9 @@ def decode_responses(
             logprobs=(True if request.top_logprobs is not None else None),
             top_logprobs=request.top_logprobs,
             reasoning_effort=(request.reasoning.effort if request.reasoning is not None else None),
+            reasoning_context=(
+                request.reasoning.context if request.reasoning is not None else None
+            ),
             reasoning_summary=(
                 request.reasoning.summary or request.reasoning.generate_summary
                 if request.reasoning is not None

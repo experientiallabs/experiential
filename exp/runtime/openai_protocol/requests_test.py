@@ -765,3 +765,43 @@ def test_chat_decoder_accepts_the_ultra_reasoning_effort() -> None:
             }
         )
     assert raised.value.detail.param == "reasoning_effort"
+
+
+def test_responses_decoder_accepts_reasoning_context_and_names_rejections() -> None:
+    """reasoning.context decodes verbatim; unknown values and fields 400 by name.
+
+    Customer repro: pydantic_ai's OpenAIResponsesModel sends
+    reasoning={"effort": ..., "context": "all_turns"} on the gpt-5.6 family
+    and OpenAI-direct accepts it, so the gateway must too.
+    """
+    for value in ("auto", "current_turn", "all_turns"):
+        decoded = decode_responses(
+            {
+                "model": "coding",
+                "input": "hi",
+                "reasoning": {"effort": "high", "context": value},
+            }
+        )
+        assert decoded.request.reasoning_context == value
+    assert decode_responses({"model": "coding", "input": "hi"}).request.reasoning_context is None
+
+    with pytest.raises(OpenAIProtocolError) as invalid_value:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": "hi",
+                "reasoning": {"context": "every_turn"},
+            }
+        )
+    assert invalid_value.value.detail.param == "reasoning.context"
+
+    # The consciously rejected reasoning.mode field keeps its named 400.
+    with pytest.raises(OpenAIProtocolError) as rejected_field:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": "hi",
+                "reasoning": {"mode": "pro"},
+            }
+        )
+    assert rejected_field.value.detail.param == "reasoning.mode"

@@ -360,3 +360,40 @@ def test_reasoning_stream_events_require_their_payloads() -> None:
             sequence_number=0,
             encrypted_content="blob",
         )
+
+
+def test_reasoning_context_is_digest_excluded_but_joins_replay_identity() -> None:
+    """Context-free requests digest byte-identically to pre-field traffic.
+
+    The field is excluded from model serialization so this release does not
+    move canonical digests for context-free traffic; a present value folds
+    into replay identity so a reused caller operation key with a different
+    context is a conflict, never a silent replay.
+    """
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.contracts import canonical_request_sha256
+
+    messages = (GatewayMessage(role="user", content="hi"),)
+    bare = GatewayRequest(surface=GatewayApiSurface.RESPONSES, messages=messages)
+    carried = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=messages,
+        reasoning_context="all_turns",
+    )
+    assert carried.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(carried) == sha256_json(bare)
+    assert canonical_request_sha256(bare) == sha256_json(bare)
+    assert canonical_request_sha256(carried) != canonical_request_sha256(bare)
+    other = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=messages,
+        reasoning_context="current_turn",
+    )
+    assert canonical_request_sha256(other) != canonical_request_sha256(carried)
+
+    with pytest.raises(ValidationError, match="reasoning_context is valid only"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            reasoning_context="all_turns",
+        )

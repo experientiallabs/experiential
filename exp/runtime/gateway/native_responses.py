@@ -185,15 +185,20 @@ def responses_envelope(request: GatewayRequest) -> JsonObject:
     Returns:
         JSON envelope fields keyed exactly as the public response object.
     """
+    reasoning: JsonObject = {
+        "effort": request.reasoning_effort,
+        "summary": request.reasoning_summary,
+    }
+    if request.reasoning_context is not None:
+        # Reflected only when the caller sent it, so context-free response
+        # bodies stay byte-identical to the committed goldens.
+        reasoning["context"] = request.reasoning_context
     return {
         "metadata": request.metadata or None,
         "parallel_tool_calls": request.parallel_tool_calls is not False,
         "temperature": request.temperature,
         "top_p": request.top_p,
-        "reasoning": {
-            "effort": request.reasoning_effort,
-            "summary": request.reasoning_summary,
-        },
+        "reasoning": reasoning,
         "ignored_parameters": list(request.ignored_parameters),
         "tool_choice": _responses_tool_choice(request),
         "tools": [

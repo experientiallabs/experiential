@@ -310,6 +310,17 @@ def route_generation_parameter_requests(
             param=path,
             code="unsupported_parameter",
         )
+    if request.reasoning_context is not None and not all(
+        profile.dialect == "openai_responses" and profile.supports_reasoning for profile in profiles
+    ):
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'reasoning.context' is not supported by this model route. "
+                "Remove the field or choose a different model."
+            ),
+            param="reasoning.context",
+            code="unsupported_parameter",
+        )
 
     if (
         request.structured_text is not None
@@ -609,6 +620,10 @@ def openai_responses_stream_payload(
         reasoning["effort"] = openai_reasoning_effort(model_id, effective_reasoning_effort)
     if supports_reasoning and request.reasoning_summary is not None:
         reasoning["summary"] = request.reasoning_summary
+    if supports_reasoning and request.reasoning_context is not None:
+        # Forwarded verbatim: the value controls provider-side re-rendering
+        # of prior turns' reasoning and has no gateway semantics.
+        reasoning["context"] = request.reasoning_context
     if reasoning:
         payload["reasoning"] = reasoning
     return payload

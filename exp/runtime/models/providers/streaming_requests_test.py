@@ -1419,3 +1419,44 @@ def test_ultra_effort_is_admitted_only_where_the_family_documents_it() -> None:
     )
     with pytest.raises(UnsupportedReasoningEffortError):
         route_generation_parameter_requests((older,), request)
+
+
+def test_reasoning_context_passes_through_verbatim_and_narrows_per_rung() -> None:
+    """reasoning.context forwards untouched and admits only native Responses rungs."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        reasoning_effort="high",
+        reasoning_context="all_turns",
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        request,
+        supports_temperature=True,
+        supports_reasoning=True,
+    )
+    assert payload["reasoning"] == {"effort": "high", "context": "all_turns"}
+
+    responses = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://openai.test",
+        model_id="gpt-5.6-luna",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+    )
+    # The fallback accepts the effort, so context is the one blocker.
+    fallback = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://fallback.test",
+        model_id="gpt-5.2",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+    )
+    route_generation_parameter_requests((responses,), request)
+    # Per-rung narrowing keeps the compatible rung; the whole-route error
+    # names the field only when no rung qualifies.
+    assert compatible_generation_parameter_profile_indexes((responses, fallback), request) == (0,)
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((fallback,), request)
+    assert raised.value.param == "reasoning.context"
+    assert raised.value.code == "unsupported_parameter"

@@ -217,6 +217,17 @@ class GatewayRequest(ContractModel):
     """
     include_encrypted_reasoning: bool = False
     """Whether the caller asked for ``include=["reasoning.encrypted_content"]``."""
+    reasoning_context: Literal["auto", "current_turn", "all_turns"] | None = Field(
+        default=None, exclude=True
+    )
+    """Caller ``reasoning.context`` selector from the Responses surface.
+
+    Controls whether the model re-renders prior turns' reasoning. Forwarded
+    verbatim to native Responses rungs. Excluded from model serialization so
+    context-free request digests stay byte-identical to pre-field traffic; a
+    present value joins replay identity through
+    :func:`canonical_request_sha256`.
+    """
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
@@ -294,6 +305,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("response_store is valid only for Responses requests")
         if self.include_encrypted_reasoning and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("include_encrypted_reasoning is valid only for Responses requests")
+        if self.reasoning_context is not None and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("reasoning_context is valid only for Responses requests")
         if self.provider_thinking_config is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_thinking_config is valid only for Messages requests")
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
@@ -330,13 +343,18 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
         for index, message in enumerate(request.messages)
         if message.provider_reasoning
     ]
-    if not carriers and request.provider_thinking_config is None:
+    if (
+        not carriers
+        and request.provider_thinking_config is None
+        and request.reasoning_context is None
+    ):
         return sha256_json(request)
     return sha256_json(
         {
             "request_sha256": sha256_json(request),
             "provider_reasoning": carriers,
             "provider_thinking_config": request.provider_thinking_config,
+            "reasoning_context": request.reasoning_context,
         }
     )
 

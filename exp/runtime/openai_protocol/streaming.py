@@ -764,10 +764,7 @@ class ResponsesSseEncoder:
             "parallel_tool_calls": self.request.parallel_tool_calls is not False,
             "temperature": self.request.temperature,
             "top_p": self.request.top_p,
-            "reasoning": {
-                "effort": self.request.reasoning_effort,
-                "summary": self.request.reasoning_summary,
-            },
+            "reasoning": _reasoning_envelope(self.request),
             "tool_choice": _responses_tool_choice(self.request),
             "tools": [
                 {
@@ -906,6 +903,21 @@ def _responses_usage(usage: GatewayUsage | None) -> JsonObject | None:
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
         "total_tokens": usage.input_tokens + usage.output_tokens,
     }
+
+
+def _reasoning_envelope(request: GatewayRequest) -> JsonObject:
+    """Reflect the caller's reasoning controls in the response envelope.
+
+    ``context`` is included only when the caller sent it, so context-free
+    response bodies stay byte-identical to pre-field traffic and goldens.
+    """
+    reasoning: JsonObject = {
+        "effort": request.reasoning_effort,
+        "summary": request.reasoning_summary,
+    }
+    if request.reasoning_context is not None:
+        reasoning["context"] = request.reasoning_context
+    return reasoning
 
 
 def _responses_tool_choice(request: GatewayRequest) -> JsonObject | str:
