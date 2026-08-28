@@ -34,15 +34,19 @@ def _preserves_provider_reasoning_authority(
     later user message, but it cannot rewrite that prefix or inject a new
     provider-reasoning block that never passed provider authentication.
     """
-    original_has_carrier = any(message.provider_reasoning for message in original)
-    carrier_indexes = tuple(
+    original_carrier_indexes = tuple(
+        index for index, message in enumerate(original) if message.provider_reasoning
+    )
+    replacement_carrier_indexes = tuple(
         index for index, message in enumerate(replacement) if message.provider_reasoning
     )
-    if not carrier_indexes:
-        return not original_has_carrier or all(
-            message.role in {"system", "developer", "user"} for message in replacement
-        )
-    bound = carrier_indexes[-1]
+    if not original_carrier_indexes:
+        return not replacement_carrier_indexes
+    if not replacement_carrier_indexes:
+        return all(message.role in {"system", "developer", "user"} for message in replacement)
+    if replacement_carrier_indexes != original_carrier_indexes:
+        return False
+    bound = original_carrier_indexes[-1]
     return len(original) > bound and tuple(replacement[: bound + 1]) == tuple(original[: bound + 1])
 
 

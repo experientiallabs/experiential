@@ -53,7 +53,30 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
         else:
             indexed_items.append((block.output_index, item))
     if message.content is not None:
-        items.append({"role": "assistant", "content": message.content})
+        if message.provider_output_index is None:
+            items.append({"role": "assistant", "content": message.content})
+        else:
+            if message.provider_item_id is None:
+                raise ProviderResponseError("Responses assistant output omitted its provider ID")
+            indexed_items.append(
+                (
+                    message.provider_output_index,
+                    {
+                        "type": "message",
+                        "id": message.provider_item_id,
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": message.content,
+                                "annotations": [],
+                                "logprobs": [],
+                            }
+                        ],
+                    },
+                )
+            )
     for call in message.tool_calls:
         item = {
             "type": "function_call",

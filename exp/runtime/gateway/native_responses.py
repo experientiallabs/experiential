@@ -147,6 +147,24 @@ def remember_turn(
     if bool(data.get("refusal")):
         return
     text = str(data.get("text") or "")
+    raw_message_item_id = data.get("message_item_id")
+    raw_message_output_index = data.get("message_output_index")
+    message_item_id: str | None
+    message_output_index: int | None
+    if raw_message_item_id is None and raw_message_output_index is None:
+        message_item_id = None
+        message_output_index = None
+    elif (
+        isinstance(raw_message_item_id, str)
+        and bool(raw_message_item_id)
+        and isinstance(raw_message_output_index, int)
+        and not isinstance(raw_message_output_index, bool)
+        and raw_message_output_index >= 0
+    ):
+        message_item_id = raw_message_item_id
+        message_output_index = raw_message_output_index
+    else:
+        raise ValueError("Responses assistant message identity is invalid")
     raw_calls = data.get("tool_calls")
     tool_calls = tuple(
         ToolCall(
@@ -208,6 +226,13 @@ def remember_turn(
         call.provider_item_id is None or call.provider_output_index is None for call in tool_calls
     ):
         raise ValueError("Responses retained tool calls require provider item identity and order")
+    indexed_output = bool(provider_reasoning) or any(
+        call.provider_output_index is not None for call in tool_calls
+    )
+    if text and indexed_output and message_output_index is None:
+        raise ValueError(
+            "Responses retained assistant text requires provider item identity and order"
+        )
     if carrier is not None:
         if not isinstance(carrier, str):
             raise ValueError("Responses reasoning carrier must be text")
@@ -219,6 +244,8 @@ def remember_turn(
         content=text or None,
         tool_calls=tool_calls,
         provider_reasoning=provider_reasoning,
+        provider_item_id=message_item_id,
+        provider_output_index=message_output_index,
     )
     continuations.remember_now(
         namespace=context.namespace,

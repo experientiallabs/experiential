@@ -30,11 +30,25 @@ pub struct CompletedToolCall {
     pub raw_arguments: String,
 }
 
+/// Provider-owned Responses output-item kind whose identity must remain exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderOutputItemKind {
+    Reasoning,
+    FunctionCall,
+    Message,
+}
+
 /// One ordered provider-neutral stream event.
 #[derive(Debug, Clone)]
 pub enum Event {
     TextDelta(String),
     RefusalDelta(String),
+    /// Reserve a public Responses slot at the provider's item-start boundary.
+    ProviderOutputItemStarted {
+        output_index: u32,
+        item_id: String,
+        kind: ProviderOutputItemKind,
+    },
     ReasoningSummaryDelta {
         output_index: u32,
         summary_index: u32,
@@ -104,6 +118,20 @@ pub fn simplified_event(event: &Event) -> Value {
     match event {
         Event::TextDelta(text) => serde_json::json!({"kind": "text_delta", "text": text}),
         Event::RefusalDelta(text) => serde_json::json!({"kind": "refusal_delta", "text": text}),
+        Event::ProviderOutputItemStarted {
+            output_index,
+            item_id,
+            kind,
+        } => serde_json::json!({
+            "kind": "provider_output_item_started",
+            "output_index": output_index,
+            "item_id": item_id,
+            "item_type": match kind {
+                ProviderOutputItemKind::Reasoning => "reasoning",
+                ProviderOutputItemKind::FunctionCall => "function_call",
+                ProviderOutputItemKind::Message => "message",
+            },
+        }),
         Event::ReasoningSummaryDelta {
             output_index,
             summary_index,
@@ -164,13 +192,19 @@ pub fn simplified_event(event: &Event) -> Value {
             "index": index,
             "text": delta,
         }),
-        Event::ToolCallCompleted { index, call } => serde_json::json!({
-            "kind": "tool_call_completed",
-            "index": index,
-            "call_id": call.call_id,
-            "name": call.name,
-            "raw_arguments": call.raw_arguments,
-        }),
+        Event::ToolCallCompleted { index, call } => {
+            let mut payload = serde_json::json!({
+                "kind": "tool_call_completed",
+                "index": index,
+                "call_id": call.call_id,
+                "name": call.name,
+                "raw_arguments": call.raw_arguments,
+            });
+            if let Some(item_id) = &call.provider_item_id {
+                payload["item_id"] = Value::String(item_id.clone());
+            }
+            payload
+        }
         Event::Usage(usage) => serde_json::json!({
             "kind": "usage",
             "input_tokens": usage.input_tokens,
@@ -433,6 +467,23 @@ pub fn require_string(
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("{label} must be text"))
+}
+
+/// Fetch a required provider identity with the public contract's character bound.
+pub fn require_bounded_string(
+    object: &Map<String, Value>,
+    key: &str,
+    label: &str,
+    maximum_chars: usize,
+) -> Result<String, String> {
+    let value = require_string(object, key, label)?;
+    let length = value.chars().count();
+    if length == 0 || length > maximum_chars {
+        return Err(format!(
+            "{label} must contain between 1 and {maximum_chars} characters"
+        ));
+    }
+    Ok(value)
 }
 
 /// Fetch a required non-negative integer field from a provider JSON object,

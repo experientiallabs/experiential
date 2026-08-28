@@ -182,9 +182,9 @@ class ToolCall(ContractModel):
 
     ``arguments`` retains the existing parsed-object contract used by environments and
     optimization artifacts. ``raw_arguments`` optionally preserves the exact provider-emitted
-    JSON string for immediate protocol replay. It is deliberately excluded from model
-    serialization so provider formatting cannot affect immutable artifacts, lineage, or
-    deduplication.
+    JSON string for immediate protocol replay. It is deliberately excluded from ordinary model
+    serialization so provider formatting cannot affect immutable artifacts or lineage. Gateway
+    idempotency folds the excluded replay fields into its separate canonical request digest.
     """
 
     call_id: str = Field(min_length=1, max_length=256)

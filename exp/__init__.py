@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from exp.common.models import BillingSource as BillingSource
     from exp.common.models import ConnectionConfig as ConnectionConfig
     from exp.common.models import DiscoveredModel as DiscoveredModel
+    from exp.common.models import (
+        GatewayDeploymentCapabilities as GatewayDeploymentCapabilities,
+    )
+    from exp.common.models import GatewayDeploymentMetadata as GatewayDeploymentMetadata
     from exp.common.models import ModelCapabilities as ModelCapabilities
     from exp.common.models import ModelCatalog as ModelCatalog
     from exp.common.models import ModelRecord as ModelRecord
@@ -146,6 +150,8 @@ _EXPORT_MODULES = {
     "BillingSource": "exp.common.models",
     "ConnectionConfig": "exp.common.models",
     "DiscoveredModel": "exp.common.models",
+    "GatewayDeploymentCapabilities": "exp.common.models",
+    "GatewayDeploymentMetadata": "exp.common.models",
     "ModelCapabilities": "exp.common.models",
     "ModelCatalog": "exp.common.models",
     "ModelRecord": "exp.common.models",

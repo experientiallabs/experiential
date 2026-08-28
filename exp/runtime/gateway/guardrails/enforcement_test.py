@@ -371,6 +371,57 @@ def test_input_modify_rejects_removing_carrier_while_retaining_tool_history() ->
     assert raised.value.failure.safe_details["action"] == GuardrailAction.ERROR.value
 
 
+def test_input_modify_rejects_removing_only_a_later_reasoning_carrier() -> None:
+    """A modifier cannot preserve one carrier while deleting a later authority turn."""
+    first = _reasoning_request()
+    second_assistant = first.messages[1].model_copy(
+        update={
+            "tool_calls": (
+                ToolCall(
+                    call_id="call-two",
+                    name="lookup",
+                    arguments={"query": "later"},
+                    raw_arguments='{"query":"later"}',
+                ),
+            ),
+            "provider_reasoning": (
+                OpaqueReasoningContentBlock(
+                    route_sha256="b" * 64,
+                    content="later authenticated hidden state",
+                ),
+            ),
+        }
+    )
+    request = first.model_copy(
+        update={
+            "messages": (
+                *first.messages,
+                GatewayMessage(role="user", content="Use another tool"),
+                second_assistant,
+                GatewayMessage(role="tool", tool_call_id="call-two", content="later result"),
+            )
+        }
+    )
+    replacement = (
+        *request.messages[:4],
+        second_assistant.model_copy(update={"provider_reasoning": ()}),
+        request.messages[5],
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
+        ),
+        checks=(_check("input-one", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    with pytest.raises(GuardrailRejected) as raised:
+        _awaited(engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0))
+
+    assert raised.value.failure.safe_details["action"] == GuardrailAction.ERROR.value
+
+
 @pytest.mark.parametrize(
     "mutation",
     ("prior_context", "tool_call", "raw_arguments", "injected_reasoning"),

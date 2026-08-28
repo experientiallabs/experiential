@@ -345,6 +345,11 @@ class NativeControlPlane(NativeObservabilityMixin):
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
         if pinned_reasoning_route is not None and not has_active_reasoning_content(request):
             pinned_reasoning_route = None
+        if continuation_context is not None:
+            # Retain exactly the post-unseal, post-guardrail history that is
+            # dispatched. Saving the pre-MODIFY context would resurrect input
+            # that the classifier removed on the next Responses continuation.
+            continuation_context.messages = request.messages
 
         # The ledger accepts the logical request before route selection, so a
         # keyed operation whose durable terminal already exists (or whose key

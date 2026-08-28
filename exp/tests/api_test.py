@@ -18,6 +18,8 @@ from exp.common.models import (
     BillingSource,
     ConnectionConfig,
     DiscoveredModel,
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
     ModelCapabilities,
     ModelCatalog,
     ModelRecord,
@@ -142,6 +144,8 @@ def test_public_api_matches_quickstart() -> None:
     assert exp.BillingSource is BillingSource
     assert exp.ConnectionConfig is ConnectionConfig
     assert exp.DiscoveredModel is DiscoveredModel
+    assert exp.GatewayDeploymentCapabilities is GatewayDeploymentCapabilities
+    assert exp.GatewayDeploymentMetadata is GatewayDeploymentMetadata
     assert exp.ModelCapabilities is ModelCapabilities
     assert exp.ModelCatalog is ModelCatalog
     assert exp.ModelRecord is ModelRecord

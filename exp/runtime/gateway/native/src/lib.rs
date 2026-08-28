@@ -350,6 +350,26 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
         let event = match kind {
             "text_delta" => events::Event::TextDelta(text),
             "refusal_delta" => events::Event::RefusalDelta(text),
+            "provider_output_item_started" => events::Event::ProviderOutputItemStarted {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                kind: match object.get("item_type").and_then(serde_json::Value::as_str) {
+                    Some("reasoning") => events::ProviderOutputItemKind::Reasoning,
+                    Some("function_call") => events::ProviderOutputItemKind::FunctionCall,
+                    Some("message") => events::ProviderOutputItemKind::Message,
+                    Some(other) => {
+                        return Err(format!("unknown provider output item kind: {other}"));
+                    }
+                    None => return Err("provider output item requires item_type".to_string()),
+                },
+            },
             "reasoning_summary_delta" => events::Event::ReasoningSummaryDelta {
                 output_index: object
                     .get("output_index")

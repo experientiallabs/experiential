@@ -142,6 +142,9 @@ class GatewayMessage(ContractModel):
     content: str | None = None
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
     tool_calls: tuple[ToolCall, ...] = ()
+    provider_item_id: str | None = Field(default=None, min_length=1, max_length=256, exclude=True)
+    provider_output_index: int | None = Field(default=None, ge=0, exclude=True)
+    """Opaque Responses assistant-message identity retained only for exact replay."""
     tool_is_error: bool = Field(default=False, exclude=True)
     """Whether this tool result reports a failed tool invocation.
 
@@ -150,8 +153,8 @@ class GatewayMessage(ContractModel):
     admission requires every waterfall rung to use that dialect. OpenAI-family
     wires cannot represent the flag and are rejected instead of dropping it. Like
     ``ToolCall.raw_arguments``, the field is deliberately excluded from model
-    serialization so request digests, replay identity, and immutable
-    artifacts are unaffected by it.
+    serialization so immutable artifacts are unaffected by it. The gateway's
+    separate canonical replay digest includes the marker.
     """
     provider_reasoning: tuple[ProviderReasoningBlock, ...] = Field(default=(), exclude=True)
     """Ordered opaque provider-reasoning blocks carried on assistant turns.
@@ -159,10 +162,10 @@ class GatewayMessage(ContractModel):
     Thinking and redacted-thinking blocks exist only on the Anthropic wire;
     encrypted reasoning items exist only on the OpenAI Responses wire. Route
     admission therefore requires every waterfall rung to speak the one
-    dialect that can replay them, mirroring ``tool_is_error``. Like that
-    flag, the carrier is excluded from model serialization so immutable
-    artifacts and carrier-free request digests are unperturbed; requests that
-    do carry it join replay identity through
+    dialect that can replay them, mirroring ``tool_is_error``. Like that flag,
+    the carrier is excluded from model serialization so immutable artifacts
+    and carrier-free request digests are unperturbed; requests that do carry it
+    join replay identity through
     :func:`canonical_request_sha256`, so a caller operation key reused with
     different reasoning is a rejected conflict, never a silent replay.
     """
@@ -183,6 +186,12 @@ class GatewayMessage(ContractModel):
             raise ValueError("tool_calls are valid only for assistant messages")
         if self.role != "assistant" and self.provider_reasoning:
             raise ValueError("provider reasoning blocks are valid only for assistant messages")
+        if self.role != "assistant" and (
+            self.provider_item_id is not None or self.provider_output_index is not None
+        ):
+            raise ValueError("provider output identity is valid only for assistant messages")
+        if (self.provider_item_id is None) != (self.provider_output_index is None):
+            raise ValueError("provider item ID and output index must be retained together")
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
@@ -328,7 +337,7 @@ class GatewayRequest(ContractModel):
 
 
 def canonical_request_sha256(request: GatewayRequest) -> Sha256:
-    """Digest one canonical request including its opaque reasoning carriers.
+    """Digest one canonical request including its exact provider replay transcript.
 
     The carriers are excluded from model serialization so immutable artifacts
     and pre-existing request digests stay byte-identical, but they are
@@ -344,20 +353,46 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
     Returns:
         The stable canonical request digest.
     """
-    carriers: list[JsonObject] = [
-        {
-            "message_index": index,
-            "blocks": [block.model_dump(mode="json") for block in message.provider_reasoning],
-        }
-        for index, message in enumerate(request.messages)
-        if message.provider_reasoning
-    ]
-    if not carriers and request.provider_thinking_config is None:
+    replay: list[JsonObject] = []
+    for message_index, message in enumerate(request.messages):
+        authority: JsonObject = {"message_index": message_index}
+        if message.provider_item_id is not None:
+            authority["message_item_id"] = message.provider_item_id
+            authority["message_output_index"] = message.provider_output_index
+        if message.provider_reasoning:
+            blocks: list[JsonObject] = []
+            for block in message.provider_reasoning:
+                serialized = block.model_dump(mode="json")
+                if isinstance(block, EncryptedReasoningBlock):
+                    serialized["output_index"] = block.output_index
+                blocks.append(serialized)
+            authority["provider_reasoning"] = blocks
+        retained_calls = [
+            {
+                "tool_call_index": call_index,
+                "call_id": call.call_id,
+                "name": call.name,
+                "raw_arguments": call.raw_arguments,
+                "provider_item_id": call.provider_item_id,
+                "provider_output_index": call.provider_output_index,
+            }
+            for call_index, call in enumerate(message.tool_calls)
+            if call.raw_arguments is not None
+            or call.provider_item_id is not None
+            or call.provider_output_index is not None
+        ]
+        if retained_calls:
+            authority["tool_calls"] = retained_calls
+        if message.tool_is_error:
+            authority["tool_is_error"] = True
+        if len(authority) > 1:
+            replay.append(authority)
+    if not replay and request.provider_thinking_config is None:
         return sha256_json(request)
     return sha256_json(
         {
             "request_sha256": sha256_json(request),
-            "provider_reasoning": carriers,
+            "provider_replay": replay,
             "provider_thinking_config": request.provider_thinking_config,
         }
     )

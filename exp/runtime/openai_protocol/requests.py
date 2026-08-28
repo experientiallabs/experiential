@@ -64,11 +64,7 @@ class _WireModel(BaseModel):
 
 
 class _EphemeralCacheControl(_WireModel):
-    """OpenCode/Anthropic cache breakpoint accepted only so it can be dropped.
-
-    The object form is ``{"type": "ephemeral"}`` with an optional ``ttl`` of
-    ``5m`` or ``1h``. An explicit ``ttl: null`` is not in that allowlist.
-    """
+    """OpenCode/Anthropic cache breakpoint accepted only so it can be dropped."""
 
     type: Literal["ephemeral"]
     ttl: Literal["5m", "1h"] | None = None
@@ -87,6 +83,8 @@ class _TextPart(_WireModel):
 
     type: Literal["text", "input_text", "output_text"]
     text: str
+    annotations: tuple[JsonObject, ...] | None = None
+    logprobs: tuple[JsonObject, ...] | None = None
 
 
 class _FunctionCall(_WireModel):
@@ -105,14 +103,7 @@ class _AssistantToolCall(_WireModel):
 
 
 class _Message(_WireModel):
-    """Text-only OpenAI message with complete assistant tool history.
-
-    Assistant messages returned by this gateway (and by official OpenAI SDK
-    clients) carry `refusal`, `annotations`, `audio`, and `function_call`
-    keys even when they are empty. Callers echo those messages back verbatim
-    on tool-call continuations, so the empty forms are accepted here; only a
-    populated value is rejected as unsupported.
-    """
+    """Text-only OpenAI message with complete assistant tool history."""
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | tuple[_TextPart, ...] | None = None
@@ -155,6 +146,17 @@ class _ResponseMessage(_Message):
     """Responses message item with its optional official discriminator."""
 
     type: Literal["message"] = "message"
+    id: str | None = Field(default=None, min_length=1, max_length=256)
+    status: Literal["in_progress", "completed", "incomplete"] | None = None
+
+    @model_validator(mode="after")
+    def _require_output_identity_pair(self) -> _ResponseMessage:
+        """Bind replayed output-message identity to its completion status."""
+        if (self.id is None) != (self.status is None):
+            raise ValueError("Responses output messages require both id and status")
+        if self.id is not None and self.role != "assistant":
+            raise ValueError("Responses output message identity requires role assistant")
+        return self
 
 
 class _FunctionDefinition(_WireModel):
@@ -307,11 +309,7 @@ class _ResponseText(_WireModel):
 
 
 class _ResponseReasoning(_WireModel):
-    """Responses reasoning controls accepted at the public boundary.
-
-    The deprecated ``generate_summary`` alias is normalized to the current
-    ``summary`` field before route capability shaping.
-    """
+    """Responses reasoning controls, including the deprecated summary alias."""
 
     effort: ReasoningEffort | None = None
     generate_summary: Literal["auto", "concise", "detailed"] | None = None
@@ -890,13 +888,7 @@ def _include_encrypted_reasoning(include: tuple[str, ...] | None) -> bool:
 def _response_input_messages(
     value: str | tuple[_ResponsesInputItem, ...],
 ) -> tuple[GatewayMessage, ...]:
-    """Convert Responses input items into ordered canonical history.
-
-    A replayed reasoning item precedes the assistant action it belongs to on
-    the official wire, so pending reasoning blocks attach to the next
-    assistant message or function call; trailing or orphaned reasoning stays
-    a standalone assistant turn carrying only the opaque blocks.
-    """
+    """Convert Responses input items into ordered canonical history."""
     if isinstance(value, str):
         return (GatewayMessage(role="user", content=value),)
     messages: list[GatewayMessage] = []
@@ -970,7 +962,11 @@ def _response_input_messages(
             if converted and item.role == "assistant":
                 converted = (
                     converted[0].model_copy(
-                        update={"provider_reasoning": take_reasoning("assistant")}
+                        update={
+                            "provider_reasoning": take_reasoning("assistant"),
+                            "provider_item_id": item.id,
+                            "provider_output_index": index if item.id is not None else None,
+                        }
                     ),
                     *converted[1:],
                 )

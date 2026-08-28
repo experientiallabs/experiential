@@ -27,9 +27,22 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayMessage,
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
+from exp.runtime.gateway.guardrails.client import DirectClassifierClient
+from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierVerdict,
+    GuardrailAction,
+    GuardrailCapabilityKind,
+    GuardrailCheck,
+    GuardrailCheckStage,
+    GuardrailPolicy,
+)
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import (
     LocalGatewayComponents,
@@ -80,6 +93,7 @@ def _control_plane(
     root: Path,
     *,
     request_timeout_seconds: float = 120.0,
+    guardrails: GuardrailEngine | None = None,
 ) -> tuple[NativeControlPlane, str]:
     """Seed one direct alias and load the native control plane over it."""
     _manager, raw_key = _configured_gateway(root)
@@ -87,7 +101,11 @@ def _control_plane(
         root,
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
     )
-    control = NativeControlPlane(components, request_timeout_seconds=request_timeout_seconds)
+    control = NativeControlPlane(
+        components,
+        request_timeout_seconds=request_timeout_seconds,
+        guardrails=guardrails,
+    )
     return control, raw_key
 
 
@@ -2536,6 +2554,70 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
     assert crossed.value.detail.code == "continuation_unavailable"
 
 
+def test_responses_continuation_retains_post_guardrail_history(tmp_path: Path) -> None:
+    """Stored Responses history must match the classifier-approved dispatched input."""
+    replacement = (GatewayMessage(role="user", content="[REDACTED]"),)
+    policy = GuardrailPolicy(
+        policy_id="redact-input",
+        organization_id="local",
+        identity_id="default",
+        checks=(
+            GuardrailCheck(
+                check_id="redact-input",
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.MODIFY,
+                timeout_ms=1_000,
+                adapter_id="scripted",
+            ),
+        ),
+    )
+    guardrails = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(
+            ClassifierRegistry(
+                {
+                    "scripted": ScriptedClassifier(
+                        input_verdict=ClassifierVerdict(
+                            flagged=True,
+                            replacement_messages=replacement,
+                        )
+                    )
+                }
+            )
+        ),
+        monotonic=time.monotonic,
+    )
+    control, raw_key = _control_plane(tmp_path, guardrails=guardrails)
+    first = _admit_responses(control, raw_key, _responses_body())
+    assert _payload_messages(first)[0]["content"] == "[REDACTED]"
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": first["request_id"],
+                    "text": "safe answer",
+                    "refusal": False,
+                    "tool_calls": [],
+                }
+            )
+        )
+        == "{}"
+    )
+    response_id = stable_public_id("resp", _admitted_request_id(first))
+    retained = control._continuations.resolve_now(  # noqa: SLF001 - retention invariant.
+        namespace=ProtocolNamespace(
+            organization_id="local",
+            identity_id="default",
+            alias_revision_id="revision-one",
+        ),
+        previous_response_id=response_id,
+    )
+
+    assert retained.messages[0] == replacement[0]
+    assert all(message.content != "hi" for message in retained.messages)
+
+
 def test_responses_tool_call_retention_survives_continuation(tmp_path: Path) -> None:
     """Completed tool calls are retained and replayed into continued history."""
     control, raw_key = _control_plane(tmp_path)
@@ -3318,6 +3400,149 @@ def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -
     assert body == _parity_golden("responses_encrypted_reasoning_body")
 
 
+def test_openai_responses_item_order_and_identity_survive_the_native_pipeline() -> None:
+    """Provider item starts reserve exact public slots before either item completes."""
+    native = pytest.importorskip("exp_gateway_native")
+    raw_arguments = '{ "query" : "λ" }'
+    provider_events = [
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "reasoning", "id": "rs-provider-0", "summary": []},
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "message",
+                "id": "msg-provider-1",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
+        },
+        {
+            "type": "response.output_text.delta",
+            "output_index": 1,
+            "item_id": "msg-provider-1",
+            "content_index": 0,
+            "delta": "I will look that up.",
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": {
+                "type": "function_call",
+                "id": "fc-provider-2",
+                "call_id": "call-provider-2",
+                "name": "lookup",
+                "arguments": "",
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "output_index": 2,
+            "delta": raw_arguments,
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "reasoning",
+                "id": "rs-provider-0",
+                "summary": [],
+                "encrypted_content": "opaque-provider-state",
+            },
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "type": "message",
+                "id": "msg-provider-1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "I will look that up.",
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                ],
+            },
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 2,
+            "item": {
+                "type": "function_call",
+                "id": "fc-provider-2",
+                "call_id": "call-provider-2",
+                "name": "lookup",
+                "arguments": raw_arguments,
+            },
+        },
+        {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": None},
+        },
+    ]
+    frames_json = json.dumps(
+        [
+            f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode().decode("latin-1")
+            for event in provider_events
+        ],
+        ensure_ascii=False,
+    )
+    normalized = json.loads(native.normalize_stream_fixture("openai_responses", frames_json))
+    assert normalized["failure"] is None
+    events = normalized["events"]
+    assert [event["kind"] for event in events[:5]] == [
+        "provider_output_item_started",
+        "provider_output_item_started",
+        "text_delta",
+        "provider_output_item_started",
+        "tool_call_started",
+    ]
+
+    body = json.loads(
+        native.completed_responses_fixture(
+            "request-provider-order",
+            "coding",
+            1_700_000_000.0,
+            '{"include_encrypted_reasoning":true}',
+            json.dumps(events, ensure_ascii=False),
+        )
+    )
+    assert [(item["type"], item["id"]) for item in body["output"]] == [
+        ("reasoning", "rs-provider-0"),
+        ("message", "msg-provider-1"),
+        ("function_call", "fc-provider-2"),
+    ]
+    assert body["output"][0]["encrypted_content"] == "opaque-provider-state"
+    assert body["output"][1]["content"][0]["text"] == "I will look that up."
+    assert body["output"][2]["arguments"] == raw_arguments
+
+    frames = native.encode_responses_fixture(
+        "request-provider-order",
+        "coding",
+        1_700_000_000.0,
+        '{"include_encrypted_reasoning":true}',
+        json.dumps(events, ensure_ascii=False),
+    )
+    added = [
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in frames
+        if "response.output_item.added" in frame
+    ]
+    assert [payload["item"]["id"] for payload in added] == [
+        "rs-provider-0",
+        "msg-provider-1",
+        "fc-provider-2",
+    ]
+
+
 def test_thinking_bytes_round_trip_the_native_pipeline_exactly() -> None:
     """Non-ASCII thinking text and a multi-kilobyte signature survive the full
     provider-frames-to-public-frames pipeline byte-identically.
@@ -3577,3 +3802,53 @@ def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
     with pytest.raises(NativeBridgeError) as repeated:
         admit_keyed(reasoning_body("blob-one=="))
     assert json.loads(repeated.value.public_error_json)["code"] != "idempotency_conflict"
+
+
+def test_keyed_responses_replay_conflicts_on_provider_id_or_raw_argument_bytes(
+    tmp_path: Path,
+) -> None:
+    """Semantically equal but byte-distinct provider transcripts cannot share an operation key."""
+    control, raw_key = _control_plane(tmp_path)
+
+    def body(*, item_id: str, arguments: str) -> str:
+        return json.dumps(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "id": item_id,
+                        "call_id": "call-1",
+                        "name": "lookup",
+                        "arguments": arguments,
+                    },
+                    {"type": "function_call_output", "call_id": "call-1", "output": "found"},
+                    {"type": "message", "role": "user", "content": "continue"},
+                ],
+            }
+        )
+
+    def admit(payload: str, key: str) -> JsonObject:
+        return json.loads(
+            control.admit(
+                json.dumps(
+                    {
+                        "raw_key": raw_key,
+                        "body": payload,
+                        "surface": "responses",
+                        "idempotency_key": key,
+                    }
+                )
+            )
+        )
+
+    original = body(item_id="fc-1", arguments='{"q":"x"}')
+    assert "request_id" in admit(original, "raw-argument-op")
+    with pytest.raises(NativeBridgeError) as changed_raw:
+        admit(body(item_id="fc-1", arguments='{ "q" : "x" }'), "raw-argument-op")
+    assert json.loads(changed_raw.value.public_error_json)["code"] == "idempotency_conflict"
+
+    assert "request_id" in admit(original, "provider-item-op")
+    with pytest.raises(NativeBridgeError) as changed_id:
+        admit(body(item_id="fc-2", arguments='{"q":"x"}'), "provider-item-op")
+    assert json.loads(changed_id.value.public_error_json)["code"] == "idempotency_conflict"

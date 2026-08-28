@@ -255,3 +255,78 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
         }
     }
 }
+
+#[test]
+fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
+    let events = vec![
+        Event::ProviderOutputItemStarted {
+            output_index: 0,
+            item_id: "rs-provider-0".to_string(),
+            kind: ProviderOutputItemKind::Reasoning,
+        },
+        Event::ProviderOutputItemStarted {
+            output_index: 1,
+            item_id: "fc-provider-1".to_string(),
+            kind: ProviderOutputItemKind::FunctionCall,
+        },
+        Event::ToolCallStarted {
+            index: 1,
+            call_id: "call-1".to_string(),
+            name: "lookup".to_string(),
+        },
+        Event::ToolArgumentsDelta {
+            index: 1,
+            delta: "{}".to_string(),
+        },
+        Event::EncryptedReasoning {
+            output_index: 0,
+            item_id: "rs-provider-0".to_string(),
+            encrypted_content: "opaque".to_string(),
+        },
+        Event::ToolCallCompleted {
+            index: 1,
+            call: CompletedToolCall {
+                call_id: "call-1".to_string(),
+                name: "lookup".to_string(),
+                provider_item_id: Some("fc-provider-1".to_string()),
+                raw_arguments: "{}".to_string(),
+            },
+        },
+        Event::Completed,
+    ];
+    let completed = completed_responses_body(
+        "request-provider-order",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+        &events,
+    )
+    .expect("provider order must encode");
+    let output = completed.body["output"].as_array().expect("output array");
+    assert_eq!(output[0]["type"], json!("reasoning"));
+    assert_eq!(output[0]["id"], json!("rs-provider-0"));
+    assert_eq!(output[1]["type"], json!("function_call"));
+    assert_eq!(output[1]["id"], json!("fc-provider-1"));
+
+    let mut encoder = ResponsesSseEncoder::new(
+        "request-provider-order",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+    );
+    encoder.start().expect("stream starts");
+    let mut frames = Vec::new();
+    for event in &events {
+        frames.extend(encoder.feed(event).expect("event must encode"));
+    }
+    let added: Vec<Value> = frames
+        .iter()
+        .filter_map(|frame| frame.split_once("data: ").map(|(_, data)| data.trim()))
+        .map(|data| serde_json::from_str(data).expect("frame data must be JSON"))
+        .filter(|payload: &Value| payload["type"] == json!("response.output_item.added"))
+        .collect();
+    assert_eq!(added[0]["item"]["id"], json!("rs-provider-0"));
+    assert_eq!(added[0]["output_index"], json!(0));
+    assert_eq!(added[1]["item"]["id"], json!("fc-provider-1"));
+    assert_eq!(added[1]["output_index"], json!(1));
+}

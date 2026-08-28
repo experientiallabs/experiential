@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::errors::{Failure, FailureClass};
-use crate::events::{simplified_event, Event, ToolAccumulator, Usage};
+use crate::events::{simplified_event, Event, ProviderOutputItemKind, ToolAccumulator, Usage};
 use crate::eventstream::EventStreamDecoder;
 use crate::sse::{SseDecoder, SseEvent};
 
@@ -148,6 +148,7 @@ pub struct Normalizer {
     accumulated_tool_bytes: usize,
     accumulated_summary_bytes: usize,
     reasoning_summaries: BTreeMap<(u32, u32), String>,
+    openai_output_items: BTreeMap<u32, (ProviderOutputItemKind, String)>,
     // Anthropic accumulation.
     input_tokens: u64,
     output_tokens: u64,
@@ -183,6 +184,7 @@ impl Normalizer {
             accumulated_tool_bytes: 0,
             accumulated_summary_bytes: 0,
             reasoning_summaries: BTreeMap::new(),
+            openai_output_items: BTreeMap::new(),
             input_tokens: 0,
             output_tokens: 0,
             cache_read: 0,
@@ -234,6 +236,7 @@ impl Normalizer {
                 .tools
                 .len()
                 .saturating_add(self.reasoning_summaries.len())
+                .saturating_add(self.openai_output_items.len())
                 >= MAXIMUM_RETAINED_PROVIDER_ENTRIES
         {
             return Err(Failure::new(
@@ -252,6 +255,28 @@ impl Normalizer {
     /// Reserve a new reasoning-summary accumulator when this key is not retained.
     fn reserve_summary_entry(&self, key: (u32, u32)) -> Result<(), Failure> {
         self.reserve_provider_entry(self.reasoning_summaries.contains_key(&key))
+    }
+
+    /// Bind one OpenAI provider output index to exactly one bounded identity.
+    fn bind_openai_output_item(
+        &mut self,
+        output_index: u32,
+        kind: ProviderOutputItemKind,
+        item_id: String,
+    ) -> Result<bool, Failure> {
+        if let Some(existing) = self.openai_output_items.get(&output_index) {
+            return if existing == &(kind, item_id) {
+                Ok(false)
+            } else {
+                Err(malformed(
+                    "OpenAI output item changed identity or type during streaming",
+                ))
+            };
+        }
+        self.reserve_provider_entry(false)?;
+        self.openai_output_items
+            .insert(output_index, (kind, item_id));
+        Ok(true)
     }
 
     /// Whether a terminal event already ended the stream.

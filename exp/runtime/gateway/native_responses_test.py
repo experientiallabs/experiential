@@ -174,6 +174,60 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
     ]
 
 
+def test_remember_turn_replays_assistant_preamble_at_its_provider_output_index() -> None:
+    """Stored text stays between earlier reasoning and a later function call."""
+    store = BoundedContinuationStore()
+    context = _context()
+    remember_turn(
+        store,
+        context=context,
+        data={
+            "text": "I will look that up.",
+            "message_output_index": 1,
+            "message_item_id": "msg-1",
+            "refusal": False,
+            "encrypted_reasoning": [
+                {"output_index": 0, "item_id": "rs-0", "encrypted_content": "opaque"}
+            ],
+            "tool_calls": [
+                {
+                    "output_index": 2,
+                    "item_id": "fc-2",
+                    "call_id": "call-2",
+                    "name": "lookup",
+                    "arguments": '{ "query" : "λ" }',
+                }
+            ],
+        },
+    )
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            *state.messages,
+            GatewayMessage(role="tool", tool_call_id="call-2", content="found"),
+        ),
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    payload_input = cast("list[JsonObject]", payload["input"])
+    assert [(item["type"], item.get("id")) for item in payload_input[:-1]] == [
+        ("reasoning", "rs-0"),
+        ("message", "msg-1"),
+        ("function_call", "fc-2"),
+    ]
+    message_content = cast("list[JsonObject]", payload_input[1]["content"])
+    assert message_content[0]["text"] == "I will look that up."
+    assert payload_input[2]["arguments"] == '{ "query" : "λ" }'
+
+
 @pytest.mark.parametrize(
     "encrypted",
     (

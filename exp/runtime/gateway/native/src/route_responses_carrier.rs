@@ -5,13 +5,14 @@ use serde_json::{json, Value};
 use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::compact_json;
 use crate::errors::PublicError;
-use crate::events::{CompletedToolCall, Event};
+use crate::events::{CompletedToolCall, Event, ProviderOutputItemKind};
 use crate::relay::event_retained_bytes;
 use crate::server::AppState;
 
 #[derive(Default)]
 pub(crate) struct ResponsesRetention {
     pub(crate) text: String,
+    pub(crate) message_output: Option<(u32, String)>,
     pub(crate) refusal: bool,
     pub(crate) tool_calls: Vec<(u32, CompletedToolCall)>,
     pub(crate) encrypted_reasoning: Vec<(u32, String, String)>,
@@ -31,6 +32,7 @@ impl ResponsesRetention {
         if self.retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
             self.overflowed = true;
             self.text.clear();
+            self.message_output = None;
             self.tool_calls.clear();
             self.encrypted_reasoning.clear();
             self.carrier_events.clear();
@@ -47,6 +49,11 @@ impl ResponsesRetention {
             self.carrier_events.push(event.clone());
         }
         match event {
+            Event::ProviderOutputItemStarted {
+                output_index,
+                item_id,
+                kind: ProviderOutputItemKind::Message,
+            } => self.message_output = Some((*output_index, item_id.clone())),
             Event::TextDelta(delta) => self.text.push_str(delta),
             Event::RefusalDelta(_) => self.refusal = true,
             Event::ToolCallCompleted { index, call } => {
@@ -74,6 +81,8 @@ fn remember_argument(
     compact_json(&json!({
         "request_id": request_id,
         "text": retention.text,
+        "message_output_index": retention.message_output.as_ref().map(|(index, _id)| index),
+        "message_item_id": retention.message_output.as_ref().map(|(_index, id)| id),
         "refusal": retention.refusal,
         "reasoning_content_carrier": reasoning_content_carrier,
         "encrypted_reasoning": retention.encrypted_reasoning.iter().map(
@@ -140,5 +149,23 @@ mod tests {
                 "encrypted_content": "provider-opaque",
             }])
         );
+    }
+
+    #[test]
+    fn assistant_message_identity_is_retained_for_ordered_replay() {
+        let mut retention = ResponsesRetention::default();
+        retention.track(&Event::ProviderOutputItemStarted {
+            output_index: 1,
+            item_id: "msg-provider".to_string(),
+            kind: ProviderOutputItemKind::Message,
+        });
+        retention.track(&Event::TextDelta("preamble".to_string()));
+
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-one", &retention, None))
+                .expect("remember payload must be valid JSON");
+        assert_eq!(payload["message_output_index"], json!(1));
+        assert_eq!(payload["message_item_id"], json!("msg-provider"));
+        assert_eq!(payload["text"], json!("preamble"));
     }
 }

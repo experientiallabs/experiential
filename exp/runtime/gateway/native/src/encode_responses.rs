@@ -7,8 +7,10 @@ use serde_json::{json, Value};
 
 use crate::encode::{compact_json, stable_public_id};
 use crate::errors::{Failure, PublicError};
-use crate::events::{CompletedToolCall, Event, Usage};
+use crate::events::{CompletedToolCall, Event, ProviderOutputItemKind, Usage};
 pub use crate::responses_envelope::ResponsesEnvelope;
+
+mod provider;
 
 fn invalid_provider_stream(message: &str) -> PublicError {
     PublicError::new(502, "invalid_provider_stream", message, "api_error")
@@ -45,6 +47,13 @@ struct ReasoningState {
     output_index: usize,
     parts: BTreeMap<u32, String>,
     encrypted_content: Option<String>,
+}
+
+/// Provider-owned output item reserved before its content-bearing event.
+struct ProviderOutputStart {
+    item_id: String,
+    kind: ProviderOutputItemKind,
+    output_index: usize,
 }
 
 impl ReasoningState {
@@ -96,6 +105,7 @@ pub struct ResponsesSseEncoder {
     output_order: Vec<OutputSlot>,
     tools: HashMap<u32, ToolState>,
     reasoning: HashMap<u32, ReasoningState>,
+    provider_output_starts: HashMap<u32, ProviderOutputStart>,
     fireworks_reasoning: Option<ReasoningState>,
     fireworks_reasoning_route_sha256: Option<String>,
     reasoning_content_carrier: Option<String>,
@@ -126,6 +136,7 @@ impl ResponsesSseEncoder {
             output_order: Vec::new(),
             tools: HashMap::new(),
             reasoning: HashMap::new(),
+            provider_output_starts: HashMap::new(),
             fireworks_reasoning: None,
             fireworks_reasoning_route_sha256: None,
             reasoning_content_carrier: None,
@@ -172,6 +183,11 @@ impl ResponsesSseEncoder {
         match event {
             Event::TextDelta(delta) => self.content_delta(true, delta),
             Event::RefusalDelta(delta) => self.content_delta(false, delta),
+            Event::ProviderOutputItemStarted {
+                output_index,
+                item_id,
+                kind,
+            } => self.provider_output_item_started(*output_index, item_id, *kind),
             Event::ReasoningSummaryDelta {
                 output_index,
                 summary_index,
@@ -315,60 +331,6 @@ impl ResponsesSseEncoder {
         index
     }
 
-    /// Create one stable reasoning output item on first use.
-    fn ensure_reasoning(
-        &mut self,
-        provider_output_index: u32,
-        item_id: &str,
-        frames: &mut Vec<String>,
-    ) -> Result<(), PublicError> {
-        if let Some(existing) = self.reasoning.get(&provider_output_index) {
-            return if existing.item_id == item_id {
-                Ok(())
-            } else {
-                Err(invalid_provider_stream(
-                    "Responses reasoning item changed provider identity.",
-                ))
-            };
-        }
-        let state = ReasoningState {
-            item_id: item_id.to_string(),
-            output_index: self.output_order.len(),
-            parts: BTreeMap::new(),
-            encrypted_content: None,
-        };
-        let frame = self.event(
-            "response.output_item.added",
-            json!({
-                "output_index": state.output_index,
-                "item": state.item(false, false),
-            }),
-        );
-        self.reasoning.insert(provider_output_index, state);
-        self.output_order
-            .push(OutputSlot::Reasoning(provider_output_index));
-        frames.push(frame);
-        Ok(())
-    }
-
-    /// Retain one opaque encrypted reasoning payload on its output item; the
-    /// payload surfaces on the item's completion frames rather than a delta.
-    fn encrypted_reasoning(
-        &mut self,
-        provider_output_index: u32,
-        item_id: &str,
-        encrypted_content: &str,
-    ) -> Result<Vec<String>, PublicError> {
-        let mut frames = Vec::new();
-        self.ensure_reasoning(provider_output_index, item_id, &mut frames)?;
-        let state = self
-            .reasoning
-            .get_mut(&provider_output_index)
-            .expect("reasoning state just ensured");
-        state.encrypted_content = Some(encrypted_content.to_string());
-        Ok(frames)
-    }
-
     /// Open one opaque reasoning item without exposing provider plaintext.
     fn fireworks_reasoning(
         &mut self,
@@ -463,9 +425,23 @@ impl ResponsesSseEncoder {
                 "A Responses tool-call index was started twice.",
             ));
         }
+        let reserved = self.provider_output_starts.get(&index);
+        if reserved.is_some_and(|start| start.kind != ProviderOutputItemKind::FunctionCall) {
+            return Err(invalid_provider_stream(
+                "Responses tool call reused a non-tool provider output item.",
+            ));
+        }
+        let (item_id, output_index, already_reserved) = match reserved {
+            Some(start) => (start.item_id.clone(), start.output_index, true),
+            None => (
+                stable_public_id("fc", &format!("{}:{}", self.response_id, call_id)),
+                self.output_order.len(),
+                false,
+            ),
+        };
         let state = ToolState {
-            item_id: stable_public_id("fc", &format!("{}:{}", self.response_id, call_id)),
-            output_index: self.output_order.len(),
+            item_id,
+            output_index,
             call_id: call_id.to_string(),
             name: name.to_string(),
             arguments: String::new(),
@@ -479,7 +455,9 @@ impl ResponsesSseEncoder {
             }),
         );
         self.tools.insert(index, state);
-        self.output_order.push(OutputSlot::Tool(index));
+        if !already_reserved {
+            self.output_order.push(OutputSlot::Tool(index));
+        }
         Ok(vec![frame])
     }
 
@@ -504,10 +482,13 @@ impl ResponsesSseEncoder {
         index: u32,
         call: &CompletedToolCall,
     ) -> Result<Vec<String>, PublicError> {
+        let provider_owned_identity = self.provider_output_starts.contains_key(&index);
         let state = self.open_tool(index)?;
         if state.call_id != call.call_id
             || state.name != call.name
             || state.arguments != call.raw_arguments
+            || (provider_owned_identity
+                && call.provider_item_id.as_deref() != Some(state.item_id.as_str()))
         {
             return Err(invalid_provider_stream(
                 "Responses tool completion changed streamed identity or bytes.",
@@ -588,14 +569,19 @@ impl ResponsesSseEncoder {
         for slot in self.output_order.clone() {
             match slot {
                 OutputSlot::Message => frames.extend(self.close_message()),
-                OutputSlot::Tool(index) if !self.tools[&index].done => {
-                    frames.extend(self.close_tool(index));
-                }
+                OutputSlot::Tool(index) => match self.tools.get(&index) {
+                    Some(tool) if !tool.done => frames.extend(self.close_tool(index)),
+                    Some(_) => {}
+                    None => {
+                        return Err(invalid_provider_stream(
+                            "Responses provider tool item never supplied its call identity.",
+                        ));
+                    }
+                },
                 OutputSlot::Reasoning(index) => frames.extend(self.close_reasoning(index)),
                 OutputSlot::FireworksReasoning => {
                     frames.extend(self.close_fireworks_reasoning());
                 }
-                OutputSlot::Tool(_) => {}
             }
         }
         self.terminal = true;

@@ -268,6 +268,7 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
                         {
                             "type": "response.output_text.delta",
                             "output_index": 0,
+                            "item_id": "msg_provider_continued",
                             "content_index": 0,
                             "delta": "continued-ok",
                         }

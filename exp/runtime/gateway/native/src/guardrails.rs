@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::bridge::Bridge;
 use crate::errors::{Failure, FailureClass};
-use crate::events::Event;
+use crate::events::{Event, ProviderOutputItemKind};
 
 /// Decision returned by one Python `enforce_output` callback.
 #[derive(Debug, Deserialize)]
@@ -79,6 +79,10 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
     for event in events {
         match event {
             Event::RefusalDelta(_)
+            | Event::ProviderOutputItemStarted {
+                kind: ProviderOutputItemKind::Reasoning,
+                ..
+            }
             | Event::ReasoningSummaryDelta { .. }
             | Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }

@@ -860,6 +860,60 @@ def test_responses_decoder_rejects_reasoning_without_item_id() -> None:
     assert raised.value.detail.param == "input.0.id"
 
 
+def test_responses_decoder_replays_output_message_in_provider_order() -> None:
+    """A stateless output transcript keeps reasoning, message, and call order."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_0",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "I will look that up.",
+                            "annotations": [],
+                            "logprobs": [],
+                        }
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_2",
+                    "call_id": "call-2",
+                    "name": "lookup",
+                    "arguments": '{ "q" : "x" }',
+                },
+                {"type": "function_call_output", "call_id": "call-2", "output": "found"},
+            ],
+        }
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-fixture",
+        decoded.request,
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    payload_input = cast("list[JsonObject]", payload["input"])
+    assert [(item["type"], item.get("id")) for item in payload_input[:3]] == [
+        ("reasoning", "rs_0"),
+        ("message", "msg_1"),
+        ("function_call", "fc_2"),
+    ]
+    message_content = cast("list[JsonObject]", payload_input[1]["content"])
+    assert message_content[0]["text"] == "I will look that up."
+    assert payload_input[2]["arguments"] == '{ "q" : "x" }'
+
+
 def test_responses_decoder_groups_fireworks_carrier_with_all_tool_calls() -> None:
     """One carrier and contiguous calls reconstruct their exact assistant turn."""
     deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
