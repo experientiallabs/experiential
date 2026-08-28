@@ -577,6 +577,8 @@ def test_native_anthropic_normalizer_completes_a_zero_argument_tool_call() -> No
         },
         {"kind": "completed"},
     ]
+
+
 def test_native_responses_preserves_multi_message_status_phase_and_idless_call() -> None:
     """OpenAI 3.x output item shapes survive normalization and public encoding."""
     from openai.types.responses.response import Response

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Mapping
+from collections.abc import Collection
 from typing import Annotated, Literal, cast
 
 from openai.types.chat.completion_create_params import CompletionCreateParams
@@ -615,6 +615,7 @@ def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) 
 
 _LOCATION_NOISE = {"body", "non-streaming", "streaming"}
 _UNION_BRANCH_TYPES = {"str", "int", "float", "bool", "list", "tuple", "dict", "NoneType"}
+_OUTPUT_ITEM_VARIANTS = {"message", "function_call", "function_call_output", "reasoning"}
 
 
 def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
@@ -627,6 +628,8 @@ def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
         if isinstance(part, str) and (
             part.startswith("_") or "[" in text or text in _UNION_BRANCH_TYPES
         ):
+            continue
+        if text in _OUTPUT_ITEM_VARIANTS and cleaned and cleaned[-1].isdigit():
             continue
         cleaned.append(text)
     return tuple(cleaned)
