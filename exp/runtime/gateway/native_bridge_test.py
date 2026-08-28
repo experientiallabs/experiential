@@ -3218,3 +3218,61 @@ def test_reasoning_context_reflects_in_the_envelope_only_when_sent() -> None:
     }
     without = decode_responses({"model": "coding", "input": "hi"}).request
     assert responses_envelope(without)["reasoning"] == {"effort": None, "summary": None}
+
+
+def _zero_argument_tool_fixture_json() -> str:
+    """Return the normalized event sequence a zero-argument tool call produces.
+
+    Mirrors the live captured wire (2026-08-28): one empty streamed fragment,
+    then the completion-time `{}` seed, then the verified completed call.
+    """
+    return json.dumps(
+        [
+            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "get_time"},
+            {"kind": "tool_arguments_delta", "index": 0, "text": ""},
+            {"kind": "tool_arguments_delta", "index": 0, "text": "{}"},
+            {
+                "kind": "tool_call_completed",
+                "index": 0,
+                "call_id": "call-1",
+                "name": "get_time",
+                "raw_arguments": "{}",
+            },
+            {"kind": "usage", "input_tokens": 5, "output_tokens": 3},
+            {"kind": "completed"},
+        ]
+    )
+
+
+def test_zero_argument_tool_calls_encode_on_every_public_lane() -> None:
+    """The zero-argument completion sequence serves both lanes, both modes.
+
+    Production incident (2026-08-28): every zero-argument tool failed as
+    malformed_response. The normalizer fix seeds `{}` at completion; these
+    assertions pin that the seeded sequence encodes as a valid Anthropic
+    tool_use block and a valid Chat tool call, streaming and non-streaming.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    fixture = _zero_argument_tool_fixture_json()
+
+    frames = native.encode_messages_fixture("request-abc", "coding", fixture)
+    assert any('"type":"tool_use"' in frame for frame in frames)
+    assert frames[-1].startswith("event: message_stop")
+    messages_body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
+    assert messages_body["content"][0] == {
+        "type": "tool_use",
+        "id": "call-1",
+        "name": "get_time",
+        "input": {},
+    }
+    assert messages_body["stop_reason"] == "tool_use"
+
+    chat_frames = native.encode_chat_fixture("request-abc", "coding", 1_700_000_000, True, fixture)
+    assert chat_frames[-1] == "data: [DONE]\n\n"
+    assert any('"finish_reason":"tool_calls"' in frame for frame in chat_frames)
+    responses_body = json.loads(
+        native.completed_responses_fixture("request-abc", "coding", 1_700_000_000.0, "{}", fixture)
+    )
+    call_items = [item for item in responses_body["output"] if item["type"] == "function_call"]
+    assert call_items[0]["arguments"] == "{}"
+    assert call_items[0]["status"] == "completed"
