@@ -96,15 +96,18 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             raise ProviderResponseError("encrypted reasoning cannot replay on the Anthropic wire")
     if message.content is not None:
         blocks.append({"type": "text", "text": message.content})
-    blocks.extend(
-        {
+    for call in message.tool_calls:
+        tool_use: JsonObject = {
             "type": "tool_use",
             "id": call.call_id,
             "name": call.name,
             "input": call.arguments,
         }
-        for call in message.tool_calls
-    )
+        # A validated caller cache hint forwards only on this wire, which
+        # defines tool_use-block prompt caching natively.
+        if call.cache_control is not None:
+            tool_use["cache_control"] = call.cache_control
+        blocks.append(tool_use)
     return "assistant", blocks
 
 

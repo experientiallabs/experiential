@@ -102,11 +102,18 @@ class _FunctionCall(_WireModel):
 
 
 class _AssistantToolCall(_WireModel):
-    """One assistant function call retained in request history."""
+    """One assistant function call retained in request history.
+
+    OpenCode-style callers attach an Anthropic ``cache_control`` to the last
+    content part of recent messages; when that part is a tool call the hint
+    lands inside this entry, so the supported ephemeral form is accepted and
+    carried for the one wire that can honor it.
+    """
 
     id: str = Field(min_length=1, max_length=256)
     type: Literal["function"] = "function"
     function: _FunctionCall
+    cache_control: _EphemeralCacheControl | None = None
 
 
 class _Message(_WireModel):
@@ -800,8 +807,12 @@ def _content(content: str | tuple[_TextPart, ...] | None) -> str | None:
 
 def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:
     """Parse one complete tool call while retaining its exact raw argument string."""
+    # Some SDK stacks echo a zero-argument call as an empty string; the
+    # canonical empty object mirrors the streaming completion seed, since no
+    # provider wire accepts empty argument bytes.
+    raw_arguments = call.function.arguments or "{}"
     try:
-        parsed = json.loads(call.function.arguments)
+        parsed = json.loads(raw_arguments)
     except json.JSONDecodeError as exc:
         raise invalid_field(param, f"'{param}' must encode one JSON object.") from exc
     if not isinstance(parsed, dict):
@@ -810,7 +821,12 @@ def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:
         call_id=call.id,
         name=call.function.name,
         arguments=cast(JsonObject, parsed),
-        raw_arguments=call.function.arguments,
+        raw_arguments=raw_arguments,
+        cache_control=(
+            call.cache_control.model_dump(mode="json", exclude_none=True)
+            if call.cache_control is not None
+            else None
+        ),
     )
 
 

@@ -212,6 +212,24 @@ already carried by ``call_id``.
 """
 
 
+CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {
+    "messages": "validated_and_dropped",
+    "messages.content": "validated_and_dropped",
+    "messages.tool_calls": "validated_and_forwarded_to_anthropic_tool_use",
+}
+"""Every Chat-surface ``cache_control`` placement and its conscious decision.
+
+The @ai-sdk stack attaches an Anthropic-style ephemeral cache hint to the
+last content part of recent messages for Claude-family model ids; depending
+on that part's shape the hint lands on the message, a text part, or inside a
+``tool_calls`` entry. Placements are classified here so a new placement is a
+recorded decision (this table plus its behavior test), never a silent 400.
+Only the tool-call placement forwards: Anthropic defines tool_use-block
+caching natively, and non-Anthropic routes disclose the omission through
+``ignored_parameters``.
+"""
+
+
 def disposition_map(manifest: CompatibilityManifest) -> dict[str, CompatibilityDisposition]:
     """Index one manifest by exact top-level request field.
 

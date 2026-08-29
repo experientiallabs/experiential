@@ -889,3 +889,124 @@ def test_responses_union_errors_name_the_item_field_not_the_branch() -> None:
             }
         )
     assert raised.value.detail.param == "input.1.caller"
+
+
+def test_every_chat_cache_control_placement_follows_its_classified_decision() -> None:
+    """Each classified cache_control placement decodes per the manifest table.
+
+    Customer repro (opencode, 2026-08-28): the @ai-sdk stack lands the hint
+    inside a ``tool_calls`` entry when the message's last content part is a
+    tool call, and the closed wire model 400ed every Claude-family multi-turn
+    tool session with no client-side workaround.
+    """
+    from exp.runtime.openai_protocol.manifest import CHAT_CACHE_CONTROL_PLACEMENTS
+
+    assert CHAT_CACHE_CONTROL_PLACEMENTS == {
+        "messages": "validated_and_dropped",
+        "messages.content": "validated_and_dropped",
+        "messages.tool_calls": "validated_and_forwarded_to_anthropic_tool_use",
+    }
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "read both files",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                },
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+                        },
+                        {
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path":"b.txt"}'},
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "a"},
+                {"role": "tool", "tool_call_id": "call-2", "content": "b"},
+            ],
+        }
+    )
+    calls = decoded.request.messages[1].tool_calls
+    assert calls[0].cache_control is None
+    assert calls[1].cache_control == {"type": "ephemeral"}
+    # Message- and part-level hints stay validated-and-dropped.
+    assert "cache_control" not in decoded.request.messages[0].model_dump(mode="json")
+
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": "{}"},
+                                "cache_control": {"type": "persistent"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    assert "cache_control" in str(raised.value.detail.param)
+
+
+def test_empty_tool_call_arguments_decode_as_the_canonical_empty_object() -> None:
+    """A zero-argument echo with arguments '' decodes as {} on both surfaces.
+
+    Mirrors the streaming completion seed: no provider wire accepts empty
+    argument bytes, and the @ai-sdk stack normally sends "{}", so the empty
+    string is normalized instead of 400ing the continuation.
+    """
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "get_time", "arguments": ""},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "noon"},
+            ],
+        }
+    )
+    call = chat.request.messages[0].tool_calls[0]
+    assert call.arguments == {}
+    assert call.raw_arguments == "{}"
+
+    responses = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "function_call", "call_id": "call-1", "name": "get_time", "arguments": ""},
+                {"type": "function_call_output", "call_id": "call-1", "output": "noon"},
+            ],
+        }
+    )
+    assert responses.request.messages[0].tool_calls[0].raw_arguments == "{}"

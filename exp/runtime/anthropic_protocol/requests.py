@@ -424,6 +424,11 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     raw_arguments=json.dumps(
                         block.input, separators=(",", ":"), ensure_ascii=False
                     ),
+                    cache_control=(
+                        block.cache_control.model_dump(mode="json", exclude_none=True)
+                        if block.cache_control is not None
+                        else None
+                    ),
                 )
             )
         else:

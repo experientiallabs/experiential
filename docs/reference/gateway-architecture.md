@@ -189,8 +189,10 @@ adaptive default; on the adaptive-only generation, which rejects `enabled`/`disa
 configs outright, an `enabled` config translates to adaptive with the dropped
 `thinking.budget_tokens` disclosed as ignored, and `disabled` is rejected by name
 because those models cannot turn thinking off), requires
-`max_tokens`, validates and drops `cache_control` (the gateway has no prompt-caching channel),
-and rejects image and document blocks loudly because the surface is text-only. Thinking carriers
+`max_tokens`, validates `cache_control` (dropping it everywhere except on `tool_use` blocks,
+where the hint forwards natively; non-Anthropic routes disclose the omission through
+`ignored_parameters`), and rejects image and document blocks loudly because the surface is
+text-only. Thinking carriers
 replay only on the Anthropic wire, so route admission requires every waterfall rung to speak the
 `anthropic_messages` dialect; on the Responses surface over Anthropic routes, thinking text is
 projected onto the reasoning-summary channel (signatures deliberately dropped) so callers receive

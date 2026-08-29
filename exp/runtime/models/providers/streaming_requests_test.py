@@ -5,7 +5,7 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.model import ReasoningEffort
+from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -1577,3 +1577,58 @@ def test_disabled_thinking_rejects_by_name_on_adaptive_only_models() -> None:
         (_anthropic_profile("claude-opus-4-6"),), _thinking_config_request({"type": "disabled"})
     )
     assert provider.provider_thinking_config == {"type": "disabled"}
+
+
+def test_tool_call_cache_hint_forwards_to_anthropic_and_discloses_elsewhere() -> None:
+    """The validated cache hint reaches only the tool_use block that can honor it."""
+    from exp.common.core.artifacts import sha256_json
+
+    hinted = ToolCall(
+        call_id="call-2",
+        name="read_file",
+        arguments={"path": "b.txt"},
+        cache_control={"type": "ephemeral"},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="read"),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(call_id="call-1", name="read_file", arguments={"path": "a.txt"}),
+                    hinted,
+                ),
+            ),
+            GatewayMessage(role="tool", content="a", tool_call_id="call-1"),
+            GatewayMessage(role="tool", content="b", tool_call_id="call-2"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+    anthropic_payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    messages = cast(list[JsonObject], anthropic_payload["messages"])
+    blocks = cast(list[JsonObject], messages[1]["content"])
+    assert "cache_control" not in blocks[0]
+    assert blocks[1]["cache_control"] == {"type": "ephemeral"}
+
+    # OpenAI-family wires never see the hint; the route discloses the no-op.
+    chat_payload = openai_compatible_stream_payload("gpt-5.5", request)
+    import json
+
+    assert "cache_control" not in json.dumps(chat_payload)
+    public, _provider = route_generation_parameter_requests(
+        (GatewayWireProfile(dialect="openai_compatible", url="https://openai.test"),),
+        request,
+    )
+    assert "messages.tool_calls.cache_control" in public.ignored_parameters
+    anthropic_public, _provider = route_generation_parameter_requests(
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"),),
+        request,
+    )
+    assert "messages.tool_calls.cache_control" not in anthropic_public.ignored_parameters
+
+    # The hint never perturbs digests, artifacts, or replay identity.
+    bare = hinted.model_copy(update={"cache_control": None})
+    assert sha256_json(hinted) == sha256_json(bare)

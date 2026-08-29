@@ -195,6 +195,16 @@ class ToolCall(ContractModel):
         max_length=4_000_000,
         exclude=True,
     )
+    cache_control: JsonObject | None = Field(default=None, exclude=True)
+    """Validated caller prompt-caching hint attached to this tool call.
+
+    OpenAI-compatible callers (the @ai-sdk stack) attach an Anthropic-style
+    ephemeral ``cache_control`` to a message's last content part, which lands
+    inside the ``tool_calls`` entry when that part is a tool call. The hint
+    forwards onto the native Anthropic ``tool_use`` block and is a no-op on
+    other wires. Like ``raw_arguments``, it is excluded from serialization so
+    a cache hint can never affect immutable artifacts or request digests.
+    """
 
     @model_validator(mode="after")
     def _require_matching_raw_arguments(self) -> ToolCall:

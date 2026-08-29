@@ -359,6 +359,17 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
+    # A tool-call cache hint is honored only on the Anthropic wire; any other
+    # rung silently cannot cache, so the omission is disclosed, never a
+    # rejection (a cache hint changes cost, not semantics).
+    if any(
+        call.cache_control is not None
+        for message in request.messages
+        for call in message.tool_calls
+    ) and not all(profile.dialect == "anthropic_messages" for profile in profiles):
+        if "messages.tool_calls.cache_control" not in ignored:
+            ignored.append("messages.tool_calls.cache_control")
+
     # Opaque provider-reasoning carriers replay only on the one wire that
     # issued them, so a mixed waterfall is rejected instead of dropping them.
     anthropic_reasoning_present = request.provider_thinking_config is not None or any(
