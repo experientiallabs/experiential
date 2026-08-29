@@ -43,3 +43,11 @@ wandb/
 
 # Local agent scratchpads: never tracked, never in PRs (AGENTS.md, Repository layout).
 .agents/
+
+# Agent worktrees nested inside a checkout: independent checkouts, never tracked here.
+# (.claude/ itself stays tracked for committed skills; only its worktrees are local.)
+.codex/
+.claude/worktrees/
+.worktree/
+.worktrees/
+implementation-worktrees/

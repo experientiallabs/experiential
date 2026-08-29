@@ -80,6 +80,14 @@ testpaths = ["exp"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Agent worktrees nested inside a checkout are independent checkouts, not project sources.
+extend-exclude = [
+    ".codex",
+    ".claude",
+    ".worktree",
+    ".worktrees",
+    "implementation-worktrees",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
@@ -94,6 +102,16 @@ convention = "google"
 "**/*_test.py" = ["D"]
 [tool.ty.environment]
 python-version = "3.12"
+
+[tool.ty.src]
+# Agent worktrees nested inside a checkout are independent checkouts, not project sources.
+exclude = [
+    ".codex/",
+    ".claude/",
+    ".worktree/",
+    ".worktrees/",
+    "implementation-worktrees/",
+]
 
 [tool.uv.sources]
 # The one permitted path source (AGENTS.md "One package"): repo checkouts rebuild the
