@@ -148,3 +148,41 @@ def test_route_wide_capability_requires_unanimous_rejection() -> None:
     assert route_wide_capability((strict, parameter), 2) is None
     assert route_wide_capability((strict,), 2) is None
     assert route_wide_capability((), 0) is None
+
+
+def test_effort_snap_requires_route_wide_construction_to_survive() -> None:
+    """The snapped candidate must survive route-wide construction, not just
+    per-rung admission: the narrowed rung set changes with the candidate, and
+    the homogeneous encrypted-reasoning gate rejects a mixed Responses and
+    Fireworks set that a farther candidate narrows past."""
+    responses_medium = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://a.test",
+        model_id="gpt-5.1",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("medium",),
+    )
+    fireworks_medium_high = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://b.test",
+        model_id="kimi-k3",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("medium", "high"),
+        fireworks_reasoning_route_sha256="a" * 64,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        reasoning_effort="low",
+        include_encrypted_reasoning=True,
+        response_store=False,
+    )
+    coercion = coerce_generation_parameters((responses_medium, fireworks_medium_high), request)
+    assert coercion is not None
+    # medium is nearer to low but admits both rungs, and the mixed set fails
+    # the homogeneous encrypted-reasoning channel; high narrows to the
+    # Fireworks rung alone and serves.
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.disclosures == ("reasoning_effort->high",)

@@ -30,6 +30,7 @@ from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
 from exp.runtime.models.providers.reasoning_compat import efforts_by_nearness
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -94,7 +95,16 @@ def coerce_generation_parameters(
     for candidate in efforts_by_nearness(request.reasoning_effort, ladder):
         snapped_request = request.model_copy(update={"reasoning_effort": candidate})
         try:
-            compatible_generation_parameter_profile_indexes(profiles, snapped_request)
+            indexes = compatible_generation_parameter_profile_indexes(profiles, snapped_request)
+            # Per-rung admission is not enough: the narrowed rung set changes
+            # with the candidate, and a route-wide gate (for example the
+            # homogeneous encrypted-reasoning channel) can reject a mixed set
+            # that a farther candidate would narrow past. Only a candidate
+            # that survives full route construction is a real snap.
+            route_generation_parameter_requests(
+                tuple(profiles[index] for index in indexes),
+                snapped_request,
+            )
         except (ProviderParameterError, ProviderCapabilityError):
             continue
         return RequestCoercion(
