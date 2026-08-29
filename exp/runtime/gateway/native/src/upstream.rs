@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
+use crate::param_attribution::rejected_parameter;
 
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a
@@ -117,6 +119,7 @@ fn open_timeout_failure() -> Failure {
 /// `raw_body` carries the exact pre-serialized body for body-signing dialects
 /// (Bedrock SigV4): its signature covers those exact bytes, so it is sent
 /// verbatim with the signed headers instead of re-serializing `payload`.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_stream(
     client: &reqwest::Client,
     url: &str,
@@ -125,6 +128,7 @@ pub async fn open_stream(
     payload: &Value,
     raw_body: Option<&str>,
     phase_timeout: Duration,
+    dialect: Dialect,
 ) -> Result<reqwest::Response, Failure> {
     let mut request = client.post(url);
     for (name, value) in headers {
@@ -150,9 +154,41 @@ pub async fn open_stream(
     };
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
-        return Err(transport_failure(Some(status)));
+        let failure = transport_failure(Some(status));
+        // Only the generic client-error class may carry attribution: the
+        // body is read bounded and the sole relayable fact is a validated
+        // parameter path; everything else stays content-free.
+        if failure.failure_class != FailureClass::InvalidRequest {
+            return Err(failure);
+        }
+        let parameter =
+            match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, bounded_error_body(response)).await
+            {
+                Ok(Some(body)) => rejected_parameter(dialect, &body),
+                _ => None,
+            };
+        return Err(failure.with_rejected_parameter(parameter));
     }
     Ok(response)
+}
+
+/// Longest provider error body read for parameter attribution.
+const ERROR_BODY_READ_LIMIT: usize = 16 * 1024;
+
+/// Bound on the whole attribution body read; a stalling error stream is
+/// abandoned and the failure stays content-free.
+const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Read at most `ERROR_BODY_READ_LIMIT` bytes of one error response body.
+async fn bounded_error_body(mut response: reqwest::Response) -> Option<String> {
+    let mut collected: Vec<u8> = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if collected.len() + chunk.len() > ERROR_BODY_READ_LIMIT {
+            return None;
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    String::from_utf8(collected).ok()
 }
 
 #[cfg(test)]

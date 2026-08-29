@@ -380,3 +380,48 @@ def test_sweep_cancels_the_active_attempt_after_the_deadline() -> None:
     ]
     assert registry.entry("request-one") is None
     assert registry.counters()[1] == 1
+
+
+def test_rejected_parameter_crosses_the_boundary_only_as_a_string() -> None:
+    """The provider-named parameter path survives the failure payload decode."""
+    registry, _ledger, _entry = _registry()
+    started = _start(registry, ordinal=0)
+    assert (
+        _settle(
+            registry,
+            attempt_id=str(started["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure={
+                "failure_class": "invalid_request",
+                "safe_message": "provider rejected the request",
+                "rejected_parameter": "input[1].status",
+            },
+        )
+        == "{}"
+    )
+    exhausted = _start(
+        registry,
+        ordinal=1,
+        current_depth=0,
+        failure={
+            "failure_class": "invalid_request",
+            "safe_message": "provider rejected the request",
+            "rejected_parameter": "input[1].status",
+        },
+    )
+    assert exhausted["exhausted"] is True
+    failure_payload = exhausted["failure"]
+    assert isinstance(failure_payload, dict)
+    assert failure_payload["rejected_parameter"] == "input[1].status"
+    # Non-string or empty payload values decode to None, never a coerced str.
+    from exp.runtime.gateway.native_accounting import _failure_from_payload
+
+    numeric = _failure_from_payload(
+        {"failure_class": "invalid_request", "safe_message": "x", "rejected_parameter": 7}
+    )
+    assert numeric is not None and numeric.rejected_parameter is None
+    empty = _failure_from_payload(
+        {"failure_class": "invalid_request", "safe_message": "x", "rejected_parameter": ""}
+    )
+    assert empty is not None and empty.rejected_parameter is None

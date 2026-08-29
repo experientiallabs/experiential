@@ -173,6 +173,25 @@ class _SseUpstream(BaseHTTPRequestHandler):
         with self.payloads_lock:
             self.payloads.append(payload)
         prompt = payload["messages"][-1]["content"]
+        if prompt == "reject-param-token":
+            # Provider 400 naming the rejected parameter, with deliberate
+            # prose markers that must never reach the public error.
+            body = json.dumps(
+                {
+                    "error": {
+                        "message": "PROVIDER-PROSE-MARKER: 'input[1].status' is unknown.",
+                        "type": "invalid_request_error",
+                        "param": "input[1].status",
+                        "code": "unknown_parameter",
+                    }
+                }
+            ).encode()
+            self.send_response(400)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
@@ -1302,3 +1321,44 @@ def test_store_false_responses_cannot_be_continued(engine: _ServingEngine) -> No
     )
     assert continued.status_code == 400
     assert continued.json()["error"]["code"] == "continuation_unavailable"
+
+
+def test_provider_400_attributes_the_rejected_parameter_without_provider_prose(
+    engine: _ServingEngine,
+) -> None:
+    """A provider client-error relays ONLY the validated parameter path.
+
+    The mock provider's 400 body names ``input[1].status`` in its ``param``
+    field and carries a prose marker in its message; the public error must
+    surface the path and keep the sanitized message, never the marker.
+    """
+    native = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("reject-param-token"),
+        timeout=30.0,
+    )
+    assert native.status_code == 400
+    error = native.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert "PROVIDER-PROSE-MARKER" not in json.dumps(native.json())
+    # The Anthropic envelope folds a present param pointer into the message.
+    assert error["message"] == (
+        "provider rejected the request; verify the request fields against "
+        "the model alias capabilities (param: input[1].status)"
+    )
+
+    # The OpenAI envelope carries the same attribution as the param field.
+    chat = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "reject-param-token"}],
+        },
+        timeout=30.0,
+    )
+    assert chat.status_code == 400
+    chat_error = chat.json()["error"]
+    assert chat_error["param"] == "input[1].status"
+    assert "PROVIDER-PROSE-MARKER" not in json.dumps(chat.json())

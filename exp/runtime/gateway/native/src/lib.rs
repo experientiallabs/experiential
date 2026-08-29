@@ -17,6 +17,7 @@ mod eventstream;
 mod guardrails;
 mod memory;
 mod metrics;
+mod param_attribution;
 mod relay;
 mod replay;
 mod respond;

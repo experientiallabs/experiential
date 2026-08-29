@@ -166,6 +166,10 @@ pub struct Failure {
     pub retryable_same_deployment: bool,
     #[serde(default)]
     pub failover_eligible: bool,
+    /// Validated provider-named parameter path (never provider prose); the
+    /// only provider-derived content a sanitized client-error may relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_parameter: Option<String>,
 }
 
 impl Failure {
@@ -175,7 +179,14 @@ impl Failure {
             safe_message: safe_message.to_string(),
             retryable_same_deployment: false,
             failover_eligible: false,
+            rejected_parameter: None,
         }
+    }
+
+    /// Attach one already-validated provider parameter path.
+    pub fn with_rejected_parameter(mut self, parameter: Option<String>) -> Self {
+        self.rejected_parameter = parameter;
+        self
     }
 
     /// Attach the python taxonomy's retry classification to this failure.
@@ -225,6 +236,9 @@ impl Failure {
             _ => (502, "all_routes_failed", "api_error"),
         };
         let mut error = PublicError::new(status, code, &self.safe_message, error_type);
+        if self.failure_class == FailureClass::InvalidRequest {
+            error.param = self.rejected_parameter.clone();
+        }
         error.retry_after_seconds = match self.failure_class {
             FailureClass::Throttled => Some(5),
             FailureClass::QuotaExceeded => Some(3600),
@@ -237,6 +251,29 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_parameter_reaches_the_public_error_only_for_invalid_requests() {
+        let attributed = Failure::new(FailureClass::InvalidRequest, "provider rejected")
+            .with_rejected_parameter(Some("input[1].status".to_string()));
+        assert_eq!(
+            attributed.public_error().param.as_deref(),
+            Some("input[1].status")
+        );
+        // Any other class stays param-free even if a parameter leaked in.
+        let internal = Failure::new(FailureClass::ProviderInternal, "provider failed")
+            .with_rejected_parameter(Some("input[1].status".to_string()));
+        assert_eq!(internal.public_error().param, None);
+        // Serde omits the field when absent, so boundary payloads are unchanged.
+        let bare = serde_json::to_value(Failure::new(FailureClass::InvalidRequest, "x"))
+            .expect("serializable");
+        assert!(bare.get("rejected_parameter").is_none());
+        let carried = serde_json::to_value(attributed).expect("serializable");
+        assert_eq!(
+            carried["rejected_parameter"].as_str(),
+            Some("input[1].status")
+        );
+    }
 
     #[test]
     fn boundary_replaces_malformed_detail_with_the_generic_message() {

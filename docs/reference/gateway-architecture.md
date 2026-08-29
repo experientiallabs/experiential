@@ -140,6 +140,14 @@ result can advance to the next certified deployment, while mixed semantic output
 commits and flushes the original route. Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 
+Provider client-errors stay sanitized: no provider error prose or body content ever reaches the
+caller. The one provider-derived fact a 4xx rejection may relay is the parameter path the provider
+named, extracted per dialect (OpenAI `error.param`; Anthropic's leading `path:` message token;
+Gemini `google.rpc.BadRequest` field violations; Bedrock never) and only when it validates against
+a strict path grammar. The path surfaces as `param` in OpenAI-shaped envelopes and folds into the
+message as `(param: ...)` on the Anthropic surface; anything unextractable keeps today's
+content-free message.
+
 Before each physical dispatch, the same immediate SQLite transaction reserves the request's
 conservative maximum integer micro-USD cost and inserts its attempt row. Applicable hard limits can
 cover the local team, one identity, one alias pool, and each provider deployment within that pool.

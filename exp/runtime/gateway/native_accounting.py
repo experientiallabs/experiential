@@ -121,11 +121,17 @@ def _failure_from_payload(payload: object) -> GatewayFailure | None:
     if not isinstance(payload, dict):
         return None
     data = cast("JsonObject", payload)
+    rejected_parameter = data.get("rejected_parameter")
     return GatewayFailure(
         failure_class=GatewayFailureClass(str(data["failure_class"])),
         safe_message=str(data["safe_message"]),
         retryable_same_deployment=bool(data.get("retryable_same_deployment", False)),
         failover_eligible=bool(data.get("failover_eligible", False)),
+        rejected_parameter=(
+            rejected_parameter
+            if isinstance(rejected_parameter, str) and rejected_parameter
+            else None
+        ),
     )
 
 
@@ -373,14 +379,14 @@ class NativeAttemptAccounting:
         self.finish_request_quietly(entry.authorization, exhaustion)
         with self._lock:
             self._inflight.pop(request_id, None)
+        failure_payload: JsonObject = {
+            "failure_class": exhaustion.failure_class.value,
+            "safe_message": exhaustion.safe_message,
+        }
+        if exhaustion.rejected_parameter is not None:
+            failure_payload["rejected_parameter"] = exhaustion.rejected_parameter
         return json.dumps(
-            {
-                "exhausted": True,
-                "failure": {
-                    "failure_class": exhaustion.failure_class.value,
-                    "safe_message": exhaustion.safe_message,
-                },
-            },
+            {"exhausted": True, "failure": failure_payload},
             separators=(",", ":"),
         )
 

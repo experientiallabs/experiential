@@ -439,6 +439,7 @@ async fn run_attempt(
         &wire.upstream_payload,
         wire.upstream_body.as_deref(),
         open_bound,
+        dialect,
     )
     .await
     {

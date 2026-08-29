@@ -642,6 +642,8 @@ class GatewayFailure(ContractModel):
     retryable_same_deployment: bool = False
     failover_eligible: bool = False
     safe_details: JsonObject = Field(default_factory=dict)
+    rejected_parameter: str | None = Field(default=None, min_length=1, max_length=128)
+    """Validated provider-named parameter path; never provider prose."""
 
 
 class ProjectSelection(ContractModel):
