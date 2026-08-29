@@ -11,6 +11,7 @@ from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayApiSurface,
     GatewayMessage,
+    SealedReasoningContentBlock,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.state import (
@@ -309,3 +310,39 @@ def test_continuation_byte_cap_counts_excluded_provider_replay_authority() -> No
 
     with pytest.raises(OpenAIProtocolError, match="too large"):
         store.remember_now(namespace=_namespace(), response_id="resp_large", state=state)
+
+
+def test_continuation_size_counts_excluded_provider_carriers() -> None:
+    """Opaque carrier bytes cannot bypass the continuation store byte ceiling."""
+    small = ContinuationState(
+        episode_key="c" * 64,
+        messages=(
+            GatewayMessage(
+                role="assistant",
+                provider_reasoning=(
+                    SealedReasoningContentBlock(carrier="x", deployment_hint="rung"),
+                ),
+            ),
+        ),
+    )
+    large = small.model_copy(
+        update={
+            "messages": (
+                GatewayMessage(
+                    role="assistant",
+                    provider_reasoning=(
+                        SealedReasoningContentBlock(
+                            carrier="x" * 1_048_576,
+                            deployment_hint="rung",
+                        ),
+                    ),
+                ),
+            )
+        }
+    )
+
+    assert large.size_bytes - small.size_bytes >= 1_048_575
+    store = BoundedContinuationStore(byte_cap=small.size_bytes + 1_024)
+    store.remember_now(namespace=_namespace(), response_id="small", state=small)
+    with pytest.raises(OpenAIProtocolError, match="too large"):
+        store.remember_now(namespace=_namespace(), response_id="large", state=large)

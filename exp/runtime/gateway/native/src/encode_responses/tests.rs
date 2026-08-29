@@ -2,6 +2,7 @@
 //! implementation stays within the repository line budget.
 
 use super::*;
+use crate::encode::reasoning_carrier_candidate;
 #[test]
 fn ignored_generation_controls_are_disclosed_by_responses_encoder() {
     let envelope = ResponsesEnvelope {
@@ -55,6 +56,164 @@ fn thinking_deltas_project_onto_reasoning_summary_parts() {
         })
         .expect("signature is dropped")
         .is_empty());
+}
+
+fn fireworks_tool_events() -> Vec<Event> {
+    vec![
+        Event::ReasoningContentDelta {
+            route_sha256: "a".repeat(64),
+            delta: "hidden provider reasoning".to_string(),
+        },
+        Event::ToolCallStarted {
+            index: 0,
+            call_id: "call-one".to_string(),
+            name: "lookup".to_string(),
+        },
+        Event::ToolArgumentsDelta {
+            index: 0,
+            delta: "{}".to_string(),
+        },
+        Event::ToolCallCompleted {
+            index: 0,
+            call: CompletedToolCall {
+                call_id: "call-one".to_string(),
+                name: "lookup".to_string(),
+                raw_arguments: "{}".to_string(),
+                provider_item_id: None,
+                provider_status: None,
+            },
+        },
+        Event::Completed,
+    ]
+}
+
+#[test]
+fn fireworks_responses_reasoning_round_trips_as_encrypted_content() {
+    let events = fireworks_tool_events();
+    let envelope = ResponsesEnvelope {
+        include_encrypted_reasoning: true,
+        ..ResponsesEnvelope::default()
+    };
+    let mut encoder =
+        ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000.0, envelope.clone());
+    encoder.start().expect("stream start must encode");
+    encoder
+        .set_reasoning_content_carrier("authenticated-carrier-v2".to_string())
+        .expect("carrier must attach");
+    let mut frames = Vec::new();
+    for event in &events {
+        frames.extend(encoder.feed(event).expect("Responses event must encode"));
+    }
+    let public = frames.join("");
+    assert!(!public.contains("hidden provider reasoning"));
+    assert!(public.contains("\"encrypted_content\":\"authenticated-carrier-v2\""));
+
+    let completed = completed_responses_body_with_carrier(
+        "request-1",
+        "coding",
+        1_700_000_000.0,
+        envelope,
+        &events,
+        Some("authenticated-carrier-v2"),
+    )
+    .expect("completed body must preserve carrier");
+    assert_eq!(
+        completed.body["output"][0]["encrypted_content"],
+        json!("authenticated-carrier-v2")
+    );
+    assert!(!completed
+        .body
+        .to_string()
+        .contains("hidden provider reasoning"));
+}
+
+#[test]
+fn fireworks_responses_reasoning_fails_closed_without_a_sealed_carrier() {
+    assert!(completed_responses_body(
+        "request-1",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+        &fireworks_tool_events(),
+    )
+    .is_err());
+}
+
+#[test]
+fn fireworks_parallel_tools_share_public_and_carrier_order() {
+    let events = vec![
+        Event::ReasoningContentDelta {
+            route_sha256: "a".repeat(64),
+            delta: "hidden".to_string(),
+        },
+        Event::ToolCallStarted {
+            index: 1,
+            call_id: "call-one".to_string(),
+            name: "first".to_string(),
+        },
+        Event::ToolCallStarted {
+            index: 0,
+            call_id: "call-zero".to_string(),
+            name: "second".to_string(),
+        },
+        Event::ToolArgumentsDelta {
+            index: 0,
+            delta: "{\"order\":0}".to_string(),
+        },
+        Event::ToolArgumentsDelta {
+            index: 1,
+            delta: "{\"order\":1}".to_string(),
+        },
+        Event::ToolCallCompleted {
+            index: 0,
+            call: CompletedToolCall {
+                call_id: "call-zero".to_string(),
+                name: "second".to_string(),
+                raw_arguments: "{\"order\":0}".to_string(),
+                provider_item_id: None,
+                provider_status: None,
+            },
+        },
+        Event::ToolCallCompleted {
+            index: 1,
+            call: CompletedToolCall {
+                call_id: "call-one".to_string(),
+                name: "first".to_string(),
+                raw_arguments: "{\"order\":1}".to_string(),
+                provider_item_id: None,
+                provider_status: None,
+            },
+        },
+        Event::Completed,
+    ];
+    let candidate = reasoning_carrier_candidate(&events)
+        .expect("provider events must validate")
+        .expect("reasoning plus tools must produce a carrier");
+    let completed = completed_responses_body_with_carrier(
+        "request-1",
+        "coding",
+        1_700_000_000.0,
+        ResponsesEnvelope::default(),
+        &events,
+        Some("authenticated-carrier-v2"),
+    )
+    .expect("Responses output must encode");
+    let output = completed.body["output"]
+        .as_array()
+        .expect("Responses output must be an array");
+    let public_calls = output
+        .iter()
+        .filter(|item| item["type"] == "function_call")
+        .map(|item| item["call_id"].as_str().expect("call ID must be text"))
+        .collect::<Vec<_>>();
+    let carrier_calls = candidate
+        .tool_calls
+        .iter()
+        .map(|call| call.call_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(public_calls, vec!["call-one", "call-zero"]);
+    assert_eq!(carrier_calls, public_calls);
 }
 
 #[test]

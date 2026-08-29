@@ -62,6 +62,34 @@ def _restored_provider_authority(
         return (
             None if any(has_authority(message) for message in replacement) else tuple(replacement)
         )
+    original_fireworks_carriers = tuple(
+        index
+        for index, message in enumerate(original)
+        if any(
+            block.kind in {"reasoning_content", "sealed_reasoning_content"}
+            for block in message.provider_reasoning
+        )
+    )
+    replacement_fireworks_carriers = tuple(
+        index
+        for index, message in enumerate(replacement)
+        if any(
+            block.kind in {"reasoning_content", "sealed_reasoning_content"}
+            for block in message.provider_reasoning
+        )
+    )
+    if original_fireworks_carriers:
+        if not replacement_fireworks_carriers:
+            return (
+                tuple(replacement)
+                if all(message.role in {"system", "developer", "user"} for message in replacement)
+                else None
+            )
+        if replacement_fireworks_carriers != original_fireworks_carriers:
+            return None
+        for index in original_fireworks_carriers:
+            if original[index] != replacement[index]:
+                return None
     bound = original_carrier_indexes[-1]
     if len(replacement) <= bound:
         return None

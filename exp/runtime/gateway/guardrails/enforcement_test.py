@@ -19,6 +19,8 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
     GatewayToolDefinition,
+    OpaqueReasoningContentBlock,
+    SealedReasoningContentBlock,
 )
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect
 from exp.runtime.gateway.guardrails.classifiers import (
@@ -278,6 +280,141 @@ def test_input_chain_runs_once_and_can_transform_the_request() -> None:
 
     assert result.messages == replacement
     assert classifier.input_calls == 1
+
+
+def test_input_modifier_rejects_carrier_removal_with_bound_tool_history() -> None:
+    """A guardrail cannot keep a Fireworks tool turn after removing its carrier."""
+    call = ToolCall(
+        call_id="call-one",
+        name="lookup",
+        arguments={},
+        raw_arguments="{}",
+    )
+    original_messages = (
+        GatewayMessage(role="user", content="Use a tool"),
+        GatewayMessage(
+            role="assistant",
+            tool_calls=(call,),
+            provider_reasoning=(
+                OpaqueReasoningContentBlock(
+                    route_sha256="a" * 64,
+                    content="private reasoning",
+                ),
+            ),
+        ),
+        GatewayMessage(role="tool", content="done", tool_call_id="call-one"),
+    )
+    replacement = (
+        original_messages[0],
+        original_messages[1].model_copy(update={"provider_reasoning": ()}),
+        original_messages[2],
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(
+                flagged=True,
+                replacement_messages=replacement,
+            )
+        ),
+        checks=(_check("input-modify", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=original_messages,
+    )
+
+    with pytest.raises(GuardrailRejected):
+        _awaited(
+            engine.enforce_input(
+                policy=policy,
+                request=request,
+                deadline_monotonic=200.0,
+            )
+        )
+
+
+def test_input_modifier_may_redact_after_an_exact_sealed_turn() -> None:
+    """A modifier may redact a tool result after preserving the sealed turn exactly."""
+    call = ToolCall(call_id="call-one", name="lookup", arguments={}, raw_arguments="{}")
+    assistant = GatewayMessage(
+        role="assistant",
+        tool_calls=(call,),
+        provider_reasoning=(
+            SealedReasoningContentBlock(carrier="opaque-carrier", deployment_hint="rung-one"),
+        ),
+    )
+    tool = GatewayMessage(role="tool", content="done", tool_call_id="call-one")
+    original = (GatewayMessage(role="user", content="secret"), assistant, tool)
+    replacement = (
+        original[0],
+        assistant,
+        tool.model_copy(update={"content": "redacted"}),
+    )
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(
+                flagged=True,
+                replacement_messages=replacement,
+            )
+        ),
+        checks=(_check("input-modify", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    result = _awaited(
+        engine.enforce_input(
+            policy=policy,
+            request=GatewayRequest(surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=original),
+            deadline_monotonic=200.0,
+        )
+    )
+
+    assert result.messages == replacement
+
+
+def test_input_modifier_may_fully_redact_carrier_bound_history() -> None:
+    """A user-only replacement safely clears the entire carrier-bound tool turn."""
+    original_messages = (
+        GatewayMessage(role="user", content="Use a tool"),
+        GatewayMessage(
+            role="assistant",
+            content="working",
+            provider_reasoning=(
+                OpaqueReasoningContentBlock(
+                    route_sha256="a" * 64,
+                    content="private reasoning",
+                ),
+            ),
+        ),
+    )
+    replacement = (GatewayMessage(role="user", content="redacted"),)
+    engine, _classifier = _engine(
+        classifier=ScriptedClassifier(
+            input_verdict=ClassifierVerdict(
+                flagged=True,
+                replacement_messages=replacement,
+            )
+        ),
+        checks=(_check("input-modify", action=GuardrailAction.MODIFY),),
+    )
+    policy = engine.policy_for("organization-one", "identity-one")
+    assert policy is not None
+
+    result = _awaited(
+        engine.enforce_input(
+            policy=policy,
+            request=GatewayRequest(
+                surface=GatewayApiSurface.CHAT_COMPLETIONS,
+                messages=original_messages,
+            ),
+            deadline_monotonic=200.0,
+        )
+    )
+
+    assert result.messages == replacement
     assert engine.input_invocations == 1
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable
 from typing import cast
 
@@ -9,6 +10,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayNamedToolChoice
+from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.model_adapter import model_request
@@ -303,6 +305,100 @@ def test_chat_decoder_accepts_echoed_assistant_message_with_empty_sdk_fields() -
     assert decoded.request.messages[1].tool_calls[0].name == "weather"
     assert decoded.request.messages[3].content == "It is sunny."
     assert decoded.request.messages[3].tool_calls == ()
+
+
+def test_chat_decoder_preserves_only_a_gateway_issued_reasoning_carrier() -> None:
+    """A Fireworks continuation stays encrypted until authorized admission."""
+    deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
+    envelope = base64.urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode()
+    carrier = f"{FIREWORKS_REASONING_CONTENT_PREFIX}{deployment}:{envelope}"
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "Use a tool"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": carrier,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+
+    block = decoded.request.messages[1].provider_reasoning[0]
+    assert block.kind == "sealed_reasoning_content"
+    assert block.carrier == carrier
+    assert block.deployment_hint == "fireworks-rung"
+    adapted = model_request(decoded.request)
+    assert adapted.messages[1].assistant_action is not None
+    assert "provider_reasoning" not in adapted.messages[1].assistant_action.model_dump()
+
+
+def test_chat_decoder_rejects_duplicate_assistant_tool_call_ids() -> None:
+    """Two active calls cannot share the result-linkage identity."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "first", "arguments": "{}"},
+                            },
+                            {
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "second", "arguments": "{}"},
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+
+    assert captured.value.detail.param == "messages.0"
+
+
+@pytest.mark.parametrize(
+    "reasoning_content",
+    (
+        "raw provider reasoning",
+        FIREWORKS_REASONING_CONTENT_PREFIX,
+        f"{FIREWORKS_REASONING_CONTENT_PREFIX}not-base64:payload",
+    ),
+)
+def test_chat_decoder_rejects_unbound_or_malformed_reasoning_content(
+    reasoning_content: str,
+) -> None:
+    """Public Chat input accepts only a bounded gateway-issued carrier."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "x",
+                        "reasoning_content": reasoning_content,
+                    }
+                ],
+            }
+        )
+    assert raised.value.detail.param == "messages.0.reasoning_content"
 
 
 def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> None:
@@ -1001,6 +1097,79 @@ def test_responses_decoder_orders_function_calls_without_optional_item_ids() -> 
         '{ "position" : 1 }',
         '{"position":2}',
     ]
+
+
+@pytest.mark.parametrize("reasoning_first", [True, False])
+def test_responses_decoder_groups_fireworks_carrier_with_all_tool_calls(
+    reasoning_first: bool,
+) -> None:
+    """One carrier and contiguous calls reconstruct their exact assistant turn in any order."""
+    deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
+    envelope = base64.urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode()
+    carrier = f"{FIREWORKS_REASONING_CONTENT_PREFIX}{deployment}:{envelope}"
+
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_fireworks",
+        "summary": [],
+        "encrypted_content": carrier,
+    }
+    message = {
+        "type": "message",
+        "role": "assistant",
+        "content": "I will check.",
+    }
+    assistant_items = [reasoning, message] if reasoning_first else [message, reasoning]
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
+            "input": [
+                *assistant_items,
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "first",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-2",
+                    "name": "second",
+                    "arguments": '{"value":2}',
+                },
+                {"type": "function_call_output", "call_id": "call-1", "output": "one"},
+                {"type": "function_call_output", "call_id": "call-2", "output": "two"},
+            ],
+        }
+    )
+
+    assistant = decoded.request.messages[0]
+    assert assistant.content == "I will check."
+    assert tuple(call.call_id for call in assistant.tool_calls) == ("call-1", "call-2")
+    assert assistant.provider_reasoning[0].kind == "sealed_reasoning_content"
+    assert assistant.provider_reasoning[0].carrier == carrier
+
+
+def test_responses_decoder_rejects_malformed_gateway_carrier() -> None:
+    """A carrier-prefixed item cannot fall back to native opaque replay."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_malformed",
+                        "summary": [],
+                        "encrypted_content": f"{FIREWORKS_REASONING_CONTENT_PREFIX}broken",
+                    }
+                ],
+            }
+        )
+
+    assert raised.value.detail.param == "input.0.encrypted_content"
 
 
 def test_responses_decoder_keeps_orphaned_reasoning_as_its_own_turn() -> None:

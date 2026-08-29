@@ -244,7 +244,8 @@ impl MessagesSseEncoder {
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
             | Event::ReasoningSummaryDelta { .. }
-            | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
+            | Event::EncryptedReasoning { .. }
+            | Event::ReasoningContentDelta { .. } => Ok(Vec::new()),
             Event::ThinkingDelta { index, delta } => self.thinking_delta(*index, delta),
             Event::ThinkingSignature { index, signature } => {
                 self.thinking_signature(*index, signature)

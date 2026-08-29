@@ -17,7 +17,6 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import (
-    ProviderCapabilityError,
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
@@ -83,6 +82,7 @@ def _fireworks_profile() -> GatewayWireProfile:
         dialect="openai_compatible",
         url="https://api.fireworks.ai/inference/v1/chat/completions",
         model_id="accounts/fireworks/models/deepseek-v4-flash-0731",
+        fireworks_reasoning_route_sha256="f" * 64,
     )
 
 
@@ -110,7 +110,7 @@ def test_fireworks_tools_that_can_run_require_continuation(
 
     with pytest.raises(ProviderParameterError, match="continuation"):
         route_generation_parameter_requests((profile,), request)
-    with pytest.raises(ProviderCapabilityError, match="reasoning_continuation"):
+    with pytest.raises(ProviderParameterError, match="continuation"):
         dialect_stream_payload(profile, request)
 
 
@@ -128,27 +128,26 @@ def test_fireworks_continuation_gate_accepts_no_tools() -> None:
     "update",
     ({"response_store": True}, {"include_encrypted_reasoning": True}),
 )
-def test_fireworks_unimplemented_continuation_channels_still_fail_closed(
+def test_fireworks_continuation_channels_are_accepted(
     update: dict[str, bool],
 ) -> None:
-    """Storage flags cannot claim retention before the carrier PR lands."""
+    """Server retention and encrypted carriers each provide a safe continuation channel."""
     profile = _fireworks_profile()
     request = _fireworks_responses_request().model_copy(update=update)
 
-    with pytest.raises(ProviderParameterError, match="unavailable"):
-        route_generation_parameter_requests((profile,), request)
+    route_generation_parameter_requests((profile,), request)
+    assert dialect_stream_payload(profile, request)["stream"] is True
 
 
-def test_fireworks_encrypted_reasoning_waits_for_the_authenticated_carrier() -> None:
-    """This small gate never claims the incompatible Chat wire preserves encrypted state."""
+def test_fireworks_encrypted_reasoning_uses_the_authenticated_carrier() -> None:
+    """Encrypted reasoning selects the authenticated gateway carrier channel."""
     profile = _fireworks_profile()
     request = _fireworks_responses_request().model_copy(
         update={"include_encrypted_reasoning": True}
     )
 
-    with pytest.raises(ProviderParameterError, match="unavailable") as raised:
-        route_generation_parameter_requests((profile,), request)
-    assert raised.value.param == "tool_choice"
+    route_generation_parameter_requests((profile,), request)
+    assert dialect_stream_payload(profile, request)["stream"] is True
 
 
 def test_openai_compatible_stream_payload_forwards_top_p_and_usage() -> None:
@@ -1529,6 +1528,55 @@ def test_route_rejects_encrypted_reasoning_outside_native_responses() -> None:
         route_generation_parameter_requests((responses, fallback), request)
     assert raised.value.param == "include"
     assert raised.value.code == "unsupported_parameter"
+
+
+def test_fireworks_stateless_carrier_include_survives_route_shaping() -> None:
+    """The gateway-issued Fireworks carrier is distinct from native OpenAI reasoning."""
+    fireworks = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        model_id="accounts/fireworks/models/deepseek-v4-flash-0731",
+        fireworks_reasoning_route_sha256="f" * 64,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="use a tool"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        response_store=False,
+        include_encrypted_reasoning=True,
+        stream=True,
+        include_usage=True,
+    )
+
+    route_generation_parameter_requests((fireworks,), request)
+    payload = dialect_stream_payload(fireworks, request)
+
+    assert payload["model"] == "accounts/fireworks/models/deepseek-v4-flash-0731"
+
+
+def test_mixed_native_and_fireworks_reasoning_channels_fail_closed() -> None:
+    """One include selector cannot promise two incompatible carrier authorities."""
+    responses = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://openai.test",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+    )
+    fireworks = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        fireworks_reasoning_route_sha256="f" * 64,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        response_store=False,
+        include_encrypted_reasoning=True,
+    )
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((responses, fireworks), request)
+    assert raised.value.param == "include"
 
 
 def test_gpt_56_efforts_match_the_provider_and_ultra_rejects_loud() -> None:

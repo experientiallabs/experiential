@@ -29,7 +29,13 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
     GatewayToolDefinition,
+    SealedReasoningContentBlock,
     StructuredTextFormat,
+)
+from exp.runtime.gateway.reasoning_carrier import (
+    FIREWORKS_REASONING_CONTENT_PREFIX,
+    MAXIMUM_REASONING_CARRIER_BYTES,
+    parse_reasoning_content_carrier,
 )
 from exp.runtime.openai_protocol.cache_control import (
     EphemeralCacheControl,
@@ -40,6 +46,13 @@ from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     RESPONSES_MANIFEST,
     disposition_map,
+)
+from exp.runtime.openai_protocol.responses_input import (
+    ReplayedFunctionCall,
+    ReplayedFunctionOutput,
+    ReplayedMessage,
+    ReplayedReasoning,
+    responses_input_messages,
 )
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
@@ -119,6 +132,10 @@ class _Message(_WireModel):
     annotations: tuple[()] | None = None
     audio: None = None
     function_call: None = None
+    reasoning_content: str | None = Field(
+        default=None,
+        max_length=MAXIMUM_REASONING_CARRIER_BYTES,
+    )
 
     @property
     def history_tool_calls(self) -> tuple[_AssistantToolCall, ...]:
@@ -136,6 +153,8 @@ class _Message(_WireModel):
             raise ValueError("tool_call_id is valid only for tool messages")
         if self.role != "assistant" and self.history_tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
+        if self.role != "assistant" and self.reasoning_content is not None:
+            raise ValueError("reasoning_content is valid only for assistant messages")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")
@@ -401,6 +420,24 @@ class _ResponsesRequest(_WireModel):
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
 
 
+def _without_chat_reasoning_content(payload: JsonObject) -> JsonObject:
+    """Hide the authenticated Chat extension from official OpenAI validation."""
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list):
+        return payload
+    changed = False
+    messages: list[JsonValue] = []
+    for raw_message in raw_messages:
+        if isinstance(raw_message, dict) and "reasoning_content" in raw_message:
+            messages.append(
+                {key: value for key, value in raw_message.items() if key != "reasoning_content"}
+            )
+            changed = True
+        else:
+            messages.append(raw_message)
+    return {**payload, "messages": messages} if changed else payload
+
+
 def decode_chat(
     payload: JsonObject,
     *,
@@ -429,7 +466,11 @@ def decode_chat(
     _validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
-    _validate_official(_CHAT_OFFICIAL, payload, extension_fields={"top_k", "reasoning_effort"})
+    _validate_official(
+        _CHAT_OFFICIAL,
+        _without_chat_reasoning_content(payload),
+        extension_fields={"top_k", "reasoning_effort"},
+    )
     request = _validate_wire(_ChatRequest, payload)
     operation = _caller_operation(idempotency_key, client_request_id)
     maximum = request.max_completion_tokens or request.max_tokens
@@ -694,12 +735,20 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             _tool_call(call, f"{prefix}.{message_index}.tool_calls.{call_index}.function.arguments")
             for call_index, call in enumerate(message.history_tool_calls)
         )
+        provider_reasoning: tuple[SealedReasoningContentBlock, ...] = ()
+        if message.reasoning_content is not None:
+            try:
+                provider_reasoning = (parse_reasoning_content_carrier(message.reasoning_content),)
+            except ValueError as exc:
+                param = f"{prefix}.{message_index}.reasoning_content"
+                raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
         converted.append(
             GatewayMessage(
                 role=message.role,
                 content=_content(message.content),
                 tool_call_id=message.tool_call_id,
                 tool_calls=calls,
+                provider_reasoning=provider_reasoning,
             )
         )
     return tuple(converted)
@@ -847,66 +896,38 @@ def _include_encrypted_reasoning(include: tuple[str, ...] | None) -> bool:
 def _response_input_messages(
     value: str | tuple[_ResponsesInputItem, ...],
 ) -> tuple[GatewayMessage, ...]:
-    """Convert Responses input items into ordered canonical history.
-
-    Provider output items retain their exact identities and indexes. Contiguous
-    function calls form one assistant turn so parallel calls and their leading
-    reasoning replay in the provider's original order.
-    """
+    """Validate replay details and reconstruct OpenAI or Fireworks history."""
     if isinstance(value, str):
-        return (GatewayMessage(role="user", content=value),)
-    messages: list[GatewayMessage] = []
-    pending_reasoning: list[EncryptedReasoningBlock] = []
-    pending_calls: list[ToolCall] = []
-
-    def take_reasoning(role: str) -> tuple[EncryptedReasoningBlock, ...]:
-        """Hand pending reasoning blocks to one assistant successor."""
-        if role != "assistant" or not pending_reasoning:
-            return ()
-        taken = tuple(pending_reasoning)
-        pending_reasoning.clear()
-        return taken
-
-    def flush_orphaned_reasoning() -> None:
-        """Emit reasoning that has no assistant successor as its own turn."""
-        if pending_reasoning:
-            messages.append(
-                GatewayMessage(role="assistant", provider_reasoning=take_reasoning("assistant"))
-            )
-
-    def flush_calls() -> None:
-        """Group contiguous function-call items into their one assistant turn."""
-        if pending_calls:
-            messages.append(
-                GatewayMessage(
-                    role="assistant",
-                    tool_calls=tuple(pending_calls),
-                    provider_reasoning=take_reasoning("assistant"),
-                )
-            )
-            pending_calls.clear()
-
+        return responses_input_messages(value)
+    replayed: list[
+        ReplayedReasoning | ReplayedMessage | ReplayedFunctionCall | ReplayedFunctionOutput
+    ] = []
     for index, item in enumerate(value):
         if isinstance(item, _ResponseReasoningItem):
-            flush_calls()
-            pending_reasoning.append(
-                EncryptedReasoningBlock(
+            if item.encrypted_content.startswith(FIREWORKS_REASONING_CONTENT_PREFIX):
+                try:
+                    block: EncryptedReasoningBlock | SealedReasoningContentBlock = (
+                        parse_reasoning_content_carrier(item.encrypted_content)
+                    )
+                except ValueError as exc:
+                    raise invalid_field(
+                        f"input.{index}.encrypted_content",
+                        "Responses encrypted_content must be a gateway-issued carrier.",
+                    ) from exc
+            else:
+                block = EncryptedReasoningBlock(
                     id=item.id,
                     encrypted_content=item.encrypted_content,
                     output_index=index,
                     status=item.status,
                 )
-            )
+            replayed.append(ReplayedReasoning(index=index, block=block))
         elif isinstance(item, _ResponseMessage):
-            flush_calls()
-            if item.role != "assistant":
-                flush_orphaned_reasoning()
             converted = _messages((item,), f"input.{index}")
             if converted and item.role == "assistant":
                 converted = (
                     converted[0].model_copy(
                         update={
-                            "provider_reasoning": take_reasoning("assistant"),
                             "provider_item_id": item.id,
                             "provider_output_index": index if item.id is not None else None,
                             "provider_status": item.status,
@@ -915,27 +936,26 @@ def _response_input_messages(
                     ),
                     *converted[1:],
                 )
-            messages.extend(converted)
+            replayed.append(ReplayedMessage(index=index, message=converted[0]))
         elif isinstance(item, _ResponseFunctionCall):
             wire_call = _AssistantToolCall(
                 id=item.call_id,
                 function=_FunctionCall(name=item.name, arguments=item.arguments),
             )
-            pending_calls.append(
-                _tool_call(wire_call, f"input.{index}.arguments").model_copy(
-                    update={
-                        "provider_item_id": item.id,
-                        "provider_output_index": index,
-                        "provider_status": item.status,
-                    }
+            replayed.append(
+                ReplayedFunctionCall(
+                    index=index,
+                    call=_tool_call(wire_call, f"input.{index}.arguments").model_copy(
+                        update={
+                            "provider_item_id": item.id,
+                            "provider_output_index": index,
+                            "provider_status": item.status,
+                        }
+                    ),
                 )
             )
         else:
-            flush_calls()
-            flush_orphaned_reasoning()
-            messages.append(
-                GatewayMessage(role="tool", content=item.output, tool_call_id=item.call_id)
+            replayed.append(
+                ReplayedFunctionOutput(index=index, call_id=item.call_id, output=item.output)
             )
-    flush_calls()
-    flush_orphaned_reasoning()
-    return tuple(messages)
+    return responses_input_messages(tuple(replayed))

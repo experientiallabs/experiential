@@ -182,10 +182,19 @@ pub struct Normalizer {
     // provider supplies no tool index; assignment order mirrors the python
     // mapper's local counter.
     gemini_tool_index: u32,
+    // Fireworks-only route identity authorizing reasoning_content capture.
+    reasoning_content_route_sha256: Option<String>,
 }
 
 impl Normalizer {
     pub fn new(dialect: Dialect) -> Self {
+        Self::new_with_reasoning_content_route(dialect, None)
+    }
+
+    pub fn new_with_reasoning_content_route(
+        dialect: Dialect,
+        reasoning_content_route_sha256: Option<String>,
+    ) -> Self {
         Self {
             dialect,
             tools: BTreeMap::new(),
@@ -204,6 +213,7 @@ impl Normalizer {
             usage: None,
             finish_reason: None,
             gemini_tool_index: 0,
+            reasoning_content_route_sha256,
         }
     }
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from typing import cast
 
 import pytest
@@ -15,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.native_responses import ContinuationContext, remember_turn
+from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -44,6 +46,56 @@ def _context() -> ContinuationContext:
         response_id="response-one",
         messages=(),
     )
+
+
+def _carrier() -> str:
+    """Build one structurally valid sealed Fireworks carrier."""
+    deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
+    envelope = base64.urlsafe_b64encode(b"opaque-envelope").rstrip(b"=").decode()
+    return f"{FIREWORKS_REASONING_CONTENT_PREFIX}{deployment}:{envelope}"
+
+
+def test_remember_turn_retains_the_sealed_responses_carrier() -> None:
+    """Server-side continuation storage never replaces the carrier with plaintext."""
+    store = BoundedContinuationStore()
+    context = _context()
+
+    remember_turn(
+        store,
+        context=context,
+        data={
+            "text": "",
+            "refusal": False,
+            "reasoning_content_carrier": _carrier(),
+            "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
+        },
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    message = state.messages[-1]
+    assert message.provider_reasoning[0].kind == "sealed_reasoning_content"
+    assert message.provider_reasoning[0].carrier == _carrier()
+
+
+def test_remember_turn_rejects_a_malformed_responses_carrier() -> None:
+    """Continuation storage rejects an unauthenticatable envelope."""
+    store = BoundedContinuationStore()
+    context = _context()
+
+    with pytest.raises(ValueError, match="carrier"):
+        remember_turn(
+            store,
+            context=context,
+            data={
+                "text": "",
+                "refusal": False,
+                "reasoning_content_carrier": "not-a-carrier",
+                "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
+            },
+        )
 
 
 def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation() -> None:

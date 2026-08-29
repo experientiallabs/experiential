@@ -33,6 +33,7 @@ from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
+from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
@@ -90,6 +91,7 @@ class InflightRequest:
     # SigV4); ``None`` at a depth whose dialect serializes its own payload.
     signers: tuple[GatewayDispatchSigner | None, ...] = ()
     dispatch_bindings: tuple[FrozenDispatchBinding | None, ...] = ()
+    reasoning_carrier_authorities: tuple[ReasoningCarrierAuthority | None, ...] = ()
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""
@@ -460,6 +462,7 @@ def deployment_wire_entry(
         "timeout_seconds": profile.timeout_seconds,
         "upstream_payload": None if upstream_body is not None else upstream_payload,
         "upstream_body": upstream_body,
+        "fireworks_reasoning_route_sha256": profile.fireworks_reasoning_route_sha256,
         "idempotency_key": deployment_operation_key(route, deployment),
     }
 

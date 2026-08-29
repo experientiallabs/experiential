@@ -36,6 +36,18 @@ pub fn completed_responses_body(
     envelope: ResponsesEnvelope,
     events: &[Event],
 ) -> Result<AggregatedResponses, PublicError> {
+    completed_responses_body_with_carrier(request_id, model, created_at, envelope, events, None)
+}
+
+/// Build one non-streaming result with an authenticated Fireworks carrier.
+pub fn completed_responses_body_with_carrier(
+    request_id: &str,
+    model: &str,
+    created_at: f64,
+    envelope: ResponsesEnvelope,
+    events: &[Event],
+    reasoning_content_carrier: Option<&str>,
+) -> Result<AggregatedResponses, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
         Some(event) => event,
@@ -75,6 +87,9 @@ pub fn completed_responses_body(
         });
     }
     let mut encoder = ResponsesSseEncoder::new(request_id, model, created_at, envelope);
+    if let Some(carrier) = reasoning_content_carrier {
+        encoder.set_reasoning_content_carrier(carrier.to_string())?;
+    }
     encoder.start()?;
     let mut terminal_frames = Vec::new();
     for event in events {

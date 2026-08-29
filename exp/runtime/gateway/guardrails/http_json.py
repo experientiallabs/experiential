@@ -17,7 +17,7 @@ import httpx
 from pydantic import ValidationError
 
 from exp.common.core.artifacts import JsonObject, canonical_json_bytes
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailAction,
@@ -224,10 +224,17 @@ class HttpJsonClassifier:
         check: GuardrailCheck,
     ) -> ClassifierVerdict:
         """Inspect one canonical request and return a validated verdict."""
-        return await self._inspect(
+        verdict = await self._inspect(
             check=check,
             payload=_inspect_payload(check=check, request=request, completion=None),
         )
+        if verdict.replacement_messages is None:
+            return verdict
+        replacement = _reattach_hidden_request_authority(
+            request.messages,
+            verdict.replacement_messages,
+        )
+        return verdict.model_copy(update={"replacement_messages": replacement})
 
     async def inspect_output(
         self,
@@ -278,6 +285,70 @@ class HttpJsonClassifier:
         except httpx.HTTPError as exc:
             raise ClassifierProtocolError("classifier transport failed") from exc
         return _verdict_from_body(body, check=check)
+
+
+def _reattach_hidden_request_authority(
+    original: tuple[GatewayMessage, ...],
+    replacement: tuple[GatewayMessage, ...],
+) -> tuple[GatewayMessage, ...]:
+    """Restore authority omitted from the hosted classifier wire contract.
+
+    Provider reasoning, raw tool arguments, and tool-error state never leave the
+    gateway. A hosted modifier may return the same visible assistant/tool history
+    with user text redacted, so compare the classifier-visible representation and
+    then restore the exact hidden gateway-owned messages. A user-only full
+    redaction remains valid and deliberately discards the prior tool history.
+
+    Args:
+        original: Canonical request supplied to the hosted classifier.
+        replacement: Classifier-returned visible replacement messages.
+
+    Returns:
+        Replacement messages with exact hidden authority reattached.
+
+    Raises:
+        ClassifierProtocolError: The replacement retained carrier-bound history
+            while changing its visible assistant/tool authority.
+    """
+    carrier_indexes = tuple(
+        index
+        for index, message in enumerate(original)
+        if any(
+            block.kind in {"reasoning_content", "sealed_reasoning_content"}
+            for block in message.provider_reasoning
+        )
+    )
+    if not carrier_indexes:
+        return replacement
+    if all(message.role in {"system", "developer", "user"} for message in replacement):
+        return replacement
+    bound = carrier_indexes[-1]
+    if len(replacement) <= bound:
+        raise ClassifierProtocolError(
+            "classifier replacement truncated provider-reasoning authority"
+        )
+    restored = list(replacement)
+    for index, original_message in enumerate(original[: bound + 1]):
+        replacement_message = replacement[index]
+        if original_message.role != replacement_message.role:
+            raise ClassifierProtocolError(
+                "classifier replacement changed provider-reasoning message roles"
+            )
+        if original_message.role not in {"assistant", "tool"}:
+            continue
+        if _classifier_visible_message(original_message) != _classifier_visible_message(
+            replacement_message
+        ):
+            raise ClassifierProtocolError(
+                "classifier replacement changed provider-reasoning assistant/tool history"
+            )
+        restored[index] = original_message
+    return tuple(restored)
+
+
+def _classifier_visible_message(message: GatewayMessage) -> JsonObject:
+    """Return the exact message representation exposed to hosted classifiers."""
+    return message.model_dump(mode="json", by_alias=True, exclude_none=False)
 
 
 def _authorization_header(bearer_env: str | None) -> str | None:

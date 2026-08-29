@@ -40,6 +40,7 @@ pub(crate) struct ResponsesRetention {
     completed_tools: BTreeSet<u32>,
     tool_statuses: BTreeMap<u32, ProviderOutputItemStatus>,
     reasoning: BTreeMap<u32, RetainedReasoning>,
+    pub(crate) carrier_events: Vec<Event>,
     retained_bytes: usize,
     pub(crate) overflowed: bool,
 }
@@ -58,7 +59,18 @@ impl ResponsesRetention {
             self.messages.clear();
             self.tool_calls.clear();
             self.reasoning.clear();
+            self.carrier_events.clear();
             return;
+        }
+        if matches!(
+            event,
+            Event::TextDelta(_)
+                | Event::ReasoningContentDelta { .. }
+                | Event::ToolCallStarted { .. }
+                | Event::ToolArgumentsDelta { .. }
+                | Event::ToolCallCompleted { .. }
+        ) {
+            self.carrier_events.push(event.clone());
         }
         match event {
             Event::ProviderOutputItemStarted {
@@ -220,7 +232,11 @@ impl ResponsesRetention {
 }
 
 /// Build the retention payload consumed by the control plane's `remember`.
-pub(crate) fn remember_argument(request_id: &str, retention: &ResponsesRetention) -> String {
+pub(crate) fn remember_argument(
+    request_id: &str,
+    retention: &ResponsesRetention,
+    reasoning_content_carrier: Option<&str>,
+) -> String {
     compact_json(&json!({
         "request_id": request_id,
         "text": retention.text,
@@ -232,6 +248,7 @@ pub(crate) fn remember_argument(request_id: &str, retention: &ResponsesRetention
             "phase": message.phase.map(ProviderAssistantMessagePhase::as_str),
         })).collect::<Vec<Value>>(),
         "refusal": retention.refusal,
+        "reasoning_content_carrier": reasoning_content_carrier,
         "encrypted_reasoning": retention.reasoning.iter()
             .filter(|(_, reasoning)| !reasoning.encrypted_content.is_empty())
             .map(|(output_index, reasoning)| json!({
@@ -350,8 +367,9 @@ mod tests {
         for event in &events {
             retention.track(event);
         }
-        let payload: Value = serde_json::from_str(&remember_argument("request-1", &retention))
-            .expect("retention payload is JSON");
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-1", &retention, None))
+                .expect("retention payload is JSON");
         assert_eq!(payload["encrypted_reasoning"][0]["status"], "incomplete");
         assert_eq!(payload["message_outputs"][0]["status"], "incomplete");
         assert_eq!(payload["message_outputs"][0]["phase"], "commentary");
@@ -386,8 +404,9 @@ mod tests {
         }
 
         assert!(!retention.is_empty());
-        let payload: Value = serde_json::from_str(&remember_argument("request-1", &retention))
-            .expect("retention payload is JSON");
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-1", &retention, None))
+                .expect("retention payload is JSON");
         assert_eq!(payload["message_outputs"][0]["item_id"], "msg-empty");
         assert_eq!(payload["message_outputs"][0]["text"], "");
         assert_eq!(payload["message_outputs"][0]["status"], "incomplete");

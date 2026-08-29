@@ -649,6 +649,22 @@ impl Normalizer {
             self.refusal_seen = true;
             events.push(Event::RefusalDelta(refusal.clone()));
         }
+        if let Some(route_sha256) = self.reasoning_content_route_sha256.clone() {
+            if let Some(value) = delta.get("reasoning_content") {
+                let reasoning = match value {
+                    Value::Null => None,
+                    Value::String(text) => Some(text),
+                    _ => return Err(malformed("Fireworks reasoning_content delta must be text")),
+                };
+                if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
+                    self.reserve_summary_bytes(reasoning.len())?;
+                    events.push(Event::ReasoningContentDelta {
+                        route_sha256,
+                        delta: reasoning.clone(),
+                    });
+                }
+            }
+        }
         if let Some(raw_tools) = delta.get("tool_calls") {
             if !raw_tools.is_null() {
                 let items = raw_tools
@@ -747,6 +763,63 @@ mod tests {
             })
             .to_string(),
         }
+    }
+
+    #[test]
+    fn compatible_reasoning_content_requires_fireworks_route_authority() {
+        let frame = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"reasoning_content": "provider private"},
+                    "finish_reason": null,
+                }]
+            })
+            .to_string(),
+        };
+        let route_sha256 = "a".repeat(64);
+        let mut authorized = Normalizer::new_with_reasoning_content_route(
+            Dialect::OpenAiCompatible,
+            Some(route_sha256.clone()),
+        );
+        let events = authorized
+            .feed(&frame)
+            .expect("authorized Fireworks reasoning must normalize");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ReasoningContentDelta {
+                route_sha256: route,
+                delta,
+            }] if route == &route_sha256 && delta == "provider private"
+        ));
+
+        let mut generic = Normalizer::new(Dialect::OpenAiCompatible);
+        assert!(generic
+            .feed(&frame)
+            .expect("generic compatible extension is ignored")
+            .is_empty());
+    }
+
+    #[test]
+    fn fireworks_reasoning_content_rejects_non_text_values() {
+        let frame = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {"reasoning_content": {"private": true}},
+                    "finish_reason": null,
+                }]
+            })
+            .to_string(),
+        };
+        let mut normalizer = Normalizer::new_with_reasoning_content_route(
+            Dialect::OpenAiCompatible,
+            Some("a".repeat(64)),
+        );
+
+        assert!(normalizer.feed(&frame).is_err());
     }
 
     #[test]

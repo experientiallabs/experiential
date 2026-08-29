@@ -10,7 +10,13 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject, canonical_json_bytes
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.common.models import ToolCall
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+    SealedReasoningContentBlock,
+)
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
     GuardrailCapabilityKind,
@@ -180,6 +186,45 @@ def test_outbound_request_subject_matches_request_content_bytes() -> None:
 
     assert canonical_json_bytes(captured["request"]) == canonical_json_bytes(request)
     assert request_content_bytes(request) == len(canonical_json_bytes(request))
+
+
+def test_hosted_modifier_reattaches_hidden_reasoning_authority() -> None:
+    """A hosted user rewrite cannot strip unchanged gateway-owned tool authority."""
+    call = ToolCall(call_id="call-one", name="lookup", arguments={}, raw_arguments="{}")
+    assistant = GatewayMessage(
+        role="assistant",
+        tool_calls=(call,),
+        provider_reasoning=(
+            SealedReasoningContentBlock(carrier="opaque-carrier", deployment_hint="rung-one"),
+        ),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="Use the tool"),
+            assistant,
+            GatewayMessage(role="tool", tool_call_id="call-one", content="done"),
+            GatewayMessage(role="user", content="secret follow-up"),
+        ),
+    )
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        """Return the wire-visible history with only the latest user redacted."""
+        messages = json.loads(http_request.content)["request"]["messages"]
+        assert "provider_reasoning" not in messages[1]
+        messages[-1]["content"] = "redacted follow-up"
+        return httpx.Response(
+            200,
+            json={"flagged": True, "replacement_messages": messages},
+        )
+
+    adapter, _client = _classifier(httpx.MockTransport(handler))
+    verdict = asyncio.run(adapter.inspect_input(request=request, check=_input_check()))
+
+    replacement = verdict.replacement_messages
+    assert replacement is not None
+    assert replacement[1] == assistant
+    assert replacement[-1].content == "redacted follow-up"
 
 
 def test_bearer_env_sends_authorization_without_embedding_the_value() -> None:

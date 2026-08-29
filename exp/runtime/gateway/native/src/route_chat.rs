@@ -18,7 +18,10 @@ use crate::admission::{
     acquire_permit, apply_output_guardrail, commit_dependent, commit_independent, new_guard,
     wire_drift_response, Admission,
 };
-use crate::encode::{chat_data, compact_json, completed_chat_body_with_ignored, ChatSseEncoder};
+use crate::encode::{
+    chat_data, compact_json, completed_chat_body_with_carrier, completed_chat_body_with_ignored,
+    reasoning_carrier_candidate, ChatSseEncoder, ReasoningCarrierCandidate,
+};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::{classify_escalation, METRICS};
@@ -279,7 +282,7 @@ async fn settled_chat_response(
             if admission.stream {
                 // The withheld refusal output and its failing terminal flush
                 // outward as the stream's only frames.
-                let body = match encode_chat_sse(admission, created_at, &events) {
+                let body = match encode_chat_sse(admission, created_at, &events, None) {
                     Ok(body) => body,
                     Err(error) => return error_response(&error),
                 };
@@ -299,7 +302,7 @@ async fn settled_chat_response(
     let mut headers = commit_independent(admission, client_request_id.as_deref());
     headers.extend(commit_dependent(admission, settled.depth));
     if admission.stream {
-        let body = match encode_chat_sse(admission, created_at, &events) {
+        let body = match encode_chat_sse(admission, created_at, &events, None) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
@@ -356,6 +359,7 @@ fn encode_chat_sse(
     admission: &Admission,
     created_at: i64,
     events: &[Event],
+    reasoning_content_carrier: Option<&str>,
 ) -> Result<Vec<u8>, PublicError> {
     let mut encoder = ChatSseEncoder::new_with_ignored(
         &admission.request_id,
@@ -364,6 +368,9 @@ fn encode_chat_sse(
         admission.include_usage,
         admission.ignored_parameters.clone(),
     );
+    if let Some(carrier) = reasoning_content_carrier {
+        encoder.set_reasoning_content_carrier(carrier.to_string());
+    }
     let mut body = Vec::new();
     for frame in encoder.start().map_err(|_| PublicError::internal())? {
         body.extend_from_slice(frame.as_bytes());
@@ -374,6 +381,77 @@ fn encode_chat_sse(
         }
     }
     Ok(body)
+}
+
+/// Seal one completed provider turn when it contains Fireworks reasoning.
+pub(crate) async fn seal_reasoning_events(
+    bridge: &crate::bridge::Bridge,
+    request_id: &str,
+    route_depth: usize,
+    events: &[Event],
+) -> Result<Option<String>, Failure> {
+    if !matches!(
+        events.iter().rev().find(|event| event.is_terminal()),
+        Some(Event::Completed)
+    ) {
+        return Ok(None);
+    }
+    let candidate = reasoning_carrier_candidate(events).map_err(|_| {
+        Failure::new(
+            FailureClass::MalformedResponse,
+            "provider returned malformed reasoning continuation data",
+        )
+    })?;
+    seal_reasoning_candidate(bridge, request_id, route_depth, candidate).await
+}
+
+/// Ask the Python authority to bind and encrypt one validated native turn.
+pub(crate) async fn seal_reasoning_candidate(
+    bridge: &crate::bridge::Bridge,
+    request_id: &str,
+    route_depth: usize,
+    candidate: Option<ReasoningCarrierCandidate>,
+) -> Result<Option<String>, Failure> {
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let argument = compact_json(&json!({
+        "request_id": request_id,
+        "route_depth": route_depth,
+        "route_sha256": candidate.route_sha256,
+        "content": candidate.content,
+        "assistant_content": candidate.assistant_content,
+        "tool_calls": candidate.tool_calls.into_iter().map(|call| json!({
+            "call_id": call.call_id,
+            "name": call.name,
+            "raw_arguments": call.raw_arguments,
+        })).collect::<Vec<_>>(),
+    }));
+    let response = bridge
+        .call("seal_reasoning_content", argument)
+        .await
+        .map_err(|_| {
+            Failure::new(
+                FailureClass::MalformedResponse,
+                "provider reasoning continuation could not be authenticated",
+            )
+        })?;
+    let payload: Value = serde_json::from_str(&response).map_err(|_| {
+        Failure::new(
+            FailureClass::Internal,
+            "gateway returned an invalid reasoning carrier response",
+        )
+    })?;
+    let carrier = payload
+        .get("carrier")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            Failure::new(
+                FailureClass::Internal,
+                "gateway omitted the authenticated reasoning carrier",
+            )
+        })?;
+    Ok(Some(carrier.to_string()))
 }
 
 /// Aggregate one committed non-streaming or guarded chat attempt and answer
@@ -392,12 +470,29 @@ async fn respond_from_chat_events(
     stream_body: bool,
 ) -> Response {
     let refusal_completed = complete_visible_refusal(&mut events);
-    let aggregated = match completed_chat_body_with_ignored(
+    let carrier = if refusal_completed.is_some() {
+        None
+    } else {
+        match seal_reasoning_events(&guard.bridge, &admission.request_id, depth, &events).await {
+            Ok(carrier) => carrier,
+            Err(failure) => {
+                guard
+                    .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
+                    .await;
+                if let Some(mut owner) = lease.take() {
+                    owner.abandon().await;
+                }
+                return error_response(&failure.public_error());
+            }
+        }
+    };
+    let aggregated = match completed_chat_body_with_carrier(
         &admission.request_id,
         &admission.alias,
         created_at,
         &events,
         &admission.ignored_parameters,
+        carrier.as_deref(),
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
@@ -477,7 +572,7 @@ async fn respond_from_chat_events(
     let mut headers = commit_independent(&admission, client_request_id.as_deref());
     headers.extend(commit_dependent(&admission, depth));
     if stream_body {
-        let body = match encode_chat_sse(&admission, created_at, &events) {
+        let body = match encode_chat_sse(&admission, created_at, &events, carrier.as_deref()) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
@@ -759,6 +854,29 @@ async fn stream_response(
                 other => other.clone(),
             };
             if event.is_terminal() {
+                if matches!(event, Event::Completed) {
+                    let candidate = match encoder.reasoning_carrier_candidate() {
+                        Ok(candidate) => candidate,
+                        Err(_) => {
+                            fail_stream!(Failure::new(
+                                FailureClass::MalformedResponse,
+                                "provider returned malformed reasoning continuation data",
+                            ))
+                        }
+                    };
+                    match seal_reasoning_candidate(
+                        &guard.bridge,
+                        &request_id,
+                        committed.depth,
+                        candidate,
+                    )
+                    .await
+                    {
+                        Ok(Some(carrier)) => encoder.set_reasoning_content_carrier(carrier),
+                        Ok(None) => {}
+                        Err(failure) => fail_stream!(failure),
+                    }
+                }
                 terminal = Some(event.clone());
                 if !settle_stream_end(&mut guard, Some(&event), usage.as_ref(), &tool_names, false)
                     .await

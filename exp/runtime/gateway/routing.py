@@ -303,6 +303,72 @@ class CatalogRouteResolver:
             fallback_reason=None,
         )
 
+    def resolve_deployment_hint(
+        self,
+        authorization: AuthorizationSnapshot,
+        deployment_id: str,
+    ) -> GatewayRoute:
+        """Resolve one untrusted carrier hint only inside current alias authority."""
+        view = self._catalogs.get((authorization.alias_revision_id, authorization.catalog_sha256))
+        if view is None:
+            raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
+        target = authorization.target
+        if isinstance(target, DirectTarget):
+            pools = (self._pool(view, target.pool_id),)
+        else:
+            if target.catalog_sha256 != authorization.catalog_sha256:
+                raise GatewayRoutingError(
+                    "project target catalog differs from authorized authority"
+                )
+            deployment = view.deployments.get(deployment_id)
+            if deployment is None:
+                raise GatewayRoutingError("reasoning carrier deployment identity is invalid")
+            self._authorize_project_deployment_hint(target, deployment)
+            pools = tuple(
+                pool for pool in view.catalog.pools if deployment_id in pool.deployment_ids
+            )
+        matching = tuple(pool for pool in pools if deployment_id in pool.deployment_ids)
+        if len(matching) != 1:
+            raise GatewayRoutingError("reasoning carrier deployment is not unambiguous")
+        pool = matching[0]
+        deployment = view.deployments.get(deployment_id)
+        if deployment is None or deployment.exact_model_id != pool.exact_model_id:
+            raise GatewayRoutingError("reasoning carrier deployment identity is invalid")
+        return GatewayRoute(
+            snapshot=ExecutionSnapshot(
+                authorization=authorization,
+                exact_model_id=pool.exact_model_id,
+                pool_id=pool.pool_id,
+                deployment_ids=(deployment_id,),
+            ),
+            deployment=deployment,
+            route_reason="reasoning_continuation",
+            fallback_reason=None,
+        )
+
+    def _authorize_project_deployment_hint(
+        self,
+        target: ProjectTarget,
+        deployment: ExactModelDeployment,
+    ) -> None:
+        """Require the loaded project resolver to authenticate candidate membership."""
+        resolver = self._project_resolver
+        authorize = (
+            None if resolver is None else getattr(resolver, "authorize_deployment_hint", None)
+        )
+        if not callable(authorize):
+            raise GatewayRoutingError(
+                "project resolver cannot authenticate reasoning continuation deployments"
+            )
+        try:
+            authorize(target=target, deployment=deployment)
+        except GatewayRoutingError:
+            raise
+        except Exception as exc:
+            raise GatewayRoutingError(
+                "project resolver rejected reasoning continuation deployment"
+            ) from exc
+
     async def _select_project(
         self,
         *,
@@ -665,6 +731,27 @@ class RouterProjectTargetResolver:
                 prepared=prepared,
             )
         return self._selection(target, decision)
+
+    def authorize_deployment_hint(
+        self,
+        *,
+        target: ProjectTarget,
+        deployment: ExactModelDeployment,
+    ) -> None:
+        """Require one hinted deployment to be a candidate of this activation."""
+        self._runtime(target)
+        exact_model_id = self._exact_models_by_alias.get(
+            (
+                target.project_ref,
+                target.activation_ref,
+                target.catalog_sha256,
+                deployment.source_alias,
+            )
+        )
+        if exact_model_id != deployment.exact_model_id:
+            raise GatewayRoutingError(
+                "reasoning continuation deployment is not a project activation candidate"
+            )
 
     def _runtime(self, target: ProjectTarget) -> RouterRuntime:
         """Return the loaded frozen runtime for one activation or fail closed."""

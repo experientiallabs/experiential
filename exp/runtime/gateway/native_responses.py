@@ -25,6 +25,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.reasoning_carrier import parse_reasoning_content_carrier
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -343,12 +344,20 @@ def remember_turn(
                 ),
             )
         )
+    raw_carrier = data.get("reasoning_content_carrier")
+    sealed_carrier = None
+    if raw_carrier is not None:
+        if not isinstance(raw_carrier, str):
+            raise ValueError("Responses reasoning carrier must be text")
+        sealed_carrier = parse_reasoning_content_carrier(raw_carrier)
     indexed_output = bool(encrypted or indexed_calls or message_outputs)
+    if sealed_carrier is not None and indexed_output:
+        raise ValueError("Responses reasoning carrier cannot mix with provider-indexed output")
     if text and indexed_output:
         raise ValueError(
             "Responses retained assistant text requires provider item identity and order"
         )
-    if not text and not unindexed_calls and not indexed_output:
+    if not text and not unindexed_calls and not indexed_output and sealed_carrier is None:
         return
 
     output_items: list[tuple[int, str, object]] = [
@@ -400,12 +409,13 @@ def remember_turn(
         else:
             segment_calls.append(cast(ToolCall, item))
     flush_segment()
-    if text or unindexed_calls:
+    if text or unindexed_calls or sealed_carrier is not None:
         retained_messages.append(
             GatewayMessage(
                 role="assistant",
                 content=text or None,
                 tool_calls=tuple(unindexed_calls),
+                provider_reasoning=(sealed_carrier,) if sealed_carrier is not None else (),
             )
         )
 

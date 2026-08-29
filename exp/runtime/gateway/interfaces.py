@@ -14,8 +14,8 @@ from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayFailure,
     GatewayRequest,
-    GatewayTarget,
     ProjectSelection,
+    ProjectTarget,
 )
 
 
@@ -123,7 +123,7 @@ class ProjectTargetResolver(Protocol):
     async def select(
         self,
         *,
-        target: GatewayTarget,
+        target: ProjectTarget,
         request: GatewayRequest,
         episode_namespace: tuple[ArtifactId, ArtifactId, ArtifactId, str],
         deadline_monotonic: float,
@@ -134,12 +134,21 @@ class ProjectTargetResolver(Protocol):
     def select_blocking(
         self,
         *,
-        target: GatewayTarget,
+        target: ProjectTarget,
         request: GatewayRequest,
         episode_namespace: tuple[ArtifactId, ArtifactId, ArtifactId, str],
         deadline_monotonic: float,
     ) -> ProjectSelection:
         """Resolve one project target synchronously for callers without an event loop."""
+        ...
+
+    def authorize_deployment_hint(
+        self,
+        *,
+        target: ProjectTarget,
+        deployment: ExactModelDeployment,
+    ) -> None:
+        """Require one carrier deployment to belong to the frozen activation."""
         ...
 
 

@@ -155,6 +155,9 @@ class GatewayWireProfile:
     sampling_requires_reasoning_none: bool = False
     """Whether sampling controls require an exact ``none`` reasoning effort."""
 
+    fireworks_reasoning_route_sha256: str | None = None
+    """Exact Fireworks route identity that authorizes opaque reasoning replay."""
+
     token_limit_key: ChatMaxTokensField = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
 

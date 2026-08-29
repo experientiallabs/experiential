@@ -43,8 +43,8 @@ from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
     _public_capability_error,
-    _public_capability_param,
 )
+from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
@@ -277,6 +277,225 @@ def _admit_started(
         client_request_id=client_request_id,
     )
     return _flatten_started(control, admission)
+
+
+def test_fireworks_carrier_round_trip_rejects_tamper_and_credential_rotation(
+    tmp_path: Path,
+) -> None:
+    """A second replica decrypts the exact turn while tamper and rotation fail closed."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.fireworks.ai/inference/v1",
+        capabilities=ModelCapabilities(supports_tools=True),
+    )
+    first_control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-fireworks-secret"},
+        )
+    )
+    initial = _admit_started(first_control, raw_key, _chat_body())
+    hidden = "private provider reasoning that must stay opaque"
+    seal_argument = json.dumps(
+        {
+            "request_id": initial["request_id"],
+            "route_depth": initial["route_depth"],
+            "route_sha256": initial["fireworks_reasoning_route_sha256"],
+            "content": hidden,
+            "assistant_content": None,
+            "tool_calls": [{"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}],
+        }
+    )
+    sealed = json.loads(first_control.seal_reasoning_content(seal_argument))["carrier"]
+    assert hidden not in sealed
+    assert "shared-fireworks-secret" not in sealed
+    assert (
+        first_control.settle(
+            json.dumps(
+                {
+                    "request_id": initial["request_id"],
+                    "attempt_id": initial["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                    "tool_names": ["lookup"],
+                    "failure": None,
+                }
+            )
+        )
+        == "{}"
+    )
+    with pytest.raises(NativeBridgeError):
+        first_control.seal_reasoning_content(seal_argument)
+    continuation_body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": sealed,
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+
+    replica = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-fireworks-secret"},
+        )
+    )
+    continued = _admit(replica, raw_key, continuation_body)
+    route = cast("list[JsonObject]", continued["route"])
+    payload = cast("JsonObject", route[0]["upstream_payload"])
+    messages = cast("list[JsonObject]", payload["messages"])
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert messages[1]["reasoning_content"] == hidden
+
+    transplanted = json.loads(continuation_body)
+    transplanted["messages"][0]["content"] = "Use this carrier under a different prompt"
+    with pytest.raises(NativeBridgeError) as transplanted_error:
+        _admit(replica, raw_key, json.dumps(transplanted))
+    assert (
+        json.loads(transplanted_error.value.public_error_json)["param"]
+        == "messages.reasoning_content"
+    )
+
+    modified_turn = json.loads(continuation_body)
+    modified_turn["messages"][1]["tool_calls"][0]["function"]["arguments"] = '{"tampered":true}'
+    with pytest.raises(NativeBridgeError) as modified:
+        _admit(replica, raw_key, json.dumps(modified_turn))
+    assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+
+    rotated = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "rotated-fireworks-secret"},
+        )
+    )
+    with pytest.raises(NativeBridgeError) as rejected:
+        _admit(rotated, raw_key, continuation_body)
+    public_error = json.loads(rejected.value.public_error_json)
+    assert public_error["status_code"] == 400
+    assert public_error["param"] == "messages.reasoning_content"
+
+    stale_turn = json.loads(continuation_body)
+    stale_turn["messages"].append({"role": "user", "content": "Start a new turn"})
+    after_rotation = _admit(rotated, raw_key, json.dumps(stale_turn))
+    rotated_route = cast("list[JsonObject]", after_rotation["route"])
+    rotated_payload = cast("JsonObject", rotated_route[0]["upstream_payload"])
+    rotated_messages = cast("list[JsonObject]", rotated_payload["messages"])
+    assert after_rotation["route_reason"] == "direct"
+    assert "reasoning_content" not in rotated_messages[1]
+
+
+def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: Path) -> None:
+    """A fallback-issued carrier replays only to its exact deployment and credential."""
+    _manager, raw_key = _configured_pool_gateway(
+        tmp_path,
+        base_urls=(
+            "https://api.fireworks.ai/inference/v1",
+            "https://api.fireworks.ai/inference/v1",
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-fireworks-secret"},
+        )
+    )
+    admission = _admit(control, raw_key, _chat_body())
+    first = _start_first(control, admission)
+    failure = {
+        "failure_class": "provider_internal",
+        "safe_message": "provider service failed",
+        "retryable_same_deployment": False,
+        "failover_eligible": True,
+    }
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "attempt_id": first["attempt_id"],
+                    "outcome": "failed",
+                    "usage": None,
+                    "tool_names": [],
+                    "failure": failure,
+                    "finalize": False,
+                }
+            )
+        )
+        == "{}"
+    )
+    second = json.loads(
+        control.start_attempt(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "attempt_ordinal": 1,
+                    "current_depth": 0,
+                    "failure": failure,
+                }
+            )
+        )
+    )
+    assert second["route_depth"] == 1
+    route = cast("list[JsonObject]", admission["route"])
+    carrier = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "route_depth": 1,
+                    "route_sha256": route[1]["fireworks_reasoning_route_sha256"],
+                    "content": "fallback-private-reasoning",
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    continuation = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": carrier,
+                        "tool_calls": [
+                            {
+                                "id": "call-one",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+                ],
+            }
+        ),
+    )
+
+    continued_route = cast("list[JsonObject]", continuation["route"])
+    assert [item["deployment_id"] for item in continued_route] == [route[1]["deployment_id"]]
+    assert continued_route[0]["model_id"] == "beta-model-exact"
 
 
 def test_bridge_error_payload_is_openai_shaped() -> None:
@@ -2782,6 +3001,97 @@ def test_responses_tool_call_retention_survives_continuation(tmp_path: Path) -> 
     first_call = tool_calls[0]
     assert isinstance(first_call, dict)
     assert first_call["function"] == {"name": "search", "arguments": '{"q":"x"}'}
+
+
+def test_fireworks_multihop_responses_retention_stays_sealed(tmp_path: Path) -> None:
+    """Executing a retained carrier never stores its decrypted plaintext copy."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.fireworks.ai/inference/v1",
+        capabilities=ModelCapabilities(supports_tools=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-fireworks-secret"},
+        )
+    )
+    first = _admit_responses(control, raw_key, _responses_body(with_tools=True))
+    started = _start_first(control, first)
+    route = first["route"]
+    assert isinstance(route, list)
+    depth = started["route_depth"]
+    assert isinstance(depth, int)
+    wire = route[depth]
+    assert isinstance(wire, dict)
+    carrier = json.loads(
+        control.seal_reasoning_content(
+            json.dumps(
+                {
+                    "request_id": first["request_id"],
+                    "route_depth": depth,
+                    "route_sha256": wire["fireworks_reasoning_route_sha256"],
+                    "content": "PLAINTEXT-HIDDEN",
+                    "assistant_content": None,
+                    "tool_calls": [
+                        {"call_id": "call-one", "name": "lookup", "raw_arguments": "{}"}
+                    ],
+                }
+            )
+        )
+    )["carrier"]
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": first["request_id"],
+                    "text": "",
+                    "refusal": False,
+                    "reasoning_content_carrier": carrier,
+                    "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
+                }
+            )
+        )
+        == "{}"
+    )
+    first_response_id = stable_public_id("resp", _admitted_request_id(first))
+    second_body = json.dumps(
+        {
+            "model": "coding",
+            "previous_response_id": first_response_id,
+            "input": [{"type": "function_call_output", "call_id": "call-one", "output": "done"}],
+        }
+    )
+    second = _admit_responses(control, raw_key, second_body)
+    upstream = _payload_messages(second)
+    assert upstream[1]["reasoning_content"] == "PLAINTEXT-HIDDEN"
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": second["request_id"],
+                    "text": "finished",
+                    "refusal": False,
+                    "tool_calls": [],
+                }
+            )
+        )
+        == "{}"
+    )
+    accounting = control._accounting.entry(_admitted_request_id(second))  # noqa: SLF001
+    assert accounting is not None and accounting.continuation is not None
+    retained = control._continuations.resolve_now(  # noqa: SLF001
+        namespace=accounting.continuation.namespace,
+        previous_response_id=stable_public_id("resp", _admitted_request_id(second)),
+    )
+    kinds = [block.kind for message in retained.messages for block in message.provider_reasoning]
+    assert kinds == ["sealed_reasoning_content"]
+    retained_reasoning = [
+        block.model_dump(mode="json")
+        for message in retained.messages
+        for block in message.provider_reasoning
+    ]
+    assert "PLAINTEXT-HIDDEN" not in json.dumps(retained_reasoning)
 
 
 def test_responses_admission_rejects_invalid_bodies_and_bad_keys(tmp_path: Path) -> None:

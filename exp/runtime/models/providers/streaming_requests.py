@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -21,14 +21,26 @@ from exp.runtime.models.providers.errors import (
     ProviderResponseError,
     UnsupportedReasoningEffortError,
 )
+from exp.runtime.models.providers.fireworks import (
+    prepare_gateway_reasoning_history,
+    require_responses_continuation_channel,
+)
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
+from exp.runtime.models.providers.generation_parameter_validation import (
+    effective_profile_reasoning_effort as _effective_profile_reasoning_effort,
+)
+from exp.runtime.models.providers.generation_parameter_validation import (
+    profile_reasoning_efforts as _profile_reasoning_efforts,
+)
+from exp.runtime.models.providers.generation_parameter_validation import (
+    require_route_numeric_parameter as _require_route_numeric_parameter,
+)
 from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
     anthropic_adaptive_only_thinking,
     anthropic_reasoning_effort,
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
-    supported_reasoning_efforts,
 )
 from exp.runtime.models.providers.wire_messages import (
     add_openai_tools,
@@ -83,7 +95,7 @@ def dialect_stream_payload(
             cannot preserve.
     """
     if _fireworks_continuation_required(profile, provider_request):
-        raise ProviderCapabilityError(capability="responses_fireworks_reasoning_continuation")
+        require_responses_continuation_channel(provider_request)
     required_reasoning_effort = (
         profile.reasoning_effort if profile.reasoning_effort_required else None
     )
@@ -147,6 +159,8 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
         )
     if profile.dialect == "openai_compatible":
+        if profile.fireworks_reasoning_route_sha256 is not None:
+            require_responses_continuation_channel(provider_request)
         return openai_compatible_stream_payload(
             profile.model_id,
             provider_request,
@@ -163,6 +177,7 @@ def dialect_stream_payload(
             reasoning_wire_format=profile.reasoning_wire_format,
             reasoning_effort=required_reasoning_effort,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
+            fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")
 
@@ -195,15 +210,9 @@ def route_generation_parameter_requests(
     """
     if not profiles:
         raise ValueError("generation parameter shaping requires at least one wire profile")
-    if any(_fireworks_continuation_required(profile, request) for profile in profiles):
-        raise ProviderParameterError(
-            message=(
-                "Fireworks Responses tool continuations are unavailable on this route. Set "
-                "tool_choice to 'none' or choose another provider route."
-            ),
-            param="tool_choice",
-            code="unsupported_parameter",
-        )
+    for profile in profiles:
+        if _fireworks_continuation_required(profile, request):
+            require_responses_continuation_channel(request)
 
     ignored = list(request.ignored_parameters)
     provider_updates: dict[str, object] = {}
@@ -442,7 +451,7 @@ def route_generation_parameter_requests(
                 param="thinking.type",
                 code="unsupported_parameter",
             )
-    encrypted_reasoning_present = request.include_encrypted_reasoning or any(
+    encrypted_reasoning_present = any(
         block.kind == "encrypted_reasoning"
         for message in request.messages
         for block in message.provider_reasoning
@@ -455,6 +464,19 @@ def route_generation_parameter_requests(
                 "The parameter 'reasoning.encrypted_content' is not supported by this "
                 "model route. Remove encrypted reasoning or choose a native OpenAI "
                 "Responses-only route."
+            ),
+            param="include",
+            code="unsupported_parameter",
+        )
+    encrypted_reasoning_channel = request.include_encrypted_reasoning and (
+        all(profile.dialect == "openai_responses" for profile in profiles)
+        or all(profile.fireworks_reasoning_route_sha256 is not None for profile in profiles)
+    )
+    if request.include_encrypted_reasoning and not encrypted_reasoning_channel:
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'reasoning.encrypted_content' requires one homogeneous "
+                "native Responses or Fireworks reasoning-carrier route."
             ),
             param="include",
             code="unsupported_parameter",
@@ -536,67 +558,6 @@ def route_generation_parameter_requests(
     public_request = request.model_copy(update={"ignored_parameters": ignored_parameters})
     provider_request = public_request.model_copy(update=provider_updates)
     return public_request, provider_request
-
-
-def _effective_profile_reasoning_effort(
-    profile: GatewayWireProfile,
-    requested_effort: str | None,
-) -> str | None:
-    """Return an explicit caller effort or one wire's required default."""
-    if requested_effort is not None:
-        return requested_effort
-    return profile.reasoning_effort if profile.reasoning_effort_required else None
-
-
-def _profile_reasoning_efforts(profile: GatewayWireProfile) -> tuple[str, ...]:
-    """Return exact accepted efforts for one deployment wire profile."""
-    if not profile.supports_reasoning or profile.reasoning_wire_format == "none":
-        return ()
-    return supported_reasoning_efforts(
-        profile.model_id,
-        profile.reasoning_wire_format,
-        configured_effort=profile.reasoning_effort,
-        explicit_efforts=profile.supported_reasoning_efforts or None,
-    )
-
-
-def _require_route_numeric_parameter(
-    profiles: Sequence[GatewayWireProfile],
-    *,
-    param: str,
-    value: float | int,
-    supported: Callable[[GatewayWireProfile], bool],
-    minimum: Callable[[GatewayWireProfile], float | int],
-    maximum: Callable[[GatewayWireProfile], float | int | None],
-) -> None:
-    """Require every waterfall rung to accept one exact numeric control."""
-    if not all(supported(profile) for profile in profiles):
-        raise ProviderParameterError(
-            message=(
-                f"The parameter {param!r} is not supported by this model route. "
-                "Remove the field or choose a different model."
-            ),
-            param=param,
-            code="unsupported_parameter",
-        )
-    route_minimum = max(minimum(profile) for profile in profiles)
-    maxima = tuple(bound for profile in profiles if (bound := maximum(profile)) is not None)
-    route_maximum = min(maxima) if maxima else None
-    if value >= route_minimum and (route_maximum is None or value <= route_maximum):
-        return
-    range_text = (
-        f"{route_minimum} or greater"
-        if route_maximum is None
-        else f"between {route_minimum} and {route_maximum}"
-    )
-    raise ProviderParameterError(
-        message=(
-            f"The value {value!r} for {param!r} is not supported by this model route. "
-            f"Supported values are {range_text}."
-        ),
-        param=param,
-        code="invalid_parameter",
-    )
 
 
 def openai_responses_stream_payload(
@@ -933,6 +894,7 @@ def openai_compatible_stream_payload(
     reasoning_wire_format: str = "reasoning_effort",
     reasoning_effort: str | None = None,
     sampling_requires_reasoning_none: bool = False,
+    fireworks_reasoning_route_sha256: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -950,12 +912,24 @@ def openai_compatible_stream_payload(
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
     """
+    messages, active_fireworks_reasoning = prepare_gateway_reasoning_history(
+        request.messages,
+        route_sha256=fireworks_reasoning_route_sha256,
+    )
     payload: JsonObject = {
         "model": model_id,
-        "messages": [openai_chat_message(message) for message in request.messages],
+        "messages": [
+            openai_chat_message(
+                message,
+                fireworks_reasoning_route_sha256=fireworks_reasoning_route_sha256,
+            )
+            for message in messages
+        ],
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if active_fireworks_reasoning:
+        payload["reasoning_history"] = "interleaved"
     add_openai_tools(payload, request, responses=False)
     if request.parallel_tool_calls is not None:
         payload["parallel_tool_calls"] = request.parallel_tool_calls

@@ -115,8 +115,35 @@ class EncryptedReasoningBlock(ContractModel):
     )
 
 
+class OpaqueReasoningContentBlock(ContractModel):
+    """Authenticated Fireworks reasoning retained only inside the gateway.
+
+    The provider-issued text is never accepted directly from a caller. Public
+    decoding creates a sealed block, and admission replaces it with this
+    plaintext form only after authenticating the carrier against the exact
+    current deployment and credential authority.
+    """
+
+    kind: Literal["reasoning_content"] = "reasoning_content"
+    route_sha256: Sha256
+    content: str = Field(min_length=1, max_length=8 * 1024 * 1024)
+    carrier_size_bytes: int = Field(default=0, ge=0, exclude=True)
+
+
+class SealedReasoningContentBlock(ContractModel):
+    """One bounded, still-encrypted Fireworks continuation carrier."""
+
+    kind: Literal["sealed_reasoning_content"] = "sealed_reasoning_content"
+    carrier: str = Field(min_length=1)
+    deployment_hint: str = Field(min_length=1, max_length=256)
+
+
 ProviderReasoningBlock = Annotated[
-    ThinkingBlock | RedactedThinkingBlock | EncryptedReasoningBlock,
+    ThinkingBlock
+    | RedactedThinkingBlock
+    | EncryptedReasoningBlock
+    | OpaqueReasoningContentBlock
+    | SealedReasoningContentBlock,
     Field(discriminator="kind"),
 ]
 
