@@ -228,12 +228,16 @@ def test_maximum_time_interrupts_a_silent_agent_and_still_cleans_up(tmp_path: Pa
     )
     started = time.monotonic()
 
+    # The wall bound must outlast pre-episode setup on a loaded runner: _Deadline starts
+    # at construction, and an expired deadline raises before the environment ever opens,
+    # which would make close_calls 0 without any cleanup having been skipped. Interrupting
+    # the 2.0s sleep is proven by finishing well under 2.0s, not by a tiny bound.
     artifact_set = simulator.run(
-        _spec(plan_input, task_input, ("cell-a",), maximum_time_seconds=0.02)
+        _spec(plan_input, task_input, ("cell-a",), maximum_time_seconds=0.5)
     )
     rollout = _load_rollout(store, artifact_set.artifact_ids[0])
 
-    assert time.monotonic() - started < 1.0
+    assert time.monotonic() - started < 1.5
     assert rollout.stop_reason == StopReason.MAXIMUM_TIME
     assert rollout.failure is not None
     assert rollout.failure.exception_type == "SandboxTimeLimitError"
