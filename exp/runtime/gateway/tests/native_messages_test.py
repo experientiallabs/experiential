@@ -533,7 +533,10 @@ def _responses_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Ser
             supports_tools=True,
             supports_temperature=False,
         ),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        ),
         prices=GatewayTokenPrices(),
         pricing_source=None,
         replace=False,
