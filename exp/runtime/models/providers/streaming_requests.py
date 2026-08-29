@@ -391,6 +391,14 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
+    # Context editing is Anthropic-native; any other rung cannot honor it,
+    # so the omission is disclosed and the field dropped from dispatch,
+    # never a rejection (Claude Code sends it by default).
+    if request.context_management is not None and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        ignore("context_management")
+
     # A tool-call cache hint is honored only on the Anthropic wire; any other
     # rung silently cannot cache, so the omission is disclosed, never a
     # rejection (a cache hint changes cost, not semantics).
@@ -747,6 +755,11 @@ def anthropic_messages_stream_payload(
         payload["top_k"] = request.top_k
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     output_config: JsonObject = {}
+    if request.context_management is not None:
+        # Anthropic-native context editing forwards byte-for-byte; the
+        # required beta header joins the dispatch via
+        # anthropic_request_headers.
+        payload["context_management"] = request.context_management
     if request.provider_thinking_config is not None:
         # The caller's exact thinking configuration wins over the catalog's
         # adaptive default and travels verbatim, so budget semantics are

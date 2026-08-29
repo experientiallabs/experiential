@@ -182,6 +182,7 @@ class _MessagesRequest(_WireModel):
     tool_choice: _ToolChoice | None = None
     metadata: _Metadata | None = None
     thinking: _ThinkingConfig | None = None
+    context_management: JsonObject | None = None
 
 
 def decode_messages(payload: JsonObject) -> DecodedGatewayRequest:
@@ -232,10 +233,30 @@ def decode_messages(payload: JsonObject) -> DecodedGatewayRequest:
             provider_thinking_config=(
                 cast(JsonObject, payload["thinking"]) if request.thinking is not None else None
             ),
+            context_management=_context_management(payload),
         )
     except ValidationError as exc:
         raise _validation_error(exc.errors(include_url=False)[0]) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
+
+
+def _context_management(payload: JsonObject) -> JsonObject | None:
+    """Validate the caller's context-editing config as an object, verbatim.
+
+    The nested shape is an evolving Anthropic beta the gateway forwards
+    byte-for-byte (with the required beta header), so validation is
+    deliberately shallow: a closed model here would recreate the
+    reject-what-real-clients-send incident class.
+
+    Raises:
+        OpenAIProtocolError: The field is present but not a JSON object.
+    """
+    value = payload.get("context_management")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise invalid_field("context_management", "context_management must be a JSON object.")
+    return cast(JsonObject, value)
 
 
 def _validate_manifest(payload: JsonObject) -> None:

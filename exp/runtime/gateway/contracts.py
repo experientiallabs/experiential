@@ -273,6 +273,18 @@ class GatewayRequest(ContractModel):
     config-free digests are unperturbed; a present config joins replay
     identity through :func:`canonical_request_sha256`.
     """
+    context_management: JsonObject | None = Field(default=None, exclude=True)
+    """Verbatim caller ``context_management`` from the Messages surface.
+
+    Anthropic's native context-editing configuration (Claude Code sends it
+    by default). The object is deliberately validated only as an object and
+    forwarded byte-for-byte with the required beta header on Anthropic
+    rungs: the shape is an evolving provider beta, and a closed model here
+    would recreate the reject-what-real-clients-send incident class.
+    Excluded from serialization like the other Anthropic-only carriers so
+    config-free digests are unperturbed; a present value joins replay
+    identity through :func:`canonical_request_sha256`.
+    """
     response_store: bool | None = None
     """Caller ``store`` selector from the Responses surface.
 
@@ -381,6 +393,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("reasoning_context is valid only for Responses requests")
         if self.provider_thinking_config is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_thinking_config is valid only for Messages requests")
+        if self.context_management is not None and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("context_management is valid only for Messages requests")
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
             raise ValueError("maximum output parameter requires a maximum output value")
         if self.reasoning_summary_parameters and self.reasoning_summary is None:
@@ -454,6 +468,7 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
         not replay
         and request.provider_thinking_config is None
         and request.reasoning_context is None
+        and request.context_management is None
     ):
         return sha256_json(request)
     return sha256_json(
@@ -462,6 +477,7 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
             "provider_replay": replay,
             "provider_thinking_config": request.provider_thinking_config,
             "reasoning_context": request.reasoning_context,
+            "context_management": request.context_management,
         }
     )
 

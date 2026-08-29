@@ -832,7 +832,6 @@ def test_responses_decoder_accepts_the_codex_request_shape() -> None:
     assert payload_input[1:] == [
         {
             "type": "reasoning",
-            "id": "rs_1",
             "summary": [],
             "encrypted_content": "blob==",
         },
@@ -845,7 +844,6 @@ def test_responses_decoder_accepts_the_codex_request_shape() -> None:
         },
         {
             "type": "reasoning",
-            "id": "rs_2",
             "summary": [],
             "encrypted_content": "second-blob==",
         },
@@ -914,13 +912,16 @@ def test_responses_decoder_replays_output_message_in_provider_order() -> None:
     )
     payload_input = cast(list[JsonObject], payload["input"])
     assert [(item["type"], item.get("id")) for item in payload_input[:3]] == [
-        ("reasoning", "rs_0"),
+        ("reasoning", None),
         ("message", "msg_1"),
         ("function_call", "fc_2"),
     ]
     message_content = cast(list[JsonObject], payload_input[1]["content"])
     assert message_content[0]["text"] == "I will look that up."
-    assert payload_input[0]["status"] == "completed"
+    # A replayed reasoning item never carries status (the provider rejects
+    # it: "Unknown parameter", verified live 2026-08-29); other item types
+    # keep it.
+    assert "status" not in payload_input[0]
     assert payload_input[2]["arguments"] == '{ "q" : "x" }'
     assert payload_input[2]["status"] == "completed"
 
@@ -1089,7 +1090,10 @@ def test_responses_decoder_orders_function_calls_without_optional_item_ids() -> 
     )
     payload_input = cast(list[JsonObject], payload["input"])
     assert [(item["type"], item.get("id")) for item in payload_input] == [
-        ("reasoning", "rs_0"),
+        # The reasoning id never crosses upstream: encrypted_content is
+        # cryptographically bound to the provider's original item id, and an
+        # id-less item verifies against the id embedded in the payload.
+        ("reasoning", None),
         ("function_call", None),
         ("function_call", "fc_2"),
     ]

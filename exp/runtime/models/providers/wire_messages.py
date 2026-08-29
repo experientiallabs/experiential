@@ -40,15 +40,19 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             raise ProviderResponseError("thinking blocks cannot replay on the Responses wire")
         # Reasoning items precede the assistant action they belong to, and
         # the encrypted payload is the round-trip authority; the display-only
-        # summary is deliberately empty on replay.
+        # summary is deliberately empty on replay. The item id and status are
+        # NEVER forwarded (verified live 2026-08-29): the provider
+        # cryptographically binds encrypted_content to its ORIGINAL item id
+        # and rejects any mismatch ("Encrypted content item_id did not
+        # match") while an id-less item verifies against the id embedded in
+        # the payload itself, and a replayed reasoning item with `status` is
+        # rejected outright ("Unknown parameter: 'input[N].status'") even
+        # though function_call and message items accept it.
         item: JsonObject = {
             "type": "reasoning",
             "summary": [],
             "encrypted_content": block.encrypted_content,
         }
-        item["id"] = block.id
-        if block.status is not None:
-            item["status"] = block.status
         if block.output_index is None:
             items.append(item)
         else:
@@ -150,6 +154,40 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             tool_use["cache_control"] = call.cache_control
         blocks.append(tool_use)
     return "assistant", blocks
+
+
+ANTHROPIC_CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
+"""Beta token Anthropic requires before it accepts ``context_management``."""
+
+
+def anthropic_request_headers(
+    profile_headers: dict[str, str],
+    request: GatewayRequest,
+) -> dict[str, str]:
+    """Return the per-request Anthropic headers for one dispatch.
+
+    ``context_management`` is served behind an ``anthropic-beta`` token
+    (verified live 2026-08-29: the field alone is "Extra inputs are not
+    permitted"), so the token joins the connection's static headers exactly
+    when the request carries the field, merging with any operator-declared
+    beta list.
+
+    Args:
+        profile_headers: The connection's static wire headers.
+        request: Canonical request about to be dispatched.
+
+    Returns:
+        Headers to send verbatim for this request.
+    """
+    headers = dict(profile_headers)
+    if request.context_management is None:
+        return headers
+    existing = headers.get("anthropic-beta")
+    if existing is None:
+        headers["anthropic-beta"] = ANTHROPIC_CONTEXT_MANAGEMENT_BETA
+    elif ANTHROPIC_CONTEXT_MANAGEMENT_BETA not in existing.split(","):
+        headers["anthropic-beta"] = f"{existing},{ANTHROPIC_CONTEXT_MANAGEMENT_BETA}"
+    return headers
 
 
 def openai_chat_message(

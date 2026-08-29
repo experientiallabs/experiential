@@ -434,6 +434,7 @@ def deployment_wire_entry(
     profile: GatewayWireProfile,
     upstream_payload: JsonObject,
     upstream_body: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -448,6 +449,9 @@ def deployment_wire_entry(
             ``upstream_payload`` is nulled out rather than doubling the
             boundary bytes for a value the data plane must not
             re-serialize.
+        headers: Optional per-request headers overriding the profile's
+            static wire headers (a beta token joining exactly the requests
+            that carry its gated field).
 
     Returns:
         The JSON-compatible wire entry consumed by the data plane.
@@ -457,7 +461,7 @@ def deployment_wire_entry(
         "deployment_id": deployment.deployment_id,
         "dialect": profile.dialect,
         "url": profile.url,
-        "headers": dict(profile.headers),
+        "headers": dict(profile.headers) if headers is None else dict(headers),
         "model_id": profile.model_id,
         "timeout_seconds": profile.timeout_seconds,
         "upstream_payload": None if upstream_body is not None else upstream_payload,

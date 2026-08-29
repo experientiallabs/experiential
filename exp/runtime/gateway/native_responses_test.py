@@ -157,10 +157,8 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
     assert payload["input"] == [
         {
             "type": "reasoning",
-            "id": "rs-0",
             "summary": [],
             "encrypted_content": "first-opaque",
-            "status": "completed",
         },
         {
             "type": "function_call",
@@ -172,10 +170,8 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
         },
         {
             "type": "reasoning",
-            "id": "rs-2",
             "summary": [],
             "encrypted_content": "second-opaque",
-            "status": "completed",
         },
         {"type": "function_call_output", "call_id": "call-one", "output": "tool-result"},
     ]
@@ -227,7 +223,7 @@ def test_remember_turn_replays_assistant_preamble_at_its_provider_output_index()
     )
     payload_input = cast(list[JsonObject], payload["input"])
     assert [(item["type"], item.get("id")) for item in payload_input[:-1]] == [
-        ("reasoning", "rs-0"),
+        ("reasoning", None),
         ("message", "msg-1"),
         ("function_call", "fc-2"),
     ]
@@ -240,7 +236,6 @@ def test_remember_turn_preserves_multiple_messages_status_phase_and_idless_call(
     """Retention and replay preserve every OpenAI 3.x output item field."""
     from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
     from openai.types.responses.response_output_message import ResponseOutputMessage
-    from openai.types.responses.response_reasoning_item import ResponseReasoningItem
 
     store = BoundedContinuationStore()
     context = _context()
@@ -320,7 +315,15 @@ def test_remember_turn_preserves_multiple_messages_status_phase_and_idless_call(
         "function_call",
         "message",
     ]
-    ResponseReasoningItem.model_validate(payload_input[0])
+    # The replayed reasoning item deliberately omits its id (the provider
+    # binds encrypted_content to the ORIGINAL id and an id-less item verifies
+    # against the embedded one), so it is not SDK-output-shaped; its fields
+    # are pinned directly instead.
+    assert payload_input[0] == {
+        "type": "reasoning",
+        "summary": [],
+        "encrypted_content": "opaque-incomplete",
+    }
     commentary = ResponseOutputMessage.model_validate(payload_input[1])
     call = ResponseFunctionToolCall.model_validate(payload_input[2])
     final = ResponseOutputMessage.model_validate(payload_input[3])

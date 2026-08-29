@@ -1212,10 +1212,8 @@ def test_native_openai_responses_retains_hidden_reasoning_for_tool_continuation(
     assert replay[-4:] == [
         {
             "type": "reasoning",
-            "id": "rs_provider",
             "summary": [],
             "encrypted_content": _ResponsesUpstream.encrypted_content,
-            "status": "completed",
         },
         {
             "type": "function_call",
@@ -1227,10 +1225,8 @@ def test_native_openai_responses_retains_hidden_reasoning_for_tool_continuation(
         },
         {
             "type": "reasoning",
-            "id": "rs_provider_2",
             "summary": [],
             "encrypted_content": "provider-opaque-state-2",
-            "status": "completed",
         },
         {
             "type": "function_call_output",
@@ -1277,10 +1273,8 @@ def test_native_openai_responses_retains_reasoning_only_continuations(
     replay = cast(list[JsonObject], upstream[1]["input"])
     assert replay[-2] == {
         "type": "reasoning",
-        "id": "rs_reason_only",
         "summary": [],
         "encrypted_content": "reason-only-opaque-state",
-        "status": "completed",
     }
 
 

@@ -1453,11 +1453,15 @@ def test_responses_payload_forwards_include_and_replays_reasoning_items() -> Non
     assert payload["store"] is False
     assert payload["include"] == ["reasoning.encrypted_content"]
     items = cast(list[JsonObject], payload["input"])
+    # The item id is never forwarded: the provider binds encrypted_content
+    # to its ORIGINAL item id and callers echo this gateway's minted public
+    # ids, so any forwarded id fails verification (live 2026-08-29:
+    # "Encrypted content item_id did not match"); an id-less item verifies
+    # against the id embedded in the payload itself.
     assert items[1] == {
         "type": "reasoning",
         "summary": [],
         "encrypted_content": "blob==",
-        "id": "rs_1",
     }
     assert items[2] == {"role": "assistant", "content": "done"}
 
@@ -1821,3 +1825,54 @@ def test_tool_call_cache_hint_forwards_to_anthropic_and_discloses_elsewhere() ->
     # The hint never perturbs digests, artifacts, or replay identity.
     bare = hinted.model_copy(update={"cache_control": None})
     assert sha256_json(hinted) == sha256_json(bare)
+
+
+def test_context_management_forwards_on_anthropic_and_discloses_elsewhere() -> None:
+    """Anthropic-native context editing forwards verbatim with its beta
+    header; any other route drops it with disclosure, never a rejection
+    (Claude Code sends the field by default)."""
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_CONTEXT_MANAGEMENT_BETA,
+        anthropic_request_headers,
+    )
+
+    config: JsonObject = {
+        "edits": [
+            {
+                "type": "clear_tool_uses_20250919",
+                "trigger": {"type": "input_tokens", "value": 30000},
+                "keep": {"type": "tool_uses", "value": 3},
+            }
+        ]
+    }
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        context_management=config,
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    assert payload["context_management"] == config
+
+    headers = anthropic_request_headers({"x-api-key": "k"}, request)
+    assert headers["anthropic-beta"] == ANTHROPIC_CONTEXT_MANAGEMENT_BETA
+    merged = anthropic_request_headers({"x-api-key": "k", "anthropic-beta": "other-beta"}, request)
+    assert merged["anthropic-beta"] == f"other-beta,{ANTHROPIC_CONTEXT_MANAGEMENT_BETA}"
+    bare = anthropic_request_headers(
+        {"x-api-key": "k"},
+        GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(GatewayMessage(role="user", content="go"),),
+        ),
+    )
+    assert "anthropic-beta" not in bare
+
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
+    public, provider = route_generation_parameter_requests((anthropic,), request)
+    assert "context_management" not in public.ignored_parameters
+    assert provider.context_management == config
+    public, provider = route_generation_parameter_requests((fallback,), request)
+    assert "context_management" in public.ignored_parameters
+    assert provider.context_management is None

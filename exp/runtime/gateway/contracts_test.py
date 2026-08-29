@@ -486,3 +486,28 @@ def test_reasoning_context_is_digest_excluded_but_joins_replay_identity() -> Non
             messages=messages,
             reasoning_context="all_turns",
         )
+
+
+def test_context_management_is_digest_excluded_but_joins_replay_identity() -> None:
+    """Config-free requests digest byte-identically to pre-field traffic."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.contracts import canonical_request_sha256
+
+    messages = (GatewayMessage(role="user", content="hi"),)
+    bare = GatewayRequest(surface=GatewayApiSurface.MESSAGES, messages=messages)
+    carried = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=messages,
+        context_management={"edits": [{"type": "clear_tool_uses_20250919"}]},
+    )
+    assert carried.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(carried) == sha256_json(bare)
+    assert canonical_request_sha256(bare) == sha256_json(bare)
+    assert canonical_request_sha256(carried) != canonical_request_sha256(bare)
+
+    with pytest.raises(ValidationError, match="context_management is valid only"):
+        GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=messages,
+            context_management={"edits": []},
+        )

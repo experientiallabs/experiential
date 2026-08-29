@@ -119,6 +119,7 @@ from exp.runtime.models.providers.errors import (
 )
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
+from exp.runtime.models.providers.wire_messages import anthropic_request_headers
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
     invalid_field,
@@ -476,6 +477,11 @@ class NativeControlPlane(NativeObservabilityMixin):
                 )
                 upstream_payload = dialect_stream_payload(profile, provider_request)
                 upstream_body, dispatch_signer = frozen_dispatch(profile, client, upstream_payload)
+                request_headers = (
+                    anthropic_request_headers(dict(profile.headers), provider_request)
+                    if profile.dialect == "anthropic_messages"
+                    else None
+                )
                 wire_route.append(
                     deployment_wire_entry(
                         route,
@@ -483,6 +489,7 @@ class NativeControlPlane(NativeObservabilityMixin):
                         profile,
                         upstream_payload,
                         upstream_body,
+                        headers=request_headers,
                     )
                 )
                 signers.append(dispatch_signer)

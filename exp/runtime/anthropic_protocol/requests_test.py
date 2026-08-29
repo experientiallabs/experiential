@@ -376,3 +376,29 @@ def test_tool_result_error_state_is_preserved_on_the_canonical_message() -> None
         )
     )
     assert plain.request.messages[0].tool_is_error is False
+
+
+def test_context_management_is_carried_verbatim_and_shallow_validated() -> None:
+    """Claude Code's context-editing config survives byte-for-byte.
+
+    Production incident (real Claude Code CLI, 2026-08-29): the field was a
+    conscious UNSUPPORTED and every default-configured session 400ed.
+    Validation is deliberately shallow (an object) because the nested shape
+    is an evolving provider beta the gateway forwards verbatim.
+    """
+    config: JsonObject = {
+        "edits": [
+            {
+                "type": "clear_tool_uses_20250919",
+                "trigger": {"type": "input_tokens", "value": 30000},
+                "keep": {"type": "tool_uses", "value": 3},
+            }
+        ]
+    }
+    decoded = decode_messages(_body(context_management=config))
+    assert decoded.request.context_management == config
+    assert decode_messages(_body()).request.context_management is None
+
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_messages(_body(context_management="clear"))
+    assert raised.value.detail.param == "context_management"

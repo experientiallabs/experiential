@@ -182,7 +182,10 @@ are accumulated in original order and validated only at the complete-call bounda
 authenticate with `x-api-key` (the Anthropic SDK default) or a standard Bearer header; both carry
 the same virtual key, and every failure on this surface is rendered in the Anthropic error
 envelope `{"type": "error", "error": {...}}`. The decoder translates text, `tool_use`,
-`tool_result`, `thinking`, and `redacted_thinking` blocks faithfully (thinking history rides an
+`tool_result`, `thinking`, and `redacted_thinking` blocks faithfully, and carries the caller's
+`context_management` object verbatim (shallow-validated as an object; Anthropic rungs receive it
+byte-for-byte together with its required `anthropic-beta` token, while non-Anthropic routes drop
+it with `ignored_parameters` disclosure) (thinking history rides an
 opaque provider-reasoning carrier with byte-exact signatures, and a caller `thinking`
 configuration is forwarded verbatim on models that honor it, overriding the catalog's
 adaptive default; on the adaptive-only generation, which rejects `enabled`/`disabled`
@@ -242,7 +245,9 @@ continuation and duplicate replay retain content only in bounded, process-local,
 alias-revision-scoped stores. A `store: false` request skips continuation retention entirely
 (continuing from its ID answers `continuation_unavailable`), and
 `include: ["reasoning.encrypted_content"]` forwards the encrypted reasoning request to native
-OpenAI Responses routes, whose opaque payloads replay verbatim from the caller's input. Replay is opt-in through an idempotency or client request key. Restart
+OpenAI Responses routes, whose opaque payloads replay verbatim from the caller's input; the
+replayed reasoning item's `id` is never forwarded upstream because the provider binds the
+encrypted payload to its original item id and callers echo this gateway's own minted public ids. Replay is opt-in through an idempotency or client request key. Restart
 or eviction returns an explicit unavailable error and never reconstructs content from SQLite.
 
 ## Content-free observability and lifecycle
