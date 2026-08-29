@@ -7,14 +7,15 @@ narrowing in ``generation_route_compat``, and the per-deployment capability
 preflight plus payload build in the control plane's admit loop). This module
 owns the step AFTER all three fail: the minimal COERCE-WITH-DISCLOSURE that
 keeps a request servable when semantics allow; when they do not, the rung's
-own field-scoped rejection stays the answer. A coercion is never silent: every substitution is
-disclosed through ``ignored_parameters`` in ``path->effective`` form, logged,
-and counted by the control plane's admission metrics.
+own field-scoped rejection stays the answer. A coercion is never silent:
+every substitution is disclosed through ``ignored_parameters`` in
+``path->effective`` form, logged, and counted by the control plane's
+admission metrics.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -53,6 +54,8 @@ class RequestCoercion:
 def coerce_generation_parameters(
     profiles: Sequence[GatewayWireProfile],
     request: GatewayRequest,
+    *,
+    admits: Callable[[GatewayRequest], bool] | None = None,
 ) -> RequestCoercion | None:
     """Build the minimal disclosed coercion after verbatim narrowing failed.
 
@@ -68,6 +71,11 @@ def coerce_generation_parameters(
     Args:
         profiles: Ordered wire profiles for every live route deployment.
         request: Decoded public request that no rung accepted verbatim.
+        admits: Optional caller probe that must accept a candidate before it
+            is offered. Admission passes its full downstream pipeline here
+            (deployment capability preflight included), because this module
+            sees only wire profiles and a candidate that dies one layer
+            later would block a farther candidate that serves.
 
     Returns:
         The disclosed substitution to retry with, or ``None`` when nothing
@@ -79,12 +87,15 @@ def coerce_generation_parameters(
     for profile in profiles:
         ladder.update(profile_reasoning_efforts(profile))
     if not ladder:
-        if request.reasoning_effort == "none":
-            return RequestCoercion(
-                request=request.model_copy(update={"reasoning_effort": None}),
-                disclosures=(EFFORT_DROP_DISCLOSURE,),
-            )
-        return None
+        if request.reasoning_effort != "none":
+            return None
+        dropped_request = request.model_copy(update={"reasoning_effort": None})
+        if admits is not None and not admits(dropped_request):
+            return None
+        return RequestCoercion(
+            request=dropped_request,
+            disclosures=(EFFORT_DROP_DISCLOSURE,),
+        )
     if request.reasoning_effort in ladder:
         # The effort itself is portable; the verbatim failure lies elsewhere
         # and a snap would change semantics for nothing.
@@ -106,6 +117,8 @@ def coerce_generation_parameters(
                 snapped_request,
             )
         except (ProviderParameterError, ProviderCapabilityError):
+            continue
+        if admits is not None and not admits(snapped_request):
             continue
         return RequestCoercion(
             request=snapped_request,

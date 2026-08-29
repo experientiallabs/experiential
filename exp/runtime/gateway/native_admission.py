@@ -78,6 +78,46 @@ def admitted_route_requests(
     """
     admitted_request = request
     coercion_disclosures: tuple[str, ...] = ()
+    full_route = route
+    full_wires = resolved_wires
+
+    def candidate_serves(candidate: GatewayRequest) -> bool:
+        """Probe the full admission pipeline for one coercion candidate.
+
+        The policy layer sees only wire profiles, so without this probe a
+        candidate could pass generation narrowing yet land on rungs that all
+        fail deployment capability preflight, blocking a farther candidate
+        whose rungs serve.
+        """
+        try:
+            candidate_indexes = compatible_generation_parameter_profile_indexes(
+                tuple(profile for profile, _client in full_wires),
+                candidate,
+            )
+            candidate_route = select_route_deployments(full_route, candidate_indexes)
+            candidate_wires = tuple(full_wires[index] for index in candidate_indexes)
+            candidate_public, candidate_provider = route_generation_parameter_requests(
+                tuple(profile for profile, _client in candidate_wires),
+                candidate,
+            )
+        except (ProviderParameterError, ProviderCapabilityError):
+            return False
+        candidate_provider = candidate_provider.model_copy(
+            update={"stream": True, "include_usage": True}
+        )
+        indexes, errors = protocol_compatible_indexes(
+            candidate_route,
+            candidate_wires,
+            candidate_provider,
+            public_stream=candidate_public.stream,
+        )
+        if indexes:
+            return True
+        # A unanimously coercible capability rejection still serves: the
+        # capability coercion runs after the snap and clears it.
+        blocking = route_wide_capability(errors, len(candidate_route.deployments))
+        return blocking is not None and coerce_capability(blocking, candidate) is not None
+
     try:
         compatible_indexes = compatible_generation_parameter_profile_indexes(
             tuple(profile for profile, _client in resolved_wires),
@@ -90,6 +130,7 @@ def admitted_route_requests(
         coercion = coerce_generation_parameters(
             tuple(profile for profile, _client in resolved_wires),
             admitted_request,
+            admits=candidate_serves,
         )
         if coercion is None:
             raise

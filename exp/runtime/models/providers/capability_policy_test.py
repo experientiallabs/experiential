@@ -186,3 +186,51 @@ def test_effort_snap_requires_route_wide_construction_to_survive() -> None:
     # Fireworks rung alone and serves.
     assert coercion.request.reasoning_effort == "high"
     assert coercion.disclosures == ("reasoning_effort->high",)
+
+
+def test_effort_snap_honors_the_admission_probe() -> None:
+    """A candidate the downstream pipeline rejects must not block a farther
+    one: the policy layer sees only wire profiles, so admission probes each
+    candidate through deployment preflight before the snap is offered."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://a.test",
+        model_id="gpt-5.1",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("medium", "high"),
+    )
+    probed: list[str | None] = []
+
+    def only_high_serves(candidate: GatewayRequest) -> bool:
+        probed.append(candidate.reasoning_effort)
+        return candidate.reasoning_effort == "high"
+
+    coercion = coerce_generation_parameters(
+        (profile,),
+        _request(reasoning_effort="low"),
+        admits=only_high_serves,
+    )
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.disclosures == ("reasoning_effort->high",)
+    # medium is nearer to low and passes every profile-level check; only the
+    # probe knows its rungs die at deployment preflight.
+    assert probed == ["medium", "high"]
+
+
+def test_effort_none_drop_honors_the_admission_probe() -> None:
+    """The disclosed none-drop is withheld when downstream cannot serve it."""
+    no_reasoning = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://a.test",
+        model_id="kimi-k3",
+    )
+    assert (
+        coerce_generation_parameters(
+            (no_reasoning,),
+            _request(reasoning_effort="none"),
+            admits=lambda _candidate: False,
+        )
+        is None
+    )
