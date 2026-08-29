@@ -426,8 +426,13 @@ def _issuing_turn_sha256(
 
 
 def _normalized_content(content: str | None) -> str | None:
-    """Return absent text for the empty string a tool-only turn may carry."""
-    return content or None
+    """Return absent text for the blank text a tool-only turn may carry.
+
+    A tool-only turn shows the caller no text, whether the provider streamed nothing,
+    the empty string, or padding such as a pair of newlines. Any client is free to trim
+    or drop that, so every blank form is the same visible turn.
+    """
+    return content if content and content.strip() else None
 
 
 def _normalized_arguments(value: JsonValue) -> JsonValue:

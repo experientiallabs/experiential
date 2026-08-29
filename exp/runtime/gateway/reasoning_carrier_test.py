@@ -247,6 +247,27 @@ def test_carrier_authenticates_a_client_reencoding_of_the_same_turn() -> None:
     assert block.content == "hidden"
 
 
+def test_carrier_authenticates_a_turn_whose_blank_text_the_client_dropped() -> None:
+    """Whitespace a provider pads a tool-only turn with is not visible text."""
+    authority = _authority()
+    carrier = seal_reasoning_content(
+        authority,
+        issuing_request_id="issuing-request",
+        issuing_route_depth=0,
+        issuing_history_sha256=_HISTORY_SHA256,
+        assistant_content="\n\n",
+        tool_calls=_tool_calls("call-one"),
+        content="hidden",
+    )
+    block, _claims = unseal_reasoning_content(
+        parse_reasoning_content_carrier(carrier),
+        authority,
+        assistant_content=None,
+        tool_calls=_tool_calls("call-one"),
+    )
+    assert block.content == "hidden"
+
+
 def test_carrier_rejects_a_number_no_float_names_exactly() -> None:
     """Beyond the exact integers a float stops standing in for one integer value."""
     authority = _authority()
