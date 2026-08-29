@@ -12,9 +12,9 @@
 //!
 //! | dialect                 | source                                        |
 //! |-------------------------|-----------------------------------------------|
-//! | `OpenAiResponses`       | `error.param` field, verbatim JSON string      |
-//! | `OpenAiCompatible`      | `error.param` field, verbatim JSON string      |
-//! | `AnthropicMessages`     | leading `path: ` token of `error.message`      |
+//! | `OpenAiResponses`       | `error.param`, else fixed unknown-argument msg |
+//! | `OpenAiCompatible`      | `error.param`, else fixed unknown-argument msg |
+//! | `AnthropicMessages`     | leading `path: ` or `` `path` `` message token |
 //! | `GeminiGenerateContent` | `fieldViolations[].field`, else `* path: ` msg |
 //! | `BedrockConverseStream` | none — no machine-readable parameter contract  |
 
@@ -25,6 +25,12 @@ use crate::dialects::Dialect;
 /// Longest parameter path relayed; anything longer is treated as prose.
 const MAXIMUM_PATH_LENGTH: usize = 128;
 
+/// Fixed OpenAI-family prefix naming one unsupported argument.
+const UNKNOWN_ARGUMENT_PREFIXES: [&str; 2] = [
+    "Unrecognized request argument supplied: ",
+    "Unknown parameter: ",
+];
+
 /// Extract the provider-named parameter path from one client-error body.
 ///
 /// Returns `Some(path)` only when the dialect's documented source yields a
@@ -34,20 +40,47 @@ const MAXIMUM_PATH_LENGTH: usize = 128;
 pub fn rejected_parameter(dialect: Dialect, body: &str) -> Option<String> {
     let value: Value = serde_json::from_str(body).ok()?;
     let candidate = match dialect {
-        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => value
-            .get("error")?
-            .get("param")?
-            .as_str()
-            .map(str::to_string),
+        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
+            let error = value.get("error")?;
+            match error.get("param").and_then(Value::as_str) {
+                Some(param) => Some(param.to_string()),
+                None => unknown_argument_name(error.get("message")?.as_str()?),
+            }
+        }
         Dialect::AnthropicMessages => {
             let message = value.get("error")?.get("message")?.as_str()?;
-            let (head, _rest) = message.split_once(": ")?;
-            Some(head.to_string())
+            match message.split_once(": ") {
+                Some((head, _rest)) if valid_parameter_path(head) => Some(head.to_string()),
+                _ => quoted_leading_name(message),
+            }
         }
         Dialect::GeminiGenerateContent => gemini_field_violation(&value),
         Dialect::BedrockConverseStream => None,
     }?;
     valid_parameter_path(&candidate).then_some(candidate)
+}
+
+/// The argument named after one fixed OpenAI-family unknown-argument prefix.
+///
+/// Azure's OpenAI surface reports an unsupported sampling field this way and
+/// carries no `param`, so the name lives in an otherwise fixed sentence. Only
+/// the trailing name is read, and only when the sentence matches exactly.
+fn unknown_argument_name(message: &str) -> Option<String> {
+    UNKNOWN_ARGUMENT_PREFIXES.iter().find_map(|prefix| {
+        let name = message.strip_prefix(prefix)?.trim_end_matches('.');
+        Some(name.trim_matches('\'').to_string())
+    })
+}
+
+/// The backtick-quoted name one message opens with.
+///
+/// Anthropic reports a per-model sampling refusal as `` `top_p` is deprecated
+/// for this model. ``, naming the field only inside the prose it otherwise
+/// owns. Only the quoted leading token is read; the prose is discarded.
+fn quoted_leading_name(message: &str) -> Option<String> {
+    let rest = message.strip_prefix('`')?;
+    let (name, _prose) = rest.split_once('`')?;
+    Some(name.to_string())
 }
 
 /// `fieldViolations[].field` when a `google.rpc.BadRequest` detail exists,
@@ -162,6 +195,45 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_backtick_quoted_leading_name_is_relayed() {
+        // Exact body captured live from api.anthropic.com (2026-08-29): the
+        // per-model sampling refusal names the field only inside prose.
+        let body = r#"{"type": "error", "error": {"type": "invalid_request_error",
+            "message": "`top_p` is deprecated for this model."}}"#;
+        assert_eq!(
+            rejected_parameter(Dialect::AnthropicMessages, body).as_deref(),
+            Some("top_p")
+        );
+        // A quoted phrase is prose, not a path, so nothing is relayed.
+        let quoted_prose = r#"{"type": "error", "error": {
+            "message": "`contact support` for account 4821 to continue."}}"#;
+        assert_eq!(
+            rejected_parameter(Dialect::AnthropicMessages, quoted_prose),
+            None
+        );
+    }
+
+    #[test]
+    fn openai_family_unknown_argument_sentence_is_relayed_without_a_param() {
+        // Exact body captured live from Azure's OpenAI surface (2026-08-29).
+        let body = r#"{"error": {"code": "unrecognized_request_argument",
+            "message": "Unrecognized request argument supplied: top_k",
+            "details": "Unrecognized request argument supplied: top_k"}}"#;
+        assert_eq!(
+            rejected_parameter(Dialect::OpenAiCompatible, body).as_deref(),
+            Some("top_k")
+        );
+        let quoted = r#"{"error": {"message": "Unknown parameter: 'response_format'."}}"#;
+        assert_eq!(
+            rejected_parameter(Dialect::OpenAiResponses, quoted).as_deref(),
+            Some("response_format")
+        );
+        // Any other message keeps the content-free failure.
+        let other = r#"{"error": {"message": "This model is not available to your account."}}"#;
+        assert_eq!(rejected_parameter(Dialect::OpenAiCompatible, other), None);
+    }
+
+    #[test]
     fn gemini_message_path_token_is_relayed_without_violation_details() {
         // Exact live shape from generativelanguage.googleapis.com (2026-08-29).
         let body = r#"{"error": {"code": 400, "status": "INVALID_ARGUMENT",
@@ -264,8 +336,10 @@ mod tests {
     /// production path.
     fn extraction_classification(dialect: Dialect) -> &'static str {
         match dialect {
-            Dialect::OpenAiResponses | Dialect::OpenAiCompatible => "error.param field",
-            Dialect::AnthropicMessages => "leading path token of error.message",
+            Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
+                "error.param field, else fixed unknown-argument message"
+            }
+            Dialect::AnthropicMessages => "leading path or backtick-quoted token of error.message",
             Dialect::GeminiGenerateContent => {
                 "google.rpc.BadRequest fieldViolations, else leading message path token"
             }
