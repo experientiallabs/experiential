@@ -648,9 +648,8 @@ def openai_responses_stream_payload(
         "store": False,
         "stream": True,
     }
-    if request.include_encrypted_reasoning or (
-        supports_reasoning and request.response_store is not False
-    ):
+    response_store = request.response_store
+    if request.include_encrypted_reasoning or supports_reasoning and response_store is not False:
         payload["include"] = ["reasoning.encrypted_content"]
     if instructions:
         payload["instructions"] = "\n\n".join(instructions)

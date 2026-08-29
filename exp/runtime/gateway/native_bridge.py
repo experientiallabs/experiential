@@ -33,7 +33,6 @@ metrics and fails the request closed with the shared internal error.
 from __future__ import annotations
 
 import json
-import logging
 import time
 from collections.abc import Callable
 
@@ -54,21 +53,32 @@ from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
+    record_dead_admission_rungs,
 )
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
+from exp.runtime.gateway.native_continuation import (
+    continuation_binding_error as _continuation_binding_error,
+)
+from exp.runtime.gateway.native_continuation import (
+    remember_continuation,
+)
+from exp.runtime.gateway.native_continuation import (
+    require_bound_wire_authority as _require_bound_wire_authority,
+)
+from exp.runtime.gateway.native_continuation import (
+    select_bound_continuation_route as _select_bound_continuation_route,
+)
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
 from exp.runtime.gateway.native_dispatch import dispatch_signature_headers, frozen_dispatch
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     MAXIMUM_TOTAL_ATTEMPTS,
-    DeadRung,
     FrozenDispatchBinding,
     InflightRequest,
     NativeDialectUnavailableError,
-    deployment_health_key,
     deployment_wire_entry,
     dispatchable_route_profiles,
     resolve_route_profiles,
@@ -79,7 +89,6 @@ from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continuation_route_binding,
     continued_request,
-    remember_turn,
     responses_envelope,
 )
 from exp.runtime.gateway.native_settlement import (
@@ -112,58 +121,10 @@ from exp.runtime.openai_protocol.errors import (
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
-    ContinuationRouteBinding,
     ProtocolNamespace,
     episode_namespace,
     replay_key,
 )
-
-
-def _continuation_binding_error() -> OpenAIProtocolError:
-    """Return the public fail-closed error for unavailable replay authority."""
-    return OpenAIProtocolError(
-        status_code=400,
-        code="continuation_unavailable",
-        message=(
-            "previous_response_id cannot be replayed on its original provider authority. "
-            "Resend the full conversation history in this request."
-        ),
-        param="previous_response_id",
-    )
-
-
-def _select_bound_continuation_route(
-    route: GatewayRoute,
-    binding: ContinuationRouteBinding | None,
-) -> GatewayRoute:
-    """Pin retained encrypted reasoning to its exact winning deployment."""
-    if binding is None:
-        return route
-    indexes = tuple(
-        index
-        for index, deployment in enumerate(route.deployments)
-        if deployment.deployment_id == binding.deployment_id
-        and deployment.connection_sha256 == binding.connection_sha256
-    )
-    if len(indexes) != 1:
-        raise _continuation_binding_error()
-    return select_route_deployments(route, indexes)
-
-
-def _require_bound_wire_authority(
-    binding: ContinuationRouteBinding | None,
-    route: GatewayRoute,
-    resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...],
-) -> None:
-    """Reject credential or wire drift for retained encrypted reasoning."""
-    if binding is None:
-        return
-    if len(route.deployments) != 1 or len(resolved_wires) != 1:
-        raise _continuation_binding_error()
-    observed = continuation_route_binding(route.deployment, resolved_wires[0][0])
-    if observed != binding:
-        raise _continuation_binding_error()
-
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
 _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
@@ -251,9 +212,6 @@ def _public_capability_error(
         ),
         param="model",
     )
-
-
-_logger = logging.getLogger(__name__)
 
 
 def _escalation(reason: str) -> str:
@@ -492,7 +450,8 @@ class NativeControlPlane(NativeObservabilityMixin):
             # connection) is skipped so a live fallback still serves the
             # request instead of the whole request failing on a dead lead.
             dispatchable = dispatchable_route_profiles(self._components.runtime_catalogs, route)
-            self._record_dead_admission_rungs(
+            record_dead_admission_rungs(
+                self._accounting,
                 authorization,
                 dispatchable.dead,
                 fallback_available=bool(dispatchable.indexes),
@@ -928,29 +887,12 @@ class NativeControlPlane(NativeObservabilityMixin):
             NativeBridgeError: The continuation exceeds the bounded store or
                 a completed tool call carried malformed fields.
         """
-        data = json.loads(argument)
-        request_id = str(data["request_id"])
-        entry = self._accounting.entry(request_id)
-        if entry is None or entry.continuation is None:
-            return "{}"
-        context = entry.continuation
-        route_binding = None
-        if entry.active_attempt_id is not None:
-            depth = entry.attempt_depths.get(entry.active_attempt_id)
-            if depth is not None and depth < len(context.route_bindings):
-                route_binding = context.route_bindings[depth]
         try:
-            remember_turn(
-                self._continuations,
-                context=context,
-                data=data,
-                route_binding=route_binding,
-            )
+            return remember_continuation(self._accounting, self._continuations, argument)
         except OpenAIProtocolError as exc:
             raise NativeBridgeError(exc) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
-        return "{}"
 
     def _decode_body(
         self,
@@ -970,47 +912,6 @@ class NativeControlPlane(NativeObservabilityMixin):
             )
         except NativeDecodeError as exc:
             raise NativeBridgeError(exc.error) from exc
-
-    def _record_dead_admission_rungs(
-        self,
-        authorization: AuthorizationSnapshot,
-        dead: tuple[DeadRung, ...],
-        *,
-        fallback_available: bool,
-    ) -> None:
-        """Feed each admission-dead rung into its health circuit and surface it.
-
-        A rung skipped because it was operationally dead at admission is
-        recorded in the same deployment health circuit as a runtime failure,
-        so the existing cooldown and half-open probe bring it back
-        automatically when it heals; it is never permanently blacklisted. A
-        skipped lead rung is logged and counted so a persistently dead lead
-        reaches a human instead of being silently masked behind a healthy
-        fallback forever. That masking signal only exists when a live
-        fallback actually serves: a total route outage escalates loudly on
-        its own path and must not read as one more fallback-served request.
-
-        Args:
-            authorization: Frozen authority for the accepted request.
-            dead: Every rung skipped as operationally dead, in route order.
-            fallback_available: Whether any live rung remains to serve.
-        """
-        if not dead:
-            return
-        health = self._accounting.health
-        for rung in dead:
-            health.failed(deployment_health_key(authorization, rung.deployment), rung.failure)
-        lead = next((rung for rung in dead if rung.index == 0), None)
-        lead_masked = lead is not None and fallback_available
-        self._accounting.record_admission_rung_skips(len(dead), lead_skipped=lead_masked)
-        if lead is not None and fallback_available:
-            _logger.warning(
-                "gateway admission skipped the lead rung for alias %r: served off a "
-                "fallback because deployment %r (provider %r) was dead at admission",
-                authorization.alias,
-                lead.deployment.deployment_id,
-                lead.deployment.provider,
-            )
 
     def _escalate_accepted(self, authorization: AuthorizationSnapshot, reason: str) -> str:
         """Finish one accepted-but-unservable request and return its disposition.

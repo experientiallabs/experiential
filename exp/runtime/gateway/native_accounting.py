@@ -13,6 +13,7 @@ string, matching the bridge boundary.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -35,6 +36,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
+    DeadRung,
     InflightRequest,
     claim_route_from,
     deployment_health_key,
@@ -50,6 +52,7 @@ from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failu
 _SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
 _SWEEP_BATCH = 16
+_logger = logging.getLogger(__name__)
 
 
 class NativeBridgeError(Exception):
@@ -635,3 +638,31 @@ class NativeAttemptAccounting:
             elif entry.active_attempt_id == attempt_id:
                 entry.active_attempt_id = None
         return True
+
+
+def record_dead_admission_rungs(
+    accounting: NativeAttemptAccounting,
+    authorization: AuthorizationSnapshot,
+    dead: tuple[DeadRung, ...],
+    *,
+    fallback_available: bool,
+) -> None:
+    """Record admission-dead rungs and surface a lead masked by fallback."""
+    if not dead:
+        return
+    for rung in dead:
+        accounting.health.failed(
+            deployment_health_key(authorization, rung.deployment),
+            rung.failure,
+        )
+    lead = next((rung for rung in dead if rung.index == 0), None)
+    lead_masked = lead is not None and fallback_available
+    accounting.record_admission_rung_skips(len(dead), lead_skipped=lead_masked)
+    if lead is not None and fallback_available:
+        _logger.warning(
+            "gateway admission skipped the lead rung for alias %r: served off a "
+            "fallback because deployment %r (provider %r) was dead at admission",
+            authorization.alias,
+            lead.deployment.deployment_id,
+            lead.deployment.provider,
+        )
