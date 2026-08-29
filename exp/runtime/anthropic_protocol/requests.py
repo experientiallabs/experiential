@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.model import ToolCall
+from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.anthropic_protocol.manifest import MESSAGES_MANIFEST
 from exp.runtime.gateway.contracts import (
     CompatibilityDisposition,
@@ -34,6 +34,7 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
+from exp.runtime.models.providers.reasoning_compat import REASONING_EFFORTS
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
     invalid_field,
@@ -119,9 +120,14 @@ _ContentBlock = (
 
 
 class _Message(_WireModel):
-    """One Anthropic conversation turn."""
+    """One Anthropic conversation turn.
 
-    role: Literal["user", "assistant"]
+    ``system`` is a first-class mid-conversation role on the live API (the
+    provider itself enforces its placement rules); Claude Code appends one
+    system turn by default.
+    """
+
+    role: Literal["user", "assistant", "system"]
     content: str | tuple[_ContentBlock, ...]
     cache_control: _CacheControl | None = None
 
@@ -155,6 +161,10 @@ class _ThinkingConfig(_WireModel):
 
     type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: int | None = Field(default=None, gt=0)
+    display: str | None = Field(default=None, max_length=64)
+    """Display disposition, forwarded verbatim (Claude Code sends "omitted";
+    accepted live without a beta, 2026-08-30). Bounded but deliberately not
+    enumerated: the value set is an evolving provider surface."""
 
     @model_validator(mode="after")
     def _require_budget_only_when_enabled(self) -> _ThinkingConfig:
@@ -183,6 +193,7 @@ class _MessagesRequest(_WireModel):
     metadata: _Metadata | None = None
     thinking: _ThinkingConfig | None = None
     context_management: JsonObject | None = None
+    output_config: JsonObject | None = None
 
 
 def decode_messages(payload: JsonObject) -> DecodedGatewayRequest:
@@ -234,10 +245,34 @@ def decode_messages(payload: JsonObject) -> DecodedGatewayRequest:
                 cast(JsonObject, payload["thinking"]) if request.thinking is not None else None
             ),
             context_management=_context_management(payload),
+            reasoning_effort=_output_config_effort(request.output_config),
+            provider_output_config=(
+                cast(JsonObject, payload["output_config"])
+                if request.output_config is not None
+                else None
+            ),
         )
     except ValidationError as exc:
         raise _validation_error(exc.errors(include_url=False)[0]) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
+
+
+def _output_config_effort(config: JsonObject | None) -> ReasoningEffort | None:
+    """Map a canonical caller ``output_config.effort`` into the shared field.
+
+    A canonical ladder value rides ``reasoning_effort`` so route narrowing,
+    the coercion policy, and non-Anthropic rungs all see it; the raw object
+    still forwards verbatim on Anthropic rungs with the caller's keys
+    winning, so an unrecognized future effort value stays provider-decided
+    instead of gateway-rejected.
+    """
+    if config is None:
+        return None
+    effort = config.get("effort")
+    if isinstance(effort, str) and effort in REASONING_EFFORTS:
+        # The membership check above is the narrowing proof for this cast.
+        return cast("ReasoningEffort", effort)
+    return None
 
 
 def _context_management(payload: JsonObject) -> JsonObject | None:

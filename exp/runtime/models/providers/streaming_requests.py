@@ -14,7 +14,6 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
-from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -25,7 +24,6 @@ from exp.runtime.models.providers.fireworks import (
     prepare_gateway_reasoning_history,
     require_responses_continuation_channel,
 )
-from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.generation_parameter_validation import (
     effective_profile_reasoning_effort as _effective_profile_reasoning_effort,
 )
@@ -35,20 +33,22 @@ from exp.runtime.models.providers.generation_parameter_validation import (
 from exp.runtime.models.providers.generation_parameter_validation import (
     require_route_numeric_parameter as _require_route_numeric_parameter,
 )
+from exp.runtime.models.providers.messages_payloads import (
+    anthropic_messages_stream_payload,
+    bedrock_converse_stream_payload,
+    gemini_generate_content_stream_payload,
+)
 from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
     anthropic_adaptive_only_thinking,
-    anthropic_reasoning_effort,
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
 )
 from exp.runtime.models.providers.wire_messages import (
     add_openai_tools,
-    anthropic_blocks,
     openai_chat_message,
     responses_items,
 )
-from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -180,6 +180,18 @@ def dialect_stream_payload(
             fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")
+
+
+def _mid_conversation_system_present(request: GatewayRequest) -> bool:
+    """Whether a system turn appears after the conversation has begun."""
+    conversation_started = False
+    for message in request.messages:
+        if message.role in {"system", "developer"} and message.provider_native_item is None:
+            if conversation_started:
+                return True
+        else:
+            conversation_started = True
+    return False
 
 
 def route_generation_parameter_requests(
@@ -399,6 +411,29 @@ def route_generation_parameter_requests(
     ):
         ignore("context_management")
 
+    # A caller output_config whose only content is a canonical effort rides
+    # reasoning_effort everywhere; anything more is Anthropic-native and is
+    # disclosed-dropped when any rung cannot honor it (Claude Code sends
+    # {"effort": ...} by default).
+    if request.provider_output_config is not None and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        effort_only = set(request.provider_output_config) <= {"effort"}
+        if not (effort_only and request.reasoning_effort is not None):
+            ignore("provider_output_config", "output_config")
+
+    # Client telemetry and the verbosity hint are native Responses surface;
+    # elsewhere they are dropped with disclosure (Codex sends both by
+    # default), never a rejection.
+    if request.client_metadata is not None and not all(
+        profile.dialect == "openai_responses" for profile in profiles
+    ):
+        ignore("client_metadata")
+    if request.text_verbosity is not None and not all(
+        profile.dialect == "openai_responses" for profile in profiles
+    ):
+        ignore("text_verbosity", "text.verbosity")
+
     # A tool-call cache hint is honored only on the Anthropic wire; any other
     # rung silently cannot cache, so the omission is disclosed, never a
     # rejection (a cache hint changes cost, not semantics).
@@ -459,6 +494,35 @@ def route_generation_parameter_requests(
                 param="thinking.type",
                 code="unsupported_parameter",
             )
+    if any(message.provider_native_item is not None for message in request.messages) and not all(
+        profile.dialect == "openai_responses" for profile in profiles
+    ):
+        raise ProviderParameterError(
+            message=(
+                "The request carries native Responses input items (tool namespaces or "
+                "custom tool calls) that only a native OpenAI Responses route can serve. "
+                "Choose a different model alias."
+            ),
+            param="input",
+            code="unsupported_parameter",
+        )
+
+    # A system turn after conversation began has positional semantics that
+    # instruction-hoisting wires cannot preserve; those rungs narrow out.
+    if _mid_conversation_system_present(request) and any(
+        profile.dialect in {"gemini_generate_content", "bedrock_converse_stream"}
+        for profile in profiles
+    ):
+        raise ProviderParameterError(
+            message=(
+                "A system message after conversation start is not supported by this "
+                "model route. Move the instruction to the leading system prompt or "
+                "choose a different model."
+            ),
+            param="messages",
+            code="unsupported_parameter",
+        )
+
     encrypted_reasoning_present = any(
         block.kind == "encrypted_reasoning"
         for message in request.messages
@@ -601,10 +665,20 @@ def openai_responses_stream_payload(
     instructions: list[str] = []
     items: list[JsonObject] = []
     for message in request.messages:
-        if message.role in {"system", "developer"}:
+        if message.provider_native_item is not None:
+            # Codex-native input items (tool namespaces, freeform tool
+            # history) re-emit byte-for-byte at their position; route
+            # admission already required every rung to speak this wire.
+            items.append(message.provider_native_item)
+        elif message.role in {"system", "developer"}:
             if message.content is None:
                 raise ProviderResponseError("instruction messages require text")
-            instructions.append(message.content)
+            # Leading instructions ride the instructions field; one arriving
+            # after conversation began keeps its position as an input item.
+            if items:
+                items.append({"role": message.role, "content": message.content})
+            else:
+                instructions.append(message.content)
         else:
             items.extend(responses_items(message))
     # Upstream storage stays disabled regardless of the caller's `store`
@@ -625,6 +699,13 @@ def openai_responses_stream_payload(
     add_openai_tools(payload, request, responses=True)
     if request.parallel_tool_calls is not None:
         payload["parallel_tool_calls"] = request.parallel_tool_calls
+    if request.client_metadata is not None:
+        # Opaque client telemetry, forwarded verbatim (standard Responses
+        # surface: accepted live with a plain API key, 2026-08-29).
+        payload["client_metadata"] = request.client_metadata
+    text_payload: JsonObject = {}
+    if request.text_verbosity is not None:
+        text_payload["verbosity"] = request.text_verbosity
     if request.structured_text is not None:
         format_payload: JsonObject = {
             "type": "json_schema",
@@ -634,7 +715,9 @@ def openai_responses_stream_payload(
         }
         if request.structured_text.description is not None:
             format_payload["description"] = request.structured_text.description
-        payload["text"] = {"format": format_payload}
+        text_payload["format"] = format_payload
+    if text_payload:
+        payload["text"] = text_payload
     if request.maximum_output_tokens is not None:
         payload["max_output_tokens"] = request.maximum_output_tokens
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
@@ -667,231 +750,6 @@ def openai_responses_stream_payload(
     if reasoning:
         payload["reasoning"] = reasoning
     return payload
-
-
-def anthropic_messages_stream_payload(
-    model_id: str,
-    request: GatewayRequest,
-    *,
-    supports_temperature: bool = True,
-    supports_top_p: bool = True,
-    supports_top_k: bool = False,
-    supports_logprobs: bool = False,
-    supports_reasoning: bool = False,
-    reasoning_effort: str | None = None,
-) -> JsonObject:
-    """Translate one canonical request to native streaming Messages JSON.
-
-    Args:
-        model_id: Exact Anthropic model identifier.
-        request: Canonical gateway request.
-
-    Returns:
-        Native Messages request with streaming enabled.
-
-    Raises:
-        ProviderResponseError: Instruction or message content is malformed.
-    """
-    # Anthropic Messages has no compatible logprob request/response surface in
-    # this adapter. Keep the shared route signature for capability plumbing,
-    # but never put an OpenAI-shaped field on the Anthropic wire.
-    del supports_logprobs
-    system_parts: list[str] = []
-    messages: list[JsonObject] = []
-    for message in request.messages:
-        if message.role in {"system", "developer"}:
-            if message.content is None:
-                raise ProviderResponseError("instruction messages require text")
-            system_parts.append(message.content)
-            continue
-        role, blocks = anthropic_blocks(message)
-        if messages and messages[-1].get("role") == role:
-            existing = messages[-1].get("content")
-            if not isinstance(existing, list):
-                raise ProviderResponseError("Anthropic message content is malformed")
-            existing.extend(blocks)
-        else:
-            messages.append({"role": role, "content": blocks})
-    payload: JsonObject = {
-        "model": model_id,
-        "messages": messages,
-        "max_tokens": request.maximum_output_tokens or 4096,
-        "stream": True,
-    }
-    if system_parts:
-        payload["system"] = "\n\n".join(system_parts)
-    if request.tools:
-        tools: list[JsonObject] = []
-        for tool in request.tools:
-            translated: JsonObject = {
-                "name": tool.name,
-                "input_schema": tool.parameters,
-            }
-            # Anthropic rejects an explicit null description ("Input should
-            # be a valid string"), so an absent description stays absent.
-            if tool.description is not None:
-                translated["description"] = tool.description
-            if tool.strict:
-                translated["strict"] = True
-            tools.append(translated)
-        payload["tools"] = tools
-    tool_choice: JsonObject | None = None
-    if request.tool_choice is not None:
-        if isinstance(request.tool_choice, GatewayNamedToolChoice):
-            tool_choice = {"type": "tool", "name": request.tool_choice.name}
-        else:
-            mapping = {"auto": "auto", "none": "none", "required": "any"}
-            tool_choice = {"type": mapping[request.tool_choice]}
-    if request.parallel_tool_calls is not None:
-        tool_choice = tool_choice or {"type": "auto"}
-        tool_choice["disable_parallel_tool_use"] = not request.parallel_tool_calls
-    if tool_choice is not None:
-        payload["tool_choice"] = tool_choice
-    if request.temperature is not None and supports_temperature:
-        payload["temperature"] = request.temperature
-    if request.top_p is not None and supports_top_p:
-        payload["top_p"] = request.top_p
-    if request.top_k is not None and supports_top_k:
-        payload["top_k"] = request.top_k
-    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
-    output_config: JsonObject = {}
-    if request.context_management is not None:
-        # Anthropic-native context editing forwards byte-for-byte; the
-        # required beta header joins the dispatch via
-        # anthropic_request_headers.
-        payload["context_management"] = request.context_management
-    if request.provider_thinking_config is not None:
-        # The caller's exact thinking configuration wins over the catalog's
-        # adaptive default and travels verbatim, so budget semantics are
-        # never reinterpreted by the gateway. An adaptive config (caller-sent
-        # or route-translated) still composes with the route's pinned effort,
-        # exactly like a request that carried no thinking config.
-        payload["thinking"] = request.provider_thinking_config
-        if (
-            request.provider_thinking_config.get("type") == "adaptive"
-            and supports_reasoning
-            and effective_reasoning_effort is not None
-        ):
-            output_config["effort"] = anthropic_reasoning_effort(
-                model_id, effective_reasoning_effort
-            )
-    elif supports_reasoning and effective_reasoning_effort is not None:
-        payload["thinking"] = {"type": "adaptive"}
-        output_config["effort"] = anthropic_reasoning_effort(model_id, effective_reasoning_effort)
-    if request.structured_text is not None:
-        output_config["format"] = {
-            "type": "json_schema",
-            "schema": request.structured_text.json_schema,
-        }
-    if output_config:
-        payload["output_config"] = output_config
-    if request.stop:
-        payload["stop_sequences"] = list(request.stop)
-    return payload
-
-
-def gemini_generate_content_stream_payload(
-    model_id: str,
-    request: GatewayRequest,
-    *,
-    supports_temperature: bool = True,
-    supports_top_p: bool = True,
-    supports_top_k: bool = False,
-    supports_logprobs: bool = False,
-    supports_reasoning: bool = False,
-    reasoning_effort: str | None = None,
-) -> JsonObject:
-    """Translate one canonical request to the native streamGenerateContent JSON.
-
-    The payload is built by the exact converter the Gemini provider client
-    uses (canonical request through the shared model adapter, then the native
-    generateContent builder), so both engines send one identical body. Gemini
-    streaming needs no body-level stream flag: streaming is selected by the
-    ``streamGenerateContent`` route in the wire profile URL.
-
-    Args:
-        model_id: Exact Gemini model identifier; travels in the route path.
-        request: Canonical gateway request.
-
-    Returns:
-        Native generation request for the SSE streaming route.
-
-    Raises:
-        ProviderResponseError: A message cannot preserve its tool linkage on
-            Gemini's wire.
-    """
-    try:
-        return gemini_generate_request(
-            model_id,
-            gateway_model_request(request),
-            supports_temperature=supports_temperature,
-            supports_top_p=supports_top_p,
-            supports_top_k=supports_top_k,
-            supports_logprobs=supports_logprobs,
-            supports_reasoning=supports_reasoning,
-            reasoning_effort=reasoning_effort,
-            stop_sequences=request.stop,
-            response_json_schema=(
-                request.structured_text.json_schema if request.structured_text is not None else None
-            ),
-        )
-    except ProviderParameterError:
-        raise
-    except ValueError as exc:
-        raise ProviderResponseError(str(exc)) from exc
-
-
-def bedrock_converse_stream_payload(
-    model_id: str,
-    request: GatewayRequest,
-    *,
-    supports_temperature: bool = True,
-    supports_top_p: bool = True,
-    supports_top_k: bool = False,
-    supports_logprobs: bool = False,
-) -> JsonObject:
-    """Translate one canonical request to the native ConverseStream REST body.
-
-    The body is built by the exact converter the Bedrock provider client
-    uses (canonical request through the shared model adapter, then the shared
-    Converse body builder), so both engines send one identical document. On
-    the REST route the model travels in the URL path, never the body, and
-    streaming is selected by the ``converse-stream`` route itself.
-
-    Args:
-        model_id: Exact Bedrock model or inference-profile identifier; it
-            travels in the wire profile URL and keeps the dispatch signature.
-        request: Canonical gateway request.
-
-    Returns:
-        Native Converse request body for the streaming REST route.
-
-    Raises:
-        ProviderResponseError: A message cannot be represented without
-            dropping tool context.
-    """
-    del model_id
-    try:
-        return converse_body(
-            gateway_model_request(request),
-            supports_temperature=supports_temperature,
-            supports_top_p=supports_top_p,
-            supports_top_k=supports_top_k,
-            supports_logprobs=supports_logprobs,
-            stop_sequences=request.stop,
-            structured_output_name=(
-                request.structured_text.name if request.structured_text is not None else None
-            ),
-            structured_output_description=(
-                request.structured_text.description if request.structured_text is not None else None
-            ),
-            structured_output_schema=(
-                request.structured_text.json_schema if request.structured_text is not None else None
-            ),
-            strict_tool_names=tuple(tool.name for tool in request.tools if tool.strict),
-        )
-    except ValueError as exc:
-        raise ProviderResponseError(str(exc)) from exc
 
 
 def openai_compatible_stream_payload(

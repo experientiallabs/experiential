@@ -113,6 +113,11 @@ RESPONSES_MANIFEST = CompatibilityManifest(
             "parallel_tool_calls",
         ),
         _field("text", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "structured_output"),
+        _field(
+            "client_metadata",
+            CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
+            "client_metadata",
+        ),
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),

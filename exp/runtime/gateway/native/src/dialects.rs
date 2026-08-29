@@ -136,7 +136,9 @@ fn complete_streamed_tool(
     events: &mut Vec<Event>,
 ) -> Result<(), Failure> {
     tool.completed = true;
-    if tool.raw_arguments.is_empty() {
+    // Only JSON function calls need the empty-object seed; custom (freeform)
+    // input is legitimately empty text.
+    if tool.raw_arguments.is_empty() && !tool.custom {
         tool.raw_arguments.push_str("{}");
         events.push(Event::ToolArgumentsDelta {
             index,

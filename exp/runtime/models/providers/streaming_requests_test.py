@@ -1876,3 +1876,170 @@ def test_context_management_forwards_on_anthropic_and_discloses_elsewhere() -> N
     public, provider = route_generation_parameter_requests((fallback,), request)
     assert "context_management" in public.ignored_parameters
     assert provider.context_management is None
+
+
+def test_mid_conversation_system_stays_positional_on_capable_wires() -> None:
+    """A system turn after conversation start keeps its position on the
+    Anthropic and OpenAI wires and narrows out instruction-hoisting rungs
+    (Claude Code appends one by default; accepted live 2026-08-30)."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="system", content="lead instructions"),
+            GatewayMessage(role="user", content="hi"),
+            GatewayMessage(role="system", content="answer in uppercase"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    assert payload["system"] == "lead instructions"
+    assert payload["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "system", "content": [{"type": "text", "text": "answer in uppercase"}]},
+    ]
+
+    responses = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request.model_copy(update={"surface": GatewayApiSurface.RESPONSES}),
+        supports_temperature=False,
+    )
+    assert responses["instructions"] == "lead instructions"
+    assert responses["input"] == [
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": "answer in uppercase"},
+    ]
+
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    gemini = GatewayWireProfile(dialect="gemini_generate_content", url="https://gemini.test")
+    with pytest.raises(ProviderParameterError) as hoisting:
+        route_generation_parameter_requests((anthropic, gemini), request)
+    assert hoisting.value.param == "messages"
+    public, _provider = route_generation_parameter_requests((anthropic,), request)
+    assert public.ignored_parameters == ()
+
+
+def test_output_config_seeds_the_payload_and_engine_keys_fill_gaps() -> None:
+    """The caller's output_config wins byte-for-byte; the engine's derived
+    effort and format only fill absent keys, so the two sources cannot
+    fight (accepted live without a beta, 2026-08-30)."""
+    caller = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        reasoning_effort="high",
+        provider_output_config={"effort": "high", "future_key": 1},
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", caller, supports_reasoning=True, reasoning_effort="low"
+    )
+    # Caller effort survives verbatim over the catalog-pinned "low".
+    assert payload["output_config"] == {"effort": "high", "future_key": 1}
+    assert payload["thinking"] == {"type": "adaptive"}
+
+    pinned_only = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        provider_output_config={"future_key": 1},
+        stream=True,
+        include_usage=True,
+    )
+    filled = anthropic_messages_stream_payload(
+        "claude-fable-5", pinned_only, supports_reasoning=True, reasoning_effort="low"
+    )
+    assert filled["output_config"] == {"future_key": 1, "effort": "low"}
+
+
+def test_output_config_discloses_on_routes_that_cannot_honor_it() -> None:
+    """An effort-only canonical config rides reasoning_effort everywhere; any
+    richer config drops with disclosure when a rung is not Anthropic."""
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-fable-5",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+    )
+    fallback = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://fallback.test",
+        model_id="gpt-5.1",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+    )
+    effort_only = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        reasoning_effort="high",
+        provider_output_config={"effort": "high"},
+        stream=True,
+        include_usage=True,
+    )
+    public, provider = route_generation_parameter_requests((anthropic, fallback), effort_only)
+    assert public.ignored_parameters == ()
+    assert provider.reasoning_effort == "high"
+
+    richer = effort_only.model_copy(
+        update={"provider_output_config": {"effort": "high", "format": {"type": "json_schema"}}}
+    )
+    public, provider = route_generation_parameter_requests((anthropic, fallback), richer)
+    assert "output_config" in public.ignored_parameters
+    assert provider.provider_output_config is None
+
+
+def test_native_items_require_a_homogeneous_responses_route_and_reemit_verbatim() -> None:
+    """Codex-native input items forward byte-for-byte on native Responses
+    rungs at their exact position; any other rung in the route is a named
+    rejection (dropping tool definitions would silently degrade the agent)."""
+    native_item: JsonObject = {
+        "type": "custom_tool_call",
+        "id": "ctc_1",
+        "call_id": "call_1",
+        "name": "exec",
+        "input": "const r = 1;",
+    }
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(role="assistant", provider_native_item=native_item),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = openai_responses_stream_payload("gpt-5.6-sol", request, supports_temperature=False)
+    assert payload["input"] == [{"role": "user", "content": "go"}, native_item]
+
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
+    chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
+    public, _provider = route_generation_parameter_requests((responses,), request)
+    assert public.ignored_parameters == ()
+    with pytest.raises(ProviderParameterError) as mixed:
+        route_generation_parameter_requests((responses, chat), request)
+    assert mixed.value.param == "input"
+
+
+def test_client_metadata_and_verbosity_forward_native_and_disclose_elsewhere() -> None:
+    """Codex's telemetry object and verbosity hint ride the native Responses
+    wire verbatim and drop with disclosure on any other route."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        text_verbosity="low",
+        client_metadata={"thread_id": "t-1"},
+        stream=True,
+        include_usage=True,
+    )
+    payload = openai_responses_stream_payload("gpt-5.6-sol", request, supports_temperature=False)
+    assert payload["client_metadata"] == {"thread_id": "t-1"}
+    assert payload["text"] == {"verbosity": "low"}
+
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
+    chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
+    public, provider = route_generation_parameter_requests((responses,), request)
+    assert public.ignored_parameters == ()
+    public, provider = route_generation_parameter_requests((responses, chat), request)
+    assert set(public.ignored_parameters) == {"client_metadata", "text.verbosity"}
+    assert provider.client_metadata is None
+    assert provider.text_verbosity is None

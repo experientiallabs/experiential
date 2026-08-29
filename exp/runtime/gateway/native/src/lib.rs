@@ -469,6 +469,7 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                         .to_string(),
+                    custom: false,
                 },
             },
             "usage" => events::Event::Usage(events::Usage {

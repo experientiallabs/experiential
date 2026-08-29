@@ -318,6 +318,61 @@ impl Normalizer {
                         }
                     }
                     self.tools.insert(index, tool);
+                } else if item_type == "custom_tool_call" {
+                    // A freeform (custom) tool call: identical lifecycle to a
+                    // function call, with opaque `input` text instead of JSON
+                    // `arguments` (stream captured live 2026-08-30).
+                    if self.tools.contains_key(&index) {
+                        return Err(malformed("OpenAI stream repeated a tool-call start"));
+                    }
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| malformed("OpenAI custom tool call ID must be text"))?;
+                    if call_id.is_empty() || call_id.chars().count() > MAXIMUM_OPENAI_ID_CHARS {
+                        return Err(malformed(
+                            "OpenAI custom tool call ID must contain between 1 and 256 characters",
+                        ));
+                    }
+                    let call_id = call_id.to_string();
+                    let name = openai_identity(item, "name", "OpenAI custom tool call name")?;
+                    let item_id =
+                        optional_openai_identity(item, "id", "OpenAI custom tool call item ID")?;
+                    if !self.bind_openai_output_item(
+                        index,
+                        ProviderOutputItemKind::CustomToolCall,
+                        item_id.clone(),
+                    )? {
+                        return Err(malformed("OpenAI stream repeated an output-item start"));
+                    }
+                    self.reserve_tool_entry(index)?;
+                    let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
+                    tool.custom = true;
+                    tool.provider_item_id = item_id.clone();
+                    tool.provider_status = status;
+                    events.push(Event::ProviderOutputItemStarted {
+                        output_index: index,
+                        item_id,
+                        kind: ProviderOutputItemKind::CustomToolCall,
+                        status,
+                        phase: None,
+                    });
+                    events.push(Event::ToolCallStarted {
+                        index,
+                        call_id,
+                        name,
+                    });
+                    if let Some(Value::String(initial)) = item.get("input") {
+                        if !initial.is_empty() {
+                            self.reserve_tool_bytes(initial.len())?;
+                            tool.raw_arguments.push_str(initial);
+                            events.push(Event::ToolArgumentsDelta {
+                                index,
+                                delta: initial.clone(),
+                            });
+                        }
+                    }
+                    self.tools.insert(index, tool);
                 } else if item_type == "reasoning" {
                     let item_id = openai_identity(item, "id", "OpenAI reasoning item ID")?;
                     if !self.bind_openai_output_item(
@@ -390,6 +445,40 @@ impl Normalizer {
                     require_string(&payload, "arguments", "OpenAI function call arguments")
                         .map_err(|message| malformed(&message))?;
                 self.reconcile_openai_tool_arguments(index, &arguments, &mut events)?;
+            }
+            "response.custom_tool_call_input.delta" => {
+                let index = openai_index(&payload, "output_index", "OpenAI output_index")?;
+                let item_id =
+                    openai_identity(&payload, "item_id", "OpenAI custom tool call item ID")?;
+                let delta = optional_text(&payload, "delta", "OpenAI input delta")?;
+                self.reserve_tool_bytes(delta.len())?;
+                let tool = self
+                    .tools
+                    .get_mut(&index)
+                    .ok_or_else(|| malformed("provider emitted input before a tool start"))?;
+                if !tool.custom || tool.provider_item_id.as_deref() != Some(item_id.as_str()) {
+                    return Err(malformed(
+                        "OpenAI custom tool call changed identity during input",
+                    ));
+                }
+                tool.raw_arguments.push_str(&delta);
+                events.push(Event::ToolArgumentsDelta { index, delta });
+            }
+            "response.custom_tool_call_input.done" => {
+                let index = openai_index(&payload, "output_index", "OpenAI output_index")?;
+                let item_id =
+                    openai_identity(&payload, "item_id", "OpenAI custom tool call item ID")?;
+                let tool = self.tools.get(&index).ok_or_else(|| {
+                    malformed("OpenAI custom tool call completed before its start")
+                })?;
+                if !tool.custom || tool.provider_item_id.as_deref() != Some(item_id.as_str()) {
+                    return Err(malformed(
+                        "OpenAI custom tool call changed identity at input done",
+                    ));
+                }
+                let input = require_string(&payload, "input", "OpenAI custom tool call input")
+                    .map_err(|message| malformed(&message))?;
+                self.reconcile_openai_tool_arguments(index, &input, &mut events)?;
             }
             "response.output_item.done" => {
                 let index = openai_index(&payload, "output_index", "OpenAI output_index")?;
@@ -500,6 +589,49 @@ impl Normalizer {
                             output_index: index,
                             item_id,
                             kind: ProviderOutputItemKind::FunctionCall,
+                            status,
+                            phase: None,
+                        });
+                        let tool = self.tools.get_mut(&index).expect("tool just checked");
+                        complete_streamed_tool(index, tool, &mut events)?;
+                    }
+                    Some("custom_tool_call") => {
+                        let item_id = optional_openai_identity(
+                            item,
+                            "id",
+                            "OpenAI custom tool call item ID",
+                        )?;
+                        self.bind_openai_output_item(
+                            index,
+                            ProviderOutputItemKind::CustomToolCall,
+                            item_id.clone(),
+                        )?;
+                        let call_id =
+                            openai_identity(item, "call_id", "OpenAI custom tool call ID")?;
+                        let name = openai_identity(item, "name", "OpenAI custom tool call name")?;
+                        let input = require_string(item, "input", "OpenAI custom tool call input")
+                            .map_err(|message| malformed(&message))?;
+                        let tool = self.tools.get(&index).ok_or_else(|| {
+                            malformed("OpenAI custom tool call completed before its start")
+                        })?;
+                        if !tool.custom
+                            || tool.provider_item_id != item_id
+                            || tool.call_id != call_id
+                            || tool.name != name
+                        {
+                            return Err(malformed(
+                                "OpenAI custom tool call changed identity at completion",
+                            ));
+                        }
+                        self.reconcile_openai_tool_arguments(index, &input, &mut events)?;
+                        self.tools
+                            .get_mut(&index)
+                            .expect("tool just checked")
+                            .provider_status = status;
+                        events.push(Event::ProviderOutputItemCompleted {
+                            output_index: index,
+                            item_id,
+                            kind: ProviderOutputItemKind::CustomToolCall,
                             status,
                             phase: None,
                         });
@@ -746,242 +878,8 @@ impl Normalizer {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dialects::{Dialect, MAXIMUM_RETAINED_PROVIDER_ENTRIES, OUTPUT_OVERFLOW_MESSAGE};
-    use crate::sse::SseEvent;
-
-    fn reasoning_delta(output_index: u32, summary_index: u32, delta: &str) -> SseEvent {
-        SseEvent {
-            event: None,
-            data: serde_json::json!({
-                "type": "response.reasoning_summary_text.delta",
-                "item_id": format!("rs-{output_index}"),
-                "output_index": output_index,
-                "summary_index": summary_index,
-                "delta": delta,
-            })
-            .to_string(),
-        }
-    }
-
-    #[test]
-    fn compatible_reasoning_content_requires_fireworks_route_authority() {
-        let frame = SseEvent {
-            event: None,
-            data: serde_json::json!({
-                "choices": [{
-                    "index": 0,
-                    "delta": {"reasoning_content": "provider private"},
-                    "finish_reason": null,
-                }]
-            })
-            .to_string(),
-        };
-        let route_sha256 = "a".repeat(64);
-        let mut authorized = Normalizer::new_with_reasoning_content_route(
-            Dialect::OpenAiCompatible,
-            Some(route_sha256.clone()),
-        );
-        let events = authorized
-            .feed(&frame)
-            .expect("authorized Fireworks reasoning must normalize");
-        assert!(matches!(
-            events.as_slice(),
-            [Event::ReasoningContentDelta {
-                route_sha256: route,
-                delta,
-            }] if route == &route_sha256 && delta == "provider private"
-        ));
-
-        let mut generic = Normalizer::new(Dialect::OpenAiCompatible);
-        assert!(generic
-            .feed(&frame)
-            .expect("generic compatible extension is ignored")
-            .is_empty());
-    }
-
-    #[test]
-    fn fireworks_reasoning_content_rejects_non_text_values() {
-        let frame = SseEvent {
-            event: None,
-            data: serde_json::json!({
-                "choices": [{
-                    "index": 0,
-                    "delta": {"reasoning_content": {"private": true}},
-                    "finish_reason": null,
-                }]
-            })
-            .to_string(),
-        };
-        let mut normalizer = Normalizer::new_with_reasoning_content_route(
-            Dialect::OpenAiCompatible,
-            Some("a".repeat(64)),
-        );
-
-        assert!(normalizer.feed(&frame).is_err());
-    }
-
-    #[test]
-    fn responses_reasoning_summary_is_normalized_and_verified() {
-        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
-        let delta = SseEvent {
-            event: None,
-            data: serde_json::json!({
-                "type": "response.reasoning_summary_text.delta",
-                "item_id": "rs-2",
-                "output_index": 2,
-                "summary_index": 1,
-                "delta": "checked",
-            })
-            .to_string(),
-        };
-        let events = normalizer
-            .feed(&delta)
-            .expect("summary delta must normalize");
-        assert!(matches!(
-            events.as_slice(),
-            [
-                Event::ProviderOutputItemStarted {
-                    output_index: 2,
-                    item_id,
-                    kind: ProviderOutputItemKind::Reasoning,
-                    ..
-                },
-                Event::ReasoningSummaryDelta {
-                    output_index: 2,
-                    summary_index: 1,
-                    item_id: _,
-                    delta,
-                }
-            ] if item_id.as_deref() == Some("rs-2") && delta == "checked"
-        ));
-
-        let done = SseEvent {
-            event: None,
-            data: serde_json::json!({
-                "type": "response.reasoning_summary_text.done",
-                "item_id": "rs-2",
-                "output_index": 2,
-                "summary_index": 1,
-                "text": "checked",
-            })
-            .to_string(),
-        };
-        assert!(normalizer
-            .feed(&done)
-            .expect("matching summary completion must validate")
-            .is_empty());
-    }
-
-    #[test]
-    fn empty_reasoning_deltas_do_not_allocate_provider_state() {
-        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
-        for output_index in 0..=MAXIMUM_RETAINED_PROVIDER_ENTRIES as u32 {
-            assert!(normalizer
-                .feed(&reasoning_delta(output_index, 0, ""))
-                .expect("empty summary delta must be ignored")
-                .is_empty());
-        }
-        assert!(normalizer.reasoning_summaries.is_empty());
-
-        assert_eq!(
-            normalizer
-                .feed(&reasoning_delta(0, 0, "bounded"))
-                .expect("non-empty summary still fits")
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn retained_provider_entries_are_bounded_across_tools_and_summaries() {
-        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
-        for index in 0..MAXIMUM_RETAINED_PROVIDER_ENTRIES as u32 {
-            normalizer
-                .reserve_tool_entry(index)
-                .expect("entry below ceiling must fit");
-            normalizer.tools.insert(
-                index,
-                ToolAccumulator::new(format!("call-{index}"), "lookup".to_string()),
-            );
-        }
-
-        let failure = normalizer
-            .feed(&reasoning_delta(0, 0, "overflow"))
-            .expect_err("entry above ceiling must fail");
-        assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
-        assert_eq!(failure.safe_message, OUTPUT_OVERFLOW_MESSAGE);
-    }
-
-    #[test]
-    fn completed_reasoning_items_pass_encrypted_content_through() {
-        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
-        let done = SseEvent {
-            event: None,
-            data: serde_json::json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {
-                    "id": "rs_provider",
-                    "type": "reasoning",
-                    "summary": [],
-                    "encrypted_content": "blob==",
-                    "status": "completed",
-                },
-            })
-            .to_string(),
-        };
-        let events = normalizer.feed(&done).expect("reasoning item completes");
-        assert!(matches!(
-            events.as_slice(),
-            [
-                Event::ProviderOutputItemStarted {
-                    output_index: 0,
-                    item_id,
-                    kind: ProviderOutputItemKind::Reasoning,
-                    ..
-                },
-                Event::EncryptedReasoning {
-                    output_index: 0,
-                    item_id: _,
-                    encrypted_content,
-                },
-                Event::ProviderOutputItemCompleted {
-                    output_index: 0,
-                    status: Some(ProviderOutputItemStatus::Completed),
-                    ..
-                },
-            ] if item_id.as_deref() == Some("rs_provider") && encrypted_content == "blob=="
-        ));
-
-        // A reasoning item without the requested include stays silent.
-        let bare = SseEvent {
-            event: None,
-            data: serde_json::json!({
-                "type": "response.output_item.done",
-                "output_index": 1,
-                "item": {"id": "rs_2", "type": "reasoning", "summary": []},
-            })
-            .to_string(),
-        };
-        assert!(matches!(
-            normalizer.feed(&bare).expect("bare item").as_slice(),
-            [
-                Event::ProviderOutputItemStarted {
-                    output_index: 1,
-                    item_id,
-                    kind: ProviderOutputItemKind::Reasoning,
-                    ..
-                },
-                Event::ProviderOutputItemCompleted {
-                    output_index: 1,
-                    ..
-                },
-            ] if item_id.as_deref() == Some("rs_2")
-        ));
-    }
-}
+#[path = "openai/normalizer_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 #[path = "openai/identity_tests.rs"]

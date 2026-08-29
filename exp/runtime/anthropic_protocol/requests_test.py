@@ -134,11 +134,19 @@ def test_decode_drops_only_nonsemantic_cache_control() -> None:
     assert decoded.request.metadata == {}
 
 
-def test_output_config_is_rejected_instead_of_silently_dropped() -> None:
-    """The Anthropic output_config control fails until its semantics can be preserved."""
-    with pytest.raises(OpenAIProtocolError) as excinfo:
-        decode_messages(_body(output_config={"effort": "high"}))
-    assert excinfo.value.detail.param == "output_config"
+def test_output_config_is_carried_verbatim_and_maps_canonical_effort() -> None:
+    """The caller's output_config survives byte-for-byte and its effort rides
+    the shared reasoning_effort field (Claude Code sends {"effort": ...} by
+    default; accepted live without a beta, 2026-08-30)."""
+    decoded = decode_messages(_body(output_config={"effort": "high"}))
+    assert decoded.request.provider_output_config == {"effort": "high"}
+    assert decoded.request.reasoning_effort == "high"
+    # A non-canonical (future provider) effort stays verbatim-only: the
+    # provider decides it, the gateway does not reject it.
+    future = decode_messages(_body(output_config={"effort": "hyperdrive"}))
+    assert future.request.provider_output_config == {"effort": "hyperdrive"}
+    assert future.request.reasoning_effort is None
+    assert decode_messages(_body()).request.provider_output_config is None
 
 
 def test_thinking_config_is_carried_verbatim() -> None:
@@ -402,3 +410,121 @@ def test_context_management_is_carried_verbatim_and_shallow_validated() -> None:
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_messages(_body(context_management="clear"))
     assert raised.value.detail.param == "context_management"
+
+
+def test_thinking_display_is_carried_verbatim() -> None:
+    """The adaptive display disposition rides the verbatim thinking config
+    (Claude Code sends {"type": "adaptive", "display": "omitted"} by
+    default; accepted live without a beta, 2026-08-30)."""
+    config: JsonObject = {"type": "adaptive", "display": "omitted"}
+    decoded = decode_messages(_body(thinking=config))
+    assert decoded.request.provider_thinking_config == config
+
+
+def test_mid_conversation_system_turn_decodes_positionally() -> None:
+    """A system message after conversation start keeps its role and order."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "answer in uppercase",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ]
+        )
+    )
+    assert [message.role for message in decoded.request.messages] == ["user", "system"]
+    assert decoded.request.messages[1].content == "answer in uppercase"
+
+
+def test_the_captured_claude_code_request_shape_decodes_losslessly() -> None:
+    """Regression fixture: the field shapes real Claude Code (2.1.251) sends
+    by default, trimmed from a live capture (2026-08-29). Every top-level
+    field and block shape from the capture appears here."""
+    decoded = decode_messages(
+        {
+            "model": "claude-fable-5",
+            "max_tokens": 64000,
+            "stream": True,
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are Claude Code.",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "high"},
+            "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+            "metadata": {"user_id": "device-hash-redacted"},
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Run a shell command",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "Run ls, then count the entries."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "count", "signature": "sig=="},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01",
+                            "name": "Bash",
+                            "input": {"command": "ls"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_01",
+                            "content": "file_a.txt",
+                            "is_error": False,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Available agent types trimmed.",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    request = decoded.request
+    assert [message.role for message in request.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "system",
+    ]
+    assert request.reasoning_effort == "high"
+    assert request.provider_output_config == {"effort": "high"}
+    assert request.provider_thinking_config == {"type": "adaptive", "display": "omitted"}
+    assert request.context_management is not None
+    assert request.metadata == {"user_id": "device-hash-redacted"}
+    assert request.ignored_parameters == ()

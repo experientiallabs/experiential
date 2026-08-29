@@ -218,7 +218,10 @@ def preflight_gateway_request(
         requirements += ((request.stream, capabilities.supports_streaming, "streaming"),)
     requirements += (
         (
-            any(message.role == "developer" for message in request.messages),
+            any(
+                message.role == "developer" and message.provider_native_item is None
+                for message in request.messages
+            ),
             capabilities.supports_developer_messages,
             "developer_messages",
         ),

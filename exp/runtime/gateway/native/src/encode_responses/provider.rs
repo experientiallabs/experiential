@@ -67,7 +67,11 @@ impl ResponsesSseEncoder {
                 "Responses provider attached a message phase to a non-message item.",
             ));
         }
-        if kind != ProviderOutputItemKind::FunctionCall && item_id.is_none() {
+        if !matches!(
+            kind,
+            ProviderOutputItemKind::FunctionCall | ProviderOutputItemKind::CustomToolCall
+        ) && item_id.is_none()
+        {
             return Err(invalid_provider_stream(
                 "Responses provider output item omitted its required item ID.",
             ));
@@ -109,7 +113,7 @@ impl ResponsesSseEncoder {
                     .push(OutputSlot::Reasoning(provider_output_index));
                 Ok(vec![frame])
             }
-            ProviderOutputItemKind::FunctionCall => {
+            ProviderOutputItemKind::FunctionCall | ProviderOutputItemKind::CustomToolCall => {
                 self.output_order
                     .push(OutputSlot::Tool(provider_output_index));
                 Ok(Vec::new())
@@ -201,7 +205,7 @@ impl ResponsesSseEncoder {
                     status.unwrap_or(ProviderOutputItemStatus::Completed),
                 ))
             }
-            ProviderOutputItemKind::FunctionCall => {
+            ProviderOutputItemKind::FunctionCall | ProviderOutputItemKind::CustomToolCall => {
                 if let Some(state) = self.tools.get_mut(&provider_output_index) {
                     state.status = status.or(state.status);
                 }

@@ -20,5 +20,5 @@ def test_required_protocol_and_sampling_fields_are_supported() -> None:
         assert decisions[path] == CompatibilityDisposition.SUPPORTED
     assert decisions["tools"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert decisions["thinking"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
-    assert decisions["output_config"] == CompatibilityDisposition.UNSUPPORTED
+    assert decisions["output_config"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert decisions["top_k"] == CompatibilityDisposition.SUPPORTED

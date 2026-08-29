@@ -283,10 +283,89 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
             and item.get("content") == "reason-only"
             for item in input_items
         )
+        custom_tools = any(
+            isinstance(item, dict) and item.get("type") == "additional_tools"
+            for item in input_items
+        )
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         try:
+            if custom_tools:
+                # Exact live event shapes for a freeform custom tool call
+                # (captured from api.openai.com, 2026-08-30).
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {
+                                "id": "ctc_provider",
+                                "type": "custom_tool_call",
+                                "status": "in_progress",
+                                "call_id": "call_custom",
+                                "input": "",
+                                "name": "exec",
+                            },
+                        }
+                    )
+                )
+                for delta in ("const r = 1;", " text(r);"):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": "response.custom_tool_call_input.delta",
+                                "delta": delta,
+                                "item_id": "ctc_provider",
+                                "output_index": 0,
+                            }
+                        )
+                    )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.custom_tool_call_input.done",
+                            "input": "const r = 1; text(r);",
+                            "item_id": "ctc_provider",
+                            "output_index": 0,
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": {
+                                "id": "ctc_provider",
+                                "type": "custom_tool_call",
+                                "status": "completed",
+                                "call_id": "call_custom",
+                                "input": "const r = 1; text(r);",
+                                "name": "exec",
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "usage": {
+                                    "input_tokens": 9,
+                                    "output_tokens": 4,
+                                    "input_tokens_details": {"cached_tokens": 0},
+                                    "output_tokens_details": {"reasoning_tokens": 0},
+                                },
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             if continued:
                 self.wfile.write(
                     _sse_frame(
@@ -1362,3 +1441,58 @@ def test_provider_400_attributes_the_rejected_parameter_without_provider_prose(
     chat_error = chat.json()["error"]
     assert chat_error["param"] == "input[1].status"
     assert "PROVIDER-PROSE-MARKER" not in json.dumps(chat.json())
+
+
+def test_custom_tool_calls_round_trip_through_the_native_responses_lane(
+    responses_engine: _ServingEngine,
+) -> None:
+    """Codex-native custom tools serve end to end: the additional_tools input
+    item forwards byte-for-byte to the provider, and the provider's freeform
+    custom_tool_call streams back to the caller with its native event names
+    (all shapes captured live 2026-08-30)."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    additional_tools = {
+        "type": "additional_tools",
+        "id": "at_e2e",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "functions",
+                "description": "",
+                "tools": [{"type": "custom", "name": "exec", "description": "Run JS"}],
+            }
+        ],
+    }
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "stream": True,
+            "input": [
+                additional_tools,
+                {"role": "user", "content": "use the exec tool"},
+            ],
+        },
+        timeout=30.0,
+    )
+    _body, events = _responses_result(response, stream=True)
+    types = [payload["type"] for payload in events]
+    assert "response.custom_tool_call_input.delta" in types, types
+    assert "response.custom_tool_call_input.done" in types
+    done_item = next(
+        cast(JsonObject, payload["item"])
+        for payload in events
+        if payload["type"] == "response.output_item.done"
+    )
+    assert done_item["type"] == "custom_tool_call"
+    assert done_item["call_id"] == "call_custom"
+    assert done_item["input"] == "const r = 1; text(r);"
+    assert done_item["name"] == "exec"
+    with _ResponsesUpstream.payloads_lock:
+        upstream = tuple(_ResponsesUpstream.payloads)
+    assert len(upstream) == 1
+    upstream_input = cast(list[JsonObject], upstream[0]["input"])
+    assert upstream_input[0] == additional_tools

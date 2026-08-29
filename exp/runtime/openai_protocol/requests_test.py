@@ -1486,3 +1486,104 @@ def test_empty_tool_call_arguments_decode_as_the_canonical_empty_object() -> Non
         }
     )
     assert responses.request.messages[0].tool_calls[0].raw_arguments == "{}"
+
+
+def test_the_captured_codex_request_shape_decodes_losslessly() -> None:
+    """Regression fixture: the field shapes real Codex (0.151.0) sends by
+    default, trimmed from a live capture (2026-08-29). Native items carry
+    byte-for-byte; non-assistant message ids are accepted and dropped;
+    assistant echoes carry id+phase without status."""
+    additional_tools = {
+        "type": "additional_tools",
+        "id": "at_fixture",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "functions",
+                "description": "",
+                "tools": [
+                    {"type": "custom", "name": "exec", "description": "Run JavaScript"},
+                    {
+                        "type": "function",
+                        "name": "followup_task",
+                        "description": "Send a follow-up task",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                ],
+            }
+        ],
+    }
+    custom_call = {
+        "type": "custom_tool_call",
+        "id": "ctc_fixture",
+        "status": "completed",
+        "call_id": "call_fixture",
+        "name": "exec",
+        "input": 'const r = await tools.exec_command({cmd:"ls"});',
+    }
+    custom_output = {
+        "type": "custom_tool_call_output",
+        "id": "ctco_fixture",
+        "call_id": "call_fixture",
+        "output": "[{'type': 'input_text', 'text': 'file_a.txt'}]",
+    }
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.6-sol",
+            "store": False,
+            "stream": True,
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": {"effort": "low", "context": "all_turns"},
+            "text": {"verbosity": "low"},
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "prompt_cache_key": "session-fixture",
+            "client_metadata": {"thread_id": "thread-fixture"},
+            "input": [
+                additional_tools,
+                {
+                    "type": "message",
+                    "id": "msg_dev_fixture",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "You are Codex."}],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_user_fixture",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Run ls."}],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_echo_fixture",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Listing now."}],
+                    "phase": "commentary",
+                },
+                custom_call,
+                custom_output,
+            ],
+        }
+    )
+    request = decoded.request
+    assert request.ignored_parameters == ()
+    assert request.text_verbosity == "low"
+    assert request.client_metadata == {"thread_id": "thread-fixture"}
+    assert request.reasoning_effort == "low"
+    roles = [message.role for message in request.messages]
+    assert roles == ["developer", "developer", "user", "assistant", "assistant", "tool"]
+    natives = [
+        message.provider_native_item
+        for message in request.messages
+        if message.provider_native_item is not None
+    ]
+    assert natives == [additional_tools, custom_call, custom_output]
+    # Non-assistant ids drop; the assistant echo retains identity with
+    # status OPTIONAL.
+    developer = request.messages[1]
+    assert developer.provider_item_id is None
+    echo = request.messages[3]
+    assert echo.provider_item_id == "msg_echo_fixture"
+    assert echo.provider_status is None
+    assert echo.provider_phase == "commentary"

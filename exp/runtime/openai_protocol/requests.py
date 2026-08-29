@@ -3,23 +3,21 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection
-from typing import Annotated, Literal, cast
+from collections.abc import Collection, Sequence
+from typing import Literal, cast
 
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import (
     BaseModel,
-    ConfigDict,
     Field,
     JsonValue,
     TypeAdapter,
     ValidationError,
-    model_validator,
 )
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models.model import ReasoningEffort, ToolCall
+from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import (
     CompatibilityDisposition,
     CompatibilityManifest,
@@ -34,11 +32,9 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.reasoning_carrier import (
     FIREWORKS_REASONING_CONTENT_PREFIX,
-    MAXIMUM_REASONING_CARRIER_BYTES,
     parse_reasoning_content_carrier,
 )
 from exp.runtime.openai_protocol.cache_control import (
-    EphemeralCacheControl,
     drop_opencode_cache_control,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
@@ -50,9 +46,30 @@ from exp.runtime.openai_protocol.manifest import (
 from exp.runtime.openai_protocol.responses_input import (
     ReplayedFunctionCall,
     ReplayedFunctionOutput,
+    ReplayedInput,
     ReplayedMessage,
+    ReplayedNativeItem,
     ReplayedReasoning,
     responses_input_messages,
+)
+from exp.runtime.openai_protocol.wire_models import (
+    _AdditionalToolsItem,
+    _AssistantToolCall,
+    _ChatRequest,
+    _ChatResponseFormat,
+    _ChatTool,
+    _CustomToolCall,
+    _CustomToolCallOutput,
+    _FunctionCall,
+    _Message,
+    _ResponseFunctionCall,
+    _ResponseMessage,
+    _ResponseReasoningItem,
+    _ResponsesInputItem,
+    _ResponsesRequest,
+    _ResponseText,
+    _ResponseTool,
+    _TextPart,
 )
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
@@ -66,358 +83,6 @@ class DecodedGatewayRequest(ContractModel):
     alias: str = Field(min_length=1, max_length=256)
     request: GatewayRequest
     developer_messages_param: str | None = None
-
-
-class _WireModel(BaseModel):
-    """Strict private OpenAI wire model used only after official shape validation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-
-_EchoedItemStatus = Literal["in_progress", "completed", "incomplete"]
-"""Lifecycle marker carried by echoed output items; validated and dropped."""
-
-
-class _TextPart(_WireModel):
-    """One supported text-only content part.
-
-    Echoed ``output_text`` parts carry empty ``annotations`` and ``logprobs``
-    arrays (this gateway emits them and callers resend prior output verbatim
-    on continuations); only a populated value is rejected as unsupported.
-    """
-
-    type: Literal["text", "input_text", "output_text"]
-    text: str
-    annotations: tuple[()] | None = None
-    logprobs: tuple[()] | None = None
-
-
-class _FunctionCall(_WireModel):
-    """Function name and raw JSON argument string."""
-
-    name: str = Field(min_length=1, max_length=256)
-    arguments: str = Field(max_length=4_000_000)
-
-
-class _AssistantToolCall(_WireModel):
-    """One assistant function call retained in request history.
-
-    OpenCode-style callers attach an Anthropic ``cache_control`` to the last
-    content part of recent messages; when that part is a tool call the hint
-    lands inside this entry, so the supported ephemeral form is accepted and
-    carried for the one wire that can honor it.
-    """
-
-    id: str = Field(min_length=1, max_length=256)
-    type: Literal["function"] = "function"
-    function: _FunctionCall
-    cache_control: EphemeralCacheControl | None = None
-
-
-class _Message(_WireModel):
-    """Text-only OpenAI message with complete assistant tool history.
-
-    Assistant messages returned by this gateway (and by official OpenAI SDK
-    clients) carry `refusal`, `annotations`, `audio`, and `function_call`
-    keys even when they are empty. Callers echo those messages back verbatim
-    on tool-call continuations, so the empty forms are accepted here; only a
-    populated value is rejected as unsupported.
-    """
-
-    role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: str | tuple[_TextPart, ...] | None = None
-    tool_calls: tuple[_AssistantToolCall, ...] | None = None
-    tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
-    refusal: None = None
-    annotations: tuple[()] | None = None
-    audio: None = None
-    function_call: None = None
-    reasoning_content: str | None = Field(
-        default=None,
-        max_length=MAXIMUM_REASONING_CARRIER_BYTES,
-    )
-
-    @property
-    def history_tool_calls(self) -> tuple[_AssistantToolCall, ...]:
-        """Return retained assistant tool calls, treating a null list as empty."""
-        return self.tool_calls or ()
-
-    @model_validator(mode="after")
-    def _require_role_fields(self) -> _Message:
-        """Require tool linkage and assistant calls on their legal roles."""
-        if self.role == "assistant" and self.content is None and not self.history_tool_calls:
-            raise ValueError("assistant messages need content or tool calls")
-        if self.role == "tool" and self.tool_call_id is None:
-            raise ValueError("tool messages require tool_call_id")
-        if self.role != "tool" and self.tool_call_id is not None:
-            raise ValueError("tool_call_id is valid only for tool messages")
-        if self.role != "assistant" and self.history_tool_calls:
-            raise ValueError("tool_calls are valid only for assistant messages")
-        if self.role != "assistant" and self.reasoning_content is not None:
-            raise ValueError("reasoning_content is valid only for assistant messages")
-        call_ids = tuple(call.id for call in self.history_tool_calls)
-        if len(call_ids) != len(set(call_ids)):
-            raise ValueError("assistant tool call IDs must be unique")
-        return self
-
-
-class _ResponseMessage(_Message):
-    """Responses message item with its optional official discriminator.
-
-    Stateless continuations echo prior OUTPUT items verbatim into the next
-    input, so the provider-issued ``id`` and lifecycle ``status`` are
-    accepted and dropped; the gateway mints its own public identities.
-    """
-
-    type: Literal["message"] = "message"
-    id: str | None = Field(default=None, min_length=1, max_length=256)
-    status: _EchoedItemStatus | None = None
-    phase: Literal["commentary", "final_answer"] | None = None
-
-    @model_validator(mode="after")
-    def _require_output_identity_pair(self) -> _ResponseMessage:
-        """Bind replayed output-message identity to its completion status."""
-        if (self.id is None) != (self.status is None):
-            raise ValueError("Responses output messages require both id and status")
-        if self.id is not None and self.role != "assistant":
-            raise ValueError("Responses output message identity requires role assistant")
-        if self.phase is not None and self.id is None:
-            raise ValueError("Responses output message phase requires output identity")
-        return self
-
-
-class _FunctionDefinition(_WireModel):
-    """One function schema offered through Chat Completions."""
-
-    name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
-    parameters: JsonObject = Field(default_factory=dict)
-    strict: bool = False
-
-
-class _ChatTool(_WireModel):
-    """Chat Completions function tool wrapper."""
-
-    type: Literal["function"] = "function"
-    function: _FunctionDefinition
-
-
-class _StructuredSchema(_WireModel):
-    """Named strict JSON Schema in a Chat response format."""
-
-    name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
-    schema_: JsonObject = Field(alias="schema")
-    strict: bool = True
-
-
-class _ChatResponseFormat(_WireModel):
-    """Supported Chat text or strict structured-text format."""
-
-    type: Literal["text", "json_schema"]
-    json_schema: _StructuredSchema | None = None
-
-    @model_validator(mode="after")
-    def _require_schema(self) -> _ChatResponseFormat:
-        """Require schema details only for the JSON Schema format."""
-        if (self.type == "json_schema") != (self.json_schema is not None):
-            raise ValueError("json_schema details must match response_format.type")
-        return self
-
-
-class _ChatStreamOptions(_WireModel):
-    """Supported Chat streaming options."""
-
-    include_usage: bool = False
-
-
-class _ChatRequest(_WireModel):
-    """Closed gateway Chat Completions request profile."""
-
-    model: str = Field(min_length=1, max_length=256)
-    messages: tuple[_Message, ...] = Field(min_length=1)
-    tools: tuple[_ChatTool, ...] = ()
-    tool_choice: JsonValue = None
-    parallel_tool_calls: bool | None = None
-    max_tokens: int | None = Field(default=None, gt=0)
-    max_completion_tokens: int | None = Field(default=None, gt=0)
-    stop: str | tuple[str, ...] | None = None
-    temperature: float | None = Field(default=None, ge=0, le=2)
-    top_p: float | None = Field(default=None, ge=0, le=1)
-    top_k: int | None = Field(default=None, ge=0)
-    logprobs: bool | None = None
-    top_logprobs: int | None = Field(default=None, ge=0, le=20)
-    reasoning_effort: ReasoningEffort | None = None
-    response_format: _ChatResponseFormat | None = None
-    stream: bool = False
-    stream_options: _ChatStreamOptions | None = None
-    metadata: JsonObject = Field(default_factory=dict)
-    # End-user attribution / cache hints; captured, never forwarded to the model.
-    safety_identifier: str | None = Field(default=None, max_length=1024)
-    user: str | None = Field(default=None, max_length=1024)
-    prompt_cache_key: str | None = Field(default=None, max_length=1024)
-
-    @model_validator(mode="after")
-    def _require_coherent_options(self) -> _ChatRequest:
-        """Reject conflicting token ceilings and non-stream usage options."""
-        if self.max_tokens is not None and self.max_completion_tokens is not None:
-            raise ValueError("max_tokens and max_completion_tokens are mutually exclusive")
-        if self.stream_options is not None and not self.stream:
-            raise ValueError("stream_options requires stream=true")
-        return self
-
-
-class _ResponseTool(_WireModel):
-    """Responses API function tool declaration."""
-
-    type: Literal["function"] = "function"
-    name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
-    parameters: JsonObject = Field(default_factory=dict)
-    strict: bool | None = None
-
-
-class _ResponseFunctionCall(_WireModel):
-    """Completed Responses function call included as assistant history.
-
-    ``id`` and ``status`` arrive on verbatim echoes of prior output items
-    and are accepted and dropped; ``call_id`` is the linkage that matters.
-    """
-
-    type: Literal["function_call"]
-    id: str | None = Field(default=None, min_length=1, max_length=256)
-    call_id: str = Field(min_length=1, max_length=256)
-    name: str = Field(min_length=1, max_length=256)
-    arguments: str = Field(max_length=4_000_000)
-    id: str | None = Field(default=None, min_length=1, max_length=256)
-    status: _EchoedItemStatus | None = None
-
-
-class _ResponseFunctionOutput(_WireModel):
-    """Text function result included as Responses tool history.
-
-    ``id`` and ``status`` arrive when a stored turn's input items are
-    re-listed and echoed; accepted and dropped like the other echo markers.
-    """
-
-    type: Literal["function_call_output"]
-    call_id: str = Field(min_length=1, max_length=256)
-    output: str
-    id: str | None = Field(default=None, min_length=1, max_length=256)
-    status: _EchoedItemStatus | None = None
-
-
-class _ReasoningSummaryPart(_WireModel):
-    """One display-only summary part replayed inside a reasoning input item."""
-
-    type: Literal["summary_text"]
-    text: str
-
-
-class _ReasoningTextPart(_WireModel):
-    """One display-only reasoning text part replayed inside a reasoning item."""
-
-    type: Literal["reasoning_text"]
-    text: str
-
-
-class _ResponseReasoningItem(_WireModel):
-    """One opaque reasoning item a stateless caller replays with its input.
-
-    ``encrypted_content`` is the round-trip payload; the display-only
-    ``summary`` and ``content`` parts and the echoed lifecycle ``status``
-    are validated and dropped because the provider derives the
-    model-visible reasoning from the encrypted payload alone.
-    """
-
-    type: Literal["reasoning"]
-    id: str = Field(min_length=1, max_length=256)
-    encrypted_content: str = Field(min_length=1)
-    summary: tuple[_ReasoningSummaryPart, ...] = ()
-    content: tuple[_ReasoningTextPart, ...] = ()
-    status: _EchoedItemStatus | None = None
-
-
-class _ResponseFormat(_WireModel):
-    """Supported Responses text format."""
-
-    type: Literal["text", "json_schema"]
-    name: str | None = Field(default=None, min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
-    schema_: JsonObject | None = Field(default=None, alias="schema")
-    strict: bool = True
-
-    @model_validator(mode="after")
-    def _require_schema(self) -> _ResponseFormat:
-        """Require named schema details only for structured output."""
-        structured = self.type == "json_schema"
-        if structured != (self.name is not None and self.schema_ is not None):
-            raise ValueError("name and schema must match text.format.type")
-        return self
-
-
-class _ResponseText(_WireModel):
-    """Responses text-output configuration."""
-
-    format: _ResponseFormat
-
-
-class _ResponseReasoning(_WireModel):
-    """Responses reasoning controls accepted at the public boundary.
-
-    The deprecated ``generate_summary`` alias is normalized to the current
-    ``summary`` field before route capability shaping.
-    """
-
-    effort: ReasoningEffort | None = None
-    context: Literal["auto", "current_turn", "all_turns"] | None = None
-    generate_summary: Literal["auto", "concise", "detailed"] | None = None
-    summary: Literal["auto", "concise", "detailed"] | None = None
-
-    @model_validator(mode="after")
-    def _require_matching_summary_aliases(self) -> _ResponseReasoning:
-        """Reject two aliases that request different summary behavior."""
-        if (
-            self.generate_summary is not None
-            and self.summary is not None
-            and self.generate_summary != self.summary
-        ):
-            raise ValueError("reasoning summary and generate_summary must match")
-        return self
-
-
-_ResponsesOutputItem = Annotated[
-    _ResponseFunctionCall | _ResponseFunctionOutput | _ResponseReasoningItem,
-    Field(discriminator="type"),
-]
-_ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem
-
-
-class _ResponsesRequest(_WireModel):
-    """Closed gateway Responses request profile."""
-
-    model: str = Field(min_length=1, max_length=256)
-    input: str | tuple[_ResponsesInputItem, ...]
-    instructions: str | None = None
-    previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
-    store: bool | None = None
-    include: tuple[str, ...] | None = None
-    tools: tuple[_ResponseTool, ...] = ()
-    tool_choice: JsonValue = None
-    parallel_tool_calls: bool | None = None
-    max_output_tokens: int | None = Field(default=None, gt=0)
-    temperature: float | None = Field(default=None, ge=0, le=2)
-    top_p: float | None = Field(default=None, ge=0, le=1)
-    top_k: int | None = Field(default=None, ge=0)
-    top_logprobs: int | None = Field(default=None, ge=0, le=20)
-    reasoning: _ResponseReasoning | None = None
-    text: _ResponseText | None = None
-    stream: bool = False
-    metadata: JsonObject = Field(default_factory=dict)
-    # End-user attribution / cache hints; captured, never forwarded to the model.
-    safety_identifier: str | None = Field(default=None, max_length=1024)
-    user: str | None = Field(default=None, max_length=1024)
-    prompt_cache_key: str | None = Field(default=None, max_length=1024)
 
 
 def _without_chat_reasoning_content(payload: JsonObject) -> JsonObject:
@@ -543,10 +208,37 @@ def decode_responses(
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     request = _validate_wire(_ResponsesRequest, payload)
-    _validate_official(_RESPONSES_OFFICIAL, payload, extension_fields={"top_k", "reasoning"})
+    official_probe = dict(payload)
+    if isinstance(raw := payload.get("input"), list):
+        # The installed SDK lags the live surface on echoed message items:
+        # it has no `phase` and requires `status` alongside `id`, while real
+        # Codex echoes carry id+phase and omit status (captured 2026-08-29).
+        # The strict wire model owns that contract, so the official probe
+        # sees a normalized item.
+        adapted: list[JsonValue] = []
+        for entry in cast("list[JsonValue]", raw):
+            if isinstance(entry, dict) and entry.get("type") == "message":
+                item = {key: value for key, value in entry.items() if key != "phase"}
+                if item.get("id") is not None and "status" not in item:
+                    item["status"] = "completed"
+                adapted.append(item)
+            else:
+                adapted.append(entry)
+        official_probe["input"] = adapted
+    _validate_official(
+        _RESPONSES_OFFICIAL,
+        official_probe,
+        extension_fields={"top_k", "reasoning", "client_metadata"},
+    )
     include_encrypted_reasoning = _include_encrypted_reasoning(request.include)
     operation = _caller_operation(idempotency_key, client_request_id)
-    messages = list(_response_input_messages(request.input))
+    raw_input = payload.get("input")
+    messages = list(
+        _response_input_messages(
+            request.input,
+            raw_items=cast("list[JsonObject]", raw_input) if isinstance(raw_input, list) else (),
+        )
+    )
     if request.instructions is not None:
         messages.insert(0, GatewayMessage(role="developer", content=request.instructions))
     try:
@@ -587,6 +279,8 @@ def decode_responses(
                 if request.reasoning is not None
                 else ()
             ),
+            text_verbosity=(request.text.verbosity if request.text is not None else None),
+            client_metadata=request.client_metadata,
             response_store=request.store,
             include_encrypted_reasoning=include_encrypted_reasoning,
             stream=request.stream,
@@ -656,7 +350,15 @@ def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) 
 
 _LOCATION_NOISE = {"body", "non-streaming", "streaming"}
 _UNION_BRANCH_TYPES = {"str", "int", "float", "bool", "list", "tuple", "dict", "NoneType"}
-_OUTPUT_ITEM_VARIANTS = {"message", "function_call", "function_call_output", "reasoning"}
+_OUTPUT_ITEM_VARIANTS = {
+    "message",
+    "function_call",
+    "function_call_output",
+    "reasoning",
+    "additional_tools",
+    "custom_tool_call",
+    "custom_tool_call_output",
+}
 
 
 def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
@@ -855,7 +557,7 @@ def _chat_structured_text(value: _ChatResponseFormat | None) -> StructuredTextFo
 
 def _responses_structured_text(value: _ResponseText | None) -> StructuredTextFormat | None:
     """Convert the Responses JSON Schema text format when requested."""
-    if value is None or value.format.type == "text":
+    if value is None or value.format is None or value.format.type == "text":
         return None
     schema = value.format.schema_
     name = value.format.name
@@ -895,15 +597,27 @@ def _include_encrypted_reasoning(include: tuple[str, ...] | None) -> bool:
 
 def _response_input_messages(
     value: str | tuple[_ResponsesInputItem, ...],
+    *,
+    raw_items: Sequence[JsonObject] = (),
 ) -> tuple[GatewayMessage, ...]:
     """Validate replay details and reconstruct OpenAI or Fireworks history."""
     if isinstance(value, str):
         return responses_input_messages(value)
-    replayed: list[
-        ReplayedReasoning | ReplayedMessage | ReplayedFunctionCall | ReplayedFunctionOutput
-    ] = []
+    replayed: list[ReplayedInput] = []
     for index, item in enumerate(value):
-        if isinstance(item, _ResponseReasoningItem):
+        if isinstance(item, (_AdditionalToolsItem, _CustomToolCall, _CustomToolCallOutput)):
+            # The raw caller item, not the re-serialized wire model, so the
+            # native rung receives the item byte-for-byte.
+            if isinstance(item, _CustomToolCall):
+                native_role = "assistant"
+            elif isinstance(item, _CustomToolCallOutput):
+                native_role = "tool"
+            else:
+                native_role = "developer"
+            replayed.append(
+                ReplayedNativeItem(index=index, role=native_role, item=raw_items[index])
+            )
+        elif isinstance(item, _ResponseReasoningItem):
             if item.encrypted_content.startswith(FIREWORKS_REASONING_CONTENT_PREFIX):
                 try:
                     block: EncryptedReasoningBlock | SealedReasoningContentBlock = (

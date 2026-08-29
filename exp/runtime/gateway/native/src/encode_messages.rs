@@ -258,6 +258,13 @@ impl MessagesSseEncoder {
             } => self.tool_started(*index, call_id, name),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments_delta(*index, delta),
             Event::ToolCallCompleted { index, call } => {
+                if call.custom {
+                    // Custom tools only enter through a Responses request,
+                    // which never encodes on the Messages surface.
+                    return Err(invalid_provider_stream(
+                        "Messages cannot represent a custom tool call.",
+                    ));
+                }
                 // Some upstream dialects (OpenAI-compatible streams) emit
                 // every tool completion only at their terminal sentinel, and
                 // parallel tool calls may interleave, so completion verifies

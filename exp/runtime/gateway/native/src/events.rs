@@ -27,8 +27,11 @@ pub struct CompletedToolCall {
     pub name: String,
     pub provider_item_id: Option<String>,
     pub provider_status: Option<ProviderOutputItemStatus>,
-    /// Raw provider-order JSON argument text, already validated as one object.
+    /// Raw provider-order argument text: a validated JSON object for
+    /// function calls, freeform text for custom (freeform) tool calls.
     pub raw_arguments: String,
+    /// Whether this is a freeform custom tool call (Responses-only).
+    pub custom: bool,
 }
 
 /// Provider-owned Responses output-item kind whose identity must remain exact.
@@ -36,6 +39,7 @@ pub struct CompletedToolCall {
 pub enum ProviderOutputItemKind {
     Reasoning,
     FunctionCall,
+    CustomToolCall,
     Message,
 }
 
@@ -225,6 +229,7 @@ pub fn simplified_event(event: &Event) -> Value {
                 "item_type": match kind {
                     ProviderOutputItemKind::Reasoning => "reasoning",
                     ProviderOutputItemKind::FunctionCall => "function_call",
+                    ProviderOutputItemKind::CustomToolCall => "custom_tool_call",
                     ProviderOutputItemKind::Message => "message",
                 },
             });
@@ -244,6 +249,7 @@ pub fn simplified_event(event: &Event) -> Value {
                 "item_type": match kind {
                 ProviderOutputItemKind::Reasoning => "reasoning",
                 ProviderOutputItemKind::FunctionCall => "function_call",
+                ProviderOutputItemKind::CustomToolCall => "custom_tool_call",
                 ProviderOutputItemKind::Message => "message",
                 },
             });
@@ -378,6 +384,7 @@ pub struct ToolAccumulator {
     pub provider_status: Option<ProviderOutputItemStatus>,
     pub raw_arguments: String,
     pub completed: bool,
+    pub custom: bool,
 }
 
 impl ToolAccumulator {
@@ -389,11 +396,16 @@ impl ToolAccumulator {
             provider_status: None,
             raw_arguments: String::new(),
             completed: false,
+            custom: false,
         }
     }
 
     pub fn complete(&self) -> Result<CompletedToolCall, String> {
-        require_json_object_text(&self.raw_arguments)?;
+        if !self.custom {
+            // Custom (freeform) tool input is opaque text by contract; only
+            // function arguments must parse as one JSON object.
+            require_json_object_text(&self.raw_arguments)?;
+        }
         // Mirror the python ToolCall model constraints so both engines accept
         // exactly the same provider tool-call streams (a call the python
         // engine rejects must not become client-visible history here).
@@ -411,6 +423,7 @@ impl ToolAccumulator {
             provider_item_id: self.provider_item_id.clone(),
             provider_status: self.provider_status,
             raw_arguments: self.raw_arguments.clone(),
+            custom: self.custom,
         })
     }
 }

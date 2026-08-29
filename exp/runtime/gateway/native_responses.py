@@ -263,6 +263,8 @@ def remember_turn(
     raw_calls = data.get("tool_calls")
     indexed_calls: list[tuple[int, ToolCall]] = []
     unindexed_calls: list[ToolCall] = []
+    indexed_natives: list[tuple[int, GatewayMessage]] = []
+    unindexed_natives: list[GatewayMessage] = []
     for call in raw_calls if isinstance(raw_calls, list) else ():
         if not isinstance(call, dict):
             raise ValueError("Responses retained tool call must be an object")
@@ -294,6 +296,27 @@ def remember_turn(
             or not isinstance(raw_arguments, str)
         ):
             raise ValueError("Responses retained tool call fields are invalid")
+        if call.get("custom") is True:
+            # A freeform custom tool call replays as the verbatim native item
+            # (its input is opaque text, not JSON arguments), at its exact
+            # provider output position.
+            native_item: JsonObject = {
+                "type": "custom_tool_call",
+                "call_id": call_id,
+                "name": name,
+                "input": raw_arguments,
+            }
+            if provider_item_id is not None:
+                native_item["id"] = provider_item_id
+            status_value = call.get("status")
+            if isinstance(status_value, str) and status_value:
+                native_item["status"] = status_value
+            native_message = GatewayMessage(role="assistant", provider_native_item=native_item)
+            if provider_output_index is None:
+                unindexed_natives.append(native_message)
+            else:
+                indexed_natives.append((provider_output_index, native_message))
+            continue
         parsed_call = ToolCall(
             call_id=call_id,
             name=name,
@@ -350,20 +373,27 @@ def remember_turn(
         if not isinstance(raw_carrier, str):
             raise ValueError("Responses reasoning carrier must be text")
         sealed_carrier = parse_reasoning_content_carrier(raw_carrier)
-    indexed_output = bool(encrypted or indexed_calls or message_outputs)
+    indexed_output = bool(encrypted or indexed_calls or message_outputs or indexed_natives)
     if sealed_carrier is not None and indexed_output:
         raise ValueError("Responses reasoning carrier cannot mix with provider-indexed output")
     if text and indexed_output:
         raise ValueError(
             "Responses retained assistant text requires provider item identity and order"
         )
-    if not text and not unindexed_calls and not indexed_output and sealed_carrier is None:
+    if (
+        not text
+        and not unindexed_calls
+        and not unindexed_natives
+        and not indexed_output
+        and sealed_carrier is None
+    ):
         return
 
     output_items: list[tuple[int, str, object]] = [
         *((index, "reasoning", block) for index, block in encrypted),
         *((index, "call", call) for index, call in indexed_calls),
         *((index, "message", message) for index, message in message_outputs),
+        *((index, "native", message) for index, message in indexed_natives),
     ]
     output_items.sort(key=lambda item: item[0])
     retained_messages: list[GatewayMessage] = []
@@ -406,6 +436,9 @@ def remember_turn(
             segment_message = cast(GatewayMessage, item)
         elif kind == "reasoning":
             segment_reasoning.append(cast(EncryptedReasoningBlock, item))
+        elif kind == "native":
+            flush_segment()
+            retained_messages.append(cast(GatewayMessage, item))
         else:
             segment_calls.append(cast(ToolCall, item))
     flush_segment()
@@ -418,6 +451,7 @@ def remember_turn(
                 provider_reasoning=(sealed_carrier,) if sealed_carrier is not None else (),
             )
         )
+    retained_messages.extend(unindexed_natives)
 
     messages = (*context.messages, *retained_messages)
     has_encrypted_reasoning = any(

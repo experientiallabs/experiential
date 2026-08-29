@@ -92,7 +92,7 @@ impl ResponsesRetention {
             }
             Event::ProviderOutputItemStarted {
                 output_index,
-                kind: ProviderOutputItemKind::FunctionCall,
+                kind: ProviderOutputItemKind::FunctionCall | ProviderOutputItemKind::CustomToolCall,
                 status,
                 ..
             } => {
@@ -268,6 +268,7 @@ pub(crate) fn remember_argument(
                 "name": call.name,
                 "arguments": call.raw_arguments,
                 "status": call.provider_status.map(ProviderOutputItemStatus::as_str),
+                "custom": call.custom,
             }))
             .collect::<Vec<Value>>(),
     }))
@@ -340,6 +341,7 @@ mod tests {
                     provider_item_id: None,
                     provider_status: Some(ProviderOutputItemStatus::Incomplete),
                     raw_arguments: "{}".to_string(),
+                    custom: false,
                 },
             },
             Event::ProviderOutputItemStarted {

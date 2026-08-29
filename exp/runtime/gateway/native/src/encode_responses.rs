@@ -25,39 +25,9 @@ fn invalid_provider_stream(message: &str) -> PublicError {
 }
 
 /// One accumulated Responses function call with stable item and output indices.
-struct ToolState {
-    item_id: Option<String>,
-    output_index: usize,
-    call_id: String,
-    name: String,
-    arguments: String,
-    status: Option<ProviderOutputItemStatus>,
-    done: bool,
-}
-
-impl ToolState {
-    /// The current official Responses function-call item.
-    fn item(&self, fallback_status: ProviderOutputItemStatus) -> Value {
-        if let Some(item_id) = &self.item_id {
-            json!({
-                "id": item_id,
-                "type": "function_call",
-                "call_id": self.call_id,
-                "name": self.name,
-                "arguments": self.arguments,
-                "status": self.status.unwrap_or(fallback_status).as_str(),
-            })
-        } else {
-            json!({
-                "type": "function_call",
-                "call_id": self.call_id,
-                "name": self.name,
-                "arguments": self.arguments,
-                "status": self.status.unwrap_or(fallback_status).as_str(),
-            })
-        }
-    }
-}
+#[path = "encode_responses/tool_state.rs"]
+mod tool_state;
+use tool_state::ToolState;
 
 /// One accumulated reasoning item with provider-indexed summary parts and
 /// an optional opaque encrypted payload the caller replays verbatim.
@@ -593,7 +563,12 @@ impl ResponsesSseEncoder {
             ));
         }
         let reserved = self.provider_output_starts.get(&index);
-        if reserved.is_some_and(|start| start.kind != ProviderOutputItemKind::FunctionCall) {
+        if reserved.is_some_and(|start| {
+            !matches!(
+                start.kind,
+                ProviderOutputItemKind::FunctionCall | ProviderOutputItemKind::CustomToolCall
+            )
+        }) {
             return Err(invalid_provider_stream(
                 "Responses tool call reused a non-tool provider output item.",
             ));
@@ -615,6 +590,10 @@ impl ResponsesSseEncoder {
                 false,
             ),
         };
+        let custom = self
+            .provider_output_starts
+            .get(&index)
+            .is_some_and(|start| start.kind == ProviderOutputItemKind::CustomToolCall);
         let state = ToolState {
             item_id,
             output_index,
@@ -623,6 +602,7 @@ impl ResponsesSseEncoder {
             arguments: String::new(),
             status,
             done: false,
+            custom,
         };
         let frame = self.event(
             "response.output_item.added",
@@ -649,8 +629,13 @@ impl ResponsesSseEncoder {
             // arguments on response.output_item.done instead.
             return Ok(Vec::new());
         };
+        let event_type = if self.tools[&index].custom {
+            "response.custom_tool_call_input.delta"
+        } else {
+            "response.function_call_arguments.delta"
+        };
         Ok(vec![self.event(
-            "response.function_call_arguments.delta",
+            event_type,
             json!({
                 "item_id": item_id,
                 "output_index": output_index,
@@ -703,7 +688,7 @@ impl ResponsesSseEncoder {
 
     /// Emit one function arguments-done and output-item-done pair.
     fn close_tool(&mut self, index: u32, fallback_status: ProviderOutputItemStatus) -> Vec<String> {
-        let (item_id, output_index, arguments, item) = {
+        let (item_id, output_index, arguments, item, custom) = {
             let state = match self.tools.get_mut(&index) {
                 Some(state) => state,
                 None => return Vec::new(),
@@ -720,16 +705,22 @@ impl ResponsesSseEncoder {
                 state.output_index,
                 state.arguments.clone(),
                 state.item(fallback_status),
+                state.custom,
             )
         };
         let mut frames = Vec::new();
         if let Some(item_id) = item_id {
+            let (event_type, payload_key) = if custom {
+                ("response.custom_tool_call_input.done", "input")
+            } else {
+                ("response.function_call_arguments.done", "arguments")
+            };
             frames.push(self.event(
-                "response.function_call_arguments.done",
+                event_type,
                 json!({
                     "item_id": item_id,
                     "output_index": output_index,
-                    "arguments": arguments,
+                    payload_key: arguments,
                 }),
             ));
         }

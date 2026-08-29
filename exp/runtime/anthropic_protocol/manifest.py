@@ -45,13 +45,17 @@ MESSAGES_MANIFEST = CompatibilityManifest(
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
             "context_management",
         ),
+        _field(
+            "output_config",
+            CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
+            "output_config",
+        ),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
                 "container",
                 "mcp_servers",
-                "output_config",
                 "service_tier",
             )
         ),

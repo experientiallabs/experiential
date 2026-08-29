@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
@@ -38,6 +40,16 @@ class ReplayedFunctionCall:
 
 
 @dataclass(frozen=True)
+class ReplayedNativeItem:
+    """One Codex-native input item carried byte-for-byte (tool namespaces,
+    freeform tool calls and their outputs)."""
+
+    index: int
+    role: Literal["developer", "assistant", "tool"]
+    item: JsonObject
+
+
+@dataclass(frozen=True)
 class ReplayedFunctionOutput:
     """One validated function result."""
 
@@ -46,7 +58,13 @@ class ReplayedFunctionOutput:
     output: str
 
 
-ReplayedInput = ReplayedReasoning | ReplayedMessage | ReplayedFunctionCall | ReplayedFunctionOutput
+ReplayedInput = (
+    ReplayedReasoning
+    | ReplayedMessage
+    | ReplayedFunctionCall
+    | ReplayedFunctionOutput
+    | ReplayedNativeItem
+)
 
 
 def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[GatewayMessage, ...]:
@@ -122,7 +140,12 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
         segment.clear()
 
     for item in value:
-        if isinstance(item, ReplayedMessage) and item.message.role != "assistant":
+        if isinstance(item, ReplayedNativeItem):
+            # Native items break the assistant segment and keep their exact
+            # position; the payload builder re-emits them verbatim.
+            flush_segment()
+            messages.append(GatewayMessage(role=item.role, provider_native_item=item.item))
+        elif isinstance(item, ReplayedMessage) and item.message.role != "assistant":
             flush_segment()
             messages.append(item.message)
         elif isinstance(item, ReplayedFunctionOutput):

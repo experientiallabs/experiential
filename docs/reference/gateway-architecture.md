@@ -140,6 +140,18 @@ result can advance to the next certified deployment, while mixed semantic output
 commits and flushes the original route. Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 
+First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
+default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
+Anthropic rungs (a canonical `effort` also rides `reasoning_effort`, caller keys always win over
+engine-derived ones), mid-conversation `system` turns keep their position on wires that express
+them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
+config. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
+and drop with disclosure elsewhere; Codex-native input items (`additional_tools` tool namespaces,
+`custom_tool_call`/`custom_tool_call_output` freeform history) carry byte-for-byte and require a
+homogeneous native Responses route; echoed message items accept `id`/`phase` with `status`
+optional (non-assistant identity drops); and freeform custom tool calls stream end to end with
+their native event names, including continuation retention.
+
 Provider client-errors stay sanitized: no provider error prose or body content ever reaches the
 caller. The one provider-derived fact a 4xx rejection may relay is the parameter path the provider
 named, extracted per dialect (OpenAI `error.param`; Anthropic's leading `path:` message token;

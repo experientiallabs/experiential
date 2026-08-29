@@ -304,6 +304,13 @@ impl ChatSseEncoder {
                 )])
             }
             Event::ToolCallCompleted { index, call } => {
+                if call.custom {
+                    // Custom tools only enter through a Responses request,
+                    // which never encodes on the Chat surface.
+                    return Err(invalid_provider_stream(
+                        "Chat cannot represent a custom tool call.",
+                    ));
+                }
                 let identity = self.tool_indices.get(index).ok_or_else(|| {
                     invalid_provider_stream("Chat tool completion omitted its started tool call.")
                 })?;
@@ -645,6 +652,7 @@ mod tests {
                     raw_arguments: "{}".to_string(),
                     provider_item_id: None,
                     provider_status: None,
+                    custom: false,
                 },
             },
             Event::Completed,
@@ -732,6 +740,7 @@ mod tests {
                     raw_arguments: "{\"order\":0}".to_string(),
                     provider_item_id: None,
                     provider_status: None,
+                    custom: false,
                 },
             },
             Event::ToolCallCompleted {
@@ -742,6 +751,7 @@ mod tests {
                     raw_arguments: "{\"order\":1}".to_string(),
                     provider_item_id: None,
                     provider_status: None,
+                    custom: false,
                 },
             },
         ];

@@ -190,6 +190,18 @@ class GatewayMessage(ContractModel):
         exclude=True,
     )
     """OpenAI Responses assistant-message phase retained for exact replay."""
+    provider_native_item: JsonObject | None = Field(default=None, exclude=True)
+    """One verbatim OpenAI Responses input item the gateway carries opaquely.
+
+    Codex ships tool definitions and freeform tool history as native input
+    items (``additional_tools``, ``custom_tool_call``,
+    ``custom_tool_call_output``) whose shapes cannot be expressed on any
+    other wire; the item is validated shallowly at decode and re-emitted
+    byte-for-byte at its position on native Responses rungs only. A message
+    carrying it carries nothing else. Excluded from serialization like the
+    other carriers so item-free digests are unperturbed; a present item
+    joins replay identity through :func:`canonical_request_sha256`.
+    """
 
     @model_validator(mode="after")
     def _require_role_coherence(self) -> GatewayMessage:
@@ -201,6 +213,17 @@ class GatewayMessage(ContractModel):
         Raises:
             ValueError: Content, tool linkage, or assistant calls are incoherent.
         """
+        if self.provider_native_item is not None:
+            if (
+                self.content is not None
+                or self.tool_calls
+                or self.provider_reasoning
+                or self.provider_item_id is not None
+                or self.tool_call_id is not None
+                or self.tool_is_error
+            ):
+                raise ValueError("a native provider item carries the whole message")
+            return self
         if (
             self.content is None
             and not self.tool_calls
@@ -304,6 +327,28 @@ class GatewayRequest(ContractModel):
     present value joins replay identity through
     :func:`canonical_request_sha256`.
     """
+    text_verbosity: Literal["low", "medium", "high"] | None = None
+    """Caller ``text.verbosity`` selector from the Responses surface."""
+    client_metadata: JsonObject | None = Field(default=None, exclude=True)
+    """Verbatim caller ``client_metadata`` from the Responses surface.
+
+    Opaque client telemetry (Codex sends it by default), forwarded verbatim
+    on native Responses rungs and dropped with disclosure elsewhere. It is
+    semantically inert, so unlike the other carriers it deliberately joins
+    NEITHER serialization nor replay identity: two requests differing only
+    here are the same request.
+    """
+    provider_output_config: JsonObject | None = Field(default=None, exclude=True)
+    """Verbatim caller ``output_config`` from the Messages surface.
+
+    Anthropic's native output configuration (Claude Code sends
+    ``{"effort": ...}`` by default). A canonical ``effort`` value also maps
+    into ``reasoning_effort`` so the shared effort machinery applies; the
+    raw object forwards byte-for-byte on Anthropic rungs with caller keys
+    winning over engine-derived ones. Excluded from serialization like the
+    other Anthropic-only carriers; a present value joins replay identity
+    through :func:`canonical_request_sha256`.
+    """
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
@@ -393,6 +438,12 @@ class GatewayRequest(ContractModel):
             raise ValueError("reasoning_context is valid only for Responses requests")
         if self.provider_thinking_config is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_thinking_config is valid only for Messages requests")
+        if self.provider_output_config is not None and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("provider_output_config is valid only for Messages requests")
+        if self.text_verbosity is not None and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("text_verbosity is valid only for Responses requests")
+        if self.client_metadata is not None and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("client_metadata is valid only for Responses requests")
         if self.context_management is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("context_management is valid only for Messages requests")
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
@@ -429,6 +480,8 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
             authority["provider_output_index"] = message.provider_output_index
             authority["provider_status"] = message.provider_status
             authority["provider_phase"] = message.provider_phase
+        if message.provider_native_item is not None:
+            authority["provider_native_item"] = message.provider_native_item
         if message.provider_reasoning:
             blocks: list[JsonObject] = []
             for block in message.provider_reasoning:
@@ -469,6 +522,7 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
         and request.provider_thinking_config is None
         and request.reasoning_context is None
         and request.context_management is None
+        and request.provider_output_config is None
     ):
         return sha256_json(request)
     return sha256_json(
@@ -478,6 +532,7 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
             "provider_thinking_config": request.provider_thinking_config,
             "reasoning_context": request.reasoning_context,
             "context_management": request.context_management,
+            "provider_output_config": request.provider_output_config,
         }
     )
 
