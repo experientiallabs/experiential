@@ -247,6 +247,29 @@ def test_carrier_authenticates_a_client_reencoding_of_the_same_turn() -> None:
     assert block.content == "hidden"
 
 
+def test_carrier_rejects_a_number_no_float_names_exactly() -> None:
+    """Beyond the exact integers a float stops standing in for one integer value."""
+    authority = _authority()
+    carrier = seal_reasoning_content(
+        authority,
+        issuing_request_id="issuing-request",
+        issuing_route_depth=0,
+        issuing_history_sha256=_HISTORY_SHA256,
+        assistant_content="visible assistant text",
+        tool_calls=_tool_calls("call-one", raw_arguments='{"n": 9007199254740993.0}'),
+        content="hidden",
+    )
+    parsed = parse_reasoning_content_carrier(carrier)
+
+    with pytest.raises(ValueError):
+        unseal_reasoning_content(
+            parsed,
+            authority,
+            assistant_content="visible assistant text",
+            tool_calls=_tool_calls("call-one", raw_arguments='{"n":9007199254740992}'),
+        )
+
+
 def test_carrier_decode_is_bounded_before_base64_or_aead_work() -> None:
     """Malformed and oversized public envelopes fail at the bounded parser."""
     with pytest.raises(ValueError):

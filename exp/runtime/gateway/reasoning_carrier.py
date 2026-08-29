@@ -47,6 +47,8 @@ MAXIMUM_REASONING_CARRIER_BYTES = 4 * ((_MAXIMUM_ENVELOPE_BYTES + 2) // 3) + 512
 _NONCE_BYTES = 12
 _KEY_DERIVATION_DOMAIN = b"experiential/fireworks-reasoning-carrier/aes256gcm/v2\0"
 _CREDENTIAL_IDENTITY_DOMAIN = b"experiential/fireworks-reasoning-credential/v2\0"
+_EXACT_INTEGER_LIMIT = 2**53
+"""First magnitude where a JSON float stops naming exactly one integer."""
 
 
 class ReasoningCarrierClaims(ContractModel):
@@ -432,14 +434,16 @@ def _normalized_arguments(value: JsonValue) -> JsonValue:
     """Return one JSON value whose numbers survive a client parse and re-encode.
 
     A JSON number carries no type, so a client that parses ``1.0`` and serializes the
-    same value as ``1`` sent the same arguments. Every integral number therefore digests
-    as an integer, leaving strings, booleans, null, and fractional numbers untouched.
+    same value as ``1`` sent the same arguments. An integral number therefore digests as
+    an integer, leaving strings, booleans, null, and fractional numbers untouched. Above
+    the exactly representable integers a float no longer names one integer, so those
+    values keep their own encoding and a changed magnitude still fails authentication.
     """
     if isinstance(value, dict):
         return {key: _normalized_arguments(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_normalized_arguments(item) for item in value]
-    if isinstance(value, float) and value.is_integer():
+    if isinstance(value, float) and value.is_integer() and abs(value) < _EXACT_INTEGER_LIMIT:
         return int(value)
     return value
 
