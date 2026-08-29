@@ -699,6 +699,8 @@ class GatewayFailure(ContractModel):
     safe_details: JsonObject = Field(default_factory=dict)
     rejected_parameter: str | None = Field(default=None, min_length=1, max_length=128)
     """Validated provider-named parameter path; never provider prose."""
+    provider_detail: str | None = Field(default=None, min_length=1, max_length=240)
+    """Provider explanation of a client error, relayed only for that class."""
 
 
 class ProjectSelection(ContractModel):

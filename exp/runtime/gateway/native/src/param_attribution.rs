@@ -1,10 +1,11 @@
 //! Provider-rejected parameter attribution for sanitized 400s.
 //!
 //! When a provider rejects a dispatched request with a client-error status,
-//! the public failure stays sanitized: no provider prose or body content ever
-//! crosses the boundary. The ONE fact this module may relay is the parameter
-//! path the provider named, and only when it validates against the strict
-//! path grammar below — anything else keeps today's content-free message.
+//! two facts may reach the caller, and only for that class: the parameter
+//! path the provider named, validated against the strict path grammar below,
+//! and the provider's own one-sentence explanation, read from the documented
+//! message field and sanitized by [`rejected_detail`]. Nothing else from the
+//! body crosses the boundary, and no other failure class relays any of it.
 //!
 //! Extraction classification per dialect (a new [`Dialect`] variant fails to
 //! compile until it is classified here, and the exhaustiveness test pins the
@@ -17,6 +18,9 @@
 //! | `AnthropicMessages`     | leading `path: ` or `` `path` `` message token |
 //! | `GeminiGenerateContent` | `fieldViolations[].field`, else `* path: ` msg |
 //! | `BedrockConverseStream` | none — no machine-readable parameter contract  |
+//!
+//! The explanation relayed alongside it comes from `error.message` for every
+//! dialect except Bedrock, which reports a bare top-level `message`.
 
 use serde_json::Value;
 
@@ -24,6 +28,9 @@ use crate::dialects::Dialect;
 
 /// Longest parameter path relayed; anything longer is treated as prose.
 const MAXIMUM_PATH_LENGTH: usize = 128;
+
+/// Longest provider explanation relayed; longer text is a body dump.
+const MAXIMUM_DETAIL_LENGTH: usize = 240;
 
 /// Fixed OpenAI-family prefix naming one unsupported argument.
 const UNKNOWN_ARGUMENT_PREFIXES: [&str; 2] = [
@@ -58,6 +65,52 @@ pub fn rejected_parameter(dialect: Dialect, body: &str) -> Option<String> {
         Dialect::BedrockConverseStream => None,
     }?;
     valid_parameter_path(&candidate).then_some(candidate)
+}
+
+/// Extract the provider's own explanation from one client-error body.
+///
+/// A client-error body explains what the caller got wrong, and the caller is
+/// the only party who can act on it, so the sentence itself is worth more to
+/// them than the gateway's generic wording. Only the dialect's documented
+/// message field is read, and only after [`sanitized_detail`] proves it is
+/// one bounded single-line sentence; a body dump, a stack trace, or a
+/// multi-line payload yields `None` and the caller keeps the generic message.
+///
+/// This relays provider wording verbatim, so it is restricted at the call
+/// site to the client-error class. Provider messages for authentication,
+/// not-found, and server-side failures are operator-facing and can name
+/// deployments or accounts, so they stay content-free.
+pub fn rejected_detail(dialect: Dialect, body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let message = match dialect {
+        Dialect::OpenAiResponses
+        | Dialect::OpenAiCompatible
+        | Dialect::AnthropicMessages
+        | Dialect::GeminiGenerateContent => value.get("error")?.get("message")?.as_str()?,
+        // Bedrock reports a modeling error as a bare top-level `message`.
+        Dialect::BedrockConverseStream => value.get("message")?.as_str()?,
+    };
+    sanitized_detail(message)
+}
+
+/// One provider sentence reduced to bounded, single-line, printable text.
+///
+/// Control characters end the candidate rather than being escaped: their
+/// presence means the field carries a payload, not a sentence. Interior runs
+/// of spaces and tabs collapse so the relayed text stays one readable line.
+fn sanitized_detail(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAXIMUM_DETAIL_LENGTH {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .any(|c| (c.is_control() && c != '\t') || (c.is_whitespace() && c != ' ' && c != '\t'))
+    {
+        return None;
+    }
+    let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then_some(collapsed)
 }
 
 /// The argument named after one fixed OpenAI-family unknown-argument prefix.
@@ -345,6 +398,52 @@ mod tests {
             }
             Dialect::BedrockConverseStream => "none: no machine-readable parameter contract",
         }
+    }
+
+    #[test]
+    fn provider_explanation_is_relayed_for_every_dialect_message_field() {
+        // Exact shapes captured live from each provider (2026-08-29).
+        let openai = r#"{"error": {"message": "Unknown parameter: 'top_k'.",
+            "type": "invalid_request_error"}}"#;
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, openai).as_deref(),
+            Some("Unknown parameter: 'top_k'.")
+        );
+        let anthropic = r#"{"type": "error", "error": {"type": "invalid_request_error",
+            "message": "`top_p` is deprecated for this model."}}"#;
+        assert_eq!(
+            rejected_detail(Dialect::AnthropicMessages, anthropic).as_deref(),
+            Some("`top_p` is deprecated for this model.")
+        );
+        let bedrock = r#"{"message": "The provided model does not support tool use."}"#;
+        assert_eq!(
+            rejected_detail(Dialect::BedrockConverseStream, bedrock).as_deref(),
+            Some("The provided model does not support tool use.")
+        );
+    }
+
+    #[test]
+    fn provider_explanation_is_dropped_when_it_is_not_one_bounded_sentence() {
+        let multiline = r#"{"error": {"message": "failed\n  at deployment-7\n"}}"#;
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, multiline), None);
+        let oversized = format!(
+            r#"{{"error": {{"message": "{}"}}}}"#,
+            "x".repeat(MAXIMUM_DETAIL_LENGTH + 1)
+        );
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, &oversized), None);
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "{}"), None);
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "<html>"), None);
+        let blank = r#"{"error": {"message": "   "}}"#;
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, blank), None);
+    }
+
+    #[test]
+    fn relayed_explanation_collapses_interior_whitespace_runs() {
+        let padded = r#"{"error": {"message": "  Unknown   parameter:\t'top_k'.  "}}"#;
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, padded).as_deref(),
+            Some("Unknown parameter: 'top_k'.")
+        );
     }
 
     #[test]

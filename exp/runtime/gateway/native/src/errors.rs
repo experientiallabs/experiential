@@ -166,10 +166,15 @@ pub struct Failure {
     pub retryable_same_deployment: bool,
     #[serde(default)]
     pub failover_eligible: bool,
-    /// Validated provider-named parameter path (never provider prose); the
-    /// only provider-derived content a sanitized client-error may relay.
+    /// Validated provider-named parameter path; one of the two facts a
+    /// sanitized client-error may relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejected_parameter: Option<String>,
+    /// The provider's own bounded single-line explanation of a client error,
+    /// relayed only for that class so the caller sees what was actually
+    /// refused. Every other class stays content-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_detail: Option<String>,
 }
 
 impl Failure {
@@ -180,12 +185,19 @@ impl Failure {
             retryable_same_deployment: false,
             failover_eligible: false,
             rejected_parameter: None,
+            provider_detail: None,
         }
     }
 
     /// Attach one already-validated provider parameter path.
     pub fn with_rejected_parameter(mut self, parameter: Option<String>) -> Self {
         self.rejected_parameter = parameter;
+        self
+    }
+
+    /// Attach one already-sanitized provider explanation.
+    pub fn with_provider_detail(mut self, detail: Option<String>) -> Self {
+        self.provider_detail = detail;
         self
     }
 
@@ -238,6 +250,18 @@ impl Failure {
         let mut error = PublicError::new(status, code, &self.safe_message, error_type);
         if self.failure_class == FailureClass::InvalidRequest {
             error.param = self.rejected_parameter.clone();
+            if let Some(detail) = self.provider_detail.as_deref() {
+                // The provider's own sentence replaces the generic "verify the
+                // request fields" advice: it says which field and why, which is
+                // the whole point of relaying it.
+                let head = self
+                    .safe_message
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim();
+                error.message = format!("{head}: {detail}");
+            }
         }
         error.retry_after_seconds = match self.failure_class {
             FailureClass::Throttled => Some(5),
@@ -272,6 +296,32 @@ mod tests {
         assert_eq!(
             carried["rejected_parameter"].as_str(),
             Some("input[1].status")
+        );
+    }
+
+    #[test]
+    fn provider_detail_replaces_the_generic_advice_only_for_invalid_requests() {
+        let explained = Failure::new(
+            FailureClass::InvalidRequest,
+            "provider rejected the request; verify the request fields against \
+             the model alias capabilities",
+        )
+        .with_provider_detail(Some("`top_p` is deprecated for this model.".to_string()));
+        assert_eq!(
+            explained.public_error().message,
+            "provider rejected the request: `top_p` is deprecated for this model."
+        );
+        // Any other class keeps its own message even if a detail leaked in.
+        let internal = Failure::new(FailureClass::ProviderInternal, "provider failed")
+            .with_provider_detail(Some("account 4711 is over its map".to_string()));
+        assert_eq!(internal.public_error().message, "provider failed");
+        let bare = serde_json::to_value(Failure::new(FailureClass::InvalidRequest, "x"))
+            .expect("serializable");
+        assert!(bare.get("provider_detail").is_none());
+        let carried = serde_json::to_value(explained).expect("serializable");
+        assert_eq!(
+            carried["provider_detail"].as_str(),
+            Some("`top_p` is deprecated for this model.")
         );
     }
 

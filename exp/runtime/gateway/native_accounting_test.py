@@ -28,6 +28,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
+    _failure_from_payload,
 )
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.routing import GatewayRoute
@@ -415,8 +416,6 @@ def test_rejected_parameter_crosses_the_boundary_only_as_a_string() -> None:
     assert isinstance(failure_payload, dict)
     assert failure_payload["rejected_parameter"] == "input[1].status"
     # Non-string or empty payload values decode to None, never a coerced str.
-    from exp.runtime.gateway.native_accounting import _failure_from_payload
-
     numeric = _failure_from_payload(
         {"failure_class": "invalid_request", "safe_message": "x", "rejected_parameter": 7}
     )
@@ -425,3 +424,30 @@ def test_rejected_parameter_crosses_the_boundary_only_as_a_string() -> None:
         {"failure_class": "invalid_request", "safe_message": "x", "rejected_parameter": ""}
     )
     assert empty is not None and empty.rejected_parameter is None
+
+
+def test_provider_detail_crosses_the_boundary_only_as_a_string() -> None:
+    """The provider explanation survives the failure payload decode."""
+    registry, _ledger, _entry = _registry()
+    _start(registry, ordinal=0)
+    exhausted = _start(
+        registry,
+        ordinal=1,
+        current_depth=0,
+        failure={
+            "failure_class": "invalid_request",
+            "safe_message": "provider rejected the request",
+            "provider_detail": "`top_p` is deprecated for this model.",
+        },
+    )
+    failure_payload = exhausted["failure"]
+    assert isinstance(failure_payload, dict)
+    assert failure_payload["provider_detail"] == "`top_p` is deprecated for this model."
+    numeric = _failure_from_payload(
+        {"failure_class": "invalid_request", "safe_message": "x", "provider_detail": 7}
+    )
+    assert numeric is not None and numeric.provider_detail is None
+    empty_detail = _failure_from_payload(
+        {"failure_class": "invalid_request", "safe_message": "x", "provider_detail": ""}
+    )
+    assert empty_detail is not None and empty_detail.provider_detail is None

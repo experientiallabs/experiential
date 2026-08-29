@@ -195,6 +195,15 @@ def public_failure_error(
         if param is None and isinstance(detail_param, str):
             param = detail_param
     message = failure.safe_message
+    if (
+        failure.failure_class is GatewayFailureClass.INVALID_REQUEST
+        and failure.provider_detail is not None
+    ):
+        # The provider's own sentence names the field and the reason, so it
+        # replaces the generic "verify the request fields" advice.
+        message = f"{message.split(';')[0].strip()}: {failure.provider_detail}"
+        if param is None and failure.rejected_parameter is not None:
+            param = failure.rejected_parameter
     if failure.failure_class is GatewayFailureClass.UNSUPPORTED_CAPABILITY and isinstance(
         failure.safe_details.get("capability"), str
     ):

@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
-use crate::param_attribution::rejected_parameter;
+use crate::param_attribution::{rejected_detail, rejected_parameter};
 
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a
@@ -155,19 +155,28 @@ pub async fn open_stream(
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         let failure = transport_failure(Some(status));
-        // Only the generic client-error class may carry attribution: the
-        // body is read bounded and the sole relayable fact is a validated
-        // parameter path; everything else stays content-free.
+        // Only the generic client-error class may carry attribution: the body
+        // is read bounded, and the relayable facts are a validated parameter
+        // path plus the provider's own bounded explanation of what the caller
+        // got wrong; every other class stays content-free.
         if failure.failure_class != FailureClass::InvalidRequest {
             return Err(failure);
         }
-        let parameter =
-            match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, bounded_error_body(response)).await
-            {
-                Ok(Some(body)) => rejected_parameter(dialect, &body),
-                _ => None,
-            };
-        return Err(failure.with_rejected_parameter(parameter));
+        let body = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, bounded_error_body(response))
+            .await
+        {
+            Ok(Some(body)) => Some(body),
+            _ => None,
+        };
+        let parameter = body
+            .as_deref()
+            .and_then(|body| rejected_parameter(dialect, body));
+        let detail = body
+            .as_deref()
+            .and_then(|body| rejected_detail(dialect, body));
+        return Err(failure
+            .with_rejected_parameter(parameter)
+            .with_provider_detail(detail));
     }
     Ok(response)
 }

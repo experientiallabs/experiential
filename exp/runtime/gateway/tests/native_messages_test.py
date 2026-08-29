@@ -173,13 +173,18 @@ class _SseUpstream(BaseHTTPRequestHandler):
         with self.payloads_lock:
             self.payloads.append(payload)
         prompt = payload["messages"][-1]["content"]
-        if prompt == "reject-param-token":
-            # Provider 400 naming the rejected parameter, with deliberate
-            # prose markers that must never reach the public error.
+        if prompt in {"reject-param-token", "reject-dump-token"}:
+            # A client error the caller can act on, and one whose message is a
+            # body dump the caller cannot: only the first is relayed.
+            message = (
+                "Unsupported value: 'input[1].status' is not one of the allowed values."
+                if prompt == "reject-param-token"
+                else "Traceback:\n  internal-deployment-7\n  account 4711 quota map\n"
+            )
             body = json.dumps(
                 {
                     "error": {
-                        "message": "PROVIDER-PROSE-MARKER: 'input[1].status' is unknown.",
+                        "message": message,
                         "type": "invalid_request_error",
                         "param": "input[1].status",
                         "code": "unknown_parameter",
@@ -1402,14 +1407,14 @@ def test_store_false_responses_cannot_be_continued(engine: _ServingEngine) -> No
     assert continued.json()["error"]["code"] == "continuation_unavailable"
 
 
-def test_provider_400_attributes_the_rejected_parameter_without_provider_prose(
+def test_provider_400_relays_the_parameter_and_the_provider_explanation(
     engine: _ServingEngine,
 ) -> None:
-    """A provider client-error relays ONLY the validated parameter path.
+    """A provider client-error relays the path and the provider's sentence.
 
     The mock provider's 400 body names ``input[1].status`` in its ``param``
-    field and carries a prose marker in its message; the public error must
-    surface the path and keep the sanitized message, never the marker.
+    field and explains the refusal in one sentence; both reach the caller,
+    who is the only party able to act on either.
     """
     native = httpx.post(
         f"{engine.base}/v1/messages",
@@ -1420,11 +1425,10 @@ def test_provider_400_attributes_the_rejected_parameter_without_provider_prose(
     assert native.status_code == 400
     error = native.json()["error"]
     assert error["type"] == "invalid_request_error"
-    assert "PROVIDER-PROSE-MARKER" not in json.dumps(native.json())
     # The Anthropic envelope folds a present param pointer into the message.
     assert error["message"] == (
-        "provider rejected the request; verify the request fields against "
-        "the model alias capabilities (param: input[1].status)"
+        "provider rejected the request: Unsupported value: 'input[1].status' "
+        "is not one of the allowed values. (param: input[1].status)"
     )
 
     # The OpenAI envelope carries the same attribution as the param field.
@@ -1440,7 +1444,33 @@ def test_provider_400_attributes_the_rejected_parameter_without_provider_prose(
     assert chat.status_code == 400
     chat_error = chat.json()["error"]
     assert chat_error["param"] == "input[1].status"
-    assert "PROVIDER-PROSE-MARKER" not in json.dumps(chat.json())
+    assert chat_error["message"].endswith("is not one of the allowed values.")
+
+
+def test_provider_400_keeps_the_generic_message_for_a_body_dump(
+    engine: _ServingEngine,
+) -> None:
+    """A multi-line provider message is a payload, not an explanation.
+
+    The mock provider's 400 message spans lines and names an internal
+    deployment and account; nothing from it may reach the caller.
+    """
+    rejected = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "reject-dump-token"}],
+        },
+        timeout=30.0,
+    )
+    assert rejected.status_code == 400
+    assert "internal-deployment-7" not in json.dumps(rejected.json())
+    assert "4711" not in json.dumps(rejected.json())
+    assert rejected.json()["error"]["message"] == (
+        "provider rejected the request; verify the request fields against "
+        "the model alias capabilities"
+    )
 
 
 def test_custom_tool_calls_round_trip_through_the_native_responses_lane(

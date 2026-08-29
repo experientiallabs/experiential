@@ -122,6 +122,7 @@ def _failure_from_payload(payload: object) -> GatewayFailure | None:
         return None
     data = cast("JsonObject", payload)
     rejected_parameter = data.get("rejected_parameter")
+    provider_detail = data.get("provider_detail")
     return GatewayFailure(
         failure_class=GatewayFailureClass(str(data["failure_class"])),
         safe_message=str(data["safe_message"]),
@@ -131,6 +132,9 @@ def _failure_from_payload(payload: object) -> GatewayFailure | None:
             rejected_parameter
             if isinstance(rejected_parameter, str) and rejected_parameter
             else None
+        ),
+        provider_detail=(
+            provider_detail if isinstance(provider_detail, str) and provider_detail else None
         ),
     )
 
@@ -385,6 +389,8 @@ class NativeAttemptAccounting:
         }
         if exhaustion.rejected_parameter is not None:
             failure_payload["rejected_parameter"] = exhaustion.rejected_parameter
+        if exhaustion.provider_detail is not None:
+            failure_payload["provider_detail"] = exhaustion.provider_detail
         return json.dumps(
             {"exhausted": True, "failure": failure_payload},
             separators=(",", ":"),

@@ -227,6 +227,11 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 "safe_message": failure.safe_message,
                 "retryable_same_deployment": failure.retryable_same_deployment,
                 "failover_eligible": failure.failover_eligible,
+                // The control plane echoes the exhausting failure back, and its
+                // answer wins over this one, so client-error attribution has to
+                // survive the round trip to reach the caller.
+                "rejected_parameter": failure.rejected_parameter,
+                "provider_detail": failure.provider_detail,
             })),
         }));
         let started_text = match ctx.bridge.call("start_attempt", argument).await {

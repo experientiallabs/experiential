@@ -140,6 +140,40 @@ def test_invalid_route_parameter_preserves_field_specific_error() -> None:
     assert error.detail.param == "max_completion_tokens"
 
 
+def test_provider_explanation_replaces_the_generic_client_error_advice() -> None:
+    """A relayed provider sentence names the refusal the caller must fix."""
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.INVALID_REQUEST,
+        safe_message=(
+            "provider rejected the request; verify the request fields against "
+            "the model alias capabilities"
+        ),
+        rejected_parameter="top_p",
+        provider_detail="`top_p` is deprecated for this model.",
+    )
+
+    error = public_failure_error(failure)
+
+    assert error.status_code == 400
+    assert error.detail.param == "top_p"
+    assert error.detail.message == (
+        "provider rejected the request: `top_p` is deprecated for this model."
+    )
+
+
+def test_provider_explanation_is_ignored_outside_the_client_error_class() -> None:
+    """Only a client error is caller-actionable, so only it relays a sentence."""
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+        safe_message="provider service failed; retry after a short delay",
+        provider_detail="deployment gpt-internal-7 is unhealthy",
+    )
+
+    error = public_failure_error(failure)
+
+    assert error.detail.message == "provider service failed; retry after a short delay"
+
+
 @pytest.mark.parametrize("param", (None, "tools"))
 def test_unsupported_capability_never_exposes_internal_identifiers(
     param: str | None,
