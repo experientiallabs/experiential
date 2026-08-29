@@ -82,41 +82,7 @@ def admitted_route_requests(
     full_wires = resolved_wires
 
     def candidate_serves(candidate: GatewayRequest) -> bool:
-        """Probe the full admission pipeline for one coercion candidate.
-
-        The policy layer sees only wire profiles, so without this probe a
-        candidate could pass generation narrowing yet land on rungs that all
-        fail deployment capability preflight, blocking a farther candidate
-        whose rungs serve.
-        """
-        try:
-            candidate_indexes = compatible_generation_parameter_profile_indexes(
-                tuple(profile for profile, _client in full_wires),
-                candidate,
-            )
-            candidate_route = select_route_deployments(full_route, candidate_indexes)
-            candidate_wires = tuple(full_wires[index] for index in candidate_indexes)
-            candidate_public, candidate_provider = route_generation_parameter_requests(
-                tuple(profile for profile, _client in candidate_wires),
-                candidate,
-            )
-        except (ProviderParameterError, ProviderCapabilityError):
-            return False
-        candidate_provider = candidate_provider.model_copy(
-            update={"stream": True, "include_usage": True}
-        )
-        indexes, errors = protocol_compatible_indexes(
-            candidate_route,
-            candidate_wires,
-            candidate_provider,
-            public_stream=candidate_public.stream,
-        )
-        if indexes:
-            return True
-        # A unanimously coercible capability rejection still serves: the
-        # capability coercion runs after the snap and clears it.
-        blocking = route_wide_capability(errors, len(candidate_route.deployments))
-        return blocking is not None and coerce_capability(blocking, candidate) is not None
+        return _candidate_serves(full_route, full_wires, candidate)
 
     try:
         compatible_indexes = compatible_generation_parameter_profile_indexes(
@@ -204,6 +170,76 @@ def admitted_route_requests(
             }
         )
     return route, resolved_wires, public_request, provider_request
+
+
+def _candidate_serves(
+    route: GatewayRoute,
+    resolved_wires: _ResolvedWires,
+    candidate: GatewayRequest,
+) -> bool:
+    """Probe the full admission pipeline for one coercion candidate.
+
+    The policy layer sees only wire profiles, so without this probe a
+    candidate could pass generation narrowing yet land on rungs that all fail
+    deployment capability preflight, blocking a farther candidate whose rungs
+    serve. The probe mirrors the real pipeline exactly, including the single
+    capability coercion admission may run afterwards: clearing one capability
+    can merely expose the next, so the coerced candidate must itself pass
+    preflight before the snap counts as servable.
+
+    Args:
+        route: Frozen full route aligned with ``resolved_wires``.
+        resolved_wires: Ordered wire profiles and clients per deployment.
+        candidate: One coercion candidate request.
+
+    Returns:
+        Whether admission would serve the candidate.
+    """
+    try:
+        candidate_indexes = compatible_generation_parameter_profile_indexes(
+            tuple(profile for profile, _client in resolved_wires),
+            candidate,
+        )
+        candidate_route = select_route_deployments(route, candidate_indexes)
+        candidate_wires = tuple(resolved_wires[index] for index in candidate_indexes)
+        candidate_public, candidate_provider = route_generation_parameter_requests(
+            tuple(profile for profile, _client in candidate_wires),
+            candidate,
+        )
+    except (ProviderParameterError, ProviderCapabilityError):
+        return False
+    candidate_provider = candidate_provider.model_copy(
+        update={"stream": True, "include_usage": True}
+    )
+    indexes, errors = protocol_compatible_indexes(
+        candidate_route,
+        candidate_wires,
+        candidate_provider,
+        public_stream=candidate_public.stream,
+    )
+    if indexes:
+        return True
+    blocking = route_wide_capability(errors, len(candidate_route.deployments))
+    if blocking is None:
+        return False
+    capability_coercion = coerce_capability(blocking, candidate)
+    if capability_coercion is None:
+        return False
+    try:
+        _coerced_public, coerced_provider = route_generation_parameter_requests(
+            tuple(profile for profile, _client in candidate_wires),
+            capability_coercion.request,
+        )
+    except (ProviderParameterError, ProviderCapabilityError):
+        return False
+    coerced_provider = coerced_provider.model_copy(update={"stream": True, "include_usage": True})
+    coerced_indexes, _coerced_errors = protocol_compatible_indexes(
+        candidate_route,
+        candidate_wires,
+        coerced_provider,
+        public_stream=candidate_public.stream,
+    )
+    return bool(coerced_indexes)
 
 
 def protocol_compatible_indexes(
