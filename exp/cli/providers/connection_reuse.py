@@ -2,8 +2,7 @@
 
 from typing import Literal
 
-from exp.common.models import ConnectionConfig
-from exp.common.models import ProviderConnection
+from exp.common.models import ConnectionConfig, ProviderConnection
 
 
 def _effective_bedrock_auth_mode(
@@ -11,8 +10,8 @@ def _effective_bedrock_auth_mode(
     provider: str,
     api_key_env: str | None,
     aws_access_key_id_env: str | None,
-    bedrock_auth_mode: str | None,
-) -> str | None:
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None,
+) -> Literal["access_key_pair", "api_key"] | None:
     """Canonicalize legacy explicit-pair records for semantic comparison."""
     if (
         provider == "bedrock"
@@ -34,7 +33,7 @@ def reused_connection(
     azure_api_surface: Literal["openai_deployments", "model_inference"] | None,
     region: str | None,
     aws_access_key_id_env: str | None = None,
-    bedrock_auth_mode: str | None = None,
+    bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None,
     require_ambient_bedrock_auth: bool = False,
 ) -> ProviderConnection | None:
     """Return the sole configured connection that semantically matches these fields."""

@@ -214,11 +214,7 @@ def provider_update(
             else azure_api_surface
         ),
         region=(
-            None
-            if clear_region
-            else current.region
-            if region is None and same_provider
-            else region
+            None if clear_region else current.region if region is None and same_provider else region
         ),
         replace=True,
         non_interactive=non_interactive,
