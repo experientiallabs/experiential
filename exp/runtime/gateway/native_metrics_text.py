@@ -56,6 +56,10 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "Fallbacks served for a dead lead rung.",
     ),
     (
+        "admission_parameter_coercions",
+        "Disclosed request coercions applied at admission.",
+    ),
+    (
         "reconciled_expired_requests",
         "Crashed requests reconciled at startup.",
     ),

@@ -304,7 +304,15 @@ class GatewayRequest(ContractModel):
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
     ignored_parameters: tuple[str, ...] = Field(default=(), exclude=True)
-    """Public compatibility fields accepted but intentionally omitted from provider dispatch."""
+    """Disclosed compatibility decisions applied to this request.
+
+    A plain field path names a control accepted but intentionally omitted
+    from provider dispatch; a ``path->effective`` entry (for example
+    ``reasoning_effort->high`` or ``tools.strict->false``) names a disclosed
+    coercion the route applied when no deployment preserved the caller's
+    exact value. Coercions are never silent: each entry here also logs and
+    counts in the admission metrics.
+    """
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=512)
     client_request_id: str | None = Field(default=None, min_length=1, max_length=512)
 

@@ -204,6 +204,22 @@ Anthropic message object. Completed streams stop with `end_turn` (`tool_use` whe
 present) and token-limited streams with `max_tokens`. The Anthropic protocol defines no
 idempotency header, so this surface never joins the keyed replay stores.
 
+Route admission preserves caller capabilities in three verbatim-preference layers before any
+coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`), generation
+controls narrow the waterfall to the rungs that preserve every exact value
+(`compatible_generation_parameter_profile_indexes`), and each remaining deployment passes the
+capability preflight plus payload build. Only when zero rungs survive does the
+capability-preservation policy (`exp/runtime/models/providers/capability_policy.py`) attempt one
+minimal COERCE-WITH-DISCLOSURE: a reasoning effort snaps to the nearest level any rung supports
+on the canonical ladder (ties prefer the lower level), an explicit `none` on a route with no
+reasoning support drops (the model already delivers what `none` asks for), and `strict: true`
+tools degrade to best-effort schemas. Every coercion is disclosed in `path->effective` form
+through `ignored_parameters`, logged, and counted in the `admission_parameter_coercions`
+metric; nothing coercible fails closed with the capability named and the route-wide gap stated.
+The per-deployment `capability_parity` export joins catalog declarations with the engine's
+provider-family ground truth so a catalog can pre-warn on gaps and route around them before a
+caller hits that 400.
+
 Commit-independent headers are available before streaming begins. Route-dependent headers are
 emitted only after an execution snapshot exists. Stable public IDs do not expose raw key,
 idempotency, request, or provider values.

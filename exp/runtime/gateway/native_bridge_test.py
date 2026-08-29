@@ -4234,3 +4234,82 @@ def test_zero_argument_tool_calls_encode_on_every_public_lane() -> None:
     call_items = [item for item in responses_body["output"] if item["type"] == "function_call"]
     assert call_items[0]["arguments"] == "{}"
     assert call_items[0]["status"] == "completed"
+
+
+def test_strict_tools_degrade_with_disclosure_when_no_rung_declares_them(
+    tmp_path: Path,
+) -> None:
+    """A strict tool on a route with no strict-capable rung serves degraded.
+
+    Production shape (org 9dd93c55): synced catalog rows declared
+    supports_strict_tools nowhere in the waterfall, so every strict-tool
+    request failed closed. Preference for a verbatim rung stays first; the
+    disclosed degrade applies only when zero rungs qualify, and the caller
+    sees exactly what happened.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "look it up"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                        "strict": True,
+                    },
+                }
+            ],
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body))
+    assert admission["ignored_parameters"] == ["tools.strict->false"]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    tools = cast("list[JsonObject]", upstream["tools"])
+    function = cast("JsonObject", tools[0]["function"])
+    assert function["strict"] is False
+    control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
+    assert control_plane["admission_parameter_coercions"] == 1
+
+
+def test_effort_none_drops_with_disclosure_on_a_reasoning_less_route(
+    tmp_path: Path,
+) -> None:
+    """reasoning_effort none is satisfied by a non-reasoning route.
+
+    The kimi-k3 shape: a route whose rungs declare no reasoning support
+    rejected the parameter wholesale. An explicit 'none' now drops with
+    disclosure (the model already does exactly what none asks for), while a
+    real effort stays the named rejection because deleting the feature is
+    not a nearest supported level.
+    """
+    control, raw_key = _control_plane(tmp_path)
+
+    def chat_body(effort: str) -> str:
+        """Return one Chat body carrying the given reasoning effort."""
+        return json.dumps(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": effort,
+            }
+        )
+
+    admission = _flatten_started(control, _admit(control, raw_key, chat_body("none")))
+    assert admission["ignored_parameters"] == ["reasoning_effort"]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "reasoning_effort" not in upstream
+    assert "reasoning" not in upstream
+    control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
+    assert control_plane["admission_parameter_coercions"] == 1
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, chat_body("high"))
+    payload = json.loads(raised.value.public_error_json)
+    assert payload["status_code"] == 400
+    assert payload["param"] == "reasoning_effort"
+    assert payload["code"] == "unsupported_parameter"

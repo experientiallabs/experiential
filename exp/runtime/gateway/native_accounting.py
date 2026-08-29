@@ -166,6 +166,7 @@ class NativeAttemptAccounting:
         # because a certified rung could not be resolved for dispatch, and the
         # subset of those where the skipped rung was the lead.
         self._admission_dead_rungs_skipped = 0
+        self._admission_parameter_coercions = 0
         self._admission_lead_rungs_skipped = 0
         # The sweep also runs on a timer so retained settlements and abandoned
         # attempts are recovered even when no further requests arrive.
@@ -198,6 +199,20 @@ class NativeAttemptAccounting:
                 self._sweep_abandoned_cancelled,
                 len(self._inflight),
             )
+
+    def record_admission_coercions(self, count: int) -> None:
+        """Count disclosed request coercions applied at admission.
+
+        Args:
+            count: Number of disclosed substitutions on one admission.
+        """
+        with self._lock:
+            self._admission_parameter_coercions += count
+
+    def admission_parameter_coercions(self) -> int:
+        """Return the total disclosed request coercions for metrics."""
+        with self._lock:
+            return self._admission_parameter_coercions
 
     def record_admission_rung_skips(self, dead_count: int, *, lead_skipped: bool) -> None:
         """Count admission-time dead-rung skips for the metrics snapshot.

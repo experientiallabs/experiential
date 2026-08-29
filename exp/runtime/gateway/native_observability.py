@@ -146,6 +146,7 @@ class NativeObservabilityMixin:
             "sweep_abandoned_attempts_cancelled": abandoned_cancelled,
             "admission_dead_rungs_skipped": dead_rungs_skipped,
             "admission_lead_rungs_skipped": lead_rungs_skipped,
+            "admission_parameter_coercions": self._accounting.admission_parameter_coercions(),
             "inflight_attempts": inflight,
             "reconciled_expired_requests": self._components.reconciled_expired_requests,
             "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
