@@ -40,6 +40,7 @@ def _control_plane() -> JsonObject:
         "sweep_abandoned_attempts_cancelled": 0,
         "admission_dead_rungs_skipped": 0,
         "admission_lead_rungs_skipped": 0,
+        "admission_parameter_coercions": 0,
         "inflight_attempts": 2,
         "reconciled_expired_requests": 0,
         "reconciled_unknown_attempts": 0,
@@ -103,6 +104,9 @@ exp_gateway_admission_dead_rungs_skipped_total 0
 # HELP exp_gateway_admission_lead_rungs_skipped_total Fallbacks served for a dead lead rung.
 # TYPE exp_gateway_admission_lead_rungs_skipped_total counter
 exp_gateway_admission_lead_rungs_skipped_total 0
+# HELP exp_gateway_admission_parameter_coercions_total Disclosed request coercions applied at admission.
+# TYPE exp_gateway_admission_parameter_coercions_total counter
+exp_gateway_admission_parameter_coercions_total 0
 # HELP exp_gateway_reconciled_expired_requests_total Crashed requests reconciled at startup.
 # TYPE exp_gateway_reconciled_expired_requests_total counter
 exp_gateway_reconciled_expired_requests_total 0
