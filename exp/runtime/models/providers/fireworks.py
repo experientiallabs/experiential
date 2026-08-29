@@ -120,9 +120,14 @@ def _require_active_carrier(
 
 
 def _require_complete_tool_results(messages: Sequence[GatewayMessage]) -> None:
-    """Require exactly one result for every active assistant tool call."""
+    """Require exactly one result for every active assistant tool call.
+
+    A provider answers some tool rounds without reasoning, so an active window mixes
+    carrier-bearing turns with plain ones. Every tool call in the window is tracked for
+    result identity, while completion is required only of the rounds that carry state.
+    """
     pending: set[str] = set()
-    active_call_ids: set[str] = set()
+    window_call_ids: set[str] = set()
     completed_call_ids: set[str] = set()
     for message in messages:
         if message.role == "assistant":
@@ -130,21 +135,21 @@ def _require_complete_tool_results(messages: Sequence[GatewayMessage]) -> None:
                 raise _reasoning_parameter_error(
                     "Fireworks reasoning_content tool calls need complete tool results."
                 )
+            call_ids = tuple(call.call_id for call in message.tool_calls)
+            if len(call_ids) != len(set(call_ids)) or window_call_ids.intersection(call_ids):
+                raise _reasoning_parameter_error(
+                    "Fireworks reasoning_content tool-call IDs must be unique."
+                )
+            window_call_ids.update(call_ids)
             if any(block.kind == "reasoning_content" for block in message.provider_reasoning):
-                call_ids = tuple(call.call_id for call in message.tool_calls)
-                if len(call_ids) != len(set(call_ids)) or active_call_ids.intersection(call_ids):
-                    raise _reasoning_parameter_error(
-                        "Fireworks reasoning_content tool-call IDs must be unique."
-                    )
                 pending = set(call_ids)
-                active_call_ids.update(call_ids)
-        elif message.role == "tool" and active_call_ids:
+        elif message.role == "tool" and window_call_ids:
             call_id = message.tool_call_id
-            if call_id not in active_call_ids or call_id in completed_call_ids:
+            if call_id not in window_call_ids or call_id in completed_call_ids:
                 raise _reasoning_parameter_error(
                     "Fireworks reasoning_content requires exactly one result per tool call."
                 )
-            pending.remove(call_id)
+            pending.discard(call_id)
             completed_call_ids.add(call_id)
     if pending or not messages or messages[-1].role != "tool":
         raise _reasoning_parameter_error(

@@ -306,10 +306,15 @@ def reasoning_history_sha256(messages: tuple[GatewayMessage, ...]) -> Sha256:
     artifact serialization. Carrier chaining is an internal authority boundary, so it
     deliberately adds the normalized blocks back before hashing. A later carrier then
     cannot be transplanted across two visually identical turns with different hidden state.
+
+    The digest covers the conversation a caller can observe, so absent and empty text are
+    the same history: a client that echoes the empty string the gateway streamed for a
+    tool-only turn continues the same conversation as one that echoes null.
     """
     payload: list[dict[str, object]] = []
     for message in messages:
         item = message.model_dump(mode="json")
+        item["content"] = _normalized_content(message.content)
         item["provider_reasoning"] = [
             block.model_dump(mode="json") for block in message.provider_reasoning
         ]
@@ -395,20 +400,34 @@ def _issuing_turn_sha256(
     assistant_content: str | None,
     tool_calls: tuple[ToolCall, ...],
 ) -> Sha256:
-    """Bind visible assistant text and every exact tool-call field."""
+    """Bind visible assistant text and every semantic tool-call field.
+
+    The turn is identified by what the caller can observe, not by one exact byte
+    encoding of it. Assistant text is compared with absent text equal to empty text,
+    and tool arguments are compared as canonically encoded objects, because an
+    OpenAI-compatible client parses the streamed arguments and re-encodes them on the
+    next turn. Argument values, names, order, and call identity all still bind.
+    """
     return sha256_json(
         {
-            "assistant_content": assistant_content,
+            "assistant_content": _normalized_content(assistant_content),
             "tool_calls": [
                 {
                     "call_id": call.call_id,
                     "name": call.name,
-                    "arguments_sha256": sha256_bytes(call.arguments_json().encode("utf-8")),
+                    "arguments_sha256": sha256_bytes(
+                        call.arguments_json(sort_keys=True, compact=True).encode("utf-8")
+                    ),
                 }
                 for call in tool_calls
             ],
         }
     )
+
+
+def _normalized_content(content: str | None) -> str | None:
+    """Return absent text for the empty string a tool-only turn may carry."""
+    return content or None
 
 
 def _associated_data(deployment_text: str) -> bytes:

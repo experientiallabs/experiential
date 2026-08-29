@@ -186,6 +186,35 @@ def test_stale_reasoning_is_stripped_at_the_next_user_boundary() -> None:
     assert prepared[1].provider_reasoning == ()
 
 
+def test_active_reasoning_accepts_a_tool_round_the_provider_answered_without_reasoning() -> None:
+    """A window mixing carrier-bound and plain tool rounds stays a valid continuation."""
+    messages = (
+        GatewayMessage(role="user", content="Use a tool"),
+        _assistant(),
+        GatewayMessage(role="tool", content="done", tool_call_id="call-one"),
+        GatewayMessage(role="assistant", tool_calls=(_call("call-two"),)),
+        GatewayMessage(role="tool", content="done", tool_call_id="call-two"),
+    )
+
+    prepared, active = prepare_gateway_reasoning_history(messages, route_sha256=_ROUTE_SHA256)
+
+    assert active
+    assert prepared[1].provider_reasoning != ()
+
+
+def test_active_reasoning_rejects_an_unanswered_carrier_bound_call() -> None:
+    """Reasoning still replays only when every carrier-bound call has its result."""
+    messages = (
+        GatewayMessage(role="user", content="Use a tool"),
+        _assistant(),
+        GatewayMessage(role="assistant", tool_calls=(_call("call-two"),)),
+        GatewayMessage(role="tool", content="done", tool_call_id="call-two"),
+    )
+
+    with pytest.raises(ProviderParameterError, match="complete tool results"):
+        prepare_gateway_reasoning_history(messages, route_sha256=_ROUTE_SHA256)
+
+
 def test_active_reasoning_rejects_duplicate_tool_results() -> None:
     """Every carrier-bound call must receive exactly one linked result."""
     messages = (
