@@ -6,8 +6,8 @@ preference already exists in three layers (operational deadness skipping in
 narrowing in ``generation_route_compat``, and the per-deployment capability
 preflight plus payload build in the control plane's admit loop). This module
 owns the step AFTER all three fail: the minimal COERCE-WITH-DISCLOSURE that
-keeps a request servable when semantics allow, and the enriched fail-closed
-message when they do not. A coercion is never silent: every substitution is
+keeps a request servable when semantics allow; when they do not, the rung's
+own field-scoped rejection stays the answer. A coercion is never silent: every substitution is
 disclosed through ``ignored_parameters`` in ``path->effective`` form, logged,
 and counted by the control plane's admission metrics.
 """
@@ -19,8 +19,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.models.providers.reasoning_compat import nearest_supported_effort
-from exp.runtime.models.providers.generation_parameter_validation import profile_reasoning_efforts
+from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
+    ProviderParameterError,
+)
+from exp.runtime.models.providers.generation_parameter_validation import (
+    profile_reasoning_efforts,
+)
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
+)
+from exp.runtime.models.providers.reasoning_compat import efforts_by_nearness
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -79,13 +88,20 @@ def coerce_generation_parameters(
         # The effort itself is portable; the verbatim failure lies elsewhere
         # and a snap would change semantics for nothing.
         return None
-    snapped = nearest_supported_effort(request.reasoning_effort, ladder)
-    if snapped is None:
-        return None
-    return RequestCoercion(
-        request=request.model_copy(update={"reasoning_effort": snapped}),
-        disclosures=(f"reasoning_effort->{snapped}",),
-    )
+    # A heterogeneous waterfall can carry a nearby effort only on rungs that
+    # reject some other control, so candidates are tried in nearness order
+    # and the snap is the closest level that actually admits a rung.
+    for candidate in efforts_by_nearness(request.reasoning_effort, ladder):
+        snapped_request = request.model_copy(update={"reasoning_effort": candidate})
+        try:
+            compatible_generation_parameter_profile_indexes(profiles, snapped_request)
+        except (ProviderParameterError, ProviderCapabilityError):
+            continue
+        return RequestCoercion(
+            request=snapped_request,
+            disclosures=(f"reasoning_effort->{candidate}",),
+        )
+    return None
 
 
 def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:
@@ -120,24 +136,31 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
     )
 
 
-def route_capability_failure_message(capability: str, deployment_count: int) -> str:
-    """Name the capability no rung declares and how to resolve it.
+def route_wide_capability(
+    errors: Sequence[ProviderParameterError | ProviderCapabilityError],
+    deployment_count: int,
+) -> str | None:
+    """Return the one capability EVERY route deployment rejected, if any.
 
-    The engine sees only the resolved route, so alias-level alternatives are
-    the catalog's job (see ``capability_parity``); this message states the
-    exact gap so an operator can declare the capability or the caller can
-    switch aliases.
+    Deployments can decline different requirements; a capability coercion is
+    honest only when a single capability was rejected by every rung, so mixed
+    rejections keep the first rung's own field-specific error instead of
+    degrading a field some rung could have preserved.
 
     Args:
-        capability: Stable capability literal from the final rejection.
-        deployment_count: Number of live deployments that declined it.
+        errors: One rejection per declined deployment, in route order.
+        deployment_count: Number of deployments the route offered.
 
     Returns:
-        The sanitized fail-closed message.
+        The universally rejected capability literal, or ``None``.
     """
-    deployments = "deployment" if deployment_count == 1 else "deployments"
-    return (
-        f"the requested capability '{capability}' is not declared by any of the "
-        f"{deployment_count} {deployments} in this model route; choose an alias "
-        "whose route supports it or remove the field"
-    )
+    if len(errors) != deployment_count:
+        return None
+    capabilities = {
+        error.capability for error in errors if isinstance(error, ProviderCapabilityError)
+    }
+    if len(capabilities) == 1 and all(
+        isinstance(error, ProviderCapabilityError) for error in errors
+    ):
+        return next(iter(capabilities))
+    return None

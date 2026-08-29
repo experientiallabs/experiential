@@ -44,41 +44,36 @@ def default_reasoning_effort(
     return cast("ReasoningEffort", supported[0]) if supported else None
 
 
-def nearest_supported_effort(
+def efforts_by_nearness(
     requested: str,
     supported: Collection[str],
-) -> ReasoningEffort | None:
-    """Return the supported effort closest to the request on the canonical ladder.
+) -> tuple[ReasoningEffort, ...]:
+    """Order supported efforts by closeness to the request on the ladder.
 
     Distance is measured in ladder positions (none < minimal < low < medium <
     high < xhigh < ultra < max); a tie prefers the LOWER level so a coercion
     never silently spends more reasoning than the caller asked for. Callers
-    must disclose the substitution: this helper only computes it.
+    must disclose any substitution: this helper only orders the candidates.
 
     Args:
         requested: Caller-provided effort value.
-        supported: Efforts every route deployment can preserve.
+        supported: Efforts the route's deployments can preserve.
 
     Returns:
-        The nearest supported effort, or ``None`` when the ladder is empty or
-        the requested value is not a known level.
+        Supported efforts from nearest to farthest, empty when the requested
+        value is not a known level or nothing is supported.
     """
     if requested not in _EFFORT_ORDER:
-        return None
-    ordered = [effort for effort in _EFFORT_ORDER if effort in supported]
-    if not ordered:
-        return None
+        return ()
     requested_index = _EFFORT_ORDER.index(requested)
-    return cast(
-        "ReasoningEffort",
-        min(
-            ordered,
-            key=lambda effort: (
-                abs(_EFFORT_ORDER.index(effort) - requested_index),
-                _EFFORT_ORDER.index(effort),
-            ),
+    ordered = sorted(
+        (effort for effort in _EFFORT_ORDER if effort in supported),
+        key=lambda effort: (
+            abs(_EFFORT_ORDER.index(effort) - requested_index),
+            _EFFORT_ORDER.index(effort),
         ),
     )
+    return cast("tuple[ReasoningEffort, ...]", tuple(ordered))
 
 
 def require_sampling_reasoning_compatibility(

@@ -215,7 +215,7 @@ on the canonical ladder (ties prefer the lower level), an explicit `none` on a r
 reasoning support drops (the model already delivers what `none` asks for), and `strict: true`
 tools degrade to best-effort schemas. Every coercion is disclosed in `path->effective` form
 through `ignored_parameters`, logged, and counted in the `admission_parameter_coercions`
-metric; nothing coercible fails closed with the capability named and the route-wide gap stated.
+metric; nothing coercible keeps the first rung's own field-scoped rejection.
 The per-deployment `capability_parity` export joins catalog declarations with the engine's
 provider-family ground truth so a catalog can pre-warn on gaps and route around them before a
 caller hits that 400.

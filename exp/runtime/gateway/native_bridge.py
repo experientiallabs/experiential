@@ -50,6 +50,7 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
+from exp.runtime.gateway.native_admission import admitted_route_requests
 from exp.runtime.gateway.native_bridge_errors import (
     escalation as _escalation,
 )
@@ -111,24 +112,13 @@ from exp.runtime.models.providers import (
     require_gateway_provider,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.capability_policy import (
-    coerce_capability,
-    coerce_generation_parameters,
-    route_capability_failure_message,
-)
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
     normalized_provider_failure,
 )
-from exp.runtime.models.providers.generation_route_compat import (
-    compatible_generation_parameter_profile_indexes,
-)
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
-from exp.runtime.models.providers.streaming_requests import (
-    dialect_stream_payload,
-    route_generation_parameter_requests,
-)
+from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
     invalid_field,
@@ -463,102 +453,13 @@ class NativeControlPlane(NativeObservabilityMixin):
         try:
             if probe_failure is not None or route is None or resolved_wires is None:
                 raise probe_failure or GatewayRoutingError("authorized route did not resolve")
-            admitted_request = request
-            coercion_disclosures: tuple[str, ...] = ()
-            try:
-                compatible_indexes = compatible_generation_parameter_profile_indexes(
-                    tuple(profile for profile, _client in resolved_wires),
-                    admitted_request,
-                )
-            except ProviderParameterError:
-                # No rung preserves the request verbatim; retry once with the
-                # minimal disclosed coercion when semantics allow, otherwise
-                # keep the named rejection.
-                coercion = coerce_generation_parameters(
-                    tuple(profile for profile, _client in resolved_wires),
-                    admitted_request,
-                )
-                if coercion is None:
-                    raise
-                compatible_indexes = compatible_generation_parameter_profile_indexes(
-                    tuple(profile for profile, _client in resolved_wires),
-                    coercion.request,
-                )
-                admitted_request = coercion.request
-                coercion_disclosures = coercion.disclosures
-            route = select_route_deployments(route, compatible_indexes)
-            resolved_wires = tuple(resolved_wires[index] for index in compatible_indexes)
-            public_request, provider_request = route_generation_parameter_requests(
-                tuple(profile for profile, _client in resolved_wires),
-                admitted_request,
-            )
-            provider_request = provider_request.model_copy(
-                update={"stream": True, "include_usage": True}
-            )
-            protocol_indexes, first_protocol_error = self._protocol_compatible_indexes(
+            route, resolved_wires, public_request, provider_request = admitted_route_requests(
                 route,
                 resolved_wires,
-                provider_request,
-                public_stream=public_request.stream,
+                request,
+                accounting=self._accounting,
+                authorization=authorization,
             )
-            if not protocol_indexes and isinstance(first_protocol_error, ProviderCapabilityError):
-                # Every rung declined the capability verbatim; degrade once
-                # with disclosure where semantics allow (strict tools only).
-                coercion = coerce_capability(first_protocol_error.capability, admitted_request)
-                if coercion is not None:
-                    admitted_request = coercion.request
-                    coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
-                    public_request, provider_request = route_generation_parameter_requests(
-                        tuple(profile for profile, _client in resolved_wires),
-                        admitted_request,
-                    )
-                    provider_request = provider_request.model_copy(
-                        update={"stream": True, "include_usage": True}
-                    )
-                    protocol_indexes, first_protocol_error = self._protocol_compatible_indexes(
-                        route,
-                        resolved_wires,
-                        provider_request,
-                        public_stream=public_request.stream,
-                    )
-            if not protocol_indexes:
-                if isinstance(first_protocol_error, ProviderCapabilityError):
-                    # Nothing coercible remains; fail closed naming the
-                    # capability and the exact route-wide gap.
-                    failure = GatewayFailure(
-                        failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
-                        safe_message=route_capability_failure_message(
-                            first_protocol_error.capability, len(route.deployments)
-                        ),
-                        safe_details={"capability": first_protocol_error.capability},
-                    )
-                    self._accounting.finish_request_quietly(authorization, failure)
-                    raise NativeBridgeError(public_failure_error(failure))
-                if first_protocol_error is None:
-                    raise GatewayRoutingError("authorized route has no compatible deployment")
-                raise first_protocol_error
-            if len(protocol_indexes) != len(route.deployments):
-                selected_indexes = tuple(protocol_indexes)
-                route = select_route_deployments(route, selected_indexes)
-                resolved_wires = tuple(resolved_wires[index] for index in selected_indexes)
-                public_request, provider_request = route_generation_parameter_requests(
-                    tuple(profile for profile, _client in resolved_wires),
-                    admitted_request,
-                )
-                provider_request = provider_request.model_copy(
-                    update={"stream": True, "include_usage": True}
-                )
-            if coercion_disclosures:
-                self._record_admission_coercions(authorization, coercion_disclosures)
-                public_request = public_request.model_copy(
-                    update={
-                        "ignored_parameters": tuple(
-                            dict.fromkeys(
-                                (*public_request.ignored_parameters, *coercion_disclosures)
-                            )
-                        )
-                    }
-                )
             wire_route: list[JsonObject] = []
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
@@ -985,69 +886,6 @@ class NativeControlPlane(NativeObservabilityMixin):
             )
         except NativeDecodeError as exc:
             raise NativeBridgeError(exc.error) from exc
-
-    def _protocol_compatible_indexes(
-        self,
-        route: GatewayRoute,
-        resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...],
-        provider_request: GatewayRequest,
-        *,
-        public_stream: bool | None,
-    ) -> tuple[tuple[int, ...], ProviderParameterError | ProviderCapabilityError | None]:
-        """Select rungs that pass capability preflight and payload build.
-
-        Args:
-            route: Frozen route aligned with ``resolved_wires``.
-            resolved_wires: Ordered wire profiles and clients per deployment.
-            provider_request: Streaming-forced request to validate.
-            public_stream: The caller's declared streaming intent.
-
-        Returns:
-            Ordered compatible indexes and the first rejection when none pass.
-        """
-        indexes: list[int] = []
-        first_error: ProviderParameterError | ProviderCapabilityError | None = None
-        for index, (deployment, (profile, _client)) in enumerate(
-            zip(route.deployments, resolved_wires, strict=True)
-        ):
-            try:
-                preflight_gateway_request(
-                    provider_request,
-                    deployment.gateway.capabilities,
-                    model_capabilities=deployment.capabilities,
-                    public_stream=public_stream,
-                )
-                dialect_stream_payload(profile, provider_request)
-            except (ProviderParameterError, ProviderCapabilityError) as exc:
-                if first_error is None:
-                    first_error = exc
-                continue
-            indexes.append(index)
-        return tuple(indexes), first_error
-
-    def _record_admission_coercions(
-        self,
-        authorization: AuthorizationSnapshot,
-        disclosures: tuple[str, ...],
-    ) -> None:
-        """Log and count one admission's disclosed request coercions.
-
-        A coercion is never silent: the caller sees it in
-        ``ignored_parameters``, the log names it for operators, and the
-        metrics snapshot counts it so a persistently coerced alias reaches a
-        human instead of quietly serving degraded semantics forever.
-
-        Args:
-            authorization: Frozen authority for the accepted request.
-            disclosures: Path->effective disclosure strings applied.
-        """
-        self._accounting.record_admission_coercions(len(disclosures))
-        _logger.warning(
-            "gateway admission coerced request semantics for alias %r: %s "
-            "(disclosed through ignored_parameters)",
-            authorization.alias,
-            ", ".join(disclosures),
-        )
 
     def _escalate_accepted(self, authorization: AuthorizationSnapshot, reason: str) -> str:
         """Finish one accepted-but-unservable request and return its disposition.

@@ -12,9 +12,8 @@ from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import (
     coerce_capability,
     coerce_generation_parameters,
-    route_capability_failure_message,
 )
-from exp.runtime.models.providers.reasoning_compat import nearest_supported_effort
+from exp.runtime.models.providers.reasoning_compat import efforts_by_nearness
 
 
 def _request(**overrides: object) -> GatewayRequest:
@@ -37,14 +36,19 @@ def _reasoning_profile(model_id: str) -> GatewayWireProfile:
     )
 
 
-def test_nearest_effort_prefers_the_lower_level_on_ties() -> None:
+def test_efforts_order_by_nearness_and_prefer_the_lower_level_on_ties() -> None:
     """Distance is ladder positions; a tie never spends more than requested."""
-    assert nearest_supported_effort("ultra", ("low", "medium", "high", "xhigh", "max")) == "xhigh"
-    assert nearest_supported_effort("medium", ("low", "high")) == "low"
-    assert nearest_supported_effort("minimal", ("high",)) == "high"
-    assert nearest_supported_effort("high", ("high",)) == "high"
-    assert nearest_supported_effort("high", ()) is None
-    assert nearest_supported_effort("bogus", ("high",)) is None
+    assert efforts_by_nearness("ultra", ("low", "medium", "high", "xhigh", "max")) == (
+        "xhigh",
+        "max",
+        "high",
+        "medium",
+        "low",
+    )
+    assert efforts_by_nearness("medium", ("low", "high")) == ("low", "high")
+    assert efforts_by_nearness("minimal", ("high",)) == ("high",)
+    assert efforts_by_nearness("high", ()) == ()
+    assert efforts_by_nearness("bogus", ("high",)) == ()
 
 
 def test_effort_snaps_to_the_nearest_route_level_with_disclosure() -> None:
@@ -55,6 +59,30 @@ def test_effort_snaps_to_the_nearest_route_level_with_disclosure() -> None:
         _request(reasoning_effort="xhigh"),
     )
     assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.disclosures == ("reasoning_effort->high",)
+
+
+def test_effort_snap_skips_levels_that_admit_no_rung() -> None:
+    """The snap is the nearest level that actually serves, not the nearest
+    level on paper: a rung carrying the closer effort may reject another
+    requested control, and the coercion must not dead-end there."""
+    xhigh_only_no_temperature = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://a.test",
+        model_id="gpt-5.2-pro",
+        supports_temperature=False,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+    )
+    request = _request(reasoning_effort="ultra", temperature=0.5)
+    coercion = coerce_generation_parameters(
+        (xhigh_only_no_temperature, _reasoning_profile("gpt-5.1")),
+        request,
+    )
+    assert coercion is not None
+    # xhigh is nearer to ultra but only the temperature-rejecting rung has
+    # it; high is the closest level that admits a serving rung.
     assert coercion.request.reasoning_effort == "high"
     assert coercion.disclosures == ("reasoning_effort->high",)
 
@@ -100,10 +128,23 @@ def test_strict_tools_degrade_only_as_a_disclosed_drop() -> None:
     assert coerce_capability("strict_tools", _request()) is None
 
 
-def test_fail_closed_message_names_the_capability_and_the_route_gap() -> None:
-    """The terminal rejection states the exact gap and how to resolve it."""
-    message = route_capability_failure_message("strict_tools", 3)
-    assert "'strict_tools'" in message
-    assert "3 deployments" in message
-    assert "choose an alias" in message
-    assert "1 deployment " in route_capability_failure_message("developer_messages", 1)
+def test_route_wide_capability_requires_unanimous_rejection() -> None:
+    """Mixed per-rung rejections never produce the route-wide claim."""
+    from exp.runtime.models.providers.capability_policy import route_wide_capability
+    from exp.runtime.models.providers.errors import (
+        ProviderCapabilityError,
+        ProviderParameterError,
+    )
+
+    strict = ProviderCapabilityError(capability="strict_tools")
+    developer = ProviderCapabilityError(capability="developer_messages")
+    parameter = ProviderParameterError(
+        message="The value 3 for 'top_k' is not supported.",
+        param="top_k",
+        code="invalid_parameter",
+    )
+    assert route_wide_capability((strict, strict), 2) == "strict_tools"
+    assert route_wide_capability((strict, developer), 2) is None
+    assert route_wide_capability((strict, parameter), 2) is None
+    assert route_wide_capability((strict,), 2) is None
+    assert route_wide_capability((), 0) is None

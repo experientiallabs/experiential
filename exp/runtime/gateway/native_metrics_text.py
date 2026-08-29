@@ -57,7 +57,7 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
     ),
     (
         "admission_parameter_coercions",
-        "Disclosed request coercions applied at admission.",
+        "Disclosed request coercions at admission.",
     ),
     (
         "reconciled_expired_requests",
