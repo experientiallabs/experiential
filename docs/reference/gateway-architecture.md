@@ -172,7 +172,10 @@ deployments.
 Responses have separate allowlist decoders and field-specific OpenAI error responses, but both
 convert to one canonical gateway request without conflating their wire contracts. The package also
 owns headers, response assembly, SSE framing, tool-call reconstruction, and official SDK
-compatibility.
+compatibility. The Chat decoder validates and drops the two annotations OpenCode-style clients
+carry on messages, `cache_control` (the gateway has no prompt-caching channel) and an assistant
+`reasoning_content` string (the DeepSeek and Kimi thinking convention), because the Chat wire
+represents reasoning in neither direction; every other unknown nested field stays rejected.
 Chat streaming emits valid completion chunks and one `[DONE]`. Responses streaming emits the
 created, in-progress, output, and exactly one terminal lifecycle. Provider tool-argument fragments
 are accumulated in original order and validated only at the complete-call boundary.

@@ -359,9 +359,12 @@ def decode_chat(
     """Decode one Chat Completions body without silently dropping fields.
 
     OpenCode may attach an Anthropic-style ``cache_control`` annotation on
-    Chat messages and on text content parts. Supported ephemeral forms are
-    validated and removed before official OpenAI validation and before
-    canonical conversion. Other unknown nested fields stay rejected.
+    Chat messages and on text content parts, and replays the assistant's
+    ``reasoning_content`` (the DeepSeek and Kimi thinking convention) in
+    history. Supported forms of both are validated and removed before
+    official OpenAI validation and before canonical conversion, because the
+    Chat wire carries no reasoning representation in either direction. Other
+    unknown nested fields stay rejected.
 
     Args:
         payload: Parsed JSON request body.
@@ -374,7 +377,7 @@ def decode_chat(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload = _drop_opencode_cache_control(payload)
+    payload = _drop_opencode_message_annotations(payload)
     _validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
@@ -508,18 +511,18 @@ def decode_responses(
     return DecodedGatewayRequest(alias=request.model, request=canonical)
 
 
-def _drop_opencode_cache_control(payload: JsonObject) -> JsonObject:
-    """Remove supported OpenCode ``cache_control`` annotations from Chat messages.
+def _drop_opencode_message_annotations(payload: JsonObject) -> JsonObject:
+    """Remove supported OpenCode annotations carried on Chat messages.
 
     Args:
         payload: Parsed Chat Completions body.
 
     Returns:
         The original payload, or a shallow copy whose messages no longer carry
-        a supported ``cache_control`` annotation.
+        a supported ``cache_control`` or ``reasoning_content`` annotation.
 
     Raises:
-        OpenAIProtocolError: A ``cache_control`` value is malformed or unsupported.
+        OpenAIProtocolError: An annotation value is malformed or unsupported.
     """
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list):
@@ -527,7 +530,7 @@ def _drop_opencode_cache_control(payload: JsonObject) -> JsonObject:
     cleaned_messages: list[JsonValue] = []
     changed = False
     for index, raw_message in enumerate(raw_messages):
-        message, message_changed = _without_message_cache_control(raw_message, index)
+        message, message_changed = _without_message_annotations(raw_message, index)
         cleaned_messages.append(message)
         changed = changed or message_changed
     if not changed:
@@ -537,8 +540,8 @@ def _drop_opencode_cache_control(payload: JsonObject) -> JsonObject:
     return cleaned_payload
 
 
-def _without_message_cache_control(raw_message: JsonValue, index: int) -> tuple[JsonValue, bool]:
-    """Drop a supported ``cache_control`` annotation from one Chat message.
+def _without_message_annotations(raw_message: JsonValue, index: int) -> tuple[JsonValue, bool]:
+    """Drop supported OpenCode annotations from one Chat message.
 
     Args:
         raw_message: One ``messages`` entry.
@@ -548,7 +551,7 @@ def _without_message_cache_control(raw_message: JsonValue, index: int) -> tuple[
         The message (copied when an annotation is removed) and whether it changed.
 
     Raises:
-        OpenAIProtocolError: The annotation is present but not a supported form.
+        OpenAIProtocolError: An annotation is present but not a supported form.
     """
     if not isinstance(raw_message, dict):
         return raw_message, False
@@ -559,6 +562,10 @@ def _without_message_cache_control(raw_message: JsonValue, index: int) -> tuple[
             message["cache_control"], f"messages.{index}.cache_control"
         )
         message = {key: value for key, value in message.items() if key != "cache_control"}
+        changed = True
+    if "reasoning_content" in message:
+        _require_supported_reasoning_content(message, index)
+        message = {key: value for key, value in message.items() if key != "reasoning_content"}
         changed = True
     content = message.get("content")
     if isinstance(content, list):
@@ -623,6 +630,22 @@ def _require_supported_cache_control(value: JsonValue, param: str) -> None:
         _EphemeralCacheControl.model_validate(value)
     except ValidationError as exc:
         raise invalid_field(param) from exc
+
+
+def _require_supported_reasoning_content(message: JsonObject, index: int) -> None:
+    """Accept replayed assistant reasoning text and reject every other form.
+
+    Args:
+        message: One ``messages`` entry carrying ``reasoning_content``.
+        index: Zero-based message index used in public error paths.
+
+    Raises:
+        OpenAIProtocolError: The annotation is not assistant text or null.
+    """
+    value = message["reasoning_content"]
+    supported = value is None or isinstance(value, str)
+    if message.get("role") != "assistant" or not supported:
+        raise invalid_field(f"messages.{index}.reasoning_content")
 
 
 def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:

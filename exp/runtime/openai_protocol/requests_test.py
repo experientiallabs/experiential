@@ -470,6 +470,102 @@ def test_chat_decoder_rejects_malformed_text_part_cache_control() -> None:
     assert captured.value.detail.param == "messages.0.content.0.cache_control"
 
 
+def test_chat_decoder_drops_replayed_assistant_reasoning_content() -> None:
+    """OpenCode replays the assistant's reasoning_content on every later turn.
+
+    DeepSeek thinking mode and Kimi K2 expect that field in history, so the
+    closed Chat wire model must accept it and drop it instead of failing the
+    second turn at messages.<index>.reasoning_content.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": "hi",
+                    "reasoning_content": "the user greeted me",
+                },
+                {"role": "user", "content": "again"},
+                {
+                    "role": "assistant",
+                    "content": "sure",
+                    "reasoning_content": None,
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        }
+    )
+
+    assert tuple(message.content for message in decoded.request.messages) == (
+        "hello",
+        "hi",
+        "again",
+        "sure",
+        "continue",
+    )
+    for message in decoded.request.messages:
+        assert "reasoning_content" not in message.model_dump(mode="json")
+    for adapted in model_request(decoded.request).messages:
+        assert "reasoning_content" not in adapted.model_dump(mode="json")
+
+
+def test_chat_decoder_drops_reasoning_content_beside_tool_calls() -> None:
+    """A replayed thinking turn that only calls tools stays decodable."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "read the file"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "I should call read",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            ],
+        }
+    )
+
+    assert decoded.request.messages[1].tool_calls[0].name == "read"
+    assert "reasoning_content" not in decoded.request.messages[1].model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    ("role", "reasoning_content"),
+    (
+        ("assistant", 1),
+        ("assistant", ["thinking"]),
+        ("assistant", {"text": "thinking"}),
+        ("user", "thinking"),
+        ("system", "thinking"),
+    ),
+)
+def test_chat_decoder_rejects_unsupported_reasoning_content(
+    role: str, reasoning_content: object
+) -> None:
+    """Only assistant reasoning text is droppable; every other form is invalid."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": role, "content": "hello", "reasoning_content": reasoning_content}
+                ],
+            }
+        )
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "messages.0.reasoning_content"
+
+
 def test_chat_decoder_still_rejects_unknown_nested_message_fields() -> None:
     """Dropping cache_control must not weaken unrelated unknown nested fields."""
     with pytest.raises(OpenAIProtocolError) as captured:
