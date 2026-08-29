@@ -235,7 +235,7 @@ def test_carrier_authenticates_a_client_reencoding_of_the_same_turn() -> None:
         issuing_route_depth=0,
         issuing_history_sha256=_HISTORY_SHA256,
         assistant_content="",
-        tool_calls=_tool_calls("call-one", raw_arguments='{"q": "x", "n": 1}'),
+        tool_calls=_tool_calls("call-one", raw_arguments='{"q": "x", "n": 1.0}'),
         content="hidden",
     )
     block, _claims = unseal_reasoning_content(

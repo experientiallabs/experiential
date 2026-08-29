@@ -18,9 +18,9 @@ from pydantic import Field, ValidationError
 
 from exp.common.core.artifacts import (
     ContractModel,
+    JsonValue,
     Sha256,
     canonical_json_bytes,
-    sha256_bytes,
     sha256_json,
 )
 from exp.common.models import ToolCall
@@ -404,7 +404,7 @@ def _issuing_turn_sha256(
 
     The turn is identified by what the caller can observe, not by one exact byte
     encoding of it. Assistant text is compared with absent text equal to empty text,
-    and tool arguments are compared as canonically encoded objects, because an
+    and tool arguments are compared as canonical JSON values, because an
     OpenAI-compatible client parses the streamed arguments and re-encodes them on the
     next turn. Argument values, names, order, and call identity all still bind.
     """
@@ -415,9 +415,7 @@ def _issuing_turn_sha256(
                 {
                     "call_id": call.call_id,
                     "name": call.name,
-                    "arguments_sha256": sha256_bytes(
-                        call.arguments_json(sort_keys=True, compact=True).encode("utf-8")
-                    ),
+                    "arguments_sha256": sha256_json(_normalized_arguments(call.arguments)),
                 }
                 for call in tool_calls
             ],
@@ -428,6 +426,22 @@ def _issuing_turn_sha256(
 def _normalized_content(content: str | None) -> str | None:
     """Return absent text for the empty string a tool-only turn may carry."""
     return content or None
+
+
+def _normalized_arguments(value: JsonValue) -> JsonValue:
+    """Return one JSON value whose numbers survive a client parse and re-encode.
+
+    A JSON number carries no type, so a client that parses ``1.0`` and serializes the
+    same value as ``1`` sent the same arguments. Every integral number therefore digests
+    as an integer, leaving strings, booleans, null, and fractional numbers untouched.
+    """
+    if isinstance(value, dict):
+        return {key: _normalized_arguments(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalized_arguments(item) for item in value]
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
 
 
 def _associated_data(deployment_text: str) -> bytes:
