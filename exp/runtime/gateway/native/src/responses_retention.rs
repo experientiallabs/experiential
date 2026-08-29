@@ -63,22 +63,20 @@ impl ResponsesRetention {
         match event {
             Event::ProviderOutputItemStarted {
                 output_index,
-                item_id,
+                item_id: Some(item_id),
                 kind: ProviderOutputItemKind::Message,
                 status,
                 phase,
             } => {
-                if let Some(item_id) = item_id {
-                    self.messages.insert(
-                        *output_index,
-                        RetainedMessage {
-                            item_id: item_id.clone(),
-                            status: *status,
-                            phase: *phase,
-                            ..RetainedMessage::default()
-                        },
-                    );
-                }
+                self.messages.insert(
+                    *output_index,
+                    RetainedMessage {
+                        item_id: item_id.clone(),
+                        status: *status,
+                        phase: *phase,
+                        ..RetainedMessage::default()
+                    },
+                );
             }
             Event::ProviderOutputItemStarted {
                 output_index,
@@ -93,21 +91,19 @@ impl ResponsesRetention {
             }
             Event::ProviderOutputItemStarted {
                 output_index,
-                item_id,
+                item_id: Some(item_id),
                 kind: ProviderOutputItemKind::Reasoning,
                 status,
                 ..
             } => {
-                if let Some(item_id) = item_id {
-                    self.reasoning.insert(
-                        *output_index,
-                        RetainedReasoning {
-                            item_id: item_id.clone(),
-                            status: *status,
-                            ..RetainedReasoning::default()
-                        },
-                    );
-                }
+                self.reasoning.insert(
+                    *output_index,
+                    RetainedReasoning {
+                        item_id: item_id.clone(),
+                        status: *status,
+                        ..RetainedReasoning::default()
+                    },
+                );
             }
             Event::ProviderOutputItemCompleted {
                 output_index,
@@ -236,14 +232,15 @@ pub(crate) fn remember_argument(request_id: &str, retention: &ResponsesRetention
             "phase": message.phase.map(ProviderAssistantMessagePhase::as_str),
         })).collect::<Vec<Value>>(),
         "refusal": retention.refusal,
-        "encrypted_reasoning": retention.reasoning.iter().filter_map(
-            |(output_index, reasoning)| (!reasoning.encrypted_content.is_empty()).then(|| json!({
+        "encrypted_reasoning": retention.reasoning.iter()
+            .filter(|(_, reasoning)| !reasoning.encrypted_content.is_empty())
+            .map(|(output_index, reasoning)| json!({
                 "output_index": output_index,
                 "item_id": reasoning.item_id,
                 "encrypted_content": reasoning.encrypted_content,
                 "status": reasoning.status.map(ProviderOutputItemStatus::as_str),
             }))
-        ).collect::<Vec<Value>>(),
+            .collect::<Vec<Value>>(),
         "tool_calls": retention
             .tool_calls
             .iter()
