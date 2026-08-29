@@ -55,22 +55,14 @@ _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
 )
 
 
-def _fireworks_continuation_required(
-    profile: GatewayWireProfile,
-    request: GatewayRequest,
-) -> bool:
+def _fireworks_continuation_required(profile: GatewayWireProfile, request: GatewayRequest) -> bool:
     """Return whether a Fireworks Responses turn can emit an unretained tool call."""
     return (
         request.surface == GatewayApiSurface.RESPONSES
-        and _is_fireworks_profile(profile)
+        and (urlsplit(profile.url).hostname or "").lower() == "api.fireworks.ai"
         and bool(request.tools)
         and request.tool_choice != "none"
     )
-
-
-def _is_fireworks_profile(profile: GatewayWireProfile) -> bool:
-    """Return whether one wire profile targets the public Fireworks API."""
-    return (urlsplit(profile.url).hostname or "").lower() == "api.fireworks.ai"
 
 
 def dialect_stream_payload(

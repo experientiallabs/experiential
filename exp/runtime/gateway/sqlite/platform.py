@@ -437,8 +437,7 @@ class SQLiteGatewayPlatform:
                     )
                 ),
                 connection_sha256=str(row["connection_sha256"]),
-                active=bool(row["active"])
-                and str(row["active_revision_id"]) == str(row["revision_id"]),
+                active=bool(row["active"]) and row["active_revision_id"] == row["revision_id"],
                 created_at=_datetime(row["created_at"]),
             )
             for row in rows
