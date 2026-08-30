@@ -114,6 +114,24 @@ pub(crate) fn latin1_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|value| value.as_bytes().iter().map(|&byte| byte as char).collect())
 }
 
+/// Read every value of a repeated list-typed header as latin-1 text, joined
+/// with commas in arrival order, the combining HTTP itself defines for
+/// list-typed fields. A caller or intermediary may split a comma list such as
+/// `anthropic-beta` across header lines; reading only the first line would
+/// silently drop the later tokens.
+pub(crate) fn latin1_header_list(headers: &HeaderMap, name: &str) -> Option<String> {
+    let values: Vec<String> = headers
+        .get_all(name)
+        .iter()
+        .map(|value| value.as_bytes().iter().map(|&byte| byte as char).collect())
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(","))
+    }
+}
+
 /// Re-encode one latin-1 decoded header value to its original bytes.
 pub(crate) fn latin1_bytes(value: &str) -> Vec<u8> {
     value
@@ -299,5 +317,44 @@ pub(crate) async fn finish_stream_terminal(
         if !send_bounded(sender, deadline, data).await {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_list_header_lines_join_in_arrival_order() {
+        let mut headers = HeaderMap::new();
+        headers.append("anthropic-beta", "context-1m-2025-08-07".parse().unwrap());
+        headers.append(
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14,fast-mode-2026-02-01"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            latin1_header_list(&headers, "anthropic-beta").as_deref(),
+            Some("context-1m-2025-08-07,interleaved-thinking-2025-05-14,fast-mode-2026-02-01")
+        );
+    }
+
+    #[test]
+    fn an_absent_list_header_reads_as_none() {
+        assert_eq!(
+            latin1_header_list(&HeaderMap::new(), "anthropic-beta"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_single_list_header_line_reads_verbatim() {
+        let mut headers = HeaderMap::new();
+        headers.append("anthropic-beta", "context-1m-2025-08-07".parse().unwrap());
+        assert_eq!(
+            latin1_header_list(&headers, "anthropic-beta").as_deref(),
+            Some("context-1m-2025-08-07")
+        );
     }
 }
