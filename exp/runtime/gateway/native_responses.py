@@ -108,7 +108,9 @@ def continued_request(
     if request.previous_response_id is None:
         episode = episode_namespace(
             namespace=namespace,
-            caller_episode_key=request.idempotency_key or request.client_request_id,
+            # The session-scoped correlation id is the stronger affinity
+            # scope; a per-operation idempotency key only pins retries.
+            caller_episode_key=request.client_request_id or request.idempotency_key,
             request_id=authorization.request_id,
         )
         return (

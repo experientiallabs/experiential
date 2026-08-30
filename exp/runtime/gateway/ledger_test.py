@@ -96,12 +96,18 @@ def _deployment(
     )
 
 
-def _request(content: str, *, idempotency_key: str | None = None) -> GatewayRequest:
+def _request(
+    content: str,
+    *,
+    idempotency_key: str | None = None,
+    client_request_id: str | None = None,
+) -> GatewayRequest:
     """Create one request whose content must not enter SQLite."""
     return GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         messages=(GatewayMessage(role="user", content=content),),
         idempotency_key=idempotency_key,
+        client_request_id=client_request_id,
     )
 
 
@@ -714,6 +720,58 @@ def test_idempotency_is_opt_in_and_restart_replay_fails_closed(tmp_path: Path) -
     )
     with pytest.raises(IdempotencyConflictError, match="different request"):
         restarted.accept_request(authorization=conflicting)
+
+
+def test_a_session_correlation_id_never_keys_duplicate_detection(tmp_path: Path) -> None:
+    """Sequential distinct requests sharing one X-Client-Request-Id all accept.
+
+    Codex sends its session id in that header on every request of a session
+    (captured live 2026-08-29), so treating it as an operation key would
+    reject the second request of every real session as a conflict.
+    """
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    for content in ("first turn", "second turn", "third turn"):
+        authorization = store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(content, client_request_id="codex-session-one"),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+        assert authorization.caller_operation_sha256 is None
+        ledger.accept_request(authorization=authorization)
+
+
+def test_a_failed_keyed_request_still_conflicts_a_mutated_retry(tmp_path: Path) -> None:
+    """Reusing an Idempotency-Key with a different body fails closed even
+    after the prior attempt failed: after a transport-ambiguous failure the
+    provider may have executed, so silently running different content under
+    the same operation identity is exactly what the key exists to prevent.
+    A stuck client must mint a new key rather than mutate the body."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    failed = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("original", idempotency_key="retry-operation"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=failed)
+    ledger.finish_request(
+        authorization=failed,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider unavailable",
+        ),
+    )
+    mutated = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("mutated", idempotency_key="retry-operation"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    with pytest.raises(IdempotencyConflictError, match="different request"):
+        ledger.accept_request(authorization=mutated)
 
 
 def test_crash_reconciliation_waits_for_deadline_and_cleanup_bound(tmp_path: Path) -> None:

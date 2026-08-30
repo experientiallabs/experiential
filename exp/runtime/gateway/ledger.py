@@ -215,6 +215,11 @@ class SQLiteAttemptLedger:
                 if str(prior["canonical_request_sha256"]) != (
                     authorization.canonical_request_sha256
                 ):
+                    # Deliberately fail closed even when the prior attempt
+                    # failed: after an ambiguous failure the provider may
+                    # have executed, so different content under one
+                    # operation identity is a client bug the key exists to
+                    # surface. Retrying different content needs a new key.
                     raise IdempotencyConflictError(
                         "caller operation key was reused with different request content"
                     )

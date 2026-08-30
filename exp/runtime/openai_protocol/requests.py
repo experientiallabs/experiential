@@ -15,6 +15,7 @@ from pydantic import (
     TypeAdapter,
     ValidationError,
 )
+from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.model import ToolCall
@@ -137,7 +138,9 @@ def decode_chat(
         extension_fields={"top_k", "reasoning_effort"},
     )
     request = _validate_wire(_ChatRequest, payload)
-    operation = _caller_operation(idempotency_key, client_request_id)
+    idempotency_key, client_request_id = _validated_operation_headers(
+        idempotency_key, client_request_id
+    )
     maximum = request.max_completion_tokens or request.max_tokens
     stop = (
         ()
@@ -177,8 +180,8 @@ def decode_chat(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
-            idempotency_key=operation if idempotency_key is not None else None,
-            client_request_id=operation if client_request_id is not None else None,
+            idempotency_key=idempotency_key,
+            client_request_id=client_request_id,
         )
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
@@ -210,11 +213,13 @@ def decode_responses(
     request = _validate_wire(_ResponsesRequest, payload)
     official_probe = dict(payload)
     if isinstance(raw := payload.get("input"), list):
-        # The installed SDK lags the live surface on echoed message items:
-        # it has no `phase` and requires `status` alongside `id`, while real
-        # Codex echoes carry id+phase and omit status (captured 2026-08-29).
-        # The strict wire model owns that contract, so the official probe
-        # sees a normalized item.
+        # The installed SDK lags the live surface on echoed output items:
+        # it has no message `phase` and requires `status` alongside `id`,
+        # while real Codex echoes carry id+phase and omit status, and it
+        # requires reasoning `content` to be an array while Codex echoes an
+        # explicit null that the provider accepts (both captured
+        # 2026-08-29). The strict wire model owns those contracts, so the
+        # official probe sees a normalized item.
         adapted: list[JsonValue] = []
         for entry in cast("list[JsonValue]", raw):
             if isinstance(entry, dict) and entry.get("type") == "message":
@@ -222,6 +227,13 @@ def decode_responses(
                 if item.get("id") is not None and "status" not in item:
                     item["status"] = "completed"
                 adapted.append(item)
+            elif (
+                isinstance(entry, dict)
+                and entry.get("type") == "reasoning"
+                and "content" in entry
+                and entry.get("content") is None
+            ):
+                adapted.append({key: value for key, value in entry.items() if key != "content"})
             else:
                 adapted.append(entry)
         official_probe["input"] = adapted
@@ -231,7 +243,9 @@ def decode_responses(
         extension_fields={"top_k", "reasoning", "client_metadata"},
     )
     include_encrypted_reasoning = _include_encrypted_reasoning(request.include)
-    operation = _caller_operation(idempotency_key, client_request_id)
+    idempotency_key, client_request_id = _validated_operation_headers(
+        idempotency_key, client_request_id
+    )
     raw_input = payload.get("input")
     messages = list(
         _response_input_messages(
@@ -289,8 +303,8 @@ def decode_responses(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
-            idempotency_key=operation if idempotency_key is not None else None,
-            client_request_id=operation if client_request_id is not None else None,
+            idempotency_key=idempotency_key,
+            client_request_id=client_request_id,
         )
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
@@ -378,6 +392,67 @@ def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
     return tuple(cleaned)
 
 
+_WIRE_TYPE_NAMES = {
+    "str": "a string",
+    "int": "an integer",
+    "float": "a number",
+    "bool": "a boolean",
+    "list": "an array",
+    "tuple": "an array",
+    "dict": "an object",
+    "NoneType": "null",
+}
+"""JSON-shape names for python input types, used in expected/got messages."""
+
+_EXPECTED_BY_ERROR_TYPE = {
+    "string_type": "a string",
+    "string_too_short": "a non-empty string",
+    "int_type": "an integer",
+    "int_parsing": "an integer",
+    "float_type": "a number",
+    "float_parsing": "a number",
+    "bool_type": "a boolean",
+    "list_type": "an array",
+    "tuple_type": "an array",
+    "dict_type": "an object",
+    "model_type": "an object",
+    "model_attributes_type": "an object",
+    "missing": "a value",
+    "none_required": "null",
+}
+"""Shape-level expectations for the pydantic error types worth naming."""
+
+
+def _shape_message(param: str, details: list[ErrorDetails]) -> str | None:
+    """Describe what shape a field expected versus what arrived.
+
+    Only structural facts appear: expectations come from this gateway's own
+    wire models and the got side is the JSON type of the caller's value,
+    never the value itself and never provider prose.
+    """
+    expected: list[str] = []
+    got: str | None = None
+    for detail in details:
+        phrase = _EXPECTED_BY_ERROR_TYPE.get(detail["type"])
+        if detail["type"] in {"literal_error", "enum"}:
+            context = detail.get("ctx") or {}
+            allowed = context.get("expected")
+            if isinstance(allowed, str):
+                phrase = f"one of {allowed}"
+        if phrase is not None and phrase not in expected:
+            expected.append(phrase)
+        # A missing-field complaint carries the parent object as its input,
+        # so it contributes no honest "got" type.
+        if detail["type"] != "missing" and "input" in detail:
+            got = _WIRE_TYPE_NAMES.get(type(detail["input"]).__name__, got)
+    if not expected:
+        return None
+    description = " or ".join(expected)
+    if got is not None:
+        return f"Invalid value for '{param}': expected {description}, but got {got} instead."
+    return f"Invalid value for '{param}': expected {description}."
+
+
 def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     """Convert Pydantic locations into stable dotted OpenAI ``param`` paths.
 
@@ -386,27 +461,43 @@ def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     most field-specific groups, the branch the caller actually meant is the
     one with the fewest complaints, so its deepest cleaned location names
     the real field (an echoed item's ``input.1.caller``), never a union
-    branch label such as ``input.str``.
+    branch label such as ``input.str``. The chosen field's own complaints
+    then name the expected shape against the arriving JSON type.
     """
-    groups: dict[tuple[str | int, ...], list[tuple[str, ...]]] = {}
+    groups: dict[tuple[str | int, ...], list[tuple[tuple[str, ...], ErrorDetails]]] = {}
     for detail in error.errors(include_url=False):
-        groups.setdefault(tuple(detail["loc"][:-1]), []).append(_cleaned_location(detail["loc"]))
+        groups.setdefault(tuple(detail["loc"][:-1]), []).append(
+            (_cleaned_location(detail["loc"]), detail)
+        )
     if not groups:
         return invalid_field("body")
-    deepest = max(len(location) for locations in groups.values() for location in locations)
+    deepest = max(len(location) for members in groups.values() for location, _ in members)
     candidates = [
-        locations
-        for locations in groups.values()
-        if any(len(location) == deepest for location in locations)
+        members
+        for members in groups.values()
+        if any(len(location) == deepest for location, _ in members)
     ]
     best = min(candidates, key=len)
-    location = max(best, key=len, default=())
+    location = max((cleaned for cleaned, _ in best), key=len, default=())
     param = ".".join(location) or "body"
-    return invalid_field(param)
+    details = [detail for cleaned, detail in best if cleaned == location]
+    return invalid_field(param, _shape_message(param, details))
 
 
-def _caller_operation(idempotency_key: str | None, client_request_id: str | None) -> str | None:
-    """Require two optional caller-operation headers to agree exactly."""
+def _validated_operation_headers(
+    idempotency_key: str | None, client_request_id: str | None
+) -> tuple[str | None, str | None]:
+    """Validate the two caller identity headers as independent concepts.
+
+    ``Idempotency-Key`` names one retriable operation and is the only header
+    that keys replay and duplicate detection. ``X-Client-Request-Id`` is a
+    caller correlation identity: Codex sends its session id there on every
+    request of a session (captured live 2026-08-29), and the provider serves
+    those requests without deduplication, so treating it as an operation key
+    would reject the second request of every real session as a conflict. It
+    is echoed on responses and scopes route affinity only, and the two
+    headers may therefore carry different values.
+    """
     for name, value in (
         ("Idempotency-Key", idempotency_key),
         ("X-Client-Request-Id", client_request_id),
@@ -415,18 +506,7 @@ def _caller_operation(idempotency_key: str | None, client_request_id: str | None
             not value or len(value) > 512 or any(ord(char) < 32 for char in value)
         ):
             raise invalid_field(name, f"{name} must be a non-empty display-safe value.")
-    if (
-        idempotency_key is not None
-        and client_request_id is not None
-        and idempotency_key != client_request_id
-    ):
-        raise OpenAIProtocolError(
-            status_code=400,
-            code="idempotency_conflict",
-            message="Idempotency-Key and X-Client-Request-Id must identify the same operation.",
-            param="Idempotency-Key",
-        )
-    return idempotency_key or client_request_id
+    return idempotency_key, client_request_id
 
 
 def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessage, ...]:

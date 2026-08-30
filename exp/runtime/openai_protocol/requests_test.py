@@ -9,7 +9,11 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayNamedToolChoice
+from exp.runtime.gateway.contracts import (
+    EncryptedReasoningBlock,
+    GatewayApiSurface,
+    GatewayNamedToolChoice,
+)
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
@@ -415,8 +419,8 @@ def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> No
         assert param is not None and param.startswith("messages.0.")
 
 
-def test_invalid_tool_arguments_and_conflicting_operation_headers_are_specific() -> None:
-    """Malformed history and mismatched dedup headers identify the exact public field."""
+def test_invalid_tool_arguments_and_divergent_operation_headers_are_specific() -> None:
+    """Malformed history names its field; independent identity headers both decode."""
     with pytest.raises(OpenAIProtocolError) as arguments:
         decode_chat(
             {
@@ -437,14 +441,16 @@ def test_invalid_tool_arguments_and_conflicting_operation_headers_are_specific()
         )
     assert arguments.value.detail.param == "messages.0.tool_calls.0.function.arguments"
 
-    with pytest.raises(OpenAIProtocolError) as operation:
-        decode_responses(
-            {"model": "coding", "input": "x"},
-            idempotency_key="one",
-            client_request_id="two",
-        )
-    assert operation.value.detail.code == "idempotency_conflict"
-    assert operation.value.detail.param == "Idempotency-Key"
+    # Idempotency-Key names one retriable operation; X-Client-Request-Id is
+    # session correlation identity (Codex sends its session id on every
+    # request of a session), so divergent values decode side by side.
+    decoded = decode_responses(
+        {"model": "coding", "input": "x"},
+        idempotency_key="one",
+        client_request_id="two",
+    )
+    assert decoded.request.idempotency_key == "one"
+    assert decoded.request.client_request_id == "two"
 
 
 def _assert_no_cache_control(decoded: DecodedGatewayRequest) -> None:
@@ -1587,3 +1593,106 @@ def test_the_captured_codex_request_shape_decodes_losslessly() -> None:
     assert echo.provider_item_id == "msg_echo_fixture"
     assert echo.provider_status is None
     assert echo.provider_phase == "commentary"
+
+
+def test_the_captured_codex_reasoning_echo_with_null_content_decodes() -> None:
+    """Regression fixture: the third request of a real Codex (0.151.0)
+    session, trimmed from a live capture (2026-08-29). After a
+    custom_tool_call round Codex echoes the reasoning output item with an
+    explicit ``content: null``; the provider accepts that request, so the
+    gateway must decode it instead of rejecting ``input.N.content``."""
+    reasoning_echo = {
+        "type": "reasoning",
+        "id": "rs_fixture",
+        "summary": [],
+        "content": None,
+        "encrypted_content": "gAAAAABfixture",
+    }
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.6-sol",
+            "store": False,
+            "stream": True,
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": {"effort": "max", "context": "all_turns"},
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "prompt_cache_key": "session-fixture",
+            "client_metadata": {"thread_id": "thread-fixture"},
+            "input": [
+                {
+                    "type": "message",
+                    "id": "msg_user_fixture",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Read data.txt."}],
+                },
+                reasoning_echo,
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_fixture",
+                    "status": "completed",
+                    "call_id": "call_fixture",
+                    "name": "exec",
+                    "input": 'const r = await tools.exec_command({cmd:"cat data.txt"});',
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_fixture",
+                    "call_id": "call_fixture",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\n"},
+                        {"type": "input_text", "text": "gateway test file\n"},
+                    ],
+                },
+            ],
+        }
+    )
+    request = decoded.request
+    roles = [message.role for message in request.messages]
+    assert roles == ["user", "assistant", "assistant", "tool"]
+    carrier = request.messages[1].provider_reasoning
+    assert len(carrier) == 1
+    assert isinstance(carrier[0], EncryptedReasoningBlock)
+    assert carrier[0].encrypted_content == "gAAAAABfixture"
+
+
+def test_decode_errors_name_the_expected_shape_against_the_arriving_type() -> None:
+    """Union rejections say what shape the field expected and what arrived,
+    at type level only, matching the provider's own error style."""
+    with pytest.raises(OpenAIProtocolError) as content:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_bad",
+                        "encrypted_content": "gAAAAABfixture",
+                        "content": 7,
+                    }
+                ],
+            }
+        )
+    assert content.value.detail.param == "input.0.content"
+    assert content.value.detail.message == (
+        "Invalid value for 'input.0.content': expected an array, but got an integer instead."
+    )
+
+    with pytest.raises(OpenAIProtocolError) as summary:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_bad",
+                        "encrypted_content": "gAAAAABfixture",
+                        "summary": None,
+                    }
+                ],
+            }
+        )
+    assert summary.value.detail.param == "input.0.summary"
+    assert summary.value.detail.message == (
+        "Invalid value for 'input.0.summary': expected an array, but got null instead."
+    )

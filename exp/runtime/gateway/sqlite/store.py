@@ -955,22 +955,19 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
 def _caller_operation_sha256(request: GatewayRequest) -> Sha256 | None:
     """Hash an opted-in caller operation without retaining the raw identifier.
 
+    Only the standard ``Idempotency-Key`` names a retriable operation.
+    ``client_request_id`` is a caller correlation identity that real
+    sessions reuse across distinct sequential requests, so it never keys
+    duplicate detection.
+
     Args:
         request: Canonical gateway request.
 
     Returns:
         Namespaced caller-operation digest, or ``None`` for ordinary requests.
-
-    Raises:
-        GatewayStoreError: Both supported headers name different operations.
     """
-    if (
-        request.idempotency_key is not None
-        and request.client_request_id is not None
-        and request.idempotency_key != request.client_request_id
-    ):
-        raise GatewayStoreError("idempotency and client request IDs must match when both are set")
-    value = request.idempotency_key or request.client_request_id
-    if value is None:
+    if request.idempotency_key is None:
         return None
-    return hashlib.sha256(f"gateway-caller-operation-v1\0{value}".encode()).hexdigest()
+    return hashlib.sha256(
+        f"gateway-caller-operation-v1\0{request.idempotency_key}".encode()
+    ).hexdigest()

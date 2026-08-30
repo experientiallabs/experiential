@@ -277,14 +277,17 @@ class _ResponseReasoningItem(_WireModel):
     ``encrypted_content`` is the round-trip payload; the display-only
     ``summary`` and ``content`` parts and the echoed lifecycle ``status``
     are validated and dropped because the provider derives the
-    model-visible reasoning from the encrypted payload alone.
+    model-visible reasoning from the encrypted payload alone. Codex echoes
+    reasoning output items with an explicit ``content: null`` (captured
+    live 2026-08-29); the provider accepts that null while rejecting a
+    null ``summary``, so exactly ``content`` is nullable here.
     """
 
     type: Literal["reasoning"]
     id: str = Field(min_length=1, max_length=256)
     encrypted_content: str = Field(min_length=1)
     summary: tuple[_ReasoningSummaryPart, ...] = ()
-    content: tuple[_ReasoningTextPart, ...] = ()
+    content: tuple[_ReasoningTextPart, ...] | None = None
     status: _EchoedItemStatus | None = None
 
 

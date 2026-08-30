@@ -267,7 +267,10 @@ alias-revision-scoped stores. A `store: false` request skips continuation retent
 `include: ["reasoning.encrypted_content"]` forwards the encrypted reasoning request to native
 OpenAI Responses routes, whose opaque payloads replay verbatim from the caller's input; the
 replayed reasoning item's `id` is never forwarded upstream because the provider binds the
-encrypted payload to its original item id and callers echo this gateway's own minted public ids. Replay is opt-in through an idempotency or client request key. Restart
+encrypted payload to its original item id and callers echo this gateway's own minted public ids. Replay is opt-in through the standard `Idempotency-Key` header only;
+`X-Client-Request-Id` is caller correlation identity (Codex sends its session id there on
+every request of a session), echoed on responses and used for route affinity, never as an
+operation key. Restart
 or eviction returns an explicit unavailable error and never reconstructs content from SQLite.
 
 ## Content-free observability and lifecycle

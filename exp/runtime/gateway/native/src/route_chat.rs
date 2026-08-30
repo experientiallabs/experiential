@@ -70,10 +70,13 @@ pub(crate) async fn chat(
     // bounded replay store dedupes concurrent duplicates and replays the
     // owner's exact stored response. Headers are decoded latin-1 so any
     // HTTP-legal value matches the python engine's view byte for byte.
+    // Only the standard Idempotency-Key opts into replay: callers reuse
+    // x-client-request-id as a session correlation id across distinct
+    // sequential requests, so it never keys an operation.
     let idempotency_key = latin1_header(&headers, "idempotency-key");
     let client_request_id = latin1_header(&headers, "x-client-request-id");
     let mut lease: Option<OwnerLease> = None;
-    if idempotency_key.is_some() || client_request_id.is_some() {
+    if idempotency_key.is_some() {
         let scope_argument = compact_json(&json!({
             "raw_key": raw_key,
             "body": body_text,

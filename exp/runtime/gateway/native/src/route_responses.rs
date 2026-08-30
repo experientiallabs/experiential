@@ -71,10 +71,14 @@ pub(crate) async fn responses(
     // protocol natively, sharing the same bounded replay store and
     // tenant-scoped key derivation the chat surface uses (the surface is
     // part of the key, so chat and Responses operations never collide).
+    // Only the standard Idempotency-Key opts into replay: Codex reuses
+    // x-client-request-id (its session id) across distinct sequential
+    // requests, so that header is correlation and affinity identity, never
+    // an operation key.
     let idempotency_key = latin1_header(&headers, "idempotency-key");
     let client_request_id = latin1_header(&headers, "x-client-request-id");
     let mut lease: Option<OwnerLease> = None;
-    if idempotency_key.is_some() || client_request_id.is_some() {
+    if idempotency_key.is_some() {
         let scope_argument = compact_json(&json!({
             "raw_key": raw_key,
             "body": body_text,

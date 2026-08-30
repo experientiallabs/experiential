@@ -1888,16 +1888,18 @@ def test_claim_scope_matches_the_python_replay_key(tmp_path: Path) -> None:
     assert scope["caller_operation_sha256"] == hashlib.sha256(b"operation-one").hexdigest()
     repeat = _claim_scope(control, raw_key, _chat_body(), idempotency_key="operation-one")
     assert repeat == scope
-    # The caller operation hashes identically through either header; the
-    # canonical request digest covers the decoded request, which records
-    # which header carried it, exactly as the shared decoder canonicalizes.
-    via_client_id = _claim_scope(
-        control,
-        raw_key,
-        _chat_body(),
-        client_request_id="operation-one",
-    )
-    assert via_client_id["caller_operation_sha256"] == scope["caller_operation_sha256"]
+    # X-Client-Request-Id is session correlation identity, never an
+    # operation key: a scope claim without an Idempotency-Key fails closed.
+    with pytest.raises(NativeBridgeError) as unkeyed:
+        _claim_scope(
+            control,
+            raw_key,
+            _chat_body(),
+            client_request_id="operation-one",
+        )
+    payload = json.loads(unkeyed.value.public_error_json)
+    assert payload["status_code"] == 400
+    assert payload["param"] == "Idempotency-Key"
     different_body = _claim_scope(
         control,
         raw_key,
@@ -1969,17 +1971,16 @@ def test_claim_scope_validates_headers_with_python_parity(tmp_path: Path) -> Non
             decode_chat(json.loads(_chat_body()), idempotency_key=bad_value)
         assert payload["code"] == expected.value.detail.code
         assert payload["message"] == expected.value.detail.message
-    with pytest.raises(NativeBridgeError) as mismatch:
-        _claim_scope(
-            control,
-            raw_key,
-            _chat_body(),
-            idempotency_key="one",
-            client_request_id="two",
-        )
-    payload = json.loads(mismatch.value.public_error_json)
-    assert payload["status_code"] == 400
-    assert payload["code"] == "idempotency_conflict"
+    # The two headers name independent concepts (operation vs session), so
+    # divergent values are legal and the operation key alone scopes replay.
+    divergent = _claim_scope(
+        control,
+        raw_key,
+        _chat_body(),
+        idempotency_key="one",
+        client_request_id="two",
+    )
+    assert divergent["caller_operation_sha256"] == hashlib.sha256(b"one").hexdigest()
 
 
 def test_keyed_admissions_enforce_the_durable_ledger_idempotency_rows(
