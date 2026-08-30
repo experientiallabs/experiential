@@ -73,8 +73,10 @@ pub fn rejected_parameter(dialect: Dialect, body: &str) -> Option<String> {
 /// the only party who can act on it, so the sentence itself is worth more to
 /// them than the gateway's generic wording. Only the dialect's documented
 /// message field is read, and only after [`sanitized_detail`] proves it is
-/// one bounded single-line sentence; a body dump, a stack trace, or a
-/// multi-line payload yields `None` and the caller keeps the generic message.
+/// one bounded single-line sentence that names no provider infrastructure; a
+/// body dump, a stack trace, or a sentence carrying a deployment, account,
+/// endpoint, or request handle yields `None` and the caller keeps the
+/// generic message.
 ///
 /// This relays provider wording verbatim, so it is restricted at the call
 /// site to the client-error class. Provider messages for authentication,
@@ -97,7 +99,9 @@ pub fn rejected_detail(dialect: Dialect, body: &str) -> Option<String> {
 ///
 /// Control characters end the candidate rather than being escaped: their
 /// presence means the field carries a payload, not a sentence. Interior runs
-/// of spaces and tabs collapse so the relayed text stays one readable line.
+/// of spaces and tabs collapse so the relayed text stays one readable line,
+/// and [`carries_provider_identifier`] then rejects any sentence naming
+/// provider-side infrastructure.
 fn sanitized_detail(message: &str) -> Option<String> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAXIMUM_DETAIL_LENGTH {
@@ -110,7 +114,42 @@ fn sanitized_detail(message: &str) -> Option<String> {
         return None;
     }
     let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!collapsed.is_empty()).then_some(collapsed)
+    if collapsed.is_empty() || collapsed.split(' ').any(carries_provider_identifier) {
+        return None;
+    }
+    Some(collapsed)
+}
+
+/// Whether one word of a provider sentence names provider-side infrastructure.
+///
+/// An explanation the caller can act on is prose about their own request, so
+/// it never needs an endpoint, a mailbox, a resource name, or an opaque
+/// handle. Any word shaped like one disqualifies the whole sentence: a
+/// partially redacted explanation reads as fact while hiding what was cut,
+/// and the caller keeps the generic message instead.
+fn carries_provider_identifier(word: &str) -> bool {
+    let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
+    if word.contains("://") || word.contains('@') || bare.to_ascii_lowercase().starts_with("arn:") {
+        return true;
+    }
+    if bare.len() == 36 && bare.chars().filter(|c| *c == '-').count() == 4 {
+        return true;
+    }
+    let dotted: Vec<&str> = bare.split('.').collect();
+    if dotted.len() == 4
+        && dotted
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+    {
+        return true;
+    }
+    let opaque = bare
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    opaque
+        && bare.len() >= 16
+        && bare.chars().any(|c| c.is_ascii_digit())
+        && bare.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 /// The argument named after one fixed OpenAI-family unknown-argument prefix.
@@ -435,6 +474,42 @@ mod tests {
         assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "<html>"), None);
         let blank = r#"{"error": {"message": "   "}}"#;
         assert_eq!(rejected_detail(Dialect::OpenAiCompatible, blank), None);
+    }
+
+    #[test]
+    fn provider_explanation_is_dropped_when_it_names_provider_infrastructure() {
+        // One readable sentence each, differing only in the operator-facing
+        // value the provider chose to echo back.
+        for message in [
+            "The deployment gpt4o-prod-7f2a91be44 is not configured for this account.",
+            "Model access denied for account 5f4dcc3b5aa765d61d8327deb882cf99.",
+            "Request 3f8a1c2e-9b44-4d17-9a1e-77c0d2b8e451 failed validation.",
+            "Route your request to https://eastus2.api.internal.example.com instead.",
+            "Contact platform-oncall@example.com about this quota.",
+            "The endpoint 10.42.117.8 rejected the model.",
+            "Model arn:aws:bedrock:us-east-1:481516234299:model/private is unavailable.",
+        ] {
+            let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
+            assert_eq!(
+                rejected_detail(Dialect::OpenAiCompatible, &body),
+                None,
+                "relayed an identifier-bearing sentence: {message}"
+            );
+        }
+        // Ordinary caller-actionable prose stays relayable, including the
+        // punctuation and short numbers that appear in parameter complaints.
+        for message in [
+            "`top_p` is deprecated for this model.",
+            "Unsupported value: 'input[1].status' is not one of the allowed values.",
+            "max_tokens must be less than or equal to 8192, got 100000.",
+        ] {
+            let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
+            assert_eq!(
+                rejected_detail(Dialect::OpenAiCompatible, &body).as_deref(),
+                Some(message),
+                "dropped a caller-actionable sentence: {message}"
+            );
+        }
     }
 
     #[test]
