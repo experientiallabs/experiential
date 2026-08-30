@@ -317,7 +317,11 @@ def _anthropic_blocks(message: ModelMessage) -> tuple[str, list[JsonObject]]:
     action = message.assistant_action
     text = message.content if message.content is not None else action.content if action else None
     blocks: list[JsonObject] = []
-    if text is not None:
+    # Anthropic rejects an empty text content block ("text content blocks must be
+    # non-empty"), so an empty assistant string is dropped, not emitted. Clients
+    # (e.g. OpenCode) routinely send content:"" on an assistant turn that carries
+    # tool calls; the tool_use blocks below still stand on their own.
+    if text:
         blocks.append({"type": "text", "text": text})
     if action is not None:
         blocks.extend(

@@ -8,6 +8,7 @@ from exp.common.models import (
     AssistantAction,
     EmbeddingClient,
     ModelClient,
+    ModelMessage,
     ModelRequest,
     ToolCall,
     ToolChoice,
@@ -368,6 +369,40 @@ def test_anthropic_uses_native_tool_blocks_and_normalizes_cache_usage() -> None:
         "name": "create_ticket",
         "input": {"priority": "normal"},
     }
+
+
+def test_anthropic_drops_empty_assistant_text_block_on_a_tool_turn() -> None:
+    """An empty assistant string never becomes an empty Anthropic text block.
+
+    Clients such as OpenCode send content:"" on an assistant turn that carries
+    tool calls. Anthropic rejects an empty text content block ("text content
+    blocks must be non-empty"), so the dialect must drop it and emit only the
+    tool_use block — otherwise Opus 5 tool threads 400 on the native route.
+    """
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="call the tool"),
+            ModelMessage(
+                role="assistant",
+                content="",
+                assistant_action=AssistantAction(
+                    content="",
+                    tool_calls=(ToolCall(call_id="toolu_1", name="get", arguments={}),),
+                ),
+            ),
+            ModelMessage(role="tool", tool_call_id="toolu_1", content="ok"),
+        )
+    )
+
+    payload = anthropic_messages_request("claude-fixture", request)
+
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    assert messages[1]["role"] == "assistant"
+    # Only the tool_use block survives — no empty text block leaks onto the wire.
+    assert messages[1]["content"] == [
+        {"type": "tool_use", "id": "toolu_1", "name": "get", "input": {}}
+    ]
 
 
 def test_anthropic_tool_none_keeps_history_schemas_and_uses_native_none() -> None:
