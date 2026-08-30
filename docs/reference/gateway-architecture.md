@@ -145,7 +145,12 @@ default are accepted and preserved. On the Messages surface, `output_config` for
 Anthropic rungs (a canonical `effort` also rides `reasoning_effort`, caller keys always win over
 engine-derived ones), mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
-config. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
+config. The conditional Claude Code fields `diagnostics` and `speed` forward verbatim on
+Anthropic rungs with their required `anthropic-beta` tokens and drop with disclosure elsewhere.
+A caller `anthropic-beta` header forwards through an exact token allowlist (notably
+`context-1m-2025-08-07`, which activates the provider's 1M context window; without it the
+provider serves 200K); non-allowlisted tokens drop with a per-token
+`anthropic-beta.<token>` disclosure, never a rejection and never a blind forward. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
 and drop with disclosure elsewhere; Codex-native input items (`additional_tools` tool namespaces,
 `custom_tool_call`/`custom_tool_call_output` freeform history) carry byte-for-byte and require a
 homogeneous native Responses route; echoed message items accept `id`/`phase` with `status`

@@ -159,6 +159,15 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
 ANTHROPIC_CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
 """Beta token Anthropic requires before it accepts ``context_management``."""
 
+ANTHROPIC_DIAGNOSTICS_BETA = "cache-diagnosis-2026-04-07"
+"""Beta token Anthropic requires before it accepts ``diagnostics``
+(verified live 2026-08-30: the field alone is "Extra inputs are not
+permitted"; with this token it is accepted)."""
+
+ANTHROPIC_FAST_MODE_BETA = "fast-mode-2026-02-01"
+"""Beta token Anthropic requires before it accepts ``speed``
+(verified live 2026-08-30)."""
+
 
 def anthropic_request_headers(
     profile_headers: dict[str, str],
@@ -166,11 +175,14 @@ def anthropic_request_headers(
 ) -> dict[str, str]:
     """Return the per-request Anthropic headers for one dispatch.
 
-    ``context_management`` is served behind an ``anthropic-beta`` token
-    (verified live 2026-08-29: the field alone is "Extra inputs are not
-    permitted"), so the token joins the connection's static headers exactly
-    when the request carries the field, merging with any operator-declared
-    beta list.
+    ``context_management``, ``diagnostics``, and ``speed`` are each served
+    behind an ``anthropic-beta`` token (each verified live: the bare field
+    is "Extra inputs are not permitted"), so their tokens join the
+    connection's static headers exactly when the request carries the field.
+    Allowlisted caller-forwarded tokens (``request.provider_beta_tokens``,
+    e.g. the 1M context window) merge the same way. The merged list keeps
+    operator tokens first, then caller tokens, then field-required tokens,
+    deduped in that order.
 
     Args:
         profile_headers: The connection's static wire headers.
@@ -180,13 +192,21 @@ def anthropic_request_headers(
         Headers to send verbatim for this request.
     """
     headers = dict(profile_headers)
-    if request.context_management is None:
+    required: list[str] = list(request.provider_beta_tokens)
+    if request.context_management is not None:
+        required.append(ANTHROPIC_CONTEXT_MANAGEMENT_BETA)
+    if request.diagnostics is not None:
+        required.append(ANTHROPIC_DIAGNOSTICS_BETA)
+    if request.speed is not None:
+        required.append(ANTHROPIC_FAST_MODE_BETA)
+    if not required:
         return headers
     existing = headers.get("anthropic-beta")
-    if existing is None:
-        headers["anthropic-beta"] = ANTHROPIC_CONTEXT_MANAGEMENT_BETA
-    elif ANTHROPIC_CONTEXT_MANAGEMENT_BETA not in existing.split(","):
-        headers["anthropic-beta"] = f"{existing},{ANTHROPIC_CONTEXT_MANAGEMENT_BETA}"
+    tokens = [token for token in (existing.split(",") if existing else []) if token]
+    for token in required:
+        if token not in tokens:
+            tokens.append(token)
+    headers["anthropic-beta"] = ",".join(tokens)
     return headers
 
 

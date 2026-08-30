@@ -32,6 +32,7 @@ def decode_native_body(
     surface: str = "chat",
     idempotency_key: str | None = None,
     client_request_id: str | None = None,
+    anthropic_beta: str | None = None,
 ) -> DecodedGatewayRequest:
     """Decode one raw request body with the shared surface decoder.
 
@@ -43,6 +44,9 @@ def decode_native_body(
             idempotency header.
         client_request_id: Optional raw ``X-Client-Request-Id`` header value.
             Ignored on the Anthropic Messages surface.
+        anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
+            Meaningful only on the Messages surface, where allowlisted
+            tokens are retained for Anthropic dispatch.
 
     Returns:
         The public alias and canonical request.
@@ -71,7 +75,7 @@ def decode_native_body(
         )
     try:
         if surface == "messages":
-            return decode_messages(payload)
+            return decode_messages(payload, anthropic_beta=anthropic_beta)
         decoder = decode_responses if surface == "responses" else decode_chat
         return decoder(
             payload,

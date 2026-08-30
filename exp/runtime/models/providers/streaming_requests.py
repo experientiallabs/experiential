@@ -411,6 +411,26 @@ def route_generation_parameter_requests(
     ):
         ignore("context_management")
 
+    # Diagnostics correlation, fast mode, and forwarded beta tokens are
+    # equally Anthropic-native; a mixed route drops them with disclosure
+    # (Claude Code sends them conditionally), never a rejection.
+    if request.diagnostics is not None and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        ignore("diagnostics")
+    if request.speed is not None and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        ignore("speed")
+    if request.provider_beta_tokens and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        for token in request.provider_beta_tokens:
+            path = f"anthropic-beta.{token}"
+            if path not in ignored:
+                ignored.append(path)
+        provider_updates["provider_beta_tokens"] = ()
+
     # A caller output_config whose only content is a canonical effort rides
     # reasoning_effort everywhere; anything more is Anthropic-native and is
     # disclosed-dropped when any rung cannot honor it (Claude Code sends

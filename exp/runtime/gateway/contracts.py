@@ -54,10 +54,16 @@ class GatewayApiSurface(StrEnum):
 
 
 class GatewayToolDefinition(ContractModel):
-    """One caller-defined function tool with its exact JSON Schema declaration."""
+    """One caller-defined function tool with its exact JSON Schema declaration.
+
+    The description bound is deliberately generous: both providers accept
+    40k-character tool descriptions live (verified 2026-08-30), and real
+    Claude Code toolsets exceeded the earlier 8k bound. The request-body
+    size cap remains the effective total limit.
+    """
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=65_536)
     parameters: JsonObject
     strict: bool = False
 
@@ -308,6 +314,40 @@ class GatewayRequest(ContractModel):
     config-free digests are unperturbed; a present value joins replay
     identity through :func:`canonical_request_sha256`.
     """
+    diagnostics: JsonObject | None = Field(default=None, exclude=True)
+    """Verbatim caller ``diagnostics`` from the Messages surface.
+
+    Anthropic's diagnostics-correlation object (Claude Code sends
+    ``{"previous_message_id": ...}`` conditionally). Validated only as an
+    object and forwarded byte-for-byte with the required beta header on
+    Anthropic rungs, dropped with disclosure elsewhere; the shape is an
+    evolving provider beta, so validation stays shallow. Excluded from
+    serialization; a present value joins replay identity through
+    :func:`canonical_request_sha256`.
+    """
+    speed: str | None = Field(default=None, max_length=64, exclude=True)
+    """Verbatim caller ``speed`` selector from the Messages surface.
+
+    Anthropic's fast-mode selector (Claude Code sends ``"fast"``; accepted
+    live behind its beta header, 2026-08-30). Bounded but deliberately not
+    enumerated: the value set is an evolving provider surface. Forwarded
+    with the required beta header on Anthropic rungs and dropped with
+    disclosure elsewhere. Fast-mode output is provider-priced at a premium,
+    so a present value joins replay identity through
+    :func:`canonical_request_sha256`.
+    """
+    provider_beta_tokens: tuple[str, ...] = Field(default=(), exclude=True)
+    """Allowlisted caller ``anthropic-beta`` tokens from the Messages surface.
+
+    Only tokens on the decoder's explicit forward allowlist appear here (a
+    caller header is operator-trust surface and is never blind-forwarded);
+    the rest are dropped at decode with an ``anthropic-beta.<token>``
+    disclosure. Forwarded tokens merge with the gateway's own per-field
+    injections on Anthropic rungs and are dropped with disclosure
+    elsewhere. Tokens change provider behavior and pricing (the 1M context
+    window rides one), so present tokens join replay identity through
+    :func:`canonical_request_sha256`.
+    """
     response_store: bool | None = None
     """Caller ``store`` selector from the Responses surface.
 
@@ -446,6 +486,12 @@ class GatewayRequest(ContractModel):
             raise ValueError("client_metadata is valid only for Responses requests")
         if self.context_management is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("context_management is valid only for Messages requests")
+        if self.diagnostics is not None and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("diagnostics is valid only for Messages requests")
+        if self.speed is not None and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("speed is valid only for Messages requests")
+        if self.provider_beta_tokens and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("provider_beta_tokens are valid only for Messages requests")
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
             raise ValueError("maximum output parameter requires a maximum output value")
         if self.reasoning_summary_parameters and self.reasoning_summary is None:
@@ -523,18 +569,28 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
         and request.reasoning_context is None
         and request.context_management is None
         and request.provider_output_config is None
+        and request.diagnostics is None
+        and request.speed is None
+        and not request.provider_beta_tokens
     ):
         return sha256_json(request)
-    return sha256_json(
-        {
-            "request_sha256": sha256_json(request),
-            "provider_replay": replay,
-            "provider_thinking_config": request.provider_thinking_config,
-            "reasoning_context": request.reasoning_context,
-            "context_management": request.context_management,
-            "provider_output_config": request.provider_output_config,
-        }
-    )
+    envelope: JsonObject = {
+        "request_sha256": sha256_json(request),
+        "provider_replay": replay,
+        "provider_thinking_config": request.provider_thinking_config,
+        "reasoning_context": request.reasoning_context,
+        "context_management": request.context_management,
+        "provider_output_config": request.provider_output_config,
+    }
+    # The newer Messages carriers join the envelope only when present, so
+    # every request decoded before they existed keeps its exact digest.
+    if request.diagnostics is not None:
+        envelope["diagnostics"] = request.diagnostics
+    if request.speed is not None:
+        envelope["speed"] = request.speed
+    if request.provider_beta_tokens:
+        envelope["provider_beta_tokens"] = list(request.provider_beta_tokens)
+    return sha256_json(envelope)
 
 
 class GatewayUsage(ContractModel):

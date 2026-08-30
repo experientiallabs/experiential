@@ -28,3 +28,15 @@ def test_invalid_json_is_a_native_decode_error() -> None:
 
     assert raised.value.error.status_code == 400
     assert raised.value.error.detail.code == "invalid_json"
+
+
+def test_messages_surface_threads_the_caller_beta_header() -> None:
+    """The Messages decode receives the caller anthropic-beta header so
+    allowlisted tokens (the 1M context window) survive to dispatch."""
+    decoded = decode_native_body(
+        '{"model":"public-model","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}',
+        surface="messages",
+        anthropic_beta="claude-code-20250219,context-1m-2025-08-07",
+    )
+    assert decoded.request.provider_beta_tokens == ("context-1m-2025-08-07",)
+    assert decoded.request.ignored_parameters == ("anthropic-beta.claude-code-20250219",)

@@ -22,7 +22,10 @@ from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ReasoningEffort, ToolCall
-from exp.runtime.anthropic_protocol.manifest import MESSAGES_MANIFEST
+from exp.runtime.anthropic_protocol.manifest import (
+    MESSAGES_BETA_TOKENS_FORWARDED,
+    MESSAGES_MANIFEST,
+)
 from exp.runtime.gateway.contracts import (
     CompatibilityDisposition,
     GatewayApiSurface,
@@ -133,10 +136,16 @@ class _Message(_WireModel):
 
 
 class _Tool(_WireModel):
-    """One caller-defined custom tool with its JSON Schema declaration."""
+    """One caller-defined custom tool with its JSON Schema declaration.
+
+    The description bound is generous on purpose: the provider accepts
+    40k-character descriptions live (verified 2026-08-30) and a real Claude
+    Code toolset exceeded the earlier 8k bound; the request-body size cap
+    remains the effective total limit.
+    """
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=65_536)
     input_schema: JsonObject
     cache_control: _CacheControl | None = None
     type: Literal["custom"] | None = None
@@ -194,9 +203,19 @@ class _MessagesRequest(_WireModel):
     thinking: _ThinkingConfig | None = None
     context_management: JsonObject | None = None
     output_config: JsonObject | None = None
+    diagnostics: JsonObject | None = None
+    speed: str | None = Field(default=None, min_length=1, max_length=64)
+    """Fast-mode selector, forwarded verbatim (Claude Code sends "fast";
+    accepted live behind its beta header, 2026-08-30). Bounded but
+    deliberately not enumerated: the value set is an evolving provider
+    surface."""
 
 
-def decode_messages(payload: JsonObject) -> DecodedGatewayRequest:
+def decode_messages(
+    payload: JsonObject,
+    *,
+    anthropic_beta: str | None = None,
+) -> DecodedGatewayRequest:
     """Decode one Anthropic Messages body without silently dropping fields.
 
     The Anthropic protocol defines no idempotency header, so this surface
@@ -204,6 +223,9 @@ def decode_messages(payload: JsonObject) -> DecodedGatewayRequest:
 
     Args:
         payload: Parsed JSON request body.
+        anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
+            Allowlisted tokens are retained for Anthropic dispatch; the rest
+            are dropped with a per-token disclosure.
 
     Returns:
         Public alias and lossless canonical gateway request.
@@ -214,6 +236,7 @@ def decode_messages(payload: JsonObject) -> DecodedGatewayRequest:
     """
     _validate_manifest(payload)
     request = _validate_wire(payload)
+    forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
     if system_text:
@@ -245,6 +268,10 @@ def decode_messages(payload: JsonObject) -> DecodedGatewayRequest:
                 cast(JsonObject, payload["thinking"]) if request.thinking is not None else None
             ),
             context_management=_context_management(payload),
+            diagnostics=_diagnostics(payload),
+            speed=request.speed,
+            provider_beta_tokens=forwarded_betas,
+            ignored_parameters=dropped_beta_disclosures,
             reasoning_effort=_output_config_effort(request.output_config),
             provider_output_config=(
                 cast(JsonObject, payload["output_config"])
@@ -292,6 +319,61 @@ def _context_management(payload: JsonObject) -> JsonObject | None:
     if not isinstance(value, dict):
         raise invalid_field("context_management", "context_management must be a JSON object.")
     return cast(JsonObject, value)
+
+
+def _diagnostics(payload: JsonObject) -> JsonObject | None:
+    """Validate the caller's diagnostics correlation as an object, verbatim.
+
+    Like ``context_management``, the nested shape is an evolving Anthropic
+    beta the gateway forwards byte-for-byte (with the required beta
+    header), so validation is deliberately shallow.
+
+    Raises:
+        OpenAIProtocolError: The field is present but not a JSON object.
+    """
+    value = payload.get("diagnostics")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise invalid_field("diagnostics", "diagnostics must be a JSON object.")
+    return cast(JsonObject, value)
+
+
+def _beta_tokens(header: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Partition a caller ``anthropic-beta`` header into forward and drop sets.
+
+    Forwarding is an exact allowlist (:data:`MESSAGES_BETA_TOKENS_FORWARDED`):
+    a caller header is operator-trust surface and is never blind-forwarded.
+    Dropped tokens are disclosed per token, never rejected, because the
+    provider itself tolerates unknown beta tokens.
+
+    Args:
+        header: Raw comma-separated header value, or ``None``.
+
+    Returns:
+        ``(forwarded_tokens, dropped_disclosures)`` in caller order, deduped.
+
+    Raises:
+        OpenAIProtocolError: The header carries a non-display-safe value.
+    """
+    if header is None:
+        return (), ()
+    if len(header) > 4_096 or any(ord(char) < 32 for char in header):
+        raise invalid_field("anthropic-beta", "anthropic-beta must be a display-safe header value.")
+    forwarded: list[str] = []
+    dropped: list[str] = []
+    for raw_token in header.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        if token in MESSAGES_BETA_TOKENS_FORWARDED:
+            if token not in forwarded:
+                forwarded.append(token)
+        else:
+            disclosure = f"anthropic-beta.{token}"
+            if disclosure not in dropped:
+                dropped.append(disclosure)
+    return tuple(forwarded), tuple(dropped)
 
 
 def _validate_manifest(payload: JsonObject) -> None:

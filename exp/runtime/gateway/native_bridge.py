@@ -272,6 +272,7 @@ class NativeControlPlane(NativeObservabilityMixin):
             surface=surface,
             idempotency_key=optional_text(data.get("idempotency_key")),
             client_request_id=optional_text(data.get("client_request_id")),
+            anthropic_beta=optional_text(data.get("anthropic_beta")),
         )
         request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
@@ -885,6 +886,7 @@ class NativeControlPlane(NativeObservabilityMixin):
         surface: str = "chat",
         idempotency_key: str | None = None,
         client_request_id: str | None = None,
+        anthropic_beta: str | None = None,
     ) -> DecodedGatewayRequest:
         """Decode one raw request body with the shared surface decoder."""
         try:
@@ -893,6 +895,7 @@ class NativeControlPlane(NativeObservabilityMixin):
                 surface=surface,
                 idempotency_key=idempotency_key,
                 client_request_id=client_request_id,
+                anthropic_beta=anthropic_beta,
             )
         except NativeDecodeError as exc:
             raise NativeBridgeError(exc.error) from exc

@@ -610,7 +610,7 @@ wheels = [
 
 [[package]]
 name = "exp-gateway-native"
-version = "0.3.8"
+version = "0.3.9"
 source = { directory = "exp/runtime/gateway/native" }
 
 [[package]]

@@ -2043,3 +2043,53 @@ def test_client_metadata_and_verbosity_forward_native_and_disclose_elsewhere() -
     assert set(public.ignored_parameters) == {"client_metadata", "text.verbosity"}
     assert provider.client_metadata is None
     assert provider.text_verbosity is None
+
+
+def test_diagnostics_speed_and_betas_forward_on_anthropic_and_disclose_elsewhere() -> None:
+    """The conditional Claude Code carriers ride Anthropic rungs verbatim
+    with their required beta tokens merged into one header; a route with
+    any other rung drops each with disclosure, never a rejection."""
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_DIAGNOSTICS_BETA,
+        ANTHROPIC_FAST_MODE_BETA,
+        anthropic_request_headers,
+    )
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        diagnostics={"previous_message_id": "msg_prior"},
+        speed="fast",
+        provider_beta_tokens=("context-1m-2025-08-07",),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    assert payload["diagnostics"] == {"previous_message_id": "msg_prior"}
+    assert payload["speed"] == "fast"
+
+    headers = anthropic_request_headers({"anthropic-beta": "operator-token"}, request)
+    assert headers["anthropic-beta"] == (
+        "operator-token,context-1m-2025-08-07,"
+        f"{ANTHROPIC_DIAGNOSTICS_BETA},{ANTHROPIC_FAST_MODE_BETA}"
+    )
+
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
+    public, provider = route_generation_parameter_requests((anthropic,), request)
+    assert public.ignored_parameters == ()
+    assert provider.diagnostics == {"previous_message_id": "msg_prior"}
+    assert provider.speed == "fast"
+    assert provider.provider_beta_tokens == ("context-1m-2025-08-07",)
+
+    mixed_public, mixed_provider = route_generation_parameter_requests(
+        (anthropic, fallback), request
+    )
+    assert set(mixed_public.ignored_parameters) == {
+        "diagnostics",
+        "speed",
+        "anthropic-beta.context-1m-2025-08-07",
+    }
+    assert mixed_provider.diagnostics is None
+    assert mixed_provider.speed is None
+    assert mixed_provider.provider_beta_tokens == ()

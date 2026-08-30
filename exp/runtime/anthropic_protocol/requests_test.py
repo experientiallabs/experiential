@@ -528,3 +528,68 @@ def test_the_captured_claude_code_request_shape_decodes_losslessly() -> None:
     assert request.context_management is not None
     assert request.metadata == {"user_id": "device-hash-redacted"}
     assert request.ignored_parameters == ()
+
+
+def test_diagnostics_and_speed_are_carried_verbatim_and_shallow_validated() -> None:
+    """Claude Code's conditional diagnostics and fast-mode fields decode.
+
+    Production incident (real Claude Code CLI, 2026-08-29): ``diagnostics``
+    was undecided and every diagnostics-carrying session 400ed with "The
+    parameter 'diagnostics' is not supported". Both fields are accepted by
+    the provider behind their beta headers (verified live 2026-08-30), so
+    the gateway carries them verbatim; validation stays shallow because the
+    shapes are evolving provider betas.
+    """
+    decoded = decode_messages(_body(diagnostics={"previous_message_id": None}, speed="fast"))
+    assert decoded.request.diagnostics == {"previous_message_id": None}
+    assert decoded.request.speed == "fast"
+    assert decode_messages(_body()).request.diagnostics is None
+    assert decode_messages(_body()).request.speed is None
+
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_messages(_body(diagnostics="on"))
+    assert raised.value.detail.param == "diagnostics"
+
+
+def test_caller_beta_tokens_partition_into_allowlist_and_disclosures() -> None:
+    """The caller anthropic-beta header forwards only allowlisted tokens.
+
+    Claude Code activates the 1M context window with a caller-sent
+    ``context-1m-2025-08-07`` token (captured live 2026-08-30); without
+    forwarding it the provider serves 200K and long sessions fail. Every
+    non-allowlisted token drops with a per-token disclosure, never a
+    rejection and never a blind forward.
+    """
+    header = (
+        "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,"
+        "thinking-token-count-2026-05-13,fallback-credit-2026-06-01"
+    )
+    decoded = decode_messages(_body(), anthropic_beta=header)
+    assert decoded.request.provider_beta_tokens == (
+        "context-1m-2025-08-07",
+        "interleaved-thinking-2025-05-14",
+    )
+    assert decoded.request.ignored_parameters == (
+        "anthropic-beta.claude-code-20250219",
+        "anthropic-beta.thinking-token-count-2026-05-13",
+        "anthropic-beta.fallback-credit-2026-06-01",
+    )
+    assert decode_messages(_body()).request.provider_beta_tokens == ()
+
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_messages(_body(), anthropic_beta="bad\nvalue")
+    assert raised.value.detail.param == "anthropic-beta"
+
+
+def test_a_real_toolset_tool_description_over_8k_decodes() -> None:
+    """Tool descriptions bound generously: a real Claude Code toolset
+    carried a description past the earlier 8k cap and 400ed with
+    "Invalid value for 'tools.1.description'" while the provider accepts
+    40k-character descriptions live (verified 2026-08-30)."""
+    tools = [
+        {"name": "small", "description": "x", "input_schema": {"type": "object"}},
+        {"name": "large", "description": "y" * 40_000, "input_schema": {"type": "object"}},
+    ]
+    decoded = decode_messages(_body(tools=tools))
+    description = decoded.request.tools[1].description
+    assert description is not None and len(description) == 40_000

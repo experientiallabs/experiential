@@ -130,6 +130,12 @@ def anthropic_messages_stream_payload(
         # required beta header joins the dispatch via
         # anthropic_request_headers.
         payload["context_management"] = request.context_management
+    if request.diagnostics is not None:
+        # Same treatment: verbatim object, beta header via
+        # anthropic_request_headers.
+        payload["diagnostics"] = request.diagnostics
+    if request.speed is not None:
+        payload["speed"] = request.speed
     if request.provider_thinking_config is not None:
         # The caller's exact thinking configuration wins over the catalog's
         # adaptive default and travels verbatim, so budget semantics are
