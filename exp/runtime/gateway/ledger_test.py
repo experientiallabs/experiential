@@ -10,7 +10,12 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata, GatewayTokenPrices
+from exp.common.models.catalog import (
+    BillingSource,
+    GatewayDeploymentMetadata,
+    GatewayLongContextTier,
+    GatewayTokenPrices,
+)
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -1006,3 +1011,123 @@ def test_first_token_and_app_attribution_default_to_null(tmp_path: Path) -> None
     assert attempt_row["first_token_at"] is None
     assert request_row["app_referer"] is None
     assert request_row["app_title"] is None
+
+
+def _tiered_deployment() -> ExactModelDeployment:
+    """One deployment priced on the published Gemini-style tier schedule."""
+    return _deployment().model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_micro_usd_per_million_tokens=1_250_000,
+                    cached_input_micro_usd_per_million_tokens=125_000,
+                    output_micro_usd_per_million_tokens=10_000_000,
+                    reasoning_micro_usd_per_million_tokens=10_000_000,
+                    long_context=GatewayLongContextTier(
+                        input_threshold_tokens=200_000,
+                        input_micro_usd_per_million_tokens=2_500_000,
+                        cached_input_micro_usd_per_million_tokens=250_000,
+                        output_micro_usd_per_million_tokens=15_000_000,
+                        reasoning_micro_usd_per_million_tokens=15_000_000,
+                    ),
+                ),
+                pricing_source="operator-authored",
+                pricing_effective_at=datetime(2026, 8, 18, tzinfo=UTC),
+            )
+        }
+    )
+
+
+def test_long_context_settlement_reprices_the_whole_request_at_the_threshold(
+    tmp_path: Path,
+) -> None:
+    """Settlement selects the frozen schedule by provider-reported input.
+
+    Both published tier schedules (Gemini's "prompts > 200k" rates and
+    Anthropic's legacy 1M-beta premium) reprice the ENTIRE request once
+    input reaches the threshold, so exactly the threshold boundary decides:
+    199,999 input tokens bill the base schedule, 200,000 and 200,001 bill
+    every token at the tier rates.
+    """
+    cases = (
+        # (input_tokens, expected settled micro-USD with 1,000 output tokens)
+        (199_999, (199_999 * 1_250_000 + 1_000 * 10_000_000 + 500_000) // 1_000_000),
+        (200_000, (200_000 * 2_500_000 + 1_000 * 15_000_000 + 500_000) // 1_000_000),
+        (200_001, (200_001 * 2_500_000 + 1_000 * 15_000_000 + 500_000) // 1_000_000),
+    )
+    for index, (input_tokens, expected) in enumerate(cases):
+        clock = FakeLedgerClock()
+        store, ledger, raw_key = _authority_fixture(tmp_path / f"case-{index}", clock)
+        authorization = store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(f"boundary-{input_tokens}"),
+            deadline_monotonic=clock.monotonic() + 30,
+        )
+        ledger.accept_request(authorization=authorization)
+        attempt_id = ledger.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_tiered_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+        )
+        ledger.finish_attempt(
+            attempt_id=attempt_id,
+            terminal_event=GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=1,
+                usage=GatewayUsage(input_tokens=input_tokens, output_tokens=1_000),
+            ),
+            failure=None,
+        )
+        usage = ledger.usage(organization_id="org-one")
+        assert usage[0].known_estimated_cost_micro_usd == expected, input_tokens
+
+
+def test_long_context_tier_with_an_unknown_rate_stays_unpriced_above_threshold(
+    tmp_path: Path,
+) -> None:
+    """A tier never inherits base rates: a missing tier rate keeps a
+    threshold-crossing attempt honestly unpriced instead of under-billed."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    incomplete_tier = _deployment().model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    input_micro_usd_per_million_tokens=1_250_000,
+                    output_micro_usd_per_million_tokens=10_000_000,
+                    long_context=GatewayLongContextTier(
+                        input_threshold_tokens=200_000,
+                        input_micro_usd_per_million_tokens=2_500_000,
+                    ),
+                ),
+                pricing_source="operator-authored",
+            )
+        }
+    )
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("unpriced-above-threshold"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=incomplete_tier,
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(input_tokens=250_000, output_tokens=64),
+        ),
+        failure=None,
+    )
+    usage = ledger.usage(organization_id="org-one")
+    assert usage[0].known_estimated_cost_micro_usd == 0
+    assert usage[0].unknown_cost_attempts == 1

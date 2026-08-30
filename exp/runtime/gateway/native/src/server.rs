@@ -46,6 +46,11 @@ pub struct ServeConfig {
     /// are paced by the deployment's own per-chunk timeout.
     #[serde(default = "default_time_to_first_byte_seconds")]
     pub time_to_first_byte_seconds: f64,
+    /// Input-scaled first-byte allowance added on top of the flat bound, in
+    /// seconds per million approximate input tokens (request bytes / 4), so
+    /// a very large prompt's prefill is not misread as a dead lane.
+    #[serde(default = "default_time_to_first_byte_seconds_per_million_input_tokens")]
+    pub time_to_first_byte_seconds_per_million_input_tokens: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
     #[serde(default = "default_native_usage_enabled")]
@@ -64,6 +69,10 @@ fn default_connect_timeout_seconds() -> f64 {
 
 fn default_time_to_first_byte_seconds() -> f64 {
     15.0
+}
+
+fn default_time_to_first_byte_seconds_per_million_input_tokens() -> f64 {
+    240.0
 }
 
 fn default_max_active_requests() -> usize {
@@ -89,8 +98,11 @@ pub(crate) struct AppState {
     pub(crate) http: reqwest::Client,
     pub(crate) permits: Arc<Semaphore>,
     pub(crate) request_timeout: Duration,
-    /// Fail-fast bound on the wait for the first provider byte per attempt.
+    /// Fail-fast flat bound on the wait for the first provider byte per attempt.
     pub(crate) time_to_first_byte: Duration,
+    /// Default input-scaled first-byte allowance in seconds per million
+    /// approximate input tokens.
+    pub(crate) time_to_first_byte_slope_seconds_per_million_input_tokens: f64,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pub(crate) pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
@@ -122,6 +134,9 @@ pub async fn run(
         permits: Arc::new(Semaphore::new(max_active_requests)),
         request_timeout: Duration::from_secs_f64(config.request_timeout_seconds),
         time_to_first_byte: Duration::from_secs_f64(config.time_to_first_byte_seconds.max(0.001)),
+        time_to_first_byte_slope_seconds_per_million_input_tokens: config
+            .time_to_first_byte_seconds_per_million_input_tokens
+            .max(0.0),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),

@@ -335,6 +335,22 @@ class GatewayDeploymentCapabilities(ContractModel):
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
+    time_to_first_byte_base_seconds: float | None = Field(default=None, gt=0)
+    """Deployment override for the lane's flat time-to-first-byte allowance.
+
+    ``None`` uses the serving configuration's default. The effective bound on
+    the wait for a provider's response headers is this base plus the
+    input-scaled allowance below, so very large prompts are not misread as a
+    dead lane.
+    """
+    time_to_first_byte_seconds_per_million_input_tokens: float | None = Field(default=None, ge=0)
+    """Deployment override for the input-scaled time-to-first-byte allowance.
+
+    Seconds added per million approximate input tokens (the request body's
+    bytes divided by four; an allowance heuristic, never a billing quantity).
+    ``None`` uses the serving configuration's default; ``0`` disables scaling
+    for this deployment.
+    """
 
     @property
     def declares_reasoning_contract(self) -> bool:
@@ -370,6 +386,27 @@ class GatewayDeploymentCapabilities(ContractModel):
         return self
 
 
+class GatewayLongContextTier(ContractModel):
+    """Premium rates a provider applies to whole long-context requests.
+
+    Both published tier schedules this models (Gemini's ``prompts > 200k``
+    rates and Anthropic's legacy 1M-beta premium) reprice the ENTIRE request
+    once provider-reported input tokens reach the threshold, never only the
+    tokens past it, so that is the one semantic implemented: when
+    ``usage.input_tokens >= input_threshold_tokens``, these rates replace
+    the base rates for every dimension of the request. ``None`` means the
+    tier rate is unknown exactly as on the base schedule; it never inherits
+    the base rate, so a deployment reporting a dimension without a tier
+    price stays honestly unpriced above the threshold.
+    """
+
+    input_threshold_tokens: int = Field(gt=0)
+    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+
+
 class GatewayTokenPrices(ContractModel):
     """Integer gateway attribution rates for one provider deployment.
 
@@ -381,6 +418,15 @@ class GatewayTokenPrices(ContractModel):
     cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
     reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
+    long_context: GatewayLongContextTier | None = None
+    """Whole-request premium schedule for long-context input, when one exists.
+
+    Verified against the providers' published schedules (2026-08-30):
+    Gemini prices ``prompts > 200k tokens`` at a higher whole-request rate
+    for input, output, and cache reads; Anthropic's Claude 4.6+ models serve
+    the full 1M window at standard pricing (no tier), so current Anthropic
+    deployments leave this ``None``.
+    """
 
 
 class GatewayDeploymentMetadata(ContractModel):

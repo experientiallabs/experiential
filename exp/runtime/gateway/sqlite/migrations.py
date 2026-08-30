@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 class GatewaySchemaError(RuntimeError):
@@ -604,6 +604,22 @@ _MIGRATION_12 = (
     """,
 )
 
+# Long-context tier rates freeze on the attempt exactly like the base
+# rates, so settlement prices with the schedule that was live at dispatch.
+# The threshold column selects the schedule once provider-reported input
+# tokens reach it; NULL means the deployment had no tier.
+_MIGRATION_13 = (
+    """
+    ALTER TABLE gateway_attempts
+    ADD COLUMN long_context_threshold_tokens INTEGER
+    CHECK (long_context_threshold_tokens IS NULL OR long_context_threshold_tokens > 0)
+    """,
+    "ALTER TABLE gateway_attempts ADD COLUMN long_context_input_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN long_context_cached_input_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN long_context_output_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN long_context_reasoning_rate INTEGER",
+)
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -617,6 +633,7 @@ _MIGRATIONS = {
     10: _MIGRATION_10,
     11: _MIGRATION_11,
     12: _MIGRATION_12,
+    13: _MIGRATION_13,
 }
 
 

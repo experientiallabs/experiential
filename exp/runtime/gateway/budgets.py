@@ -538,8 +538,10 @@ def maximum_attempt_cost_micro_usd(
     unpriceable. Cached-input and
     reasoning counts are subsets of the total input and output counts, so the worst case uses
     the highest applicable rate in each direction rather than adding subset rates to the same
-    token ceiling. Unknown required prices still produce ``None`` so an applicable hard limit
-    fails closed.
+    token ceiling. A long-context tier joins the worst case exactly when the byte bound reaches
+    its threshold (bytes never undercount tokens, so a smaller request cannot be repriced), and
+    a reachable tier missing a required rate unprices the route. Unknown required prices still
+    produce ``None`` so an applicable hard limit fails closed.
     """
     input_tokens = len(canonical_json_bytes(request))
     output_tokens = request.maximum_output_tokens
@@ -575,29 +577,40 @@ def maximum_attempt_cost_micro_usd(
         )
     prices = deployment.gateway.prices
     capabilities = deployment.gateway.capabilities
-    required_rates = [
-        prices.input_micro_usd_per_million_tokens,
-        prices.output_micro_usd_per_million_tokens,
-    ]
-    if capabilities.reports_cached_input_tokens:
-        required_rates.append(prices.cached_input_micro_usd_per_million_tokens)
-    if capabilities.reports_reasoning_tokens:
-        required_rates.append(prices.reasoning_micro_usd_per_million_tokens)
-    if any(rate is None for rate in required_rates):
-        return None
+    # The byte bound never undercounts tokens, so a request whose canonical
+    # bytes stay below the long-context threshold can never be repriced by
+    # the tier; above it, the worst case must also survive the whole-request
+    # premium schedule.
+    tier = prices.long_context
+    if tier is not None and input_tokens < tier.input_threshold_tokens:
+        tier = None
+    schedules = [prices] if tier is None else [prices, tier]
+    for schedule in schedules:
+        required_rates = [
+            schedule.input_micro_usd_per_million_tokens,
+            schedule.output_micro_usd_per_million_tokens,
+        ]
+        if capabilities.reports_cached_input_tokens:
+            required_rates.append(schedule.cached_input_micro_usd_per_million_tokens)
+        if capabilities.reports_reasoning_tokens:
+            required_rates.append(schedule.reasoning_micro_usd_per_million_tokens)
+        if any(rate is None for rate in required_rates):
+            return None
     input_rate = max(
         rate
+        for schedule in schedules
         for rate in (
-            prices.input_micro_usd_per_million_tokens,
-            prices.cached_input_micro_usd_per_million_tokens,
+            schedule.input_micro_usd_per_million_tokens,
+            schedule.cached_input_micro_usd_per_million_tokens,
         )
         if rate is not None
     )
     output_rate = max(
         rate
+        for schedule in schedules
         for rate in (
-            prices.output_micro_usd_per_million_tokens,
-            prices.reasoning_micro_usd_per_million_tokens,
+            schedule.output_micro_usd_per_million_tokens,
+            schedule.reasoning_micro_usd_per_million_tokens,
         )
         if rate is not None
     )

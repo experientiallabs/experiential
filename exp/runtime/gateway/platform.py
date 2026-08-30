@@ -303,6 +303,16 @@ class AttemptReservationRecord(ContractModel):
     cached_input_rate: int | None = Field(default=None, ge=0)
     output_rate: int | None = Field(default=None, ge=0)
     reasoning_rate: int | None = Field(default=None, ge=0)
+    long_context_threshold_tokens: int | None = Field(default=None, gt=0)
+    """Frozen whole-request repricing threshold, when the deployment had one.
+
+    When provider-reported input tokens reach it, the ``long_context_*``
+    rates below replace the base rates for the entire attempt.
+    """
+    long_context_input_rate: int | None = Field(default=None, ge=0)
+    long_context_cached_input_rate: int | None = Field(default=None, ge=0)
+    long_context_output_rate: int | None = Field(default=None, ge=0)
+    long_context_reasoning_rate: int | None = Field(default=None, ge=0)
     attempt_ordinal: int = Field(ge=0)
     route_depth: int = Field(ge=0)
     period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")

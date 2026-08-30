@@ -173,6 +173,17 @@ If no route can fit the shared team, identity, or total pool allocation, the neu
 returns HTTP 429 with OpenAI `insufficient_quota` semantics before provider work. Any required
 unknown price makes that route ineligible while a hard limit applies.
 
+A deployment's price schedule may declare a long-context tier: a whole-request premium applied
+once provider-reported input tokens reach its threshold, matching both published tier schedules
+(Gemini reprices `prompts > 200k` entirely; Anthropic's Claude 4.6+ models serve the 1M window at
+standard pricing and carry no tier). Reservation prices the tier fail-safe through the canonical
+byte bound (bytes never undercount tokens), settlement selects the frozen schedule by actual
+input tokens, and a tier missing a required rate keeps threshold-crossing attempts honestly
+unpriced. The wait for each attempt's first provider byte scales with input size (a flat base
+plus seconds per million approximate input tokens, both serving defaults with per-deployment
+overrides), so a 1M-token prefill is not misread as a dead lane while small requests keep the
+fail-fast bound.
+
 Settlement replaces the reservation with observed integer micro-USD usage. A dispatched failure,
 cancellation, or crash without trustworthy usage retains its conservative reservation because it
 may be billable. Retries and fallbacks therefore consume one allocation entry per physical attempt,

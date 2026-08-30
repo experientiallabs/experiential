@@ -133,6 +133,11 @@ def reservation_record(
         cached_input_rate=optional_int(row["cached_input_rate"]),
         output_rate=optional_int(row["output_rate"]),
         reasoning_rate=optional_int(row["reasoning_rate"]),
+        long_context_threshold_tokens=optional_int(row["long_context_threshold_tokens"]),
+        long_context_input_rate=optional_int(row["long_context_input_rate"]),
+        long_context_cached_input_rate=optional_int(row["long_context_cached_input_rate"]),
+        long_context_output_rate=optional_int(row["long_context_output_rate"]),
+        long_context_reasoning_rate=optional_int(row["long_context_reasoning_rate"]),
         attempt_ordinal=int(row["attempt_ordinal"]),
         route_depth=int(row["route_depth"]),
         period=str(row["budget_period_start"])[:7],
@@ -174,6 +179,27 @@ def require_reservation_replay(
         prices.cached_input_micro_usd_per_million_tokens,
         prices.output_micro_usd_per_million_tokens,
         prices.reasoning_micro_usd_per_million_tokens,
+        (None if prices.long_context is None else prices.long_context.input_threshold_tokens),
+        (
+            None
+            if prices.long_context is None
+            else prices.long_context.input_micro_usd_per_million_tokens
+        ),
+        (
+            None
+            if prices.long_context is None
+            else prices.long_context.cached_input_micro_usd_per_million_tokens
+        ),
+        (
+            None
+            if prices.long_context is None
+            else prices.long_context.output_micro_usd_per_million_tokens
+        ),
+        (
+            None
+            if prices.long_context is None
+            else prices.long_context.reasoning_micro_usd_per_million_tokens
+        ),
         request.attempt_ordinal,
         request.route_depth,
         request.maximum_cost_micro_usd,
@@ -198,6 +224,11 @@ def require_reservation_replay(
         record.cached_input_rate,
         record.output_rate,
         record.reasoning_rate,
+        record.long_context_threshold_tokens,
+        record.long_context_input_rate,
+        record.long_context_cached_input_rate,
+        record.long_context_output_rate,
+        record.long_context_reasoning_rate,
         record.attempt_ordinal,
         record.route_depth,
         record.reserved_micro_usd,

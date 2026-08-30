@@ -69,6 +69,15 @@ pub struct DeploymentWire {
     #[serde(default)]
     pub fireworks_reasoning_route_sha256: Option<String>,
     pub idempotency_key: String,
+    /// Deployment override for the flat first-byte allowance; the serving
+    /// configuration's default applies when absent.
+    #[serde(default)]
+    pub time_to_first_byte_base_seconds: Option<f64>,
+    /// Deployment override for the input-scaled first-byte allowance in
+    /// seconds per million approximate input tokens; the serving
+    /// configuration's default applies when absent.
+    #[serde(default)]
+    pub time_to_first_byte_seconds_per_million_input_tokens: Option<f64>,
 }
 
 /// The frozen retry-policy facts returned by admission.
@@ -90,11 +99,39 @@ pub struct WaterfallContext<'a> {
     pub route: &'a [DeploymentWire],
     pub policy: RoutePolicy,
     pub deadline: Instant,
-    /// Fail-fast bound on the wait for each physical attempt's first provider
-    /// byte. Applied per attempt (each redial and each failover advance gets a
-    /// fresh window); it bounds the connect/header/first-byte phase only and
-    /// never caps generation once the provider has started answering.
+    /// Fail-fast flat bound on the wait for each physical attempt's first
+    /// provider byte. Applied per attempt (each redial and each failover
+    /// advance gets a fresh window); it bounds the connect/header/first-byte
+    /// phase only and never caps generation once the provider has started
+    /// answering. Deployments may override it per wire entry.
     pub time_to_first_byte: Duration,
+    /// Default input-scaled first-byte allowance in seconds per million
+    /// approximate input tokens, so a very large prompt whose prefill
+    /// legitimately takes longer than the flat bound is not misread as a
+    /// dead lane. Deployments may override it per wire entry.
+    pub time_to_first_byte_slope_seconds_per_million_input_tokens: f64,
+    /// Approximate input tokens for this request: the raw body's bytes
+    /// divided by four. An allowance heuristic only, never a billing
+    /// quantity.
+    pub approximate_input_tokens: f64,
+}
+
+/// The effective first-byte allowance for one attempt: the deployment's (or
+/// serving default's) flat base plus its input-scaled allowance.
+pub(crate) fn first_byte_allowance(
+    wire: &DeploymentWire,
+    default_base: Duration,
+    default_slope_seconds_per_million: f64,
+    approximate_input_tokens: f64,
+) -> Duration {
+    let base = wire
+        .time_to_first_byte_base_seconds
+        .unwrap_or(default_base.as_secs_f64());
+    let slope = wire
+        .time_to_first_byte_seconds_per_million_input_tokens
+        .unwrap_or(default_slope_seconds_per_million);
+    let scaled = slope * (approximate_input_tokens.max(0.0) / 1_000_000.0);
+    Duration::from_secs_f64((base + scaled).max(0.001))
 }
 
 /// The winning outcome of one waterfall run.
@@ -432,7 +469,13 @@ async fn run_attempt(
     // that never answers is abandoned in seconds, not after the full
     // per-deployment timeout.
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
-    let first_byte_deadline = Instant::now() + ctx.time_to_first_byte;
+    let first_byte_deadline = Instant::now()
+        + first_byte_allowance(
+            wire,
+            ctx.time_to_first_byte,
+            ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
+            ctx.approximate_input_tokens,
+        );
     let open_bound = remaining(ctx.deadline)
         .min(phase_timeout)
         .min(remaining(first_byte_deadline));
@@ -621,6 +664,46 @@ async fn run_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
+        DeploymentWire {
+            provider: "openai".to_string(),
+            deployment_id: "d".to_string(),
+            dialect: "openai_compatible".to_string(),
+            url: "https://provider.test".to_string(),
+            headers: HashMap::new(),
+            timeout_seconds: 60.0,
+            upstream_payload: Value::Null,
+            upstream_body: None,
+            fireworks_reasoning_route_sha256: None,
+            idempotency_key: "op".to_string(),
+            time_to_first_byte_base_seconds: base,
+            time_to_first_byte_seconds_per_million_input_tokens: slope,
+        }
+    }
+
+    #[test]
+    fn first_byte_allowance_scales_with_input_and_honors_overrides() {
+        let default_base = Duration::from_secs(15);
+        // No overrides, tiny request: effectively the flat default.
+        let flat = first_byte_allowance(&wire(None, None), default_base, 240.0, 100.0);
+        assert!((flat.as_secs_f64() - 15.024).abs() < 1e-6);
+        // No overrides, one million approximate tokens: base plus the
+        // full default slope.
+        let scaled = first_byte_allowance(&wire(None, None), default_base, 240.0, 1_000_000.0);
+        assert!((scaled.as_secs_f64() - 255.0).abs() < 1e-6);
+        // Deployment overrides replace both the base and the slope.
+        let overridden = first_byte_allowance(
+            &wire(Some(30.0), Some(60.0)),
+            default_base,
+            240.0,
+            500_000.0,
+        );
+        assert!((overridden.as_secs_f64() - 60.0).abs() < 1e-6);
+        // A zero slope pins the flat bound regardless of input size.
+        let pinned = first_byte_allowance(&wire(None, Some(0.0)), default_base, 240.0, 9e9);
+        assert!((pinned.as_secs_f64() - 15.0).abs() < 1e-6);
+    }
 
     fn policy(refusal_failover: bool) -> RoutePolicy {
         RoutePolicy {

@@ -942,3 +942,58 @@ def test_deployment_budget_scope_fails_closed_on_unreadable_snapshot(tmp_path: P
             ),
             limit_micro_usd=100,
         )
+
+
+def test_reservation_prices_the_long_context_tier_conservatively() -> None:
+    """The byte bound decides tier exposure fail-safe.
+
+    Canonical bytes never undercount tokens, so a request whose bytes stay
+    below the threshold reserves at base rates, while a byte bound at or
+    past the threshold must survive the whole-request premium schedule; a
+    tier missing a required rate unprices the route entirely.
+    """
+    from exp.common.models.catalog import GatewayLongContextTier
+
+    def tiered(tier: GatewayLongContextTier | None) -> ExactModelDeployment:
+        base = _deployment()
+        return base.model_copy(
+            update={
+                "gateway": base.gateway.model_copy(
+                    update={
+                        "prices": GatewayTokenPrices(
+                            input_micro_usd_per_million_tokens=1_000_000,
+                            output_micro_usd_per_million_tokens=2_000_000,
+                            long_context=tier,
+                        )
+                    }
+                )
+            }
+        )
+
+    tier = GatewayLongContextTier(
+        input_threshold_tokens=64,
+        input_micro_usd_per_million_tokens=3_000_000,
+        output_micro_usd_per_million_tokens=5_000_000,
+    )
+    request = _request("x" * 400)
+    input_bytes = len(canonical_json_bytes(request))
+    assert input_bytes >= 64
+
+    flat = maximum_attempt_cost_micro_usd(request, tiered(None))
+    premium = maximum_attempt_cost_micro_usd(request, tiered(tier))
+    assert flat is not None and premium is not None
+    # 16 output tokens from the deployment ceiling; the premium worst case
+    # prices both directions at the tier's higher rates.
+    assert flat == (input_bytes * 1_000_000 + 16 * 2_000_000 + 999_999) // 1_000_000
+    assert premium == (input_bytes * 3_000_000 + 16 * 5_000_000 + 999_999) // 1_000_000
+
+    # Below the threshold the tier cannot trigger, so base rates reserve.
+    unreachable = tier.model_copy(update={"input_threshold_tokens": input_bytes + 1})
+    assert maximum_attempt_cost_micro_usd(request, tiered(unreachable)) == flat
+
+    # A reachable tier with an unknown required rate fails closed.
+    unpriced = GatewayLongContextTier(
+        input_threshold_tokens=64,
+        input_micro_usd_per_million_tokens=3_000_000,
+    )
+    assert maximum_attempt_cost_micro_usd(request, tiered(unpriced)) is None

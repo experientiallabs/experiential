@@ -204,6 +204,11 @@ pub(crate) async fn responses(
         policy: admission.policy(),
         deadline,
         time_to_first_byte: state.time_to_first_byte,
+        time_to_first_byte_slope_seconds_per_million_input_tokens: state
+            .time_to_first_byte_slope_seconds_per_million_input_tokens,
+        // Bytes over four approximates input tokens; a timeout heuristic
+        // only, never a billing quantity.
+        approximate_input_tokens: (body_text.len() as f64) / 4.0,
     };
     let won = acquire_attempt(&context, &mut guard).await;
 

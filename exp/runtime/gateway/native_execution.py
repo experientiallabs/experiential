@@ -456,6 +456,7 @@ def deployment_wire_entry(
     Returns:
         The JSON-compatible wire entry consumed by the data plane.
     """
+    capabilities = deployment.gateway.capabilities
     return {
         "provider": deployment.provider,
         "deployment_id": deployment.deployment_id,
@@ -468,6 +469,12 @@ def deployment_wire_entry(
         "upstream_body": upstream_body,
         "fireworks_reasoning_route_sha256": profile.fireworks_reasoning_route_sha256,
         "idempotency_key": deployment_operation_key(route, deployment),
+        # First-byte allowance overrides; the data plane falls back to its
+        # serving defaults when a deployment declares nothing.
+        "time_to_first_byte_base_seconds": capabilities.time_to_first_byte_base_seconds,
+        "time_to_first_byte_seconds_per_million_input_tokens": (
+            capabilities.time_to_first_byte_seconds_per_million_input_tokens
+        ),
     }
 
 

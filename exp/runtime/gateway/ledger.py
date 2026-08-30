@@ -366,10 +366,13 @@ class SQLiteAttemptLedger:
                 billing_source,
                 pricing_source, pricing_effective_at,
                 input_rate, cached_input_rate, output_rate, reasoning_rate,
+                long_context_threshold_tokens, long_context_input_rate,
+                long_context_cached_input_rate, long_context_output_rate,
+                long_context_reasoning_rate,
                 route_reason, fallback_reason,
                 state, started_at, budget_period_start, budget_reserved_micro_usd
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 'dispatched', ?, ?, ?
             )
             """,
@@ -395,6 +398,31 @@ class SQLiteAttemptLedger:
                 prices.cached_input_micro_usd_per_million_tokens,
                 prices.output_micro_usd_per_million_tokens,
                 prices.reasoning_micro_usd_per_million_tokens,
+                (
+                    None
+                    if prices.long_context is None
+                    else prices.long_context.input_threshold_tokens
+                ),
+                (
+                    None
+                    if prices.long_context is None
+                    else prices.long_context.input_micro_usd_per_million_tokens
+                ),
+                (
+                    None
+                    if prices.long_context is None
+                    else prices.long_context.cached_input_micro_usd_per_million_tokens
+                ),
+                (
+                    None
+                    if prices.long_context is None
+                    else prices.long_context.output_micro_usd_per_million_tokens
+                ),
+                (
+                    None
+                    if prices.long_context is None
+                    else prices.long_context.reasoning_micro_usd_per_million_tokens
+                ),
                 route_reason,
                 fallback_reason,
                 utc_text(now),
@@ -467,7 +495,10 @@ class SQLiteAttemptLedger:
         row = connection.execute(
             """
             SELECT request_id, state, input_rate, cached_input_rate,
-                   output_rate, reasoning_rate, budget_reserved_micro_usd
+                   output_rate, reasoning_rate,
+                   long_context_threshold_tokens, long_context_input_rate,
+                   long_context_cached_input_rate, long_context_output_rate,
+                   long_context_reasoning_rate, budget_reserved_micro_usd
             FROM gateway_attempts WHERE attempt_id = ?
             """,
             (attempt_id,),
@@ -479,12 +510,23 @@ class SQLiteAttemptLedger:
             if current_state == state:
                 return
             raise GatewayLedgerError("attempt is already settled with another terminal state")
+        # Both published tier schedules reprice the WHOLE request once
+        # provider-reported input tokens reach the frozen threshold, so the
+        # tier's rates replace the base rates rather than composing with them.
+        threshold = _optional_int(row["long_context_threshold_tokens"])
+        long_context = (
+            threshold is not None
+            and usage is not None
+            and usage.input_tokens is not None
+            and usage.input_tokens >= threshold
+        )
+        prefix = "long_context_" if long_context else ""
         cost = _estimated_cost(
             usage,
-            input_rate=_optional_int(row["input_rate"]),
-            cached_input_rate=_optional_int(row["cached_input_rate"]),
-            output_rate=_optional_int(row["output_rate"]),
-            reasoning_rate=_optional_int(row["reasoning_rate"]),
+            input_rate=_optional_int(row[f"{prefix}input_rate"]),
+            cached_input_rate=_optional_int(row[f"{prefix}cached_input_rate"]),
+            output_rate=_optional_int(row[f"{prefix}output_rate"]),
+            reasoning_rate=_optional_int(row[f"{prefix}reasoning_rate"]),
         )
         budget_settlement = (
             cost if cost is not None else _optional_int(row["budget_reserved_micro_usd"])
