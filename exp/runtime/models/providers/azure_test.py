@@ -157,6 +157,35 @@ def test_model_inference_route_keeps_deployment_in_body() -> None:
     assert "max_completion_tokens" not in payload
 
 
+def test_openai_surface_declines_top_k_whatever_the_catalog_declares() -> None:
+    """The Azure OpenAI surface rejects top_k as an unknown field, so the route declines it."""
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint=_ENDPOINT,
+        api_key=_SECRET,
+        api_version="v1",
+        transport=ScriptedJsonTransport([]),
+        supports_top_k=True,
+    )
+
+    assert client.gateway_wire_profile().supports_top_k is False
+
+
+def test_model_inference_surface_keeps_declared_top_k_support() -> None:
+    """The Foundry model-inference surface carries top_k, so the declared capability stands."""
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint="https://resource.services.ai.azure.com/models",
+        api_key=_SECRET,
+        api_version="2024-05-01-preview",
+        api_surface="model_inference",
+        transport=ScriptedJsonTransport([]),
+        supports_top_k=True,
+    )
+
+    assert client.gateway_wire_profile().supports_top_k is True
+
+
 def test_model_inference_appends_models_to_a_resource_root() -> None:
     """A Foundry resource root and its explicit /models root resolve identically."""
     transport = ScriptedJsonTransport(

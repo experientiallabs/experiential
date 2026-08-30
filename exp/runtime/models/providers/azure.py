@@ -181,6 +181,13 @@ class AzureClient(OpenAICompatibleClient):
             raise ValueError("Azure model_inference requires a dated api_version")
         if api_surface == "model_inference":
             chat_max_tokens_field = "max_tokens"
+        # The Azure OpenAI surface validates the body against the OpenAI Chat
+        # schema and answers any extra field with
+        # `Unrecognized request argument supplied: top_k`, whatever the model
+        # itself accepts. Only the Foundry model-inference surface carries the
+        # field, so the wire, not the catalog, decides top-k support here.
+        if api_surface == "openai_deployments":
+            supports_top_k = False
         super().__init__(
             model=model,
             api_key=api_key,
