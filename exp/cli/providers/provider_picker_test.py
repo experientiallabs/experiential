@@ -1079,6 +1079,17 @@ def test_azure_prepares_explicit_model_inference_surface() -> None:
     assert connection.azure_api_surface == "model_inference"
 
 
+def test_azure_defaults_a_foundry_endpoint_to_its_own_surface_and_version() -> None:
+    """A Foundry endpoint offers the model-inference surface and a dated version by default."""
+    console = ScriptedConsole("https://resource.services.ai.azure.com\n\n\n")
+
+    connection = provider_picker.collect_provider_connection("azure", console=console)
+
+    assert connection is not None
+    assert connection.azure_api_surface == "model_inference"
+    assert connection.api_version == "2024-05-01-preview"
+
+
 @pytest.mark.parametrize(
     ("configured_base_url", "configured_surface", "collected_base_url", "collected_surface"),
     [

@@ -23,7 +23,11 @@ from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
     HttpxAsyncJsonTransport,
 )
-from exp.runtime.models.providers.azure import AzureClient, bind_azure_api_key
+from exp.runtime.models.providers.azure import (
+    AzureClient,
+    bind_azure_api_key,
+    resolve_azure_api_surface,
+)
 from exp.runtime.models.providers.bedrock import (
     BedrockClient,
     BedrockRuntimeFactory,
@@ -344,19 +348,24 @@ class RuntimeModelCatalog:
                 )
             if connection.api_key_env is None:
                 raise ModelConnectionError(f"Azure alias {alias!r} needs connection.api_key_env")
+            api_surface, api_version = resolve_azure_api_surface(
+                endpoint=connection.base_url,
+                api_version=connection.api_version,
+                configured_surface=connection.azure_api_surface,
+            )
             api_key = bind_azure_api_key(
                 endpoint=connection.base_url,
                 api_key_env=connection.api_key_env,
                 api_key=api_key,
                 environment=self._environment,
-                api_surface=connection.azure_api_surface or "openai_deployments",
+                api_surface=api_surface,
             )
             client = AzureClient(
                 model=snapshot,
                 endpoint=connection.base_url,
                 api_key=api_key,
-                api_version=connection.api_version,
-                api_surface=connection.azure_api_surface or "openai_deployments",
+                api_version=api_version,
+                api_surface=api_surface,
                 transport=self._transport_factory(),
                 supports_temperature=capabilities.supports_temperature,
                 supports_top_p=_supports_top_p(capabilities),

@@ -25,6 +25,7 @@ from exp.common.models import (
     load_model_catalog,
     write_model_catalog,
 )
+from exp.common.models.catalog import infer_azure_api_surface
 
 
 def _catalog() -> ModelCatalog:
@@ -477,6 +478,32 @@ def test_native_provider_rejects_a_custom_endpoint_that_could_receive_its_key(
             base_url="https://untrusted.example.test/v1",
             api_key_env="FIXTURE_API_KEY",
         )
+
+
+def test_azure_surface_inference_follows_the_resource_host() -> None:
+    """Foundry hosts serve model inference, Azure OpenAI hosts serve deployments."""
+    assert infer_azure_api_surface("https://resource.openai.azure.com") == "openai_deployments"
+    assert (
+        infer_azure_api_surface("https://Resource.Services.AI.Azure.com/models")
+        == "model_inference"
+    )
+    assert infer_azure_api_surface("https://resource.inference.ai.azure.com") == "model_inference"
+    assert infer_azure_api_surface("https://gateway.example.test/tenant-a") is None
+
+
+def test_undeclared_foundry_endpoint_spellings_share_one_identity() -> None:
+    """A Foundry host without a declared surface still normalizes its terminal models segment."""
+    with_models = ConnectionConfig(
+        provider="azure",
+        base_url="https://resource.services.ai.azure.com/models",
+        api_key_env="AZURE_FOUNDRY_API_KEY",
+        api_version="2024-05-01-preview",
+    )
+    without_models = with_models.model_copy(
+        update={"base_url": "https://resource.services.ai.azure.com"}
+    )
+
+    assert with_models.identity_sha256() == without_models.identity_sha256()
 
 
 def test_azure_connection_requires_endpoint_key_and_api_version() -> None:

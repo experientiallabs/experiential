@@ -7,6 +7,7 @@ from typing import ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 from exp.common.models import ChatMaxTokensField, ModelSnapshot
+from exp.common.models.catalog import AzureApiSurface, infer_azure_api_surface
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
@@ -17,6 +18,42 @@ AZURE_OPENAI_API_KEY_ENV = "AZURE_OPENAI_API_KEY"
 AZURE_OPENAI_ENDPOINT_ENV = "AZURE_OPENAI_ENDPOINT"
 _V1_API_VERSION = "v1"
 _V1_ROOT_SUFFIX = "/openai/v1"
+
+DEFAULT_AZURE_API_SURFACE: AzureApiSurface = "openai_deployments"
+# The Foundry model-inference surface requires a dated API version, so an endpoint left on the
+# Azure OpenAI ``v1`` spelling still resolves to a version that surface accepts.
+MODEL_INFERENCE_FALLBACK_API_VERSION = "2024-05-01-preview"
+
+
+def resolve_azure_api_surface(
+    *,
+    endpoint: str,
+    api_version: str,
+    configured_surface: AzureApiSurface | None,
+) -> tuple[AzureApiSurface, str]:
+    """Resolve the wire surface and API version one Azure connection should use.
+
+    An explicitly configured surface always wins. Otherwise the surface follows the endpoint
+    host, so a Foundry resource reaches the model-inference surface without an operator having to
+    name it. An inferred model-inference surface also upgrades the Azure OpenAI ``v1`` API
+    version, which that surface rejects.
+
+    Args:
+        endpoint: Azure resource endpoint from the connection.
+        api_version: API version configured on the connection.
+        configured_surface: Operator-declared surface, when the connection carries one.
+
+    Returns:
+        The surface to call and the API version to send with it.
+    """
+    if configured_surface is not None:
+        return configured_surface, api_version
+    inferred = infer_azure_api_surface(endpoint)
+    if inferred is None:
+        return DEFAULT_AZURE_API_SURFACE, api_version
+    if inferred == "model_inference" and api_version == _V1_API_VERSION:
+        return inferred, MODEL_INFERENCE_FALLBACK_API_VERSION
+    return inferred, api_version
 
 
 def same_azure_endpoint(

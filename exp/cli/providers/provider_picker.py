@@ -68,6 +68,11 @@ from exp.runtime.models.providers import (
     ProviderListingError,
     ProviderModelLister,
 )
+from exp.runtime.models.providers.azure import (
+    DEFAULT_AZURE_API_SURFACE,
+    MODEL_INFERENCE_FALLBACK_API_VERSION,
+    infer_azure_api_surface,
+)
 
 SETUP_PROVIDER_LABELS = {
     HOSTED_SETUP_PICKER: HOSTED_SETUP_LABEL,
@@ -368,13 +373,20 @@ def collect_provider_connection(
         if not base_url:
             return None
     if provider == "azure":
-        api_version = ask_text("Azure OpenAI API version", console=console, default="v1")
+        assert base_url is not None
+        inferred_surface = infer_azure_api_surface(base_url)
+        default_api_version = (
+            MODEL_INFERENCE_FALLBACK_API_VERSION if inferred_surface == "model_inference" else "v1"
+        )
+        api_version = ask_text(
+            "Azure OpenAI API version", console=console, default=default_api_version
+        )
         if not api_version:
             return None
         selected_surface = ask_text(
             "Azure API surface",
             console=console,
-            default="openai_deployments",
+            default=inferred_surface or DEFAULT_AZURE_API_SURFACE,
         )
         if not selected_surface:
             return None

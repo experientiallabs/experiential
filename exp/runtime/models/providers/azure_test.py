@@ -20,8 +20,11 @@ from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.azure import (
     AZURE_OPENAI_API_KEY_ENV,
     AZURE_OPENAI_ENDPOINT_ENV,
+    MODEL_INFERENCE_FALLBACK_API_VERSION,
     AzureClient,
     bind_azure_api_key,
+    infer_azure_api_surface,
+    resolve_azure_api_surface,
     same_azure_endpoint,
 )
 from exp.runtime.models.providers.openai_compatible_test import _request, _snapshot
@@ -488,3 +491,78 @@ def test_catalog_resolution_pairs_one_endpoint_with_its_key() -> None:
     )
     with pytest.raises(ModelCredentialError, match="different Azure resource"):
         mismatched.resolve("gpt")
+
+
+def test_infers_the_surface_each_azure_host_family_serves() -> None:
+    """Foundry resources serve model inference, Azure OpenAI resources serve deployments."""
+    assert infer_azure_api_surface("https://resource.openai.azure.com") == "openai_deployments"
+    assert (
+        infer_azure_api_surface("https://Resource.Services.AI.Azure.com/models")
+        == "model_inference"
+    )
+    assert infer_azure_api_surface("https://resource.inference.ai.azure.com") == "model_inference"
+    assert infer_azure_api_surface("http://127.0.0.1:9096/v1") is None
+
+
+def test_resolution_keeps_an_operator_declared_surface_and_version() -> None:
+    """An explicit surface is authoritative, even against the endpoint host."""
+    assert resolve_azure_api_surface(
+        endpoint="https://resource.services.ai.azure.com",
+        api_version="v1",
+        configured_surface="openai_deployments",
+    ) == ("openai_deployments", "v1")
+
+
+def test_resolution_upgrades_an_unconfigured_foundry_connection() -> None:
+    """A Foundry endpoint with no declared surface reaches model inference on a dated version."""
+    assert resolve_azure_api_surface(
+        endpoint="https://resource.services.ai.azure.com",
+        api_version="v1",
+        configured_surface=None,
+    ) == ("model_inference", MODEL_INFERENCE_FALLBACK_API_VERSION)
+    assert resolve_azure_api_surface(
+        endpoint="https://resource.services.ai.azure.com",
+        api_version="2024-05-01-preview",
+        configured_surface=None,
+    ) == ("model_inference", "2024-05-01-preview")
+
+
+def test_resolution_leaves_unrecognized_and_azure_openai_hosts_on_deployments() -> None:
+    """Azure OpenAI hosts and private endpoints keep the deployment surface and version."""
+    assert resolve_azure_api_surface(
+        endpoint=_ENDPOINT, api_version="v1", configured_surface=None
+    ) == ("openai_deployments", "v1")
+    assert resolve_azure_api_surface(
+        endpoint="http://127.0.0.1:9096/v1", api_version="v1", configured_surface=None
+    ) == ("openai_deployments", "v1")
+
+
+def test_unconfigured_foundry_alias_resolves_to_the_model_inference_surface() -> None:
+    """A catalog connection without azure_api_surface serves top_k on a Foundry endpoint."""
+    catalog = RuntimeModelCatalog(
+        ModelCatalog(
+            connections={
+                "azure": ConnectionConfig(
+                    provider="azure",
+                    base_url="https://resource.services.ai.azure.com",
+                    api_key_env="AZURE_FOUNDRY_API_KEY",
+                    api_version="v1",
+                )
+            },
+            models={
+                "ds": ModelRecord(
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    connection="azure",
+                    model="DeepSeek-V4-Flash",
+                    capabilities=ModelCapabilities(supports_completions=True, supports_top_k=True),
+                )
+            },
+        ),
+        environment={"AZURE_FOUNDRY_API_KEY": _SECRET},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    client = catalog.resolve("ds").client
+
+    assert isinstance(client, AzureClient)
+    assert client.gateway_wire_profile().supports_top_k is True
