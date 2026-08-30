@@ -18,7 +18,7 @@ from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
 )
 from exp.runtime.gateway.auth import utc_text
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayRequest, provider_replay_authority
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
@@ -544,6 +544,13 @@ def maximum_attempt_cost_micro_usd(
     produce ``None`` so an applicable hard limit fails closed.
     """
     input_tokens = len(canonical_json_bytes(request))
+    # Excluded provider carriers (replayed reasoning, native items, verbatim
+    # configurations) are provider-read input the plain serialization does
+    # not cover; their envelope bytes keep the bound an upper bound so a
+    # carrier-heavy request cannot cross a pricing threshold unreserved.
+    replay_envelope = provider_replay_authority(request)
+    if replay_envelope is not None:
+        input_tokens += len(canonical_json_bytes(replay_envelope))
     output_tokens = request.maximum_output_tokens
     deployment_ceiling = (
         deployment.capabilities.maximum_output_tokens

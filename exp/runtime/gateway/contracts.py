@@ -501,22 +501,23 @@ class GatewayRequest(ContractModel):
         return self
 
 
-def canonical_request_sha256(request: GatewayRequest) -> Sha256:
-    """Digest one canonical request including excluded provider replay authority.
+def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
+    """Collect the provider-significant input excluded from serialization.
 
-    The carriers are excluded from model serialization so immutable artifacts
-    and pre-existing request digests stay byte-identical, but they are
-    provider-significant input: a caller operation key reused with different
-    replayed reasoning must be a rejected conflict, never a silent replay of
-    the earlier response. A request with no carrier digests exactly as its
-    plain serialization, so every request decoded before the carriers existed
-    keeps its identity.
+    The carriers (replayed reasoning, native items, verbatim provider
+    configurations) are excluded from model serialization so immutable
+    artifacts and pre-existing request digests stay byte-identical, but the
+    provider still reads them as input. Replay identity folds this envelope
+    into :func:`canonical_request_sha256`, and reservation adds its bytes to
+    the conservative input bound so an excluded carrier can never push a
+    request across a pricing threshold unreserved.
 
     Args:
         request: Canonical gateway request as decoded from the public wire.
 
     Returns:
-        The stable canonical request digest.
+        The envelope of excluded provider input, or ``None`` when the plain
+        serialization already covers everything.
     """
     replay: list[JsonObject] = []
     for message_index, message in enumerate(request.messages):
@@ -573,9 +574,8 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
         and request.speed is None
         and not request.provider_beta_tokens
     ):
-        return sha256_json(request)
+        return None
     envelope: JsonObject = {
-        "request_sha256": sha256_json(request),
         "provider_replay": replay,
         "provider_thinking_config": request.provider_thinking_config,
         "reasoning_context": request.reasoning_context,
@@ -590,7 +590,27 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
         envelope["speed"] = request.speed
     if request.provider_beta_tokens:
         envelope["provider_beta_tokens"] = list(request.provider_beta_tokens)
-    return sha256_json(envelope)
+    return envelope
+
+
+def canonical_request_sha256(request: GatewayRequest) -> Sha256:
+    """Digest one canonical request including excluded provider replay authority.
+
+    A caller operation key reused with different replayed reasoning must be
+    a rejected conflict, never a silent replay of the earlier response. A
+    request with no carrier digests exactly as its plain serialization, so
+    every request decoded before the carriers existed keeps its identity.
+
+    Args:
+        request: Canonical gateway request as decoded from the public wire.
+
+    Returns:
+        The stable canonical request digest.
+    """
+    envelope = provider_replay_authority(request)
+    if envelope is None:
+        return sha256_json(request)
+    return sha256_json({"request_sha256": sha256_json(request), **envelope})
 
 
 class GatewayUsage(ContractModel):

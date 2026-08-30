@@ -997,3 +997,64 @@ def test_reservation_prices_the_long_context_tier_conservatively() -> None:
         input_micro_usd_per_million_tokens=3_000_000,
     )
     assert maximum_attempt_cost_micro_usd(request, tiered(unpriced)) is None
+
+
+def test_reservation_counts_excluded_provider_carriers_toward_the_tier_bound() -> None:
+    """Serialization-excluded carriers cannot dodge the premium reservation.
+
+    Replayed encrypted reasoning is provider-read input excluded from the
+    request's plain serialization; without its envelope bytes a
+    carrier-heavy request could reserve at base rates and settle at the
+    premium schedule, overdrawing a hard budget.
+    """
+    from exp.common.models.catalog import GatewayLongContextTier
+    from exp.runtime.gateway.contracts import EncryptedReasoningBlock, GatewayApiSurface
+
+    tier = GatewayLongContextTier(
+        input_threshold_tokens=2_048,
+        input_micro_usd_per_million_tokens=3_000_000,
+        output_micro_usd_per_million_tokens=5_000_000,
+    )
+    base = _deployment()
+    tiered = base.model_copy(
+        update={
+            "gateway": base.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=1_000_000,
+                        output_micro_usd_per_million_tokens=2_000_000,
+                        long_context=tier,
+                    )
+                }
+            )
+        }
+    )
+    carried = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(
+                role="assistant",
+                content="tiny",
+                provider_reasoning=(
+                    EncryptedReasoningBlock(
+                        id="rs_carrier",
+                        encrypted_content="A" * 4_096,
+                        output_index=0,
+                    ),
+                ),
+            ),
+        ),
+        maximum_output_tokens=16,
+    )
+    from exp.runtime.gateway.contracts import provider_replay_authority
+
+    visible_bytes = len(canonical_json_bytes(carried))
+    assert visible_bytes < 2_048
+    envelope = provider_replay_authority(carried)
+    assert envelope is not None
+    bound = visible_bytes + len(canonical_json_bytes(envelope))
+    assert bound >= 2_048
+    # The premium worst case governs because the carrier bytes cross the
+    # threshold even though the visible serialization stays below it.
+    expected = (bound * 3_000_000 + 16 * 5_000_000 + 999_999) // 1_000_000
+    assert maximum_attempt_cost_micro_usd(carried, tiered) == expected
