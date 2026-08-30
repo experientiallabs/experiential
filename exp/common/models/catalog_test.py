@@ -491,19 +491,24 @@ def test_azure_surface_inference_follows_the_resource_host() -> None:
     assert infer_azure_api_surface("https://gateway.example.test/tenant-a") is None
 
 
-def test_undeclared_foundry_endpoint_spellings_share_one_identity() -> None:
-    """A Foundry host without a declared surface still normalizes its terminal models segment."""
-    with_models = ConnectionConfig(
+def test_undeclared_foundry_endpoint_keeps_its_stored_identity() -> None:
+    """Inference never moves the identity digest of a connection whose surface was not declared."""
+    undeclared = ConnectionConfig(
         provider="azure",
         base_url="https://resource.services.ai.azure.com/models",
         api_key_env="AZURE_FOUNDRY_API_KEY",
         api_version="2024-05-01-preview",
     )
-    without_models = with_models.model_copy(
-        update={"base_url": "https://resource.services.ai.azure.com"}
-    )
+    declared = undeclared.model_copy(update={"azure_api_surface": "model_inference"})
 
-    assert with_models.identity_sha256() == without_models.identity_sha256()
+    assert undeclared.identity_sha256() != declared.identity_sha256()
+    assert undeclared.identity_sha256() == sha256_json(
+        {
+            "provider": "azure",
+            "base_url": "https://resource.services.ai.azure.com/models",
+            "api_version": "2024-05-01-preview",
+        }
+    )
 
 
 def test_azure_connection_requires_endpoint_key_and_api_version() -> None:

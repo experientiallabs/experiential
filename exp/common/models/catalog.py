@@ -100,10 +100,13 @@ def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
     if connection.base_url is None:
         return None
     normalized = _normalize_base_url(connection.base_url)
-    if connection.provider != "azure":
-        return normalized
-    surface = connection.azure_api_surface or infer_azure_api_surface(connection.base_url)
-    if surface == "model_inference" and normalized.lower().endswith("/models"):
+    # Endpoint identity stays keyed on the declared surface only. An inferred surface must not
+    # move a stored credential's digest for a connection the operator never edited.
+    if (
+        connection.provider == "azure"
+        and connection.azure_api_surface == "model_inference"
+        and normalized.lower().endswith("/models")
+    ):
         return normalized[:-7].rstrip("/")
     return normalized
 

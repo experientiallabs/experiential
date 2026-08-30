@@ -138,7 +138,10 @@ def _azure_base_url(
     """Build the Azure request root for the configured API surface.
 
     ``v1`` uses the Foundry and Azure OpenAI ``/openai/v1`` root and places the deployment in
-    the JSON body. A dated API version uses the classic deployment-in-path root.
+    the JSON body. A dated API version uses the classic deployment-in-path root. The
+    model-inference surface serves ``/models`` directly off the resource, so an endpoint spelled
+    with either the terminal ``/models`` segment or the Azure OpenAI ``/openai/v1`` root resolves
+    to that one route.
 
     Args:
         endpoint: Normalized Azure resource endpoint, with or without the ``/openai/v1`` root.
@@ -154,6 +157,8 @@ def _azure_base_url(
         path = parsed.path.rstrip("/")
         if path.lower().endswith("/models"):
             path = path[:-7].rstrip("/")
+        elif path.lower().endswith(_V1_ROOT_SUFFIX):
+            path = path[: -len(_V1_ROOT_SUFFIX)].rstrip("/")
         model_path = f"{path}/models" if path else "/models"
         return urlunsplit((parsed.scheme, parsed.netloc, model_path, "", ""))
     if api_version == _V1_API_VERSION:
@@ -279,7 +284,8 @@ def _canonical_azure_endpoint(
 
     Default HTTPS port 443 and HTTP port 80 are treated as omitted so catalog identity and key
     pairing stay aligned. A non-default port is part of the resource identity. Model-inference
-    resource roots and their terminal ``/models`` form share one authority.
+    resource roots, their terminal ``/models`` form, and the Azure OpenAI ``/openai/v1`` root
+    share one authority.
     """
     parsed = urlsplit(value)
     hostname = (parsed.hostname or "").lower()
@@ -291,6 +297,9 @@ def _canonical_azure_endpoint(
     default_port = 443 if scheme == "https" else 80
     comparable_port = None if port in {None, default_port} else port
     path = parsed.path.rstrip("/")
-    if api_surface == "model_inference" and path.lower().endswith("/models"):
-        path = path[:-7].rstrip("/")
+    if api_surface == "model_inference":
+        if path.lower().endswith("/models"):
+            path = path[:-7].rstrip("/")
+        elif path.lower().endswith(_V1_ROOT_SUFFIX):
+            path = path[: -len(_V1_ROOT_SUFFIX)].rstrip("/")
     return (scheme, hostname, comparable_port, path)

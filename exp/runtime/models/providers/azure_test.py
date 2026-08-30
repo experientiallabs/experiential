@@ -566,3 +566,24 @@ def test_unconfigured_foundry_alias_resolves_to_the_model_inference_surface() ->
 
     assert isinstance(client, AzureClient)
     assert client.gateway_wire_profile().supports_top_k is True
+
+
+def test_inferred_foundry_endpoint_with_the_v1_root_targets_the_models_route() -> None:
+    """A Foundry resource spelled with the Azure OpenAI v1 root still posts to /models."""
+    client = AzureClient(
+        model=_snapshot("azure", "DeepSeek-V4-Flash"),
+        endpoint="https://resource.services.ai.azure.com/openai/v1",
+        api_key=_SECRET,
+        api_version=MODEL_INFERENCE_FALLBACK_API_VERSION,
+        api_surface="model_inference",
+        transport=ScriptedJsonTransport([]),
+    )
+
+    assert client._base_url == "https://resource.services.ai.azure.com/models"
+
+
+def test_foundry_endpoint_roots_pair_with_one_stored_credential() -> None:
+    """The resource root, its /models form, and its /openai/v1 form name one Azure resource."""
+    root = "https://resource.services.ai.azure.com"
+    for spelling in (root, f"{root}/models", f"{root}/openai/v1"):
+        assert same_azure_endpoint(spelling, root, api_surface="model_inference")
