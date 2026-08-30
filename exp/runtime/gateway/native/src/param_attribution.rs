@@ -143,11 +143,16 @@ fn carries_provider_identifier(word: &str) -> bool {
     {
         return true;
     }
-    let opaque = bare
+    // A bare word mixing letters and digits is a label, not English: an
+    // account, a deployment, a region, a revision, or a key. Length is not
+    // part of the test, so `prod-7` and `acct-123` are as disqualifying as a
+    // full opaque handle. Prose keeps its numbers (`8192`) and parameter
+    // names keep their shape (`top_p`, `input[1].status`), because neither
+    // mixes the two inside one unpunctuated word.
+    let label = bare
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    opaque
-        && bare.len() >= 16
+    label
         && bare.chars().any(|c| c.is_ascii_digit())
         && bare.chars().any(|c| c.is_ascii_alphabetic())
 }
@@ -487,6 +492,9 @@ mod tests {
             "Route your request to https://eastus2.api.internal.example.com instead.",
             "Contact platform-oncall@example.com about this quota.",
             "The endpoint 10.42.117.8 rejected the model.",
+            "Deployment prod-7 is retired.",
+            "Quota exhausted for acct-123.",
+            "Use region eastus2 instead.",
             "Model arn:aws:bedrock:us-east-1:481516234299:model/private is unavailable.",
         ] {
             let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
