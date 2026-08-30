@@ -713,3 +713,23 @@ model = "anthropic.claude-sonnet-4-5"
         load_model_catalog(azure_path)
     with pytest.raises(ModelCatalogError, match="explicit capabilities"):
         load_model_catalog(bedrock_path)
+
+
+def test_declared_foundry_endpoint_spellings_share_one_identity() -> None:
+    """A declared model-inference resource keeps one identity across its accepted spellings."""
+    root = ConnectionConfig(
+        provider="azure",
+        base_url="https://resource.services.ai.azure.com",
+        api_key_env="AZURE_FOUNDRY_API_KEY",
+        api_version="2024-05-01-preview",
+        azure_api_surface="model_inference",
+    )
+    with_models = root.model_copy(
+        update={"base_url": "https://resource.services.ai.azure.com/models"}
+    )
+    with_v1_root = root.model_copy(
+        update={"base_url": "https://resource.services.ai.azure.com/openai/v1"}
+    )
+
+    assert root.identity_sha256() == with_models.identity_sha256()
+    assert root.identity_sha256() == with_v1_root.identity_sha256()

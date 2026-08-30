@@ -7,7 +7,11 @@ from typing import ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 from exp.common.models import ChatMaxTokensField, ModelSnapshot
-from exp.common.models.catalog import AzureApiSurface, infer_azure_api_surface
+from exp.common.models.catalog import (
+    AzureApiSurface,
+    infer_azure_api_surface,
+    strip_model_inference_root,
+)
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
@@ -154,11 +158,7 @@ def _azure_base_url(
     root = endpoint.rstrip("/")
     if api_surface == "model_inference":
         parsed = urlsplit(endpoint)
-        path = parsed.path.rstrip("/")
-        if path.lower().endswith("/models"):
-            path = path[:-7].rstrip("/")
-        elif path.lower().endswith(_V1_ROOT_SUFFIX):
-            path = path[: -len(_V1_ROOT_SUFFIX)].rstrip("/")
+        path = strip_model_inference_root(parsed.path)
         model_path = f"{path}/models" if path else "/models"
         return urlunsplit((parsed.scheme, parsed.netloc, model_path, "", ""))
     if api_version == _V1_API_VERSION:
@@ -298,8 +298,5 @@ def _canonical_azure_endpoint(
     comparable_port = None if port in {None, default_port} else port
     path = parsed.path.rstrip("/")
     if api_surface == "model_inference":
-        if path.lower().endswith("/models"):
-            path = path[:-7].rstrip("/")
-        elif path.lower().endswith(_V1_ROOT_SUFFIX):
-            path = path[: -len(_V1_ROOT_SUFFIX)].rstrip("/")
+        path = strip_model_inference_root(path)
     return (scheme, hostname, comparable_port, path)

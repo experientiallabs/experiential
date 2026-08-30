@@ -49,6 +49,7 @@ AzureApiSurface = Literal["openai_deployments", "model_inference"]
 
 _FOUNDRY_HOST_SUFFIXES = (".services.ai.azure.com", ".inference.ai.azure.com")
 _AZURE_OPENAI_HOST_SUFFIX = ".openai.azure.com"
+_MODEL_INFERENCE_ROOT_SUFFIXES = ("/models", "/openai/v1")
 
 
 def _normalize_base_url(value: str) -> str:
@@ -95,6 +96,25 @@ def infer_azure_api_surface(endpoint: str) -> AzureApiSurface | None:
     return None
 
 
+def strip_model_inference_root(value: str) -> str:
+    """Remove the route suffix one Azure model-inference endpoint spelling carries.
+
+    The model-inference surface serves ``/models`` directly off the resource, so the bare resource,
+    its terminal ``/models`` form, and the Azure OpenAI ``/openai/v1`` root all name one resource.
+
+    Args:
+        value: Endpoint or endpoint path, with or without a trailing slash.
+
+    Returns:
+        The value reduced to the resource itself.
+    """
+    trimmed = value.rstrip("/")
+    for suffix in _MODEL_INFERENCE_ROOT_SUFFIXES:
+        if trimmed.lower().endswith(suffix):
+            return trimmed[: -len(suffix)].rstrip("/")
+    return trimmed
+
+
 def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
     """Normalize one endpoint while preserving provider-surface equivalence."""
     if connection.base_url is None:
@@ -102,12 +122,8 @@ def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
     normalized = _normalize_base_url(connection.base_url)
     # Endpoint identity stays keyed on the declared surface only. An inferred surface must not
     # move a stored credential's digest for a connection the operator never edited.
-    if (
-        connection.provider == "azure"
-        and connection.azure_api_surface == "model_inference"
-        and normalized.lower().endswith("/models")
-    ):
-        return normalized[:-7].rstrip("/")
+    if connection.provider == "azure" and connection.azure_api_surface == "model_inference":
+        return strip_model_inference_root(normalized)
     return normalized
 
 
