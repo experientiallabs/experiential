@@ -715,8 +715,8 @@ model = "anthropic.claude-sonnet-4-5"
         load_model_catalog(bedrock_path)
 
 
-def test_declared_foundry_endpoint_spellings_share_one_identity() -> None:
-    """A declared model-inference resource keeps one identity across its accepted spellings."""
+def test_declared_foundry_endpoint_spellings_keep_their_stored_identity() -> None:
+    """Identity folds only the terminal /models segment, so no stored digest moves on upgrade."""
     root = ConnectionConfig(
         provider="azure",
         base_url="https://resource.services.ai.azure.com",
@@ -732,4 +732,4 @@ def test_declared_foundry_endpoint_spellings_share_one_identity() -> None:
     )
 
     assert root.identity_sha256() == with_models.identity_sha256()
-    assert root.identity_sha256() == with_v1_root.identity_sha256()
+    assert root.identity_sha256() != with_v1_root.identity_sha256()
