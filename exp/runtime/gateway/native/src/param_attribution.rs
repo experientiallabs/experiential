@@ -124,9 +124,11 @@ fn sanitized_detail(message: &str) -> Option<String> {
 ///
 /// An explanation the caller can act on is prose about their own request, so
 /// it never needs an endpoint, a mailbox, a resource name, or an opaque
-/// handle. Any word shaped like one disqualifies the whole sentence: a
-/// partially redacted explanation reads as fact while hiding what was cut,
-/// and the caller keeps the generic message instead.
+/// handle. Any unquoted word shaped like one disqualifies the whole sentence:
+/// a partially redacted explanation reads as fact while hiding what was cut,
+/// and the caller keeps the generic message instead. A quoted word is the
+/// value the caller sent back to them, so only the unambiguous network and
+/// resource shapes disqualify it.
 fn carries_provider_identifier(word: &str) -> bool {
     let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
     if word.contains("://") || word.contains('@') || bare.to_ascii_lowercase().starts_with("arn:") {
@@ -143,12 +145,20 @@ fn carries_provider_identifier(word: &str) -> bool {
     {
         return true;
     }
-    // A bare word mixing letters and digits is a label, not English: an
-    // account, a deployment, a region, a revision, or a key. Length is not
+    // A bare word mixing letters and digits is a label rather than English:
+    // an account, a deployment, a region, a revision, or a key. Length is not
     // part of the test, so `prod-7` and `acct-123` are as disqualifying as a
     // full opaque handle. Prose keeps its numbers (`8192`) and parameter
     // names keep their shape (`top_p`, `input[1].status`), because neither
     // mixes the two inside one unpunctuated word.
+    //
+    // Quoting is the exception. A provider quotes the value the caller sent
+    // (`Unsupported model 'gpt-4o-mini'.`) and states its own infrastructure
+    // unquoted, so a quoted label is something the caller already knows and
+    // needs to see named.
+    if word.starts_with(['\'', '"', '`']) {
+        return false;
+    }
     let label = bare
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
@@ -510,6 +520,8 @@ mod tests {
             "`top_p` is deprecated for this model.",
             "Unsupported value: 'input[1].status' is not one of the allowed values.",
             "max_tokens must be less than or equal to 8192, got 100000.",
+            "Unsupported model 'gpt-4o-mini' for the Responses API.",
+            "`v2` is not a valid value for `api_version`.",
         ] {
             let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
             assert_eq!(
