@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -17,6 +17,41 @@ use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass};
 use crate::events::Usage;
 use crate::metrics::METRICS;
+
+/// Format one wall-clock instant as an RFC 3339 / ISO 8601 UTC string with
+/// millisecond precision, e.g. `2026-08-30T12:34:56.789+00:00`.
+///
+/// The control plane parses this with `datetime.fromisoformat`, so the output
+/// stays inside that grammar (explicit `+00:00` offset, millisecond fraction).
+/// The crate carries no datetime dependency, so the civil date is derived from
+/// the Unix epoch with Howard Hinnant's `civil_from_days` algorithm; a time
+/// before the epoch (never expected for a served token) clamps to the epoch.
+fn system_time_to_rfc3339(at: SystemTime) -> String {
+    let since_epoch = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = since_epoch.as_secs() as i64;
+    let millis = since_epoch.subsec_millis();
+    let days = secs.div_euclid(86_400);
+    let seconds_of_day = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (
+        seconds_of_day / 3_600,
+        (seconds_of_day % 3_600) / 60,
+        seconds_of_day % 60,
+    );
+    // civil_from_days: shift the epoch to a 0000-03-01 era so leap handling is
+    // branch-free, then recover the Gregorian year/month/day.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097; // [0, 146_096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153; // [0, 11], months shifted so March = 0
+    let day = day_of_year - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}+00:00")
+}
 
 /// Build the settle callback argument shared by explicit settlement and the
 /// drop backstop.
@@ -30,6 +65,7 @@ fn settle_argument(
     failure: Option<&Failure>,
     finalize: bool,
     opened: bool,
+    first_token_at: Option<SystemTime>,
 ) -> String {
     compact_json(&json!({
         "request_id": request_id,
@@ -48,6 +84,7 @@ fn settle_argument(
         })),
         "finalize": finalize,
         "opened": opened,
+        "first_token_at": first_token_at.map(system_time_to_rfc3339),
     }))
 }
 
@@ -109,6 +146,10 @@ pub struct AttemptGuard {
     /// diverge from the recorded metric.
     decided_settlement: Option<String>,
     pub started: Instant,
+    /// Wall-clock time the winning attempt streamed its first output token,
+    /// reported in the finalizing settlement so the control plane can derive
+    /// time-to-first-token. `None` until an attempt observes a first token.
+    first_token_at: Option<SystemTime>,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -153,6 +194,7 @@ impl AttemptGuard {
             opened: false,
             decided_settlement: None,
             started,
+            first_token_at: None,
         }
     }
 
@@ -161,6 +203,18 @@ impl AttemptGuard {
         self.attempt_id = Some(attempt_id);
         self.opened = false;
         self.decided_settlement = None;
+        // Each physical attempt observes its own first token; a prior failed
+        // attempt's timing never carries into its successor.
+        self.first_token_at = None;
+    }
+
+    /// Record the wall-clock time the active attempt streamed its first output
+    /// token, read from its relay just before settlement. Only the first
+    /// observation for the attempt is kept.
+    pub fn record_first_token(&mut self, at: Option<SystemTime>) {
+        if self.first_token_at.is_none() {
+            self.first_token_at = at;
+        }
     }
 
     /// Record that the active attempt's provider dispatch opened.
@@ -208,6 +262,7 @@ impl AttemptGuard {
             failure,
             finalize,
             self.opened,
+            self.first_token_at,
         );
         if finalize {
             let cancelled = failure.map(|failure| failure.failure_class == FailureClass::Cancelled)
@@ -314,6 +369,7 @@ impl Drop for AttemptGuard {
                             )),
                             true,
                             self.opened,
+                            self.first_token_at,
                         ),
                     )
                 }
@@ -343,5 +399,53 @@ impl Drop for AttemptGuard {
             deliver(&bridge, method, argument).await;
             pending.fetch_sub(1, Ordering::SeqCst);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rfc3339_formats_epoch_seconds_and_millis_in_utc() {
+        assert_eq!(
+            system_time_to_rfc3339(UNIX_EPOCH),
+            "1970-01-01T00:00:00.000+00:00"
+        );
+        // A fixed instant with sub-second precision (1_700_000_000.500s).
+        let at = UNIX_EPOCH + Duration::from_millis(1_700_000_000_500);
+        assert_eq!(system_time_to_rfc3339(at), "2023-11-14T22:13:20.500+00:00");
+        // A leap day exercises the civil-from-days month/day recovery.
+        let leap = UNIX_EPOCH + Duration::from_secs(1_582_934_400);
+        assert_eq!(
+            system_time_to_rfc3339(leap),
+            "2020-02-29T00:00:00.000+00:00"
+        );
+    }
+
+    #[test]
+    fn settle_argument_carries_first_token_at_only_when_observed() {
+        let observed = UNIX_EPOCH + Duration::from_millis(1_700_000_000_500);
+        let with_token = settle_argument(
+            "req",
+            "att",
+            "completed",
+            None,
+            &[],
+            None,
+            true,
+            true,
+            Some(observed),
+        );
+        let parsed: Value = serde_json::from_str(&with_token).expect("valid json");
+        assert_eq!(
+            parsed["first_token_at"],
+            Value::String("2023-11-14T22:13:20.500+00:00".to_string())
+        );
+        // A non-streaming attempt observes no first token: the field is null,
+        // matching the control plane's backward-compatible parse.
+        let without = settle_argument("req", "att", "completed", None, &[], None, true, true, None);
+        let parsed: Value = serde_json::from_str(&without).expect("valid json");
+        assert_eq!(parsed["first_token_at"], Value::Null);
     }
 }

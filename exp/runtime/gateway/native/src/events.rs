@@ -187,6 +187,32 @@ impl Event {
             Event::Completed | Event::Incomplete | Event::Failed(_)
         )
     }
+
+    /// Whether this event carries the first visible model output, used to
+    /// stamp time-to-first-token. A content, refusal, reasoning, or tool-argument
+    /// delta counts only when it carries at least one character: an empty delta
+    /// (a role-establishing or empty refusal frame) is not a visible token and
+    /// must not stamp TTFT early. A tool-call start is itself the first token of
+    /// a tool-only turn, so it counts even before any arguments stream. Purely
+    /// structural frames are excluded so TTFT is not stamped early: the Responses
+    /// `ProviderOutputItemStarted` reserves a slot at the item-start boundary
+    /// *before* the first delta arrives, and the opaque reasoning-carrier frames
+    /// (`ThinkingSignature`, `RedactedThinking`, `EncryptedReasoning`) never lead
+    /// a turn on their own. Usage, item-close, and lifecycle/terminal frames are
+    /// not output tokens either.
+    pub fn is_output_token(&self) -> bool {
+        match self {
+            Event::TextDelta(text) | Event::RefusalDelta(text) => !text.is_empty(),
+            Event::ProviderTextDelta { delta, .. }
+            | Event::ProviderRefusalDelta { delta, .. }
+            | Event::ReasoningSummaryDelta { delta, .. }
+            | Event::ThinkingDelta { delta, .. }
+            | Event::ReasoningContentDelta { delta, .. }
+            | Event::ToolArgumentsDelta { delta, .. } => !delta.is_empty(),
+            Event::ToolCallStarted { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 /// Render one event as the content-bearing JSON object used by dialect parity
@@ -655,6 +681,60 @@ pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Resul
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn output_tokens_lead_a_turn_but_control_frames_do_not() {
+        // Content, reasoning, and tool-call deltas are the first visible output.
+        assert!(Event::TextDelta("hi".to_string()).is_output_token());
+        assert!(Event::RefusalDelta("no".to_string()).is_output_token());
+        assert!(Event::ProviderTextDelta {
+            output_index: 0,
+            item_id: "msg_1".to_string(),
+            delta: "hi".to_string(),
+        }
+        .is_output_token());
+        assert!(Event::ThinkingDelta {
+            index: 0,
+            delta: "hmm".to_string(),
+        }
+        .is_output_token());
+        // A tool-only turn's first token is the tool call itself.
+        assert!(Event::ToolCallStarted {
+            index: 0,
+            call_id: "call_1".to_string(),
+            name: "get".to_string(),
+        }
+        .is_output_token());
+        // Usage, terminals, and opaque reasoning-carrier frames never lead.
+        assert!(!Event::Usage(Usage::default()).is_output_token());
+        assert!(!Event::Completed.is_output_token());
+        assert!(!Event::Incomplete.is_output_token());
+        assert!(!Event::ThinkingSignature {
+            index: 0,
+            signature: "sig".to_string(),
+        }
+        .is_output_token());
+        // A Responses item-start reserves a slot before the first delta; it
+        // must not stamp TTFT early -- the following delta is the real token.
+        assert!(!Event::ProviderOutputItemStarted {
+            output_index: 0,
+            item_id: Some("msg_1".to_string()),
+            kind: ProviderOutputItemKind::Message,
+            status: None,
+            phase: None,
+        }
+        .is_output_token());
+        // An empty delta (role-establishing or empty refusal frame) carries no
+        // visible token, so it must not stamp TTFT.
+        assert!(!Event::TextDelta(String::new()).is_output_token());
+        assert!(!Event::RefusalDelta(String::new()).is_output_token());
+        assert!(!Event::ProviderTextDelta {
+            output_index: 0,
+            item_id: "msg_1".to_string(),
+            delta: String::new(),
+        }
+        .is_output_token());
+    }
 
     #[test]
     fn openai_compatible_usage_counts_absent_fields_as_zero() {

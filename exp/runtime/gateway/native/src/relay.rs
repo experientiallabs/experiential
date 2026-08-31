@@ -4,7 +4,7 @@
 //! deployment; the HTTP surfaces then drain it live or to completion.
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
@@ -126,6 +126,12 @@ pub struct UpstreamRelay {
     /// per-chunk timeout instead, so a slow reasoning model can stream for a
     /// long time after it has started answering.
     first_byte_deadline: Instant,
+    /// Wall-clock time this relay yielded its first output token (a content,
+    /// reasoning, or tool-call delta), or `None` before any token arrives.
+    /// Distinct from `first_byte_recorded`: the first byte can be an SSE frame
+    /// carrying only role/lifecycle scaffolding, so time-to-first-token is
+    /// stamped on the first event that carries visible model output.
+    first_token_at: Option<SystemTime>,
 }
 
 impl UpstreamRelay {
@@ -177,7 +183,15 @@ impl UpstreamRelay {
             eof: false,
             first_byte_recorded: false,
             first_byte_deadline,
+            first_token_at: None,
         }
+    }
+
+    /// The wall-clock time this relay yielded its first output token, or
+    /// `None` if it has not produced one yet. Read at settlement to report
+    /// the winning attempt's time-to-first-token.
+    pub fn first_token_at(&self) -> Option<SystemTime> {
+        self.first_token_at
     }
 
     /// Yield the next normalized event. `Ok(None)` means the upstream closed
@@ -192,6 +206,14 @@ impl UpstreamRelay {
     ) -> Result<Option<Event>, Failure> {
         loop {
             if let Some(event) = self.pending.pop_front() {
+                // Every yielded event exits here, so this is the one place that
+                // stamps time-to-first-token: the first event carrying visible
+                // model output. Prefix events peeked during commit also passed
+                // through here, so the winning attempt's first token is stamped
+                // whether it is later replayed from a prefix or drained live.
+                if self.first_token_at.is_none() && event.is_output_token() {
+                    self.first_token_at = Some(SystemTime::now());
+                }
                 return Ok(Some(event));
             }
             if self.eof {
@@ -308,7 +330,44 @@ pub async fn collect_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dialects::Dialect;
+    use crate::events::Event;
     use futures_util::stream;
+
+    #[tokio::test]
+    async fn first_token_at_is_stamped_on_the_first_output_delta() {
+        // A content delta then the OpenAI terminal sentinel.
+        let frames = vec![
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            )),
+            Ok::<_, reqwest::Error>(Bytes::from("data: [DONE]\n\n")),
+        ];
+        let mut relay = UpstreamRelay::from_stream(
+            stream::iter(frames).boxed(),
+            Dialect::OpenAiCompatible,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(
+            relay.first_token_at().is_none(),
+            "no first-token time before any event is yielded"
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let per_chunk = Duration::from_secs(5);
+        let first = relay
+            .next_event(deadline, per_chunk, Instant::now())
+            .await
+            .expect("the stream yields")
+            .expect("an event is produced");
+        assert!(
+            matches!(&first, Event::TextDelta(text) if text == "hi"),
+            "the first output event is the content delta"
+        );
+        assert!(
+            relay.first_token_at().is_some(),
+            "the first content delta stamps time-to-first-token"
+        );
+    }
 
     #[test]
     fn a_first_byte_stall_fails_over_without_redialing_the_dead_lane() {

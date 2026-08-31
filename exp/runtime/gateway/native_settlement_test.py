@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from exp.runtime.gateway.contracts import GatewayEventKind, GatewayFailureClass
 from exp.runtime.gateway.native_settlement import (
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
+    first_token_at_from_settlement,
     terminal_from_settlement,
 )
+
+
+def test_first_token_at_parses_the_native_plane_rfc3339_wire_format() -> None:
+    # The exact string the Rust data plane emits (settlement.rs
+    # `system_time_to_rfc3339`): explicit +00:00 offset, millisecond fraction.
+    # This pins the producer/consumer contract so a format drift on either side
+    # fails loudly instead of silently dropping time-to-first-token.
+    parsed = first_token_at_from_settlement({"first_token_at": "2023-11-14T22:13:20.500+00:00"})
+    assert parsed == datetime(2023, 11, 14, 22, 13, 20, 500_000, tzinfo=UTC)
+
+
+def test_first_token_at_is_none_when_absent_or_malformed() -> None:
+    # A non-streaming attempt observes no first token, so the field is absent;
+    # a malformed value never crashes accounting.
+    assert first_token_at_from_settlement({}) is None
+    assert first_token_at_from_settlement({"first_token_at": None}) is None
+    assert first_token_at_from_settlement({"first_token_at": 1_700_000_000}) is None
+    assert first_token_at_from_settlement({"first_token_at": "not-a-timestamp"}) is None
 
 
 def test_usage_from_payload_handles_tokens_and_tool_names() -> None:

@@ -374,24 +374,27 @@ async fn completed_messages(
 ) -> Response {
     let _permit = permit;
     let phase_timeout = admission.phase_timeout(committed.depth);
-    let events =
-        match collect_committed(&mut committed, deadline, phase_timeout, guard.started).await {
-            Ok(events) => events,
-            Err(failure) => {
-                let failure = failure.boundary();
-                let error = collection_public_error(&failure);
-                guard
-                    .settle(
-                        "failed",
-                        committed.usage.as_ref(),
-                        &committed.tool_names,
-                        Some(&failure),
-                        true,
-                    )
-                    .await;
-                return messages_error_response(&error);
-            }
-        };
+    let collection =
+        collect_committed(&mut committed, deadline, phase_timeout, guard.started).await;
+    // Record TTFT before any settle so a mid-collection failure still keeps an observed first token.
+    guard.record_first_token(committed.relay.first_token_at());
+    let events = match collection {
+        Ok(events) => events,
+        Err(failure) => {
+            let failure = failure.boundary();
+            let error = collection_public_error(&failure);
+            guard
+                .settle(
+                    "failed",
+                    committed.usage.as_ref(),
+                    &committed.tool_names,
+                    Some(&failure),
+                    true,
+                )
+                .await;
+            return messages_error_response(&error);
+        }
+    };
     respond_from_messages_events(
         admission,
         guard,
@@ -413,24 +416,27 @@ async fn guarded_messages(
 ) -> Response {
     let _permit = permit;
     let phase_timeout = admission.phase_timeout(committed.depth);
-    let collected =
-        match collect_committed(&mut committed, deadline, phase_timeout, guard.started).await {
-            Ok(events) => events,
-            Err(failure) => {
-                let failure = failure.boundary();
-                let error = collection_public_error(&failure);
-                guard
-                    .settle(
-                        "failed",
-                        committed.usage.as_ref(),
-                        &committed.tool_names,
-                        Some(&failure),
-                        true,
-                    )
-                    .await;
-                return messages_error_response(&error);
-            }
-        };
+    let collection =
+        collect_committed(&mut committed, deadline, phase_timeout, guard.started).await;
+    // Record TTFT before any settle so a mid-collection failure still keeps an observed first token.
+    guard.record_first_token(committed.relay.first_token_at());
+    let collected = match collection {
+        Ok(events) => events,
+        Err(failure) => {
+            let failure = failure.boundary();
+            let error = collection_public_error(&failure);
+            guard
+                .settle(
+                    "failed",
+                    committed.usage.as_ref(),
+                    &committed.tool_names,
+                    Some(&failure),
+                    true,
+                )
+                .await;
+            return messages_error_response(&error);
+        }
+    };
     let events = match apply_output_guardrail(&admission, &guard.bridge, collected).await {
         Ok(events) => events,
         Err(failure) => {
@@ -498,6 +504,8 @@ async fn stream_messages(
             }};
         }
 
+        // Mirror any prefix-peeked first token before a start-frame send can cancel and drop it.
+        guard.record_first_token(committed.relay.first_token_at());
         let start_frames = match encoder.start() {
             Ok(frames) => frames,
             Err(_) => {
@@ -535,6 +543,8 @@ async fn stream_messages(
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
+            // Mirror the relay's first-token time onto the guard as tokens stream.
+            guard.record_first_token(committed.relay.first_token_at());
             if matches!(
                 event,
                 Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
