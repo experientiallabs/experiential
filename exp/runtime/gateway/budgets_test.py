@@ -533,6 +533,84 @@ def test_default_limit_admits_unpriced_attempts_and_tracks_token_volume(
     assert not remaining.exhausted
 
 
+def _reported_volume(root: Path, usage: GatewayUsage) -> tuple[int, int]:
+    """Report one unpriced attempt's observed token volume under a default limit.
+
+    Args:
+        root: Directory holding this attempt's isolated gateway database.
+        usage: Provider-reported token counts for the single unpriced attempt.
+
+    Returns:
+        The limit's reported unknown-cost input and output token volume.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    clock = _Clock()
+    store, ledger, budgets, key = _authority(root, clock)
+    budgets.set_limit(
+        organization_id="org",
+        period="2026-08",
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_micro_usd=1_000,
+    )
+    _request_value, snapshot = _accepted(store, ledger, clock, key, "volume")
+    attempt = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=_deployment(priced=False),
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_micro_usd=None,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=0,
+            usage=usage,
+        ),
+        failure=None,
+    )
+    remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
+    return remaining.unknown_cost_input_tokens, remaining.unknown_cost_output_tokens
+
+
+def test_reported_input_volume_counts_a_cache_hit_once(tmp_path: Path) -> None:
+    """One prompt is the same traffic whether the provider served it fresh or cached.
+
+    ``cached_input_tokens`` is a subset of ``input_tokens``, so a 10,000-token prompt
+    answered entirely from the provider's cache is still 10,000 tokens of traffic.
+    """
+    fresh, _ = _reported_volume(
+        tmp_path / "fresh",
+        GatewayUsage(input_tokens=10_000, output_tokens=50),
+    )
+    cached, _ = _reported_volume(
+        tmp_path / "cached",
+        GatewayUsage(input_tokens=10_000, cached_input_tokens=10_000, output_tokens=50),
+    )
+
+    assert fresh == 10_000
+    assert cached == fresh
+
+
+def test_reported_output_volume_counts_reasoning_once(tmp_path: Path) -> None:
+    """One response is the same traffic whether or not the model reasoned first.
+
+    ``reasoning_tokens`` is a subset of ``output_tokens``, so a 500-token response
+    is 500 tokens of traffic even when every one of them was a reasoning token.
+    """
+    _, plain = _reported_volume(
+        tmp_path / "plain",
+        GatewayUsage(input_tokens=100, output_tokens=500),
+    )
+    _, reasoned = _reported_volume(
+        tmp_path / "reasoned",
+        GatewayUsage(input_tokens=100, output_tokens=500, reasoning_tokens=500),
+    )
+
+    assert plain == 500
+    assert reasoned == plain
+
+
 def test_strict_limit_fails_closed_on_unknown_cost(tmp_path: Path) -> None:
     """A strict limit rejects unpriced attempts and blocks while unknown cost remains."""
     clock = _Clock()
