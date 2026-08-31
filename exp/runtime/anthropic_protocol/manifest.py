@@ -201,13 +201,17 @@ MESSAGES_SERVER_TOOL_TYPES_REJECTED = frozenset(
 """Anthropic-defined tool types consciously rejected by name.
 
 Each is rejected because the gateway cannot yet serve it truthfully, not
-because the provider would refuse it: ``web_fetch_*``, ``code_execution_*``,
+because the provider would refuse it (a live probe on a plain key,
+2026-08-31, accepted the current-generation types bare; beta headers only
+matter for the 2024-10-22 family): ``web_fetch_*``, ``code_execution_*``,
 and ``tool_search_*`` stream result blocks the data plane does not carry
 (silently dropping them would falsify the response); ``code_execution_*``,
 ``browser_toolset_*``, ``computer*``, and ``mcp_toolset`` additionally bind
-provider-hosted execution state; ``computer*``, ``bash_*``, ``text_editor_*``,
-``memory_*``, and ``advisor_*`` are client-executed but unverified here and
-several require beta headers this gateway does not forward. Accepting one
+provider-hosted execution state. ``bash_20250124``,
+``text_editor_20250728``, and ``memory_20250818`` are client-executed
+through ordinary ``tool_use`` blocks (no new block vocabulary in that
+probe), making them the nearest accept candidates once verified end to end;
+the remaining client-executed types are unverified here. Accepting one
 means moving it to :data:`MESSAGES_SERVER_TOOL_TYPES_ACCEPTED` with live
 block-vocabulary evidence, exactly as web_search was.
 """
