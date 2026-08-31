@@ -593,3 +593,116 @@ def test_a_real_toolset_tool_description_over_8k_decodes() -> None:
     decoded = decode_messages(_body(tools=tools))
     description = decoded.request.tools[1].description
     assert description is not None and len(description) == 40_000
+
+
+def test_decode_accepts_the_live_eager_input_streaming_tool_shape() -> None:
+    """Live-captured 2026-08-30: a production Claude Code session sent a tool
+    carrying ``eager_input_streaming`` and got "Invalid value for
+    'tools.0.eager_input_streaming'" while api.anthropic.com accepts the field
+    bare (no beta header). The exact wire shape stays accepted."""
+    decoded = decode_messages(
+        _body(
+            stream=True,
+            tools=[
+                {
+                    "name": "Bash",
+                    "description": "Executes a bash command and returns its output.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                    "eager_input_streaming": True,
+                }
+            ],
+        )
+    )
+    tool = decoded.request.tools[0]
+    assert tool.eager_input_streaming is True
+    assert decoded.request.ignored_parameters == ()
+
+
+def test_decode_carries_every_provider_native_tool_annotation() -> None:
+    """The provider-native tool annotations land on the canonical tool
+    (each accepted bare by the live API, verified 2026-08-30)."""
+    decoded = decode_messages(
+        _body(
+            tools=[
+                {
+                    "name": "get_weather",
+                    "description": "Get weather.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    "eager_input_streaming": False,
+                    "defer_loading": False,
+                    "allowed_callers": ["code_execution_20260120"],
+                    "input_examples": [{"city": "Paris"}],
+                }
+            ]
+        )
+    )
+    tool = decoded.request.tools[0]
+    assert tool.strict is True
+    assert tool.cache_control == {"type": "ephemeral", "ttl": "1h"}
+    assert tool.eager_input_streaming is False
+    assert tool.defer_loading is False
+    assert tool.allowed_callers == ("code_execution_20260120",)
+    assert tool.input_examples == ({"city": "Paris"},)
+
+    bare = decode_messages(
+        _body(tools=[{"name": "get_weather", "input_schema": {"type": "object"}}])
+    ).request.tools[0]
+    assert bare.strict is False
+    assert bare.cache_control is None
+    assert bare.eager_input_streaming is None
+    assert bare.defer_loading is None
+    assert bare.allowed_callers is None
+    assert bare.input_examples is None
+
+
+def test_decode_carries_top_level_cache_control_and_inference_geo() -> None:
+    """Top-level auto-caching and the inference region ride their carriers
+    verbatim (both accepted bare by the live API, verified 2026-08-30)."""
+    decoded = decode_messages(_body(cache_control={"type": "ephemeral"}, inference_geo="us"))
+    assert decoded.request.provider_cache_control == {"type": "ephemeral"}
+    assert decoded.request.inference_geo == "us"
+    absent = decode_messages(_body()).request
+    assert absent.provider_cache_control is None
+    assert absent.inference_geo is None
+
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(_body(cache_control={"type": "persistent"}))
+    assert excinfo.value.detail.param == "cache_control.type"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["user_profile_id", "fallbacks", "fallback_credit_token", "betas"],
+)
+def test_route_identity_and_delegation_fields_stay_consciously_rejected(field: str) -> None:
+    """Fallback model swaps, body-borne beta opt-ins, and third-party
+    attribution are recorded rejections, each answered by its named 400."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(_body(**{field: "x"}))
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail.param == field
+
+
+def test_validation_errors_state_the_expectation_not_only_the_field() -> None:
+    """A strict-decode 400 names the field and what was expected there."""
+    with pytest.raises(OpenAIProtocolError) as unknown:
+        decode_messages(_body(tools=[{"name": "t", "input_schema": {}, "eager_streaming": True}]))
+    assert unknown.value.detail.param == "tools.0.eager_streaming"
+    assert "Unknown parameter 'tools.0.eager_streaming'" in unknown.value.detail.message
+
+    with pytest.raises(OpenAIProtocolError) as invalid:
+        decode_messages(_body(tools=[{"name": "t", "input_schema": {}, "strict": "maybe"}]))
+    assert invalid.value.detail.param == "tools.0.strict"
+    assert "Invalid value for 'tools.0.strict'" in invalid.value.detail.message
+    assert "bool" in invalid.value.detail.message

@@ -511,3 +511,93 @@ def test_context_management_is_digest_excluded_but_joins_replay_identity() -> No
             messages=messages,
             context_management={"edits": []},
         )
+
+
+def test_anthropic_tool_annotations_are_digest_free_but_bind_replay_identity() -> None:
+    """Tool carriers never perturb plain digests; present ones bind replay."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.contracts import GatewayToolDefinition, canonical_request_sha256
+
+    def request(tool: GatewayToolDefinition) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            tools=(tool,),
+        )
+
+    plain_tool = GatewayToolDefinition(name="bash", parameters={"type": "object"})
+    bare = request(plain_tool)
+    eager = request(plain_tool.model_copy(update={"eager_input_streaming": True}))
+    assert eager.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(eager) == sha256_json(bare)
+    assert canonical_request_sha256(bare) == sha256_json(bare)
+    assert canonical_request_sha256(eager) != canonical_request_sha256(bare)
+    assert canonical_request_sha256(eager) == canonical_request_sha256(
+        request(plain_tool.model_copy(update={"eager_input_streaming": True}))
+    )
+    assert canonical_request_sha256(eager) != canonical_request_sha256(
+        request(plain_tool.model_copy(update={"eager_input_streaming": False}))
+    )
+    for annotated in (
+        plain_tool.model_copy(update={"defer_loading": False}),
+        plain_tool.model_copy(update={"allowed_callers": ("code_execution_20260120",)}),
+        plain_tool.model_copy(update={"input_examples": ({"city": "Paris"},)}),
+    ):
+        assert canonical_request_sha256(request(annotated)) != canonical_request_sha256(bare)
+
+    # A cache hint changes cost, not semantics: neither digest nor replay moves.
+    hinted = request(plain_tool.model_copy(update={"cache_control": {"type": "ephemeral"}}))
+    assert sha256_json(hinted) == sha256_json(bare)
+    assert canonical_request_sha256(hinted) == canonical_request_sha256(bare)
+
+
+def test_messages_only_carriers_cache_control_and_inference_geo() -> None:
+    """The top-level cache marker stays identity-inert; the region binds replay."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.contracts import canonical_request_sha256
+
+    messages = (GatewayMessage(role="user", content="hi"),)
+    bare = GatewayRequest(surface=GatewayApiSurface.MESSAGES, messages=messages)
+    cached = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=messages,
+        provider_cache_control={"type": "ephemeral"},
+    )
+    assert cached.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(cached) == sha256_json(bare)
+    assert canonical_request_sha256(cached) == canonical_request_sha256(bare)
+
+    regional = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=messages,
+        inference_geo="us",
+    )
+    assert sha256_json(regional) == sha256_json(bare)
+    assert canonical_request_sha256(regional) != canonical_request_sha256(bare)
+
+    with pytest.raises(ValidationError, match="provider_cache_control is valid only"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            provider_cache_control={"type": "ephemeral"},
+        )
+    with pytest.raises(ValidationError, match="inference_geo is valid only"):
+        GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=messages,
+            inference_geo="us",
+        )
+    from exp.runtime.gateway.contracts import GatewayToolDefinition
+
+    with pytest.raises(ValidationError, match="Anthropic tool carriers are valid only"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            tools=(
+                GatewayToolDefinition(
+                    name="bash",
+                    parameters={"type": "object"},
+                    eager_input_streaming=True,
+                ),
+            ),
+        )

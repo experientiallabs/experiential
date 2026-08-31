@@ -228,10 +228,16 @@ adaptive default; on the adaptive-only generation, which rejects `enabled`/`disa
 configs outright, an `enabled` config translates to adaptive with the dropped
 `thinking.budget_tokens` disclosed as ignored, and `disabled` is rejected by name
 because those models cannot turn thinking off), requires
-`max_tokens`, validates `cache_control` (dropping it everywhere except on `tool_use` blocks,
-where the hint forwards natively; non-Anthropic routes disclose the omission through
-`ignored_parameters`), and rejects image and document blocks loudly because the surface is
-text-only. Thinking carriers
+`max_tokens`, validates `cache_control` (carrying it where the Anthropic wire caches natively:
+`tool_use` blocks, tool definitions, and the top-level automatic marker forward verbatim, while
+content-block hints drop; non-Anthropic routes disclose each omission through
+`ignored_parameters`), carries the provider-native tool annotations (`strict`,
+`eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
+bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with
+disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
+decision behind an SDK-surface drift gate in
+`exp/runtime/anthropic_protocol/manifest.py`, and rejects image and document blocks loudly
+because the surface is text-only. Thinking carriers
 replay only on the Anthropic wire, so route admission requires every waterfall rung to speak the
 `anthropic_messages` dialect; on the Responses surface over Anthropic routes, thinking text is
 projected onto the reasoning-summary channel (signatures deliberately dropped) so callers receive

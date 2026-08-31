@@ -3,10 +3,12 @@
 The decoder is strict and lossless for supported content: text, ``tool_use``,
 ``tool_result``, ``thinking``, and ``redacted_thinking`` blocks translate
 faithfully (thinking history rides the opaque provider-reasoning carrier with
-byte-exact signatures); ``cache_control`` annotations are validated and
-dropped because they do not change model semantics; ``image`` and
-``document`` blocks are rejected loudly because the serving surface cannot
-preserve them. Unknown or unsupported fields are rejected with a
+byte-exact signatures); ``cache_control`` annotations are validated
+everywhere and carried on the surfaces the Anthropic wire caches natively
+(tool_use blocks, tool definitions, and the top-level automatic marker),
+while content-block hints are dropped because they do not change model
+semantics; ``image`` and ``document`` blocks are rejected loudly because
+the serving surface cannot preserve them. Unknown or unsupported fields are rejected with a
 field-specific error, never silently dropped. Errors raise
 :class:`OpenAIProtocolError` so the shared boundary stays single-authority;
 the HTTP layer renders them in the Anthropic envelope.
@@ -142,6 +144,13 @@ class _Tool(_WireModel):
     40k-character descriptions live (verified 2026-08-30) and a real Claude
     Code toolset exceeded the earlier 8k bound; the request-body size cap
     remains the effective total limit.
+
+    ``eager_input_streaming``, ``defer_loading``, ``allowed_callers``, and
+    ``input_examples`` are provider-native tool annotations the live API
+    accepts bare (each verified 2026-08-30; Claude Code sends
+    ``eager_input_streaming`` conditionally). They forward verbatim on
+    Anthropic rungs, which own their validity rules, and drop with
+    disclosure elsewhere.
     """
 
     name: str = Field(min_length=1, max_length=256)
@@ -149,6 +158,11 @@ class _Tool(_WireModel):
     input_schema: JsonObject
     cache_control: _CacheControl | None = None
     type: Literal["custom"] | None = None
+    strict: bool = False
+    eager_input_streaming: bool | None = None
+    defer_loading: bool | None = None
+    allowed_callers: tuple[str, ...] | None = None
+    input_examples: tuple[JsonObject, ...] | None = None
 
 
 class _ToolChoice(_WireModel):
@@ -209,6 +223,15 @@ class _MessagesRequest(_WireModel):
     accepted live behind its beta header, 2026-08-30). Bounded but
     deliberately not enumerated: the value set is an evolving provider
     surface."""
+    cache_control: _CacheControl | None = None
+    """Top-level automatic prompt-caching marker (accepted live without a
+    beta, 2026-08-30). Validated closed, forwarded verbatim on Anthropic
+    rungs, and dropped with disclosure elsewhere: a cache hint changes
+    cost, not semantics."""
+    inference_geo: str | None = Field(default=None, min_length=1, max_length=64)
+    """Inference-region selector, forwarded verbatim (accepted live without
+    a beta, 2026-08-30). Bounded but deliberately not enumerated: the
+    region set is an evolving provider surface."""
 
 
 def decode_messages(
@@ -270,6 +293,14 @@ def decode_messages(
             context_management=_context_management(payload),
             diagnostics=_diagnostics(payload),
             speed=request.speed,
+            # Raw payload value, mirroring thinking: the provider receives the
+            # caller's cache marker byte-for-byte on Anthropic rungs.
+            provider_cache_control=(
+                cast(JsonObject, payload["cache_control"])
+                if request.cache_control is not None
+                else None
+            ),
+            inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
             ignored_parameters=dropped_beta_disclosures,
             reasoning_effort=_output_config_effort(request.output_config),
@@ -398,7 +429,13 @@ def _validate_wire(payload: JsonObject) -> _MessagesRequest:
 
 
 def _validation_error(first: ErrorDetails) -> OpenAIProtocolError:
-    """Convert one Pydantic error location into a stable dotted field error."""
+    """Convert one Pydantic error location into a stable dotted field error.
+
+    The public message keeps the expected-vs-got shape: it names the field
+    and states what the decoder expected there (Pydantic's own expectation
+    text, which never echoes the caller's value), so a rejected request says
+    what to fix instead of only where it failed.
+    """
     location = first["loc"]
     cleaned: list[str] = []
     for part in location:
@@ -407,7 +444,13 @@ def _validation_error(first: ErrorDetails) -> OpenAIProtocolError:
         if isinstance(part, str) and (part.startswith("_") or "[" in text):
             continue
         cleaned.append(text)
-    return invalid_field(".".join(cleaned) or "body")
+    param = ".".join(cleaned) or "body"
+    if first["type"] == "extra_forbidden":
+        return invalid_field(
+            param,
+            f"Unknown parameter '{param}'. Remove the field and resend the request.",
+        )
+    return invalid_field(param, f"Invalid value for '{param}': {first['msg']}.")
 
 
 def _rejected_block_hint(payload: JsonObject) -> str | None:
@@ -460,6 +503,16 @@ def _gateway_tool(tool: _Tool) -> GatewayToolDefinition:
         name=tool.name,
         description=tool.description,
         parameters=tool.input_schema,
+        strict=tool.strict,
+        cache_control=(
+            tool.cache_control.model_dump(mode="json", exclude_none=True)
+            if tool.cache_control is not None
+            else None
+        ),
+        eager_input_streaming=tool.eager_input_streaming,
+        defer_loading=tool.defer_loading,
+        allowed_callers=tool.allowed_callers,
+        input_examples=tool.input_examples,
     )
 
 

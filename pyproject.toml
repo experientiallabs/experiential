@@ -34,6 +34,10 @@ sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.8",
+    # Powers the Anthropic SDK-surface drift gate in the Messages manifest tests,
+    # mirroring the runtime `openai` dependency's drift gate: an SDK bump turns new
+    # request surface into a loud classification decision instead of a silent 400.
+    "anthropic>=1.2,<2",
     "ruff>=0.5",
     "ty>=0.0.1a1",
     "experiential[sft]",

@@ -96,6 +96,19 @@ def anthropic_messages_stream_payload(
                 translated["description"] = tool.description
             if tool.strict:
                 translated["strict"] = True
+            # Anthropic-native tool annotations forward verbatim on this
+            # wire only; the provider owns their validity rules. An absent
+            # value stays absent so provider defaults keep applying.
+            if tool.cache_control is not None:
+                translated["cache_control"] = tool.cache_control
+            if tool.eager_input_streaming is not None:
+                translated["eager_input_streaming"] = tool.eager_input_streaming
+            if tool.defer_loading is not None:
+                translated["defer_loading"] = tool.defer_loading
+            if tool.allowed_callers is not None:
+                translated["allowed_callers"] = list(tool.allowed_callers)
+            if tool.input_examples is not None:
+                translated["input_examples"] = list(tool.input_examples)
             tools.append(translated)
         payload["tools"] = tools
     tool_choice: JsonObject | None = None
@@ -136,6 +149,12 @@ def anthropic_messages_stream_payload(
         payload["diagnostics"] = request.diagnostics
     if request.speed is not None:
         payload["speed"] = request.speed
+    if request.provider_cache_control is not None:
+        # The top-level automatic caching marker forwards byte-for-byte; the
+        # provider accepts it bare (verified live 2026-08-30).
+        payload["cache_control"] = request.provider_cache_control
+    if request.inference_geo is not None:
+        payload["inference_geo"] = request.inference_geo
     if request.provider_thinking_config is not None:
         # The caller's exact thinking configuration wins over the catalog's
         # adaptive default and travels verbatim, so budget semantics are

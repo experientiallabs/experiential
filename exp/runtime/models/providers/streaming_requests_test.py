@@ -2093,3 +2093,86 @@ def test_diagnostics_speed_and_betas_forward_on_anthropic_and_disclose_elsewhere
     assert mixed_provider.diagnostics is None
     assert mixed_provider.speed is None
     assert mixed_provider.provider_beta_tokens == ()
+
+
+def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_elsewhere() -> None:
+    """Provider-native tool annotations plus the top-level cache marker and
+    inference region reach only the Anthropic wire; any other rung drops
+    each with a per-field disclosure, never a rejection (a production
+    Claude Code session sent ``eager_input_streaming`` and was 400ed)."""
+    from exp.runtime.gateway.contracts import GatewayToolDefinition
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="run"),),
+        tools=(
+            GatewayToolDefinition(
+                name="Bash",
+                description="Executes a bash command.",
+                parameters={"type": "object"},
+                cache_control={"type": "ephemeral"},
+                eager_input_streaming=True,
+                defer_loading=False,
+                allowed_callers=("code_execution_20260120",),
+                input_examples=({"command": "ls"},),
+            ),
+        ),
+        provider_cache_control={"type": "ephemeral"},
+        inference_geo="us",
+        stream=True,
+        include_usage=True,
+    )
+
+    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    tool = cast(list[JsonObject], payload["tools"])[0]
+    assert tool["cache_control"] == {"type": "ephemeral"}
+    assert tool["eager_input_streaming"] is True
+    assert tool["defer_loading"] is False
+    assert tool["allowed_callers"] == ["code_execution_20260120"]
+    assert tool["input_examples"] == [{"command": "ls"}]
+    assert payload["cache_control"] == {"type": "ephemeral"}
+    assert payload["inference_geo"] == "us"
+
+    # None of these accepted fields require a beta token (verified live
+    # 2026-08-30), so the dispatch headers stay untouched.
+    from exp.runtime.models.providers.wire_messages import anthropic_request_headers
+
+    assert anthropic_request_headers({}, request) == {}
+
+    # OpenAI-family wires never see the annotations; the route discloses
+    # each dropped field by name.
+    import json
+
+    chat_payload = openai_compatible_stream_payload("gpt-5.5", request)
+    serialized = json.dumps(chat_payload)
+    for marker in (
+        "cache_control",
+        "eager_input_streaming",
+        "defer_loading",
+        "allowed_callers",
+        "input_examples",
+        "inference_geo",
+    ):
+        assert marker not in serialized
+
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
+    public, provider = route_generation_parameter_requests((anthropic,), request)
+    assert public.ignored_parameters == ()
+    assert provider.provider_cache_control == {"type": "ephemeral"}
+    assert provider.inference_geo == "us"
+
+    mixed_public, mixed_provider = route_generation_parameter_requests(
+        (anthropic, fallback), request
+    )
+    assert set(mixed_public.ignored_parameters) == {
+        "cache_control",
+        "inference_geo",
+        "tools.cache_control",
+        "tools.eager_input_streaming",
+        "tools.defer_loading",
+        "tools.allowed_callers",
+        "tools.input_examples",
+    }
+    assert mixed_provider.provider_cache_control is None
+    assert mixed_provider.inference_geo is None

@@ -422,6 +422,14 @@ def route_generation_parameter_requests(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
         ignore("speed")
+    if request.provider_cache_control is not None and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        ignore("provider_cache_control", "cache_control")
+    if request.inference_geo is not None and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        ignore("inference_geo")
     if request.provider_beta_tokens and not all(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
@@ -464,6 +472,30 @@ def route_generation_parameter_requests(
     ) and not all(profile.dialect == "anthropic_messages" for profile in profiles):
         if "messages.tool_calls.cache_control" not in ignored:
             ignored.append("messages.tool_calls.cache_control")
+
+    # Anthropic-native tool-definition annotations exist only on that wire;
+    # every other rung drops each one with a per-field disclosure, never a
+    # rejection (Claude Code sends eager_input_streaming conditionally).
+    if not all(profile.dialect == "anthropic_messages" for profile in profiles):
+        tool_annotation_paths = (
+            ("tools.cache_control", any(tool.cache_control is not None for tool in request.tools)),
+            (
+                "tools.eager_input_streaming",
+                any(tool.eager_input_streaming is not None for tool in request.tools),
+            ),
+            ("tools.defer_loading", any(tool.defer_loading is not None for tool in request.tools)),
+            (
+                "tools.allowed_callers",
+                any(tool.allowed_callers is not None for tool in request.tools),
+            ),
+            (
+                "tools.input_examples",
+                any(tool.input_examples is not None for tool in request.tools),
+            ),
+        )
+        for path, present in tool_annotation_paths:
+            if present and path not in ignored:
+                ignored.append(path)
 
     # Opaque provider-reasoning carriers replay only on the one wire that
     # issued them, so a mixed waterfall is rejected instead of dropping them.
