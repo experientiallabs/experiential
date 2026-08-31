@@ -700,6 +700,30 @@ def test_route_shaping_omits_tool_controls_when_no_tools_exist() -> None:
     assert provider_request.parallel_tool_calls is None
 
 
+def test_mixed_route_keeps_the_prompt_cache_marker_when_any_rung_is_anthropic() -> None:
+    """The cache marker survives a mixed waterfall so the winning Anthropic rung
+    still caches; only an all-non-Anthropic route drops it. Dropping it the
+    moment one fallback rung was non-Anthropic billed every turn's full context
+    uncached (~10x on a large system prompt)."""
+    request = _chat_request().model_copy(update={"provider_cache_control": {"type": "ephemeral"}})
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://a.test", model_id="claude-fable-5"
+    )
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://b.test")
+
+    # Mixed route with an Anthropic rung: kept, not disclosed.
+    public_request, provider_request = route_generation_parameter_requests(
+        (anthropic, fallback), request
+    )
+    assert provider_request.provider_cache_control == {"type": "ephemeral"}
+    assert "cache_control" not in public_request.ignored_parameters
+
+    # No rung can cache: dropped with disclosure.
+    public_only, provider_only = route_generation_parameter_requests((fallback,), request)
+    assert provider_only.provider_cache_control is None
+    assert "cache_control" in public_only.ignored_parameters
+
+
 def test_route_shaping_omits_parallel_control_when_tool_choice_disables_tools() -> None:
     """A parallel selector cannot affect a turn whose tool choice is none."""
     request = _chat_request().model_copy(
@@ -2096,10 +2120,12 @@ def test_diagnostics_speed_and_betas_forward_on_anthropic_and_disclose_elsewhere
 
 
 def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_elsewhere() -> None:
-    """Provider-native tool annotations plus the top-level cache marker and
-    inference region reach only the Anthropic wire; any other rung drops
-    each with a per-field disclosure, never a rejection (a production
-    Claude Code session sent ``eager_input_streaming`` and was 400ed)."""
+    """Provider-native tool annotations and inference region reach only the
+    Anthropic wire; any other rung drops each with a per-field disclosure,
+    never a rejection (a production Claude Code session sent
+    ``eager_input_streaming`` and was 400ed). The top-level cache marker is the
+    exception: it is cost-only and honored on any Anthropic rung, so a mixed
+    waterfall keeps it rather than billing every turn uncached."""
     from exp.runtime.gateway.contracts import GatewayToolDefinition
 
     request = GatewayRequest(
@@ -2165,8 +2191,11 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
     mixed_public, mixed_provider = route_generation_parameter_requests(
         (anthropic, fallback), request
     )
+    # The top-level cache marker is COST-only and honored on the Anthropic rung,
+    # so a mixed waterfall keeps it (dropping it billed every turn uncached);
+    # the behavioral annotations still drop with disclosure on the non-Anthropic
+    # rungs.
     assert set(mixed_public.ignored_parameters) == {
-        "cache_control",
         "inference_geo",
         "tools.cache_control",
         "tools.eager_input_streaming",
@@ -2174,7 +2203,7 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
         "tools.allowed_callers",
         "tools.input_examples",
     }
-    assert mixed_provider.provider_cache_control is None
+    assert mixed_provider.provider_cache_control == {"type": "ephemeral"}
     assert mixed_provider.inference_geo is None
 
 

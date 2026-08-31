@@ -422,7 +422,13 @@ def route_generation_parameter_requests(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
         ignore("speed")
-    if request.provider_cache_control is not None and not all(
+    # Prompt-cache marker: honored on every Anthropic rung, so it is kept as
+    # long as ANY rung is Anthropic (only the non-Anthropic rungs silently
+    # cannot cache; a cache marker changes cost, not semantics). Dropping it the
+    # moment one fallback rung is non-Anthropic used to strip prefix caching
+    # from the winning Anthropic rung too, billing every turn's full context
+    # uncached (~10x on input for a large system prompt).
+    if request.provider_cache_control is not None and not any(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
         ignore("provider_cache_control", "cache_control")
