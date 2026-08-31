@@ -788,3 +788,75 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
     assert not any(
         payload["type"].startswith("response.function_call_arguments") for payload in payloads
     )
+
+
+def _anthropic_prompt_stream(*, fresh: int, cache_write: int) -> tuple[bytes, ...]:
+    """Build one Anthropic stream splitting the prompt between fresh and cache-write tokens.
+
+    Args:
+        fresh: Tokens the provider processed at the ordinary input rate.
+        cache_write: Tokens the provider wrote into its prompt cache.
+
+    Returns:
+        Raw ``message_start`` through ``message_stop`` frames in arrival order.
+    """
+    start = {
+        "type": "message_start",
+        "message": {
+            "model": "claude-haiku-4-5",
+            "id": "msg_fixture",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "stop_reason": None,
+            "usage": {
+                "input_tokens": fresh,
+                "cache_creation_input_tokens": cache_write,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+            },
+        },
+    }
+    delta = {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": 20},
+    }
+    return (
+        b"event: message_start\ndata: " + json.dumps(start).encode() + b"\n\n",
+        b"event: message_delta\ndata: " + json.dumps(delta).encode() + b"\n\n",
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    )
+
+
+def _usage_event(result: JsonObject) -> JsonObject:
+    """Return the single usage event from one normalized stream result.
+
+    Args:
+        result: Decoded ``{"events": [...], "failure": ...}`` fixture result.
+
+    Returns:
+        The usage event in the golden fixture vocabulary.
+    """
+    events = cast(Sequence[JsonObject], result["events"])
+    return next(event for event in events if event["kind"] == "usage")
+
+
+def test_native_anthropic_normalizer_keeps_cache_writes_distinguishable() -> None:
+    """Writing a prompt to the provider cache is not the same billable event as sending it fresh.
+
+    Anthropic bills ``cache_creation_input_tokens`` at 1.25x the ordinary input rate for a
+    five-minute entry and 2x for a one-hour entry, so normalized usage has to keep the write
+    leg separable for the ledger to price either stream correctly.
+    """
+    fresh = _native_normalized(
+        "anthropic_messages",
+        _anthropic_prompt_stream(fresh=1_000, cache_write=0),
+    )
+    written = _native_normalized(
+        "anthropic_messages",
+        _anthropic_prompt_stream(fresh=0, cache_write=1_000),
+    )
+
+    assert _usage_event(fresh)["input_tokens"] == 1_000
+    assert _usage_event(written) != _usage_event(fresh)
