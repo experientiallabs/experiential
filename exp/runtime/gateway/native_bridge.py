@@ -427,11 +427,21 @@ class NativeControlPlane(NativeObservabilityMixin):
         except NativeDialectUnavailableError as exc:
             return self._escalate_accepted(authorization, str(exc))
         except OpenAIProtocolError as exc:
+            # A continuation whose bound provider authority is no longer
+            # available is a CLIENT error (400 continuation_unavailable: resend
+            # the full conversation), not a gateway-internal fault. Class the
+            # durable failure by the public status so usage and health read it
+            # as a client failure and it never pages as internal; the caller
+            # still receives the exact public error unchanged.
             self._accounting.finish_request_quietly(
                 authorization,
                 GatewayFailure(
-                    failure_class=GatewayFailureClass.INTERNAL,
-                    safe_message="retained provider continuation authority was unavailable",
+                    failure_class=(
+                        GatewayFailureClass.INTERNAL
+                        if exc.status_code >= 500
+                        else GatewayFailureClass.INVALID_REQUEST
+                    ),
+                    safe_message=exc.detail.message,
                 ),
             )
             raise NativeBridgeError(exc) from exc

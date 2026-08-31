@@ -1607,6 +1607,7 @@ def _openai_responses_pool_control_plane(
 def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
     tmp_path: Path,
     rotated_beta: str | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Retained ciphertext can replay only on its exact winning authenticated wire."""
     environment = {"TEST_ALPHA_KEY": "alpha-secret", "TEST_BETA_KEY": "beta-secret"}
@@ -1709,6 +1710,18 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
     else:
         environment["TEST_BETA_KEY"] = rotated_beta
     assert environment["TEST_ALPHA_KEY"] == "alpha-secret"
+    # Capture the durable failure the accepted request records: a continuation
+    # that cannot bind is a client 400, so it must NOT be stamped internal (a
+    # 5xx-class ledger row would page the internal-error alert for a caller
+    # mistake).
+    recorded: list[GatewayFailure] = []
+    original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
+
+    def _capture_finish(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+        recorded.append(failure)
+        return original_finish(authorization, failure)
+
+    monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture_finish)  # noqa: SLF001
     with pytest.raises(NativeBridgeError) as rejected:
         _admit_responses(
             control,
@@ -1719,6 +1732,8 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
     assert error["status_code"] == 400
     assert error["code"] == "continuation_unavailable"
     assert error["param"] == "previous_response_id"
+    assert recorded, "the unavailable continuation must record a durable failure"
+    assert recorded[-1].failure_class == GatewayFailureClass.INVALID_REQUEST
 
 
 def test_admit_skips_a_dead_lead_rung_and_serves_the_fallback(tmp_path: Path) -> None:
