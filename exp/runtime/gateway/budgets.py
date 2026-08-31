@@ -826,19 +826,15 @@ def _unknown_token_volume(
 ) -> tuple[int, int]:
     """Sum observed token volume across one limit's unresolved unknown-cost attempts.
 
-    Input volume includes cached input tokens and output volume includes reasoning
-    tokens, so operators can gauge the real traffic behind attempts whose price is
-    still unknown.
+    Cached-input and reasoning counts are subsets of the total input and output counts,
+    which therefore already include them and must not add them a second time. The result
+    is the real traffic behind attempts whose price is still unknown.
     """
     row = connection.execute(
         """
         SELECT
-            COALESCE(SUM(
-                COALESCE(a.input_tokens, 0) + COALESCE(a.cached_input_tokens, 0)
-            ), 0) AS input_volume,
-            COALESCE(SUM(
-                COALESCE(a.output_tokens, 0) + COALESCE(a.reasoning_tokens, 0)
-            ), 0) AS output_volume
+            COALESCE(SUM(COALESCE(a.input_tokens, 0)), 0) AS input_volume,
+            COALESCE(SUM(COALESCE(a.output_tokens, 0)), 0) AS output_volume
         FROM gateway_attempt_budget_charges AS c
         JOIN gateway_attempts AS a ON a.attempt_id = c.attempt_id
         WHERE c.budget_id = ?

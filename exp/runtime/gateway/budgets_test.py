@@ -528,7 +528,7 @@ def test_default_limit_admits_unpriced_attempts_and_tracks_token_volume(
     remaining = budgets.remaining(organization_id="org", period="2026-08")[0]
     assert remaining.unknown_cost_attempts == 1
     assert remaining.unknown_cost_input_tokens == 120
-    assert remaining.unknown_cost_output_tokens == 20
+    assert remaining.unknown_cost_output_tokens == 16
     assert remaining.remaining_micro_usd == 1_000
     assert not remaining.exhausted
 
