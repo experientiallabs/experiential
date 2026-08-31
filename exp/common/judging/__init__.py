@@ -43,6 +43,11 @@ from exp.common.judging.proposal import (
     RubricProposalEvidence,
     write_rubric_proposal_evidence,
 )
+from exp.common.judging.realism import (
+    RealismAssessment,
+    RealismJudge,
+    RealismJudgmentError,
+)
 from exp.common.judging.review import (
     RubricReview,
     RubricReviewDraft,
@@ -90,6 +95,9 @@ __all__ = [
     "RawDimensionJudgment",
     "RawJudgment",
     "judge_response_schema",
+    "RealismAssessment",
+    "RealismJudge",
+    "RealismJudgmentError",
     "Rubric",
     "RubricProposal",
     "RubricProposalEvidence",
