@@ -7,7 +7,8 @@ use serde_json::Value;
 
 use super::{
     complete_streamed_tool, finish_open_tools, malformed, optional_text, parse_object,
-    provider_stream_failed, refusal_failure, Normalizer,
+    provider_stream_failed, refusal_failure, Normalizer, OpaqueBlockAccumulator,
+    ANTHROPIC_SERVER_TOOL_BLOCK_TYPES,
 };
 use crate::errors::Failure;
 use crate::events::{
@@ -106,6 +107,25 @@ impl Normalizer {
                         let data = optional_text(block, "data", "Anthropic redacted thinking")?;
                         events.push(Event::RedactedThinking { index, data });
                     }
+                    Some(kind) if ANTHROPIC_SERVER_TOOL_BLOCK_TYPES.contains(&kind) => {
+                        if self.tools.contains_key(&index)
+                            || self.opaque_blocks.contains_key(&index)
+                        {
+                            return Err(malformed("Anthropic stream repeated a block start"));
+                        }
+                        self.reserve_tool_entry(index)?;
+                        let start_block = Value::Object(block.clone());
+                        // The whole block is retained until its stop frame,
+                        // so its bytes join the retained-output budget.
+                        self.reserve_tool_bytes(start_block.to_string().len())?;
+                        self.opaque_blocks.insert(
+                            index,
+                            OpaqueBlockAccumulator {
+                                start_block,
+                                raw_input: String::new(),
+                            },
+                        );
+                    }
                     // Unknown block kinds with no gateway-visible output are
                     // skipped rather than rejected.
                     _ => {}
@@ -129,14 +149,20 @@ impl Normalizer {
                         let fragment =
                             optional_text(delta, "partial_json", "Anthropic argument delta")?;
                         self.reserve_tool_bytes(fragment.len())?;
-                        let tool = self.tools.get_mut(&index).ok_or_else(|| {
-                            malformed("provider emitted arguments before a tool start")
-                        })?;
-                        tool.raw_arguments.push_str(&fragment);
-                        events.push(Event::ToolArgumentsDelta {
-                            index,
-                            delta: fragment,
-                        });
+                        if let Some(opaque) = self.opaque_blocks.get_mut(&index) {
+                            // Server-tool input folds into the verbatim
+                            // block at its stop frame; no event yet.
+                            opaque.raw_input.push_str(&fragment);
+                        } else {
+                            let tool = self.tools.get_mut(&index).ok_or_else(|| {
+                                malformed("provider emitted arguments before a tool start")
+                            })?;
+                            tool.raw_arguments.push_str(&fragment);
+                            events.push(Event::ToolArgumentsDelta {
+                                index,
+                                delta: fragment,
+                            });
+                        }
                     }
                     Some("refusal_delta") => {
                         self.refusal_seen = true;
@@ -169,6 +195,18 @@ impl Normalizer {
                     if !tool.completed {
                         complete_streamed_tool(index, tool, &mut events)?;
                     }
+                } else if let Some(opaque) = self.opaque_blocks.remove(&index) {
+                    let mut block = opaque.start_block;
+                    if !opaque.raw_input.is_empty() {
+                        // The streamed fragments are the block's final
+                        // input; the start frame carried an empty seed.
+                        let input: Value =
+                            serde_json::from_str(&opaque.raw_input).map_err(|_| {
+                                malformed("Anthropic server-tool input is not valid JSON")
+                            })?;
+                        block["input"] = input;
+                    }
+                    events.push(Event::ServerToolBlock { index, block });
                 }
             }
             "message_delta" => {
@@ -186,6 +224,32 @@ impl Normalizer {
                 self.output_tokens =
                     count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
                         .map_err(|message| malformed(&message))?;
+                // The delta usage is cumulative and can exceed message_start:
+                // server tools inject searched or fetched content into the
+                // billed input mid-turn (a live web_search turn grew from
+                // 2230 to 10538 input tokens), so present counts here
+                // supersede the start frame; absent counts keep it.
+                if usage.contains_key("input_tokens") {
+                    self.input_tokens =
+                        count_or_zero(usage, "input_tokens", "Anthropic input_tokens")
+                            .map_err(|message| malformed(&message))?;
+                }
+                if usage.contains_key("cache_read_input_tokens") {
+                    self.cache_read = count_or_zero(
+                        usage,
+                        "cache_read_input_tokens",
+                        "Anthropic cache_read_input_tokens",
+                    )
+                    .map_err(|message| malformed(&message))?;
+                }
+                if usage.contains_key("cache_creation_input_tokens") {
+                    self.cache_write = count_or_zero(
+                        usage,
+                        "cache_creation_input_tokens",
+                        "Anthropic cache_creation_input_tokens",
+                    )
+                    .map_err(|message| malformed(&message))?;
+                }
                 if self.stop_reason.as_deref() == Some("refusal") && !self.refusal_seen {
                     self.refusal_seen = true;
                     events.push(Event::RefusalDelta(String::new()));
@@ -193,6 +257,25 @@ impl Normalizer {
             }
             "message_stop" => {
                 events.extend(finish_open_tools(&mut self.tools)?);
+                // A provider that ends the message without closing a server-
+                // tool block still delivers it whole, mirroring the lenient
+                // open-tool finish above.
+                let open_blocks: Vec<u32> = self.opaque_blocks.keys().copied().collect();
+                for index in open_blocks {
+                    let opaque = self
+                        .opaque_blocks
+                        .remove(&index)
+                        .expect("collected key is present");
+                    let mut block = opaque.start_block;
+                    if !opaque.raw_input.is_empty() {
+                        let input: Value =
+                            serde_json::from_str(&opaque.raw_input).map_err(|_| {
+                                malformed("Anthropic server-tool input is not valid JSON")
+                            })?;
+                        block["input"] = input;
+                    }
+                    events.push(Event::ServerToolBlock { index, block });
+                }
                 // Individually persistable legs whose folded total is not
                 // are a provider contract violation, exactly like the
                 // Bedrock cache-leg fold.
@@ -217,6 +300,10 @@ impl Normalizer {
                     events.push(Event::Failed(refusal_failure()));
                 } else if self.stop_reason.as_deref() == Some("max_tokens") {
                     events.push(Event::Incomplete);
+                } else if self.stop_reason.as_deref() == Some("pause_turn") {
+                    // A paused server-tool turn: the caller resends the
+                    // conversation as-is to continue; billed like completion.
+                    events.push(Event::Paused);
                 } else {
                     events.push(Event::Completed);
                 }
@@ -288,5 +375,74 @@ mod tests {
             events.as_slice(),
             [Event::RedactedThinking { index: 1, data }] if data == "opaque=="
         ));
+    }
+
+    #[test]
+    fn server_tool_blocks_carry_verbatim_and_pause_turn_is_terminal() {
+        // Mirrors the live web_search capture (2026-08-31): server_tool_use
+        // streams its input via input_json_delta, the result block arrives
+        // whole in its start frame, and pause_turn ends the attempt as a
+        // paused terminal instead of a fake end_turn.
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        let start = frame(serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "web_search",
+                "input": {},
+            },
+        }));
+        assert!(normalizer.feed(&start).expect("start").is_empty());
+        let delta = frame(serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"query\": \"utc\"}"},
+        }));
+        assert!(normalizer.feed(&delta).expect("delta").is_empty());
+        let stop = frame(serde_json::json!({"type": "content_block_stop", "index": 0}));
+        let events = normalizer.feed(&stop).expect("stop");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ServerToolBlock { index: 0, block }]
+                if block["input"]["query"] == serde_json::json!("utc")
+                    && block["id"] == serde_json::json!("srvtoolu_1")
+        ));
+
+        let result_start = frame(serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "caller": {"type": "direct"},
+                "content": [{"type": "web_search_result", "url": "https://utc.test"}],
+            },
+        }));
+        assert!(normalizer
+            .feed(&result_start)
+            .expect("result start")
+            .is_empty());
+        let result_stop = frame(serde_json::json!({"type": "content_block_stop", "index": 1}));
+        let events = normalizer.feed(&result_stop).expect("result stop");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ServerToolBlock { index: 1, block }]
+                if block["caller"]["type"] == serde_json::json!("direct")
+        ));
+
+        let message_delta = frame(serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "pause_turn", "stop_sequence": null},
+            "usage": {"output_tokens": 9},
+        }));
+        assert!(normalizer
+            .feed(&message_delta)
+            .expect("message delta")
+            .is_empty());
+        let message_stop = frame(serde_json::json!({"type": "message_stop"}));
+        let events = normalizer.feed(&message_stop).expect("message stop");
+        assert!(matches!(events.last(), Some(Event::Paused)));
     }
 }

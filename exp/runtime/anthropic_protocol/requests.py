@@ -17,9 +17,18 @@ the HTTP layer renders them in the Anthropic envelope.
 from __future__ import annotations
 
 import json
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    Tag,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
@@ -27,6 +36,8 @@ from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FORWARDED,
     MESSAGES_MANIFEST,
+    MESSAGES_SERVER_TOOL_TYPES_ACCEPTED,
+    MESSAGES_SERVER_TOOL_TYPES_REJECTED,
 )
 from exp.runtime.gateway.contracts import (
     CompatibilityDisposition,
@@ -34,6 +45,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
+    GatewayServerTool,
     GatewayToolDefinition,
     ProviderReasoningBlock,
     RedactedThinkingBlock,
@@ -51,8 +63,8 @@ from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 _REJECTED_BLOCK_HINTS = {
     "image": "image blocks are not supported: this gateway surface is text-only",
     "document": "document blocks are not supported: this gateway surface is text-only",
-    "server_tool_use": "server tools are not supported by this gateway",
-    "web_search_tool_result": "server tools are not supported by this gateway",
+    "container_upload": "container_upload blocks require the unsupported container field",
+    "search_result": "search_result blocks are not supported: this gateway serves no citations",
 }
 
 
@@ -119,8 +131,41 @@ class _ToolResultBlock(_WireModel):
     cache_control: _CacheControl | None = None
 
 
+class _ServerToolHistoryBlock(BaseModel):
+    """One echoed assistant server-tool block, validated shallowly.
+
+    Callers resend prior-turn ``server_tool_use`` and result blocks
+    verbatim; their shapes evolve per tool family, so only the closed type
+    set is enforced here and the whole block is carried byte-for-byte for
+    Anthropic replay. The literal list must stay equal to
+    ``MESSAGES_SERVER_TOOL_RESULT_BLOCKS_ACCEPTED`` (pinned by the manifest
+    tests).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal[
+        "server_tool_use",
+        "web_search_tool_result",
+        "web_fetch_tool_result",
+        "code_execution_tool_result",
+        "bash_code_execution_tool_result",
+        "text_editor_code_execution_tool_result",
+        "tool_search_tool_result",
+    ]
+
+    def verbatim(self) -> JsonObject:
+        """The whole block, declared field plus every extra, for replay."""
+        return cast(JsonObject, self.model_dump(mode="json"))
+
+
 _ContentBlock = (
-    _TextBlock | _ThinkingBlock | _RedactedThinkingBlock | _ToolUseBlock | _ToolResultBlock
+    _TextBlock
+    | _ThinkingBlock
+    | _RedactedThinkingBlock
+    | _ToolUseBlock
+    | _ToolResultBlock
+    | _ServerToolHistoryBlock
 )
 
 
@@ -163,6 +208,59 @@ class _Tool(_WireModel):
     defer_loading: bool | None = None
     allowed_callers: tuple[str, ...] | None = None
     input_examples: tuple[JsonObject, ...] | None = None
+
+
+class _ServerToolEntry(BaseModel):
+    """One typed Anthropic tool entry (server or Anthropic-defined), shallow.
+
+    These entries carry no ``input_schema`` and their per-family config
+    evolves with the provider (``max_uses``, domain filters, citations,
+    ``max_characters``, ...), so validation is deliberately shallow: a
+    closed, recorded type set plus a bounded name, with the raw entry
+    forwarded byte-for-byte on Anthropic rungs, which own per-model and
+    cross-tool validity (every accepted type is bare-accepted live,
+    verified 2026-08-31).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str = Field(min_length=1, max_length=256)
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    cache_control: _CacheControl | None = None
+
+    @field_validator("type")
+    @classmethod
+    def _require_recorded_type(cls, value: str) -> str:
+        """Accept only the recorded tool types, naming the decision."""
+        if value in MESSAGES_SERVER_TOOL_TYPES_ACCEPTED:
+            return value
+        if value in MESSAGES_SERVER_TOOL_TYPES_REJECTED:
+            raise ValueError(f"tool type '{value}' is consciously not served by this gateway")
+        raise ValueError(
+            f"unknown tool type '{value}'; expected 'custom' or one of the supported "
+            "Anthropic tool types"
+        )
+
+
+def _tool_entry_kind(value: object) -> str:
+    """Route one tools[] entry to the custom or typed wire branch.
+
+    The tag labels are underscore-prefixed so the shared error renderer
+    strips them from public field paths like union member class names.
+    """
+    if isinstance(value, _ServerToolEntry):
+        return "_server"
+    if isinstance(value, dict):
+        entry_type = cast(JsonObject, value).get("type")
+        if isinstance(entry_type, str) and entry_type != "custom":
+            return "_server"
+    return "_custom"
+
+
+_ToolEntry = Annotated[
+    Annotated[_Tool, Tag("_custom")] | Annotated[_ServerToolEntry, Tag("_server")],
+    Discriminator(_tool_entry_kind),
+]
 
 
 class _ToolChoice(_WireModel):
@@ -211,7 +309,7 @@ class _MessagesRequest(_WireModel):
     top_k: int | None = Field(default=None, ge=0)
     stop_sequences: tuple[str, ...] | None = None
     stream: bool = False
-    tools: tuple[_Tool, ...] = ()
+    tools: tuple[_ToolEntry, ...] = ()
     tool_choice: _ToolChoice | None = None
     metadata: _Metadata | None = None
     thinking: _ThinkingConfig | None = None
@@ -269,11 +367,24 @@ def decode_messages(
     parallel_tool_calls: bool | None = None
     if request.tool_choice is not None and request.tool_choice.disable_parallel_tool_use:
         parallel_tool_calls = False
+    client_tools: list[GatewayToolDefinition] = []
+    server_tools: list[GatewayServerTool] = []
+    raw_tools = cast(list[JsonObject], payload.get("tools", []))
+    for position, entry in enumerate(request.tools):
+        if isinstance(entry, _ServerToolEntry):
+            # The raw payload entry, not the re-serialized wire model, so the
+            # provider receives the caller's typed tool byte-for-byte.
+            server_tools.append(
+                GatewayServerTool(position=position, definition=raw_tools[position])
+            )
+        else:
+            client_tools.append(_gateway_tool(entry))
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
             messages=tuple(messages),
-            tools=tuple(_gateway_tool(tool) for tool in request.tools),
+            tools=tuple(client_tools),
+            provider_server_tools=tuple(server_tools),
             tool_choice=_gateway_tool_choice(request.tool_choice),
             parallel_tool_calls=parallel_tool_calls,
             maximum_output_tokens=request.max_tokens,
@@ -620,6 +731,23 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                         if block.cache_control is not None
                         else None
                     ),
+                )
+            )
+        elif isinstance(block, _ServerToolHistoryBlock):
+            if message.role != "assistant":
+                raise invalid_field(
+                    f"{param}.content.{block_index}",
+                    "server-tool blocks are only valid in assistant messages.",
+                )
+            # An opaque server-tool block carries its own canonical message
+            # at its exact position, mirroring the tool_result split; the
+            # Anthropic emitter merges consecutive assistant messages back
+            # into one content list.
+            flush()
+            out.append(
+                GatewayMessage(
+                    role="assistant",
+                    provider_server_tool_block=block.verbatim(),
                 )
             )
         else:

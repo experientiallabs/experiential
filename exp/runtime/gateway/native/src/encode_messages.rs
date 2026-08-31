@@ -50,9 +50,13 @@ fn invalid_provider_stream(message: &str) -> PublicError {
 }
 
 /// Map the terminal outcome to the Anthropic stop reason.
-fn stop_reason(incomplete: bool, saw_tool_use: bool) -> &'static str {
+fn stop_reason(incomplete: bool, paused: bool, saw_tool_use: bool) -> &'static str {
     if incomplete {
         "max_tokens"
+    } else if paused {
+        // The provider paused a long-running server-tool turn; the caller
+        // resends the conversation as-is to continue.
+        "pause_turn"
     } else if saw_tool_use {
         "tool_use"
     } else {
@@ -102,6 +106,9 @@ enum BlockKind {
     Tool(u32),
     Thinking(u32),
     Redacted,
+    /// One complete opaque Anthropic server-tool block (server_tool_use or
+    /// a *_tool_result), re-emitted verbatim in its start frame.
+    Server,
 }
 
 /// One scheduled content block, buffered until it can stream in order.
@@ -119,6 +126,8 @@ struct PendingBlock {
     pending_signature: String,
     /// Redacted only: the whole opaque payload travels in the start frame.
     redacted_data: Option<String>,
+    /// Server only: the whole verbatim block travels in the start frame.
+    server_block: Option<Value>,
     anthropic_index: Option<u32>,
 }
 
@@ -129,6 +138,7 @@ impl PendingBlock {
             pending: String::new(),
             pending_signature: String::new(),
             redacted_data: None,
+            server_block: None,
             anthropic_index: None,
         }
     }
@@ -251,6 +261,7 @@ impl MessagesSseEncoder {
                 self.thinking_signature(*index, signature)
             }
             Event::RedactedThinking { data, .. } => self.redacted_thinking(data),
+            Event::ServerToolBlock { block, .. } => self.server_tool_block(block),
             Event::ToolCallStarted {
                 index,
                 call_id,
@@ -293,7 +304,7 @@ impl MessagesSseEncoder {
                 }
                 Ok(Vec::new())
             }
-            Event::Completed | Event::Incomplete => {
+            Event::Completed | Event::Incomplete | Event::Paused => {
                 self.terminal = true;
                 if self.refusal_seen {
                     return Ok(vec![error_frame(&refusal_failure())]);
@@ -307,6 +318,7 @@ impl MessagesSseEncoder {
                         "delta": {
                             "stop_reason": stop_reason(
                                 matches!(event, Event::Incomplete),
+                                matches!(event, Event::Paused),
                                 self.saw_tool_use,
                             ),
                             "stop_sequence": Value::Null,
@@ -366,6 +378,20 @@ impl MessagesSseEncoder {
             ));
         }
         self.blocks[position].pending_signature.push_str(signature);
+        Ok(self.advance())
+    }
+
+    /// Schedule one complete verbatim server-tool block at its arrival position.
+    fn server_tool_block(&mut self, block: &Value) -> Result<Vec<String>, PublicError> {
+        self.buffered_bytes = self.buffered_bytes.saturating_add(block.to_string().len());
+        if self.buffered_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
+            return Err(invalid_provider_stream(
+                "Messages stream buffered blocks exceeded the gateway response limit.",
+            ));
+        }
+        let mut pending = PendingBlock::new(BlockKind::Server);
+        pending.server_block = Some(block.clone());
+        self.blocks.push(pending);
         Ok(self.advance())
     }
 
@@ -475,7 +501,10 @@ impl MessagesSseEncoder {
                 let last = position == self.blocks.len() - 1;
                 let closable = self.draining
                     || match block.kind {
-                        BlockKind::Text | BlockKind::Thinking(_) | BlockKind::Redacted => !last,
+                        BlockKind::Text
+                        | BlockKind::Thinking(_)
+                        | BlockKind::Redacted
+                        | BlockKind::Server => !last,
                         BlockKind::Tool(tool_index) => self.tool_completed.contains(&tool_index),
                     };
                 if !closable {
@@ -511,6 +540,13 @@ impl MessagesSseEncoder {
                     let data = block.redacted_data.take().unwrap_or_default();
                     self.buffered_bytes = self.buffered_bytes.saturating_sub(data.len());
                     json!({"type": "redacted_thinking", "data": data})
+                }
+                BlockKind::Server => {
+                    let verbatim = block.server_block.take().unwrap_or(Value::Null);
+                    self.buffered_bytes = self
+                        .buffered_bytes
+                        .saturating_sub(verbatim.to_string().len());
+                    verbatim
                 }
                 BlockKind::Tool(tool_index) => {
                     let identity = self
@@ -569,9 +605,9 @@ impl MessagesSseEncoder {
         let delta = match block.kind {
             BlockKind::Text => json!({"type": "text_delta", "text": block.pending}),
             BlockKind::Thinking(_) => json!({"type": "thinking_delta", "thinking": block.pending}),
-            // Redacted blocks carry their payload in the start frame and
-            // never buffer deltas.
-            BlockKind::Redacted => return,
+            // Redacted and server blocks carry their whole payload in the
+            // start frame and never buffer deltas.
+            BlockKind::Redacted | BlockKind::Server => return,
             BlockKind::Tool(_) => {
                 json!({"type": "input_json_delta", "partial_json": block.pending})
             }
@@ -645,6 +681,7 @@ pub fn completed_messages_body(
         });
     }
     let incomplete = matches!(terminal, Event::Incomplete);
+    let paused = matches!(terminal, Event::Paused);
     if events.iter().any(|event| {
         matches!(
             event,
@@ -718,6 +755,9 @@ pub fn completed_messages_body(
             Event::RedactedThinking { data, .. } => {
                 slots.push(Some(json!({"type": "redacted_thinking", "data": data})));
             }
+            Event::ServerToolBlock { block, .. } => {
+                slots.push(Some(block.clone()));
+            }
             Event::ToolCallStarted { index, .. } => {
                 tool_positions.insert(*index, slots.len());
                 slots.push(None);
@@ -749,7 +789,7 @@ pub fn completed_messages_body(
         "role": "assistant",
         "model": model,
         "content": content,
-        "stop_reason": stop_reason(incomplete, saw_tool_use),
+        "stop_reason": stop_reason(incomplete, paused, saw_tool_use),
         "stop_sequence": Value::Null,
         "usage": messages_usage(usage.as_ref()),
     });

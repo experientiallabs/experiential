@@ -2176,3 +2176,77 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
     }
     assert mixed_provider.provider_cache_control is None
     assert mixed_provider.inference_geo is None
+
+
+def test_server_tools_interleave_verbatim_on_anthropic_and_reject_elsewhere() -> None:
+    """Typed tool entries re-enter the wire at their caller positions and any
+    non-Anthropic rung is a named rejection, never a silent capability drop
+    (a production Claude Code WebSearch request 400ed on engine 0.7.10)."""
+    from exp.runtime.gateway.contracts import GatewayServerTool, GatewayToolDefinition
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="search"),
+            GatewayMessage(
+                role="assistant",
+                provider_server_tool_block={
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {"query": "utc"},
+                },
+            ),
+            GatewayMessage(
+                role="assistant",
+                provider_server_tool_block={
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_1",
+                    "caller": {"type": "direct"},
+                    "content": [{"type": "web_search_result", "url": "https://utc.test"}],
+                },
+            ),
+            GatewayMessage(role="assistant", content="Monday."),
+            GatewayMessage(role="user", content="and tomorrow?"),
+        ),
+        tools=(GatewayToolDefinition(name="Bash", parameters={"type": "object"}),),
+        provider_server_tools=(
+            GatewayServerTool(
+                position=0,
+                definition={"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+    payload = anthropic_messages_stream_payload("claude-sonnet-4-6", request)
+    tools = cast(list[JsonObject], payload["tools"])
+    assert tools[0] == {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+    assert tools[1]["name"] == "Bash"
+    messages = cast(list[JsonObject], payload["messages"])
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    blocks = cast(list[JsonObject], messages[1]["content"])
+    assert [block["type"] for block in blocks] == [
+        "server_tool_use",
+        "web_search_tool_result",
+        "text",
+    ]
+    assert blocks[0]["input"] == {"query": "utc"}
+    assert blocks[1]["caller"] == {"type": "direct"}
+
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
+    public, provider = route_generation_parameter_requests((anthropic,), request)
+    assert public.ignored_parameters == ()
+    assert provider.provider_server_tools == request.provider_server_tools
+
+    with pytest.raises(ProviderParameterError) as tools_rejected:
+        route_generation_parameter_requests((anthropic, fallback), request)
+    assert tools_rejected.value.param == "tools"
+    assert "web_search_20250305" in str(tools_rejected.value)
+
+    history_only = request.model_copy(update={"provider_server_tools": ()})
+    with pytest.raises(ProviderParameterError) as history_rejected:
+        route_generation_parameter_requests((fallback,), history_only)
+    assert history_rejected.value.param == "messages"

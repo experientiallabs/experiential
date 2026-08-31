@@ -4314,3 +4314,51 @@ def test_effort_none_drops_with_disclosure_on_a_reasoning_less_route(
     assert payload["status_code"] == 400
     assert payload["param"] == "reasoning_effort"
     assert payload["code"] == "unsupported_parameter"
+
+
+def test_rust_messages_encoder_streams_server_tool_blocks_and_pause_turn() -> None:
+    """Server-tool blocks re-emit whole in their start frames, in order, and a
+    paused turn reaches the caller as the provider's own pause_turn stop."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    search = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_1",
+        "name": "web_search",
+        "input": {"query": "utc"},
+    }
+    result = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "caller": {"type": "direct"},
+        "content": [{"type": "web_search_result", "url": "https://utc.test"}],
+    }
+    events = json.dumps(
+        [
+            {"kind": "server_tool_block", "index": 0, "block": search},
+            {"kind": "server_tool_block", "index": 1, "block": result},
+            {"kind": "text_delta", "text": "Monday."},
+            {"kind": "usage", "input_tokens": 10538, "output_tokens": 93, "cached_input_tokens": 0},
+            {"kind": "paused"},
+        ]
+    )
+    frames = list(native.encode_messages_fixture("request-abc", "coding", events))
+    joined = "".join(frames)
+    starts = [
+        json.loads(frame.split("data: ", 1)[1])
+        for frame in frames
+        if frame.startswith("event: content_block_start")
+    ]
+    assert [start["content_block"].get("type") for start in starts] == [
+        "server_tool_use",
+        "web_search_tool_result",
+        "text",
+    ]
+    assert starts[0]["content_block"] == search
+    assert starts[1]["content_block"] == result
+    assert '"stop_reason":"pause_turn"' in joined
+    assert '"input_tokens":10538' in joined
+
+    body = json.loads(native.completed_messages_fixture("request-abc", "coding", events))
+    assert body["stop_reason"] == "pause_turn"
+    assert body["content"] == [search, result, {"type": "text", "text": "Monday."}]

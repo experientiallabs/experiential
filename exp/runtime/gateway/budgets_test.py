@@ -1046,7 +1046,7 @@ def test_reservation_counts_excluded_provider_carriers_toward_the_tier_bound() -
         ),
         maximum_output_tokens=16,
     )
-    from exp.runtime.gateway.contracts import provider_replay_authority
+    from exp.runtime.gateway.replay_identity import provider_replay_authority
 
     visible_bytes = len(canonical_json_bytes(carried))
     assert visible_bytes < 2_048

@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
+from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelId,
@@ -119,6 +119,36 @@ class GatewayToolDefinition(ContractModel):
             or self.allowed_callers is not None
             or self.input_examples is not None
         )
+
+
+class GatewayServerTool(ContractModel):
+    """One verbatim Anthropic server or Anthropic-defined tool entry.
+
+    Typed tool-union entries (``web_search_*``, ``web_fetch_*``,
+    ``code_execution_*``, ``tool_search_*``, ``bash``, ``text_editor``,
+    ``memory``) carry no ``input_schema`` and evolve per family, so the
+    gateway validates them shallowly against the manifest's accepted type
+    set and forwards the entry byte-for-byte on Anthropic rungs, which own
+    the per-model validity rules (every current type is accepted bare on
+    the live API, verified 2026-08-31). ``position`` is the entry's index
+    in the caller's ``tools`` array so the provider sees the exact caller
+    ordering. Server tools change what the provider executes, so a present
+    entry joins replay identity through :func:`canonical_request_sha256`.
+    """
+
+    position: int = Field(ge=0)
+    definition: JsonObject
+
+    @property
+    def tool_type(self) -> str:
+        """The entry's provider tool type."""
+        return str(self.definition.get("type", ""))
+
+    @property
+    def name(self) -> str | None:
+        """The entry's fixed provider tool name, when it declares one."""
+        name = self.definition.get("name")
+        return name if isinstance(name, str) else None
 
 
 class StructuredTextFormat(ContractModel):
@@ -261,6 +291,18 @@ class GatewayMessage(ContractModel):
     other carriers so item-free digests are unperturbed; a present item
     joins replay identity through :func:`canonical_request_sha256`.
     """
+    provider_server_tool_block: JsonObject | None = Field(default=None, exclude=True)
+    """One verbatim Anthropic server-tool history block carried opaquely.
+
+    Callers echo prior-turn ``server_tool_use`` and ``*_tool_result``
+    assistant blocks back on the next turn; their shapes evolve per tool
+    family, so decode validates them shallowly and Anthropic rungs receive
+    them byte-for-byte at their positions (route admission rejects every
+    other rung: no other wire can replay them). A message carrying one
+    carries nothing else, mirroring ``provider_native_item``. Excluded from
+    serialization so block-free digests are unperturbed; a present block
+    joins replay identity through :func:`canonical_request_sha256`.
+    """
 
     @model_validator(mode="after")
     def _require_role_coherence(self) -> GatewayMessage:
@@ -280,8 +322,22 @@ class GatewayMessage(ContractModel):
                 or self.provider_item_id is not None
                 or self.tool_call_id is not None
                 or self.tool_is_error
+                or self.provider_server_tool_block is not None
             ):
                 raise ValueError("a native provider item carries the whole message")
+            return self
+        if self.provider_server_tool_block is not None:
+            if self.role != "assistant":
+                raise ValueError("server-tool blocks are valid only for assistant messages")
+            if (
+                self.content is not None
+                or self.tool_calls
+                or self.provider_reasoning
+                or self.provider_item_id is not None
+                or self.tool_call_id is not None
+                or self.tool_is_error
+            ):
+                raise ValueError("a server-tool block carries the whole message")
             return self
         if (
             self.content is None
@@ -409,6 +465,17 @@ class GatewayRequest(ContractModel):
     caller-visible processing commitment, so a present value joins replay
     identity through :func:`canonical_request_sha256`.
     """
+    provider_server_tools: tuple[GatewayServerTool, ...] = Field(default=(), exclude=True)
+    """Verbatim Anthropic server and Anthropic-defined tool entries.
+
+    Each entry keeps its exact caller position among ``tools`` and forwards
+    byte-for-byte on Anthropic rungs only; route admission rejects any
+    other rung by name because dropping a search or execution capability
+    the caller asked for would silently change what the model can do.
+    Excluded from serialization so entry-free digests are unperturbed;
+    present entries join replay identity through
+    :func:`canonical_request_sha256`.
+    """
     provider_beta_tokens: tuple[str, ...] = Field(default=(), exclude=True)
     """Allowlisted caller ``anthropic-beta`` tokens from the Messages surface.
 
@@ -529,7 +596,10 @@ class GatewayRequest(ContractModel):
         Raises:
             ValueError: Tool definitions or tool choice are incoherent.
         """
-        names = tuple(tool.name for tool in self.tools)
+        server_names = tuple(
+            tool.name for tool in self.provider_server_tools if tool.name is not None
+        )
+        names = tuple(tool.name for tool in self.tools) + server_names
         if len(set(names)) != len(names):
             raise ValueError("gateway tool names must not repeat")
         if (
@@ -537,8 +607,14 @@ class GatewayRequest(ContractModel):
             and self.tool_choice.name not in names
         ):
             raise ValueError("named gateway tool choice must name a request tool")
-        if self.tool_choice == "required" and not self.tools:
+        if self.tool_choice == "required" and not self.tools and not self.provider_server_tools:
             raise ValueError("required gateway tool choice needs at least one tool")
+        server_positions = tuple(tool.position for tool in self.provider_server_tools)
+        total_entries = len(self.tools) + len(self.provider_server_tools)
+        if len(set(server_positions)) != len(server_positions) or any(
+            position >= total_entries for position in server_positions
+        ):
+            raise ValueError("server tool positions must be unique caller tools indexes")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
         if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
@@ -572,6 +648,13 @@ class GatewayRequest(ContractModel):
             and self.surface != GatewayApiSurface.MESSAGES
         ):
             raise ValueError("Anthropic tool carriers are valid only for Messages requests")
+        if self.provider_server_tools and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("server tools are valid only for Messages requests")
+        if (
+            any(message.provider_server_tool_block is not None for message in self.messages)
+            and self.surface != GatewayApiSurface.MESSAGES
+        ):
+            raise ValueError("server-tool blocks are valid only for Messages requests")
         if self.provider_beta_tokens and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_beta_tokens are valid only for Messages requests")
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
@@ -581,138 +664,6 @@ class GatewayRequest(ContractModel):
         if len(set(self.reasoning_summary_parameters)) != len(self.reasoning_summary_parameters):
             raise ValueError("reasoning summary parameter paths must not repeat")
         return self
-
-
-def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
-    """Collect the provider-significant input excluded from serialization.
-
-    The carriers (replayed reasoning, native items, verbatim provider
-    configurations) are excluded from model serialization so immutable
-    artifacts and pre-existing request digests stay byte-identical, but the
-    provider still reads them as input. Replay identity folds this envelope
-    into :func:`canonical_request_sha256`, and reservation adds its bytes to
-    the conservative input bound so an excluded carrier can never push a
-    request across a pricing threshold unreserved.
-
-    Args:
-        request: Canonical gateway request as decoded from the public wire.
-
-    Returns:
-        The envelope of excluded provider input, or ``None`` when the plain
-        serialization already covers everything.
-    """
-    replay: list[JsonObject] = []
-    for message_index, message in enumerate(request.messages):
-        authority: JsonObject = {"message_index": message_index}
-        if message.provider_item_id is not None:
-            authority["provider_item_id"] = message.provider_item_id
-            authority["provider_output_index"] = message.provider_output_index
-            authority["provider_status"] = message.provider_status
-            authority["provider_phase"] = message.provider_phase
-        if message.provider_native_item is not None:
-            authority["provider_native_item"] = message.provider_native_item
-        if message.provider_reasoning:
-            blocks: list[JsonObject] = []
-            for block in message.provider_reasoning:
-                serialized = block.model_dump(mode="json")
-                if isinstance(block, EncryptedReasoningBlock):
-                    serialized["output_index"] = block.output_index
-                    serialized["status"] = block.status
-                blocks.append(serialized)
-            authority["provider_reasoning"] = blocks
-        retained_calls: list[JsonObject] = []
-        for tool_call_index, call in enumerate(message.tool_calls):
-            if (
-                call.raw_arguments is None
-                and call.provider_item_id is None
-                and call.provider_output_index is None
-                and call.provider_status is None
-            ):
-                continue
-            retained_calls.append(
-                {
-                    "tool_call_index": tool_call_index,
-                    "call_id": call.call_id,
-                    "name": call.name,
-                    "raw_arguments": call.raw_arguments,
-                    "provider_item_id": call.provider_item_id,
-                    "provider_output_index": call.provider_output_index,
-                    "provider_status": call.provider_status,
-                }
-            )
-        if retained_calls:
-            authority["tool_calls"] = retained_calls
-        if message.tool_is_error:
-            authority["tool_is_error"] = True
-        if len(authority) > 1:
-            replay.append(authority)
-    retained_tools: list[JsonObject] = []
-    for tool_index, tool in enumerate(request.tools):
-        if not tool.has_anthropic_tool_carriers():
-            continue
-        retained_tool: JsonObject = {"tool_index": tool_index, "name": tool.name}
-        if tool.eager_input_streaming is not None:
-            retained_tool["eager_input_streaming"] = tool.eager_input_streaming
-        if tool.defer_loading is not None:
-            retained_tool["defer_loading"] = tool.defer_loading
-        if tool.allowed_callers is not None:
-            retained_tool["allowed_callers"] = list(tool.allowed_callers)
-        if tool.input_examples is not None:
-            retained_tool["input_examples"] = list(tool.input_examples)
-        retained_tools.append(retained_tool)
-    if (
-        not replay
-        and not retained_tools
-        and request.provider_thinking_config is None
-        and request.reasoning_context is None
-        and request.context_management is None
-        and request.provider_output_config is None
-        and request.diagnostics is None
-        and request.speed is None
-        and request.inference_geo is None
-        and not request.provider_beta_tokens
-    ):
-        return None
-    envelope: JsonObject = {
-        "provider_replay": replay,
-        "provider_thinking_config": request.provider_thinking_config,
-        "reasoning_context": request.reasoning_context,
-        "context_management": request.context_management,
-        "provider_output_config": request.provider_output_config,
-    }
-    # The newer Messages carriers join the envelope only when present, so
-    # every request decoded before they existed keeps its exact digest.
-    if request.diagnostics is not None:
-        envelope["diagnostics"] = request.diagnostics
-    if request.speed is not None:
-        envelope["speed"] = request.speed
-    if request.inference_geo is not None:
-        envelope["inference_geo"] = request.inference_geo
-    if retained_tools:
-        envelope["tools"] = retained_tools
-    if request.provider_beta_tokens:
-        envelope["provider_beta_tokens"] = list(request.provider_beta_tokens)
-    return envelope
-
-
-def canonical_request_sha256(request: GatewayRequest) -> Sha256:
-    """Digest one canonical request including excluded provider replay authority.
-
-    A caller operation key reused with different replayed reasoning must be
-    a rejected conflict, never a silent replay of the earlier response. A
-    request with no carrier digests exactly as its plain serialization, so
-    every request decoded before the carriers existed keeps its identity.
-
-    Args:
-        request: Canonical gateway request as decoded from the public wire.
-
-    Returns:
-        The stable canonical request digest.
-    """
-    envelope = provider_replay_authority(request)
-    if envelope is None:
-        return sha256_json(request)
-    return sha256_json({"request_sha256": sha256_json(request), **envelope})
 
 
 class GatewayUsage(ContractModel):

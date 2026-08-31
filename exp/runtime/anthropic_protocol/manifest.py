@@ -137,12 +137,100 @@ rungs, which own their validity rules, and drop with disclosure elsewhere.
 """
 
 MESSAGES_TOOL_FIELDS_REJECTED: frozenset[str] = frozenset()
-"""Custom tool-definition fields consciously rejected, currently none.
+"""Custom tool-definition fields consciously rejected, currently none."""
 
-Server-defined tools (bash, text editor, web search, code execution, tool
-search) are rejected wholesale through the closed ``type`` literal instead
-of field-by-field: the gateway serves no provider-hosted execution.
+
+MESSAGES_SERVER_TOOL_TYPES_ACCEPTED = frozenset(
+    {
+        "bash_20250124",
+        "text_editor_20250124",
+        "text_editor_20250429",
+        "text_editor_20250728",
+        "memory_20250818",
+        "web_search_20250305",
+        "web_search_20260209",
+        "web_search_20260318",
+        "web_fetch_20250910",
+        "web_fetch_20260209",
+        "web_fetch_20260309",
+        "web_fetch_20260318",
+        "code_execution_20250522",
+        "code_execution_20250825",
+        "code_execution_20260120",
+        "code_execution_20260521",
+        "tool_search_tool_bm25_20251119",
+        "tool_search_tool_bm25",
+        "tool_search_tool_regex_20251119",
+        "tool_search_tool_regex",
+        "browser_toolset_20260801",
+        "computer_toolset_20260801",
+    }
+)
+"""Typed Anthropic tool entries carried verbatim on Anthropic rungs.
+
+Every type here is accepted bare by the live API on a plain key (verified
+2026-08-31; the only 400s are the provider's own per-model support errors),
+so the gateway forwards the entry byte-for-byte and the provider stays the
+authority on per-model and cross-tool validity. A route with any
+non-Anthropic rung rejects by name: silently dropping a search or execution
+capability the caller declared would change what the model can do.
 """
+
+MESSAGES_SERVER_TOOL_TYPES_REJECTED = frozenset(
+    {
+        # Legacy Claude 3.5 tool versions served only behind the
+        # computer-use-2024-10-22 beta; no current client sends them.
+        "bash_20241022",
+        "text_editor_20241022",
+        # Computer use is beta-gated (computer-use-*) and unverified here.
+        "computer_20241022",
+        "computer_20250124",
+        "computer_20251124",
+        # The advisor tool runs a second, differently priced model inside
+        # the same request, which would falsify this gateway's committed
+        # route identity and billing (the fallbacks rationale).
+        "advisor_20260301",
+        # MCP toolsets bind the rejected mcp_servers field.
+        "mcp_toolset",
+    }
+)
+"""Typed Anthropic tool entries consciously rejected, each with a reason."""
+
+
+MESSAGES_SERVER_TOOL_RESULT_BLOCKS_ACCEPTED = frozenset(
+    {
+        "server_tool_use",
+        "web_search_tool_result",
+        "web_fetch_tool_result",
+        "code_execution_tool_result",
+        "bash_code_execution_tool_result",
+        "text_editor_code_execution_tool_result",
+        "tool_search_tool_result",
+    }
+)
+"""Assistant history blocks carried verbatim for server-tool replay.
+
+Callers echo these blocks back on the turn after a server tool ran; their
+shapes evolve per family, so decode validates them shallowly and Anthropic
+rungs replay them byte-for-byte. This set must stay equal to the native
+normalizer's ``ANTHROPIC_SERVER_TOOL_BLOCK_TYPES`` so every block the
+gateway can emit is a block it accepts back.
+"""
+
+MESSAGES_CONTENT_BLOCKS_REJECTED = frozenset(
+    {
+        # This gateway surface is text-only.
+        "image",
+        "document",
+        # Requires the rejected container field.
+        "container_upload",
+        # Citation source blocks: the gateway does not serve citations yet,
+        # so accepting search-result inputs would promise grounding it
+        # cannot return.
+        "search_result",
+    }
+)
+"""Caller content blocks consciously rejected, each with a reason."""
 
 
 MESSAGES_BETA_TOKENS_FORWARDED = frozenset(

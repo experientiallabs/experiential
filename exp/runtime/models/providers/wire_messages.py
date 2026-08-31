@@ -109,6 +109,11 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
 
 def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
     """Translate one non-instruction gateway message to Anthropic content blocks."""
+    if message.provider_server_tool_block is not None:
+        # One echoed server-tool block carries the whole message and re-emits
+        # byte-for-byte at its position; the caller's message loop merges
+        # consecutive assistant messages back into one content list.
+        return "assistant", [dict(message.provider_server_tool_block)]
     if message.role == "tool":
         result: JsonObject = {
             "type": "tool_result",

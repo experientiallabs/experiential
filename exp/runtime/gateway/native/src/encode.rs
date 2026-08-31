@@ -259,6 +259,10 @@ impl ChatSseEncoder {
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
             | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
+            // Server tools enter only through a Messages request onto an
+            // Anthropic-only route, so a Chat stream can never legally carry
+            // one; an arriving block is dropped like the reasoning carriers.
+            Event::ServerToolBlock { .. } => Ok(Vec::new()),
             Event::ToolCallStarted {
                 index,
                 call_id,
@@ -330,7 +334,10 @@ impl ChatSseEncoder {
                 }
                 Ok(Vec::new())
             }
-            Event::Completed | Event::Incomplete => {
+            // A paused server-tool turn cannot legally reach the Chat
+            // surface (server tools enter only through Messages); the
+            // defensive mapping is ordinary completion.
+            Event::Completed | Event::Incomplete | Event::Paused => {
                 self.terminal = true;
                 let finish_reason = if matches!(event, Event::Incomplete) {
                     "length"

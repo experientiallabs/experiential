@@ -237,7 +237,20 @@ bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthr
 disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
 decision behind an SDK-surface drift gate in
 `exp/runtime/anthropic_protocol/manifest.py`, and rejects image and document blocks loudly
-because the surface is text-only. Thinking carriers
+because the surface is text-only. Typed Anthropic tool entries (web search, web fetch, code
+execution, tool search, bash, text editor, memory; every accepted type bare-accepted live,
+verified 2026-08-31) decode onto a verbatim server-tool carrier that re-enters the tools array
+at its exact caller position on Anthropic rungs, and the echoed `server_tool_use` and
+`*_tool_result` assistant history blocks ride an opaque per-block carrier the same way; any
+non-Anthropic rung is a named rejection for both, never a disclosure-drop, because silently
+removing a declared search or execution capability would change what the model can do. On the
+response side the native normalizer folds `server_tool_use` input fragments into one verbatim
+block, delivers result blocks whole, honors the provider's `pause_turn` stop reason, and reads
+the cumulative `message_delta` usage so search-inflated input tokens bill correctly; the
+per-search provider fee itself is deliberately not modeled yet (searched content is billed
+through the grown input-token total). Text citations from search results are not carried yet:
+the answer text streams uncited, and `search_result` input blocks stay rejected for the same
+reason. Thinking carriers
 replay only on the Anthropic wire, so route admission requires every waterfall rung to speak the
 `anthropic_messages` dialect; on the Responses surface over Anthropic routes, thinking text is
 projected onto the reasoning-summary channel (signatures deliberately dropped) so callers receive

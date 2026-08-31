@@ -404,3 +404,92 @@ fn interleaved_thinking_between_tool_blocks_keeps_sequential_indices() {
     assert_eq!(aggregated.body["content"][1]["type"], json!("tool_use"));
     assert_eq!(aggregated.body["stop_reason"], json!("tool_use"));
 }
+
+#[test]
+fn server_tool_blocks_stream_whole_and_paused_turns_keep_pause_turn() {
+    // The live web_search shape (captured 2026-08-31): a server_tool_use
+    // block, its whole result block, then cited answer text; a paused turn
+    // must reach the caller as the provider's own pause_turn stop reason.
+    let search = json!({
+        "type": "server_tool_use",
+        "id": "srvtoolu_1",
+        "name": "web_search",
+        "input": {"query": "current UTC date"},
+    });
+    let result = json!({
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "caller": {"type": "direct"},
+        "content": [{"type": "web_search_result", "title": "UTC", "url": "https://utc.test"}],
+    });
+    let mut encoder = MessagesSseEncoder::new("req-1", "sonnet");
+    let mut frames = encoder.start().expect("start");
+    frames.extend(
+        encoder
+            .feed(&Event::ServerToolBlock {
+                index: 0,
+                block: search.clone(),
+            })
+            .expect("search block"),
+    );
+    frames.extend(
+        encoder
+            .feed(&Event::ServerToolBlock {
+                index: 1,
+                block: result.clone(),
+            })
+            .expect("result block"),
+    );
+    frames.extend(
+        encoder
+            .feed(&Event::TextDelta("Today is ...".to_string()))
+            .expect("text"),
+    );
+    frames.extend(encoder.feed(&Event::Paused).expect("paused terminal"));
+    let joined = frames.join("");
+    let search_start = format!(
+        "event: content_block_start\ndata: {}\n\n",
+        compact_json(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": search,
+        }))
+    );
+    let result_start = format!(
+        "event: content_block_start\ndata: {}\n\n",
+        compact_json(&json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": result,
+        }))
+    );
+    assert!(joined.contains(&search_start));
+    assert!(joined.contains(&result_start));
+    assert!(joined.contains("\"stop_reason\":\"pause_turn\""));
+    // A pure server-tool turn is not a client tool_use stop.
+    assert!(!joined.contains("\"stop_reason\":\"tool_use\""));
+
+    let aggregated = completed_messages_body(
+        "req-1",
+        "sonnet",
+        &[
+            Event::ServerToolBlock {
+                index: 0,
+                block: search.clone(),
+            },
+            Event::ServerToolBlock {
+                index: 1,
+                block: result.clone(),
+            },
+            Event::TextDelta("Today is ...".to_string()),
+            Event::Paused,
+        ],
+    )
+    .expect("aggregate");
+    assert!(aggregated.failure.is_none());
+    assert_eq!(aggregated.body["stop_reason"], json!("pause_turn"));
+    assert_eq!(
+        aggregated.body["content"],
+        json!([search, result, {"type": "text", "text": "Today is ..."}])
+    );
+}

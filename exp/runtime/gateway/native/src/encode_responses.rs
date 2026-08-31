@@ -283,6 +283,10 @@ impl ResponsesSseEncoder {
                 self.reasoning_summary_delta(*index, 0, &item_id, delta)
             }
             Event::ThinkingSignature { .. } | Event::RedactedThinking { .. } => Ok(Vec::new()),
+            // Server tools enter only through a Messages request onto an
+            // Anthropic-only route, so a Responses stream can never legally
+            // carry one; an arriving block is dropped like the signatures.
+            Event::ServerToolBlock { .. } => Ok(Vec::new()),
             Event::ReasoningContentDelta {
                 route_sha256,
                 delta,
@@ -306,6 +310,9 @@ impl ResponsesSseEncoder {
                 Ok(Vec::new())
             }
             Event::Completed => self.finish("completed", None),
+            // A paused server-tool turn cannot legally reach the Responses
+            // surface; the defensive mapping is ordinary completion.
+            Event::Paused => self.finish("completed", None),
             Event::Incomplete => self.finish("incomplete", None),
             Event::Failed(failure) => self.finish("failed", Some(failure)),
         }

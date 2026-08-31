@@ -86,6 +86,9 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
             | Event::EncryptedReasoning { .. } => {}
+            // Server-tool blocks carry searched or fetched content; rewritten
+            // output must not leak the redacted material through them.
+            Event::ServerToolBlock { .. } => {}
             Event::TextDelta(_) | Event::ProviderTextDelta { .. } => {
                 if inserted {
                     continue;
@@ -93,7 +96,9 @@ pub fn apply_text_replacement(events: &[Event], replacement: &str) -> Vec<Event>
                 rewritten.push(Event::TextDelta(replacement.to_string()));
                 inserted = true;
             }
-            Event::Completed | Event::Incomplete | Event::Failed(_) if !inserted => {
+            Event::Completed | Event::Incomplete | Event::Paused | Event::Failed(_)
+                if !inserted =>
+            {
                 rewritten.push(Event::TextDelta(replacement.to_string()));
                 inserted = true;
                 rewritten.push(event.clone());

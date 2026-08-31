@@ -706,3 +706,86 @@ def test_validation_errors_state_the_expectation_not_only_the_field() -> None:
     assert invalid.value.detail.param == "tools.0.strict"
     assert "Invalid value for 'tools.0.strict'" in invalid.value.detail.message
     assert "bool" in invalid.value.detail.message
+
+
+def test_decode_accepts_the_live_web_search_server_tool_shape() -> None:
+    """Live repro (engine 0.7.10, 2026-08-31): a Claude Code WebSearch tool
+    definition 400ed with "Invalid value for 'tools.0.input_schema'" because
+    server-tool entries carry no input_schema. The typed entry decodes onto
+    the verbatim server-tool carrier at its caller position."""
+    decoded = decode_messages(
+        _body(
+            stream=True,
+            tools=[
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+                {
+                    "name": "Bash",
+                    "description": "Executes a bash command.",
+                    "input_schema": {"type": "object"},
+                },
+            ],
+        )
+    )
+    request = decoded.request
+    assert [tool.name for tool in request.tools] == ["Bash"]
+    assert len(request.provider_server_tools) == 1
+    server = request.provider_server_tools[0]
+    assert server.position == 0
+    assert server.definition == {
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 8,
+    }
+    assert request.ignored_parameters == ()
+
+
+def test_decode_names_rejected_and_unknown_tool_types() -> None:
+    """Typed tool entries answer recorded, named 400s."""
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_messages(_body(tools=[{"type": "mcp_toolset", "name": "srv"}]))
+    assert rejected.value.detail.param == "tools.0.type"
+    assert "consciously not served" in rejected.value.detail.message
+
+    with pytest.raises(OpenAIProtocolError) as unknown:
+        decode_messages(_body(tools=[{"type": "web_search_20990101", "name": "web_search"}]))
+    assert unknown.value.detail.param == "tools.0.type"
+    assert "unknown tool type" in unknown.value.detail.message
+
+
+def test_decode_carries_echoed_server_tool_history_blocks_verbatim() -> None:
+    """The turn-2 echo of a web_search turn splits into ordered verbatim
+    carrier messages so Anthropic rungs replay the exact assistant content."""
+    search_block: JsonObject = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_1",
+        "name": "web_search",
+        "input": {"query": "utc"},
+    }
+    result_block: JsonObject = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "caller": {"type": "direct"},
+        "content": [{"type": "web_search_result", "url": "https://utc.test"}],
+    }
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "what is the date"},
+                {
+                    "role": "assistant",
+                    "content": [search_block, result_block, {"type": "text", "text": "Monday."}],
+                },
+                {"role": "user", "content": "thanks, and tomorrow?"},
+            ],
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        )
+    )
+    roles = [message.role for message in decoded.request.messages]
+    assert roles == ["user", "assistant", "assistant", "assistant", "user"]
+    assert decoded.request.messages[1].provider_server_tool_block == search_block
+    assert decoded.request.messages[2].provider_server_tool_block == result_block
+    assert decoded.request.messages[3].content == "Monday."
+
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(_body(messages=[{"role": "user", "content": [search_block]}]))
+    assert "only valid in assistant messages" in excinfo.value.detail.message

@@ -486,8 +486,16 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .get("reasoning_tokens")
                     .and_then(serde_json::Value::as_u64),
             }),
+            "server_tool_block" => events::Event::ServerToolBlock {
+                index,
+                block: object
+                    .get("block")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            },
             "completed" => events::Event::Completed,
             "incomplete" => events::Event::Incomplete,
+            "paused" => events::Event::Paused,
             "failed" => events::Event::Failed(errors::Failure::new(
                 errors::FailureClass::ProviderInternal,
                 if text.is_empty() {

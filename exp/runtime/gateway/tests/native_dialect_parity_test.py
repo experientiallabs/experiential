@@ -788,3 +788,153 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
     assert not any(
         payload["type"].startswith("response.function_call_arguments") for payload in payloads
     )
+
+
+# Captured from a live api.anthropic.com web_search stream (2026-08-31,
+# claude-sonnet-4-6, ids and encrypted payloads neutralized, result list
+# truncated to two entries): the real wire opens server_tool_use with an
+# empty input then streams input_json_delta fragments (the first one empty),
+# delivers the whole web_search_tool_result in its start frame (with a
+# `caller` object), opens the answer text block with a `citations` key and a
+# leading citations_delta, and reports the search-inflated cumulative input
+# total (2230 -> 10538) only in message_delta.usage.
+ANTHROPIC_LIVE_WEB_SEARCH_FRAMES: tuple[bytes, ...] = (
+    b'event: message_start\ndata: {"type": "message_start", "message": {"model": "claude-s'
+    b'onnet-4-6", "id": "msg_fixture", "type": "message", "role": "assistant", "content": '
+    b'[], "stop_reason": null, "stop_sequence": null, "stop_details": null, "usage": {"inp'
+    b'ut_tokens": 2230, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "c'
+    b'ache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0}, "o'
+    b'utput_tokens": 22, "service_tier": "standard", "inference_geo": "global"}}}\n\n',
+    b'event: content_block_start\ndata: {"type": "content_block_start", "index": 0, "conte'
+    b'nt_block": {"type": "server_tool_use", "id": "srvtoolu_fixture", "name": "web_search'
+    b'", "input": {}}}\n\n',
+    b'event: ping\ndata: {"type": "ping"}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta'
+    b'": {"type": "input_json_delta", "partial_json": ""}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta'
+    b'": {"type": "input_json_delta", "partial_json": "{\\"query\\": "}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta'
+    b'": {"type": "input_json_delta", "partial_json": "\\"current"}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta'
+    b'": {"type": "input_json_delta", "partial_json": " UTC"}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta'
+    b'": {"type": "input_json_delta", "partial_json": " da"}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta'
+    b'": {"type": "input_json_delta", "partial_json": "te today\\"}"}}\n\n',
+    b'event: content_block_stop\ndata: {"type": "content_block_stop", "index": 0}\n\n',
+    b'event: content_block_start\ndata: {"type": "content_block_start", "index": 1, "conte'
+    b'nt_block": {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_fixture", "co'
+    b'ntent": [{"type": "web_search_result", "title": "UTC Time Now", "url": "https://www.'
+    b'utctime.net/", "encrypted_content": "ENCRYPTED_0==", "page_age": null}, {"type": "we'
+    b'b_search_result", "title": "UTC%2B14:00", "url": "https://en.wikipedia.org/wiki/UTC%'
+    b'2B14:00", "encrypted_content": "ENCRYPTED_1==", "page_age": null}], "caller": {"type'
+    b'": "direct"}}}\n\n',
+    b'event: content_block_stop\ndata: {"type": "content_block_stop", "index": 1}\n\n',
+    b'event: content_block_start\ndata: {"type": "content_block_start", "index": 2, "conte'
+    b'nt_block": {"citations": [], "type": "text", "text": ""}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 2, "delta'
+    b'": {"type": "citations_delta", "citation": {"type": "web_search_result_location", "c'
+    b'ited_text": "UTC current date is 31st Monday August 2026. ", "url": "https://www.utc'
+    b'time.net/", "title": "UTC Time Now", "encrypted_index": "ENCIDX=="}}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 2, "delta'
+    b'": {"type": "text_delta", "text": "The current"}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 2, "delta'
+    b'": {"type": "text_delta", "text": " UTC date"}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 2, "delta'
+    b'": {"type": "text_delta", "text": " is"}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 2, "delta'
+    b'": {"type": "text_delta", "text": " **"}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 2, "delta'
+    b'": {"type": "text_delta", "text": "Monday"}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 2, "delta'
+    b'": {"type": "text_delta", "text": ", August 31"}}\n\n',
+    b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 2, "delta'
+    b'": {"type": "text_delta", "text": ", 2026**."}}\n\n',
+    b'event: content_block_stop\ndata: {"type": "content_block_stop", "index": 2}\n\n',
+    b'event: message_delta\ndata: {"type": "message_delta", "delta": {"stop_reason": "end_'
+    b'turn", "stop_sequence": null, "stop_details": null}, "usage": {"input_tokens": 10538'
+    b', "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 9'
+    b'3, "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 0}}}\n\n',
+    b'event: message_stop\ndata: {"type": "message_stop"}\n\n',
+)
+
+ANTHROPIC_LIVE_WEB_SEARCH_EVENTS: tuple[JsonObject, ...] = (
+    {
+        "kind": "server_tool_block",
+        "index": 0,
+        "block": {
+            "type": "server_tool_use",
+            "id": "srvtoolu_fixture",
+            "name": "web_search",
+            "input": {"query": "current UTC date today"},
+        },
+    },
+    {
+        "kind": "server_tool_block",
+        "index": 1,
+        "block": {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_fixture",
+            "content": [
+                {
+                    "type": "web_search_result",
+                    "title": "UTC Time Now",
+                    "url": "https://www.utctime.net/",
+                    "encrypted_content": "ENCRYPTED_0==",
+                    "page_age": None,
+                },
+                {
+                    "type": "web_search_result",
+                    "title": "UTC%2B14:00",
+                    "url": "https://en.wikipedia.org/wiki/UTC%2B14:00",
+                    "encrypted_content": "ENCRYPTED_1==",
+                    "page_age": None,
+                },
+            ],
+            "caller": {"type": "direct"},
+        },
+    },
+    {"kind": "text_delta", "text": "The current"},
+    {"kind": "text_delta", "text": " UTC date"},
+    {"kind": "text_delta", "text": " is"},
+    {"kind": "text_delta", "text": " **"},
+    {"kind": "text_delta", "text": "Monday"},
+    {"kind": "text_delta", "text": ", August 31"},
+    {"kind": "text_delta", "text": ", 2026**."},
+    {
+        "kind": "usage",
+        "input_tokens": 10538,
+        "output_tokens": 93,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": None,
+    },
+    {"kind": "completed"},
+)
+
+
+def test_native_anthropic_normalizer_decodes_the_live_web_search_wire() -> None:
+    """The captured web_search wire decodes to verbatim server-tool blocks.
+
+    Production incident (2026-08-31, engine 0.7.10): a Claude Code WebSearch
+    request 400ed at decode, and even past decode the normalizer would have
+    failed the stream at the first server_tool_use input fragment. The
+    pinned wire also proves the billing total: the search-inflated input
+    count from message_delta (10538) supersedes message_start's 2230.
+    """
+    result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_WEB_SEARCH_FRAMES)
+    assert result["failure"] is None
+    assert result["events"] == list(ANTHROPIC_LIVE_WEB_SEARCH_EVENTS)
+
+
+def test_native_anthropic_normalizer_marks_paused_turns_terminal() -> None:
+    """A pause_turn stop reason ends the attempt as a paused terminal."""
+    chunks = list(ANTHROPIC_LIVE_WEB_SEARCH_FRAMES)
+    delta = json.loads(chunks[-2].decode().split("data: ", 1)[1])
+    delta["delta"]["stop_reason"] = "pause_turn"
+    payload = json.dumps(delta, ensure_ascii=False)
+    chunks[-2] = f"event: message_delta\ndata: {payload}\n\n".encode()
+    result = _native_normalized("anthropic_messages", tuple(chunks))
+    assert result["failure"] is None
+    expected = list(ANTHROPIC_LIVE_WEB_SEARCH_EVENTS)
+    expected[-1] = {"kind": "paused"}
+    assert result["events"] == expected

@@ -174,9 +174,24 @@ pub enum Event {
         index: u32,
         call: CompletedToolCall,
     },
+    /// One complete Anthropic server-tool content block carried verbatim.
+    ///
+    /// `server_tool_use` blocks fold their streamed `input_json_delta`
+    /// fragments into the final `input`; result blocks arrive whole in their
+    /// start frame. Server tools are admitted only onto Anthropic-only
+    /// Messages routes, so exactly the Messages encoder re-emits the block;
+    /// other surfaces can never legally receive it.
+    ServerToolBlock {
+        index: u32,
+        block: Value,
+    },
     Usage(Usage),
     Completed,
     Incomplete,
+    /// The provider paused a long-running server-tool turn (`pause_turn`):
+    /// the caller resends the conversation as-is to continue. Terminal for
+    /// this attempt and billed like a completed turn.
+    Paused,
     Failed(Failure),
 }
 
@@ -184,7 +199,7 @@ impl Event {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Event::Completed | Event::Incomplete | Event::Failed(_)
+            Event::Completed | Event::Incomplete | Event::Paused | Event::Failed(_)
         )
     }
 
@@ -210,6 +225,9 @@ impl Event {
             | Event::ReasoningContentDelta { delta, .. }
             | Event::ToolArgumentsDelta { delta, .. } => !delta.is_empty(),
             Event::ToolCallStarted { .. } => true,
+            // A server-tool block is visible model output and may lead a
+            // search-only turn, so it stamps TTFT like a tool-call start.
+            Event::ServerToolBlock { .. } => true,
             _ => false,
         }
     }
@@ -365,8 +383,14 @@ pub fn simplified_event(event: &Event) -> Value {
             "cached_input_tokens": usage.cached_input_tokens,
             "reasoning_tokens": usage.reasoning_tokens,
         }),
+        Event::ServerToolBlock { index, block } => serde_json::json!({
+            "kind": "server_tool_block",
+            "index": index,
+            "block": block,
+        }),
         Event::Completed => serde_json::json!({"kind": "completed"}),
         Event::Incomplete => serde_json::json!({"kind": "incomplete"}),
+        Event::Paused => serde_json::json!({"kind": "paused"}),
         Event::Failed(failure) => serde_json::json!({
             "kind": "failed",
             "failure_class": failure.failure_class.as_str(),

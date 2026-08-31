@@ -160,10 +160,37 @@ fn finish_open_tools(tools: &mut BTreeMap<u32, ToolAccumulator>) -> Result<Vec<E
     Ok(events)
 }
 
+/// Anthropic server-tool content-block types carried verbatim through the
+/// gateway. A closed set on purpose: a genuinely unknown block kind keeps
+/// today's skip behavior instead of silently widening the pass-through
+/// contract. `server_tool_use` folds streamed `input_json_delta` fragments
+/// into its final `input`; the result kinds arrive whole in their start
+/// frame (verified on a live web_search capture, 2026-08-31).
+pub const ANTHROPIC_SERVER_TOOL_BLOCK_TYPES: &[&str] = &[
+    "server_tool_use",
+    "web_search_tool_result",
+    "web_fetch_tool_result",
+    "code_execution_tool_result",
+    "bash_code_execution_tool_result",
+    "text_editor_code_execution_tool_result",
+    "tool_search_tool_result",
+];
+
+/// One in-flight opaque Anthropic server-tool block.
+pub(crate) struct OpaqueBlockAccumulator {
+    /// The verbatim `content_block` object from the start frame.
+    pub(crate) start_block: Value,
+    /// Concatenated `input_json_delta` fragments, empty for result blocks.
+    pub(crate) raw_input: String,
+}
+
 /// Incremental normalizer of one upstream SSE stream into gateway events.
 pub struct Normalizer {
     dialect: Dialect,
     tools: BTreeMap<u32, ToolAccumulator>,
+    /// Anthropic-only: opaque server-tool blocks accumulating until their
+    /// `content_block_stop`.
+    opaque_blocks: BTreeMap<u32, OpaqueBlockAccumulator>,
     refusal_seen: bool,
     terminal: bool,
     accumulated_tool_bytes: usize,
@@ -200,6 +227,7 @@ impl Normalizer {
         Self {
             dialect,
             tools: BTreeMap::new(),
+            opaque_blocks: BTreeMap::new(),
             refusal_seen: false,
             terminal: false,
             accumulated_tool_bytes: 0,
@@ -257,6 +285,7 @@ impl Normalizer {
             && self
                 .tools
                 .len()
+                .saturating_add(self.opaque_blocks.len())
                 .saturating_add(self.reasoning_summaries.len())
                 .saturating_add(self.openai_output_items.len())
                 >= MAXIMUM_RETAINED_PROVIDER_ENTRIES
@@ -271,7 +300,9 @@ impl Normalizer {
 
     /// Reserve a new tool-call accumulator when this index is not retained.
     fn reserve_tool_entry(&self, index: u32) -> Result<(), Failure> {
-        self.reserve_provider_entry(self.tools.contains_key(&index))
+        self.reserve_provider_entry(
+            self.tools.contains_key(&index) || self.opaque_blocks.contains_key(&index),
+        )
     }
 
     /// Reserve a new reasoning-summary accumulator when this key is not retained.

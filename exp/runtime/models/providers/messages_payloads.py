@@ -83,9 +83,21 @@ def anthropic_messages_stream_payload(
     }
     if system_parts:
         payload["system"] = "\n\n".join(system_parts)
-    if request.tools:
+    if request.tools or request.provider_server_tools:
+        # Typed server and Anthropic-defined entries re-enter the tools array
+        # at their exact caller positions, byte-for-byte; only this wire can
+        # serve them (route admission already rejected every other rung).
+        server_by_position = {
+            server.position: server.definition for server in request.provider_server_tools
+        }
+        client_tools = iter(request.tools)
         tools: list[JsonObject] = []
-        for tool in request.tools:
+        for position in range(len(request.tools) + len(request.provider_server_tools)):
+            server_definition = server_by_position.get(position)
+            if server_definition is not None:
+                tools.append(dict(server_definition))
+                continue
+            tool = next(client_tools)
             translated: JsonObject = {
                 "name": tool.name,
                 "input_schema": tool.parameters,

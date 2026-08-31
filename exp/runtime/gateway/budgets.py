@@ -18,8 +18,9 @@ from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
 )
 from exp.runtime.gateway.auth import utc_text
-from exp.runtime.gateway.contracts import GatewayRequest, provider_replay_authority
+from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.interfaces import GatewayClock
+from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
 

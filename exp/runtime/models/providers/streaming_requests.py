@@ -403,6 +403,35 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
+    # Server and Anthropic-defined tools execute on the provider, so only a
+    # native Anthropic-only route can serve them; dropping a declared search
+    # or execution capability would silently change what the model can do,
+    # so any other rung is a named rejection, never a disclosure-drop. The
+    # echoed server-tool history blocks replay on the same wire only.
+    if request.provider_server_tools and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        named = ", ".join(sorted({server.tool_type for server in request.provider_server_tools}))
+        raise ProviderParameterError(
+            message=(
+                f"The Anthropic tool types [{named}] are not supported by this model "
+                "route. Remove them or choose a native Anthropic-only route."
+            ),
+            param="tools",
+            code="unsupported_parameter",
+        )
+    if any(
+        message.provider_server_tool_block is not None for message in request.messages
+    ) and not all(profile.dialect == "anthropic_messages" for profile in profiles):
+        raise ProviderParameterError(
+            message=(
+                "Server-tool history blocks are not supported by this model route. "
+                "Remove them or choose a native Anthropic-only route."
+            ),
+            param="messages",
+            code="unsupported_parameter",
+        )
+
     # Context editing is Anthropic-native; any other rung cannot honor it,
     # so the omission is disclosed and the field dropped from dispatch,
     # never a rejection (Claude Code sends it by default).
