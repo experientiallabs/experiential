@@ -119,6 +119,11 @@ def test_rejects_a_verdict_outside_the_contract() -> None:
     combined_score = _ScriptedClient(json.dumps({"realism": 0.4, "rationale": "x"}))
     with pytest.raises(RealismJudgmentError, match="contracted shape"):
         RealismJudge(combined_score).assess("Scenario text.")
+    blank_rationale = _ScriptedClient(
+        json.dumps({"likelihood": 0.4, "feasibility": 0.6, "rationale": "   "})
+    )
+    with pytest.raises(RealismJudgmentError, match="contracted shape"):
+        RealismJudge(blank_rationale).assess("Scenario text.")
 
 
 def test_rejects_a_tool_call_only_reply() -> None:

@@ -22,6 +22,7 @@ from pydantic import AwareDatetime, Field
 from exp.common.core.artifacts import ContractModel, JsonObject, SourceIdentity
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace, TraceSource, TraceSpan
+from exp.simulation.mining.coverage import PartitionCoverage
 from exp.simulation.mining.descriptors import DescriptorEmbedder
 from exp.simulation.mining.service import MiningSpec, TaskMiningResult, mine_tasks
 
@@ -57,9 +58,12 @@ class ChatCaptureMiningSummary(ContractModel):
     exclusion count) as flat scalars, so a consumer can persist or display
     what the mining actually covered without re-deriving numbers that drift
     across runs. The per-partition ``*_workload_covered`` fractions are the
-    selected workload mass over the partition's eligible traces. When no
-    capture was minable every count is zero and ``split_separation_verified``
-    is vacuously true.
+    share of the partition's eligible workload mass lying within the coverage
+    similarity threshold of a selected task (selection assigns every
+    candidate's mass to its nearest representative, so raw assigned mass
+    would always be complete; distance-qualified mass is the honest number).
+    When no capture was minable every count is zero and
+    ``split_separation_verified`` is vacuously true.
 
     Args:
         input_capture_count: All captures given to the run.
@@ -72,10 +76,12 @@ class ChatCaptureMiningSummary(ContractModel):
         held_out_task_budget: Task budget requested of the held-out partition.
         fit_selected_task_count: Tasks selected in the fit partition.
         held_out_selected_task_count: Tasks selected in the held-out partition.
-        fit_workload_covered: Fit selected workload mass over fit eligible
-            traces.
-        held_out_workload_covered: Held-out selected workload mass over
-            held-out eligible traces.
+        fit_workload_covered: Share of fit eligible workload mass within the
+            similarity threshold of a selected fit task; zero when nothing
+            was selected.
+        held_out_workload_covered: Share of held-out eligible workload mass
+            within the similarity threshold of a selected held-out task;
+            zero when nothing was selected.
         split_separation_verified: Whether fit and held-out lineage groups
             were verified disjoint.
     """
@@ -118,11 +124,32 @@ class ChatCaptureMiningResult:
 
 
 def _text_content(message: JsonObject) -> str | None:
-    """Return the message's text content; None for tool calls and structured parts."""
+    """Return the message's text content; None for tool calls, structured parts, and blanks."""
     content = message.get("content")
-    if isinstance(content, str) and content:
+    if isinstance(content, str) and content.strip():
         return content
     return None
+
+
+def _workload_covered(partition: PartitionCoverage) -> float:
+    """Return the share of eligible workload near a selected task, in ``[0, 1]``.
+
+    Selection assigns every candidate's workload mass to its nearest retained
+    representative, so the raw assigned mass is complete whenever anything is
+    selected. The honest coverage number qualifies that mass by distance:
+    only mass within the coverage similarity threshold of a selected task
+    counts as covered.
+
+    Args:
+        partition: One partition's coverage report.
+
+    Returns:
+        The covered fraction; zero when the partition selected nothing.
+    """
+    if partition.selected_task_count == 0:
+        return 0.0
+    covered_mass = partition.eligible_trace_count - partition.low_similarity_workload_mass
+    return covered_mass / max(partition.eligible_trace_count, 1)
 
 
 def _task_text(messages: tuple[JsonObject, ...]) -> str | None:
@@ -252,10 +279,8 @@ def mine_tasks_from_chat_captures(
         held_out_task_budget=coverage.held_out.requested_task_budget,
         fit_selected_task_count=coverage.fit.selected_task_count,
         held_out_selected_task_count=coverage.held_out.selected_task_count,
-        fit_workload_covered=coverage.fit.selected_workload_mass
-        / max(coverage.fit.eligible_trace_count, 1),
-        held_out_workload_covered=coverage.held_out.selected_workload_mass
-        / max(coverage.held_out.eligible_trace_count, 1),
+        fit_workload_covered=_workload_covered(coverage.fit),
+        held_out_workload_covered=_workload_covered(coverage.held_out),
         split_separation_verified=coverage.split_separation_verified,
     )
     return ChatCaptureMiningResult(

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.models import (
@@ -25,7 +25,11 @@ from exp.common.models import (
     structured_json_text,
 )
 
-DEFAULT_REALISM_OUTPUT_TOKENS = 400
+# Reasoning models spend hidden reasoning tokens (hundreds per call on
+# current frontier models) from the same output budget as the visible JSON
+# verdict, and an exhausted budget is rejected as a truncated reply. The
+# default leaves room for both; a longer reply costs nothing unless produced.
+DEFAULT_REALISM_OUTPUT_TOKENS = 2_000
 
 REALISM_PROMPT = (
     "You assess ONE scenario for an AI agent, on two SEPARATE axes:\n"
@@ -59,6 +63,15 @@ class RealismAssessment(ContractModel):
     likelihood: float = Field(ge=0.0, le=1.0)
     feasibility: float = Field(ge=0.0, le=1.0)
     rationale: str = Field(min_length=1, max_length=300)
+
+    @field_validator("rationale")
+    @classmethod
+    def _require_visible_text(cls, value: str) -> str:
+        """Trim edge whitespace and reject a blank-looking rationale."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must contain non-whitespace text")
+        return stripped
 
 
 class RealismJudge:
@@ -98,7 +111,7 @@ class RealismJudge:
             RealismJudgmentError: The reply was truncated at the token limit,
                 carried no text, or broke the JSON contract.
         """
-        if not scenario:
+        if not scenario.strip():
             raise ValueError("realism assessment needs non-empty scenario text")
         response = self._client.complete(
             ModelRequest(

@@ -90,7 +90,7 @@ def test_generates_probes_from_the_observed_sample() -> None:
     assert request.messages[1].role == "user"
     assert "Reset a billing password." in str(request.messages[1].content)
     assert '"probe_count":2' in str(request.messages[1].content)
-    assert request.maximum_output_tokens == 1_500
+    assert request.maximum_output_tokens == 4_000
 
 
 def test_truncates_an_overlong_reply_to_the_requested_count() -> None:
@@ -134,6 +134,17 @@ def test_rejects_a_probe_outside_the_contract() -> None:
     client = _ScriptedClient(json.dumps([{"task": "Probe without rationale."}]))
     with pytest.raises(FrontierProbeError, match="contracted shape"):
         generate_frontier_probes(client, ("Observed task.",))
+
+
+def test_rejects_whitespace_only_probe_text_and_trims_edges() -> None:
+    """Blank-looking probe fields break the contract; edge whitespace is trimmed."""
+    blank = _ScriptedClient(json.dumps([{"task": "   ", "rationale": "Reason."}]))
+    with pytest.raises(FrontierProbeError, match="contracted shape"):
+        generate_frontier_probes(blank, ("Observed task.",))
+    padded = _ScriptedClient(json.dumps([{"task": "  Probe.  ", "rationale": " Reason. "}]))
+    (probe,) = generate_frontier_probes(padded, ("Observed task.",)).probes
+    assert probe.task == "Probe."
+    assert probe.rationale == "Reason."
 
 
 def test_rejects_a_tool_call_only_reply() -> None:

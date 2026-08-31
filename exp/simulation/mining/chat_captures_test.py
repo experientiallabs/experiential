@@ -102,6 +102,40 @@ def test_mines_tasks_and_reports_capture_honesty() -> None:
     assert summary.split_separation_verified
 
 
+def test_workload_covered_discriminates_between_full_and_tight_budgets() -> None:
+    """The covered fraction is distance-qualified, not the always-complete assigned mass."""
+    captures = _distinct_captures(6)
+    full_budget = mine_tasks_from_chat_captures(
+        captures,
+        MiningSpec(fit_task_budget=4, held_out_task_budget=2),
+        embedder=HashingDescriptorEmbedder(),
+    )
+    assert full_budget.summary.fit_workload_covered == 1.0
+    assert full_budget.summary.held_out_workload_covered == 1.0
+    tight_budget = mine_tasks_from_chat_captures(
+        captures,
+        MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+        embedder=HashingDescriptorEmbedder(),
+    )
+    assert tight_budget.summary.fit_workload_covered < 1.0
+    assert tight_budget.summary.held_out_workload_covered < 1.0
+
+
+def test_whitespace_only_content_is_not_usable_text() -> None:
+    """A capture whose only text is whitespace counts as unusable, not as a task."""
+    capture = ChatCapture(
+        request_id="req-blank",
+        messages=(
+            {"role": "system", "content": " \n\t"},
+            {"role": "user", "content": "   "},
+        ),
+        captured_at=_START,
+    )
+    result = mine_tasks_from_chat_captures((capture,), embedder=HashingDescriptorEmbedder())
+    assert result.mining is None
+    assert result.summary.captures_without_text == 1
+
+
 def test_task_text_joins_system_developer_and_first_user_turn() -> None:
     """The task basis is system plus developer contents plus the first text user turn."""
     capture = ChatCapture(

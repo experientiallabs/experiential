@@ -16,7 +16,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.models import (
@@ -29,7 +29,11 @@ from exp.common.models import (
 )
 
 DEFAULT_PROBE_COUNT = 5
-DEFAULT_PROBE_OUTPUT_TOKENS = 1_500
+# Reasoning models spend hidden reasoning tokens (hundreds per call on
+# current frontier models) from the same output budget as the visible JSON,
+# and an exhausted budget is rejected as a truncated reply. The default
+# leaves room for both; a longer reply costs nothing unless produced.
+DEFAULT_PROBE_OUTPUT_TOKENS = 4_000
 
 FRONTIER_PROBE_PROMPT = (
     "You generate PROBE scenarios for an AI agent, given a sample of "
@@ -63,6 +67,15 @@ class FrontierProbe(ContractModel):
 
     task: str = Field(min_length=1, max_length=2000)
     rationale: str = Field(min_length=1, max_length=300)
+
+    @field_validator("task", "rationale")
+    @classmethod
+    def _require_visible_text(cls, value: str) -> str:
+        """Trim edge whitespace and reject blank-looking text."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must contain non-whitespace text")
+        return stripped
 
     @property
     def task_sha256(self) -> str:
@@ -139,7 +152,7 @@ def generate_frontier_probes(
     """
     if not observed_tasks:
         raise ValueError("frontier probe generation needs at least one observed task")
-    if any(not task for task in observed_tasks):
+    if any(not task.strip() for task in observed_tasks):
         raise ValueError("observed tasks must be non-empty strings")
     if probe_count <= 0:
         raise ValueError("probe_count must be positive")
