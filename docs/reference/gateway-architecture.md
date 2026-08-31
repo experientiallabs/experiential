@@ -237,7 +237,17 @@ bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthr
 disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
 decision behind an SDK-surface drift gate in
 `exp/runtime/anthropic_protocol/manifest.py`, and rejects image and document blocks loudly
-because the surface is text-only. Thinking carriers
+because the surface is text-only. Anthropic server tools are decided per type by the same
+manifest: verified `web_search_*` entries forward verbatim after the converted custom tools,
+their streamed output (`server_tool_use`, `web_search_tool_result`, citation-bearing text
+blocks, and the `pause_turn` stop reason) reaches the caller intact on both response paths, and
+a next-turn echo of those blocks (each carried verbatim as a whole-message block) re-serves
+byte-for-byte; every other Anthropic-defined tool type is rejected by name because the data
+plane does not yet carry its result blocks. Like the thinking carriers, server tools replay
+only on the Anthropic wire, so a route with any other rung rejects them by name instead of
+dropping a requested capability. The terminal `message_delta` usage report supersedes the
+`message_start` input legs when present, because server-tool turns re-read fetched results as
+input and the start-frame count severely undercounts the billed total. Thinking carriers
 replay only on the Anthropic wire, so route admission requires every waterfall rung to speak the
 `anthropic_messages` dialect; on the Responses surface over Anthropic routes, thinking text is
 projected onto the reasoning-summary channel (signatures deliberately dropped) so callers receive

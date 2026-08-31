@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from exp.runtime.gateway.contracts import (
+from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
     CompatibilityField,
     CompatibilityManifest,
-    GatewayApiSurface,
 )
+from exp.runtime.gateway.contracts import GatewayApiSurface
 
 
 def _field(
@@ -77,8 +77,9 @@ MESSAGES_MANIFEST = CompatibilityManifest(
         #   proxy it truthfully, so it stays rejected until a verified
         #   contract exists.
         # - ``container`` and ``mcp_servers`` bind provider-hosted execution
-        #   state this gateway does not serve (server tools are rejected on
-        #   the same grounds).
+        #   state this gateway does not serve (server tools whose result
+        #   blocks the gateway cannot carry are rejected on the same grounds;
+        #   see MESSAGES_SERVER_TOOL_TYPES_ACCEPTED).
         # - ``service_tier`` selects provider priority capacity priced above
         #   the gateway's committed billing model.
         # - ``fallbacks`` and ``fallback_credit_token`` swap the upstream
@@ -139,9 +140,76 @@ rungs, which own their validity rules, and drop with disclosure elsewhere.
 MESSAGES_TOOL_FIELDS_REJECTED: frozenset[str] = frozenset()
 """Custom tool-definition fields consciously rejected, currently none.
 
-Server-defined tools (bash, text editor, web search, code execution, tool
-search) are rejected wholesale through the closed ``type`` literal instead
-of field-by-field: the gateway serves no provider-hosted execution.
+Anthropic-defined tools (bash, text editor, web search, code execution,
+tool search) are decided per type through
+:data:`MESSAGES_SERVER_TOOL_TYPES_ACCEPTED` and
+:data:`MESSAGES_SERVER_TOOL_TYPES_REJECTED` instead of field-by-field: an
+accepted entry forwards verbatim, so its per-type configuration is the
+provider's own validity surface.
+"""
+
+
+MESSAGES_SERVER_TOOL_TYPES_ACCEPTED = frozenset(
+    {
+        "web_search_20250305",
+        "web_search_20260209",
+        "web_search_20260318",
+    }
+)
+"""Anthropic-defined tool types the gateway forwards verbatim.
+
+The bar for acceptance is truthful end-to-end serving, not decode success:
+the data plane must carry every block the tool makes the provider stream.
+All three web_search versions were verified live (2026-08-31) to emit the
+same block vocabulary this gateway carries intact: ``server_tool_use``,
+``web_search_tool_result``, and citation-bearing ``text`` blocks (the newer
+two default to programmatic calling on some models; that 400 is the
+provider's own, named and actionable). Claude Code's WebSearch sends
+``web_search_20250305`` by default.
+"""
+
+MESSAGES_SERVER_TOOL_TYPES_REJECTED = frozenset(
+    {
+        "advisor_20260301",
+        "bash_20241022",
+        "bash_20250124",
+        "browser_toolset_20260801",
+        "code_execution_20250522",
+        "code_execution_20250825",
+        "code_execution_20260120",
+        "code_execution_20260521",
+        "computer_20241022",
+        "computer_20250124",
+        "computer_20251124",
+        "computer_toolset_20260801",
+        "mcp_toolset",
+        "memory_20250818",
+        "text_editor_20241022",
+        "text_editor_20250124",
+        "text_editor_20250429",
+        "text_editor_20250728",
+        "tool_search_tool_bm25",
+        "tool_search_tool_bm25_20251119",
+        "tool_search_tool_regex",
+        "tool_search_tool_regex_20251119",
+        "web_fetch_20250910",
+        "web_fetch_20260209",
+        "web_fetch_20260309",
+        "web_fetch_20260318",
+    }
+)
+"""Anthropic-defined tool types consciously rejected by name.
+
+Each is rejected because the gateway cannot yet serve it truthfully, not
+because the provider would refuse it: ``web_fetch_*``, ``code_execution_*``,
+and ``tool_search_*`` stream result blocks the data plane does not carry
+(silently dropping them would falsify the response); ``code_execution_*``,
+``browser_toolset_*``, ``computer*``, and ``mcp_toolset`` additionally bind
+provider-hosted execution state; ``computer*``, ``bash_*``, ``text_editor_*``,
+``memory_*``, and ``advisor_*`` are client-executed but unverified here and
+several require beta headers this gateway does not forward. Accepting one
+means moving it to :data:`MESSAGES_SERVER_TOOL_TYPES_ACCEPTED` with live
+block-vocabulary evidence, exactly as web_search was.
 """
 
 

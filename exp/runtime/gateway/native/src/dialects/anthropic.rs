@@ -9,9 +9,11 @@ use super::{
     complete_streamed_tool, finish_open_tools, malformed, optional_text, parse_object,
     provider_stream_failed, refusal_failure, Normalizer,
 };
+use crate::encode::compact_json;
 use crate::errors::Failure;
 use crate::events::{
-    count_or_zero, require_string, require_u64, Event, ToolAccumulator, Usage, MAXIMUM_LEDGER_COUNT,
+    count_if_present, count_or_zero, require_string, require_u64, Event, ToolAccumulator, Usage,
+    MAXIMUM_LEDGER_COUNT,
 };
 
 impl Normalizer {
@@ -81,7 +83,44 @@ impl Normalizer {
                             name,
                         });
                     }
+                    Some("server_tool_use") => {
+                        // Provider-executed server tool (web search): same
+                        // start/argument lifecycle as a client tool, but on
+                        // dedicated events so it never becomes client tool
+                        // history or a tool_use stop reason.
+                        let call_id = require_string(block, "id", "Anthropic server tool ID")
+                            .map_err(|message| malformed(&message))?;
+                        let name = require_string(block, "name", "Anthropic server tool name")
+                            .map_err(|message| malformed(&message))?;
+                        if self.tools.contains_key(&index) {
+                            return Err(malformed("Anthropic stream repeated a tool-call start"));
+                        }
+                        self.reserve_tool_entry(index)?;
+                        let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
+                        tool.server = true;
+                        self.tools.insert(index, tool);
+                        events.push(Event::ServerToolUseStarted {
+                            index,
+                            call_id,
+                            name,
+                        });
+                    }
+                    Some("web_search_tool_result") => {
+                        // The result arrives whole in the start frame and is
+                        // carried verbatim so the caller (and its next-turn
+                        // echo) sees exactly what the provider produced.
+                        let serialized = compact_json(&Value::Object(block.clone()));
+                        self.reserve_tool_bytes(serialized.len())?;
+                        events.push(Event::ServerToolResult {
+                            index,
+                            block: serialized,
+                        });
+                    }
                     Some("text") => {
+                        // The boundary event lets the Messages encoder mirror
+                        // the provider's text-block structure, which is what
+                        // citations attach to.
+                        events.push(Event::TextBlockStarted { index });
                         let text = optional_text(block, "text", "Anthropic initial text")?;
                         if !text.is_empty() {
                             events.push(Event::TextDelta(text));
@@ -133,9 +172,33 @@ impl Normalizer {
                             malformed("provider emitted arguments before a tool start")
                         })?;
                         tool.raw_arguments.push_str(&fragment);
-                        events.push(Event::ToolArgumentsDelta {
+                        events.push(if tool.server {
+                            Event::ServerToolArgumentsDelta {
+                                index,
+                                delta: fragment,
+                            }
+                        } else {
+                            Event::ToolArgumentsDelta {
+                                index,
+                                delta: fragment,
+                            }
+                        });
+                    }
+                    Some("citations_delta") => {
+                        // One whole citation object attached to the open text
+                        // block, carried verbatim (server-tool answers cite
+                        // their web sources through these).
+                        let citation = delta
+                            .get("citation")
+                            .and_then(Value::as_object)
+                            .ok_or_else(|| {
+                                malformed("Anthropic citations_delta.citation must be an object")
+                            })?;
+                        let serialized = compact_json(&Value::Object(citation.clone()));
+                        self.reserve_tool_bytes(serialized.len())?;
+                        events.push(Event::CitationDelta {
                             index,
-                            delta: fragment,
+                            citation: serialized,
                         });
                     }
                     Some("refusal_delta") => {
@@ -186,6 +249,21 @@ impl Normalizer {
                 self.output_tokens =
                     count_or_zero(usage, "output_tokens", "Anthropic output_tokens")
                         .map_err(|message| malformed(&message))?;
+                // The terminal usage report supersedes message_start when its
+                // input legs are present: server-tool turns re-read fetched
+                // results as input, so the start-frame count undercounts the
+                // billed total severely (verified live 2026-08-31).
+                for (key, slot) in [
+                    ("input_tokens", &mut self.input_tokens),
+                    ("cache_read_input_tokens", &mut self.cache_read),
+                    ("cache_creation_input_tokens", &mut self.cache_write),
+                ] {
+                    if let Some(value) = count_if_present(usage, key, "Anthropic message_delta")
+                        .map_err(|message| malformed(&message))?
+                    {
+                        *slot = value;
+                    }
+                }
                 if self.stop_reason.as_deref() == Some("refusal") && !self.refusal_seen {
                     self.refusal_seen = true;
                     events.push(Event::RefusalDelta(String::new()));
@@ -217,6 +295,11 @@ impl Normalizer {
                     events.push(Event::Failed(refusal_failure()));
                 } else if self.stop_reason.as_deref() == Some("max_tokens") {
                     events.push(Event::Incomplete);
+                } else if self.stop_reason.as_deref() == Some("pause_turn") {
+                    // A paused server-tool turn must keep its stop reason:
+                    // the caller resumes it by resending the conversation,
+                    // and an end_turn rewrite would end the task instead.
+                    events.push(Event::PausedTurn);
                 } else {
                     events.push(Event::Completed);
                 }
@@ -288,5 +371,125 @@ mod tests {
             events.as_slice(),
             [Event::RedactedThinking { index: 1, data }] if data == "opaque=="
         ));
+    }
+
+    /// Frame shapes captured live from one web_search stream (2026-08-31):
+    /// server tool use with a leading empty input fragment, the whole result
+    /// in its start frame, a cited answer, terminal usage that supersedes the
+    /// start-frame input count, and the pause_turn stop reason.
+    #[test]
+    fn server_tool_frames_normalize_to_dedicated_events() {
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        let start_message = frame(serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 2230, "output_tokens": 25}},
+        }));
+        assert!(normalizer.feed(&start_message).expect("start").is_empty());
+
+        let start = frame(serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "web_search",
+                "input": {},
+            },
+        }));
+        let events = normalizer.feed(&start).expect("server tool start");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ServerToolUseStarted { index: 0, call_id, name }]
+                if call_id == "srvtoolu_1" && name == "web_search"
+        ));
+
+        // The provider legally leads with an empty input fragment.
+        for partial in ["", "{\"query\": \"python\"}"] {
+            let delta = frame(serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": partial},
+            }));
+            let events = normalizer.feed(&delta).expect("server input delta");
+            assert!(matches!(
+                events.as_slice(),
+                [Event::ServerToolArgumentsDelta { index: 0, delta }] if delta == partial
+            ));
+        }
+        let stop = frame(serde_json::json!({"type": "content_block_stop", "index": 0}));
+        let events = normalizer.feed(&stop).expect("server tool stop");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ServerToolUseCompleted { index: 0, call }]
+                if call.raw_arguments == "{\"query\": \"python\"}" && !call.custom
+        ));
+
+        let result = frame(serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": [{"type": "web_search_result", "url": "https://example.com"}],
+                "caller": {"type": "direct"},
+            },
+        }));
+        let events = normalizer.feed(&result).expect("server tool result");
+        match events.as_slice() {
+            [Event::ServerToolResult { index: 1, block }] => {
+                assert!(block.contains("\"caller\":{\"type\":\"direct\"}"));
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+
+        let text_start = frame(serde_json::json!({
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {"citations": [], "type": "text", "text": ""},
+        }));
+        let events = normalizer.feed(&text_start).expect("text start");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::TextBlockStarted { index: 2 }]
+        ));
+        let citation = frame(serde_json::json!({
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {
+                "type": "citations_delta",
+                "citation": {"type": "web_search_result_location", "cited_text": "3.14.7"},
+            },
+        }));
+        let events = normalizer.feed(&citation).expect("citation delta");
+        match events.as_slice() {
+            [Event::CitationDelta { index: 2, citation }] => {
+                assert!(citation.contains("\"cited_text\":\"3.14.7\""));
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+
+        // The terminal usage report supersedes the start-frame input legs.
+        let message_delta = frame(serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "pause_turn", "stop_sequence": null},
+            "usage": {
+                "input_tokens": 12284,
+                "cache_read_input_tokens": 4,
+                "cache_creation_input_tokens": 6,
+                "output_tokens": 103,
+                "server_tool_use": {"web_search_requests": 1},
+            },
+        }));
+        assert!(normalizer.feed(&message_delta).expect("delta").is_empty());
+        let stop_message = frame(serde_json::json!({"type": "message_stop"}));
+        let events = normalizer.feed(&stop_message).expect("message stop");
+        match events.as_slice() {
+            [Event::Usage(usage), Event::PausedTurn] => {
+                assert_eq!(usage.input_tokens, Some(12294));
+                assert_eq!(usage.output_tokens, Some(103));
+                assert_eq!(usage.cached_input_tokens, Some(4));
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
     }
 }

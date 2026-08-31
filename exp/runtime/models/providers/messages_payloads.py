@@ -111,6 +111,16 @@ def anthropic_messages_stream_payload(
                 translated["input_examples"] = list(tool.input_examples)
             tools.append(translated)
         payload["tools"] = tools
+    if request.provider_server_tools:
+        # Server tools re-emit verbatim after the converted custom tools (an
+        # accepted ordering deviation); route admission guarantees this
+        # dispatch is an Anthropic rung, which owns their validity rules.
+        server_entries = [dict(entry) for entry in request.provider_server_tools]
+        existing_tools = payload.get("tools")
+        if isinstance(existing_tools, list):
+            existing_tools.extend(server_entries)
+        else:
+            payload["tools"] = server_entries
     tool_choice: JsonObject | None = None
     if request.tool_choice is not None:
         if isinstance(request.tool_choice, GatewayNamedToolChoice):

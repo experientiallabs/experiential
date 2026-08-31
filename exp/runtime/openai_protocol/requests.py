@@ -19,9 +19,11 @@ from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.model import ToolCall
-from exp.runtime.gateway.contracts import (
+from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
     CompatibilityManifest,
+)
+from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayApiSurface,
     GatewayMessage,

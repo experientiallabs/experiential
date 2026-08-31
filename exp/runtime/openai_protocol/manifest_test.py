@@ -7,7 +7,10 @@ import typing
 import pytest
 
 from exp.common.models.model import ReasoningEffort
-from exp.runtime.gateway.contracts import CompatibilityDisposition, CompatibilityManifest
+from exp.runtime.gateway.compatibility import (
+    CompatibilityDisposition,
+    CompatibilityManifest,
+)
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     RESPONSES_INCLUDE_PATHS_ACCEPTED,

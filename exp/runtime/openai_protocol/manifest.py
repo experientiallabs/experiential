@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from exp.runtime.gateway.contracts import (
+from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
     CompatibilityField,
     CompatibilityManifest,
-    GatewayApiSurface,
 )
+from exp.runtime.gateway.contracts import GatewayApiSurface
 
 
 def _field(

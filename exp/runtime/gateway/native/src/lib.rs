@@ -486,8 +486,65 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .get("reasoning_tokens")
                     .and_then(serde_json::Value::as_u64),
             }),
+            "server_tool_use_started" => events::Event::ServerToolUseStarted {
+                index,
+                call_id: object
+                    .get("call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                name: object
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "server_tool_arguments_delta" => {
+                events::Event::ServerToolArgumentsDelta { index, delta: text }
+            }
+            "server_tool_use_completed" => events::Event::ServerToolUseCompleted {
+                index,
+                call: events::CompletedToolCall {
+                    call_id: object
+                        .get("call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    name: object
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    provider_item_id: None,
+                    provider_status: None,
+                    raw_arguments: object
+                        .get("raw_arguments")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    custom: false,
+                },
+            },
+            "server_tool_result" => events::Event::ServerToolResult {
+                index,
+                block: object
+                    .get("block")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "text_block_started" => events::Event::TextBlockStarted { index },
+            "citation_delta" => events::Event::CitationDelta {
+                index,
+                citation: object
+                    .get("citation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
             "completed" => events::Event::Completed,
             "incomplete" => events::Event::Incomplete,
+            "paused_turn" => events::Event::PausedTurn,
             "failed" => events::Event::Failed(errors::Failure::new(
                 errors::FailureClass::ProviderInternal,
                 if text.is_empty() {

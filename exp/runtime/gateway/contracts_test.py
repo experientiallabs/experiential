@@ -7,12 +7,15 @@ from typing import Literal
 import pytest
 from pydantic import ValidationError
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ToolCall
-from exp.runtime.gateway.contracts import (
-    AuthorizationSnapshot,
+from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
     CompatibilityField,
     CompatibilityManifest,
+)
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
     DirectTarget,
     ExecutionSnapshot,
     GatewayApiSurface,
@@ -600,4 +603,70 @@ def test_messages_only_carriers_cache_control_and_inference_geo() -> None:
                     eager_input_streaming=True,
                 ),
             ),
+        )
+
+
+def test_server_tool_carriers_are_scoped_verbatim_and_join_replay_identity() -> None:
+    """Server tool entries and echoed blocks are Messages-only whole-message carriers."""
+    from exp.runtime.gateway.contracts import canonical_request_sha256
+
+    server_entry: JsonObject = {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+    bare = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="search"),),
+    )
+    carried = bare.model_copy(update={"provider_server_tools": (server_entry,)})
+    # Excluded from serialization, distinct in replay identity.
+    assert carried.model_dump() == bare.model_dump()
+    assert canonical_request_sha256(carried) != canonical_request_sha256(bare)
+
+    echoed = bare.model_copy(
+        update={
+            "messages": bare.messages
+            + (
+                GatewayMessage(
+                    role="assistant",
+                    provider_anthropic_block={
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {},
+                    },
+                ),
+            )
+        }
+    )
+    assert canonical_request_sha256(echoed) != canonical_request_sha256(bare)
+
+    with pytest.raises(ValidationError, match="valid only for Messages"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            provider_server_tools=(server_entry,),
+        )
+    with pytest.raises(ValidationError, match="carries the whole message"):
+        GatewayMessage(
+            role="assistant",
+            content="also text",
+            provider_anthropic_block={"type": "server_tool_use"},
+        )
+
+
+def test_tool_choice_may_name_a_server_tool() -> None:
+    """Named and required selectors count verbatim server tools as tools."""
+    server_entry: JsonObject = {"type": "web_search_20250305", "name": "web_search"}
+    for tool_choice in (GatewayNamedToolChoice(name="web_search"), "required"):
+        request = GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            provider_server_tools=(server_entry,),
+            tool_choice=tool_choice,
+        )
+        assert request.provider_server_tools == (server_entry,)
+    with pytest.raises(ValidationError, match="must name a request tool"):
+        GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            provider_server_tools=(server_entry,),
+            tool_choice=GatewayNamedToolChoice(name="absent"),
         )

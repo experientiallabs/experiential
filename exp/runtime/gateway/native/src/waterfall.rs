@@ -183,6 +183,12 @@ fn is_semantic(event: &Event) -> bool {
             | Event::ToolCallStarted { .. }
             | Event::ToolArgumentsDelta { .. }
             | Event::ToolCallCompleted { .. }
+            | Event::TextBlockStarted { .. }
+            | Event::CitationDelta { .. }
+            | Event::ServerToolUseStarted { .. }
+            | Event::ServerToolArgumentsDelta { .. }
+            | Event::ServerToolUseCompleted { .. }
+            | Event::ServerToolResult { .. }
     )
 }
 

@@ -4314,3 +4314,84 @@ def test_effort_none_drops_with_disclosure_on_a_reasoning_less_route(
     assert payload["status_code"] == 400
     assert payload["param"] == "reasoning_effort"
     assert payload["code"] == "unsupported_parameter"
+
+
+def _web_search_fixture_json() -> str:
+    """One WebSearch event stream in the fixture-event vocabulary."""
+    result_block = (
+        '{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1",'
+        '"content":[{"type":"web_search_result","encrypted_content":"Et8Q"}],'
+        '"caller":{"type":"direct"}}'
+    )
+    citation = '{"type":"web_search_result_location","cited_text":"3.14.7"}'
+    return json.dumps(
+        [
+            {
+                "kind": "server_tool_use_started",
+                "index": 0,
+                "call_id": "srvtoolu_1",
+                "name": "web_search",
+            },
+            {"kind": "server_tool_arguments_delta", "index": 0, "text": '{"query": "python"}'},
+            {
+                "kind": "server_tool_use_completed",
+                "index": 0,
+                "call_id": "srvtoolu_1",
+                "name": "web_search",
+                "raw_arguments": '{"query": "python"}',
+            },
+            {"kind": "server_tool_result", "index": 1, "block": result_block},
+            {"kind": "text_block_started", "index": 2},
+            {"kind": "citation_delta", "index": 2, "citation": citation},
+            {"kind": "text_delta", "text": "It is 3.14.7."},
+            {"kind": "usage", "input_tokens": 12284, "output_tokens": 103},
+            {"kind": "completed"},
+        ]
+    )
+
+
+def test_rust_messages_streams_server_tool_blocks_intact() -> None:
+    """Server tool events stream back as their native Anthropic blocks."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    frames = list(
+        native.encode_messages_fixture("request-abc", "coding", _web_search_fixture_json())
+    )
+    joined = "".join(frames)
+    assert '"type":"server_tool_use","id":"srvtoolu_1","name":"web_search"' in joined
+    assert '"type":"web_search_tool_result"' in joined
+    assert '"caller":{"type":"direct"}' in joined
+    assert '"type":"citations_delta"' in joined
+    # Provider-executed tool use never becomes the tool_use stop reason.
+    assert '"stop_reason":"end_turn"' in joined
+
+
+def test_rust_messages_completed_body_carries_server_tool_blocks() -> None:
+    """The non-streaming aggregation keeps every server-tool block in order."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    body = json.loads(
+        native.completed_messages_fixture("request-abc", "coding", _web_search_fixture_json())
+    )
+    kinds = [block["type"] for block in body["content"]]
+    assert kinds == ["server_tool_use", "web_search_tool_result", "text"]
+    assert body["content"][2]["citations"] == [
+        {"type": "web_search_result_location", "cited_text": "3.14.7"}
+    ]
+    assert body["stop_reason"] == "end_turn"
+
+
+def test_rust_messages_paused_turn_keeps_its_stop_reason() -> None:
+    """A pause_turn terminal survives to the caller instead of end_turn."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    fixture = json.dumps(
+        [
+            {"kind": "text_delta", "text": "searching"},
+            {"kind": "paused_turn"},
+        ]
+    )
+    frames = "".join(native.encode_messages_fixture("request-abc", "coding", fixture))
+    assert '"stop_reason":"pause_turn"' in frames
+    body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
+    assert body["stop_reason"] == "pause_turn"

@@ -140,13 +140,24 @@ fn complete_streamed_tool(
     // input is legitimately empty text.
     if tool.raw_arguments.is_empty() && !tool.custom {
         tool.raw_arguments.push_str("{}");
-        events.push(Event::ToolArgumentsDelta {
-            index,
-            delta: "{}".to_string(),
+        events.push(if tool.server {
+            Event::ServerToolArgumentsDelta {
+                index,
+                delta: "{}".to_string(),
+            }
+        } else {
+            Event::ToolArgumentsDelta {
+                index,
+                delta: "{}".to_string(),
+            }
         });
     }
     let call = tool.complete().map_err(|message| malformed(&message))?;
-    events.push(Event::ToolCallCompleted { index, call });
+    events.push(if tool.server {
+        Event::ServerToolUseCompleted { index, call }
+    } else {
+        Event::ToolCallCompleted { index, call }
+    });
     Ok(())
 }
 

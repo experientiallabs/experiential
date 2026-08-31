@@ -299,13 +299,24 @@ impl ResponsesSseEncoder {
             } => self.tool_started(*index, call_id, name),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments(*index, delta),
             Event::ToolCallCompleted { index, call } => self.tool_completed(*index, call),
+            // Anthropic text-block boundaries and citation metadata have no
+            // Responses representation; the text itself streams as deltas.
+            Event::TextBlockStarted { .. } | Event::CitationDelta { .. } => Ok(Vec::new()),
+            // Server tools enter only through a Messages request, which
+            // never encodes on the Responses surface.
+            Event::ServerToolUseStarted { .. }
+            | Event::ServerToolArgumentsDelta { .. }
+            | Event::ServerToolUseCompleted { .. }
+            | Event::ServerToolResult { .. } => Err(invalid_provider_stream(
+                "Responses cannot represent a provider server tool.",
+            )),
             Event::Usage(usage) => {
                 if usage.has_token_counts() {
                     self.usage = Some(usage.clone());
                 }
                 Ok(Vec::new())
             }
-            Event::Completed => self.finish("completed", None),
+            Event::Completed | Event::PausedTurn => self.finish("completed", None),
             Event::Incomplete => self.finish("incomplete", None),
             Event::Failed(failure) => self.finish("failed", Some(failure)),
         }

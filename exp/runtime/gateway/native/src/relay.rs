@@ -45,8 +45,14 @@ pub fn event_retained_bytes(event: &Event) -> usize {
             encrypted_content, ..
         } => encrypted_content.len(),
         Event::ReasoningContentDelta { delta, .. } => delta.len(),
-        Event::ToolArgumentsDelta { delta, .. } => delta.len(),
-        Event::ToolCallCompleted { call, .. } => call.raw_arguments.len().max(64),
+        Event::ToolArgumentsDelta { delta, .. } | Event::ServerToolArgumentsDelta { delta, .. } => {
+            delta.len()
+        }
+        Event::ToolCallCompleted { call, .. } | Event::ServerToolUseCompleted { call, .. } => {
+            call.raw_arguments.len().max(64)
+        }
+        Event::ServerToolResult { block, .. } => block.len(),
+        Event::CitationDelta { citation, .. } => citation.len(),
         _ => 64,
     }
 }
@@ -104,7 +110,12 @@ pub fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Ve
         Event::Usage(candidate) if candidate.has_token_counts() => {
             *usage = Some(candidate.clone());
         }
-        Event::ToolCallCompleted { call, .. } if !tool_names.contains(&call.name) => {
+        Event::ToolCallCompleted { call, .. } | Event::ServerToolUseCompleted { call, .. }
+            if !tool_names.contains(&call.name) =>
+        {
+            // Server tool invocations are provider-executed but still
+            // invoked tools: their names join usage so operators can see
+            // (and price) per-invocation server tool activity.
             tool_names.push(call.name.clone());
         }
         _ => {}

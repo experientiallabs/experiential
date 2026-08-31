@@ -2176,3 +2176,148 @@ def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_els
     }
     assert mixed_provider.provider_cache_control is None
     assert mixed_provider.inference_geo is None
+
+
+def _web_search_messages_request(
+    *,
+    tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None,
+    echoed_block: bool = False,
+) -> GatewayRequest:
+    """Build one Messages request carrying a verbatim web_search server tool."""
+    messages: tuple[GatewayMessage, ...] = (GatewayMessage(role="user", content="search"),)
+    if echoed_block:
+        messages += (
+            GatewayMessage(
+                role="assistant",
+                provider_anthropic_block={
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {"query": "python"},
+                },
+            ),
+            GatewayMessage(role="user", content="and now?"),
+        )
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=messages,
+        provider_server_tools=(
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+        ),
+        tool_choice=tool_choice,
+        maximum_output_tokens=256,
+        maximum_output_tokens_parameter="max_tokens",
+        stream=True,
+        include_usage=True,
+    )
+
+
+def _anthropic_web_search_profile(url: str = "https://anthropic.test") -> GatewayWireProfile:
+    """Return one native Anthropic Messages wire profile."""
+    return GatewayWireProfile(
+        dialect="anthropic_messages",
+        url=url,
+        model_id="claude-haiku-4-5",
+        reasoning_wire_format="anthropic_adaptive",
+    )
+
+
+def test_server_tools_reject_mixed_routes_by_name() -> None:
+    """A route with any non-Anthropic rung cannot serve server tools.
+
+    Rejection, not disclosure-drop: silently removing a search capability
+    the caller asked for would falsify every answer that needed it.
+    """
+    profiles = (
+        _anthropic_web_search_profile(),
+        GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test"),
+    )
+    for request in (
+        _web_search_messages_request(),
+        _web_search_messages_request(echoed_block=True).model_copy(
+            update={"provider_server_tools": ()}
+        ),
+    ):
+        with pytest.raises(ProviderParameterError) as raised:
+            route_generation_parameter_requests(profiles, request)
+        assert raised.value.code == "unsupported_parameter"
+        assert raised.value.param == "tools"
+        assert "Anthropic" in str(raised.value)
+
+
+def test_server_tools_keep_tool_choice_on_an_anthropic_route() -> None:
+    """Server tools count as tool definitions for the no-op selector rule."""
+    profiles = (
+        _anthropic_web_search_profile(),
+        _anthropic_web_search_profile("https://anthropic-b.test"),
+    )
+    for tool_choice in ("auto", "required", GatewayNamedToolChoice(name="web_search")):
+        request = _web_search_messages_request(tool_choice=tool_choice)
+        public_request, provider_request = route_generation_parameter_requests(profiles, request)
+        assert "tool_choice" not in public_request.ignored_parameters
+        assert provider_request.tool_choice == tool_choice
+        assert provider_request.provider_server_tools == request.provider_server_tools
+
+
+def test_anthropic_payload_appends_server_tools_verbatim_after_custom_tools() -> None:
+    """Server tool entries re-emit byte-for-byte after the converted tools."""
+    request = _web_search_messages_request(tool_choice="auto").model_copy(
+        update={
+            "tools": (GatewayToolDefinition(name="Bash", parameters={"type": "object"}),),
+        }
+    )
+    payload = anthropic_messages_stream_payload("claude-haiku-4-5", request)
+    assert payload["tools"] == [
+        {"name": "Bash", "input_schema": {"type": "object"}},
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+    ]
+    assert payload["tool_choice"] == {"type": "auto"}
+
+
+def test_anthropic_payload_serves_a_server_tool_only_toolset() -> None:
+    """A request whose only tools are server tools still sends a tools array."""
+    payload = anthropic_messages_stream_payload("claude-haiku-4-5", _web_search_messages_request())
+    assert payload["tools"] == [
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
+    ]
+
+
+def test_anthropic_payload_reemits_echoed_server_blocks_in_order() -> None:
+    """Echoed server-tool blocks re-emit verbatim at their positions."""
+    cited_text: JsonObject = {
+        "citations": [{"type": "web_search_result_location", "encrypted_index": "Eo8B"}],
+        "type": "text",
+        "text": "It is 3.14.7.",
+    }
+    result_block: JsonObject = {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": [{"type": "web_search_result", "encrypted_content": "Et8Q"}],
+        "caller": {"type": "direct"},
+    }
+    request = _web_search_messages_request(echoed_block=True)
+    messages = (
+        request.messages[:2]
+        + (
+            GatewayMessage(role="assistant", provider_anthropic_block=result_block),
+            GatewayMessage(role="assistant", provider_anthropic_block=cited_text),
+        )
+        + request.messages[2:]
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5", request.model_copy(update={"messages": messages})
+    )
+    wire_messages = cast(list[JsonObject], payload["messages"])
+    assert [message["role"] for message in wire_messages] == ["user", "assistant", "user"]
+    # Consecutive assistant carrier messages merge back into one turn with
+    # the exact echoed block order.
+    assert wire_messages[1]["content"] == [
+        {
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {"query": "python"},
+        },
+        result_block,
+        cited_text,
+    ]

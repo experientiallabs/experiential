@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from exp.runtime.gateway.contracts import (
-    AuthorizationSnapshot,
+from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
     CompatibilityField,
     CompatibilityManifest,
+)
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
     DirectTarget,
     ExecutionSnapshot,
     GatewayApiSurface,

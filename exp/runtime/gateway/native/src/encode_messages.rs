@@ -49,21 +49,22 @@ fn invalid_provider_stream(message: &str) -> PublicError {
     PublicError::new(502, "invalid_provider_stream", message, "api_error")
 }
 
-/// Map the terminal outcome to the Anthropic stop reason.
-fn stop_reason(incomplete: bool, saw_tool_use: bool) -> &'static str {
-    if incomplete {
-        "max_tokens"
-    } else if saw_tool_use {
-        "tool_use"
-    } else {
-        "end_turn"
+/// Map the terminal outcome to the Anthropic stop reason. Server tool use is
+/// provider-executed and deliberately never yields `tool_use`; a paused
+/// server-tool turn must keep `pause_turn` so the caller resumes it.
+pub(super) fn stop_reason(terminal: &Event, saw_tool_use: bool) -> &'static str {
+    match terminal {
+        Event::Incomplete => "max_tokens",
+        Event::PausedTurn => "pause_turn",
+        _ if saw_tool_use => "tool_use",
+        _ => "end_turn",
     }
 }
 
 /// The Anthropic usage shape from `messages_usage`: cached reads come back
 /// out of the normalized input total, and unknown usage reports zero counts
 /// because the Anthropic shape requires both fields.
-fn messages_usage(usage: Option<&Usage>) -> Value {
+pub(super) fn messages_usage(usage: Option<&Usage>) -> Value {
     let usage = match usage {
         Some(usage) if usage.has_token_counts() => usage,
         _ => return json!({"input_tokens": 0, "output_tokens": 0}),
@@ -102,6 +103,11 @@ enum BlockKind {
     Tool(u32),
     Thinking(u32),
     Redacted,
+    /// Provider-executed server tool use, streamed like a tool block but
+    /// re-emitted as `server_tool_use` and excluded from the tool_use stop.
+    ServerTool(u32),
+    /// One whole verbatim server-tool result block (arrives complete).
+    ServerResult,
 }
 
 /// One scheduled content block, buffered until it can stream in order.
@@ -119,6 +125,12 @@ struct PendingBlock {
     pending_signature: String,
     /// Redacted only: the whole opaque payload travels in the start frame.
     redacted_data: Option<String>,
+    /// Server result only: the whole verbatim block (validated compact JSON
+    /// text) travels in the start frame.
+    server_result_block: Option<String>,
+    /// Text only: verbatim citation objects (validated compact JSON text),
+    /// each flushed as one `citations_delta` while the block is open.
+    pending_citations: Vec<String>,
     anthropic_index: Option<u32>,
 }
 
@@ -129,6 +141,8 @@ impl PendingBlock {
             pending: String::new(),
             pending_signature: String::new(),
             redacted_data: None,
+            server_result_block: None,
+            pending_citations: Vec::new(),
             anthropic_index: None,
         }
     }
@@ -157,6 +171,9 @@ pub struct MessagesSseEncoder {
     tool_identities: HashMap<u32, (String, String)>,
     tool_arguments: HashMap<u32, String>,
     tool_completed: HashSet<u32>,
+    server_identities: HashMap<u32, (String, String)>,
+    server_arguments: HashMap<u32, String>,
+    server_completed: HashSet<u32>,
     saw_tool_use: bool,
     refusal_seen: bool,
     usage: Option<Usage>,
@@ -178,6 +195,9 @@ impl MessagesSseEncoder {
             tool_identities: HashMap::new(),
             tool_arguments: HashMap::new(),
             tool_completed: HashSet::new(),
+            server_identities: HashMap::new(),
+            server_arguments: HashMap::new(),
+            server_completed: HashSet::new(),
             saw_tool_use: false,
             refusal_seen: false,
             usage: None,
@@ -287,13 +307,51 @@ impl MessagesSseEncoder {
                 self.tool_completed.insert(*index);
                 Ok(self.advance())
             }
+            Event::TextBlockStarted { .. } => {
+                // A provider text-block boundary starts a fresh caller block
+                // so citations attach to the block they belong to.
+                self.blocks.push(PendingBlock::new(BlockKind::Text));
+                Ok(self.advance())
+            }
+            Event::CitationDelta { citation, .. } => self.citation_delta(citation),
+            Event::ServerToolUseStarted {
+                index,
+                call_id,
+                name,
+            } => self.server_tool_started(*index, call_id, name),
+            Event::ServerToolArgumentsDelta { index, delta } => {
+                self.server_tool_arguments_delta(*index, delta)
+            }
+            Event::ServerToolUseCompleted { index, call } => {
+                let identity = self.server_identities.get(index);
+                if identity.is_none() || self.server_completed.contains(index) {
+                    return Err(invalid_provider_stream(
+                        "Messages server tool completion omitted its started tool use.",
+                    ));
+                }
+                let streamed = self
+                    .server_arguments
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_default();
+                if identity != Some(&(call.call_id.clone(), call.name.clone()))
+                    || streamed != call.raw_arguments
+                {
+                    return Err(invalid_provider_stream(
+                        "Messages server tool completion changed streamed identity or bytes.",
+                    ));
+                }
+                self.server_completed.insert(*index);
+                Ok(self.advance())
+            }
+            Event::ServerToolResult { block, .. } => self.server_tool_result(block),
             Event::Usage(usage) => {
                 if usage.has_token_counts() {
                     self.usage = Some(usage.clone());
                 }
                 Ok(Vec::new())
             }
-            Event::Completed | Event::Incomplete => {
+            Event::Completed | Event::Incomplete | Event::PausedTurn => {
                 self.terminal = true;
                 if self.refusal_seen {
                     return Ok(vec![error_frame(&refusal_failure())]);
@@ -305,10 +363,7 @@ impl MessagesSseEncoder {
                     &json!({
                         "type": "message_delta",
                         "delta": {
-                            "stop_reason": stop_reason(
-                                matches!(event, Event::Incomplete),
-                                self.saw_tool_use,
-                            ),
+                            "stop_reason": stop_reason(event, self.saw_tool_use),
                             "stop_sequence": Value::Null,
                         },
                         "usage": messages_usage(self.usage.as_ref()),
@@ -397,6 +452,109 @@ impl MessagesSseEncoder {
         self.blocks.len() - 1
     }
 
+    /// Attach one verbatim citation to the newest text block, creating one
+    /// when the citation leads its block's content.
+    fn citation_delta(&mut self, citation: &str) -> Result<Vec<String>, PublicError> {
+        self.buffered_bytes = self.buffered_bytes.saturating_add(citation.len());
+        if self.buffered_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
+            return Err(invalid_provider_stream(
+                "Messages stream buffered blocks exceeded the gateway response limit.",
+            ));
+        }
+        if serde_json::from_str::<Value>(citation).is_err() {
+            return Err(invalid_provider_stream(
+                "Messages citation was not valid JSON.",
+            ));
+        }
+        let position = match self
+            .blocks
+            .iter()
+            .rposition(|block| block.kind == BlockKind::Text)
+        {
+            Some(position) => position,
+            None => {
+                self.blocks.push(PendingBlock::new(BlockKind::Text));
+                self.blocks.len() - 1
+            }
+        };
+        self.blocks[position]
+            .pending_citations
+            .push(citation.to_string());
+        let mut frames = self.advance();
+        self.flush_open(&mut frames);
+        Ok(frames)
+    }
+
+    /// Schedule one server_tool_use block at its start position.
+    fn server_tool_started(
+        &mut self,
+        tool_index: u32,
+        call_id: &str,
+        name: &str,
+    ) -> Result<Vec<String>, PublicError> {
+        if self.server_identities.contains_key(&tool_index) {
+            return Err(invalid_provider_stream(
+                "A Messages server tool index was started twice.",
+            ));
+        }
+        self.server_identities
+            .insert(tool_index, (call_id.to_string(), name.to_string()));
+        self.server_arguments.insert(tool_index, String::new());
+        self.blocks
+            .push(PendingBlock::new(BlockKind::ServerTool(tool_index)));
+        Ok(self.advance())
+    }
+
+    /// Schedule one raw server-tool input fragment behind earlier blocks.
+    fn server_tool_arguments_delta(
+        &mut self,
+        tool_index: u32,
+        delta: &str,
+    ) -> Result<Vec<String>, PublicError> {
+        if !self.server_identities.contains_key(&tool_index) {
+            return Err(invalid_provider_stream(
+                "Messages server tool arguments arrived before its start.",
+            ));
+        }
+        if self.server_completed.contains(&tool_index) {
+            return Err(invalid_provider_stream(
+                "Messages server tool arguments arrived after completion.",
+            ));
+        }
+        self.server_arguments
+            .get_mut(&tool_index)
+            .expect("started server tool has accumulated arguments")
+            .push_str(delta);
+        let position = self
+            .blocks
+            .iter()
+            .position(|block| block.kind == BlockKind::ServerTool(tool_index))
+            .expect("started server tool has a scheduled block");
+        self.buffer(position, delta)?;
+        let mut frames = self.advance();
+        self.flush_open(&mut frames);
+        Ok(frames)
+    }
+
+    /// Schedule one whole verbatim server-tool result block at its position.
+    fn server_tool_result(&mut self, block: &str) -> Result<Vec<String>, PublicError> {
+        self.buffered_bytes = self.buffered_bytes.saturating_add(block.len());
+        if self.buffered_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
+            return Err(invalid_provider_stream(
+                "Messages stream buffered blocks exceeded the gateway response limit.",
+            ));
+        }
+        if serde_json::from_str::<Value>(block).is_err() {
+            return Err(invalid_provider_stream(
+                "Messages server tool result was not valid JSON.",
+            ));
+        }
+        let mut pending = PendingBlock::new(BlockKind::ServerResult);
+        pending.server_result_block = Some(block.to_string());
+        self.blocks.push(pending);
+        Ok(self.advance())
+    }
+
     /// Schedule one tool_use block at its start position.
     fn tool_started(
         &mut self,
@@ -475,12 +633,19 @@ impl MessagesSseEncoder {
                 let last = position == self.blocks.len() - 1;
                 let closable = self.draining
                     || match block.kind {
-                        BlockKind::Text | BlockKind::Thinking(_) | BlockKind::Redacted => !last,
+                        BlockKind::Text
+                        | BlockKind::Thinking(_)
+                        | BlockKind::Redacted
+                        | BlockKind::ServerResult => !last,
                         BlockKind::Tool(tool_index) => self.tool_completed.contains(&tool_index),
+                        BlockKind::ServerTool(tool_index) => {
+                            self.server_completed.contains(&tool_index)
+                        }
                     };
                 if !closable {
                     return frames;
                 }
+                self.flush_citations(position, &mut frames);
                 self.flush_signature(position, &mut frames);
                 let block = &self.blocks[position];
                 frames.push(event_frame(
@@ -524,6 +689,24 @@ impl MessagesSseEncoder {
                         "input": {},
                     })
                 }
+                BlockKind::ServerTool(tool_index) => {
+                    let identity = self
+                        .server_identities
+                        .get(&tool_index)
+                        .expect("scheduled server tool has an identity");
+                    json!({
+                        "type": "server_tool_use",
+                        "id": identity.0,
+                        "name": identity.1,
+                        "input": {},
+                    })
+                }
+                BlockKind::ServerResult => {
+                    let raw = block.server_result_block.take().unwrap_or_default();
+                    self.buffered_bytes = self.buffered_bytes.saturating_sub(raw.len());
+                    serde_json::from_str(&raw)
+                        .expect("scheduled server result was validated as JSON")
+                }
             };
             frames.push(event_frame(
                 "content_block_start",
@@ -534,6 +717,28 @@ impl MessagesSseEncoder {
                 }),
             ));
             self.flush_open(&mut frames);
+        }
+    }
+
+    /// Emit each retained verbatim citation as one `citations_delta` frame.
+    fn flush_citations(&mut self, position: usize, frames: &mut Vec<String>) {
+        let block = &mut self.blocks[position];
+        if block.kind != BlockKind::Text || block.pending_citations.is_empty() {
+            return;
+        }
+        let anthropic_index = block.anthropic_index;
+        for citation in block.pending_citations.drain(..) {
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(citation.len());
+            let parsed: Value =
+                serde_json::from_str(&citation).expect("retained citation was validated as JSON");
+            frames.push(event_frame(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": anthropic_index,
+                    "delta": {"type": "citations_delta", "citation": parsed},
+                }),
+            ));
         }
     }
 
@@ -558,10 +763,14 @@ impl MessagesSseEncoder {
     }
 
     /// Emit the open block's buffered content as one delta, if any.
+    /// Citations flush first: on the provider wire a block's citations can
+    /// precede the text they cover, and the accumulated block is identical
+    /// either way.
     fn flush_open(&mut self, frames: &mut Vec<String>) {
         let Some(position) = self.open_position else {
             return;
         };
+        self.flush_citations(position, frames);
         let block = &mut self.blocks[position];
         if block.pending.is_empty() {
             return;
@@ -569,10 +778,10 @@ impl MessagesSseEncoder {
         let delta = match block.kind {
             BlockKind::Text => json!({"type": "text_delta", "text": block.pending}),
             BlockKind::Thinking(_) => json!({"type": "thinking_delta", "thinking": block.pending}),
-            // Redacted blocks carry their payload in the start frame and
-            // never buffer deltas.
-            BlockKind::Redacted => return,
-            BlockKind::Tool(_) => {
+            // Redacted and server-result blocks carry their whole payload in
+            // the start frame and never buffer deltas.
+            BlockKind::Redacted | BlockKind::ServerResult => return,
+            BlockKind::Tool(_) | BlockKind::ServerTool(_) => {
                 json!({"type": "input_json_delta", "partial_json": block.pending})
             }
         };
@@ -589,178 +798,9 @@ impl MessagesSseEncoder {
     }
 }
 
-/// The terminal outcome aggregated from one Messages event stream.
-pub struct AggregatedMessage {
-    pub body: Value,
-    pub failure: Option<Failure>,
-    pub usage: Option<Usage>,
-    pub incomplete: bool,
-    pub tool_names: Vec<String>,
-}
+mod aggregate;
 
-/// Build one non-streaming Anthropic message from ordered events, mirroring
-/// the python `completed_messages_body`. Provider refusal content has no
-/// Anthropic message shape, so it aggregates as a sanitized failure.
-pub fn completed_messages_body(
-    request_id: &str,
-    model: &str,
-    events: &[Event],
-) -> Result<AggregatedMessage, PublicError> {
-    let terminal = events.iter().rev().find(|event| event.is_terminal());
-    let terminal = match terminal {
-        Some(event) => event,
-        None => {
-            return Err(PublicError::new(
-                502,
-                "all_routes_failed",
-                "Provider stream ended without a terminal result.",
-                "api_error",
-            ))
-        }
-    };
-    let mut usage: Option<Usage> = None;
-    for event in events.iter().rev() {
-        if let Event::Usage(candidate) = event {
-            if candidate.has_token_counts() {
-                usage = Some(candidate.clone());
-                break;
-            }
-        }
-    }
-    let mut tool_names: Vec<String> = Vec::new();
-    for event in events {
-        if let Event::ToolCallCompleted { call, .. } = event {
-            if !tool_names.contains(&call.name) {
-                tool_names.push(call.name.clone());
-            }
-        }
-    }
-    if let Event::Failed(failure) = terminal {
-        return Ok(AggregatedMessage {
-            body: Value::Null,
-            failure: Some(failure.clone()),
-            usage,
-            incomplete: false,
-            tool_names,
-        });
-    }
-    let incomplete = matches!(terminal, Event::Incomplete);
-    if events.iter().any(|event| {
-        matches!(
-            event,
-            Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
-        )
-    }) {
-        return Ok(AggregatedMessage {
-            body: Value::Null,
-            failure: Some(refusal_failure()),
-            usage,
-            incomplete,
-            tool_names,
-        });
-    }
-    // Blocks preserve provider order, merging adjacent text deltas, so the
-    // non-streaming content sequence equals the streaming block sequence.
-    // Tool blocks anchor at their start position: some dialects (OpenAI-
-    // compatible streams) emit every tool completion only at their terminal
-    // sentinel, after later text.
-    let mut slots: Vec<Option<Value>> = Vec::new();
-    let mut tool_positions: HashMap<u32, usize> = HashMap::new();
-    let mut thinking_positions: HashMap<u32, usize> = HashMap::new();
-    let mut saw_tool_use = false;
-    // Resolve one thinking slot per provider index, creating the block with
-    // the SDK-required empty fields on first use.
-    fn thinking_slot<'a>(
-        slots: &'a mut Vec<Option<Value>>,
-        positions: &mut HashMap<u32, usize>,
-        index: u32,
-    ) -> &'a mut Value {
-        let position = *positions.entry(index).or_insert_with(|| {
-            slots.push(Some(
-                json!({"type": "thinking", "thinking": "", "signature": ""}),
-            ));
-            slots.len() - 1
-        });
-        slots[position].as_mut().expect("thinking slot is filled")
-    }
-    for event in events {
-        match event {
-            Event::TextDelta(delta) | Event::ProviderTextDelta { delta, .. }
-                if !delta.is_empty() =>
-            {
-                let appended = match slots.last_mut() {
-                    Some(Some(block)) if block["type"] == json!("text") => {
-                        if let Some(Value::String(text)) = block.get_mut("text") {
-                            text.push_str(delta);
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                };
-                if !appended {
-                    slots.push(Some(json!({"type": "text", "text": delta})));
-                }
-            }
-            Event::ThinkingDelta { index, delta } if !delta.is_empty() => {
-                let block = thinking_slot(&mut slots, &mut thinking_positions, *index);
-                if let Some(Value::String(text)) = block.get_mut("thinking") {
-                    text.push_str(delta);
-                }
-            }
-            Event::ThinkingSignature { index, signature } => {
-                let block = thinking_slot(&mut slots, &mut thinking_positions, *index);
-                if let Some(Value::String(text)) = block.get_mut("signature") {
-                    text.push_str(signature);
-                }
-            }
-            Event::RedactedThinking { data, .. } => {
-                slots.push(Some(json!({"type": "redacted_thinking", "data": data})));
-            }
-            Event::ToolCallStarted { index, .. } => {
-                tool_positions.insert(*index, slots.len());
-                slots.push(None);
-            }
-            Event::ToolCallCompleted { index, call } => {
-                if let Some(position) = tool_positions.get(index) {
-                    saw_tool_use = true;
-                    // The raw argument text was validated as one JSON object
-                    // by the normalizer; preserve_order keeps its key order,
-                    // matching the python engine's parsed-object
-                    // serialization.
-                    let input: Value = serde_json::from_str(&call.raw_arguments)
-                        .map_err(|_| PublicError::internal())?;
-                    slots[*position] = Some(json!({
-                        "type": "tool_use",
-                        "id": call.call_id,
-                        "name": call.name,
-                        "input": input,
-                    }));
-                }
-            }
-            _ => {}
-        }
-    }
-    let content: Vec<Value> = slots.into_iter().flatten().collect();
-    let body = json!({
-        "id": stable_public_id("msg", request_id),
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": content,
-        "stop_reason": stop_reason(incomplete, saw_tool_use),
-        "stop_sequence": Value::Null,
-        "usage": messages_usage(usage.as_ref()),
-    });
-    Ok(AggregatedMessage {
-        body,
-        failure: None,
-        usage,
-        incomplete,
-        tool_names,
-    })
-}
+pub use aggregate::completed_messages_body;
 
 #[cfg(test)]
 mod tests;

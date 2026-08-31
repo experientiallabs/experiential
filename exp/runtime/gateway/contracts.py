@@ -261,6 +261,20 @@ class GatewayMessage(ContractModel):
     other carriers so item-free digests are unperturbed; a present item
     joins replay identity through :func:`canonical_request_sha256`.
     """
+    provider_anthropic_block: JsonObject | None = Field(default=None, exclude=True)
+    """One verbatim Anthropic content block the gateway carries opaquely.
+
+    Server tools return ``server_tool_use`` and ``web_search_tool_result``
+    blocks, plus citation-bearing ``text`` blocks (citations exist only as
+    server-tool output), whose shapes exist on no other wire; a caller
+    echoing them in history gets each carried shallowly at its position and
+    re-emitted byte-for-byte on native Anthropic rungs only (route admission
+    mirrors ``provider_native_item``). Decode splits the assistant turn at
+    block boundaries so re-emission preserves the exact block order. A
+    message carrying it carries nothing else. Excluded from serialization
+    like the other carriers so block-free digests are unperturbed; a present
+    block joins replay identity through :func:`canonical_request_sha256`.
+    """
 
     @model_validator(mode="after")
     def _require_role_coherence(self) -> GatewayMessage:
@@ -282,6 +296,17 @@ class GatewayMessage(ContractModel):
                 or self.tool_is_error
             ):
                 raise ValueError("a native provider item carries the whole message")
+            return self
+        if self.provider_anthropic_block is not None:
+            if (
+                self.content is not None
+                or self.tool_calls
+                or self.provider_reasoning
+                or self.provider_item_id is not None
+                or self.tool_call_id is not None
+                or self.tool_is_error
+            ):
+                raise ValueError("a native Anthropic block carries the whole message")
             return self
         if (
             self.content is None
@@ -462,6 +487,20 @@ class GatewayRequest(ContractModel):
     other Anthropic-only carriers; a present value joins replay identity
     through :func:`canonical_request_sha256`.
     """
+    provider_server_tools: tuple[JsonObject, ...] = Field(default=(), exclude=True)
+    """Verbatim Anthropic server-tool entries from the Messages ``tools`` array.
+
+    Server tools (``web_search_20250305``-style typed entries with no
+    ``input_schema``) execute at the provider; their per-type configuration
+    is an evolving provider surface, so each entry is validated shallowly at
+    decode and re-emitted byte-for-byte AFTER the converted custom tools on
+    native Anthropic rungs only (an accepted ordering deviation from the
+    caller's interleaving). Other rungs cannot execute them, so route
+    admission rejects by name instead of silently dropping a capability the
+    caller asked for. Excluded from serialization like the other carriers so
+    server-tool-free digests are unperturbed; present entries join replay
+    identity through :func:`canonical_request_sha256`.
+    """
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
@@ -532,12 +571,18 @@ class GatewayRequest(ContractModel):
         names = tuple(tool.name for tool in self.tools)
         if len(set(names)) != len(names):
             raise ValueError("gateway tool names must not repeat")
+        # Server tools are addressable by tool_choice too; the provider owns
+        # cross-set name rules for the verbatim entries.
+        server_names = tuple(
+            str(entry["name"]) for entry in self.provider_server_tools if "name" in entry
+        )
         if (
             isinstance(self.tool_choice, GatewayNamedToolChoice)
             and self.tool_choice.name not in names
+            and self.tool_choice.name not in server_names
         ):
             raise ValueError("named gateway tool choice must name a request tool")
-        if self.tool_choice == "required" and not self.tools:
+        if self.tool_choice == "required" and not self.tools and not self.provider_server_tools:
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
@@ -574,6 +619,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("Anthropic tool carriers are valid only for Messages requests")
         if self.provider_beta_tokens and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_beta_tokens are valid only for Messages requests")
+        if self.provider_server_tools and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("provider_server_tools are valid only for Messages requests")
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
             raise ValueError("maximum output parameter requires a maximum output value")
         if self.reasoning_summary_parameters and self.reasoning_summary is None:
@@ -611,6 +658,8 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
             authority["provider_phase"] = message.provider_phase
         if message.provider_native_item is not None:
             authority["provider_native_item"] = message.provider_native_item
+        if message.provider_anthropic_block is not None:
+            authority["provider_anthropic_block"] = message.provider_anthropic_block
         if message.provider_reasoning:
             blocks: list[JsonObject] = []
             for block in message.provider_reasoning:
@@ -671,6 +720,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and request.speed is None
         and request.inference_geo is None
         and not request.provider_beta_tokens
+        and not request.provider_server_tools
     ):
         return None
     envelope: JsonObject = {
@@ -692,6 +742,8 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         envelope["tools"] = retained_tools
     if request.provider_beta_tokens:
         envelope["provider_beta_tokens"] = list(request.provider_beta_tokens)
+    if request.provider_server_tools:
+        envelope["provider_server_tools"] = list(request.provider_server_tools)
     return envelope
 
 
@@ -922,49 +974,3 @@ class ExecutionSnapshot(ContractModel):
     exact_model_id: ExactModelId
     pool_id: ExactModelPoolId
     deployment_ids: tuple[DeploymentId, ...] = Field(min_length=1)
-
-
-class CompatibilityDisposition(StrEnum):
-    """How one installed public request field is handled by the gateway.
-
-    ``IGNORED`` keeps a compatibility field valid at the public boundary while
-    deliberately omitting it from provider dispatch when the normalized gateway
-    response cannot preserve its result.
-    """
-
-    SUPPORTED = "supported"
-    CONDITIONALLY_SUPPORTED = "conditionally_supported"
-    METADATA_ONLY = "metadata_only"
-    IGNORED = "ignored"
-    UNSUPPORTED = "unsupported"
-
-
-class CompatibilityField(ContractModel):
-    """One explicit public-field decision in a versioned compatibility manifest."""
-
-    field_path: str = Field(min_length=1, max_length=512)
-    disposition: CompatibilityDisposition
-    capability: str | None = Field(default=None, min_length=1, max_length=256)
-
-
-class CompatibilityManifest(ContractModel):
-    """Closed field-classification contract for one public API surface."""
-
-    schema_version: int = Field(ge=1)
-    surface: GatewayApiSurface
-    fields: tuple[CompatibilityField, ...]
-
-    @model_validator(mode="after")
-    def _require_unique_field_paths(self) -> CompatibilityManifest:
-        """Reject duplicate field decisions that could make parsing ambiguous.
-
-        Returns:
-            The validated manifest.
-
-        Raises:
-            ValueError: A field path appears more than once.
-        """
-        paths = tuple(field.field_path for field in self.fields)
-        if len(set(paths)) != len(paths):
-            raise ValueError("compatibility manifest field paths must be unique")
-        return self

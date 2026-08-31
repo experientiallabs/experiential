@@ -174,9 +174,52 @@ pub enum Event {
         index: u32,
         call: CompletedToolCall,
     },
+    /// One provider-executed Anthropic server tool invocation opening
+    /// (`server_tool_use`); the provider runs the tool itself, so these
+    /// never become client tool calls or affect the tool-use stop reason.
+    ServerToolUseStarted {
+        index: u32,
+        call_id: String,
+        name: String,
+    },
+    /// Raw provider-order input fragment for one open server tool use.
+    ServerToolArgumentsDelta {
+        index: u32,
+        delta: String,
+    },
+    /// One completed server tool invocation with its validated input text.
+    ServerToolUseCompleted {
+        index: u32,
+        call: CompletedToolCall,
+    },
+    /// One whole verbatim Anthropic server-tool result content block
+    /// (`web_search_tool_result`), carried as compact JSON text: the result
+    /// arrives complete in its start frame and must reach the caller intact.
+    ServerToolResult {
+        index: u32,
+        block: String,
+    },
+    /// Provider text content-block boundary on the Anthropic wire. Emitted
+    /// before that block's first text delta so the Messages encoder can
+    /// mirror the provider's block structure (citations attach per block);
+    /// encoders without a block concept ignore it.
+    TextBlockStarted {
+        index: u32,
+    },
+    /// One whole verbatim citation object attached to the open Anthropic
+    /// text block (`citations_delta`), carried as compact JSON text.
+    CitationDelta {
+        index: u32,
+        citation: String,
+    },
     Usage(Usage),
     Completed,
     Incomplete,
+    /// Anthropic `pause_turn` terminal: the provider paused a long-running
+    /// server-tool turn and expects the caller to resend the conversation to
+    /// continue it. Settlement treats it like a completed turn; the Messages
+    /// encoder must preserve the stop reason or the caller never resumes.
+    PausedTurn,
     Failed(Failure),
 }
 
@@ -184,7 +227,7 @@ impl Event {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Event::Completed | Event::Incomplete | Event::Failed(_)
+            Event::Completed | Event::Incomplete | Event::PausedTurn | Event::Failed(_)
         )
     }
 
@@ -208,8 +251,9 @@ impl Event {
             | Event::ReasoningSummaryDelta { delta, .. }
             | Event::ThinkingDelta { delta, .. }
             | Event::ReasoningContentDelta { delta, .. }
-            | Event::ToolArgumentsDelta { delta, .. } => !delta.is_empty(),
-            Event::ToolCallStarted { .. } => true,
+            | Event::ToolArgumentsDelta { delta, .. }
+            | Event::ServerToolArgumentsDelta { delta, .. } => !delta.is_empty(),
+            Event::ToolCallStarted { .. } | Event::ServerToolUseStarted { .. } => true,
             _ => false,
         }
     }
@@ -358,6 +402,42 @@ pub fn simplified_event(event: &Event) -> Value {
             }
             payload
         }
+        Event::ServerToolUseStarted {
+            index,
+            call_id,
+            name,
+        } => serde_json::json!({
+            "kind": "server_tool_use_started",
+            "index": index,
+            "call_id": call_id,
+            "name": name,
+        }),
+        Event::ServerToolArgumentsDelta { index, delta } => serde_json::json!({
+            "kind": "server_tool_arguments_delta",
+            "index": index,
+            "text": delta,
+        }),
+        Event::ServerToolUseCompleted { index, call } => serde_json::json!({
+            "kind": "server_tool_use_completed",
+            "index": index,
+            "call_id": call.call_id,
+            "name": call.name,
+            "raw_arguments": call.raw_arguments,
+        }),
+        Event::ServerToolResult { index, block } => serde_json::json!({
+            "kind": "server_tool_result",
+            "index": index,
+            "block": block,
+        }),
+        Event::TextBlockStarted { index } => serde_json::json!({
+            "kind": "text_block_started",
+            "index": index,
+        }),
+        Event::CitationDelta { index, citation } => serde_json::json!({
+            "kind": "citation_delta",
+            "index": index,
+            "citation": citation,
+        }),
         Event::Usage(usage) => serde_json::json!({
             "kind": "usage",
             "input_tokens": usage.input_tokens,
@@ -367,6 +447,7 @@ pub fn simplified_event(event: &Event) -> Value {
         }),
         Event::Completed => serde_json::json!({"kind": "completed"}),
         Event::Incomplete => serde_json::json!({"kind": "incomplete"}),
+        Event::PausedTurn => serde_json::json!({"kind": "paused_turn"}),
         Event::Failed(failure) => serde_json::json!({
             "kind": "failed",
             "failure_class": failure.failure_class.as_str(),
@@ -411,6 +492,10 @@ pub struct ToolAccumulator {
     pub raw_arguments: String,
     pub completed: bool,
     pub custom: bool,
+    /// Whether this is a provider-executed Anthropic server tool
+    /// (`server_tool_use`), whose lifecycle events stay on the dedicated
+    /// server-tool variants and never count toward the tool-use stop reason.
+    pub server: bool,
 }
 
 impl ToolAccumulator {
@@ -423,6 +508,7 @@ impl ToolAccumulator {
             raw_arguments: String::new(),
             completed: false,
             custom: false,
+            server: false,
         }
     }
 
@@ -470,6 +556,24 @@ pub fn count_or_zero(object: &Map<String, Value>, key: &str, label: &str) -> Res
             .as_u64()
             .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
             .ok_or_else(|| format!("{label} must be a non-negative integer")),
+    }
+}
+
+/// Read one count only when its key is present and non-null: an absent key
+/// yields `None` so a partial usage report never overwrites an earlier leg
+/// with an invented zero.
+pub fn count_if_present(
+    object: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<Option<u64>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
+            .map(Some)
+            .ok_or_else(|| format!("{label}.{key} must be a non-negative integer")),
     }
 }
 

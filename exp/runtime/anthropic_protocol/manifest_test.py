@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from exp.runtime.anthropic_protocol.manifest import MESSAGES_MANIFEST
-from exp.runtime.gateway.contracts import CompatibilityDisposition, GatewayApiSurface
+from exp.runtime.gateway.compatibility import CompatibilityDisposition
+from exp.runtime.gateway.contracts import GatewayApiSurface
 
 
 def test_manifest_binds_the_messages_surface_with_unique_fields() -> None:
@@ -96,3 +97,48 @@ def test_route_identity_and_delegation_fields_are_recorded_rejections() -> None:
         assert decisions[path] == CompatibilityDisposition.UNSUPPORTED
     for path in ("cache_control", "inference_geo"):
         assert decisions[path] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+
+
+def _sdk_tool_type_literals() -> set[str]:
+    """Collect every ``type`` literal on the official GA and beta tool unions."""
+    import typing
+
+    from anthropic.types import tool_union_param
+    from anthropic.types.beta import beta_tool_union_param
+
+    literals: set[str] = set()
+    for union in (tool_union_param.ToolUnionParam, beta_tool_union_param.BetaToolUnionParam):
+        for member in typing.get_args(union):
+            if typing.get_origin(member) is not None:
+                member = typing.get_args(member)[0]
+            annotation = typing.get_type_hints(member, include_extras=True)["type"]
+            while typing.get_origin(annotation) is not typing.Literal:
+                arguments = typing.get_args(annotation)
+                assert arguments, f"{member.__name__}.type carries no literal"
+                annotation = arguments[0]
+            literals.update(typing.get_args(annotation))
+    return literals
+
+
+def test_every_official_sdk_tool_type_is_consciously_classified() -> None:
+    """Anthropic-defined tool types are part of the drift gate.
+
+    Claude Code's WebSearch sends ``web_search_20250305`` by default (a
+    production session was answered with a 400 before the accept table
+    existed), so every ``type`` literal on the official tool unions must be
+    a conscious decision: served verbatim, or rejected by name with the
+    reason recorded in the table docstrings.
+    """
+    from exp.runtime.anthropic_protocol.manifest import (
+        MESSAGES_SERVER_TOOL_TYPES_ACCEPTED,
+        MESSAGES_SERVER_TOOL_TYPES_REJECTED,
+    )
+
+    assert not MESSAGES_SERVER_TOOL_TYPES_ACCEPTED & MESSAGES_SERVER_TOOL_TYPES_REJECTED
+    # "custom" is the caller-defined tool discriminator handled by the strict
+    # custom-tool model, never a server tool decision.
+    sdk_types = _sdk_tool_type_literals() - {"custom"}
+    undecided = (
+        sdk_types - MESSAGES_SERVER_TOOL_TYPES_ACCEPTED - MESSAGES_SERVER_TOOL_TYPES_REJECTED
+    )
+    assert not undecided, _decided(undecided, "Anthropic-defined tool")

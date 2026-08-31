@@ -259,6 +259,17 @@ impl ChatSseEncoder {
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
             | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
+            // Anthropic text-block boundaries and citation metadata have no
+            // Chat representation; the text itself streams through TextDelta.
+            Event::TextBlockStarted { .. } | Event::CitationDelta { .. } => Ok(Vec::new()),
+            // Server tools enter only through a Messages request, which
+            // never encodes on the Chat surface.
+            Event::ServerToolUseStarted { .. }
+            | Event::ServerToolArgumentsDelta { .. }
+            | Event::ServerToolUseCompleted { .. }
+            | Event::ServerToolResult { .. } => Err(invalid_provider_stream(
+                "Chat cannot represent a provider server tool.",
+            )),
             Event::ToolCallStarted {
                 index,
                 call_id,
@@ -330,7 +341,7 @@ impl ChatSseEncoder {
                 }
                 Ok(Vec::new())
             }
-            Event::Completed | Event::Incomplete => {
+            Event::Completed | Event::Incomplete | Event::PausedTurn => {
                 self.terminal = true;
                 let finish_reason = if matches!(event, Event::Incomplete) {
                     "length"

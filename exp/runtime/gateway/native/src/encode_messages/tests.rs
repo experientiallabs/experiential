@@ -404,3 +404,188 @@ fn interleaved_thinking_between_tool_blocks_keeps_sequential_indices() {
     assert_eq!(aggregated.body["content"][1]["type"], json!("tool_use"));
     assert_eq!(aggregated.body["stop_reason"], json!("tool_use"));
 }
+
+/// The captured live WebSearch lifecycle (2026-08-31): server tool use with
+/// streamed input, one whole verbatim result block, then a cited answer.
+fn web_search_events() -> Vec<Event> {
+    let result_block = json!({
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": [{
+            "type": "web_search_result",
+            "title": "Python versions",
+            "url": "https://www.python.org/doc/versions/",
+            "encrypted_content": "EtGzBA==",
+            "page_age": "March 12, 2026",
+        }],
+        "caller": {"type": "direct"},
+    });
+    let citation = json!({
+        "type": "web_search_result_location",
+        "cited_text": "Python 3.14.7, released on 5 August 2026",
+        "url": "https://www.python.org/doc/versions/",
+        "title": "Python versions",
+        "encrypted_index": "Eo8BCg==",
+    });
+    vec![
+        Event::ServerToolUseStarted {
+            index: 0,
+            call_id: "srvtoolu_1".to_string(),
+            name: "web_search".to_string(),
+        },
+        Event::ServerToolArgumentsDelta {
+            index: 0,
+            delta: "{\"query\": \"current stable Python\"}".to_string(),
+        },
+        Event::ServerToolUseCompleted {
+            index: 0,
+            call: CompletedToolCall {
+                call_id: "srvtoolu_1".to_string(),
+                name: "web_search".to_string(),
+                provider_item_id: None,
+                provider_status: None,
+                raw_arguments: "{\"query\": \"current stable Python\"}".to_string(),
+                custom: false,
+            },
+        },
+        Event::ServerToolResult {
+            index: 1,
+            block: compact_json(&result_block),
+        },
+        Event::TextBlockStarted { index: 2 },
+        Event::CitationDelta {
+            index: 2,
+            citation: compact_json(&citation),
+        },
+        Event::TextDelta("The current stable Python version is 3.14.7.".to_string()),
+        Event::Completed,
+    ]
+}
+
+#[test]
+fn server_tool_blocks_stream_in_valid_anthropic_order() {
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    let mut frames = encoder.start().expect("starts");
+    for event in &web_search_events() {
+        frames.extend(encoder.feed(event).expect("streams server tools"));
+    }
+    let names: Vec<&str> = frames
+        .iter()
+        .map(|frame| {
+            frame
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("event: "))
+                .expect("named frame")
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "message_start",
+            "ping",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    assert!(
+        frames[2].contains(
+            "{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{}}"
+        ),
+        "server tool start frame: {}",
+        frames[2]
+    );
+    assert!(frames[3]
+        .contains("{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\": \\\"current stable Python\\\"}\"}"));
+    // The whole verbatim result block rides its start frame, caller field
+    // included.
+    assert!(frames[5].contains("\"type\":\"web_search_tool_result\""));
+    assert!(frames[5].contains("\"caller\":{\"type\":\"direct\"}"));
+    // Citations flush on the text block before its text, mirroring the
+    // provider's own delta order.
+    assert!(frames[8].contains("\"type\":\"citations_delta\""));
+    assert!(frames[8].contains("\"cited_text\":\"Python 3.14.7, released on 5 August 2026\""));
+    assert!(frames[9].contains("\"type\":\"text_delta\""));
+    // Server tool use is provider-executed: the turn still ends end_turn.
+    assert!(frames[11].contains("\"stop_reason\":\"end_turn\""));
+}
+
+#[test]
+fn completed_body_carries_server_tool_blocks_and_citations() {
+    let aggregated =
+        completed_messages_body("request-abc", "coding", &web_search_events()).expect("aggregates");
+    assert!(aggregated.failure.is_none());
+    assert_eq!(aggregated.body["stop_reason"], json!("end_turn"));
+    assert_eq!(aggregated.tool_names, vec!["web_search".to_string()]);
+    let content = aggregated.body["content"].as_array().expect("content");
+    assert_eq!(content.len(), 3);
+    assert_eq!(
+        content[0],
+        json!({
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {"query": "current stable Python"},
+        })
+    );
+    assert_eq!(content[1]["type"], json!("web_search_tool_result"));
+    assert_eq!(content[1]["caller"], json!({"type": "direct"}));
+    assert_eq!(
+        content[2]["text"],
+        json!("The current stable Python version is 3.14.7.")
+    );
+    assert_eq!(
+        content[2]["citations"][0]["cited_text"],
+        json!("Python 3.14.7, released on 5 August 2026")
+    );
+}
+
+#[test]
+fn paused_turn_keeps_its_stop_reason_on_both_paths() {
+    let events = vec![
+        Event::ServerToolUseStarted {
+            index: 0,
+            call_id: "srvtoolu_1".to_string(),
+            name: "web_search".to_string(),
+        },
+        Event::ServerToolArgumentsDelta {
+            index: 0,
+            delta: "{}".to_string(),
+        },
+        Event::ServerToolUseCompleted {
+            index: 0,
+            call: CompletedToolCall {
+                call_id: "srvtoolu_1".to_string(),
+                name: "web_search".to_string(),
+                provider_item_id: None,
+                provider_status: None,
+                raw_arguments: "{}".to_string(),
+                custom: false,
+            },
+        },
+        Event::PausedTurn,
+    ];
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    let mut frames = encoder.start().expect("starts");
+    for event in &events {
+        frames.extend(encoder.feed(event).expect("streams pause"));
+    }
+    assert!(encoder.saw_terminal());
+    let message_delta = frames
+        .iter()
+        .find(|frame| frame.starts_with("event: message_delta"))
+        .expect("message_delta frame");
+    assert!(message_delta.contains("\"stop_reason\":\"pause_turn\""));
+    let aggregated = completed_messages_body("request-abc", "coding", &events).expect("aggregates");
+    assert_eq!(aggregated.body["stop_reason"], json!("pause_turn"));
+    assert!(!aggregated.incomplete);
+}

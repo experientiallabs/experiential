@@ -443,6 +443,10 @@ ANTHROPIC_THINKING_EVENTS: tuple[JsonObject, ...] = (
     {"kind": "thinking_delta", "index": 0, "text": "step one"},
     {"kind": "thinking_signature", "index": 0, "signature": "c2ln"},
     {"kind": "redacted_thinking", "index": 1, "data": "b3BhcXVl"},
+    # Every Anthropic text block opens with its boundary event so the
+    # Messages encoder mirrors the provider's block structure (citations
+    # attach per block); block-less encoders ignore it.
+    {"kind": "text_block_started", "index": 2},
     {"kind": "text_delta", "text": "Hi"},
     {
         "kind": "usage",
@@ -577,6 +581,123 @@ def test_native_anthropic_normalizer_completes_a_zero_argument_tool_call() -> No
         },
         {"kind": "completed"},
     ]
+
+
+# Captured from a live api.anthropic.com web_search stream (2026-08-31,
+# claude-haiku-4-5, ids neutralized, results trimmed to one and encrypted
+# payloads shortened; structure and frame order are the real wire): the
+# server_tool_use block streams input like a client tool but with an
+# srvtoolu_ id, the whole web_search_tool_result block (caller field
+# included) rides its start frame, the answer text block opens with an empty
+# citations array and its citations_delta arrives BEFORE the first
+# text_delta, and the terminal usage reports the true post-search input
+# total (12284) that the message_start count (2230) severely undercounts.
+ANTHROPIC_LIVE_WEB_SEARCH_FRAMES: tuple[bytes, ...] = (
+    b'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-haiku-4-5",'
+    b'"id":"msg_fixture","type":"message","role":"assistant","content":[],"stop_reason":null,'
+    b'"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2230,'
+    b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":'
+    b'{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":25,'
+    b'"service_tier":"standard","inference_geo":"not_available"}}         }\n\n',
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+    b'"content_block":{"type":"server_tool_use","id":"srvtoolu_fixture","name":"web_search",'
+    b'"input":{}}            }\n\n',
+    b'event: ping\ndata: {"type": "ping"}\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"input_json_delta","partial_json":""}             }\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"input_json_delta","partial_json":"{\\"query\\": \\"c"}}\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+    b'"delta":{"type":"input_json_delta","partial_json":"urrent stable Python\\"}"}  }\n\n',
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0 }\n\n',
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":1,'
+    b'"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_fixture",'
+    b'"content":[{"type":"web_search_result","title":"Python versions",'
+    b'"url":"https://www.python.org/doc/versions/","encrypted_content":"Et8QCioIExgC",'
+    b'"page_age":"March 12, 2026"}],"caller":{"type":"direct"}}        }\n\n',
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":1    }\n\n',
+    b'event: content_block_start\ndata: {"type":"content_block_start","index":2,'
+    b'"content_block":{"citations":[],"type":"text","text":""}}\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,'
+    b'"delta":{"type":"citations_delta","citation":{"type":"web_search_result_location",'
+    b'"cited_text":"Python 3.14.7, released on 5 August 2026",'
+    b'"url":"https://www.python.org/doc/versions/","title":"Python versions",'
+    b'"encrypted_index":"Eo8BCioIExgC"}}  }\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,'
+    b'"delta":{"type":"text_delta","text":"The"}       }\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","index":2,'
+    b'"delta":{"type":"text_delta","text":" current stable Python version is 3.14.7."} }\n\n',
+    b'event: content_block_stop\ndata: {"type":"content_block_stop","index":2 }\n\n',
+    b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn",'
+    b'"stop_sequence":null,"stop_details":null},"usage":{"input_tokens":12284,'
+    b'"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":103,'
+    b'"server_tool_use":{"web_search_requests":1,"web_fetch_requests":0}}     }\n\n',
+    b'event: message_stop\ndata: {"type":"message_stop"  }\n\n',
+)
+
+ANTHROPIC_LIVE_WEB_SEARCH_EVENTS: tuple[JsonObject, ...] = (
+    {
+        "kind": "server_tool_use_started",
+        "index": 0,
+        "call_id": "srvtoolu_fixture",
+        "name": "web_search",
+    },
+    {"kind": "server_tool_arguments_delta", "index": 0, "text": ""},
+    {"kind": "server_tool_arguments_delta", "index": 0, "text": '{"query": "c'},
+    {"kind": "server_tool_arguments_delta", "index": 0, "text": 'urrent stable Python"}'},
+    {
+        "kind": "server_tool_use_completed",
+        "index": 0,
+        "call_id": "srvtoolu_fixture",
+        "name": "web_search",
+        "raw_arguments": '{"query": "current stable Python"}',
+    },
+    {
+        "kind": "server_tool_result",
+        "index": 1,
+        "block": (
+            '{"type":"web_search_tool_result","tool_use_id":"srvtoolu_fixture",'
+            '"content":[{"type":"web_search_result","title":"Python versions",'
+            '"url":"https://www.python.org/doc/versions/","encrypted_content":"Et8QCioIExgC",'
+            '"page_age":"March 12, 2026"}],"caller":{"type":"direct"}}'
+        ),
+    },
+    {"kind": "text_block_started", "index": 2},
+    {
+        "kind": "citation_delta",
+        "index": 2,
+        "citation": (
+            '{"type":"web_search_result_location",'
+            '"cited_text":"Python 3.14.7, released on 5 August 2026",'
+            '"url":"https://www.python.org/doc/versions/","title":"Python versions",'
+            '"encrypted_index":"Eo8BCioIExgC"}'
+        ),
+    },
+    {"kind": "text_delta", "text": "The"},
+    {"kind": "text_delta", "text": " current stable Python version is 3.14.7."},
+    {
+        "kind": "usage",
+        # The terminal usage report supersedes the start-frame input legs:
+        # the model re-reads fetched results as input.
+        "input_tokens": 12284,
+        "output_tokens": 103,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": None,
+    },
+    {"kind": "completed"},
+)
+
+
+def test_native_anthropic_normalizer_decodes_the_live_web_search_wire() -> None:
+    """The captured WebSearch wire decodes to dedicated server-tool events.
+
+    Production incident (2026-08-31 class): server_tool_use blocks were
+    skipped as unknown, so their input_json_delta frames failed the whole
+    stream as malformed, and the request itself 400d at decode.
+    """
+    result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_WEB_SEARCH_FRAMES)
+    assert result["failure"] is None
+    assert result["events"] == list(ANTHROPIC_LIVE_WEB_SEARCH_EVENTS)
 
 
 def test_native_responses_preserves_multi_message_status_phase_and_idless_call() -> None:

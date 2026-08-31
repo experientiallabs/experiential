@@ -546,6 +546,25 @@ def route_generation_parameter_requests(
                 param="thinking.type",
                 code="unsupported_parameter",
             )
+    server_tools_present = bool(request.provider_server_tools) or any(
+        message.provider_anthropic_block is not None for message in request.messages
+    )
+    if server_tools_present and not all(
+        profile.dialect == "anthropic_messages" for profile in profiles
+    ):
+        # Server tools execute at the provider; silently dropping a search
+        # capability the caller asked for would be a behavior lie, so a
+        # route that cannot serve them rejects by name instead.
+        raise ProviderParameterError(
+            message=(
+                "The request carries Anthropic server tools (web_search-style "
+                "entries or their echoed result blocks) that only a native "
+                "Anthropic route can serve. Remove the server tools or choose "
+                "a different model alias."
+            ),
+            param="tools",
+            code="unsupported_parameter",
+        )
     if any(message.provider_native_item is not None for message in request.messages) and not all(
         profile.dialect == "openai_responses" for profile in profiles
     ):
@@ -608,7 +627,12 @@ def route_generation_parameter_requests(
 
     # Tool-selection controls have no semantics without tool definitions and
     # several provider APIs reject the otherwise harmless combination.
-    if not request.tools:
+    # Verbatim server tools are tool definitions too: a request carrying only
+    # web_search keeps its tool_choice on the wire.
+    server_tool_names = tuple(
+        str(entry["name"]) for entry in request.provider_server_tools if "name" in entry
+    )
+    if not request.tools and not request.provider_server_tools:
         if request.tool_choice == "required" or isinstance(
             request.tool_choice, GatewayNamedToolChoice
         ):
@@ -624,8 +648,10 @@ def route_generation_parameter_requests(
             ignore("tool_choice")
         if request.parallel_tool_calls is not None:
             ignore("parallel_tool_calls")
-    elif isinstance(request.tool_choice, GatewayNamedToolChoice) and not any(
-        tool.name == request.tool_choice.name for tool in request.tools
+    elif (
+        isinstance(request.tool_choice, GatewayNamedToolChoice)
+        and not any(tool.name == request.tool_choice.name for tool in request.tools)
+        and request.tool_choice.name not in server_tool_names
     ):
         raise ProviderParameterError(
             message=(

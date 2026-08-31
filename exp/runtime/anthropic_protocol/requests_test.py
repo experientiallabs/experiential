@@ -706,3 +706,199 @@ def test_validation_errors_state_the_expectation_not_only_the_field() -> None:
     assert invalid.value.detail.param == "tools.0.strict"
     assert "Invalid value for 'tools.0.strict'" in invalid.value.detail.message
     assert "bool" in invalid.value.detail.message
+
+
+def test_the_prod_failing_web_search_tool_shape_decodes() -> None:
+    """The exact Claude Code WebSearch entry decodes and carries verbatim.
+
+    Production incident (2026-08-31 class): the strict custom-tool model
+    400d every session with WebSearch enabled because the server tool entry
+    carries no input_schema.
+    """
+    server_entry: JsonObject = {
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 8,
+    }
+    decoded = decode_messages(
+        _body(
+            tools=[
+                {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+                server_entry,
+            ],
+            tool_choice={"type": "auto"},
+        )
+    )
+    request = decoded.request
+    assert tuple(tool.name for tool in request.tools) == ("Bash",)
+    # The carried entry equals the raw payload object byte-for-byte.
+    assert request.provider_server_tools == (server_entry,)
+
+
+def test_every_verified_web_search_version_decodes() -> None:
+    """All live-verified web_search versions pass the accept table."""
+    for tool_type in ("web_search_20250305", "web_search_20260209", "web_search_20260318"):
+        decoded = decode_messages(_body(tools=[{"type": tool_type, "name": "web_search"}]))
+        entries = decoded.request.provider_server_tools
+        assert len(entries) == 1 and entries[0]["type"] == tool_type
+
+
+def test_unserved_server_tool_types_are_rejected_by_name() -> None:
+    """A classified-but-unserved or unknown server tool type 400s loudly."""
+    for tool_type in ("web_fetch_20250910", "code_execution_20250522", "someday_20990101"):
+        with pytest.raises(OpenAIProtocolError) as error:
+            decode_messages(_body(tools=[{"type": tool_type, "name": "t"}]))
+        assert error.value.status_code == 400
+        assert tool_type in error.value.detail.message
+        assert "web_search_20250305" in error.value.detail.message
+
+
+def test_malformed_server_tool_entries_are_rejected() -> None:
+    """A non-pattern type or a nameless server entry stays a validation error."""
+    for entry in (
+        {"type": "Web Search!", "name": "web_search"},
+        {"type": "web_search_20250305"},
+    ):
+        with pytest.raises(OpenAIProtocolError) as error:
+            decode_messages(_body(tools=[entry]))
+        assert error.value.status_code == 400
+
+
+def _echoed_web_search_turn() -> list[JsonObject]:
+    """The assistant blocks a served WebSearch turn echoes back (live shape)."""
+    return [
+        {
+            "type": "server_tool_use",
+            "id": "srvtoolu_fixture",
+            "name": "web_search",
+            "input": {"query": "current stable Python"},
+        },
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_fixture",
+            "content": [
+                {
+                    "type": "web_search_result",
+                    "title": "Python versions",
+                    "url": "https://www.python.org/doc/versions/",
+                    "encrypted_content": "Et8QCioIExgC",
+                    "page_age": "March 12, 2026",
+                }
+            ],
+            "caller": {"type": "direct"},
+        },
+        {
+            "citations": [
+                {
+                    "type": "web_search_result_location",
+                    "cited_text": "Python 3.14.7, released on 5 August 2026",
+                    "url": "https://www.python.org/doc/versions/",
+                    "title": "Python versions",
+                    "encrypted_index": "Eo8BCioIExgC",
+                }
+            ],
+            "type": "text",
+            "text": "The current stable Python version is 3.14.7.",
+        },
+    ]
+
+
+def test_echoed_server_tool_turn_rides_the_verbatim_block_carrier() -> None:
+    """A turn-2 echo decodes into ordered verbatim per-block messages.
+
+    The echoed turn (server_tool_use, web_search_tool_result, cited text)
+    must round-trip byte-faithfully: every block, extras and provider-issued
+    encrypted payloads included, becomes one whole-message carrier at its
+    position.
+    """
+    blocks = _echoed_web_search_turn()
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "search please"},
+                {"role": "assistant", "content": blocks},
+                {"role": "user", "content": "thanks, just the version"},
+            ],
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+        )
+    )
+    messages = decoded.request.messages
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "assistant",
+        "user",
+    ]
+    carried = [
+        message.provider_anthropic_block
+        for message in messages
+        if message.provider_anthropic_block is not None
+    ]
+    assert carried == blocks
+    assert messages[-1].content == "thanks, just the version"
+
+
+def test_cited_text_splits_around_plain_assistant_text_in_order() -> None:
+    """Plain text merges as content while cited text carries verbatim."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Let me check."},
+                        {
+                            "type": "text",
+                            "text": "It is 3.14.7.",
+                            "citations": [{"type": "web_search_result_location"}],
+                        },
+                        {"type": "text", "text": "Anything else?"},
+                    ],
+                },
+                {"role": "user", "content": "no"},
+            ]
+        )
+    )
+    assistant = decoded.request.messages[1:4]
+    assert assistant[0].content == "Let me check."
+    assert assistant[1].provider_anthropic_block == {
+        "type": "text",
+        "text": "It is 3.14.7.",
+        "citations": [{"type": "web_search_result_location"}],
+    }
+    assert assistant[2].content == "Anything else?"
+
+
+def test_uncited_citation_shapes_stay_on_the_plain_text_path() -> None:
+    """The SDK accumulator's null and empty citations decode as plain text."""
+    for citations in (None, []):
+        decoded = decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok", "citations": citations}],
+                    },
+                    {"role": "user", "content": "next"},
+                ]
+            )
+        )
+        assistant = decoded.request.messages[1]
+        assert assistant.content == "ok"
+        assert assistant.provider_anthropic_block is None
+
+
+def test_server_tool_blocks_and_citations_are_assistant_only() -> None:
+    """Server-tool output shapes in a user turn are rejected with the field."""
+    for content in (
+        [{"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}],
+        [{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []}],
+        [{"type": "text", "text": "hi", "citations": [{"type": "char_location"}]}],
+    ):
+        with pytest.raises(OpenAIProtocolError) as error:
+            decode_messages(_body(messages=[{"role": "user", "content": content}]))
+        assert error.value.status_code == 400
+        assert "assistant" in error.value.detail.message

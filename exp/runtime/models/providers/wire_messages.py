@@ -124,6 +124,10 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
         return "user", [{"type": "text", "text": message.content or ""}]
     if message.role != "assistant":
         raise ProviderResponseError("unsupported Anthropic message role")
+    if message.provider_anthropic_block is not None:
+        # An echoed server-tool block re-emits byte-for-byte at its position;
+        # route admission guarantees this dispatch is an Anthropic rung.
+        return "assistant", [message.provider_anthropic_block]
     blocks: list[JsonObject] = []
     for reasoning in message.provider_reasoning:
         # Thinking blocks lead the assistant turn (the Anthropic contract)
