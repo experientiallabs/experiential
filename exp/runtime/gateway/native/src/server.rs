@@ -28,6 +28,7 @@ use crate::respond::{bearer_key, error_response, json_response, unknown_route_er
 use crate::route_chat::chat;
 use crate::route_messages::{messages, messages_count_tokens};
 use crate::route_responses::responses;
+use crate::route_responses_ws::responses_ws;
 
 /// Serve-time configuration passed from `exp --engine rust`.
 #[derive(Debug, Clone, Deserialize)]
@@ -151,7 +152,7 @@ pub async fn run(
         .route("/v1/models", get(models))
         .route("/v1/models/{model_id}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
-        .route("/v1/responses", post(responses))
+        .route("/v1/responses", post(responses).get(responses_ws))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
         .route("/health/live", get(health_live))

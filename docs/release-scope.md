@@ -14,7 +14,8 @@ on the exact release checkout.
   written to the project.
 - The local gateway supports explicit provider references, identities, virtual keys, grants,
   singleton and certified ordered exact-model pools, frozen-project aliases, bounded precommit
-  provider fallback, Chat Completions, Responses, bounded in-memory continuation and replay,
+  provider fallback, Chat Completions, Responses (over HTTP and as the Responses-over-WebSocket
+  transport on the same route), bounded in-memory continuation and replay,
   content-free SQLite accounting, monthly integer micro-USD enforcement, loopback-only health
   and usage views, and optional identity-scoped guardrails that stay off until a policy is
   assigned. The bundled standard classifier pack is also default-off and is enabled only

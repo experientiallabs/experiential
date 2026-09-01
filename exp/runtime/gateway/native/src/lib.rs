@@ -25,6 +25,7 @@ mod responses_retention;
 mod route_chat;
 mod route_messages;
 mod route_responses;
+mod route_responses_ws;
 mod server;
 mod settlement;
 mod sse;

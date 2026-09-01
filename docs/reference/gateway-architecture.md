@@ -10,6 +10,12 @@ It serves:
 - `GET /v1/models/{model_id}`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
+- `GET /v1/responses` as a WebSocket upgrade (the Responses-over-WebSocket transport used by
+  the Codex CLI against api.openai.com: `response.create` request frames, one standard
+  Responses stream event JSON per text frame, wrapped `{"type": "error", ...}` frames for
+  request-level failures, and a `generate: false` prewarm answered without provider work; the
+  bearer key is authenticated before the upgrade is accepted, and a GET without a well-formed
+  upgrade answers 426, the status the Codex client maps to its HTTP fallback)
 - `POST /v1/messages` (the Anthropic Messages API; `POST /v1/messages/count_tokens` answers an
   explicit Anthropic-shaped refusal because the gateway has no tokenizer authority)
 - `GET /health/live` and `GET /health/ready`
