@@ -65,6 +65,24 @@ _STRICT_STRUCTURED_OUTPUT_DIALECTS = frozenset(
 _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
     {"gemini_generate_content", "bedrock_converse_stream"}
 )
+_REASONING_SUMMARY_DIALECTS = frozenset({"openai_responses", "anthropic_messages"})
+
+
+def _serves_reasoning_summary(profile: GatewayWireProfile) -> bool:
+    """Return whether one rung's reasoning reaches Responses summary parts.
+
+    Native Responses deployments carry summary parts on the wire, and
+    Anthropic thinking text is projected onto the same parts by the
+    Responses encoder. Every other dialect either has no reasoning text or
+    surfaces a reasoning item the summary channel cannot carry.
+
+    Args:
+        profile: One certified deployment wire profile from the route.
+
+    Returns:
+        Whether this deployment can serve a requested reasoning summary.
+    """
+    return profile.supports_reasoning and profile.dialect in _REASONING_SUMMARY_DIALECTS
 
 
 def _fireworks_continuation_required(profile: GatewayWireProfile, request: GatewayRequest) -> bool:
@@ -345,7 +363,7 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
     if request.reasoning_summary is not None and not all(
-        profile.dialect == "openai_responses" and profile.supports_reasoning for profile in profiles
+        _serves_reasoning_summary(profile) for profile in profiles
     ):
         path = next(
             iter(request.reasoning_summary_parameters),

@@ -369,6 +369,63 @@ def test_route_rejects_reasoning_summary_outside_native_responses() -> None:
     assert raised.value.param == "reasoning.generate_summary"
 
 
+def test_route_accepts_reasoning_summary_on_native_anthropic() -> None:
+    """Anthropic thinking reaches the summary channel, so the route serves the field."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_summary="auto",
+        reasoning_summary_parameters=("reasoning.summary",),
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://anthropic.test",
+            model_id="claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+    )
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert public_request.reasoning_summary == "auto"
+    assert provider_request.reasoning_summary == "auto"
+    assert "reasoning" not in anthropic_messages_stream_payload(
+        "claude-opus-5",
+        provider_request,
+        supports_reasoning=True,
+    )
+
+
+def test_reasoning_summary_narrows_a_mixed_claude_waterfall() -> None:
+    """A Claude route serves the summary on Anthropic instead of failing on its fallback."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_summary="auto",
+        reasoning_summary_parameters=("reasoning.summary",),
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://anthropic.test",
+            model_id="claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://openrouter.test",
+            model_id="anthropic/claude-opus-5",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        ),
+    )
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (0,)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("temperature", 0.2), ("top_p", 0.8), ("top_k", 20)],
