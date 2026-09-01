@@ -769,3 +769,23 @@ def test_required_tool_choice_counts_native_tool_declarations() -> None:
         tool_choice="required",
     )
     assert request.provider_native_tools[0].tool == {"type": "web_search"}
+
+
+def test_native_tool_positions_must_tile_the_tools_array() -> None:
+    """Duplicate or out-of-range positions are construction errors, keeping
+    the native re-emission interleave total by construction."""
+    entry = GatewayProviderNativeTool(index=0, tool={"type": "web_search"})
+    with pytest.raises(ValidationError, match="distinct indexes"):
+        GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            provider_native_tools=(entry, entry),
+        )
+    with pytest.raises(ValidationError, match="distinct indexes"):
+        GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            provider_native_tools=(
+                GatewayProviderNativeTool(index=2, tool={"type": "web_search"}),
+            ),
+        )

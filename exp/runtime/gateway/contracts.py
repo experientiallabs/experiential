@@ -690,6 +690,18 @@ class GatewayRequest(ContractModel):
             raise ValueError("provider_server_tools are valid only for Messages requests")
         if self.provider_native_tools and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("provider_native_tools are valid only for Responses requests")
+        if self.provider_native_tools:
+            # Positions must tile one tools array with the converted function
+            # tools exactly, so native re-emission is total by construction.
+            positions = tuple(entry.index for entry in self.provider_native_tools)
+            declaration_count = len(self.tools) + len(positions)
+            if len(set(positions)) != len(positions) or any(
+                position >= declaration_count for position in positions
+            ):
+                raise ValueError(
+                    "provider_native_tools positions must be distinct indexes "
+                    "into the caller's tools array"
+                )
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
             raise ValueError("maximum output parameter requires a maximum output value")
         if self.reasoning_summary_parameters and self.reasoning_summary is None:
