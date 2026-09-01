@@ -54,6 +54,20 @@ fn envelope_response(rendered: &str) -> Response {
     json_response(status, &body, &[])
 }
 
+/// Authenticate the presented key over the bridge before any body work.
+///
+/// Mirrors the synchronous routes: authentication happens before the plane
+/// buffers request content, so an unauthenticated caller can never make the
+/// gateway allocate an upload.
+async fn pre_authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+    let key = bearer_key(headers).map_err(|error| error_response(&error))?;
+    let authenticate = compact_json(&json!({"raw_key": key.clone()}));
+    if let Err(error) = state.bridge.call("authenticate", authenticate).await {
+        return Err(error_response(&error));
+    }
+    Ok(key)
+}
+
 /// Shape the shared argument object carrying the caller's bearer key.
 fn keyed_payload(headers: &HeaderMap) -> Result<Map<String, Value>, PublicError> {
     let key = bearer_key(headers)?;
@@ -68,10 +82,12 @@ pub(crate) async fn batches_create(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let mut payload = match keyed_payload(&headers) {
-        Ok(payload) => payload,
-        Err(error) => return error_response(&error),
+    let key = match pre_authenticate(&state, &headers).await {
+        Ok(key) => key,
+        Err(response) => return response,
     };
+    let mut payload = Map::new();
+    payload.insert("bearer_key".to_string(), Value::String(key));
     let raw = match read_body(body).await {
         Ok(raw) => raw,
         Err(error) => return error_response(&error),
@@ -149,25 +165,54 @@ pub(crate) async fn batches_cancel(
     plane_call(&state, "batch_cancel", Value::Object(payload)).await
 }
 
+/// Map one multipart read failure onto an honest client error.
+fn multipart_error_response(error: &axum::extract::multipart::MultipartError) -> Response {
+    let status = error.status();
+    let public = if status == StatusCode::PAYLOAD_TOO_LARGE {
+        PublicError::request_too_large()
+    } else {
+        PublicError::new(
+            400,
+            "invalid_request",
+            "The multipart upload is malformed or truncated.",
+            "invalid_request_error",
+        )
+    };
+    error_response(&public)
+}
+
 /// `POST /v1/files`: store one multipart batch input file.
 pub(crate) async fn files_create(
     State(state): State<AppState>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    let mut payload = match keyed_payload(&headers) {
-        Ok(payload) => payload,
-        Err(error) => return error_response(&error),
+    let key = match pre_authenticate(&state, &headers).await {
+        Ok(key) => key,
+        Err(response) => return response,
     };
+    let mut payload = Map::new();
+    payload.insert("bearer_key".to_string(), Value::String(key));
     let mut purpose: Option<String> = None;
     let mut filename: Option<String> = None;
     let mut content: Option<Vec<u8>> = None;
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => return multipart_error_response(&error),
+        };
         match field.name().unwrap_or_default() {
-            "purpose" => purpose = field.text().await.ok(),
+            "purpose" => match field.text().await {
+                Ok(text) => purpose = Some(text),
+                Err(error) => return multipart_error_response(&error),
+            },
             "file" => {
                 filename = field.file_name().map(str::to_string);
-                content = field.bytes().await.ok().map(|bytes| bytes.to_vec());
+                match field.bytes().await {
+                    Ok(bytes) => content = Some(bytes.to_vec()),
+                    Err(error) => return multipart_error_response(&error),
+                }
             }
             _ => {}
         }

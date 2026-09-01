@@ -293,7 +293,16 @@ class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
                 app_title=optional_text(data.get("app_title")),
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-            if self._batches is not None and self._batches.is_batch_model(alias=decoded.alias):
+            mapped = _authority_error(exc)
+            # Only an authorized identity learns that a name is batch-only:
+            # authentication failures keep their generic error so an invalid
+            # key cannot enumerate the batch catalog.
+            authenticated = json.loads(mapped.public_error_json)["status_code"] != 401
+            if (
+                authenticated
+                and self._batches is not None
+                and self._batches.is_batch_model(alias=decoded.alias)
+            ):
                 raise NativeBridgeError(
                     OpenAIProtocolError(
                         status_code=404,
@@ -305,7 +314,7 @@ class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
                         error_type="invalid_request_error",
                     )
                 ) from exc
-            raise _authority_error(exc) from exc
+            raise mapped from exc
 
         # Responses continuation resolves after authorization and before any
         # ledger write; unavailable, expired, evicted, or cross-namespace

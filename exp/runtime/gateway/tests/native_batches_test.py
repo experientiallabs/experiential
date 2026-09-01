@@ -286,3 +286,47 @@ def test_file_content_roundtrips_exact_bytes(
         thread.join(timeout=10)
         inner.write_ledger.close()
     assert not thread.is_alive()
+
+
+def test_invalid_keys_never_learn_that_a_model_is_batch_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unauthenticated caller gets the generic 401, not the batch pointer."""
+    monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret")
+    _configure_gateway(tmp_path, base_url="http://127.0.0.1:9/v1")
+    engine = BatchEngine(
+        store=MemoryStore(),
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=MemoryLedger(),
+        secrets_resolver=MemorySecrets(),
+    )
+    port = _unused_port()
+    inner = load_gateway_components(tmp_path)
+    batches = BatchControlPlane(engine=engine, control=inner.store)
+    thread, shutdown, _plane, _ = _serve_with(tmp_path, port, batches, inner)
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            refused = client.post(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                headers={"Authorization": "Bearer xpl_invalid"},
+                json={
+                    "model": "gpt-oss-120b-batch",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert refused.status_code == 401, refused.text
+            assert "/v1/batches" not in refused.text
+
+            upload = client.post(
+                f"http://127.0.0.1:{port}/v1/files",
+                headers={"Authorization": "Bearer xpl_invalid"},
+                data={"purpose": "batch"},
+                files={"file": ("input.jsonl", b"{}", "application/jsonl")},
+            )
+            assert upload.status_code == 401
+    finally:
+        shutdown.request_shutdown()
+        thread.join(timeout=10)
+        inner.write_ledger.close()
+    assert not thread.is_alive()
