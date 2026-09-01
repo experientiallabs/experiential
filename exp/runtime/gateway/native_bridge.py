@@ -428,7 +428,7 @@ class NativeControlPlane(NativeObservabilityMixin):
             return self._escalate_accepted(authorization, str(exc))
         except OpenAIProtocolError as exc:
             # A continuation whose bound provider authority is no longer
-            # available is a CLIENT error (400 continuation_unavailable: resend
+            # available is a CLIENT error (400 previous_response_not_found: resend
             # the full conversation), not a gateway-internal fault. Class the
             # durable failure by the public status so usage and health read it
             # as a client failure and it never pages as internal; the caller

@@ -173,6 +173,17 @@ def test_websocket_transport_mirrors_the_http_event_stream(
             assert untagged[0]["type"] == "error"
             assert untagged[0]["status"] == 400
 
+            # An unknown previous_response_id answers the api.openai.com
+            # error code, the one string the Codex client auto-recovers on
+            # by resending the full conversation.
+            socket.send(_request_frame(previous_response_id="resp_unknown"))
+            not_found = _collect_stream(socket)
+            assert not_found[0]["type"] == "error"
+            assert not_found[0]["status"] == 400
+            missing = not_found[0]["error"]
+            assert isinstance(missing, dict)
+            assert missing["code"] == "previous_response_not_found"
+
             # The socket still serves after in-band errors.
             socket.send(_request_frame())
             third = _collect_stream(socket)

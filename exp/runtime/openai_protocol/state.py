@@ -562,7 +562,10 @@ class BoundedContinuationStore:
             if entry is None:
                 raise OpenAIProtocolError(
                     status_code=400,
-                    code="continuation_unavailable",
+                    # api.openai.com's code for an unknown previous_response_id;
+                    # the Codex client auto-recovers on exactly this string by
+                    # resending the full conversation.
+                    code="previous_response_not_found",
                     message=(
                         "previous_response_id is unavailable or expired in this namespace. "
                         "Resend the full conversation history in this request."

@@ -1730,7 +1730,7 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
         )
     error = json.loads(rejected.value.public_error_json)
     assert error["status_code"] == 400
-    assert error["code"] == "continuation_unavailable"
+    assert error["code"] == "previous_response_not_found"
     assert error["param"] == "previous_response_id"
     assert recorded, "the unavailable continuation must record a durable failure"
     assert recorded[-1].failure_class == GatewayFailureClass.INVALID_REQUEST
@@ -2946,7 +2946,7 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
         _admit_responses(control, raw_key, _responses_body(previous_response_id="resp_missing"))
     payload = json.loads(unknown.value.public_error_json)
     assert payload["status_code"] == 400
-    assert payload["code"] == "continuation_unavailable"
+    assert payload["code"] == "previous_response_not_found"
     assert payload["param"] == "previous_response_id"
 
     refused = _admit_responses(control, raw_key, _responses_body())
@@ -2971,7 +2971,9 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
                 previous_response_id=stable_public_id("resp", _admitted_request_id(refused))
             ),
         )
-    assert json.loads(after_refusal.value.public_error_json)["code"] == "continuation_unavailable"
+    assert (
+        json.loads(after_refusal.value.public_error_json)["code"] == "previous_response_not_found"
+    )
 
     foreign = ProtocolNamespace(
         organization_id="other-org",
@@ -2983,7 +2985,7 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
             namespace=foreign,
             previous_response_id=response_id,
         )
-    assert crossed.value.detail.code == "continuation_unavailable"
+    assert crossed.value.detail.code == "previous_response_not_found"
 
 
 def test_responses_tool_call_retention_survives_continuation(tmp_path: Path) -> None:
@@ -3739,7 +3741,7 @@ def test_rust_messages_interleaved_parallel_tools_match_the_goldens() -> None:
 
 def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
     """A store:false response is never remembered, so continuing from it fails
-    closed with the shared continuation_unavailable error."""
+    closed with the shared previous_response_not_found error."""
     control, raw_key = _control_plane(tmp_path)
     first = _admit_responses(control, raw_key, _responses_body(store=False))
     assert (
@@ -3759,7 +3761,7 @@ def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
     with pytest.raises(NativeBridgeError) as raised:
         _admit_responses(control, raw_key, _responses_body(previous_response_id=response_id))
     payload = json.loads(raised.value.public_error_json)
-    assert payload["code"] == "continuation_unavailable"
+    assert payload["code"] == "previous_response_not_found"
 
     # An explicit store:true keeps the default retention behavior.
     stored = _admit_responses(control, raw_key, _responses_body(store=True))
@@ -4010,7 +4012,7 @@ def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None
 def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) -> None:
     """An Idempotency-Key on a store:false request opens no side door into
     continuation state: the retention callback stays a no-op, the response ID
-    resolves to continuation_unavailable in its own namespace, and keyed
+    resolves to previous_response_not_found in its own namespace, and keyed
     admission replays the operation without manufacturing stored history."""
     control, raw_key = _control_plane(tmp_path)
     body = _responses_body(store=False)
@@ -4051,7 +4053,7 @@ def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) 
             namespace=entry.continuation.namespace,
             previous_response_id=response_id,
         )
-    assert direct.value.detail.code == "continuation_unavailable"
+    assert direct.value.detail.code == "previous_response_not_found"
     # Continuing from the ID through the public path fails closed too, with
     # or without the original caller operation key.
     for key in (None, "codex-op-next"):
@@ -4066,7 +4068,9 @@ def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) 
                     }
                 )
             )
-        assert json.loads(continued.value.public_error_json)["code"] == "continuation_unavailable"
+        assert (
+            json.loads(continued.value.public_error_json)["code"] == "previous_response_not_found"
+        )
 
 
 def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:

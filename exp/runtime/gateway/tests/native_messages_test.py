@@ -1404,7 +1404,7 @@ def test_store_false_responses_cannot_be_continued(engine: _ServingEngine) -> No
         timeout=30.0,
     )
     assert continued.status_code == 400
-    assert continued.json()["error"]["code"] == "continuation_unavailable"
+    assert continued.json()["error"]["code"] == "previous_response_not_found"
 
 
 def test_provider_400_relays_the_parameter_and_the_provider_explanation(
