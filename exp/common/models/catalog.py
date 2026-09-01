@@ -50,13 +50,14 @@ FailoverMode = Literal["maximize_availability", "maximize_cache"]
 """How a pool's waterfall reacts to a failed attempt.
 
 ``maximize_availability`` (the default, historical behavior) fails over to the
-next rung on any failover-eligible error. ``maximize_cache`` keeps a throttle
-(429) on the SAME warm rung -- redialing to preserve its prompt cache rather than
-restarting cold on another provider -- while STILL failing over on operational
-deadness (auth/not-found/5xx/transport) and on a stalled lane (a first-byte or
+next rung on any failover-eligible error. ``maximize_cache`` does NOT fail over on
+a throttle (429) -- it returns the throttle so the caller retries the warm rung
+after backoff, preserving its prompt cache rather than restarting cold on another
+provider -- while STILL failing over on operational deadness
+(auth/not-found/5xx/transport) and on a stalled lane (a first-byte or
 header-phase timeout that never answered), for which there is no warm cache to
-preserve. A genuinely retryable timeout (provider 408) already redials the warm
-rung in both modes. Client errors reject without failover in both modes.
+preserve. A genuinely retryable timeout (provider 408) redials the warm rung in
+both modes. Client errors reject without failover in both modes.
 """
 """Azure wire surface a connection speaks: classic deployments or Foundry model inference."""
 

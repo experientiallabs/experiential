@@ -265,10 +265,30 @@ def test_caller_invalid_request_never_advances() -> None:
     assert candidate is None
 
 
-def test_maximize_cache_redials_a_throttle_on_the_same_warm_rung() -> None:
-    """maximize_cache keeps a throttle on the same rung (cache) until its cap."""
+def test_maximize_cache_returns_a_throttle_without_failing_over() -> None:
+    """maximize_cache surfaces a throttle to the caller instead of failing over cold.
+
+    A same-request redial is infeasible -- the 429 records the rung's throttle
+    window before the next candidate is chosen -- so the cache-preserving move is
+    to stop the ladder and let the caller retry the warm rung after backoff. The
+    default policy still fails over on the same throttle.
+    """
     health = DeploymentHealthRegistry()
-    # A throttle that fails over immediately under the default policy...
+    # Under maximize_cache a throttle ends the ladder (no cold failover)...
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=1,
+            refusal_failover=False,
+            failover_mode="maximize_cache",
+        )
+        is None
+    )
+    # ...while the default maximize_availability policy fails over to the next rung.
     assert (
         next_route_candidate(
             health=health,
@@ -279,35 +299,6 @@ def test_maximize_cache_redials_a_throttle_on_the_same_warm_rung() -> None:
             total_attempts=1,
             refusal_failover=False,
             failover_mode="maximize_availability",
-        )
-        == 1
-    )
-    # ...redials the SAME warm rung under maximize_cache to preserve its cache.
-    assert (
-        next_route_candidate(
-            health=health,
-            keys=_KEYS,
-            failure=_failover_only(),
-            current_depth=0,
-            attempt_counts=[1, 0],
-            total_attempts=1,
-            refusal_failover=False,
-            failover_mode="maximize_cache",
-        )
-        == 0
-    )
-    # Once the per-deployment cap is reached it still fails over (availability
-    # is preserved; cache preservation is best-effort, not a trap on a dead rung).
-    assert (
-        next_route_candidate(
-            health=health,
-            keys=_KEYS,
-            failure=_failover_only(),
-            current_depth=0,
-            attempt_counts=[2, 0],
-            total_attempts=2,
-            refusal_failover=False,
-            failover_mode="maximize_cache",
         )
         == 1
     )
