@@ -17,6 +17,7 @@ from exp.common.models import (
     ModelSnapshot,
 )
 from exp.common.models.catalog import GatewayDeploymentCapabilities
+from exp.common.models.content import ImageContentPart, TextContentPart
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -257,3 +258,67 @@ def test_tinker_is_explicitly_excluded_from_gateway_execution() -> None:
         require_gateway_provider("tinker")
 
     require_gateway_provider("openai")
+
+
+def _image_request() -> GatewayRequest:
+    """Build one caller request carrying an inline image beside its text."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="what is this",
+                content_parts=(
+                    TextContentPart(text="what is this"),
+                    ImageContentPart(
+                        media_type="image/png",
+                        data=(
+                            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+                            "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def test_preflight_rejects_an_image_on_a_route_that_does_not_declare_it() -> None:
+    """A picture is never dropped and answered from the surrounding text alone."""
+    with pytest.raises(ProviderCapabilityError, match="image_input"):
+        preflight_gateway_request(_image_request(), GatewayDeploymentCapabilities())
+
+
+def test_preflight_admits_an_inline_image_on_an_image_route() -> None:
+    """A declared image route serves inline bytes without declaring URL support."""
+    preflight_gateway_request(
+        _image_request(),
+        GatewayDeploymentCapabilities(supports_image_input=True),
+    )
+
+
+def test_preflight_rejects_an_image_url_on_an_inline_only_route() -> None:
+    """A remote URL needs its own declaration, so a waterfall can narrow to it."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="what is this",
+                content_parts=(
+                    TextContentPart(text="what is this"),
+                    ImageContentPart(url="https://example.com/cat.png"),
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(ProviderCapabilityError, match="image_url_input"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_image_input=True),
+        )
+    preflight_gateway_request(
+        request,
+        GatewayDeploymentCapabilities(supports_image_input=True, supports_image_url_input=True),
+    )

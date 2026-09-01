@@ -383,6 +383,20 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_parallel_tool_calls: bool = False
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
+    supports_image_input: bool = False
+    """Whether this deployment's wire and model can carry caller image parts.
+
+    Image input is declaration-driven and never assumed: a route that does
+    not declare it rejects an image request at admission, so a picture is
+    never dropped and answered from the surrounding text alone.
+    """
+    supports_image_url_input: bool = False
+    """Whether this route's provider fetches a caller image URL itself.
+
+    Inline base64 rides every image-capable wire, but only some wires accept a
+    remote URL. A route that does not declare this rejects a URL image at
+    admission, which lets a waterfall narrow to a rung that can carry it.
+    """
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
     """Largest stop-sequence count this route accepts, when the provider caps it.
 

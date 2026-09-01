@@ -15,6 +15,11 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.models.providers.errors import ProviderResponseError
+from exp.runtime.models.providers.images import (
+    anthropic_image_block,
+    openai_chat_image_part,
+    responses_image_part,
+)
 
 
 def responses_items(message: GatewayMessage) -> list[JsonObject]:
@@ -28,6 +33,18 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             }
         ]
     if message.role == "user":
+        if message.content_parts:
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": part.text}
+                        if part.kind == "text"
+                        else responses_image_part(part)
+                        for part in message.content_parts
+                    ],
+                }
+            ]
         return [{"role": "user", "content": message.content or ""}]
     if message.role != "assistant":
         raise ProviderResponseError("unsupported Responses message role")
@@ -125,6 +142,15 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             result["cache_control"] = message.cache_control
         return ("user", [result])
     if message.role == "user":
+        if message.content_parts:
+            # The caller's exact interleaving is preserved: an image before
+            # its question reads differently from one after it.
+            return "user", [
+                {"type": "text", "text": part.text}
+                if part.kind == "text"
+                else anthropic_image_block(part)
+                for part in message.content_parts
+            ]
         if message.provider_text_blocks:
             # The cache-marked run re-emits the caller's exact blocks; the
             # flattened content stays canonical for every other wire.
@@ -236,7 +262,19 @@ def openai_chat_message(
             "content": message.content or "",
             "tool_call_id": message.tool_call_id or "",
         }
-    payload: JsonObject = {"role": message.role, "content": message.content or ""}
+    payload: JsonObject = {
+        "role": message.role,
+        "content": (
+            [
+                {"type": "text", "text": part.text}
+                if part.kind == "text"
+                else openai_chat_image_part(part)
+                for part in message.content_parts
+            ]
+            if message.content_parts
+            else message.content or ""
+        ),
+    }
     if message.tool_calls:
         payload["tool_calls"] = [
             {

@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.types import JsonValue
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import MAXIMUM_IMAGE_BASE64_BYTES
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
@@ -42,6 +43,48 @@ class _TextPart(_WireModel):
     logprobs: tuple[()] | None = None
 
 
+_ImageDetail = Literal["auto", "low", "high"]
+"""Caller fidelity hint forwarded verbatim to the wires that accept it."""
+
+_MAXIMUM_IMAGE_URL_CHARACTERS = MAXIMUM_IMAGE_BASE64_BYTES + 128
+"""Room for the largest inline image plus its ``data:`` URL preamble."""
+
+
+class _ChatImageUrl(_WireModel):
+    """Chat Completions image reference: a remote URL or a base64 data URL."""
+
+    url: str = Field(min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS)
+    detail: _ImageDetail | None = None
+
+
+class _ChatImagePart(_WireModel):
+    """One Chat Completions ``image_url`` content part."""
+
+    type: Literal["image_url"]
+    image_url: _ChatImageUrl
+
+
+class _ResponsesImagePart(_WireModel):
+    """One Responses ``input_image`` content part.
+
+    Responses carries the reference as a bare string, and ``file_id`` names
+    an uploaded file this gateway does not host, so only the null form of
+    that field is accepted.
+    """
+
+    type: Literal["input_image"]
+    image_url: str = Field(min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS)
+    detail: _ImageDetail | None = None
+    file_id: None = None
+
+
+_ContentPart = Annotated[
+    _TextPart | _ChatImagePart | _ResponsesImagePart,
+    Field(discriminator="type"),
+]
+"""One accepted content part on either OpenAI-style request surface."""
+
+
 class _FunctionCall(_WireModel):
     """Function name and raw JSON argument string."""
 
@@ -65,7 +108,7 @@ class _AssistantToolCall(_WireModel):
 
 
 class _Message(_WireModel):
-    """Text-only OpenAI message with complete assistant tool history.
+    """One OpenAI message with its content parts and assistant tool history.
 
     Assistant messages returned by this gateway (and by official OpenAI SDK
     clients) carry `refusal`, `annotations`, `audio`, and `function_call`
@@ -75,7 +118,7 @@ class _Message(_WireModel):
     """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: str | tuple[_TextPart, ...] | None = None
+    content: str | tuple[_ContentPart, ...] | None = None
     tool_calls: tuple[_AssistantToolCall, ...] | None = None
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
     refusal: None = None
@@ -86,6 +129,11 @@ class _Message(_WireModel):
         default=None,
         max_length=MAXIMUM_REASONING_CARRIER_BYTES,
     )
+
+    @property
+    def image_capable_parts(self) -> tuple[_ContentPart, ...]:
+        """Return this message's structured content parts, empty for plain text."""
+        return () if self.content is None or isinstance(self.content, str) else self.content
 
     @property
     def history_tool_calls(self) -> tuple[_AssistantToolCall, ...]:
@@ -105,6 +153,10 @@ class _Message(_WireModel):
             raise ValueError("tool_calls are valid only for assistant messages")
         if self.role != "assistant" and self.reasoning_content is not None:
             raise ValueError("reasoning_content is valid only for assistant messages")
+        if self.role != "user" and any(
+            not isinstance(part, _TextPart) for part in self.image_capable_parts
+        ):
+            raise ValueError("image parts are valid only for user messages")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")

@@ -8,7 +8,7 @@ from typing import cast
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayApiSurface,
@@ -1696,3 +1696,143 @@ def test_decode_errors_name_the_expected_shape_against_the_arriving_type() -> No
     assert summary.value.detail.message == (
         "Invalid value for 'input.0.summary': expected an array, but got null instead."
     )
+
+
+_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+    "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
+"""One valid single-pixel PNG, base64 encoded."""
+
+
+def test_chat_decoder_retains_image_parts_in_caller_order() -> None:
+    """A chat image part is kept beside its text in the order the caller sent."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{_PNG_BASE64}",
+                                "detail": "high",
+                            },
+                        },
+                        {"type": "text", "text": "be brief"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert message.content == "what is thisbe brief"
+    assert [part.kind for part in message.content_parts] == ["text", "image", "text"]
+    image = decoded.request.images[0]
+    assert image.data == _PNG_BASE64
+    assert image.media_type == "image/png"
+    assert image.detail == "high"
+
+
+def test_responses_decoder_retains_input_image_parts() -> None:
+    """A Responses ``input_image`` survives decoding as a canonical image."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "describe"},
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/cat.png",
+                            "detail": "auto",
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    assert [part.kind for part in decoded.request.messages[0].content_parts] == ["text", "image"]
+    assert decoded.request.images[0].url == "https://example.com/cat.png"
+
+
+def test_text_only_chat_messages_keep_no_content_parts() -> None:
+    """Text-only requests decode exactly as before, with no retained parts."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        }
+    )
+    assert decoded.request.messages[0].content_parts == ()
+    assert decoded.request.images == ()
+
+
+def test_images_change_the_canonical_request_digest() -> None:
+    """An image changes what the model is asked, so it changes replay identity."""
+    text_only = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "what is this"}]}
+    )
+    with_image = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    assert sha256_json(text_only.request) != sha256_json(with_image.request)
+
+
+def test_malformed_chat_image_url_is_rejected_with_its_field() -> None:
+    """An unusable image carrier names the exact offending request field."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png"}}
+                        ],
+                    }
+                ],
+            }
+        )
+    assert error.value.detail.param == "messages.0.content.0.image_url"
+
+
+def test_assistant_image_parts_are_rejected() -> None:
+    """Only a caller message may carry an image."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        )

@@ -18,6 +18,11 @@ from pydantic import (
 from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import ContractModel, JsonObject
+from exp.common.models.content import (
+    MessageContentPart,
+    TextContentPart,
+    image_part_from_url,
+)
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
@@ -58,9 +63,11 @@ from exp.runtime.openai_protocol.responses_input import (
 from exp.runtime.openai_protocol.wire_models import (
     _AdditionalToolsItem,
     _AssistantToolCall,
+    _ChatImagePart,
     _ChatRequest,
     _ChatResponseFormat,
     _ChatTool,
+    _ContentPart,
     _CustomToolCall,
     _CustomToolCallOutput,
     _FunctionCall,
@@ -526,10 +533,14 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             except ValueError as exc:
                 param = f"{prefix}.{message_index}.reasoning_content"
                 raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
+        content, content_parts = _message_content(
+            message.content, f"{prefix}.{message_index}.content"
+        )
         converted.append(
             GatewayMessage(
                 role=message.role,
-                content=_content(message.content),
+                content=content,
+                content_parts=content_parts,
                 tool_call_id=message.tool_call_id,
                 tool_calls=calls,
                 provider_reasoning=provider_reasoning,
@@ -538,11 +549,50 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
     return tuple(converted)
 
 
-def _content(content: str | tuple[_TextPart, ...] | None) -> str | None:
-    """Join supported text parts without accepting multimodal loss."""
+def _message_content(
+    content: str | tuple[_ContentPart, ...] | None,
+    param: str,
+) -> tuple[str | None, tuple[MessageContentPart, ...]]:
+    """Flatten wire content parts, retaining images in the caller's order.
+
+    Args:
+        content: Wire content: plain text, ordered parts, or absent.
+        param: Public parameter path used to report an invalid image.
+
+    Returns:
+        The flattened text and, only for a message that carries an image,
+        the ordered canonical parts. A text-only message keeps its previous
+        representation exactly, so nothing downstream changes for it.
+
+    Raises:
+        OpenAIProtocolError: An image reference is not a supported URL or
+            base64 data URL.
+    """
     if content is None or isinstance(content, str):
-        return content
-    return "".join(part.text for part in content)
+        return content, ()
+    parts: list[MessageContentPart] = []
+    for index, part in enumerate(content):
+        if isinstance(part, _TextPart):
+            parts.append(TextContentPart(text=part.text))
+            continue
+        url, detail = (
+            (part.image_url.url, part.image_url.detail)
+            if isinstance(part, _ChatImagePart)
+            else (part.image_url, part.detail)
+        )
+        try:
+            parts.append(image_part_from_url(url, detail=detail))
+        except ValueError as exc:
+            location = f"{param}.{index}.image_url"
+            raise invalid_field(
+                location,
+                f"'{location}' must be an http(s) URL or a base64 data URL "
+                "of a PNG, JPEG, GIF, or WebP image.",
+            ) from exc
+    text = "".join(part.text for part in parts if part.kind == "text")
+    if not any(part.kind == "image" for part in parts):
+        return text, ()
+    return text, tuple(parts)
 
 
 def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:

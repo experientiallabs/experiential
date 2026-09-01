@@ -185,9 +185,10 @@ RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
         "web_search_call.results",
     }
 )
-"""``include`` selectors consciously rejected: each names a server-tool or
-multimodal surface this gateway does not serve, so honoring the selector is
-impossible and accepting it would be silent."""
+"""``include`` selectors consciously rejected: each asks the response to echo
+a server-tool or stored-content surface this gateway does not retain (image
+input is served, but the gateway does not echo the caller's image back), so
+honoring the selector is impossible and accepting it would be silent."""
 
 
 RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {

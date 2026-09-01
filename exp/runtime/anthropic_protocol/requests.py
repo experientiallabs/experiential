@@ -10,8 +10,10 @@ Anthropic rungs; ``cache_control`` annotations are validated
 everywhere and carried on the surfaces the Anthropic wire caches natively
 (tool_use blocks, tool definitions, and the top-level automatic marker),
 while content-block hints are dropped because they do not change model
-semantics; ``image`` and ``document`` blocks are rejected loudly because
-the serving surface cannot preserve them. Unknown or unsupported fields are rejected with a
+semantics; ``image`` blocks are retained as canonical content parts so a
+route that declares image input carries them, and ``document`` blocks are
+rejected loudly because the serving surface cannot preserve them.
+Unknown or unsupported fields are rejected with a
 field-specific error, never silently dropped. Errors raise
 :class:`OpenAIProtocolError` so the shared boundary stays single-authority;
 the HTTP layer renders them in the Anthropic envelope.
@@ -26,6 +28,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import (
+    IMAGE_MEDIA_TYPES,
+    MAXIMUM_IMAGE_BASE64_BYTES,
+    ImageContentPart,
+    MessageContentPart,
+    TextContentPart,
+    image_part_from_url,
+)
 from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FORWARDED,
@@ -53,8 +63,7 @@ from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 
 _REJECTED_BLOCK_HINTS = {
-    "image": "image blocks are not supported: this gateway surface is text-only",
-    "document": "document blocks are not supported: this gateway surface is text-only",
+    "document": "document blocks are not supported: this gateway surface serves text and images",
 }
 
 
@@ -85,6 +94,23 @@ class _TextBlock(_WireModel):
     text: str
     cache_control: _CacheControl | None = None
     citations: tuple[JsonObject, ...] | None = None
+
+
+class _ImageSource(_WireModel):
+    """Where one image block's bytes come from: inline base64 or a URL."""
+
+    type: Literal["base64", "url"]
+    media_type: str | None = Field(default=None, max_length=64)
+    data: str | None = Field(default=None, max_length=MAXIMUM_IMAGE_BASE64_BYTES)
+    url: str | None = Field(default=None, max_length=8_192)
+
+
+class _ImageBlock(_WireModel):
+    """One caller image content block."""
+
+    type: Literal["image"]
+    source: _ImageSource
+    cache_control: _CacheControl | None = None
 
 
 class _ThinkingBlock(_WireModel):
@@ -153,6 +179,7 @@ class _WebSearchToolResultBlock(BaseModel):
 
 _ContentBlock = (
     _TextBlock
+    | _ImageBlock
     | _ThinkingBlock
     | _RedactedThinkingBlock
     | _ToolUseBlock
@@ -576,6 +603,35 @@ def _rejected_block_hint(payload: JsonObject) -> str | None:
     return None
 
 
+def _image_part(block: _ImageBlock, param: str) -> ImageContentPart:
+    """Convert one Anthropic image block into the canonical image part.
+
+    Args:
+        block: Validated caller image block.
+        param: Public parameter path used to report an invalid image.
+
+    Returns:
+        The canonical image part carrying the caller's bytes or URL.
+
+    Raises:
+        OpenAIProtocolError: The source is not a supported image.
+    """
+    source = block.source
+    try:
+        if source.type == "url":
+            return image_part_from_url(source.url or "")
+        return ImageContentPart(
+            media_type=IMAGE_MEDIA_TYPES[source.media_type or ""],
+            data=source.data,
+        )
+    except (KeyError, ValueError) as exc:
+        raise invalid_field(
+            f"{param}.source",
+            f"'{param}.source' must carry an http(s) URL or base64 data "
+            "for a PNG, JPEG, GIF, or WebP image.",
+        ) from exc
+
+
 def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
     """Flatten the system prompt; blocks join with a blank line."""
     if system is None or isinstance(system, str):
@@ -688,24 +744,30 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
         return [GatewayMessage(role=message.role, content=message.content)]
     out: list[GatewayMessage] = []
     text_parts: list[_TextBlock] = []
+    content_parts: list[MessageContentPart] = []
     tool_calls: list[ToolCall] = []
     reasoning: list[ProviderReasoningBlock] = []
 
     def flush() -> None:
-        """Emit the pending text, tool calls, and reasoning as one canonical message."""
+        """Emit the pending content, tool calls, and reasoning as one message."""
         content = "".join(part.text for part in text_parts) if text_parts else None
-        if content is None and not tool_calls and not reasoning:
+        images = any(part.kind == "image" for part in content_parts)
+        if content is None and not tool_calls and not reasoning and not images:
             return
         out.append(
             GatewayMessage(
                 role=message.role,
-                content=content,
+                content=content or ("" if images else None),
+                content_parts=tuple(content_parts) if images else (),
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
-                provider_text_blocks=_marked_text_blocks(tuple(text_parts)),
+                # The retained parts already carry the caller's exact order,
+                # so the cache-marked text run applies to text-only turns.
+                provider_text_blocks=(() if images else _marked_text_blocks(tuple(text_parts))),
             )
         )
         text_parts.clear()
+        content_parts.clear()
         tool_calls.clear()
         reasoning.clear()
 
@@ -733,6 +795,14 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             # carries no information and drops; a cache marker on the block
             # survives through the marked-run carrier.
             text_parts.append(block)
+            content_parts.append(TextContentPart(text=block.text))
+        elif isinstance(block, _ImageBlock):
+            if message.role != "user":
+                raise invalid_field(
+                    f"{param}.content.{block_index}",
+                    "image blocks are only valid in user messages.",
+                )
+            content_parts.append(_image_part(block, f"{param}.content.{block_index}"))
         elif isinstance(block, (_ThinkingBlock, _RedactedThinkingBlock)):
             if message.role != "assistant":
                 raise invalid_field(

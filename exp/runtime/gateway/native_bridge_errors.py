@@ -12,6 +12,8 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
     GatewayApiSurface.CHAT_COMPLETIONS: {
         "developer_messages": "messages",
         "function_tools": "tools",
+        "image_input": "messages",
+        "image_url_input": "messages",
         "parallel_tool_calls": "parallel_tool_calls",
         "stop_sequences": "stop",
         "streaming": "stream",
@@ -23,6 +25,8 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
     GatewayApiSurface.RESPONSES: {
         "developer_messages": "instructions",
         "function_tools": "tools",
+        "image_input": "input",
+        "image_url_input": "input",
         "parallel_tool_calls": "parallel_tool_calls",
         "streaming": "stream",
         "streaming_tool_arguments": "stream",
@@ -33,6 +37,8 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
     GatewayApiSurface.MESSAGES: {
         "developer_messages": "system",
         "function_tools": "tools",
+        "image_input": "messages",
+        "image_url_input": "messages",
         "parallel_tool_calls": "tool_choice.disable_parallel_tool_use",
         "stop_sequences": "stop_sequences",
         "streaming": "stream",

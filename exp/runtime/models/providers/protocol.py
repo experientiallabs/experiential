@@ -225,6 +225,12 @@ def preflight_gateway_request(
             capabilities.supports_developer_messages,
             "developer_messages",
         ),
+        (bool(request.images), capabilities.supports_image_input, "image_input"),
+        (
+            any(image.url is not None for image in request.images),
+            capabilities.supports_image_url_input,
+            "image_url_input",
+        ),
         (bool(request.stop), capabilities.supports_stop_sequences, "stop_sequences"),
         (
             any(tool.strict for tool in request.tools),

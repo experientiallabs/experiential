@@ -14,6 +14,7 @@ from typing import Literal
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
+from exp.runtime.models.providers.images import gemini_image_part
 from exp.runtime.models.providers.reasoning_compat import gemini_thinking_level
 
 
@@ -151,6 +152,14 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
             ],
         }
     if message.role == "user":
+        if message.content_parts:
+            return {
+                "role": "user",
+                "parts": [
+                    {"text": part.text} if part.kind == "text" else gemini_image_part(part)
+                    for part in message.content_parts
+                ],
+            }
         if message.content is None:
             raise ValueError("user messages need text content")
         return {"role": "user", "parts": [{"text": message.content}]}

@@ -43,6 +43,7 @@ def model_request(request: GatewayRequest) -> ModelRequest:
                 content=message.content,
                 tool_call_id=message.tool_call_id,
                 assistant_action=action,
+                content_parts=message.content_parts,
             )
         )
     tools = tuple(

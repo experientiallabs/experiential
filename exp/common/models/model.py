@@ -18,6 +18,7 @@ from pydantic import (
 )
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
+from exp.common.models.content import ImageContentPart, MessageContentPart
 from exp.common.tasks import ToolSchema
 
 ModelAlias = ArtifactId
@@ -271,6 +272,16 @@ class ModelMessage(ContractModel):
     content: str | None = None
     tool_call_id: str | None = None
     assistant_action: AssistantAction | None = None
+    content_parts: tuple[MessageContentPart, ...] = Field(default=(), exclude=True)
+    """Ordered caller content parts when a user message carries images.
+
+    Empty on every text-only message. The text parts concatenate to
+    ``content``, so selectors, simulators, and persisted artifacts keep
+    seeing exactly the text they saw before images existed; provider clients
+    that can carry images read the parts and emit the caller's exact
+    interleaving. Excluded from serialization so identities of text-only
+    requests are byte-identical to pre-image traffic.
+    """
 
     @model_validator(mode="after")
     def _require_message_payload(self) -> ModelMessage:
@@ -282,7 +293,18 @@ class ModelMessage(ContractModel):
             raise ValueError("assistant_action is valid only for assistant messages")
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
+        if self.content_parts:
+            if self.role != "user":
+                raise ValueError("content parts are valid only for user messages")
+            texts = [part.text for part in self.content_parts if part.kind == "text"]
+            if (self.content or "") != "".join(texts):
+                raise ValueError("content parts must flatten to the message content")
         return self
+
+    @property
+    def images(self) -> tuple[ImageContentPart, ...]:
+        """Return this message's image parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "image")
 
 
 class ModelFinishReason(StrEnum):

@@ -8,6 +8,11 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
+from exp.common.models.content import (
+    MAXIMUM_IMAGES_PER_REQUEST,
+    ImageContentPart,
+    MessageContentPart,
+)
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelId,
@@ -290,6 +295,17 @@ class GatewayMessage(ContractModel):
     so like the other cache carriers this joins neither serialization nor
     replay identity.
     """
+    content_parts: tuple[MessageContentPart, ...] = ()
+    """Ordered caller content parts for a message that carries images.
+
+    Empty on every text-only message, so a text-only request serializes and
+    digests exactly as it did before images existed. When present, the text
+    parts concatenate to ``content`` byte-for-byte and at least one image
+    part is included, so a route that cannot carry images is rejected at
+    admission instead of silently serving the text alone. Images change what
+    the model sees, so unlike the cache carriers this field is serialized and
+    joins request identity.
+    """
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Validated caller prompt-caching marker on this tool-result message.
 
@@ -375,7 +391,20 @@ class GatewayMessage(ContractModel):
             texts = [str(block.get("text", "")) for block in self.provider_text_blocks]
             if (self.content or "") not in ("".join(texts), "\n\n".join(texts)):
                 raise ValueError("provider text blocks must flatten to the message content")
+        if self.content_parts:
+            if self.role != "user":
+                raise ValueError("content parts are valid only for user messages")
+            if not any(part.kind == "image" for part in self.content_parts):
+                raise ValueError("content parts are retained only for multimodal messages")
+            texts = [part.text for part in self.content_parts if part.kind == "text"]
+            if (self.content or "") != "".join(texts):
+                raise ValueError("content parts must flatten to the message content")
         return self
+
+    @property
+    def images(self) -> tuple[ImageContentPart, ...]:
+        """Return this message's retained image parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "image")
 
 
 class GatewayRequest(ContractModel):
@@ -572,6 +601,11 @@ class GatewayRequest(ContractModel):
         """
         return self.safety_identifier or self.user
 
+    @property
+    def images(self) -> tuple[ImageContentPart, ...]:
+        """Return every image this request carries, in message and part order."""
+        return tuple(image for message in self.messages for image in message.images)
+
     @field_validator("stop")
     @classmethod
     def _require_unique_stop_sequences(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -620,6 +654,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
+        if len(self.images) > MAXIMUM_IMAGES_PER_REQUEST:
+            raise ValueError(f"a request carries at most {MAXIMUM_IMAGES_PER_REQUEST} images")
         if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("reasoning_summary is valid only for Responses requests")
         if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:

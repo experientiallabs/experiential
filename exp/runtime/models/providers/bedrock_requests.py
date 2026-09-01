@@ -15,6 +15,7 @@ from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.models.providers.images import bedrock_image_block
 
 
 def converse_request(
@@ -202,6 +203,12 @@ def _message_blocks(message: ModelMessage) -> list[JsonObject]:
         raise ValueError("user messages cannot carry assistant actions")
     if message.role == "user" and message.content is None:
         raise ValueError("user messages need text content")
+    if message.content_parts:
+        return [
+            {"text": part.text} if part.kind == "text" else bedrock_image_block(part)
+            for part in message.content_parts
+            if part.kind == "image" or part.text
+        ]
     blocks: list[JsonObject] = []
     action = message.assistant_action
     text = message.content if message.content is not None else action.content if action else None
