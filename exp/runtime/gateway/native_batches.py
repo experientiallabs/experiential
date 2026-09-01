@@ -11,6 +11,9 @@ from __future__ import annotations
 import json
 from typing import Protocol
 
+from exp.runtime.gateway.native_accounting import NativeBridgeError
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+
 
 class _BatchPlane(Protocol):
     """The duck-typed surface the relay forwards to."""
@@ -36,6 +39,32 @@ class NativeBatchRelayMixin:
     """Relay the batch route methods onto an optionally injected plane."""
 
     _batches: _BatchPlane | None
+
+    def _batch_pointer_error(self, *, alias: str, mapped: Exception) -> Exception | None:
+        """Return the did-you-mean pointer for an authorized batch-only miss.
+
+        Only an authenticated identity learns that a name is batch-only: an
+        authentication failure (the mapped error carries status 401) keeps
+        its generic envelope so an invalid key cannot enumerate the batch
+        catalog. Returns None when the pointer does not apply.
+        """
+        if self._batches is None or not isinstance(mapped, NativeBridgeError):
+            return None
+        if json.loads(mapped.public_error_json)["status_code"] == 401:
+            return None
+        if not self._batches.is_batch_model(alias=alias):
+            return None
+        return NativeBridgeError(
+            OpenAIProtocolError(
+                status_code=404,
+                code="model_requires_batch",
+                message=(
+                    f"The model {alias!r} is only available through the "
+                    "Batch API. Submit it explicitly via /v1/batches."
+                ),
+                error_type="invalid_request_error",
+            )
+        )
 
     def _batches_disabled(self) -> str:
         """Render the uniform envelope for gateways without the batch lane."""

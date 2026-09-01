@@ -294,26 +294,9 @@ class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             mapped = _authority_error(exc)
-            # Only an authorized identity learns that a name is batch-only:
-            # authentication failures keep their generic error so an invalid
-            # key cannot enumerate the batch catalog.
-            authenticated = json.loads(mapped.public_error_json)["status_code"] != 401
-            if (
-                authenticated
-                and self._batches is not None
-                and self._batches.is_batch_model(alias=decoded.alias)
-            ):
-                raise NativeBridgeError(
-                    OpenAIProtocolError(
-                        status_code=404,
-                        code="model_requires_batch",
-                        message=(
-                            f"The model {decoded.alias!r} is only available through the "
-                            "Batch API. Submit it explicitly via /v1/batches."
-                        ),
-                        error_type="invalid_request_error",
-                    )
-                ) from exc
+            pointer = self._batch_pointer_error(alias=decoded.alias, mapped=mapped)
+            if pointer is not None:
+                raise pointer from exc
             raise mapped from exc
 
         # Responses continuation resolves after authorization and before any
