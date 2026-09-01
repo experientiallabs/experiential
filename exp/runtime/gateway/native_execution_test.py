@@ -313,6 +313,35 @@ def test_maximize_cache_redials_a_throttle_on_the_same_warm_rung() -> None:
     )
 
 
+def test_maximize_cache_does_not_redial_a_stalled_timeout_lane() -> None:
+    """A stalled-lane timeout fails over even under maximize_cache.
+
+    The engine marks first-byte and header-phase stalls as ``TIMEOUT`` with
+    ``retryable_same_deployment=False`` precisely so a dead lane advances instead
+    of burning another fail-fast window. maximize_cache must respect that signal:
+    a lane that accepted the connection but never answered has no warm cache to
+    preserve, so it is not redialed.
+    """
+    health = DeploymentHealthRegistry()
+    stalled = GatewayFailure(
+        failure_class=GatewayFailureClass.TIMEOUT,
+        safe_message="provider did not send the first token in time",
+        retryable_same_deployment=False,
+        failover_eligible=True,
+    )
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=stalled,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode="maximize_cache",
+    )
+    assert candidate == 1
+
+
 def test_maximize_cache_still_fails_over_on_operational_deadness() -> None:
     """A dead rung (auth failure) fails over even under maximize_cache."""
     health = DeploymentHealthRegistry()

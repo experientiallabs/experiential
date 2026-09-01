@@ -48,14 +48,27 @@ if TYPE_CHECKING:
 MAXIMUM_TOTAL_ATTEMPTS = 8
 MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
 
-# Under maximize_cache, a transient throttle or timeout is redialed on the SAME
-# warm rung (preserving its prompt cache) before any failover, because the rung
-# is otherwise healthy and likely to recover. Every other failover-eligible
-# class -- auth, not-found, provider 5xx, transport deadness -- keeps failing
-# over in both modes: there is no cache to preserve on a rung that cannot serve.
-_CACHE_PRESERVING_REDIAL_CLASSES = frozenset(
-    {GatewayFailureClass.THROTTLED, GatewayFailureClass.TIMEOUT}
-)
+# Under maximize_cache, a throttle (429) is redialed on the SAME warm rung
+# (preserving its prompt cache) before any failover: the provider demonstrably
+# answered, so the rung is warm and likely to recover after its backoff, yet the
+# default policy would fail over cold to another provider. Every other
+# failover-eligible class -- auth, not-found, provider 5xx, transport deadness --
+# keeps failing over in both modes: there is no cache to preserve on a rung that
+# cannot serve.
+#
+# TIMEOUT is deliberately NOT in this set. The classifier already decides, per
+# timeout, whether the same rung may be redialed: a genuine retryable timeout
+# (provider 408) carries retryable_same_deployment=True and so redials the warm
+# rung in BOTH modes via the default branch below, needing no cache override. The
+# only timeouts that reach here with retryable_same_deployment=False are the
+# first-byte and header-phase stalls (relay.first_byte_timeout_failure /
+# upstream.open_timeout_failure), which are dead-lane signals: the lane accepted
+# the connection but never answered, so redialing it would only burn another
+# fail-fast window before failing over. Folding the whole TIMEOUT class into the
+# cache-preserving set would override that signal and reintroduce exactly the
+# dead-lane redial those fail-fast bounds removed -- there is no warm cache to
+# preserve on a lane that never answered.
+_CACHE_PRESERVING_REDIAL_CLASSES = frozenset({GatewayFailureClass.THROTTLED})
 
 
 class NativeDialectUnavailableError(RuntimeError):
@@ -174,12 +187,16 @@ def next_route_candidate(
     a failover-eligible failure (or an opted-in typed refusal) advances to the
     next claimable deployment.
 
-    Under ``maximize_cache`` a transient throttle/timeout is treated as a
-    same-deployment redial (preserving the warm rung's prompt cache) before it
-    is allowed to fail over -- but only up to the same per-deployment cap, after
-    which it advances like any failover-eligible failure. Operational deadness
-    (auth, not-found, provider 5xx, transport) and client errors are unchanged:
-    deadness still fails over in both modes, client errors never do.
+    Under ``maximize_cache`` a throttle (429) is treated as a same-deployment
+    redial (preserving the warm rung's prompt cache) before it is allowed to fail
+    over -- but only up to the same per-deployment cap, after which it advances
+    like any failover-eligible failure. Timeouts are unchanged from the default:
+    a retryable 408 already redials the warm rung via its own
+    ``retryable_same_deployment`` flag, while a first-byte/header-phase stall is a
+    dead lane the classifier marks non-redialable and so still fails over.
+    Operational deadness (auth, not-found, provider 5xx, transport) and client
+    errors are unchanged too: deadness still fails over in both modes, client
+    errors never do.
 
     Args:
         health: Revision-isolated circuit and throttle registry.
