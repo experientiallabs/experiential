@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayFailure,
@@ -47,6 +47,15 @@ if TYPE_CHECKING:
 # The frozen native retry policy.
 MAXIMUM_TOTAL_ATTEMPTS = 8
 MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
+
+# Under maximize_cache, a transient throttle or timeout is redialed on the SAME
+# warm rung (preserving its prompt cache) before any failover, because the rung
+# is otherwise healthy and likely to recover. Every other failover-eligible
+# class -- auth, not-found, provider 5xx, transport deadness -- keeps failing
+# over in both modes: there is no cache to preserve on a rung that cannot serve.
+_CACHE_PRESERVING_REDIAL_CLASSES = frozenset(
+    {GatewayFailureClass.THROTTLED, GatewayFailureClass.TIMEOUT}
+)
 
 
 class NativeDialectUnavailableError(RuntimeError):
@@ -154,6 +163,7 @@ def next_route_candidate(
     attempt_counts: list[int],
     total_attempts: int,
     refusal_failover: bool,
+    failover_mode: FailoverMode = "maximize_availability",
     maximum_total_attempts: int = MAXIMUM_TOTAL_ATTEMPTS,
     maximum_same_deployment_attempts: int = MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
 ) -> int | None:
@@ -164,6 +174,13 @@ def next_route_candidate(
     a failover-eligible failure (or an opted-in typed refusal) advances to the
     next claimable deployment.
 
+    Under ``maximize_cache`` a transient throttle/timeout is treated as a
+    same-deployment redial (preserving the warm rung's prompt cache) before it
+    is allowed to fail over -- but only up to the same per-deployment cap, after
+    which it advances like any failover-eligible failure. Operational deadness
+    (auth, not-found, provider 5xx, transport) and client errors are unchanged:
+    deadness still fails over in both modes, client errors never do.
+
     Args:
         health: Revision-isolated circuit and throttle registry.
         keys: One health key per ordered route deployment.
@@ -172,6 +189,7 @@ def next_route_candidate(
         attempt_counts: Physical dispatch counts per route position.
         total_attempts: Physical dispatches so far across the whole request.
         refusal_failover: Whether a typed precommit refusal may advance.
+        failover_mode: The pool's per-model failover policy.
         maximum_total_attempts: Hard cap across retries and deployments.
         maximum_same_deployment_attempts: Initial dispatch plus safe retries
             per deployment.
@@ -181,8 +199,12 @@ def next_route_candidate(
     """
     if total_attempts >= maximum_total_attempts:
         return None
+    prefers_same_rung = failure.retryable_same_deployment or (
+        failover_mode == "maximize_cache"
+        and failure.failure_class in _CACHE_PRESERVING_REDIAL_CLASSES
+    )
     if (
-        failure.retryable_same_deployment
+        prefers_same_rung
         and attempt_counts[current_depth] < maximum_same_deployment_attempts
         and health.claim(keys[current_depth])
     ):

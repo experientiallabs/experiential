@@ -12,6 +12,7 @@ from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelId,
     ExactModelPoolId,
+    FailoverMode,
 )
 from exp.common.models.model import ReasoningEffort, ToolCall
 
@@ -878,3 +879,7 @@ class ExecutionSnapshot(ContractModel):
     exact_model_id: ExactModelId
     pool_id: ExactModelPoolId
     deployment_ids: tuple[DeploymentId, ...] = Field(min_length=1)
+    # The pool's per-model failover policy, carried onto the route so the
+    # per-attempt retry/failover decision can honor it. Defaults to the
+    # historical maximize_availability.
+    failover_mode: FailoverMode = "maximize_availability"

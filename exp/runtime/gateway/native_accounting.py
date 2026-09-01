@@ -312,6 +312,7 @@ class NativeAttemptAccounting:
                 attempt_counts=entry.attempt_counts,
                 total_attempts=entry.total_attempts,
                 refusal_failover=entry.authorization.refusal_failover,
+                failover_mode=route.snapshot.failover_mode,
             )
             last_failure: GatewayFailure | None = failure
         else:

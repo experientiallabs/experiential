@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, sha256_json
@@ -16,6 +18,17 @@ from exp.common.models.model import ModelAlias, ModelCapabilities
 ExactModelId = ArtifactId
 DeploymentId = ArtifactId
 ExactModelPoolId = ArtifactId
+
+FailoverMode = Literal["maximize_availability", "maximize_cache"]
+"""How a pool's waterfall reacts to a failed attempt.
+
+``maximize_availability`` (the default, historical behavior) fails over to the
+next rung on any failover-eligible error. ``maximize_cache`` keeps a transient
+throttle/timeout on the SAME warm rung -- redialing to preserve its prompt cache
+rather than restarting cold on another provider -- while STILL failing over on
+operational deadness (auth/not-found/5xx/transport), for which there is no cache
+to preserve. Client errors reject without failover in both modes.
+"""
 
 GATEWAY_EXCLUDED_PROVIDERS = frozenset({"tinker"})
 """Runtime-resolvable providers whose records never become gateway deployments."""
@@ -56,6 +69,9 @@ class ExactModelPool(ContractModel):
     exact_model_id: ExactModelId
     deployment_ids: tuple[DeploymentId, ...] = Field(min_length=1)
     equivalence: GatewayEquivalenceCertification | None = None
+    # Per-model failover policy for this pool's waterfall. Defaults to the
+    # historical maximize_availability so an unset pool behaves exactly as before.
+    failover_mode: FailoverMode = "maximize_availability"
 
     @model_validator(mode="after")
     def _require_unique_deployments(self) -> ExactModelPool:

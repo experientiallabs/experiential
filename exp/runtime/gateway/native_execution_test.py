@@ -265,6 +265,76 @@ def test_caller_invalid_request_never_advances() -> None:
     assert candidate is None
 
 
+def test_maximize_cache_redials_a_throttle_on_the_same_warm_rung() -> None:
+    """maximize_cache keeps a throttle on the same rung (cache) until its cap."""
+    health = DeploymentHealthRegistry()
+    # A throttle that fails over immediately under the default policy...
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=1,
+            refusal_failover=False,
+            failover_mode="maximize_availability",
+        )
+        == 1
+    )
+    # ...redials the SAME warm rung under maximize_cache to preserve its cache.
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=1,
+            refusal_failover=False,
+            failover_mode="maximize_cache",
+        )
+        == 0
+    )
+    # Once the per-deployment cap is reached it still fails over (availability
+    # is preserved; cache preservation is best-effort, not a trap on a dead rung).
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=[2, 0],
+            total_attempts=2,
+            refusal_failover=False,
+            failover_mode="maximize_cache",
+        )
+        == 1
+    )
+
+
+def test_maximize_cache_still_fails_over_on_operational_deadness() -> None:
+    """A dead rung (auth failure) fails over even under maximize_cache."""
+    health = DeploymentHealthRegistry()
+    dead = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+        safe_message="provider authentication failed",
+        failover_eligible=True,
+    )
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=dead,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode="maximize_cache",
+    )
+    # No cache to preserve on a rung that cannot authenticate -> advance.
+    assert candidate == 1
+
+
 def test_native_serving_blockers_name_dialectless_providers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
