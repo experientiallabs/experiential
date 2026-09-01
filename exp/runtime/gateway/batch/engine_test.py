@@ -699,3 +699,55 @@ def test_interrupted_terminal_settlement_resumes_from_open_jobs() -> None:
     final = store.jobs[job.batch_id]
     assert final.settled
     assert ledger.released == [("a", "failed")]
+
+
+def test_completed_job_settlement_retries_on_fetch_failure() -> None:
+    """A transient results-fetch error keeps a completed job unsettled."""
+    from exp.runtime.gateway.batch.contracts import BatchSubmitError as SubmitError
+
+    class FlakyResultsClient(ScriptedClient):
+        """Client whose first results fetch fails, then succeeds."""
+
+        def __init__(self) -> None:
+            """Script one completed snapshot and one flaky fetch."""
+            super().__init__(
+                [ProviderBatchSnapshot(status=BatchStatus.COMPLETED, results_ready=True)],
+                [
+                    BatchLineResult(
+                        custom_id="a",
+                        status_code=200,
+                        response={"usage": {"prompt_tokens": 1, "completion_tokens": 2}},
+                        input_tokens=1,
+                        output_tokens=2,
+                    )
+                ],
+            )
+            self.fetches = 0
+
+        async def results(self, *, job: BatchJob, api_key: str) -> list[BatchLineResult]:
+            """Fail the first fetch definitively, succeed afterwards."""
+            self.fetches += 1
+            if self.fetches == 1:
+                raise SubmitError(
+                    "provider result download failed with status 500", code="provider_error"
+                )
+            return list(self._results)
+
+    client = FlakyResultsClient()
+    engine, store, _, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    asyncio.run(engine.poll_once())
+    assert store.jobs[job.batch_id].settled is False
+    assert ledger.released == []
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.settled is True
+    assert ledger.settled == [("a", 2)]
+    assert ledger.released == []

@@ -538,7 +538,14 @@ class BatchEngine:
             client = self._clients[job.provider]
             try:
                 fetched = await client.results(job=job, api_key=self._api_key(job))
-            except (BatchSubmitError, AmbiguousProviderResponse):
+            except BatchSubmitError:
+                if job.status is BatchStatus.COMPLETED:
+                    # A completed job's results exist; a fetch failure is
+                    # retryable, so settlement stays open for a later poll
+                    # instead of releasing lines whose work already ran.
+                    raise
+                # A definitive provider response on a failed, expired, or
+                # cancelled job means no per-line results are available.
                 _LOGGER.warning(
                     "batch %s: no results retrievable for %s job; releasing all lines",
                     job.batch_id,
