@@ -11,6 +11,12 @@ pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
+    /// Cache-write tokens inside the input total, present only when the
+    /// provider reported a nonzero count (Anthropic-only today). The ledger
+    /// keeps billing the folded input total; this leg exists so callers see
+    /// their prompt being cached (Claude Code displays it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
 }
 
@@ -438,13 +444,19 @@ pub fn simplified_event(event: &Event) -> Value {
             "index": index,
             "citation": citation,
         }),
-        Event::Usage(usage) => serde_json::json!({
-            "kind": "usage",
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cached_input_tokens": usage.cached_input_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
-        }),
+        Event::Usage(usage) => {
+            let mut payload = serde_json::json!({
+                "kind": "usage",
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+            });
+            if let Some(creation) = usage.cache_creation_input_tokens {
+                payload["cache_creation_input_tokens"] = serde_json::json!(creation);
+            }
+            payload
+        }
         Event::Completed => serde_json::json!({"kind": "completed"}),
         Event::Incomplete => serde_json::json!({"kind": "incomplete"}),
         Event::PausedTurn => serde_json::json!({"kind": "paused_turn"}),
@@ -629,6 +641,7 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
             "cached_tokens",
             "OpenAI cached_tokens",
         )?,
+        cache_creation_input_tokens: None,
         reasoning_tokens: optional_usage_detail(
             object,
             "output_tokens_details",
@@ -658,6 +671,7 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
             "cached_tokens",
             "cached_tokens",
         )?,
+        cache_creation_input_tokens: None,
         reasoning_tokens: optional_usage_detail(
             object,
             "completion_tokens_details",
@@ -698,6 +712,7 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
             "cachedContentTokenCount",
             "Gemini cachedContentTokenCount",
         )?),
+        cache_creation_input_tokens: None,
         reasoning_tokens,
     })
 }
@@ -736,6 +751,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
             "Bedrock outputTokens",
         )?),
         cached_input_tokens: Some(cache_read),
+        cache_creation_input_tokens: None,
         reasoning_tokens: None,
     })
 }

@@ -902,3 +902,70 @@ def test_server_tool_blocks_and_citations_are_assistant_only() -> None:
             decode_messages(_body(messages=[{"role": "user", "content": content}]))
         assert error.value.status_code == 400
         assert "assistant" in error.value.detail.message
+
+
+def test_decode_carries_block_level_cache_markers_like_a_live_claude_code_turn() -> None:
+    """P0 (captured live 2026-09-01): Claude Code marks two of its three
+    system blocks and the last text block of the last user turn; agent loops
+    also mark tool_result breakpoints. Flattening dropped every marker, so
+    nothing through the gateway was ever cacheable (measured cache_read=0
+    across whole sessions, ~10x input billing)."""
+    decoded = decode_messages(
+        _body(
+            system=[
+                {"type": "text", "text": "You are Claude Code."},
+                {"type": "text", "text": "Short block.", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Long env block.", "cache_control": {"type": "ephemeral"}},
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "context"},
+                        {
+                            "type": "text",
+                            "text": "do the thing",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call-1", "name": "Bash", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": "ok",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+        )
+    )
+    system = decoded.request.messages[0]
+    assert system.role == "system"
+    assert system.content == "You are Claude Code.\n\nShort block.\n\nLong env block."
+    assert system.provider_text_blocks == (
+        {"type": "text", "text": "You are Claude Code."},
+        {"type": "text", "text": "Short block.", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "Long env block.", "cache_control": {"type": "ephemeral"}},
+    )
+    user = decoded.request.messages[1]
+    assert user.content == "contextdo the thing"
+    assert user.provider_text_blocks == (
+        {"type": "text", "text": "context"},
+        {"type": "text", "text": "do the thing", "cache_control": {"type": "ephemeral"}},
+    )
+    tool = decoded.request.messages[3]
+    assert tool.role == "tool"
+    assert tool.cache_control == {"type": "ephemeral"}
+
+    # A markerless request carries nothing: payloads stay byte-identical.
+    plain = decode_messages(_body(system=[{"type": "text", "text": "You are terse."}])).request
+    assert plain.messages[0].provider_text_blocks == ()
+    assert plain.messages[1].provider_text_blocks == ()

@@ -324,7 +324,13 @@ def decode_messages(
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
     if system_text:
-        messages.append(GatewayMessage(role="system", content=system_text))
+        messages.append(
+            GatewayMessage(
+                role="system",
+                content=system_text,
+                provider_text_blocks=_marked_text_blocks(request.system),
+            )
+        )
     for index, message in enumerate(request.messages):
         messages.extend(_gateway_messages(message, index))
     parallel_tool_calls: bool | None = None
@@ -577,6 +583,31 @@ def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
     return "\n\n".join(block.text for block in system)
 
 
+def _marked_text_blocks(
+    blocks: str | tuple[_TextBlock, ...] | None,
+) -> tuple[JsonObject, ...]:
+    """Rebuild a text-block run verbatim when any block carries a cache marker.
+
+    Claude Code marks system blocks and the last text block of recent user
+    turns (captured live 2026-09-01). The flattened string stays the
+    canonical content on every wire; this carrier exists so Anthropic rungs
+    re-emit the caller's exact block structure with its markers, which is
+    what makes the prompt cacheable at all. A markerless run carries
+    nothing, keeping existing payloads byte-identical.
+    """
+    if blocks is None or isinstance(blocks, str):
+        return ()
+    if all(block.cache_control is None for block in blocks):
+        return ()
+    rebuilt: list[JsonObject] = []
+    for block in blocks:
+        entry: JsonObject = {"type": "text", "text": block.text}
+        if block.cache_control is not None:
+            entry["cache_control"] = block.cache_control.model_dump(mode="json", exclude_none=True)
+        rebuilt.append(entry)
+    return tuple(rebuilt)
+
+
 def _stop_sequences(sequences: tuple[str, ...] | None) -> tuple[str, ...]:
     """Dedupe stop sequences in caller order and reject empty entries."""
     if not sequences:
@@ -656,13 +687,13 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             )
         return [GatewayMessage(role=message.role, content=message.content)]
     out: list[GatewayMessage] = []
-    text_parts: list[str] = []
+    text_parts: list[_TextBlock] = []
     tool_calls: list[ToolCall] = []
     reasoning: list[ProviderReasoningBlock] = []
 
     def flush() -> None:
         """Emit the pending text, tool calls, and reasoning as one canonical message."""
-        content = "".join(text_parts) if text_parts else None
+        content = "".join(part.text for part in text_parts) if text_parts else None
         if content is None and not tool_calls and not reasoning:
             return
         out.append(
@@ -671,6 +702,7 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 content=content,
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
+                provider_text_blocks=_marked_text_blocks(tuple(text_parts)),
             )
         )
         text_parts.clear()
@@ -698,9 +730,9 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 )
                 continue
             # An empty citations array (the SDK accumulator's uncited shape)
-            # is dropped with the other content-block hints: it carries no
-            # information and the bare text round-trips on every wire.
-            text_parts.append(block.text)
+            # carries no information and drops; a cache marker on the block
+            # survives through the marked-run carrier.
+            text_parts.append(block)
         elif isinstance(block, (_ThinkingBlock, _RedactedThinkingBlock)):
             if message.role != "assistant":
                 raise invalid_field(
@@ -761,6 +793,14 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     content=_tool_result_text(block),
                     tool_call_id=block.tool_use_id,
                     tool_is_error=block.is_error,
+                    # The marker Claude Code puts on its conversation
+                    # breakpoints usually lands on a tool_result block; it
+                    # re-emits with the block on Anthropic rungs.
+                    cache_control=(
+                        block.cache_control.model_dump(mode="json", exclude_none=True)
+                        if block.cache_control is not None
+                        else None
+                    ),
                 )
             )
     flush()

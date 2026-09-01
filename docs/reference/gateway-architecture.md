@@ -228,9 +228,16 @@ adaptive default; on the adaptive-only generation, which rejects `enabled`/`disa
 configs outright, an `enabled` config translates to adaptive with the dropped
 `thinking.budget_tokens` disclosed as ignored, and `disabled` is rejected by name
 because those models cannot turn thinking off), requires
-`max_tokens`, validates `cache_control` (carrying it where the Anthropic wire caches natively:
-`tool_use` blocks, tool definitions, and the top-level automatic marker forward verbatim, while
-content-block hints drop; non-Anthropic routes disclose each omission through
+`max_tokens`, validates `cache_control` (carrying it everywhere the Anthropic wire caches
+natively: `tool_use` blocks, tool definitions, the top-level automatic marker, and block-level
+markers on system and message text runs and on `tool_result` breakpoints all forward verbatim.
+Marked runs re-emit the caller's exact block structure while the flattened string stays the
+canonical content for every other wire and for digests; markerless payloads stay byte-identical.
+This is what makes Claude Code sessions cacheable at all: it marks its system blocks and
+conversation breakpoints on every request, and flattening them once billed whole sessions
+uncached at ~10x. Responses report both cache legs back out of the folded ledger total, so
+callers see `cache_creation_input_tokens` on the writing turn and `cache_read_input_tokens` on
+later turns. Routes with no Anthropic rung disclose the dropped markers through
 `ignored_parameters`), carries the provider-native tool annotations (`strict`,
 `eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
 bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with

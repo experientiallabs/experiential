@@ -476,6 +476,9 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 input_tokens: object
                     .get("input_tokens")
                     .and_then(serde_json::Value::as_u64),
+                cache_creation_input_tokens: object
+                    .get("cache_creation_input_tokens")
+                    .and_then(serde_json::Value::as_u64),
                 output_tokens: object
                     .get("output_tokens")
                     .and_then(serde_json::Value::as_u64),

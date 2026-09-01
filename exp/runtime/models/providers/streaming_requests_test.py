@@ -2407,3 +2407,85 @@ def test_anthropic_payload_reemits_echoed_server_blocks_in_order() -> None:
         result_block,
         cited_text,
     ]
+
+
+def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes() -> None:
+    """The caller's block structure re-emits exactly where markers exist and
+    only there; markerless payloads stay byte-identical, and per the #699
+    rule a mixed waterfall keeps the markers for its Anthropic rung."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(
+                role="system",
+                content="You are Claude Code.\n\nLong env block.",
+                provider_text_blocks=(
+                    {"type": "text", "text": "You are Claude Code."},
+                    {
+                        "type": "text",
+                        "text": "Long env block.",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ),
+            ),
+            GatewayMessage(
+                role="user",
+                content="contextdo the thing",
+                provider_text_blocks=(
+                    {"type": "text", "text": "context"},
+                    {
+                        "type": "text",
+                        "text": "do the thing",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ),
+            ),
+            GatewayMessage(role="assistant", content="ran it"),
+            GatewayMessage(
+                role="tool",
+                content="ok",
+                tool_call_id="call-1",
+                cache_control={"type": "ephemeral"},
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    assert payload["system"] == [
+        {"type": "text", "text": "You are Claude Code."},
+        {"type": "text", "text": "Long env block.", "cache_control": {"type": "ephemeral"}},
+    ]
+    messages = cast(list[JsonObject], payload["messages"])
+    user_blocks = cast(list[JsonObject], messages[0]["content"])
+    assert user_blocks == [
+        {"type": "text", "text": "context"},
+        {"type": "text", "text": "do the thing", "cache_control": {"type": "ephemeral"}},
+    ]
+    tool_blocks = cast(list[JsonObject], messages[2]["content"])
+    assert tool_blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+    # Markerless requests keep the exact pre-change wire shape.
+    plain = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="system", content="a\n\nb"),
+            GatewayMessage(role="user", content="hi"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    plain_payload = anthropic_messages_stream_payload("claude-fable-5", plain)
+    assert plain_payload["system"] == "a\n\nb"
+    plain_messages = cast(list[JsonObject], plain_payload["messages"])
+    assert plain_messages[0]["content"] == [{"type": "text", "text": "hi"}]
+
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
+    mixed_public, mixed_provider = route_generation_parameter_requests(
+        (anthropic, fallback), request
+    )
+    assert "messages.content.cache_control" not in mixed_public.ignored_parameters
+    assert mixed_provider.messages[0].provider_text_blocks
+    foreign_public, _foreign_provider = route_generation_parameter_requests((fallback,), request)
+    assert "messages.content.cache_control" in foreign_public.ignored_parameters

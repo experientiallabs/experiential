@@ -50,7 +50,7 @@ def anthropic_messages_stream_payload(
     # this adapter. Keep the shared route signature for capability plumbing,
     # but never put an OpenAI-shaped field on the Anthropic wire.
     del supports_logprobs
-    system_parts: list[str] = []
+    system_parts: list[tuple[str, tuple[JsonObject, ...]]] = []
     messages: list[JsonObject] = []
     for message in request.messages:
         if message.role in {"system", "developer"}:
@@ -62,10 +62,17 @@ def anthropic_messages_stream_payload(
             # rules), so its position is preserved verbatim.
             if messages:
                 messages.append(
-                    {"role": "system", "content": [{"type": "text", "text": message.content}]}
+                    {
+                        "role": "system",
+                        "content": (
+                            list(message.provider_text_blocks)
+                            if message.provider_text_blocks
+                            else [{"type": "text", "text": message.content}]
+                        ),
+                    }
                 )
             else:
-                system_parts.append(message.content)
+                system_parts.append((message.content, message.provider_text_blocks))
             continue
         role, blocks = anthropic_blocks(message)
         if messages and messages[-1].get("role") == role:
@@ -82,7 +89,20 @@ def anthropic_messages_stream_payload(
         "stream": True,
     }
     if system_parts:
-        payload["system"] = "\n\n".join(system_parts)
+        if any(blocks for _, blocks in system_parts):
+            # A cache-marked system prompt re-emits the caller's exact block
+            # structure: block-level markers are the only way the provider
+            # caches the prompt. Markerless requests keep the joined string
+            # so their payloads stay byte-identical.
+            system_blocks: list[JsonObject] = []
+            for content, blocks in system_parts:
+                if blocks:
+                    system_blocks.extend(blocks)
+                else:
+                    system_blocks.append({"type": "text", "text": content})
+            payload["system"] = system_blocks
+        else:
+            payload["system"] = "\n\n".join(content for content, _ in system_parts)
     if request.tools:
         tools: list[JsonObject] = []
         for tool in request.tools:

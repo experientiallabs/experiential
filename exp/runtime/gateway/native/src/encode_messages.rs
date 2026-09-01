@@ -70,10 +70,18 @@ pub(super) fn messages_usage(usage: Option<&Usage>) -> Value {
         _ => return json!({"input_tokens": 0, "output_tokens": 0}),
     };
     let cached = usage.cached_input_tokens.unwrap_or(0);
+    let creation = usage.cache_creation_input_tokens.unwrap_or(0);
     let mut body = Map::new();
+    // Both cache legs come back out of the folded ledger total so callers
+    // see the provider's own shape: input_tokens excludes cached reads and
+    // cache writes, each reported on its own leg.
     body.insert(
         "input_tokens".to_string(),
-        json!(usage.input_tokens.unwrap_or(0).saturating_sub(cached)),
+        json!(usage
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_sub(cached)
+            .saturating_sub(creation)),
     );
     body.insert(
         "output_tokens".to_string(),
@@ -81,6 +89,9 @@ pub(super) fn messages_usage(usage: Option<&Usage>) -> Value {
     );
     if cached > 0 {
         body.insert("cache_read_input_tokens".to_string(), json!(cached));
+    }
+    if creation > 0 {
+        body.insert("cache_creation_input_tokens".to_string(), json!(creation));
     }
     Value::Object(body)
 }

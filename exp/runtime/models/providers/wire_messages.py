@@ -119,8 +119,16 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
         # marker is emitted solely when set so existing payloads are unchanged.
         if message.tool_is_error:
             result["is_error"] = True
+        # A caller cache marker on the tool result re-emits with its block:
+        # this is where Claude Code's conversation breakpoints usually land.
+        if message.cache_control is not None:
+            result["cache_control"] = message.cache_control
         return ("user", [result])
     if message.role == "user":
+        if message.provider_text_blocks:
+            # The cache-marked run re-emits the caller's exact blocks; the
+            # flattened content stays canonical for every other wire.
+            return "user", list(message.provider_text_blocks)
         return "user", [{"type": "text", "text": message.content or ""}]
     if message.role != "assistant":
         raise ProviderResponseError("unsupported Anthropic message role")
@@ -143,7 +151,9 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             # OpenAI encrypted reasoning cannot replay on the Anthropic wire;
             # route admission rejects the combination before dispatch.
             raise ProviderResponseError("encrypted reasoning cannot replay on the Anthropic wire")
-    if message.content is not None:
+    if message.provider_text_blocks:
+        blocks.extend(message.provider_text_blocks)
+    elif message.content is not None:
         blocks.append({"type": "text", "text": message.content})
     for call in message.tool_calls:
         tool_use: JsonObject = {

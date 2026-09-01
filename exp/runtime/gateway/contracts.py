@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
+from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelId,
@@ -275,6 +275,28 @@ class GatewayMessage(ContractModel):
     like the other carriers so block-free digests are unperturbed; a present
     block joins replay identity through :func:`canonical_request_sha256`.
     """
+    provider_text_blocks: tuple[JsonObject, ...] = Field(default=(), exclude=True)
+    """This message's verbatim Anthropic text blocks when one carries a
+    prompt-cache marker.
+
+    Claude Code marks system blocks and the last text block of recent user
+    turns (captured live 2026-09-01); flattening them to one plain string
+    strips every marker, so nothing the caller sends is ever cacheable and
+    long sessions bill full input each turn (measured ~10x). When present,
+    the blocks' concatenated text equals ``content`` exactly and Anthropic
+    rungs re-emit them verbatim; other wires keep the flattened string and
+    disclose the dropped markers. A cache hint changes cost, not semantics,
+    so like the other cache carriers this joins neither serialization nor
+    replay identity.
+    """
+    cache_control: JsonObject | None = Field(default=None, exclude=True)
+    """Validated caller prompt-caching marker on this tool-result message.
+
+    Claude Code marks the last block of recent user turns, which in an agent
+    loop is usually a ``tool_result``; the split tool message carries the
+    marker onto the re-emitted block on Anthropic rungs. Cost, not
+    semantics: never in digests or replay identity.
+    """
 
     @model_validator(mode="after")
     def _require_role_coherence(self) -> GatewayMessage:
@@ -341,6 +363,17 @@ class GatewayMessage(ContractModel):
             raise ValueError("tool_call_id is valid only for tool messages")
         if self.role != "tool" and self.tool_is_error:
             raise ValueError("tool_is_error is valid only for tool messages")
+        if self.cache_control is not None and self.role != "tool":
+            raise ValueError("message cache_control is valid only for tool messages")
+        if self.provider_text_blocks:
+            if self.role == "tool":
+                raise ValueError("text blocks are not valid for tool messages")
+            # The carrier never changes semantics: its text must flatten to
+            # this message's canonical content (message runs join adjacent
+            # parts directly; system blocks join with one blank line).
+            texts = [str(block.get("text", "")) for block in self.provider_text_blocks]
+            if (self.content or "") not in ("".join(texts), "\n\n".join(texts)):
+                raise ValueError("provider text blocks must flatten to the message content")
         return self
 
 
@@ -630,143 +663,6 @@ class GatewayRequest(ContractModel):
         return self
 
 
-def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
-    """Collect the provider-significant input excluded from serialization.
-
-    The carriers (replayed reasoning, native items, verbatim provider
-    configurations) are excluded from model serialization so immutable
-    artifacts and pre-existing request digests stay byte-identical, but the
-    provider still reads them as input. Replay identity folds this envelope
-    into :func:`canonical_request_sha256`, and reservation adds its bytes to
-    the conservative input bound so an excluded carrier can never push a
-    request across a pricing threshold unreserved.
-
-    Args:
-        request: Canonical gateway request as decoded from the public wire.
-
-    Returns:
-        The envelope of excluded provider input, or ``None`` when the plain
-        serialization already covers everything.
-    """
-    replay: list[JsonObject] = []
-    for message_index, message in enumerate(request.messages):
-        authority: JsonObject = {"message_index": message_index}
-        if message.provider_item_id is not None:
-            authority["provider_item_id"] = message.provider_item_id
-            authority["provider_output_index"] = message.provider_output_index
-            authority["provider_status"] = message.provider_status
-            authority["provider_phase"] = message.provider_phase
-        if message.provider_native_item is not None:
-            authority["provider_native_item"] = message.provider_native_item
-        if message.provider_anthropic_block is not None:
-            authority["provider_anthropic_block"] = message.provider_anthropic_block
-        if message.provider_reasoning:
-            blocks: list[JsonObject] = []
-            for block in message.provider_reasoning:
-                serialized = block.model_dump(mode="json")
-                if isinstance(block, EncryptedReasoningBlock):
-                    serialized["output_index"] = block.output_index
-                    serialized["status"] = block.status
-                blocks.append(serialized)
-            authority["provider_reasoning"] = blocks
-        retained_calls: list[JsonObject] = []
-        for tool_call_index, call in enumerate(message.tool_calls):
-            if (
-                call.raw_arguments is None
-                and call.provider_item_id is None
-                and call.provider_output_index is None
-                and call.provider_status is None
-            ):
-                continue
-            retained_calls.append(
-                {
-                    "tool_call_index": tool_call_index,
-                    "call_id": call.call_id,
-                    "name": call.name,
-                    "raw_arguments": call.raw_arguments,
-                    "provider_item_id": call.provider_item_id,
-                    "provider_output_index": call.provider_output_index,
-                    "provider_status": call.provider_status,
-                }
-            )
-        if retained_calls:
-            authority["tool_calls"] = retained_calls
-        if message.tool_is_error:
-            authority["tool_is_error"] = True
-        if len(authority) > 1:
-            replay.append(authority)
-    retained_tools: list[JsonObject] = []
-    for tool_index, tool in enumerate(request.tools):
-        if not tool.has_anthropic_tool_carriers():
-            continue
-        retained_tool: JsonObject = {"tool_index": tool_index, "name": tool.name}
-        if tool.eager_input_streaming is not None:
-            retained_tool["eager_input_streaming"] = tool.eager_input_streaming
-        if tool.defer_loading is not None:
-            retained_tool["defer_loading"] = tool.defer_loading
-        if tool.allowed_callers is not None:
-            retained_tool["allowed_callers"] = list(tool.allowed_callers)
-        if tool.input_examples is not None:
-            retained_tool["input_examples"] = list(tool.input_examples)
-        retained_tools.append(retained_tool)
-    if (
-        not replay
-        and not retained_tools
-        and request.provider_thinking_config is None
-        and request.reasoning_context is None
-        and request.context_management is None
-        and request.provider_output_config is None
-        and request.diagnostics is None
-        and request.speed is None
-        and request.inference_geo is None
-        and not request.provider_beta_tokens
-        and not request.provider_server_tools
-    ):
-        return None
-    envelope: JsonObject = {
-        "provider_replay": replay,
-        "provider_thinking_config": request.provider_thinking_config,
-        "reasoning_context": request.reasoning_context,
-        "context_management": request.context_management,
-        "provider_output_config": request.provider_output_config,
-    }
-    # The newer Messages carriers join the envelope only when present, so
-    # every request decoded before they existed keeps its exact digest.
-    if request.diagnostics is not None:
-        envelope["diagnostics"] = request.diagnostics
-    if request.speed is not None:
-        envelope["speed"] = request.speed
-    if request.inference_geo is not None:
-        envelope["inference_geo"] = request.inference_geo
-    if retained_tools:
-        envelope["tools"] = retained_tools
-    if request.provider_beta_tokens:
-        envelope["provider_beta_tokens"] = list(request.provider_beta_tokens)
-    if request.provider_server_tools:
-        envelope["provider_server_tools"] = list(request.provider_server_tools)
-    return envelope
-
-
-def canonical_request_sha256(request: GatewayRequest) -> Sha256:
-    """Digest one canonical request including excluded provider replay authority.
-
-    A caller operation key reused with different replayed reasoning must be
-    a rejected conflict, never a silent replay of the earlier response. A
-    request with no carrier digests exactly as its plain serialization, so
-    every request decoded before the carriers existed keeps its identity.
-
-    Args:
-        request: Canonical gateway request as decoded from the public wire.
-
-    Returns:
-        The stable canonical request digest.
-    """
-    envelope = provider_replay_authority(request)
-    if envelope is None:
-        return sha256_json(request)
-    return sha256_json({"request_sha256": sha256_json(request), **envelope})
-
-
 class GatewayUsage(ContractModel):
     """Normalized token counts and invoked tool names from one provider attempt.
 
@@ -781,6 +677,10 @@ class GatewayUsage(ContractModel):
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_input_tokens: int | None = Field(default=None, ge=0)
+    """Cache-write tokens inside the input total (Anthropic-only today),
+    present only when the provider reported a nonzero count; billing keeps
+    using the folded input total."""
     reasoning_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
@@ -792,7 +692,11 @@ class GatewayUsage(ContractModel):
         if (totals[0] is None) != (totals[1] is None):
             raise ValueError("input and output token counts must be reported together")
         if totals[0] is None:
-            if self.cached_input_tokens is not None or self.reasoning_tokens is not None:
+            if (
+                self.cached_input_tokens is not None
+                or self.cache_creation_input_tokens is not None
+                or self.reasoning_tokens is not None
+            ):
                 raise ValueError("token detail counts require input and output totals")
             if not self.tool_names:
                 raise ValueError("usage requires token totals or invoked tool names")

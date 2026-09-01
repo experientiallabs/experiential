@@ -236,7 +236,7 @@ def test_provider_reasoning_carrier_is_ordered_assistant_only_and_digest_free() 
     # Plain digests stay byte-identical (immutable artifacts, pre-carrier
     # requests), but replay identity distinguishes reasoning content so a
     # reused caller operation key with different reasoning conflicts.
-    from exp.runtime.gateway.contracts import canonical_request_sha256
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
     assert canonical_request_sha256(bare) == sha256_json(bare)
     assert canonical_request_sha256(carried) != canonical_request_sha256(bare)
@@ -316,7 +316,7 @@ def test_reasoning_carrier_request_fields_are_surface_scoped() -> None:
 
 def test_provider_replay_identity_hashes_exact_tool_and_message_state() -> None:
     """Excluded wire identity and raw argument bytes still bind idempotent replay."""
-    from exp.runtime.gateway.contracts import canonical_request_sha256
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
     def request(*, item_id: str, raw_arguments: str, output_index: int = 2) -> GatewayRequest:
         return GatewayRequest(
@@ -358,7 +358,7 @@ def test_provider_replay_identity_hashes_exact_tool_and_message_state() -> None:
 
 def test_provider_replay_identity_hashes_status_phase_and_idless_call_order() -> None:
     """Excluded OpenAI item fields remain authenticated canonical authority."""
-    from exp.runtime.gateway.contracts import canonical_request_sha256
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
     def request(
         *,
@@ -463,7 +463,7 @@ def test_reasoning_context_is_digest_excluded_but_joins_replay_identity() -> Non
     context is a conflict, never a silent replay.
     """
     from exp.common.core.artifacts import sha256_json
-    from exp.runtime.gateway.contracts import canonical_request_sha256
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
     messages = (GatewayMessage(role="user", content="hi"),)
     bare = GatewayRequest(surface=GatewayApiSurface.RESPONSES, messages=messages)
@@ -494,7 +494,7 @@ def test_reasoning_context_is_digest_excluded_but_joins_replay_identity() -> Non
 def test_context_management_is_digest_excluded_but_joins_replay_identity() -> None:
     """Config-free requests digest byte-identically to pre-field traffic."""
     from exp.common.core.artifacts import sha256_json
-    from exp.runtime.gateway.contracts import canonical_request_sha256
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
     messages = (GatewayMessage(role="user", content="hi"),)
     bare = GatewayRequest(surface=GatewayApiSurface.MESSAGES, messages=messages)
@@ -519,7 +519,8 @@ def test_context_management_is_digest_excluded_but_joins_replay_identity() -> No
 def test_anthropic_tool_annotations_are_digest_free_but_bind_replay_identity() -> None:
     """Tool carriers never perturb plain digests; present ones bind replay."""
     from exp.common.core.artifacts import sha256_json
-    from exp.runtime.gateway.contracts import GatewayToolDefinition, canonical_request_sha256
+    from exp.runtime.gateway.contracts import GatewayToolDefinition
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
     def request(tool: GatewayToolDefinition) -> GatewayRequest:
         return GatewayRequest(
@@ -557,7 +558,7 @@ def test_anthropic_tool_annotations_are_digest_free_but_bind_replay_identity() -
 def test_messages_only_carriers_cache_control_and_inference_geo() -> None:
     """The top-level cache marker stays identity-inert; the region binds replay."""
     from exp.common.core.artifacts import sha256_json
-    from exp.runtime.gateway.contracts import canonical_request_sha256
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
     messages = (GatewayMessage(role="user", content="hi"),)
     bare = GatewayRequest(surface=GatewayApiSurface.MESSAGES, messages=messages)
@@ -608,7 +609,7 @@ def test_messages_only_carriers_cache_control_and_inference_geo() -> None:
 
 def test_server_tool_carriers_are_scoped_verbatim_and_join_replay_identity() -> None:
     """Server tool entries and echoed blocks are Messages-only whole-message carriers."""
-    from exp.runtime.gateway.contracts import canonical_request_sha256
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
 
     server_entry: JsonObject = {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
     bare = GatewayRequest(
@@ -669,4 +670,60 @@ def test_tool_choice_may_name_a_server_tool() -> None:
             messages=(GatewayMessage(role="user", content="hi"),),
             provider_server_tools=(server_entry,),
             tool_choice=GatewayNamedToolChoice(name="absent"),
+        )
+
+
+def test_block_cache_markers_are_identity_inert_and_role_scoped() -> None:
+    """Cache markers change cost, not semantics: no digest or replay effect."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    marked = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(
+                role="system",
+                content="a\n\nb",
+                provider_text_blocks=(
+                    {"type": "text", "text": "a"},
+                    {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}},
+                ),
+            ),
+            GatewayMessage(role="user", content="hi"),
+        ),
+    )
+    bare = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="system", content="a\n\nb"),
+            GatewayMessage(role="user", content="hi"),
+        ),
+    )
+    assert marked.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(marked) == sha256_json(bare)
+    assert canonical_request_sha256(marked) == canonical_request_sha256(bare)
+
+    marked_tool = GatewayMessage(
+        role="tool",
+        content="ok",
+        tool_call_id="call-1",
+        cache_control={"type": "ephemeral"},
+    )
+    bare_tool = GatewayMessage(role="tool", content="ok", tool_call_id="call-1")
+    assert sha256_json(marked_tool) == sha256_json(bare_tool)
+
+    with pytest.raises(ValidationError, match="valid only for tool messages"):
+        GatewayMessage(role="user", content="hi", cache_control={"type": "ephemeral"})
+    with pytest.raises(ValidationError, match="must flatten to the message content"):
+        GatewayMessage(
+            role="user",
+            content="different",
+            provider_text_blocks=({"type": "text", "text": "hi"},),
+        )
+    with pytest.raises(ValidationError, match="not valid for tool messages"):
+        GatewayMessage(
+            role="tool",
+            content="ok",
+            tool_call_id="call-1",
+            provider_text_blocks=({"type": "text", "text": "ok"},),
         )

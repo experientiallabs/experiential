@@ -497,6 +497,19 @@ def route_generation_parameter_requests(
         if "messages.tool_calls.cache_control" not in ignored:
             ignored.append("messages.tool_calls.cache_control")
 
+    # Block-level cache markers (system and message text runs, tool-result
+    # breakpoints) follow the #699 rule: kept while ANY rung is Anthropic
+    # (the marker changes cost, not semantics, and only the non-Anthropic
+    # rungs silently cannot cache), disclosed only when no rung can honor
+    # them. Claude Code marks its system prompt and conversation
+    # breakpoints on every request.
+    if any(
+        message.provider_text_blocks or message.cache_control is not None
+        for message in request.messages
+    ) and not any(profile.dialect == "anthropic_messages" for profile in profiles):
+        if "messages.content.cache_control" not in ignored:
+            ignored.append("messages.content.cache_control")
+
     # Anthropic-native tool-definition annotations exist only on that wire;
     # every other rung drops each one with a per-field disclosure, never a
     # rejection (Claude Code sends eager_input_streaming conditionally).

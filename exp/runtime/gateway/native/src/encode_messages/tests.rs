@@ -10,6 +10,7 @@ fn usage_reports_cached_reads_out_of_the_input_total() {
         input_tokens: Some(10),
         output_tokens: Some(4),
         cached_input_tokens: Some(3),
+        cache_creation_input_tokens: None,
         reasoning_tokens: None,
     };
     assert_eq!(
@@ -588,4 +589,26 @@ fn paused_turn_keeps_its_stop_reason_on_both_paths() {
     let aggregated = completed_messages_body("request-abc", "coding", &events).expect("aggregates");
     assert_eq!(aggregated.body["stop_reason"], json!("pause_turn"));
     assert!(!aggregated.incomplete);
+}
+
+#[test]
+fn usage_reports_both_cache_legs_out_of_the_folded_input_total() {
+    // A live cached turn folds input as uncached + read + write for the
+    // ledger; callers get the provider's own shape back, with each cache
+    // leg on its own field (Claude Code displays cache_creation on turn 1).
+    let usage = Usage {
+        input_tokens: Some(45_543),
+        output_tokens: Some(9),
+        cached_input_tokens: Some(0),
+        cache_creation_input_tokens: Some(45_338),
+        reasoning_tokens: None,
+    };
+    assert_eq!(
+        messages_usage(Some(&usage)),
+        json!({
+            "input_tokens": 205,
+            "output_tokens": 9,
+            "cache_creation_input_tokens": 45_338,
+        })
+    );
 }

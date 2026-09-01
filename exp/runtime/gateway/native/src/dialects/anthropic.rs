@@ -286,6 +286,9 @@ impl Normalizer {
                     input_tokens: Some(input_tokens),
                     output_tokens: Some(self.output_tokens),
                     cached_input_tokens: Some(self.cache_read),
+                    // Present only when nonzero so cache-less streams keep
+                    // their exact pre-field usage shape.
+                    cache_creation_input_tokens: (self.cache_write > 0).then_some(self.cache_write),
                     // Anthropic reports thinking inside output_tokens and
                     // publishes no separate count, so the reasoning subset
                     // stays unknown instead of being invented.

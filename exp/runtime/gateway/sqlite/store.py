@@ -28,9 +28,9 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayTarget,
     ProjectTarget,
-    canonical_request_sha256,
 )
 from exp.runtime.gateway.interfaces import GatewayClock
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.sqlite import key_delivery
 from exp.runtime.gateway.sqlite.alias_activation import (
     activate_alias_revision_in_transaction,
