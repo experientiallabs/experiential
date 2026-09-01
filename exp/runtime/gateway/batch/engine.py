@@ -98,6 +98,10 @@ class BatchEngine:
         self._clients = clients if clients is not None else PROVIDER_CLIENTS
         self._poll_interval = max(1.0, poll_interval_seconds)
 
+    def is_batch_model(self, *, model: str) -> bool:
+        """Return whether the catalog resolves one explicit batch model."""
+        return self._catalog.batch_deployment(model=model) is not None
+
     def upload_file(
         self, *, organization_id: str, filename: str, purpose: str, content: bytes
     ) -> BatchFile:
@@ -368,13 +372,19 @@ class BatchEngine:
             return job
         client = self._clients[job.provider]
         if job.provider_batch_id is not None:
+            if not client.supports_cancel:
+                # An honest refusal beats a silent no-op: the caller learns
+                # the provider limitation and the job state stays untouched.
+                raise BatchSubmitError(
+                    f"{job.provider} batches cannot be cancelled; the job runs to completion",
+                    code="cancel_unsupported",
+                )
             # The intent persists before the provider call, so a failed call
             # cannot lose it: the poller re-requests cancellation until the
             # provider confirms a terminal state.
             job = job.model_copy(update={"status": BatchStatus.CANCELLING})
             self._store.save_job(job=job)
-            if client.supports_cancel:
-                await client.cancel(job=job, api_key=self._api_key(job))
+            await client.cancel(job=job, api_key=self._api_key(job))
         elif self._store.begin_dispatch(batch_id=job.batch_id):
             # Winning the one-time dispatch claim proves no submission ever
             # ran or will run, so the lines release safely right now.

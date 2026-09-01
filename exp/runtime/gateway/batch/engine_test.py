@@ -823,3 +823,22 @@ def test_failed_provider_cancel_keeps_the_intent_and_retries() -> None:
     final = store.jobs[job.batch_id]
     assert final.status is BatchStatus.CANCELLED and final.settled
     assert ledger.released == [("a", "cancelled")]
+
+
+def test_direct_cancel_on_an_unsupported_provider_refuses_honestly() -> None:
+    """A dispatched OpenRouter-style job refuses cancellation with the reason."""
+    client = ScriptedClient([ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS)], [])
+    engine, store, _, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    with pytest.raises(BatchSubmitError, match="cannot be cancelled"):
+        asyncio.run(engine.cancel(organization_id="org_a", batch_id=job.batch_id))
+    unchanged = store.jobs[job.batch_id]
+    assert unchanged.status is BatchStatus.IN_PROGRESS
+    assert ledger.released == []

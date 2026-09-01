@@ -38,6 +38,10 @@ class BatchControlPlane:
         self._engine = engine
         self._control = control
 
+    def is_batch_model(self, *, alias: str) -> bool:
+        """Return whether one alias names an explicit batch-callable model."""
+        return self._engine.is_batch_model(model=alias)
+
     def _identity(self, argument: JsonObject) -> tuple[str, str]:
         """Authenticate the carried bearer key into an owning identity.
 

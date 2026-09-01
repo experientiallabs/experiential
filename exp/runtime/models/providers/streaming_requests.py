@@ -614,6 +614,19 @@ def route_generation_parameter_requests(
             param="input",
             code="unsupported_parameter",
         )
+    if request.provider_native_tools and not all(
+        profile.dialect == "openai_responses" for profile in profiles
+    ):
+        raise ProviderParameterError(
+            message=(
+                "The request carries native Responses tool declarations (custom, "
+                "namespace, web_search, or tool_search entries) that only a native "
+                "OpenAI Responses route can serve. Remove those tools or choose a "
+                "different model alias."
+            ),
+            param="tools",
+            code="unsupported_parameter",
+        )
 
     # A system turn after conversation began has positional semantics that
     # instruction-hoisting wires cannot preserve; those rungs narrow out.

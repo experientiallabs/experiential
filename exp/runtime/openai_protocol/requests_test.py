@@ -1836,3 +1836,90 @@ def test_assistant_image_parts_are_rejected() -> None:
                 ],
             }
         )
+
+
+def test_non_function_tool_declarations_carry_verbatim_at_their_positions() -> None:
+    """Regression fixture: the top-level tools array real Codex (0.151.0)
+    sends by default on gpt-5.x models, trimmed from a live capture
+    (2026-09-01). Every non-function declaration type api.openai.com accepts
+    with a plain key (custom, namespace, web_search, tool_search; each
+    verified live 2026-09-01) carries byte-for-byte with its position;
+    function declarations keep the strict typed profile."""
+    function_tool = {
+        "type": "function",
+        "name": "exec_command",
+        "description": "Execute shell commands",
+        "strict": False,
+        "parameters": {"type": "object", "properties": {}},
+    }
+    custom_tool = {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Use the `apply_patch` tool to edit files.",
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": 'start: begin_patch hunk+ end_patch\nbegin_patch: "*** Begin Patch"',
+        },
+    }
+    namespace_tool = {
+        "type": "namespace",
+        "name": "multi_agent_v1",
+        "description": "Tools for spawning and managing sub-agents.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "close_agent",
+                "description": "Close an agent.",
+                "strict": False,
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    }
+    web_search_tool = {"type": "web_search", "external_web_access": False}
+    tool_search_tool = {
+        "type": "tool_search",
+        "description": "Search for additional tools.",
+        "parameters": {"type": "object", "properties": {}},
+        "execution": {"type": "server"},
+    }
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.2",
+            "store": False,
+            "stream": True,
+            "tool_choice": "required",
+            "input": "Run ls.",
+            "tools": [
+                function_tool,
+                custom_tool,
+                namespace_tool,
+                web_search_tool,
+                tool_search_tool,
+            ],
+        }
+    )
+    request = decoded.request
+    assert [tool.name for tool in request.tools] == ["exec_command"]
+    assert [(entry.index, entry.tool) for entry in request.provider_native_tools] == [
+        (1, custom_tool),
+        (2, namespace_tool),
+        (3, web_search_tool),
+        (4, tool_search_tool),
+    ]
+
+
+def test_a_malformed_function_tool_declaration_still_fails_closed() -> None:
+    """The opaque carrier accepts only non-function types; a function
+    declaration missing its name is a named validation error, never an
+    opaque forward."""
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_responses(
+            {
+                "model": "gpt-5.2",
+                "input": "hi",
+                "tools": [{"type": "function", "description": "nameless"}],
+            }
+        )
+    assert rejection.value.status_code == 400
+    assert "tools" in (rejection.value.detail.param or "")

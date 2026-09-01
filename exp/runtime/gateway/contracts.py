@@ -136,6 +136,24 @@ class StructuredTextFormat(ContractModel):
     strict: bool = True
 
 
+class GatewayProviderNativeTool(ContractModel):
+    """One verbatim non-function OpenAI Responses tool declaration.
+
+    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool
+    tree), ``web_search``, and ``tool_search`` declarations whose shapes
+    exist on no other wire; each is validated shallowly at decode and
+    re-emitted byte-for-byte on native Responses rungs only, with the
+    provider owning the declaration's internal shape (each type captured
+    live from Codex 0.151.0 and accepted with a plain API key, 2026-09-01).
+    ``index`` is the declaration's position in the caller's ``tools`` array
+    so re-emission preserves the caller's exact interleaving with the
+    converted function tools.
+    """
+
+    index: int = Field(ge=0)
+    tool: JsonObject
+
+
 class GatewayNamedToolChoice(ContractModel):
     """A request to require one named caller-defined function."""
 
@@ -550,6 +568,16 @@ class GatewayRequest(ContractModel):
     other Anthropic-only carriers; a present value joins replay identity
     through :func:`canonical_request_sha256`.
     """
+    provider_native_tools: tuple[GatewayProviderNativeTool, ...] = Field(default=(), exclude=True)
+    """Verbatim non-function OpenAI Responses tool declarations.
+
+    See :class:`GatewayProviderNativeTool`. Rungs that are not native
+    Responses cannot serve these, so route admission rejects by name instead
+    of silently dropping a capability the caller asked for. Excluded from
+    serialization like the other carriers so declaration-free digests are
+    unperturbed; present entries join replay identity through
+    :func:`canonical_request_sha256`.
+    """
     provider_server_tools: tuple[JsonObject, ...] = Field(default=(), exclude=True)
     """Verbatim Anthropic server-tool entries from the Messages ``tools`` array.
 
@@ -650,7 +678,12 @@ class GatewayRequest(ContractModel):
             and self.tool_choice.name not in server_names
         ):
             raise ValueError("named gateway tool choice must name a request tool")
-        if self.tool_choice == "required" and not self.tools and not self.provider_server_tools:
+        if (
+            self.tool_choice == "required"
+            and not self.tools
+            and not self.provider_server_tools
+            and not self.provider_native_tools
+        ):
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
@@ -691,6 +724,20 @@ class GatewayRequest(ContractModel):
             raise ValueError("provider_beta_tokens are valid only for Messages requests")
         if self.provider_server_tools and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_server_tools are valid only for Messages requests")
+        if self.provider_native_tools and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("provider_native_tools are valid only for Responses requests")
+        if self.provider_native_tools:
+            # Positions must tile one tools array with the converted function
+            # tools exactly, so native re-emission is total by construction.
+            positions = tuple(entry.index for entry in self.provider_native_tools)
+            declaration_count = len(self.tools) + len(positions)
+            if len(set(positions)) != len(positions) or any(
+                position >= declaration_count for position in positions
+            ):
+                raise ValueError(
+                    "provider_native_tools positions must be distinct indexes "
+                    "into the caller's tools array"
+                )
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
             raise ValueError("maximum output parameter requires a maximum output value")
         if self.reasoning_summary_parameters and self.reasoning_summary is None:
@@ -858,6 +905,11 @@ class GatewayFailureClass(StrEnum):
     CANCELLED = "cancelled"
     GUARDRAIL = "guardrail"
     INTERNAL = "internal"
+    # A transient control-plane condition (a rolling deploy building the
+    # authorized catalog revision) that the caller should simply retry. Unlike
+    # INTERNAL it is not a bug signal and does not page; unlike a provider class
+    # it never opens a deployment circuit.
+    UNAVAILABLE = "unavailable"
 
 
 class GatewayFailure(ContractModel):

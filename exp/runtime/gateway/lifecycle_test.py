@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import replace
@@ -384,6 +385,38 @@ def test_live_alias_revision_update_hot_reloads_authority_without_restart(
 
     assert _granted_authorities(components, raw_key) == {"coding": "revision-two"}
     assert _authorize(components, raw_key, "coding") == "revision-two"
+
+
+def test_cross_version_snapshot_is_served_not_rejected_during_a_roll(tmp_path: Path) -> None:
+    """Roll-safety guard for the hydration path.
+
+    Rewrite a live alias's stored normalized snapshot the way a NEWER engine
+    build would author it during a rolling deploy: a bumped schema_version and a
+    field this build does not know, leaving the pinned digest (which this build
+    can no longer recompute) untouched. The pod must still LOAD and SERVE the
+    alias through its tolerant view rather than hard-failing every request, which
+    was the fleet-wide incident this change prevents.
+    """
+    manager, raw_key = _configured_gateway(tmp_path)
+    alias = manager.aliases()[0]
+    snapshot_path = manager.state_dir / str(alias.snapshot_ref)
+    document = json.loads(snapshot_path.read_bytes())
+    # A newer build's snapshot: a version this reader has not seen plus a field
+    # it cannot know. The pinned catalog_sha256 in SQLite is left unchanged, so
+    # this reader cannot reproduce it — exactly the cross-version case.
+    document["schema_version"] = 999
+    document["a_future_top_level_field"] = {"anything": True}
+    document["pools"][0]["a_future_pool_field"] = "maximize_something_new"
+    snapshot_path.write_bytes(json.dumps(document).encode())
+
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "available"},
+    )
+
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    assert components.unavailable_aliases == ()
+    assert _authorize(components, raw_key, "coding") == "revision-one"
 
 
 def test_unrelated_invalid_snapshot_does_not_block_a_valid_alias_reload(tmp_path: Path) -> None:

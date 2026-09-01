@@ -206,7 +206,15 @@ def preflight_gateway_request(
     requirements: tuple[tuple[bool, bool, str], ...] = ()
     if model_capabilities is not None:
         requirements += (
-            (bool(request.tools), model_capabilities.supports_tools is not False, "function_tools"),
+            (
+                # Verbatim native declarations are tools too: a rung that
+                # declares no tool support must reject a native-tools-only
+                # request locally instead of dispatching a known-unsupported
+                # provider call.
+                bool(request.tools) or bool(request.provider_native_tools),
+                model_capabilities.supports_tools is not False,
+                "function_tools",
+            ),
             (
                 request.structured_text is not None,
                 model_capabilities.supports_structured_output,

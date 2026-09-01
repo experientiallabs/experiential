@@ -17,8 +17,11 @@ from filelock import FileLock, Timeout
 from exp.common.config import ARTIFACT_DIR
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
+    SNAPSHOT_SCHEMA_VERSION,
     ModelCatalog,
     NormalizedGatewayCatalog,
+    is_foreign_snapshot,
+    load_forward_compatible,
     normalize_gateway_catalog,
 )
 from exp.runtime.gateway.contracts import (
@@ -347,6 +350,9 @@ class LocalGatewayComponents:
     selection_workers: SelectionWorkerPool
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
+    # The local launch serves no asynchronous batch lane; hosted compositions
+    # supply a BatchControlPlane here to enable /v1/batches.
+    batches: object | None = None
 
     @property
     def runtime_catalogs(self) -> Mapping[tuple[str, str], RuntimeModelCatalog]:
@@ -643,14 +649,37 @@ def _load_snapshot(
         raise GatewayLifecycleError("catalog snapshot reference escapes gateway state")
     authored = snapshot.with_suffix(".models.json")
     try:
-        normalized = NormalizedGatewayCatalog.model_validate_json(snapshot.read_bytes())
-        authored_catalog = ModelCatalog.model_validate_json(authored.read_bytes())
+        # Read forward-compatibly: a snapshot authored by a NEWER engine build
+        # during a rolling deploy may carry fields this build does not know, and
+        # rejecting it would hard-fail every request until the roll finished.
+        # Unknown fields are dropped; every other validation stays strict.
+        normalized, normalized_dropped = load_forward_compatible(
+            NormalizedGatewayCatalog, snapshot.read_bytes()
+        )
+        authored_catalog, authored_dropped = load_forward_compatible(
+            ModelCatalog, authored.read_bytes()
+        )
     except (OSError, ValueError) as exc:
         raise GatewayLifecycleError(
             f"alias {alias.alias_name!r} has an unreadable catalog snapshot"
         ) from exc
     catalog_sha256 = _required(alias.catalog_sha256, "catalog digest", alias)
-    if normalized.identity_sha256() != catalog_sha256:
+    # A cross-version skew (this build's schema differs from the snapshot's) is
+    # served through this build's own tolerant view, keyed by the pinned digest,
+    # instead of the byte-exact digest checks below: the local normalizer is not
+    # expected to reproduce another build's bytes. When the versions agree the
+    # checks stay strict, so same-version corruption is still caught.
+    foreign = is_foreign_snapshot(normalized)
+    if normalized_dropped or authored_dropped or foreign:
+        _logger.warning(
+            "gateway alias %r catalog snapshot is cross-version (schema_version=%d, this build=%d, "
+            "dropped_fields=%s); serving this build's tolerant view keyed by the pinned digest",
+            alias.alias_name,
+            normalized.schema_version,
+            SNAPSHOT_SCHEMA_VERSION,
+            bool(normalized_dropped or authored_dropped),
+        )
+    if not foreign and normalized.identity_sha256() != catalog_sha256:
         raise GatewayLifecycleError(f"alias {alias.alias_name!r} catalog digest does not match")
     revision_id, _digest = _required_revision(alias)
     authorities = manager.ensure_alias_provider_bindings(
@@ -664,7 +693,7 @@ def _load_snapshot(
             f"alias {alias.alias_name!r} provider bindings differ from its snapshot"
         )
     catalog = authored_catalog.model_copy(update={"connections": connections})
-    if normalize_gateway_catalog(catalog) != normalized:
+    if not foreign and normalize_gateway_catalog(catalog) != normalized:
         raise GatewayLifecycleError(
             f"alias {alias.alias_name!r} authored catalog differs from normalized authority"
         )

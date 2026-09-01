@@ -158,8 +158,10 @@ A caller `anthropic-beta` header forwards through an exact token allowlist (nota
 provider serves 200K); non-allowlisted tokens drop with a per-token
 `anthropic-beta.<token>` disclosure, never a rejection and never a blind forward. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
 and drop with disclosure elsewhere; Codex-native input items (`additional_tools` tool namespaces,
-`custom_tool_call`/`custom_tool_call_output` freeform history) carry byte-for-byte and require a
-homogeneous native Responses route; echoed message items accept `id`/`phase` with `status`
+`custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
+declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,
+`tool_search`) carry byte-for-byte at their caller positions and require a homogeneous native
+Responses route; echoed message items accept `id`/`phase` with `status`
 optional (non-assistant identity drops); and freeform custom tool calls stream end to end with
 their native event names, including continuation retention.
 

@@ -129,6 +129,7 @@ pub enum FailureClass {
     Cancelled,
     Guardrail,
     Internal,
+    Unavailable,
 }
 
 impl FailureClass {
@@ -150,6 +151,7 @@ impl FailureClass {
             FailureClass::Cancelled => "cancelled",
             FailureClass::Guardrail => "guardrail",
             FailureClass::Internal => "internal",
+            FailureClass::Unavailable => "unavailable",
         }
     }
 }
@@ -255,6 +257,7 @@ impl Failure {
             FailureClass::Timeout => (504, "deadline_exceeded", "api_error"),
             FailureClass::Cancelled => (499, "request_cancelled", "api_error"),
             FailureClass::Guardrail => (400, "content_filter", "invalid_request_error"),
+            FailureClass::Unavailable => (503, "gateway_unavailable", "api_error"),
             _ => (502, "all_routes_failed", "api_error"),
         };
         let mut error = PublicError::new(status, code, &self.safe_message, error_type);
@@ -276,6 +279,7 @@ impl Failure {
         error.retry_after_seconds = match self.failure_class {
             FailureClass::Throttled => Some(5),
             FailureClass::QuotaExceeded => Some(3600),
+            FailureClass::Unavailable => Some(2),
             _ => None,
         };
         error
@@ -353,10 +357,26 @@ mod tests {
             FailureClass::QuotaExceeded,
             FailureClass::MalformedResponse,
             FailureClass::Cancelled,
+            FailureClass::Unavailable,
         ] {
             let wire = serde_json::to_value(class).expect("serializable");
             let back: FailureClass = serde_json::from_value(wire).expect("round trip");
             assert_eq!(back.as_str(), class.as_str());
         }
+    }
+
+    #[test]
+    fn unavailable_maps_to_a_retryable_503() {
+        // Parity with the python control plane's UNAVAILABLE mapping: a
+        // transient roll condition is a retryable 503, not a closed 500/502.
+        let failure = Failure::new(FailureClass::Unavailable, "the gateway is updating");
+        let error = failure.public_error();
+        assert_eq!(error.status_code, 503);
+        assert_eq!(error.code, "gateway_unavailable");
+        assert_eq!(error.error_type, "api_error");
+        assert_eq!(error.retry_after_seconds, Some(2));
+        // The wire name matches the python GatewayFailureClass member so a
+        // failure serialized on either side deserializes on the other.
+        assert_eq!(FailureClass::Unavailable.as_str(), "unavailable");
     }
 }

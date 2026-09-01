@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from exp.common.core.artifacts import stable_id
-from exp.common.models.gateway_catalog import NormalizedGatewayCatalog
+from exp.common.models.gateway_catalog import read_pinned_normalized_snapshot
 from exp.runtime.gateway.budgets import (
     BudgetScope,
     BudgetScopeKind,
@@ -481,11 +481,11 @@ class SQLiteGatewayPlatform:
             if not snapshot_path.is_relative_to(state_dir):
                 raise RuntimeError("catalog snapshot reference escapes gateway state")
             try:
-                catalog = NormalizedGatewayCatalog.model_validate_json(snapshot_path.read_bytes())
+                catalog = read_pinned_normalized_snapshot(
+                    snapshot_path.read_bytes(), catalog_sha256
+                )
             except (OSError, ValueError) as exc:
                 raise RuntimeError("catalog snapshot is unreadable or invalid") from exc
-            if catalog.identity_sha256() != catalog_sha256:
-                raise RuntimeError("catalog snapshot digest differs from SQLite authority")
             for pool in catalog.pools:
                 revision_id = stable_id(
                     "gateway-exact-pool-revision",

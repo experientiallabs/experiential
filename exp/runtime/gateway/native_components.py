@@ -100,6 +100,18 @@ class NativeGatewayComponents(Protocol):
         ...
 
     @property
+    def batches(self) -> object | None:
+        """Return the optional batch control plane serving /v1/batches.
+
+        Hosts without the batch lane return ``None`` (or omit the attribute);
+        the control plane then answers every batch route with a uniform
+        not-enabled error. The returned object is a
+        ``exp.runtime.gateway.batch.BatchControlPlane``; the loose annotation
+        keeps the synchronous components importable without the batch package.
+        """
+        ...
+
+    @property
     def routes(self) -> CatalogRouteResolver:
         """Return the direct-route resolver."""
         ...

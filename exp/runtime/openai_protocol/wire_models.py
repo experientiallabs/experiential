@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.types import JsonValue
 
 from exp.common.core.artifacts import JsonObject
@@ -279,6 +279,31 @@ class _ResponseTool(_WireModel):
     strict: bool | None = None
 
 
+class _NativeResponseTool(BaseModel):
+    """One non-function Responses tool declaration carried opaquely.
+
+    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool
+    tree), ``web_search``, and ``tool_search`` declarations whose shapes
+    exist on no other wire. Like ``_AdditionalToolsItem``, validation is
+    deliberately shallow and the raw declaration forwards byte-for-byte on
+    native Responses rungs only (each type captured live from Codex 0.151.0
+    and accepted by the provider with a plain API key, 2026-09-01); the
+    provider stays the authority on each declaration's internal shape.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str = Field(min_length=1, max_length=64)
+
+    @field_validator("type")
+    @classmethod
+    def _require_non_function(cls, value: str) -> str:
+        """Keep typed function declarations on the strict model."""
+        if value == "function":
+            raise ValueError("function tool declarations use the typed profile")
+        return value
+
+
 class _ResponseFunctionCall(_WireModel):
     """Completed Responses function call included as assistant history.
 
@@ -450,7 +475,7 @@ class _ResponsesRequest(_WireModel):
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     store: bool | None = None
     include: tuple[str, ...] | None = None
-    tools: tuple[_ResponseTool, ...] = ()
+    tools: tuple[_ResponseTool | _NativeResponseTool, ...] = ()
     tool_choice: JsonValue = None
     parallel_tool_calls: bool | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)

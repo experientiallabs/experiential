@@ -46,6 +46,7 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
@@ -1734,6 +1735,39 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
     assert error["param"] == "previous_response_id"
     assert recorded, "the unavailable continuation must record a durable failure"
     assert recorded[-1].failure_class == GatewayFailureClass.INVALID_REQUEST
+
+
+def test_admission_maps_a_route_build_failure_to_a_retryable_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A route/catalog that cannot be built during a rolling deploy records a
+    retryable UNAVAILABLE ledger failure and answers a retryable 503, never the
+    paging INTERNAL that turned the last catalog-schema roll into a fleet-wide
+    incident.
+    """
+    control, raw_key = _control_plane(tmp_path)
+
+    def _raise_routing(*_args: object, **_kwargs: object) -> object:
+        raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
+
+    monkeypatch.setattr(control, "_resolve_route", _raise_routing)  # noqa: SLF001
+    recorded: list[GatewayFailure] = []
+    original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
+
+    def _capture(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+        recorded.append(failure)
+        return original_finish(authorization, failure)
+
+    monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
+
+    with pytest.raises(NativeBridgeError) as rejected:
+        _admit(control, raw_key, _chat_body())
+
+    error = json.loads(rejected.value.public_error_json)
+    assert error["status_code"] == 503
+    assert recorded, "the roll condition must record a durable failure"
+    assert recorded[-1].failure_class == GatewayFailureClass.UNAVAILABLE
+    assert recorded[-1].safe_message == "the gateway is updating; retry the request"
 
 
 def test_admit_skips_a_dead_lead_rung_and_serves_the_fallback(tmp_path: Path) -> None:
