@@ -443,13 +443,28 @@ class BatchEngine:
                 await self._finalize(job, BatchStatus.CANCELLED, None)
                 return
             if not self._store.begin_dispatch(batch_id=job.batch_id):
-                # Another actor holds or held the one-time dispatch claim. A
-                # claim without a durable provider id means that dispatch was
-                # interrupted; submitting again would duplicate paid provider
-                # work against an unknown provider-side batch, so the job
-                # fails closed and releases its reservations.
+                # Another actor holds or held the one-time dispatch claim.
+                # This snapshot is stale by definition, so re-load before
+                # concluding anything: the claim holder may have already
+                # resolved the job (a cancel that won the claim, a dispatch
+                # that persisted its id, or a completed settlement).
+                current = self._store.load_job(
+                    batch_id=job.batch_id, organization_id=job.organization_id
+                )
+                if (
+                    current is None
+                    or current.settled
+                    or current.provider_batch_id is not None
+                    or current.status in TERMINAL_STATUSES
+                    or current.status is BatchStatus.CANCELLING
+                ):
+                    return
+                # The persisted job still shows a claim without a provider
+                # id: that dispatch was interrupted, and submitting again
+                # would duplicate paid provider work against an unknown
+                # provider-side batch, so the job fails closed.
                 await self._finalize(
-                    job.model_copy(update={"dispatch_started": True}),
+                    current,
                     BatchStatus.FAILED,
                     "dispatch was interrupted before the provider batch id "
                     "was persisted; resubmit the input file as a new batch",

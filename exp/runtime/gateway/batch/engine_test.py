@@ -751,3 +751,25 @@ def test_completed_job_settlement_retries_on_fetch_failure() -> None:
     assert final.settled is True
     assert ledger.settled == [("a", 2)]
     assert ledger.released == []
+
+
+def test_poller_with_stale_snapshot_never_overwrites_a_cancelled_job() -> None:
+    """A cancel that wins the claim is final; a racing poller changes nothing."""
+    engine, store, _, ledger, client = _engine()
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    stale_snapshot = store.jobs[job.batch_id]
+    cancelled = asyncio.run(engine.cancel(organization_id="org_a", batch_id=job.batch_id))
+    assert cancelled.status is BatchStatus.CANCELLED and cancelled.settled
+    releases_after_cancel = list(ledger.released)
+    asyncio.run(engine._advance(stale_snapshot))
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.CANCELLED
+    assert final.settled is True
+    assert ledger.released == releases_after_cancel
+    assert client.submitted == []
