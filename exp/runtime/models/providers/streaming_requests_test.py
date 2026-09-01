@@ -10,6 +10,7 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
+    GatewayProviderNativeTool,
     GatewayRequest,
     GatewayToolDefinition,
     StructuredTextFormat,
@@ -2544,3 +2545,50 @@ def test_marked_system_prompt_keeps_the_exact_unmarked_text_bytes() -> None:
         "text": "\n\nLong env block.",
         "cache_control": {"type": "ephemeral"},
     }
+
+
+def test_native_tool_declarations_require_a_homogeneous_responses_route() -> None:
+    """Non-function tool declarations (custom, namespace, web_search,
+    tool_search) forward byte-for-byte at their caller positions on native
+    Responses rungs; any other rung in the route is a named rejection
+    (dropping an agent's tool definitions would silently degrade it)."""
+    custom_tool: JsonObject = {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Edit files.",
+        "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"},
+    }
+    web_search_tool: JsonObject = {"type": "web_search", "external_web_access": False}
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        tools=(
+            GatewayToolDefinition(name="exec_command", parameters={"type": "object"}),
+            GatewayToolDefinition(name="view_image", parameters={"type": "object"}),
+        ),
+        provider_native_tools=(
+            GatewayProviderNativeTool(index=1, tool=custom_tool),
+            GatewayProviderNativeTool(index=3, tool=web_search_tool),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = openai_responses_stream_payload("gpt-5.2", request, supports_temperature=False)
+    tools = payload["tools"]
+    assert isinstance(tools, list)
+    assert [entry.get("type") for entry in tools if isinstance(entry, dict)] == [
+        "function",
+        "custom",
+        "function",
+        "web_search",
+    ]
+    assert tools[1] == custom_tool
+    assert tools[3] == web_search_tool
+
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
+    chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
+    public, _provider = route_generation_parameter_requests((responses,), request)
+    assert public.ignored_parameters == ()
+    with pytest.raises(ProviderParameterError) as mixed:
+        route_generation_parameter_requests((responses, chat), request)
+    assert mixed.value.param == "tools"

@@ -28,6 +28,7 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
+    GatewayProviderNativeTool,
     GatewayRequest,
     GatewayToolDefinition,
     SealedReasoningContentBlock,
@@ -249,6 +250,22 @@ def decode_responses(
         idempotency_key, client_request_id
     )
     raw_input = payload.get("input")
+    raw_tools = payload.get("tools")
+    function_tools: list[GatewayToolDefinition] = []
+    native_tools: list[GatewayProviderNativeTool] = []
+    for tool_index, declared in enumerate(request.tools):
+        if isinstance(declared, _ResponseTool):
+            function_tools.append(_response_tool(declared))
+        else:
+            # The raw caller declaration, not the re-serialized wire model,
+            # so the native rung receives it byte-for-byte at its position.
+            assert isinstance(raw_tools, list)
+            native_tools.append(
+                GatewayProviderNativeTool(
+                    index=tool_index,
+                    tool=cast("JsonObject", raw_tools[tool_index]),
+                )
+            )
     messages = list(
         _response_input_messages(
             request.input,
@@ -261,7 +278,8 @@ def decode_responses(
         canonical = GatewayRequest(
             surface=GatewayApiSurface.RESPONSES,
             messages=tuple(messages),
-            tools=tuple(_response_tool(tool) for tool in request.tools),
+            tools=tuple(function_tools),
+            provider_native_tools=tuple(native_tools),
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=_responses_structured_text(request.text),

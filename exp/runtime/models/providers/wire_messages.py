@@ -267,9 +267,9 @@ def add_openai_tools(
     responses: bool,
 ) -> None:
     """Add Responses-native or Chat-native tools and tool choice in place."""
-    if request.tools:
+    if request.tools or request.provider_native_tools:
         if responses:
-            payload["tools"] = [
+            declared: list[JsonObject] = [
                 {
                     "type": "function",
                     "name": tool.name,
@@ -279,7 +279,18 @@ def add_openai_tools(
                 }
                 for tool in request.tools
             ]
-        else:
+            if request.provider_native_tools:
+                # Re-emit each verbatim declaration at its caller position;
+                # decode assigns contiguous indexes over one tools array, so
+                # the converted function tools exactly fill the gaps.
+                natives = {entry.index: entry.tool for entry in request.provider_native_tools}
+                functions = iter(declared)
+                declared = [
+                    natives[position] if position in natives else next(functions)
+                    for position in range(len(declared) + len(natives))
+                ]
+            payload["tools"] = declared
+        elif request.tools:
             payload["tools"] = [
                 {
                     "type": "function",
