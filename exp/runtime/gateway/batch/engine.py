@@ -64,7 +64,15 @@ def _approximate_tokens(body: JsonObject) -> int:
 
 
 class BatchEngine:
-    """Job lifecycle over host seams; the only writer of batch state."""
+    """Job lifecycle over host seams; the only writer of batch state.
+
+    Exactly one poller may run per job store. The dispatch-intent guard makes
+    an interrupted dispatch fail closed, but it cannot arbitrate two live
+    pollers racing the same job: a host that runs multiple workers must lease
+    the poller role (or partition jobs) so one engine advances a given job at
+    a time. Settlement re-runs are absorbed by the host ledger's contractual
+    idempotency, and every public read is owner-scoped.
+    """
 
     def __init__(
         self,
@@ -379,7 +387,10 @@ class BatchEngine:
         return advanced
 
     async def run_poller(self, *, stop: asyncio.Event | None = None) -> None:
-        """Poll open jobs forever, until the optional stop event is set."""
+        """Poll open jobs forever, until the optional stop event is set.
+
+        Run exactly one poller per job store; see the class contract.
+        """
         while stop is None or not stop.is_set():
             await self.poll_once()
             if stop is None:
@@ -465,6 +476,9 @@ class BatchEngine:
 
     async def _settle(self, job: BatchJob) -> None:
         """Settle results per line idempotently, then mark the job settled."""
+        current = self._store.load_job(batch_id=job.batch_id, organization_id=job.organization_id)
+        if current is not None and current.settled:
+            return
         if job.settled:
             return
         results: dict[str, BatchLineResult] = {}
