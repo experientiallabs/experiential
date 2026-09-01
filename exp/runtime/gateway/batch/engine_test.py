@@ -462,3 +462,71 @@ def test_open_jobs_use_the_submit_time_credential_reference() -> None:
     catalog.deployments["gpt-oss-120b-batch"] = repointed
     asyncio.run(engine.poll_once())
     assert client.submitted == ["key-for-secret://openrouter"]
+
+
+def test_definitive_submit_rejection_fails_immediately_with_the_reason() -> None:
+    """A provider response rejecting the submit terminalizes the job at once."""
+
+    class RejectingClient(ScriptedClient):
+        """Client whose submit receives a definitive provider rejection."""
+
+        async def submit(self, *, job: BatchJob, api_key: str) -> str:
+            """Raise the response-backed rejection."""
+            raise BatchSubmitError(
+                "provider batch create failed with status 401", code="provider_error"
+            )
+
+    client = RejectingClient([ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS)], [])
+    engine, store, _, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.FAILED
+    assert final.failure_message is not None
+    assert "provider rejected the batch submission" in final.failure_message
+    assert "status 401" in final.failure_message
+    assert ledger.released == [("a", "failed")]
+
+
+def test_validation_and_binding_share_one_catalog_resolution() -> None:
+    """The job binds the deployment captured during line validation."""
+
+    class CountingCatalog(MemoryCatalog):
+        """Catalog counting resolutions and repointing after the first."""
+
+        def __init__(self) -> None:
+            """Track lookups."""
+            super().__init__()
+            self.lookups = 0
+
+        def batch_deployment(self, *, model: str) -> BatchDeployment | None:
+            """Repoint the credential after the first resolution."""
+            self.lookups += 1
+            deployment = super().batch_deployment(model=model)
+            if deployment is not None and self.lookups > 1:
+                return deployment.model_copy(update={"credential_reference": "secret://repointed"})
+            return deployment
+
+    catalog = CountingCatalog()
+    engine = BatchEngine(
+        store=MemoryStore(),
+        files=MemoryFiles(),
+        catalog=catalog,
+        ledger=MemoryLedger(),
+        secrets_resolver=MemorySecrets(),
+    )
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    assert job.credential_reference == "secret://openrouter"
+    assert catalog.lookups == 1

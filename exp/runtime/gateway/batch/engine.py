@@ -22,6 +22,7 @@ from exp.runtime.gateway.batch.contracts import (
     COMPLETION_WINDOW_SECONDS,
     TERMINAL_STATUSES,
     BatchCounts,
+    BatchDeployment,
     BatchFile,
     BatchJob,
     BatchLine,
@@ -142,23 +143,20 @@ class BatchEngine:
         if content is None:
             raise BatchSubmitError(f"input file {input_file_id!r} does not exist")
         raw_lines = parse_input_jsonl(content)
-        lines, line_errors, provider = self._validate_lines(raw_lines, surface)
-        if not lines:
+        lines, line_errors, binding = self._validate_lines(raw_lines, surface)
+        if not lines or binding is None:
             raise BatchSubmitError(
                 "every input line was rejected: "
                 + "; ".join(error.message for error in line_errors[:5])
             )
-        deployment = self._catalog.batch_deployment(model=lines[0].model)
-        if deployment is None:
-            raise BatchSubmitError(f"model {lines[0].model!r} left the catalog during submit")
         created = _now()
         job = BatchJob(
             batch_id=_new_id("batch"),
             organization_id=organization_id,
             identity_id=identity_id,
             surface=surface,
-            provider=provider,
-            credential_reference=deployment.credential_reference,
+            provider=binding.provider,
+            credential_reference=binding.credential_reference,
             input_file_id=input_file_id,
             counts=BatchCounts(total=len(lines)),
             lines=tuple(lines),
@@ -175,12 +173,14 @@ class BatchEngine:
         self,
         raw_lines: list[tuple[int, JsonObject]],
         surface: BatchSurface,
-    ) -> tuple[list[BatchLine], list[BatchLineError], str]:
+    ) -> tuple[list[BatchLine], list[BatchLineError], BatchDeployment | None]:
         """Validate every raw line against the explicit-request contract.
 
         Returns:
-            The accepted lines, the per-line rejections, and the single
-            provider that serves the job.
+            The accepted lines, the per-line rejections, and the deployment
+            binding of the single provider that serves the job, captured from
+            the same catalog resolution the validation used so a concurrent
+            catalog edit can never split validation from binding.
 
         Raises:
             BatchSubmitError: When accepted lines span providers, repeat a
@@ -190,6 +190,7 @@ class BatchEngine:
         errors: list[BatchLineError] = []
         seen_ids: set[str] = set()
         providers: set[str] = set()
+        binding: BatchDeployment | None = None
         for line_number, raw in raw_lines:
             custom_id = raw.get("custom_id")
             body = raw.get("body")
@@ -262,6 +263,8 @@ class BatchEngine:
                 )
                 continue
             providers.add(deployment.provider)
+            if binding is None:
+                binding = deployment
             maximum_output = body.get("max_tokens", body.get("max_completion_tokens"))
             if not isinstance(maximum_output, int) or maximum_output <= 0:
                 maximum_output = deployment.default_maximum_output_tokens
@@ -282,17 +285,16 @@ class BatchEngine:
                 "one batch is served by exactly one provider; split lines by provider "
                 f"(saw {', '.join(sorted(providers))})"
             )
-        provider = next(iter(providers), "")
-        if provider and provider not in self._clients:
-            raise BatchSubmitError(f"provider {provider} has no batch client enabled")
-        if provider and self._clients[provider].requires_uniform_model:
+        if binding is not None and binding.provider not in self._clients:
+            raise BatchSubmitError(f"provider {binding.provider} has no batch client enabled")
+        if binding is not None and self._clients[binding.provider].requires_uniform_model:
             models = {line.provider_model for line in lines}
             if len(models) > 1:
                 raise BatchSubmitError(
-                    f"provider {provider} requires one model per batch; "
+                    f"provider {binding.provider} requires one model per batch; "
                     f"saw {', '.join(sorted(models))}"
                 )
-        return lines, errors, provider
+        return lines, errors, binding
 
     def _reserve(self, job: BatchJob) -> BatchJob:
         """Reserve every line's estimated cost, releasing all on any rejection.
@@ -413,9 +415,21 @@ class BatchEngine:
                 )
                 return
             self._store.save_job(job=job.model_copy(update={"dispatch_started": True}))
-            provider_batch_id = await client.submit(
-                job=job.model_copy(update={"dispatch_started": True}), api_key=api_key
-            )
+            try:
+                provider_batch_id = await client.submit(
+                    job=job.model_copy(update={"dispatch_started": True}), api_key=api_key
+                )
+            except BatchSubmitError as rejection:
+                # A raised BatchSubmitError means a provider response was
+                # received, so nothing was accepted: fail now with the reason.
+                # Ambiguous transport losses raise other errors and take the
+                # fail-closed interrupted path on the next poll instead.
+                await self._finalize(
+                    job.model_copy(update={"dispatch_started": True}),
+                    BatchStatus.FAILED,
+                    f"provider rejected the batch submission: {rejection.message}",
+                )
+                return
             job = job.model_copy(
                 update={
                     "dispatch_started": True,
