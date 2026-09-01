@@ -2452,9 +2452,12 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
         include_usage=True,
     )
     payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    # The canonical blank-line separator folds into the following block
+    # (the provider rejects whitespace-only blocks), so the system TEXT
+    # equals the unmarked join with markers on their blocks.
     assert payload["system"] == [
         {"type": "text", "text": "You are Claude Code."},
-        {"type": "text", "text": "Long env block.", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "\n\nLong env block.", "cache_control": {"type": "ephemeral"}},
     ]
     messages = cast(list[JsonObject], payload["messages"])
     user_blocks = cast(list[JsonObject], messages[0]["content"])
@@ -2489,3 +2492,55 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
     assert mixed_provider.messages[0].provider_text_blocks
     foreign_public, _foreign_provider = route_generation_parameter_requests((fallback,), request)
     assert "messages.content.cache_control" in foreign_public.ignored_parameters
+
+
+def test_marked_system_prompt_keeps_the_exact_unmarked_text_bytes() -> None:
+    """Marked and unmarked payloads carry byte-identical system TEXT.
+
+    Cache markers must never change the instructions the model reads: with a
+    marked top-level system followed by a leading system-role turn, the
+    block-path text (blocks concatenated in order) equals the unmarked
+    joined string exactly, separator included, and the only difference is
+    the markers themselves.
+    """
+
+    def request(marked: bool) -> GatewayRequest:
+        blocks: tuple[JsonObject, ...] = (
+            (
+                {"type": "text", "text": "You are Claude Code."},
+                {
+                    "type": "text",
+                    "text": "Long env block.",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            )
+            if marked
+            else ()
+        )
+        return GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(
+                GatewayMessage(
+                    role="system",
+                    content="You are Claude Code.\n\nLong env block.",
+                    provider_text_blocks=blocks,
+                ),
+                GatewayMessage(role="system", content="Leading turn instruction."),
+                GatewayMessage(role="user", content="hi"),
+            ),
+            stream=True,
+            include_usage=True,
+        )
+
+    unmarked_payload = anthropic_messages_stream_payload("claude-fable-5", request(False))
+    marked_payload = anthropic_messages_stream_payload("claude-fable-5", request(True))
+    unmarked_system = cast(str, unmarked_payload["system"])
+    marked_system = cast(list[JsonObject], marked_payload["system"])
+    assert "".join(str(block["text"]) for block in marked_system) == unmarked_system
+    marked_controls = [block.get("cache_control") for block in marked_system]
+    assert marked_controls.count({"type": "ephemeral"}) == 1
+    assert marked_system[1] == {
+        "type": "text",
+        "text": "\n\nLong env block.",
+        "cache_control": {"type": "ephemeral"},
+    }
