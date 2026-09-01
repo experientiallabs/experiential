@@ -12,17 +12,15 @@ Labs platform is the first consumer of this seam.
 
 from __future__ import annotations
 
-import json
-
 from pydantic import Field, ValidationError, field_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.models import (
     ModelClient,
-    ModelFinishReason,
     ModelMessage,
     ModelRequest,
-    structured_json_text,
+    StructuredReplyError,
+    structured_reply_json,
 )
 
 # Reasoning models spend hidden reasoning tokens (hundreds per call on
@@ -122,18 +120,10 @@ class RealismJudge:
                 maximum_output_tokens=self._maximum_output_tokens,
             )
         )
-        if response.finish_reason is ModelFinishReason.LENGTH:
-            msg = "the judge stopped at its output-token limit; raise maximum_output_tokens"
-            raise RealismJudgmentError(msg)
-        content = response.output.content
-        if content is None:
-            msg = "the judge returned no text output; rerun the assessment"
-            raise RealismJudgmentError(msg)
         try:
-            raw = json.loads(structured_json_text(content))
-        except json.JSONDecodeError as error:
-            msg = "the judge returned non-JSON output; rerun the assessment"
-            raise RealismJudgmentError(msg) from error
+            raw = structured_reply_json(response)
+        except StructuredReplyError as error:
+            raise RealismJudgmentError(str(error)) from error
         try:
             return RealismAssessment.model_validate(raw)
         except ValidationError as error:

@@ -19,6 +19,11 @@ from exp.common.judging.calibration_provenance import (
     verify_persisted_calibration,
 )
 from exp.common.judging.display import render_rubric_table
+from exp.common.judging.grading import (
+    AnswerGrade,
+    AnswerGradeError,
+    AnswerGradeJudge,
+)
 from exp.common.judging.interface import Judge
 from exp.common.judging.judgment import DimensionJudgment, Judgment
 from exp.common.judging.labels import HumanLabelSet, HumanScore, HumanScoreHistory, HumanScoreReview
@@ -67,6 +72,9 @@ from exp.common.judging.rubric import (
 )
 
 __all__ = [
+    "AnswerGrade",
+    "AnswerGradeError",
+    "AnswerGradeJudge",
     "CalibrationDatum",
     "CalibrationError",
     "CalibrationReport",

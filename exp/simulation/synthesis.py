@@ -18,14 +18,14 @@ from collections.abc import Sequence
 
 from pydantic import Field, ValidationError, field_validator
 
-from exp.common.core.artifacts import ContractModel
+from exp.common.core.artifacts import ContractModel, JsonValue
 from exp.common.models import (
     ModelClient,
-    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelSnapshot,
-    structured_json_text,
+    StructuredReplyError,
+    structured_reply_json,
 )
 
 DEFAULT_PROBE_COUNT = 5
@@ -95,24 +95,19 @@ class FrontierProbeBatch(ContractModel):
     model: ModelSnapshot
 
 
-def _parse_probes(payload: str) -> tuple[FrontierProbe, ...]:
-    """Parse the generator's JSON array, loudly refusing malformed output.
+def _parse_probes(raw: JsonValue) -> tuple[FrontierProbe, ...]:
+    """Validate the generator's parsed JSON array, loudly refusing malformed output.
 
     Args:
-        payload: Candidate JSON text from the generator's visible reply.
+        raw: Parsed JSON value from the generator's visible reply.
 
     Returns:
         Every probe in the array, in reply order.
 
     Raises:
-        FrontierProbeError: The payload is not a JSON array of contract-valid
+        FrontierProbeError: The value is not a JSON array of contract-valid
             probes; rerun the generation or adjust the generator model.
     """
-    try:
-        raw = json.loads(payload)
-    except json.JSONDecodeError as error:
-        msg = "the generator returned non-JSON output; rerun the generation"
-        raise FrontierProbeError(msg) from error
     if not isinstance(raw, list):
         msg = "the generator returned JSON that is not an array; rerun the generation"
         raise FrontierProbeError(msg)
@@ -174,15 +169,9 @@ def generate_frontier_probes(
             maximum_output_tokens=maximum_output_tokens,
         )
     )
-    if response.finish_reason is ModelFinishReason.LENGTH:
-        msg = (
-            "the generator stopped at its output-token limit; raise "
-            "maximum_output_tokens or lower probe_count"
-        )
-        raise FrontierProbeError(msg)
-    content = response.output.content
-    if content is None:
-        msg = "the generator returned no text output; rerun the generation"
-        raise FrontierProbeError(msg)
-    probes = _parse_probes(structured_json_text(content))
+    try:
+        raw = structured_reply_json(response)
+    except StructuredReplyError as error:
+        raise FrontierProbeError(str(error)) from error
+    probes = _parse_probes(raw)
     return FrontierProbeBatch(probes=probes[:probe_count], model=response.model)
