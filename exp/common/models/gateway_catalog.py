@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Literal
-
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, sha256_json
 from exp.common.models.catalog import (
     BillingSource,
+    FailoverMode,
     GatewayDeploymentMetadata,
     GatewayEquivalenceCertification,
     ModelCatalog,
@@ -18,17 +17,6 @@ from exp.common.models.model import ModelAlias, ModelCapabilities
 ExactModelId = ArtifactId
 DeploymentId = ArtifactId
 ExactModelPoolId = ArtifactId
-
-FailoverMode = Literal["maximize_availability", "maximize_cache"]
-"""How a pool's waterfall reacts to a failed attempt.
-
-``maximize_availability`` (the default, historical behavior) fails over to the
-next rung on any failover-eligible error. ``maximize_cache`` keeps a transient
-throttle/timeout on the SAME warm rung -- redialing to preserve its prompt cache
-rather than restarting cold on another provider -- while STILL failing over on
-operational deadness (auth/not-found/5xx/transport), for which there is no cache
-to preserve. Client errors reject without failover in both modes.
-"""
 
 GATEWAY_EXCLUDED_PROVIDERS = frozenset({"tinker"})
 """Runtime-resolvable providers whose records never become gateway deployments."""
@@ -192,6 +180,7 @@ def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog
                 exact_model_id=authored.exact_model_id,
                 deployment_ids=deployment_ids,
                 equivalence=authored.equivalence,
+                failover_mode=authored.failover_mode,
             )
         )
         claimed_aliases.update(authored.deployment_aliases)

@@ -282,6 +282,54 @@ def test_operator_certified_pool_preserves_explicit_deployment_order_and_provena
     assert normalized.identity_sha256() == normalize_gateway_catalog(catalog).identity_sha256()
 
 
+def test_authored_pool_failover_mode_carries_into_the_normalized_pool() -> None:
+    """A maximize_cache authored pool normalizes to a maximize_cache exact-model pool."""
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-cache",
+        provenance="operator comparison run 2026-09-01",
+        evidence_sha256=_DIGEST,
+        certified_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    catalog = ModelCatalog(
+        connections={"openai": ConnectionConfig(provider="openai")},
+        models={
+            "route-a": ModelRecord(
+                connection="openai",
+                model="m-a",
+                billing_source=BillingSource.HOST_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id="exact-cache"),
+            ),
+            "route-b": ModelRecord(
+                connection="openai",
+                model="m-b",
+                billing_source=BillingSource.HOST_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id="exact-cache"),
+            ),
+        },
+        gateway_pools={
+            "cache-pool": GatewayPoolRecord(
+                exact_model_id="exact-cache",
+                deployment_aliases=("route-a", "route-b"),
+                equivalence=certification,
+                failover_mode="maximize_cache",
+            )
+        },
+    )
+
+    normalized = normalize_gateway_catalog(catalog)
+
+    assert normalized.pools[0].failover_mode == "maximize_cache"
+    # An unset authored pool stays on the historical default.
+    assert (
+        GatewayPoolRecord(
+            exact_model_id="x",
+            deployment_aliases=("a", "b"),
+            equivalence=certification,
+        ).failover_mode
+        == "maximize_availability"
+    )
+
+
 def test_equivalence_catalog_rejects_implicit_false_or_ambiguous_grouping() -> None:
     """Missing exact declarations, training handles, and repeated membership fail closed."""
     certification = GatewayEquivalenceCertification(
