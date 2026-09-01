@@ -5,6 +5,7 @@ from typing import Literal, cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import ImageContentPart, TextContentPart
 from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -34,6 +35,12 @@ from exp.runtime.models.providers.streaming_requests import (
     route_generation_parameter_requests,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request
+
+_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+    "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
+"""One valid single-pixel PNG, base64 encoded."""
 
 
 def _chat_request(
@@ -2492,6 +2499,49 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
     assert mixed_provider.messages[0].provider_text_blocks
     foreign_public, _foreign_provider = route_generation_parameter_requests((fallback,), request)
     assert "messages.content.cache_control" in foreign_public.ignored_parameters
+
+
+def test_block_cache_markers_survive_a_multimodal_user_turn() -> None:
+    """An image in the marked turn must not cost the caller its cache prefix.
+
+    Claude Code marks the last text block of recent user turns, and a turn
+    that attaches a screenshot is exactly such a turn: the image joins the
+    caller's blocks at its position and the marker re-emits with its text.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="contextdescribe this",
+                content_parts=(
+                    TextContentPart(text="context"),
+                    ImageContentPart(media_type="image/png", data=_PNG_BASE64),
+                    TextContentPart(text="describe this"),
+                ),
+                provider_text_blocks=(
+                    {"type": "text", "text": "context"},
+                    {
+                        "type": "text",
+                        "text": "describe this",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "context"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+        },
+        {"type": "text", "text": "describe this", "cache_control": {"type": "ephemeral"}},
+    ]
 
 
 def test_marked_system_prompt_keeps_the_exact_unmarked_text_bytes() -> None:

@@ -761,9 +761,10 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                 content_parts=tuple(content_parts) if images else (),
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
-                # The retained parts already carry the caller's exact order,
-                # so the cache-marked text run applies to text-only turns.
-                provider_text_blocks=(() if images else _marked_text_blocks(tuple(text_parts))),
+                # The marked run is carried alongside the retained parts: its
+                # blocks are the same text in the same order, so a multimodal
+                # turn keeps its cache markers when it re-emits.
+                provider_text_blocks=_marked_text_blocks(tuple(text_parts)),
             )
         )
         text_parts.clear()

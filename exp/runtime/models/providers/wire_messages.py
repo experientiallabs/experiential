@@ -124,6 +124,35 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
     return items
 
 
+def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
+    """Emit one multimodal user turn in caller order, markers intact.
+
+    The cache-marked run holds the caller's text blocks verbatim, one per
+    retained text part and in the same order, so a marker on the last text
+    block of a turn that also carries an image still re-emits: dropping it
+    would make the whole prefix uncacheable on exactly the turns Claude Code
+    marks.
+
+    Args:
+        message: A user message carrying at least one image part.
+
+    Returns:
+        The ordered Anthropic content blocks for the turn.
+    """
+    marked = list(message.provider_text_blocks)
+    blocks: list[JsonObject] = []
+    text_index = 0
+    for part in message.content_parts:
+        if part.kind == "image":
+            blocks.append(anthropic_image_block(part))
+            continue
+        blocks.append(
+            marked[text_index] if text_index < len(marked) else {"type": "text", "text": part.text}
+        )
+        text_index += 1
+    return blocks
+
+
 def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
     """Translate one non-instruction gateway message to Anthropic content blocks."""
     if message.role == "tool":
@@ -145,12 +174,7 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
         if message.content_parts:
             # The caller's exact interleaving is preserved: an image before
             # its question reads differently from one after it.
-            return "user", [
-                {"type": "text", "text": part.text}
-                if part.kind == "text"
-                else anthropic_image_block(part)
-                for part in message.content_parts
-            ]
+            return "user", _anthropic_multimodal_blocks(message)
         if message.provider_text_blocks:
             # The cache-marked run re-emits the caller's exact blocks; the
             # flattened content stays canonical for every other wire.
