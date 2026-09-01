@@ -168,6 +168,10 @@ pub(crate) async fn batches_retrieve(
     headers: HeaderMap,
     Path(batch_id): Path<String>,
 ) -> Response {
+    let _permit = match acquire_batch_permit(&state).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(&error),
+    };
     let mut payload = match keyed_payload(&headers) {
         Ok(payload) => payload,
         Err(error) => return error_response(&error),
@@ -182,6 +186,10 @@ pub(crate) async fn batches_cancel(
     headers: HeaderMap,
     Path(batch_id): Path<String>,
 ) -> Response {
+    let _permit = match acquire_batch_permit(&state).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(&error),
+    };
     let mut payload = match keyed_payload(&headers) {
         Ok(payload) => payload,
         Err(error) => return error_response(&error),
@@ -278,6 +286,10 @@ pub(crate) async fn files_retrieve(
     headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> Response {
+    let _permit = match acquire_batch_permit(&state).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(&error),
+    };
     let mut payload = match keyed_payload(&headers) {
         Ok(payload) => payload,
         Err(error) => return error_response(&error),
@@ -292,6 +304,10 @@ pub(crate) async fn files_content(
     headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> Response {
+    let _permit = match acquire_batch_permit(&state).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(&error),
+    };
     let mut payload = match keyed_payload(&headers) {
         Ok(payload) => payload,
         Err(error) => return error_response(&error),
