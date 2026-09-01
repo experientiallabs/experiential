@@ -149,6 +149,13 @@ def supported_reasoning_efforts(
     return tuple(effort for effort in _EFFORT_ORDER if effort in supported)
 
 
+# Family entries are GENERATION PREFIXES matched as substrings of the
+# normalized model id (dots and underscores become hyphens), so point
+# releases inherit their generation's contract by construction:
+# claude-fable-5-1 matches "claude-fable-5" (verified live 2026-09-01, the
+# 5.1 launch). A NEW generation (claude-fable-6) matches nothing and must be
+# added here deliberately; the known-models drift gate fails by name when a
+# served Anthropic listing id resolves no generation contract.
 _ANTHROPIC_ADAPTIVE_ONLY_FAMILIES = (
     "claude-fable-5",
     "claude-mythos-5",

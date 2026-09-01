@@ -267,3 +267,99 @@ def test_recommendation_ranks_are_explicit_per_provider_and_role() -> None:
     assert recommended_model_rank("anthropic", "claude-sonnet-5", "judge") == 0
     assert recommended_model_rank("gemini", "models/gemini-3.6-flash", "router_candidate") == 0
     assert recommended_model_rank("openai", "gpt-5.4-mini", "world_model") is None
+
+
+def test_claude_fable_5_1_is_recorded_with_its_verified_launch_contract() -> None:
+    """The 5.1 launch entry pins the live-verified contract and prices.
+
+    A real Claude Code session against claude-fable-5-1 was answered with
+    "The parameter 'reasoning_effort' is not supported by this model route"
+    because the id resolved no metadata and the route derived as
+    non-reasoning. The contract below was verified live 2026-09-01,
+    including the 0.025x cache-read discount that forbids inheriting
+    claude-fable-5's prices.
+    """
+    known = known_model_metadata("anthropic", "claude-fable-5-1")
+    assert known is not None
+    assert known.supports_reasoning_effort is True
+    assert known.minimum_temperature == 1.0
+    assert known.maximum_temperature == 1.0
+    assert known.supports_top_k is False
+    assert known.context_window_tokens == 1_000_000
+    assert known.maximum_output_tokens == 128_000
+    assert known.input_cost_per_million_tokens_usd == 10.0
+    assert known.output_cost_per_million_tokens_usd == 50.0
+    assert known.cached_input_cost_per_million_tokens_usd == 0.25
+    assert known.cache_write_cost_per_million_tokens_usd == 12.5
+    mythos = known_model_metadata("anthropic", "claude-mythos-5-1")
+    assert mythos is not None and mythos.cached_input_cost_per_million_tokens_usd == 0.25
+
+
+def test_anthropic_point_releases_inherit_generation_controls_never_prices() -> None:
+    """An unrecorded minor version keeps its generation's wire contract.
+
+    The matching rule: ``<generation>-<minor>`` resolves the recorded
+    ``<generation>`` with every price cleared, so a newly launched point
+    release serves with the right reasoning contract while priced lanes
+    keep failing closed until its prices are recorded. A new GENERATION
+    inherits nothing and must be a deliberate table addition.
+    """
+    inherited = known_model_metadata("anthropic", "claude-sonnet-5-2")
+    assert inherited is not None
+    assert inherited.supports_reasoning_effort is True
+    assert inherited.minimum_temperature == 1.0
+    assert inherited.input_cost_per_million_tokens_usd is None
+    assert inherited.output_cost_per_million_tokens_usd is None
+    assert inherited.cached_input_cost_per_million_tokens_usd is None
+    assert inherited.cache_write_cost_per_million_tokens_usd is None
+    # A dated snapshot of a point release resolves the same way.
+    dated = known_model_metadata("anthropic", "claude-sonnet-5-2-20270101")
+    assert dated is not None and dated.supports_reasoning_effort is True
+    # A new generation is a deliberate decision, never an inheritance.
+    assert known_model_metadata("anthropic", "claude-fable-6") is None
+    # Real two-segment model ids never fall through to a bogus generation.
+    haiku = known_model_metadata("anthropic", "claude-haiku-4-5")
+    assert haiku is not None and haiku.input_cost_per_million_tokens_usd == 1.0
+
+
+# The exact /v1/models listing served to a plain key, captured 2026-09-01
+# (the claude-fable-5-1 launch). The drift gate below turns the next launch
+# into a loud decision instead of a customer-facing reasoning_effort 400.
+ANTHROPIC_LIVE_LISTING_2026_09_01 = (
+    "claude-fable-5-1",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+    "claude-opus-4-5-20251101",
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-5-20250929",
+)
+
+
+def test_every_served_anthropic_listing_id_resolves_a_generation_contract() -> None:
+    """Every id Anthropic serves must resolve metadata, by name.
+
+    When this fails, a launched model is reaching customers with no
+    recorded contract: add its generation entry (or explicit point-release
+    entry with verified prices) to ``_ANTHROPIC_MODELS`` now. Silent drift
+    here is how paying customers become the first detector (claude-fable-5-1
+    shipped as a non-reasoning route for exactly this reason).
+    """
+    unresolved = [
+        wire_id
+        for wire_id in ANTHROPIC_LIVE_LISTING_2026_09_01
+        if known_model_metadata("anthropic", wire_id) is None
+    ]
+    assert not unresolved, (
+        f"Anthropic serves ids with no recorded generation contract: {unresolved}. "
+        "Record each in _ANTHROPIC_MODELS (verified prices, or the generation "
+        "entry a point release should inherit) before customers hit it."
+    )
+    # The adaptive generation must resolve WITH its reasoning contract.
+    for wire_id in ("claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-sonnet-5"):
+        known = known_model_metadata("anthropic", wire_id)
+        assert known is not None and known.supports_reasoning_effort is True, wire_id
