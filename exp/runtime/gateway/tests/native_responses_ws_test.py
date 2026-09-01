@@ -114,7 +114,12 @@ def test_websocket_transport_mirrors_the_http_event_stream(
             ]
         assert http_events[-1] == "response.completed"
 
-        with connect(ws_url, additional_headers=headers) as socket:
+        # The upgrade may carry an Idempotency-Key (some clients send blanket
+        # headers); it names ONE operation, so the transport must not key
+        # every frame of the connection to it.
+        with connect(
+            ws_url, additional_headers={**headers, "Idempotency-Key": "connection-op"}
+        ) as socket:
             # Prewarm completes an empty response without touching the provider.
             provider_calls = _LoopbackProvider.calls
             socket.send(_request_frame(generate=False, input=[]))

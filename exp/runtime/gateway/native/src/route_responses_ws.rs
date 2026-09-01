@@ -89,6 +89,12 @@ fn upgrade_required_error() -> PublicError {
 
 /// Copy the upgrade headers every synthesized per-frame request carries,
 /// dropping the handshake-only fields that do not describe the request.
+///
+/// `Idempotency-Key` is also dropped: it names ONE operation, and the
+/// WebSocket transport has no per-request header channel, so carrying the
+/// upgrade's value into every synthesized request would key every frame of
+/// the connection to the same replay identity. The operation-keyed replay
+/// protocol stays HTTP-only.
 fn request_headers(headers: &HeaderMap) -> HeaderMap {
     let mut carried = headers.clone();
     for name in [
@@ -102,6 +108,7 @@ fn request_headers(headers: &HeaderMap) -> HeaderMap {
     ] {
         carried.remove(name);
     }
+    carried.remove("idempotency-key");
     carried
 }
 
@@ -215,6 +222,7 @@ async fn relay_response(socket: &mut WebSocket, response: Response) -> Result<()
         .is_some_and(|value| value.starts_with("text/event-stream"));
     if status.is_success() && is_event_stream {
         let mut decoder = SseDecoder::new();
+        let mut saw_terminal = false;
         // Dropping the body mid-stream cancels the in-flight attempt through
         // the same disconnect guards an HTTP client disconnect triggers.
         let mut body = response.into_body().into_data_stream();
@@ -234,10 +242,24 @@ async fn relay_response(socket: &mut WebSocket, response: Response) -> Result<()
                 }
             };
             for event in events {
+                saw_terminal = saw_terminal || is_terminal_event(event.event.as_deref());
                 if socket.send(Message::Text(event.data.into())).await.is_err() {
                     return Err(());
                 }
             }
+        }
+        if !saw_terminal {
+            // A deliberately truncated stream (retention or keyed publication
+            // failed) ends the HTTP body without a terminal event; over HTTP
+            // the caller observes EOF, but a socket would wait forever, so
+            // the truncation becomes an explicit in-band error.
+            let error = PublicError::new(
+                502,
+                "incomplete_stream",
+                "The response stream ended before its terminal event. Resend the request.",
+                "server_error",
+            );
+            return send_public_error(socket, &error).await;
         }
         return Ok(());
     }
@@ -271,8 +293,7 @@ async fn send_prewarm_ack(socket: &mut WebSocket, request: &Value) -> Result<(),
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let envelope: ResponsesEnvelope =
-        serde_json::from_value(request.clone()).unwrap_or_default();
+    let envelope: ResponsesEnvelope = serde_json::from_value(request.clone()).unwrap_or_default();
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs_f64())
@@ -301,6 +322,20 @@ async fn send_prewarm_ack(socket: &mut WebSocket, request: &Value) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// Whether one relayed SSE event name closes its response stream.
+///
+/// Mirrors the Responses terminal vocabulary the encoder emits; a stream
+/// that ends without one of these was truncated, never completed.
+fn is_terminal_event(event_name: Option<&str>) -> bool {
+    matches!(
+        event_name,
+        Some("response.completed")
+            | Some("response.failed")
+            | Some("response.incomplete")
+            | Some("error")
+    )
 }
 
 /// Extract the single-line `data:` payload from one encoder SSE frame.
@@ -356,7 +391,10 @@ mod tests {
     #[test]
     fn sse_frame_data_extracts_the_payload() {
         let frame = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
-        assert_eq!(sse_frame_data(frame), Some("{\"type\":\"response.created\"}"));
+        assert_eq!(
+            sse_frame_data(frame),
+            Some("{\"type\":\"response.created\"}")
+        );
     }
 
     #[test]
@@ -386,5 +424,28 @@ mod tests {
         assert!(!carried.contains_key(header::UPGRADE));
         assert!(!carried.contains_key(header::SEC_WEBSOCKET_KEY));
         assert!(!carried.contains_key(header::SEC_WEBSOCKET_VERSION));
+    }
+
+    #[test]
+    fn request_headers_never_carry_an_operation_key_across_frames() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer xpl_test".parse().unwrap());
+        headers.insert("idempotency-key", "op-1".parse().unwrap());
+        let carried = request_headers(&headers);
+        assert!(!carried.contains_key("idempotency-key"));
+    }
+
+    #[test]
+    fn terminal_vocabulary_matches_the_responses_lifecycle() {
+        for name in [
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+            "error",
+        ] {
+            assert!(is_terminal_event(Some(name)), "{name} must be terminal");
+        }
+        assert!(!is_terminal_event(Some("response.output_text.delta")));
+        assert!(!is_terminal_event(None));
     }
 }
