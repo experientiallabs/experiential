@@ -42,6 +42,7 @@ from exp.runtime.gateway.batch.interfaces import (
 )
 from exp.runtime.gateway.batch.providers import (
     PROVIDER_CLIENTS,
+    AmbiguousProviderResponse,
     ProviderBatchClient,
 )
 
