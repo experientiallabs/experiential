@@ -38,17 +38,21 @@ def responses_image_part(image: ImageContentPart) -> JsonObject:
 
 
 def anthropic_image_block(image: ImageContentPart) -> JsonObject:
-    """Encode one image as an Anthropic ``image`` content block."""
-    if image.data is None:
-        return {"type": "image", "source": {"type": "url", "url": image.url or ""}}
-    return {
-        "type": "image",
-        "source": {
-            "type": "base64",
-            "media_type": image.media_type,
-            "data": image.data,
-        },
-    }
+    """Encode one image as an Anthropic ``image`` content block.
+
+    A caller cache breakpoint re-emits on the block it was placed on: this
+    wire caches a marked image, and a lost marker silently returns the whole
+    prefix to full input billing.
+    """
+    source: JsonObject = (
+        {"type": "url", "url": image.url or ""}
+        if image.data is None
+        else {"type": "base64", "media_type": image.media_type, "data": image.data}
+    )
+    block: JsonObject = {"type": "image", "source": source}
+    if image.cache_control is not None:
+        block["cache_control"] = image.cache_control
+    return block
 
 
 def gemini_image_part(image: ImageContentPart) -> JsonObject:

@@ -8,9 +8,10 @@ byte-exact signatures); echoed server-tool output (``server_tool_use``,
 verbatim per-block carrier so it round-trips byte-for-byte to native
 Anthropic rungs; ``cache_control`` annotations are validated
 everywhere and carried on the surfaces the Anthropic wire caches natively
-(tool_use blocks, tool definitions, and the top-level automatic marker),
-while content-block hints are dropped because they do not change model
-semantics; ``image`` blocks are retained as canonical content parts so a
+(text and image content blocks, tool_use blocks, tool definitions, and the
+top-level automatic marker), and dropped on wires that do not cache a marked
+block because a cache hint changes cost, not semantics; ``image`` blocks are
+retained as canonical content parts so a
 route that declares image input carries them, and ``document`` blocks are
 rejected loudly because the serving surface cannot preserve them.
 Unknown or unsupported fields are rejected with a
@@ -617,12 +618,19 @@ def _image_part(block: _ImageBlock, param: str) -> ImageContentPart:
         OpenAIProtocolError: The source is not a supported image.
     """
     source = block.source
+    marker = (
+        block.cache_control.model_dump(mode="json", exclude_none=True)
+        if block.cache_control is not None
+        else None
+    )
     try:
         if source.type == "url":
-            return image_part_from_url(source.url or "")
+            part = image_part_from_url(source.url or "")
+            return part.model_copy(update={"cache_control": marker})
         return ImageContentPart(
             media_type=IMAGE_MEDIA_TYPES[source.media_type or ""],
             data=source.data,
+            cache_control=marker,
         )
     except (KeyError, ValueError) as exc:
         raise invalid_field(

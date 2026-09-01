@@ -293,6 +293,31 @@ def test_image_blocks_are_retained_in_caller_order() -> None:
     assert message.images[0].data == _PNG_BASE64
 
 
+def test_a_cache_marker_on_an_image_block_is_retained() -> None:
+    """A breakpoint the caller placed on the image reaches the wire."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    assert decoded.request.messages[-1].images[0].cache_control == {"type": "ephemeral"}
+
+
 def test_malformed_image_source_is_rejected() -> None:
     """An image the gateway cannot forward is rejected at its own path."""
     with pytest.raises(OpenAIProtocolError) as excinfo:

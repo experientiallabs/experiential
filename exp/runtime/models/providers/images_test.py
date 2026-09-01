@@ -67,6 +67,16 @@ def test_anthropic_splits_base64_and_url_sources() -> None:
     }
 
 
+def test_anthropic_re_emits_a_cache_marker_placed_on_the_image() -> None:
+    """A breakpoint on the image survives to the wire that honors it."""
+    marked = _INLINE.model_copy(update={"cache_control": {"type": "ephemeral"}})
+    assert anthropic_image_block(marked) == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+        "cache_control": {"type": "ephemeral"},
+    }
+
+
 def test_gemini_uses_inline_data() -> None:
     """Gemini carries the bytes as an ``inline_data`` part."""
     assert gemini_image_part(_INLINE) == {

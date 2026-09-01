@@ -16,7 +16,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
-from exp.common.core.artifacts import ContractModel
+from exp.common.core.artifacts import ContractModel, JsonObject
 
 ImageMediaType = Literal["image/png", "image/jpeg", "image/gif", "image/webp"]
 
@@ -60,6 +60,10 @@ class ImageContentPart(ContractModel):
     data: str | None = Field(default=None, max_length=MAXIMUM_IMAGE_BASE64_BYTES)
     url: str | None = Field(default=None, max_length=8_192)
     detail: Literal["auto", "low", "high"] | None = None
+    cache_control: JsonObject | None = None
+    """Prompt-cache breakpoint the caller placed on this image, re-emitted
+    verbatim on wires that cache a marked block natively and dropped
+    elsewhere: a cache hint changes cost, not semantics."""
 
     @model_validator(mode="after")
     def _require_one_carrier(self) -> ImageContentPart:
