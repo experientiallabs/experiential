@@ -410,3 +410,55 @@ def test_list_jobs_is_owner_scoped() -> None:
     )
     assert len(engine.list_jobs(organization_id="org_a")) == 1
     assert engine.list_jobs(organization_id="org_b") == []
+
+
+def test_interrupted_dispatch_fails_closed_without_resubmitting() -> None:
+    """A job with dispatch started but no provider id never submits again."""
+    client = ScriptedClient(
+        [ProviderBatchSnapshot(status=BatchStatus.COMPLETED, results_ready=True)], []
+    )
+    engine, store, _, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    interrupted = store.jobs[job.batch_id].model_copy(update={"dispatch_started": True})
+    store.save_job(job=interrupted)
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.FAILED
+    assert final.failure_message is not None and "interrupted" in final.failure_message
+    assert client.submitted == []
+    assert ledger.released == [("a", "failed")]
+
+
+def test_open_jobs_use_the_submit_time_credential_reference() -> None:
+    """Repointing the catalog mid-job never changes the credential in use."""
+    client = ScriptedClient([ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS)], [])
+    catalog = MemoryCatalog()
+    store = MemoryStore()
+    engine = BatchEngine(
+        store=store,
+        files=MemoryFiles(),
+        catalog=catalog,
+        ledger=MemoryLedger(),
+        secrets_resolver=MemorySecrets(),
+        clients={"openrouter": client, "openai": client},
+    )
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    assert store.jobs[job.batch_id].credential_reference == "secret://openrouter"
+    repointed = catalog.deployments["gpt-oss-120b-batch"].model_copy(
+        update={"credential_reference": "secret://other-connection"}
+    )
+    catalog.deployments["gpt-oss-120b-batch"] = repointed
+    asyncio.run(engine.poll_once())
+    assert client.submitted == ["key-for-secret://openrouter"]

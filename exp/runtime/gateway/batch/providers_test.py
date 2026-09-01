@@ -42,6 +42,7 @@ def _job(provider: str, lines: int = 2, provider_batch_id: str | None = "pb_1") 
         identity_id="id_a",
         surface=surface,
         provider=provider,
+        credential_reference="secret://fixture",
         provider_batch_id=provider_batch_id,
         input_file_id="file_t",
         counts=BatchCounts(total=lines),

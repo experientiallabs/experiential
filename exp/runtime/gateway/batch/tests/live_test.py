@@ -60,6 +60,7 @@ def _job(provider: str, surface: BatchSurface, provider_model: str, body: dict) 
         identity_id="id_live",
         surface=surface,
         provider=provider,
+        credential_reference="secret://fixture",
         input_file_id="file_live",
         counts=BatchCounts(total=2),
         lines=lines,

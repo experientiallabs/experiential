@@ -148,6 +148,9 @@ class BatchEngine:
                 "every input line was rejected: "
                 + "; ".join(error.message for error in line_errors[:5])
             )
+        deployment = self._catalog.batch_deployment(model=lines[0].model)
+        if deployment is None:
+            raise BatchSubmitError(f"model {lines[0].model!r} left the catalog during submit")
         created = _now()
         job = BatchJob(
             batch_id=_new_id("batch"),
@@ -155,6 +158,7 @@ class BatchEngine:
             identity_id=identity_id,
             surface=surface,
             provider=provider,
+            credential_reference=deployment.credential_reference,
             input_file_id=input_file_id,
             counts=BatchCounts(total=len(lines)),
             lines=tuple(lines),
@@ -353,14 +357,13 @@ class BatchEngine:
         return job
 
     def _api_key(self, job: BatchJob) -> str:
-        """Resolve the provider credential for one job at call time."""
-        deployment = self._catalog.batch_deployment(model=job.lines[0].model)
-        if deployment is None:
-            raise BatchSubmitError(
-                f"model {job.lines[0].model!r} left the catalog while the job ran",
-                code="provider_error",
-            )
-        return self._secrets.resolve(deployment.credential_reference)
+        """Resolve the job's submit-time credential reference at call time.
+
+        The reference is frozen on the job at submit, so catalog edits while
+        the job runs can never repoint an open job at a different connection;
+        only the secret value itself is late-bound through the resolver.
+        """
+        return self._secrets.resolve(job.credential_reference)
 
     async def poll_once(self) -> int:
         """Advance every open job one step; returns how many jobs progressed."""
@@ -397,9 +400,25 @@ class BatchEngine:
         client = self._clients[job.provider]
         api_key = self._api_key(job)
         if job.provider_batch_id is None:
-            provider_batch_id = await client.submit(job=job, api_key=api_key)
+            if job.dispatch_started:
+                # A prior dispatch was interrupted between the provider accept
+                # and the durable id write. Submitting again would duplicate
+                # paid provider work against an unknown provider-side batch,
+                # so the job fails closed and releases its reservations.
+                await self._finalize(
+                    job,
+                    BatchStatus.FAILED,
+                    "dispatch was interrupted before the provider batch id "
+                    "was persisted; resubmit the input file as a new batch",
+                )
+                return
+            self._store.save_job(job=job.model_copy(update={"dispatch_started": True}))
+            provider_batch_id = await client.submit(
+                job=job.model_copy(update={"dispatch_started": True}), api_key=api_key
+            )
             job = job.model_copy(
                 update={
+                    "dispatch_started": True,
                     "provider_batch_id": provider_batch_id,
                     "status": BatchStatus.IN_PROGRESS,
                 }

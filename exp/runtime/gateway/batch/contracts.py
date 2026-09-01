@@ -139,6 +139,8 @@ class BatchJob(ContractModel):
     identity_id: str = Field(min_length=1, max_length=128)
     surface: BatchSurface
     provider: str = Field(min_length=1, max_length=128)
+    credential_reference: str = Field(min_length=1, max_length=512)
+    dispatch_started: bool = False
     provider_batch_id: str | None = Field(default=None, max_length=256)
     input_file_id: str = Field(min_length=1, max_length=128)
     output_file_id: str | None = Field(default=None, max_length=128)

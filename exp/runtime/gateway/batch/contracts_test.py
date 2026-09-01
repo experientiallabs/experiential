@@ -27,6 +27,7 @@ def _job(**overrides: object) -> BatchJob:
         "identity_id": "id_a",
         "surface": "/v1/chat/completions",
         "provider": "openrouter",
+        "credential_reference": "secret://fixture",
         "input_file_id": "file_a",
         "counts": BatchCounts(total=2),
         "created_at": created,
