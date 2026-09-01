@@ -773,3 +773,53 @@ def test_poller_with_stale_snapshot_never_overwrites_a_cancelled_job() -> None:
     assert final.settled is True
     assert ledger.released == releases_after_cancel
     assert client.submitted == []
+
+
+def test_failed_provider_cancel_keeps_the_intent_and_retries() -> None:
+    """A provider cancel failure never loses CANCELLING; the poller retries."""
+
+    class FlakyCancelClient(ScriptedClient):
+        """Client whose first cancel fails, second succeeds."""
+
+        provider = "openai"
+        supports_cancel = True
+        requires_uniform_model = False
+
+        def __init__(self) -> None:
+            """Script the snapshots and the flaky cancel."""
+            super().__init__(
+                [
+                    ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+                    ProviderBatchSnapshot(status=BatchStatus.CANCELLED),
+                ],
+                [],
+            )
+            self.cancel_attempts = 0
+
+        async def cancel(self, *, job: BatchJob, api_key: str) -> None:
+            """Fail once, then accept."""
+            self.cancel_attempts += 1
+            if self.cancel_attempts == 1:
+                raise BatchSubmitError(
+                    "provider batch cancel failed with status 500", code="provider_error"
+                )
+
+    client = FlakyCancelClient()
+    engine, store, _, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a", model="kimi-k3-batch")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    with pytest.raises(BatchSubmitError):
+        asyncio.run(engine.cancel(organization_id="org_a", batch_id=job.batch_id))
+    assert store.jobs[job.batch_id].status is BatchStatus.CANCELLING
+    asyncio.run(engine.poll_once())
+    assert client.cancel_attempts == 2
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.CANCELLED and final.settled
+    assert ledger.released == [("a", "cancelled")]

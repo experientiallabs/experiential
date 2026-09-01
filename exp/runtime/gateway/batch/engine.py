@@ -367,8 +367,13 @@ class BatchEngine:
             return job
         client = self._clients[job.provider]
         if job.provider_batch_id is not None:
-            await client.cancel(job=job, api_key=self._api_key(job))
+            # The intent persists before the provider call, so a failed call
+            # cannot lose it: the poller re-requests cancellation until the
+            # provider confirms a terminal state.
             job = job.model_copy(update={"status": BatchStatus.CANCELLING})
+            self._store.save_job(job=job)
+            if client.supports_cancel:
+                await client.cancel(job=job, api_key=self._api_key(job))
         elif self._store.begin_dispatch(batch_id=job.batch_id):
             # Winning the one-time dispatch claim proves no submission ever
             # ran or will run, so the lines release safely right now.
@@ -508,6 +513,18 @@ class BatchEngine:
                 return
             self._store.save_job(job=job)
             return
+        if (
+            job.status is BatchStatus.CANCELLING
+            and job.provider_batch_id is not None
+            and client.supports_cancel
+        ):
+            try:
+                await client.cancel(job=job, api_key=api_key)
+            except (BatchSubmitError, AmbiguousProviderResponse):
+                _LOGGER.warning(
+                    "batch %s: provider cancellation re-request failed; will retry",
+                    job.batch_id,
+                )
         snapshot = await client.poll(job=job, api_key=api_key)
         counts = job.counts.model_copy(
             update={"completed": snapshot.completed, "failed": snapshot.failed}
