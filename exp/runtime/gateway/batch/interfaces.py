@@ -39,7 +39,11 @@ class BatchStore(Protocol):
         ...
 
     def open_jobs(self) -> list[BatchJob]:
-        """Return every job in a non-terminal status, for the poller."""
+        """Return every job the poller still owes work: all unsettled jobs.
+
+        Terminal jobs whose settlement has not completed are included, so an
+        interrupted settlement always resumes on a later poll.
+        """
         ...
 
     def begin_dispatch(self, *, batch_id: str) -> bool:

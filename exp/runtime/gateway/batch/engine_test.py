@@ -646,3 +646,56 @@ def test_terminal_jobs_settle_partial_provider_results() -> None:
     assert final.status is BatchStatus.CANCELLED and final.settled
     assert ledger.settled == [("a", 4)]
     assert ledger.released == [("b", "cancelled")]
+
+
+def test_inflight_cancel_without_provider_support_runs_to_terminal() -> None:
+    """CANCELLING survives non-terminal polls and settles at provider end."""
+    client = ScriptedClient(
+        [
+            ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+            ProviderBatchSnapshot(status=BatchStatus.COMPLETED, results_ready=True),
+        ],
+        [],
+    )
+    engine, store, _, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    store.save_job(
+        job=store.jobs[job.batch_id].model_copy(update={"status": BatchStatus.CANCELLING})
+    )
+    asyncio.run(engine.poll_once())
+    assert store.jobs[job.batch_id].status is BatchStatus.CANCELLING
+    assert client.cancelled == 0
+    asyncio.run(engine.poll_once())
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.COMPLETED and final.settled
+    assert ledger.released == [("a", "completed")]
+
+
+def test_interrupted_terminal_settlement_resumes_from_open_jobs() -> None:
+    """A terminal job whose settlement never ran settles on a later poll."""
+    engine, store, _, ledger, _ = _engine()
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    store.save_job(
+        job=store.jobs[job.batch_id].model_copy(
+            update={"status": BatchStatus.FAILED, "failure_message": "crashed mid-finalize"}
+        )
+    )
+    assert not store.jobs[job.batch_id].settled
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.settled
+    assert ledger.released == [("a", "failed")]

@@ -483,11 +483,14 @@ class BatchEngine:
             )
             if current is not None and current.status is BatchStatus.CANCELLING:
                 # Cancellation arrived while the submit was in flight: keep
-                # the provider id, request provider-side cancellation, and
-                # let settlement account for whatever partial work ran.
+                # the provider id and the CANCELLING intent. Providers with
+                # cancellation get the request; without it the job runs to
+                # its provider-terminal state and settles normally, which is
+                # the strongest cancellation the provider offers.
                 job = job.model_copy(update={"status": BatchStatus.CANCELLING})
                 self._store.save_job(job=job)
-                await client.cancel(job=job, api_key=api_key)
+                if client.supports_cancel:
+                    await client.cancel(job=job, api_key=api_key)
                 return
             self._store.save_job(job=job)
             return
@@ -495,7 +498,12 @@ class BatchEngine:
         counts = job.counts.model_copy(
             update={"completed": snapshot.completed, "failed": snapshot.failed}
         )
-        job = job.model_copy(update={"status": snapshot.status, "counts": counts})
+        next_status = snapshot.status
+        if job.status is BatchStatus.CANCELLING and next_status not in TERMINAL_STATUSES:
+            # The caller's cancellation intent survives provider snapshots
+            # that have not yet observed it (or providers without cancel).
+            next_status = BatchStatus.CANCELLING
+        job = job.model_copy(update={"status": next_status, "counts": counts})
         if snapshot.status in TERMINAL_STATUSES:
             await self._finalize(job, snapshot.status, snapshot.failure_message)
         else:
