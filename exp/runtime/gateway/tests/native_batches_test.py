@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from exp.runtime.gateway.batch import BatchControlPlane, BatchEngine, BatchStatus
-from exp.runtime.gateway.batch.contracts import BatchLineResult
+from exp.runtime.gateway.batch.contracts import BatchJob, BatchLineResult
 from exp.runtime.gateway.batch.engine_test import (
     MemoryCatalog,
     MemoryFiles,
@@ -325,6 +325,110 @@ def test_invalid_keys_never_learn_that_a_model_is_batch_only(
                 files={"file": ("input.jsonl", b"{}", "application/jsonl")},
             )
             assert upload.status_code == 401
+    finally:
+        shutdown.request_shutdown()
+        thread.join(timeout=10)
+        inner.write_ledger.close()
+    assert not thread.is_alive()
+
+
+def test_caller_visible_error_messages_meet_the_quality_bar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every refusal a customer can hit states what happened and what to do."""
+    monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "provider-secret")
+    _manager, raw_key = _configure_gateway(tmp_path, base_url="http://127.0.0.1:9/v1")
+
+    class CancelHonestClient(ScriptedClient):
+        """Scripted lifecycle with the real OpenRouter cancel refusal."""
+
+        async def cancel(self, *, job: BatchJob, api_key: str) -> None:
+            """Refuse exactly as the real OpenRouter client does."""
+            from exp.runtime.gateway.batch.providers import OpenRouterBatchClient
+
+            await OpenRouterBatchClient().cancel(job=job, api_key=api_key)
+
+    provider = CancelHonestClient([ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS)], [])
+    engine = BatchEngine(
+        store=MemoryStore(),
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=MemoryLedger(),
+        secrets_resolver=MemorySecrets(),
+        clients={"openrouter": provider, "openai": provider},
+    )
+    port = _unused_port()
+    inner = load_gateway_components(tmp_path)
+    batches = BatchControlPlane(engine=engine, control=inner.store)
+    thread, shutdown, _plane, _ = _serve_with(tmp_path, port, batches, inner)
+    try:
+        base = f"http://127.0.0.1:{port}"
+        auth = {"Authorization": f"Bearer {raw_key}"}
+        with httpx.Client(timeout=10.0) as client:
+            refused = client.post(
+                f"{base}/v1/chat/completions",
+                headers=auth,
+                json={
+                    "model": "gpt-oss-120b-batch",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            message = refused.json()["error"]["message"]
+            assert "only available through the Batch API" in message
+            assert "Submit it explicitly via /v1/batches" in message
+
+            malformed = client.post(
+                f"{base}/v1/files",
+                headers=auth,
+                data={"purpose": "batch"},
+                files={"file": ("bad.jsonl", b'{"custom_id": "a"}\n{nope}\n', "application/jsonl")},
+            )
+            assert malformed.status_code == 400
+            assert "line 2" in malformed.json()["error"]["message"]
+
+            too_many = "\n".join(f'{{"custom_id": "x{index}"}}' for index in range(50_001))
+            oversized = client.post(
+                f"{base}/v1/files",
+                headers=auth,
+                data={"purpose": "batch"},
+                files={"file": ("big.jsonl", too_many.encode("utf-8"), "application/jsonl")},
+            )
+            assert oversized.status_code == 400
+            oversize_message = oversized.json()["error"]["message"]
+            assert "50001 lines" in oversize_message
+            assert "limit is 50000" in oversize_message
+
+            mixed = _chat_line("good-0") + "\n" + _chat_line("sync-0", model="gpt-oss-120b")
+            uploaded = client.post(
+                f"{base}/v1/files",
+                headers=auth,
+                data={"purpose": "batch"},
+                files={"file": ("mixed.jsonl", mixed.encode("utf-8"), "application/jsonl")},
+            )
+            created = client.post(
+                f"{base}/v1/batches",
+                headers=auth,
+                json={"input_file_id": uploaded.json()["id"], "endpoint": "/v1/chat/completions"},
+            )
+            batch = created.json()
+            line_errors = batch["errors"]["data"]
+            assert len(line_errors) == 1
+            assert "'gpt-oss-120b'" in line_errors[0]["message"]
+            assert "batch jobs accept only explicit batch models" in line_errors[0]["message"]
+
+            asyncio.run(engine.poll_once())
+            cancel = client.post(f"{base}/v1/batches/{batch['id']}/cancel", headers=auth)
+            assert cancel.status_code == 409
+            cancel_message = cancel.json()["error"]["message"]
+            assert "cannot be cancelled" in cancel_message
+            assert "runs to completion" in cancel_message
+
+            unknown_batch = client.get(f"{base}/v1/batches/batch_missing", headers=auth)
+            assert unknown_batch.status_code == 404
+            assert "does not exist" in unknown_batch.json()["error"]["message"]
+            unknown_file = client.get(f"{base}/v1/files/file_missing", headers=auth)
+            assert unknown_file.status_code == 404
+            assert "does not exist" in unknown_file.json()["error"]["message"]
     finally:
         shutdown.request_shutdown()
         thread.join(timeout=10)

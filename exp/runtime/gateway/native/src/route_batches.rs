@@ -59,12 +59,10 @@ fn envelope_response(rendered: &str) -> Response {
 /// Mirrors the synchronous routes: authentication happens before the plane
 /// buffers request content, so an unauthenticated caller can never make the
 /// gateway allocate an upload.
-async fn pre_authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
-    let key = bearer_key(headers).map_err(|error| error_response(&error))?;
+async fn pre_authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, PublicError> {
+    let key = bearer_key(headers)?;
     let authenticate = compact_json(&json!({"raw_key": key.clone()}));
-    if let Err(error) = state.bridge.call("authenticate", authenticate).await {
-        return Err(error_response(&error));
-    }
+    state.bridge.call("authenticate", authenticate).await?;
     Ok(key)
 }
 
@@ -84,7 +82,7 @@ pub(crate) async fn batches_create(
 ) -> Response {
     let key = match pre_authenticate(&state, &headers).await {
         Ok(key) => key,
-        Err(response) => return response,
+        Err(error) => return error_response(&error),
     };
     let mut payload = Map::new();
     payload.insert("bearer_key".to_string(), Value::String(key));
@@ -189,7 +187,7 @@ pub(crate) async fn files_create(
 ) -> Response {
     let key = match pre_authenticate(&state, &headers).await {
         Ok(key) => key,
-        Err(response) => return response,
+        Err(error) => return error_response(&error),
     };
     let mut payload = Map::new();
     payload.insert("bearer_key".to_string(), Value::String(key));
