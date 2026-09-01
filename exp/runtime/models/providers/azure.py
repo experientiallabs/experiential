@@ -168,6 +168,25 @@ def _azure_base_url(
     return f"{root}/openai/deployments/{deployment}"
 
 
+def azure_anthropic_base_url(endpoint: str) -> str:
+    """Return the Foundry native Anthropic Messages root off one resource endpoint.
+
+    Azure AI Foundry serves Anthropic models at ``{resource}/anthropic/v1/messages``
+    off the RESOURCE root, independent of whichever wire path the connection
+    endpoint is spelled with (``/models``, ``/openai/v1``, ``/openai/deployments/…``),
+    so every equivalent spelling collapses to the one Anthropic root instead of
+    appending ``/anthropic/v1`` after a stale ``/models`` or ``/openai`` segment.
+
+    Args:
+        endpoint: Azure resource endpoint in any of its equivalent spellings.
+
+    Returns:
+        The ``{scheme}://{host}/anthropic/v1`` root, never a credential or query.
+    """
+    parsed = urlsplit(endpoint)
+    return urlunsplit((parsed.scheme, parsed.netloc, "/anthropic/v1", "", ""))
+
+
 class AzureClient(OpenAICompatibleClient):
     """Calls one explicit Azure connection without streaming, failover, or guessed deployments.
 

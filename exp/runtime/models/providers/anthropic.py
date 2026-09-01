@@ -190,8 +190,16 @@ class AnthropicClient(ProviderHttpClient):
         supports_logprobs: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
+        authorization_bearer: bool = False,
     ) -> None:
-        """Create an Anthropic client with explicit generation capability gates."""
+        """Create an Anthropic client with explicit generation capability gates.
+
+        ``authorization_bearer`` sends the credential as ``Authorization: Bearer``
+        instead of ``x-api-key``. Anthropic's own API uses ``x-api-key``; Azure AI
+        Foundry serves the same native Messages API at ``{endpoint}/anthropic/v1``
+        but authenticates with a Bearer token, so a Foundry-hosted Claude routes
+        through this client with ``authorization_bearer=True``.
+        """
         super().__init__(
             model=model,
             api_key=api_key,
@@ -206,11 +214,17 @@ class AnthropicClient(ProviderHttpClient):
         self._supports_logprobs = supports_logprobs
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
+        self._authorization_bearer = authorization_bearer
 
     def _headers(self) -> dict[str, str]:
-        """Build native Anthropic Messages headers with the versioned API key scheme."""
+        """Build native Anthropic Messages headers with the connection's auth scheme."""
+        auth = (
+            {"Authorization": f"Bearer {self._api_key}"}
+            if self._authorization_bearer
+            else {"x-api-key": self._api_key}
+        )
         return {
-            "x-api-key": self._api_key,
+            **auth,
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
         }

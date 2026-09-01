@@ -15,6 +15,7 @@ from exp.common.models import (
     ModelClient,
     ModelSnapshot,
     ReasoningEffort,
+    known_model_metadata,
 )
 from exp.runtime.models.credentials import read_connection_api_key
 from exp.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
@@ -25,6 +26,7 @@ from exp.runtime.models.providers.async_transport import (
 )
 from exp.runtime.models.providers.azure import (
     AzureClient,
+    azure_anthropic_base_url,
     bind_azure_api_key,
     resolve_azure_api_surface,
 )
@@ -360,6 +362,33 @@ class RuntimeModelCatalog:
                 environment=self._environment,
                 api_surface=api_surface,
             )
+            # Azure AI Foundry serves Anthropic models over the NATIVE Anthropic
+            # Messages API at ``{endpoint}/anthropic/v1`` with Bearer auth, not
+            # the OpenAI-deployments wire (which 404s `api_not_supported` for
+            # them). A known Anthropic model on an Azure connection routes there;
+            # every other azure model keeps the OpenAI-compatible AzureClient.
+            if known_model_metadata("anthropic", snapshot.model_id) is not None:
+                anthropic_client = AnthropicClient(
+                    model=snapshot,
+                    api_key=api_key,
+                    base_url=azure_anthropic_base_url(connection.base_url),
+                    authorization_bearer=True,
+                    transport=self._transport_factory(),
+                    supports_temperature=capabilities.supports_temperature,
+                    supports_top_p=_supports_top_p(capabilities),
+                    supports_top_k=_supports_flag(capabilities, "supports_top_k"),
+                    supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                    supports_reasoning=capabilities.supports_reasoning,
+                    reasoning_effort=capabilities.reasoning_effort,
+                )
+                return ResolvedModel(
+                    alias,
+                    snapshot,
+                    capabilities,
+                    anthropic_client,
+                    None,
+                    served_model_id=record.served_model_id,
+                )
             client = AzureClient(
                 model=snapshot,
                 endpoint=connection.base_url,

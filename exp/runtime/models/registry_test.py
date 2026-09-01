@@ -22,6 +22,7 @@ from exp.common.models import (
 )
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
+from exp.runtime.models.providers.anthropic import AnthropicClient
 from exp.runtime.models.providers.azure import AzureClient
 from exp.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
@@ -129,6 +130,78 @@ def test_foundry_catalog_resolution_uses_model_inference_token_field() -> None:
 
     assert isinstance(resolved.client, AzureClient)
     assert resolved.client.gateway_wire_profile().token_limit_key == "max_tokens"
+
+
+def test_azure_foundry_routes_a_known_anthropic_model_over_the_native_messages_wire() -> None:
+    """A known Anthropic model on an Azure (Foundry) connection dispatches over the
+    NATIVE Anthropic Messages API at /anthropic/v1 with Bearer auth, not the
+    OpenAI-deployments wire (which 404s api_not_supported for Claude on Foundry)."""
+    # A `/models`-spelled Foundry endpoint must still collapse to the resource
+    # root's /anthropic/v1, never `/models/anthropic/v1`.
+    catalog = ModelCatalog(
+        connections={
+            "primary": ConnectionConfig(
+                provider="azure",
+                base_url="https://silen-resource.services.ai.azure.com/models",
+                api_key_env="FIXTURE_API_KEY",
+                api_version="2024-10-21",
+            )
+        },
+        models={
+            "opus": ModelRecord(
+                connection="primary",
+                model="claude-opus-4-6",
+                billing_source=BillingSource.HOST_MANAGED,
+                capabilities=ModelCapabilities(supports_completions=True, supports_reasoning=True),
+            )
+        },
+        roles=ModelRoles(candidates=("opus",), incumbent="opus"),
+    )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "foundry-secret"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    resolved = runtime.resolve("opus")
+
+    assert isinstance(resolved.client, AnthropicClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.dialect == "anthropic_messages"
+    assert profile.url == "https://silen-resource.services.ai.azure.com/anthropic/v1/messages"
+    assert profile.headers["Authorization"] == "Bearer foundry-secret"
+    assert "x-api-key" not in profile.headers
+
+
+def test_azure_non_anthropic_model_keeps_the_openai_deployments_wire() -> None:
+    """A non-Anthropic model on the SAME Azure connection still uses AzureClient,
+    so the mixed Foundry connection (glm/kimi/deepseek + Claude) routes per model."""
+    catalog = ModelCatalog(
+        connections={
+            "primary": ConnectionConfig(
+                provider="azure",
+                base_url="https://silen-resource.services.ai.azure.com",
+                api_key_env="FIXTURE_API_KEY",
+                api_version="2024-10-21",
+            )
+        },
+        models={
+            "glm": ModelRecord(
+                connection="primary",
+                model="FW-GLM-5.2",
+                billing_source=BillingSource.HOST_MANAGED,
+                capabilities=ModelCapabilities(supports_completions=True),
+            )
+        },
+        roles=ModelRoles(candidates=("glm",), incumbent="glm"),
+    )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "foundry-secret"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    assert isinstance(runtime.resolve("glm").client, AzureClient)
 
 
 def test_snapshots_preserve_per_model_billing_source_on_one_connection() -> None:
