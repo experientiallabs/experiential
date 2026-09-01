@@ -54,6 +54,25 @@ fn envelope_response(rendered: &str) -> Response {
     json_response(status, &body, &[])
 }
 
+/// Hold one aggregate admission permit for the duration of a batch handler.
+///
+/// Batch bodies share the same concurrency budget as synchronous requests,
+/// so a burst of large uploads cannot bypass the plane's memory admission.
+async fn acquire_batch_permit(
+    state: &AppState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, PublicError> {
+    match tokio::time::timeout(state.request_timeout, state.permits.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(PublicError::draining()),
+        Err(_) => Err(PublicError::new(
+            429,
+            "unavailable_route",
+            "The gateway is at capacity; retry the batch request shortly.",
+            "api_error",
+        )),
+    }
+}
+
 /// Authenticate the presented key over the bridge before any body work.
 ///
 /// Mirrors the synchronous routes: authentication happens before the plane
@@ -80,6 +99,10 @@ pub(crate) async fn batches_create(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let _permit = match acquire_batch_permit(&state).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(&error),
+    };
     let key = match pre_authenticate(&state, &headers).await {
         Ok(key) => key,
         Err(error) => return error_response(&error),
@@ -122,6 +145,10 @@ pub(crate) async fn batches_list(
     headers: HeaderMap,
     Query(query): Query<BatchListQuery>,
 ) -> Response {
+    let _permit = match acquire_batch_permit(&state).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(&error),
+    };
     let mut payload = match keyed_payload(&headers) {
         Ok(payload) => payload,
         Err(error) => return error_response(&error),
@@ -185,6 +212,10 @@ pub(crate) async fn files_create(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
+    let _permit = match acquire_batch_permit(&state).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(&error),
+    };
     let key = match pre_authenticate(&state, &headers).await {
         Ok(key) => key,
         Err(error) => return error_response(&error),
