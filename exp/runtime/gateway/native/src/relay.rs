@@ -261,6 +261,13 @@ impl UpstreamRelay {
                         let events = self.normalizer.feed(&frame)?;
                         self.pending.extend(events);
                     }
+                    // A Gemini stream may end cleanly after its last content
+                    // frame without a finishReason frame; synthesize the
+                    // terminal completion (folding the last-seen usage) so a
+                    // real answer is not thrown away as malformed. A stream
+                    // that produced no content stays terminal-less and the
+                    // caller still synthesizes `ended_without_terminal`.
+                    self.pending.extend(self.normalizer.on_stream_end());
                     continue;
                 }
                 Err(_) => {

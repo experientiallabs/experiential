@@ -217,6 +217,16 @@ impl Failure {
                 if self.safe_message
                     != "provider returned a malformed response; retry the request" =>
             {
+                // The generic boundary message is about to erase the specific
+                // parse-reject reason, so emit it once as a structured,
+                // content-free operator line (the crate's stderr idiom) before
+                // it is lost. The reason is always a static parser label, never
+                // provider payload, so it is safe to log.
+                let line = json!({
+                    "event": "malformed_response_boundary",
+                    "reason": self.safe_message,
+                });
+                eprintln!("exp-gateway-native: {line}");
                 Failure::new(
                     FailureClass::MalformedResponse,
                     "provider returned a malformed response; retry the request",
