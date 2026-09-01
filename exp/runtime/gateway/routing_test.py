@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from exp.common.models.catalog import (
     GatewayDeploymentMetadata,
     GatewayEquivalenceCertification,
     GatewayTokenPrices,
 )
 from exp.common.models.gateway_catalog import (
+    SNAPSHOT_SCHEMA_VERSION,
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
@@ -228,3 +231,49 @@ def test_published_metadata_stays_closed_when_the_revision_has_no_direct_pool() 
         )
         is None
     )
+
+
+def _single_pool_catalog() -> NormalizedGatewayCatalog:
+    """One valid single-deployment catalog for the roll-safety index guards."""
+    deployment = _deployment(deployment_id="deployment-one", source_alias="source-one")
+    catalog, _digest = _catalog(
+        (deployment,),
+        (
+            ExactModelPool(
+                pool_id="pool-one",
+                exact_model_id="exact-one",
+                deployment_ids=("deployment-one",),
+            ),
+        ),
+    )
+    return catalog
+
+
+def test_index_rejects_a_same_version_catalog_under_the_wrong_digest() -> None:
+    """A same-version catalog that does not reproduce its key digest is
+    corruption and still fails closed when the resolver indexes it."""
+    with pytest.raises(ValueError, match="wrong digest"):
+        CatalogRouteResolver({(_REVISION, "b" * 64): _single_pool_catalog()})
+
+
+def test_index_serves_a_cross_version_catalog_under_its_pinned_digest() -> None:
+    """Roll-safety guard: a snapshot authored by a newer engine build (a higher
+    schema_version, a digest this build cannot recompute) is indexed under its
+    pinned digest and resolves rather than hard-failing route admission, so a
+    rolling deploy never turns a route lookup into a fleet-wide error."""
+    foreign = _single_pool_catalog().model_copy(
+        update={"schema_version": SNAPSHOT_SCHEMA_VERSION + 1}
+    )
+    pinned = "b" * 64
+    resolver = CatalogRouteResolver(
+        {(_REVISION, pinned): foreign},
+        listing_pools={("public-model", _REVISION, pinned): "pool-one"},
+    )
+
+    metadata = resolver.published_metadata(
+        alias="public-model",
+        revision_id=_REVISION,
+        catalog_sha256=pinned,
+    )
+
+    assert metadata is not None

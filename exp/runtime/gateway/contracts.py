@@ -822,6 +822,11 @@ class GatewayFailureClass(StrEnum):
     CANCELLED = "cancelled"
     GUARDRAIL = "guardrail"
     INTERNAL = "internal"
+    # A transient control-plane condition (a rolling deploy building the
+    # authorized catalog revision) that the caller should simply retry. Unlike
+    # INTERNAL it is not a bug signal and does not page; unlike a provider class
+    # it never opens a deployment circuit.
+    UNAVAILABLE = "unavailable"
 
 
 class GatewayFailure(ContractModel):

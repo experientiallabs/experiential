@@ -35,13 +35,18 @@ from exp.common.models.discovery import (
 )
 from exp.common.models.gateway_catalog import (
     GATEWAY_EXCLUDED_PROVIDERS,
+    SNAPSHOT_SCHEMA_VERSION,
+    CatalogSnapshotDigestError,
     DeploymentId,
     ExactModelDeployment,
     ExactModelId,
     ExactModelPool,
     ExactModelPoolId,
     NormalizedGatewayCatalog,
+    is_foreign_snapshot,
+    load_forward_compatible,
     normalize_gateway_catalog,
+    read_pinned_normalized_snapshot,
 )
 from exp.common.models.known_models import (
     KnownModel,
@@ -175,9 +180,14 @@ __all__ = [
     "derive_connection_name",
     "derive_model_alias",
     "known_model_metadata",
+    "CatalogSnapshotDigestError",
+    "load_forward_compatible",
     "load_model_catalog",
     "load_pricing_snapshot",
+    "is_foreign_snapshot",
     "normalize_gateway_catalog",
+    "read_pinned_normalized_snapshot",
+    "SNAPSHOT_SCHEMA_VERSION",
     "persist_pricing_snapshot",
     "reconcile_completion_economics",
     "resolve_discovered_model",

@@ -45,6 +45,7 @@ from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
+    gateway_updating_failure,
     record_dead_admission_rungs,
 )
 from exp.runtime.gateway.native_accounting import (
@@ -561,6 +562,13 @@ class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
                 else public_failure_error(failure, param=exc.param)
             )
             raise NativeBridgeError(public_error) from exc
+        except GatewayRoutingError as exc:
+            # A route/catalog that cannot be built during a rolling deploy is a
+            # transient control-plane condition, not a bug: record it retryable
+            # so it never pages as INTERNAL. The public error is already a 503.
+            failure = gateway_updating_failure()
+            self._accounting.finish_request_quietly(authorization, failure)
+            raise _authority_error(exc) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             error = _authority_error(exc)
             failure = GatewayFailure(
