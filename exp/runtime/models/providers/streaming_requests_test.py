@@ -2592,3 +2592,27 @@ def test_native_tool_declarations_require_a_homogeneous_responses_route() -> Non
     with pytest.raises(ProviderParameterError) as mixed:
         route_generation_parameter_requests((responses, chat), request)
     assert mixed.value.param == "tools"
+
+
+def test_native_tool_declarations_count_as_tools_for_capability_preflight() -> None:
+    """A rung that declares no tool support rejects a native-tools-only
+    request locally instead of dispatching a known-unsupported call."""
+    from exp.common.models import GatewayDeploymentCapabilities, ModelCapabilities
+    from exp.runtime.models.providers.errors import ProviderCapabilityError
+    from exp.runtime.models.providers.protocol import preflight_gateway_request
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        provider_native_tools=(GatewayProviderNativeTool(index=0, tool={"type": "web_search"}),),
+        stream=True,
+        include_usage=True,
+    )
+    capabilities = GatewayDeploymentCapabilities(supports_streaming=True)
+    with pytest.raises(ProviderCapabilityError) as rejection:
+        preflight_gateway_request(
+            request,
+            capabilities,
+            model_capabilities=ModelCapabilities(supports_tools=False),
+        )
+    assert rejection.value.capability == "function_tools"
