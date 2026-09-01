@@ -22,6 +22,7 @@ mod relay;
 mod replay;
 mod respond;
 mod responses_retention;
+mod route_batches;
 mod route_chat;
 mod route_messages;
 mod route_responses;

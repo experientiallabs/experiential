@@ -51,6 +51,7 @@ from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
 from exp.runtime.gateway.native_admission import admitted_route_requests
+from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
 from exp.runtime.gateway.native_bridge_errors import (
     escalation as _escalation,
 )
@@ -136,7 +137,7 @@ from exp.runtime.openai_protocol.state import (
 _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
-class NativeControlPlane(NativeObservabilityMixin):
+class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
     """Authority and accounting callbacks for the native data plane.
 
     Rust worker threads share the group-commit writer and the locked in-flight
@@ -178,6 +179,9 @@ class NativeControlPlane(NativeObservabilityMixin):
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
+        # The optional batch lane: hosts without it leave every batch route
+        # answering the uniform not-enabled error below.
+        self._batches = getattr(components, "batches", None)
         # Hosted compositions have no local group-commit writer; they settle
         # directly through their own synchronous ledger.
         group_writer = getattr(components, "write_ledger", None)
@@ -289,6 +293,18 @@ class NativeControlPlane(NativeObservabilityMixin):
                 app_title=optional_text(data.get("app_title")),
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            if self._batches is not None and self._batches.is_batch_model(alias=decoded.alias):
+                raise NativeBridgeError(
+                    OpenAIProtocolError(
+                        status_code=404,
+                        code="model_requires_batch",
+                        message=(
+                            f"The model {decoded.alias!r} is only available through the "
+                            "Batch API. Submit it explicitly via /v1/batches."
+                        ),
+                        error_type="invalid_request_error",
+                    )
+                ) from exc
             raise _authority_error(exc) from exc
 
         # Responses continuation resolves after authorization and before any

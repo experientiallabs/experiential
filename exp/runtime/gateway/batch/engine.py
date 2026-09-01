@@ -98,6 +98,10 @@ class BatchEngine:
         self._clients = clients if clients is not None else PROVIDER_CLIENTS
         self._poll_interval = max(1.0, poll_interval_seconds)
 
+    def is_batch_model(self, *, model: str) -> bool:
+        """Return whether the catalog resolves one explicit batch model."""
+        return self._catalog.batch_deployment(model=model) is not None
+
     def upload_file(
         self, *, organization_id: str, filename: str, purpose: str, content: bytes
     ) -> BatchFile:

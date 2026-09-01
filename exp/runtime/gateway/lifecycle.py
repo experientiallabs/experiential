@@ -347,6 +347,9 @@ class LocalGatewayComponents:
     selection_workers: SelectionWorkerPool
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
+    # The local launch serves no asynchronous batch lane; hosted compositions
+    # supply a BatchControlPlane here to enable /v1/batches.
+    batches: object | None = None
 
     @property
     def runtime_catalogs(self) -> Mapping[tuple[str, str], RuntimeModelCatalog]:

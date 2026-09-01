@@ -20,9 +20,10 @@ extension-module = ["pyo3/extension-module"]
 pyo3 = { version = "0.29", features = ["abi3-py312"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 tokio-stream = "0.1"
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 http = "1"
 http-body-util = "0.1"
+base64 = "0.22"
 bytes = "1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }

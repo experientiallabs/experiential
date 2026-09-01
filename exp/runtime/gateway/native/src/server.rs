@@ -25,6 +25,10 @@ use crate::encode::compact_json;
 use crate::errors::PublicError;
 use crate::replay::ReplayStore;
 use crate::respond::{bearer_key, error_response, json_response, unknown_route_error};
+use crate::route_batches::{
+    batches_cancel, batches_create, batches_list, batches_retrieve, files_body_limit,
+    files_content, files_create, files_retrieve,
+};
 use crate::route_chat::chat;
 use crate::route_messages::{messages, messages_count_tokens};
 use crate::route_responses::responses;
@@ -155,6 +159,12 @@ pub async fn run(
         .route("/v1/responses", post(responses).get(responses_ws))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
+        .route("/v1/batches", post(batches_create).get(batches_list))
+        .route("/v1/batches/{batch_id}", get(batches_retrieve))
+        .route("/v1/batches/{batch_id}/cancel", post(batches_cancel))
+        .route("/v1/files", post(files_create).layer(files_body_limit()))
+        .route("/v1/files/{file_id}", get(files_retrieve))
+        .route("/v1/files/{file_id}/content", get(files_content))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .route("/metrics.json", get(metrics_json))
