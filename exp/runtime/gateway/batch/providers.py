@@ -28,6 +28,15 @@ from exp.runtime.gateway.batch.contracts import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
+class AmbiguousProviderResponse(Exception):
+    """A provider accepted the call but its response could not be parsed.
+
+    The provider-side outcome is unknown, so callers must treat the operation
+    as possibly performed and never as a definitive rejection.
+    """
+
+
 _REQUEST_TIMEOUT_SECONDS = 120.0
 _ANTHROPIC_VERSION = "2023-06-01"
 
@@ -118,9 +127,9 @@ async def _checked(response: httpx.Response, *, action: str) -> JsonObject:
     try:
         parsed = response.json()
     except json.JSONDecodeError as exc:
-        raise BatchSubmitError(f"provider {action} returned invalid JSON") from exc
+        raise AmbiguousProviderResponse(f"provider {action} returned invalid JSON") from exc
     if not isinstance(parsed, dict):
-        raise BatchSubmitError(f"provider {action} returned a non-object body")
+        raise AmbiguousProviderResponse(f"provider {action} returned a non-object body")
     return parsed
 
 

@@ -50,6 +50,14 @@ class MemoryStore:
         """Return jobs that still need the poller."""
         return [job for job in self.jobs.values() if not job.settled]
 
+    def begin_dispatch(self, *, batch_id: str) -> bool:
+        """Claim the one-time dispatch: first caller wins."""
+        job = self.jobs[batch_id]
+        if job.dispatch_started:
+            return False
+        self.jobs[batch_id] = job.model_copy(update={"dispatch_started": True})
+        return True
+
 
 class MemoryFiles:
     """In-memory BatchFileStore."""
@@ -530,3 +538,111 @@ def test_validation_and_binding_share_one_catalog_resolution() -> None:
     )
     assert job.credential_reference == "secret://openrouter"
     assert catalog.lookups == 1
+
+
+def test_same_provider_different_connections_split_per_line() -> None:
+    """Lines on another connection of the same provider are rejected per line."""
+    catalog = MemoryCatalog()
+    catalog.deployments["gpt-oss-20b-batch"] = catalog.deployments["gpt-oss-120b-batch"].model_copy(
+        update={
+            "model": "gpt-oss-20b-batch",
+            "credential_reference": "secret://openrouter-second-account",
+        }
+    )
+    engine = BatchEngine(
+        store=MemoryStore(),
+        files=MemoryFiles(),
+        catalog=catalog,
+        ledger=MemoryLedger(),
+        secrets_resolver=MemorySecrets(),
+    )
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("b", model="gpt-oss-20b-batch")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    assert job.counts.total == 1
+    assert job.line_errors[0].code == "connection_mismatch"
+
+
+def test_ambiguous_submit_response_takes_the_fail_closed_path() -> None:
+    """A 2xx submit response that cannot parse never counts as a rejection."""
+    from exp.runtime.gateway.batch.providers import AmbiguousProviderResponse
+
+    class AmbiguousClient(ScriptedClient):
+        """Client whose submit response is unparseable."""
+
+        async def submit(self, *, job: BatchJob, api_key: str) -> str:
+            """Raise the ambiguous outcome."""
+            raise AmbiguousProviderResponse("provider batch create returned invalid JSON")
+
+    client = AmbiguousClient([ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS)], [])
+    engine, store, _, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    assert store.jobs[job.batch_id].status is BatchStatus.VALIDATING
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.FAILED
+    assert final.failure_message is not None and "interrupted" in final.failure_message
+    assert ledger.released == [("a", "failed")]
+
+
+def test_cancel_during_inflight_dispatch_keeps_reservations() -> None:
+    """Losing the dispatch claim marks CANCELLING and releases nothing."""
+    engine, store, _, ledger, client = _engine()
+    file_id = _upload(engine, [_chat_line("a")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    assert store.begin_dispatch(batch_id=job.batch_id)
+    cancelled = asyncio.run(engine.cancel(organization_id="org_a", batch_id=job.batch_id))
+    assert cancelled.status is BatchStatus.CANCELLING
+    assert ledger.released == []
+    assert client.cancelled == 0
+
+
+def test_terminal_jobs_settle_partial_provider_results() -> None:
+    """A cancelled provider batch still settles the lines that ran."""
+    partial = [
+        BatchLineResult(
+            custom_id="a",
+            status_code=200,
+            response={"usage": {"prompt_tokens": 1, "completion_tokens": 4}},
+            input_tokens=1,
+            output_tokens=4,
+        )
+    ]
+    client = ScriptedClient(
+        [
+            ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+            ProviderBatchSnapshot(status=BatchStatus.CANCELLED),
+        ],
+        partial,
+    )
+    engine, store, _, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("b")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    asyncio.run(engine.poll_once())
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.CANCELLED and final.settled
+    assert ledger.settled == [("a", 4)]
+    assert ledger.released == [("b", "cancelled")]

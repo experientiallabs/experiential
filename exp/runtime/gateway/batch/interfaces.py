@@ -42,6 +42,16 @@ class BatchStore(Protocol):
         """Return every job in a non-terminal status, for the poller."""
         ...
 
+    def begin_dispatch(self, *, batch_id: str) -> bool:
+        """Atomically claim the one-time dispatch of one job.
+
+        Returns True exactly once per job: the first caller flips the
+        persisted dispatch_started flag from False to True and owns the
+        provider submission; every later caller gets False. Hosts implement
+        this as one atomic compare-and-set write.
+        """
+        ...
+
 
 class BatchFileStore(Protocol):
     """Durable content storage for batch input and output files."""

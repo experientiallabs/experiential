@@ -40,7 +40,11 @@ from exp.runtime.gateway.batch.interfaces import (
     BatchSecretResolver,
     BatchStore,
 )
-from exp.runtime.gateway.batch.providers import PROVIDER_CLIENTS, ProviderBatchClient
+from exp.runtime.gateway.batch.providers import (
+    PROVIDER_CLIENTS,
+    AmbiguousProviderResponse,
+    ProviderBatchClient,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -273,6 +277,19 @@ class BatchEngine:
             providers.add(deployment.provider)
             if binding is None:
                 binding = deployment
+            elif deployment.credential_reference != binding.credential_reference:
+                errors.append(
+                    BatchLineError(
+                        line_number=line_number,
+                        custom_id=custom_id,
+                        code="connection_mismatch",
+                        message=(
+                            f"model {model!r} is served by a different provider connection "
+                            "than this batch; split lines by connection"
+                        ),
+                    )
+                )
+                continue
             maximum_output = body.get("max_tokens", body.get("max_completion_tokens"))
             if not isinstance(maximum_output, int) or maximum_output <= 0:
                 maximum_output = deployment.default_maximum_output_tokens
@@ -353,16 +370,24 @@ class BatchEngine:
         if job.provider_batch_id is not None:
             await client.cancel(job=job, api_key=self._api_key(job))
             job = job.model_copy(update={"status": BatchStatus.CANCELLING})
-        else:
+        elif self._store.begin_dispatch(batch_id=job.batch_id):
+            # Winning the one-time dispatch claim proves no submission ever
+            # ran or will run, so the lines release safely right now.
             for line in job.lines:
                 self._ledger.release_line(job=job, line=line, reason="cancelled")
             job = job.model_copy(
                 update={
                     "status": BatchStatus.CANCELLED,
+                    "dispatch_started": True,
                     "finalized_at": _now(),
                     "settled": True,
                 }
             )
+        else:
+            # A dispatch claim exists: a submission may be in flight or was
+            # interrupted. Mark the intent and let the poller resolve it
+            # without releasing money that may already be spending.
+            job = job.model_copy(update={"status": BatchStatus.CANCELLING})
         self._store.save_job(job=job)
         return job
 
@@ -413,19 +438,24 @@ class BatchEngine:
         client = self._clients[job.provider]
         api_key = self._api_key(job)
         if job.provider_batch_id is None:
-            if job.dispatch_started:
-                # A prior dispatch was interrupted between the provider accept
-                # and the durable id write. Submitting again would duplicate
-                # paid provider work against an unknown provider-side batch,
-                # so the job fails closed and releases its reservations.
+            if job.status is BatchStatus.CANCELLING:
+                # Cancellation won the dispatch race: nothing was or will be
+                # submitted, so the job terminalizes without provider work.
+                await self._finalize(job, BatchStatus.CANCELLED, None)
+                return
+            if not self._store.begin_dispatch(batch_id=job.batch_id):
+                # Another actor holds or held the one-time dispatch claim. A
+                # claim without a durable provider id means that dispatch was
+                # interrupted; submitting again would duplicate paid provider
+                # work against an unknown provider-side batch, so the job
+                # fails closed and releases its reservations.
                 await self._finalize(
-                    job,
+                    job.model_copy(update={"dispatch_started": True}),
                     BatchStatus.FAILED,
                     "dispatch was interrupted before the provider batch id "
                     "was persisted; resubmit the input file as a new batch",
                 )
                 return
-            self._store.save_job(job=job.model_copy(update={"dispatch_started": True}))
             try:
                 provider_batch_id = await client.submit(
                     job=job.model_copy(update={"dispatch_started": True}), api_key=api_key
@@ -433,8 +463,8 @@ class BatchEngine:
             except BatchSubmitError as rejection:
                 # A raised BatchSubmitError means a provider response was
                 # received, so nothing was accepted: fail now with the reason.
-                # Ambiguous transport losses raise other errors and take the
-                # fail-closed interrupted path on the next poll instead.
+                # Ambiguous responses and transport losses raise other errors
+                # and take the fail-closed interrupted path on the next poll.
                 await self._finalize(
                     job.model_copy(update={"dispatch_started": True}),
                     BatchStatus.FAILED,
@@ -448,6 +478,17 @@ class BatchEngine:
                     "status": BatchStatus.IN_PROGRESS,
                 }
             )
+            current = self._store.load_job(
+                batch_id=job.batch_id, organization_id=job.organization_id
+            )
+            if current is not None and current.status is BatchStatus.CANCELLING:
+                # Cancellation arrived while the submit was in flight: keep
+                # the provider id, request provider-side cancellation, and
+                # let settlement account for whatever partial work ran.
+                job = job.model_copy(update={"status": BatchStatus.CANCELLING})
+                self._store.save_job(job=job)
+                await client.cancel(job=job, api_key=api_key)
+                return
             self._store.save_job(job=job)
             return
         snapshot = await client.poll(job=job, api_key=api_key)
@@ -482,9 +523,20 @@ class BatchEngine:
         if job.settled:
             return
         results: dict[str, BatchLineResult] = {}
-        if job.status is BatchStatus.COMPLETED and job.provider_batch_id is not None:
+        if job.provider_batch_id is not None:
+            # Cancelled, expired, and failed provider batches can still carry
+            # billable partial results; settle whatever the provider reports
+            # and release only the lines that produced nothing.
             client = self._clients[job.provider]
-            fetched = await client.results(job=job, api_key=self._api_key(job))
+            try:
+                fetched = await client.results(job=job, api_key=self._api_key(job))
+            except (BatchSubmitError, AmbiguousProviderResponse):
+                _LOGGER.warning(
+                    "batch %s: no results retrievable for %s job; releasing all lines",
+                    job.batch_id,
+                    job.status.value,
+                )
+                fetched = []
             results = {result.custom_id: result for result in fetched}
         output_lines: list[str] = []
         error_lines: list[str] = []
