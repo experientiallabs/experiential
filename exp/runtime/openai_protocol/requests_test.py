@@ -1737,6 +1737,31 @@ def test_chat_decoder_retains_image_parts_in_caller_order() -> None:
     assert image.detail == "high"
 
 
+def test_an_empty_text_part_beside_an_image_drops() -> None:
+    """A client's empty text part never reaches a wire that rejects one."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ""},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        },
+                        {"type": "text", "text": "read it"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert message.content == "read it"
+    assert [part.kind for part in message.content_parts] == ["image", "text"]
+
+
 def test_responses_decoder_retains_input_image_parts() -> None:
     """A Responses ``input_image`` survives decoding as a canonical image."""
     decoded = decode_responses(

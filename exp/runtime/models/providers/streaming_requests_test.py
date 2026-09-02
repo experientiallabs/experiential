@@ -1229,6 +1229,30 @@ def test_anthropic_messages_stream_payload_round_trips_tool_error_state() -> Non
     assert blocks[1] == {"type": "tool_result", "tool_use_id": "call-2", "content": "fine"}
 
 
+def test_an_empty_assistant_text_never_reaches_the_anthropic_wire() -> None:
+    """A tool-call-only assistant turn omits the empty text block."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="look it up"),
+            GatewayMessage(
+                role="assistant",
+                content="",
+                tool_calls=(
+                    ToolCall(call_id="call-1", name="lookup", arguments={}, raw_arguments="{}"),
+                ),
+            ),
+            GatewayMessage(role="tool", content="found", tool_call_id="call-1"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("exact-model", request)
+    messages = cast("list[dict[str, object]]", payload["messages"])
+    blocks = cast("list[dict[str, object]]", messages[1]["content"])
+    assert [block["type"] for block in blocks] == ["tool_use"]
+
+
 def test_tool_error_state_requires_an_anthropic_only_waterfall() -> None:
     """A fallback cannot discard Anthropic tool-result error semantics."""
     request = GatewayRequest(

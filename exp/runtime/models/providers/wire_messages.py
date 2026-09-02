@@ -203,7 +203,14 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             raise ProviderResponseError("encrypted reasoning cannot replay on the Anthropic wire")
     if message.provider_text_blocks:
         blocks.extend(message.provider_text_blocks)
-    elif message.content is not None:
+    elif message.content:
+        blocks.append({"type": "text", "text": message.content})
+    elif message.content is not None and not blocks and not message.tool_calls:
+        # An empty assistant text block is rejected by this wire, and an
+        # agent that answers with a tool call alone sends exactly that
+        # (OpenCode 1.18.26, captured live 2026-09-02). The block re-emits
+        # only when it is the entire turn, where dropping it would leave an
+        # empty content array the wire also rejects.
         blocks.append({"type": "text", "text": message.content})
     for call in message.tool_calls:
         tool_use: JsonObject = {
