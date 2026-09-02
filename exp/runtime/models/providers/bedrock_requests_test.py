@@ -151,25 +151,28 @@ def test_converse_request_adds_stop_schema_and_strict_tool_fields() -> None:
     }
 
 
-def _inline_media_request(*parts: ImageContentPart | VideoContentPart) -> ModelRequest:
+def _inline_media_request(
+    *parts: ImageContentPart | VideoContentPart, system: str | None = None
+) -> ModelRequest:
     """Build one user message carrying the given inline media parts and a caption."""
-    return ModelRequest(
-        messages=(
-            ModelMessage(
-                role="user",
-                content="describe",
-                content_parts=(*parts, TextContentPart(text="describe")),
-            ),
-        ),
-        maximum_output_tokens=32,
+    messages: list[ModelMessage] = []
+    if system is not None:
+        messages.append(ModelMessage(role="system", content=system))
+    messages.append(
+        ModelMessage(
+            role="user",
+            content="describe",
+            content_parts=(*parts, TextContentPart(text="describe")),
+        )
     )
+    return ModelRequest(messages=tuple(messages), maximum_output_tokens=32)
 
 
 def test_converse_request_rejects_inline_media_over_the_payload_ceiling() -> None:
     """Inline media that individually fits but jointly exceeds 25 MB is refused pre-dispatch."""
     chunk = base64.b64encode(b"\0" * (6 * 1024 * 1024)).decode()
     videos = tuple(VideoContentPart(media_type="video/mp4", data=chunk) for _ in range(3))
-    with pytest.raises(ProviderParameterError, match="25 MB of inline image and video") as info:
+    with pytest.raises(ProviderParameterError, match="at most 25 MB including inline") as info:
         converse_request("amazon.nova-lite-v1:0", _inline_media_request(*videos))
     assert info.value.param == "messages"
     assert info.value.code == "invalid_parameter"
@@ -191,6 +194,28 @@ def test_converse_request_sums_inline_images_and_videos_together() -> None:
     assert [next(iter(block)) for block in blocks] == ["video", "image", "text"]
     with pytest.raises(ProviderParameterError):
         converse_request("amazon.nova-lite-v1:0", _inline_media_request(video, large))
+
+
+def test_converse_request_measures_the_complete_body_not_only_inline_media() -> None:
+    """Text riding beside inline media counts toward the same 25 MB payload ceiling."""
+    video = VideoContentPart(
+        media_type="video/mp4",
+        data=base64.b64encode(b"\0" * (15 * 1024 * 1024)).decode(),
+    )
+    prose = "x" * (2 * 1024 * 1024)
+    converse_request("amazon.nova-lite-v1:0", _inline_media_request(video, system=prose))
+    with pytest.raises(ProviderParameterError) as info:
+        converse_request("amazon.nova-lite-v1:0", _inline_media_request(video, system=prose * 3))
+    assert info.value.param == "messages"
+
+
+def test_converse_request_does_not_cap_text_only_bodies() -> None:
+    """Without inline media the payload ceiling does not apply."""
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="y" * 26_000_000),),
+        maximum_output_tokens=32,
+    )
+    assert "messages" in converse_request("amazon.nova-lite-v1:0", request)
 
 
 def test_converse_request_emits_named_document_blocks_in_caller_order() -> None:

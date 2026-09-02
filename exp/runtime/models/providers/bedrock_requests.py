@@ -22,8 +22,9 @@ from exp.runtime.models.providers.videos import bedrock_video_block
 
 BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES = 25_000_000
 """Converse accepts inline media only while the whole request payload stays
-under 25 MB. Per-file gateway ceilings do not bound the sum, so the encoded
-bytes of every inline image and video in a request are checked together."""
+under 25 MB. Per-file gateway ceilings do not bound the sum, so a request that
+carries inline media is measured as the complete serialized body: media, text,
+system prompts, tools, and output configuration together."""
 
 
 def converse_request(
@@ -114,10 +115,9 @@ def converse_body(
 
     Raises:
         ValueError: A message cannot be represented without dropping tool context.
-        ProviderParameterError: Inline media across the request exceeds the
-            Converse payload ceiling.
+        ProviderParameterError: The request carries inline media and its
+            complete serialized body exceeds the Converse payload ceiling.
     """
-    _require_inline_media_within_payload(request)
     # Converse has no provider-neutral logprobs field. Keep the flag in the
     # shared signature so all provider lanes use one capability contract, but
     # omit the request until response projection exists.
@@ -195,30 +195,41 @@ def converse_body(
     tool_config = _tool_config(request, strict_tool_names=strict_tool_names)
     if tool_config is not None:
         payload["toolConfig"] = tool_config
+    _require_inline_media_within_payload(request, payload)
     return payload
 
 
-def _require_inline_media_within_payload(request: ModelRequest) -> None:
-    """Reject a request whose inline images and videos exceed the Converse payload cap.
+def _carries_inline_media(request: ModelRequest) -> bool:
+    """Return whether any message carries an inline image, video, or document."""
+    return any(
+        part.kind != "text" and part.data is not None
+        for message in request.messages
+        for part in message.content_parts
+    )
+
+
+def _require_inline_media_within_payload(request: ModelRequest, payload: JsonObject) -> None:
+    """Reject an inline-media request whose complete body exceeds the Converse payload cap.
+
+    Text-only requests are not measured here: the ceiling is documented for
+    inline media, and text limits are enforced by the model's token budget.
 
     Args:
         request: Typed EXP request whose user messages may carry inline media.
+        payload: The fully assembled Converse body about to be dispatched.
 
     Raises:
-        ProviderParameterError: The encoded inline media bytes together
-            exceed ``BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES``.
+        ProviderParameterError: The serialized body exceeds
+            ``BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES``.
     """
-    encoded = sum(
-        len(part.data)
-        for message in request.messages
-        for part in message.content_parts
-        if part.kind != "text" and part.data is not None
-    )
+    if not _carries_inline_media(request):
+        return
+    encoded = len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode())
     if encoded > BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES:
         raise ProviderParameterError(
             message=(
-                "This model route accepts at most 25 MB of inline image and video "
-                "data per request. Send fewer or smaller files."
+                "This model route accepts requests of at most 25 MB including inline "
+                "image and video data. Send fewer or smaller files or less text."
             ),
             param="messages",
             code="invalid_parameter",
