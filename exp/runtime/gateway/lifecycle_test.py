@@ -466,9 +466,13 @@ def test_unrelated_invalid_snapshot_does_not_block_a_valid_alias_reload(tmp_path
         catalog_sha256=normalized.identity_sha256(),
     )
 
-    assert _granted_authorities(components, raw_key) == {"coding": "revision-two"}
-    with pytest.raises(GatewayRoutingError):
-        _authorize(components, raw_key, "sibling")
+    # The broken sibling revision never blocks coding's reload, and the sibling
+    # itself degrades to its last-good prior revision instead of going dark.
+    assert _granted_authorities(components, raw_key) == {
+        "coding": "revision-two",
+        "sibling": "revision-sibling",
+    }
+    assert _authorize(components, raw_key, "sibling") == "revision-sibling"
 
 
 class _FailingProjectRepository:
@@ -522,8 +526,11 @@ def test_broken_project_sibling_does_not_block_a_valid_alias_reload(tmp_path: Pa
         _authorize(components, raw_key, "router")
 
 
-def test_invalid_new_revision_fails_closed_and_recovers_after_fix(tmp_path: Path) -> None:
-    """An unloadable new revision keeps fail-closed behavior and recovers in place."""
+def test_invalid_new_revision_serves_last_good_and_recovers_after_fix(tmp_path: Path) -> None:
+    """An unloadable new revision serves the last-good prior revision, not a 503,
+    and adopts a repaired revision in place. This is the persistent-hydration
+    fix: a live alias whose active revision pins a dead snapshot degrades to its
+    most recent good revision instead of going dark."""
     manager, raw_key = _configured_gateway(tmp_path)
     components = load_gateway_components(
         tmp_path,
@@ -540,9 +547,10 @@ def test_invalid_new_revision_fails_closed_and_recovers_after_fix(tmp_path: Path
         catalog_sha256="a" * 64,
     )
 
-    assert _granted_authorities(components, raw_key) == {}
-    with pytest.raises(GatewayRoutingError):
-        _authorize(components, raw_key, "coding")
+    # The active (broken) revision is unservable, so the alias is served and
+    # listed on its last-good prior revision, attributed to what was served.
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    assert _authorize(components, raw_key, "coding") == "revision-one"
 
     manager.activate_direct_alias(
         alias_id="coding",
@@ -555,6 +563,57 @@ def test_invalid_new_revision_fails_closed_and_recovers_after_fix(tmp_path: Path
 
     assert _granted_authorities(components, raw_key) == {"coding": "revision-repaired"}
     assert _authorize(components, raw_key, "coding") == "revision-repaired"
+
+
+def test_cold_start_clears_a_dead_active_pin_via_last_good(tmp_path: Path) -> None:
+    """A FRESH pod whose alias active revision pins an unservable snapshot serves
+    and lists it on the last-good prior revision at startup — the persistent
+    dead-pin case cleared automatically on a fresh-image deploy (no reload, no
+    in-memory retention involved)."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    manager.activate_direct_alias(
+        alias_id="coding",
+        alias_name="coding",
+        revision_id="revision-dead",
+        pool_id="coding",
+        snapshot_ref="catalog-snapshots/missing.json",
+        catalog_sha256="a" * 64,
+    )
+
+    # A brand-new process loads with the dead pin already active.
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "available"},
+    )
+
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    assert _authorize(components, raw_key, "coding") == "revision-one"
+    assert components.unavailable_aliases == ()
+
+
+def test_dead_pin_with_no_loadable_prior_stays_retryable_unavailable(tmp_path: Path) -> None:
+    """An alias whose only revision pins an unservable snapshot (no prior to fall
+    back to) degrades to a retryable-unavailable routing error, never a permanent
+    hard-fail, and does not block a healthy sibling."""
+    manager, raw_key = _configured_gateway(tmp_path)
+    manager.activate_direct_alias(
+        alias_id="orphan",
+        alias_name="orphan",
+        revision_id="orphan-dead",
+        pool_id="orphan",
+        snapshot_ref="catalog-snapshots/missing.json",
+        catalog_sha256="a" * 64,
+    )
+    manager.add_grant(identity_id="default", alias_id="orphan")
+
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "available"},
+    )
+
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    with pytest.raises(GatewayRoutingError):
+        _authorize(components, raw_key, "orphan")
 
 
 def test_concurrent_authorization_survives_pool_recertification_hot_swap(

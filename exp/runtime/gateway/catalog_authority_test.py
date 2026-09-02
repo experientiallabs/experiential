@@ -21,9 +21,11 @@ from exp.common.models import (
     ModelCatalog,
     ModelRecord,
     ModelRoles,
+    normalize_gateway_catalog,
     write_model_catalog,
 )
 from exp.runtime.gateway.catalog_authority import (
+    _write_catalog_snapshot,
     authored_snapshot_path,
     upsert_singleton_deployment,
 )
@@ -89,6 +91,35 @@ def test_rejected_singleton_deployment_leaves_the_authored_catalog_unchanged(
         )
 
     assert path.read_bytes() == before
+
+
+def test_write_catalog_snapshot_repairs_a_stale_content_addressed_file(tmp_path: Path) -> None:
+    """C1 root-cause fix: a normalized snapshot whose on-disk bytes no longer hash
+    to their own content-addressed name (a stale or partially written file) is
+    rewritten instead of blindly trusted, so a self-inconsistent snapshot can
+    never be pinned by this write path."""
+    catalog = ModelCatalog(
+        connections={"openai": ConnectionConfig(provider="openai")},
+        models={
+            "m": ModelRecord(
+                connection="openai",
+                model="gpt-test",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+            )
+        },
+    )
+    normalized = normalize_gateway_catalog(catalog)
+
+    snapshot = _write_catalog_snapshot(tmp_path, catalog, normalized)
+    assert sha256(snapshot.read_bytes()).hexdigest() == normalized.identity_sha256()
+
+    # A stale/corrupt file already sitting at the content-addressed path.
+    snapshot.write_bytes(b'{"stale": true}')
+    repaired = _write_catalog_snapshot(tmp_path, catalog, normalized)
+
+    assert repaired == snapshot
+    # The bytes on disk once again hash to their own content-addressed name.
+    assert sha256(snapshot.read_bytes()).hexdigest() == normalized.identity_sha256()
 
 
 def test_valid_singleton_deployment_still_persists_after_validation(tmp_path: Path) -> None:

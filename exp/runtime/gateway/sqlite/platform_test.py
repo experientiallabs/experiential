@@ -60,6 +60,7 @@ from exp.runtime.gateway import (
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.contracts import DirectTarget, ExecutionSnapshot
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.snapshot_integrity import refuse_self_inconsistent_snapshot
 from exp.runtime.gateway.sqlite.platform import SQLiteGatewayPlatform
 from exp.runtime.gateway.sqlite.store import (
     GatewayStoreError,
@@ -196,6 +197,49 @@ def test_default_adapter_constructs_existing_atomic_components(tmp_path: Path) -
     assert platform.budgets.database_path == platform.database_path
     assert platform.attempts.database_path == platform.database_path
     assert platform.exact_pool_revisions(organization_id="missing") == ()
+
+
+def test_activation_refuses_a_self_inconsistent_snapshot(tmp_path: Path) -> None:
+    """C2 write-side guard: a snapshot whose stored content does not hash to its
+    pinned digest is refused at activation so it never becomes an authority; a
+    matching one is accepted; and an absent file cannot be verified here, so it
+    is flagged and allowed rather than blocking a legitimate activation."""
+    normalized = NormalizedGatewayCatalog(
+        deployments=(
+            ExactModelDeployment(
+                deployment_id="deployment-one",
+                source_alias="deployment-one",
+                exact_model_id="exact-coding",
+                connection="openai",
+                provider="openai",
+                provider_model="gpt-test",
+                connection_sha256="b" * 64,
+                capabilities_sha256="c" * 64,
+            ),
+        ),
+        pools=(
+            ExactModelPool(
+                pool_id="coding-pool",
+                exact_model_id="exact-coding",
+                deployment_ids=("deployment-one",),
+            ),
+        ),
+    )
+    digest = normalized.identity_sha256()
+    snapshot_ref = f"catalog-snapshots/{digest}.json"
+    snapshot_path = tmp_path / snapshot_ref
+    snapshot_path.parent.mkdir()
+    snapshot_path.write_bytes(canonical_json_bytes(normalized))
+
+    # Matching content and digest: accepted.
+    refuse_self_inconsistent_snapshot(tmp_path, snapshot_ref, digest)
+
+    # Present file pinned under the wrong digest (the 6d85fcc0 shape): refused.
+    with pytest.raises(ValueError, match="does not match its pinned digest"):
+        refuse_self_inconsistent_snapshot(tmp_path, snapshot_ref, "a" * 64)
+
+    # Absent file: unverifiable on this node, flagged and allowed.
+    refuse_self_inconsistent_snapshot(tmp_path, "catalog-snapshots/missing.json", "a" * 64)
 
 
 def test_default_adapter_reads_complete_local_pool_revisions(tmp_path: Path) -> None:
