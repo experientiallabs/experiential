@@ -41,12 +41,23 @@ def refuse_self_inconsistent_snapshot(
             digest.
     """
     root = state_dir.resolve()
-    snapshot_path = (root / snapshot_ref).resolve()
+    reference_path = root / snapshot_ref
+    snapshot_path = reference_path.resolve()
     if not snapshot_path.is_relative_to(root):
         raise ValueError("catalog snapshot reference escapes gateway state")
     try:
         data = snapshot_path.read_bytes()
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        # A broken symlink (or any dangling entry) at the reference is a PRESENT
+        # local filesystem object, not a genuine absence: it fails closed like an
+        # unreadable file rather than being waved through as a remote-node pin.
+        if reference_path.is_symlink():
+            _logger.error(
+                "gateway refused a catalog snapshot reference that is a broken symlink"
+            )
+            raise ValueError(
+                "catalog snapshot path is a broken symlink; refusing to pin"
+            ) from exc
         # Genuinely absent: a pin whose content lives on another node. It cannot
         # be verified here, so flag and proceed rather than block a legitimate
         # cross-node activation (topology-agnostic).

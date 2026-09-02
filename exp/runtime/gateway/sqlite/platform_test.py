@@ -247,6 +247,13 @@ def test_activation_refuses_a_self_inconsistent_snapshot(tmp_path: Path) -> None
     with pytest.raises(ValueError, match="present but unreadable"):
         refuse_self_inconsistent_snapshot(tmp_path, "catalog-snapshots/unreadable.json", digest)
 
+    # Broken symlink: a PRESENT dangling entry, not a genuine absence -> fails
+    # closed rather than being waved through as a remote-node pin.
+    broken = tmp_path / "catalog-snapshots" / "broken.json"
+    broken.symlink_to(tmp_path / "catalog-snapshots" / "does-not-exist.json")
+    with pytest.raises(ValueError, match="broken symlink"):
+        refuse_self_inconsistent_snapshot(tmp_path, "catalog-snapshots/broken.json", digest)
+
 
 def test_default_adapter_reads_complete_local_pool_revisions(tmp_path: Path) -> None:
     """SQLite resolves complete pools from its pinned immutable local snapshots."""
