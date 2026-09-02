@@ -34,11 +34,11 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "top_p",
                 "stream",
                 "stream_options",
-                "service_tier",
             )
         ),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("stop", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "stop_sequences"),
+        _field("service_tier", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "service_tier"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field(
             "parallel_tool_calls",
@@ -102,11 +102,11 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "top_p",
                 "stream",
                 "store",
-                "service_tier",
             )
         ),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("include", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "encrypted_reasoning"),
+        _field("service_tier", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "service_tier"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field(
             "parallel_tool_calls",
