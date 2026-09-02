@@ -105,6 +105,129 @@ narrowest provider cap."""
 MAXIMUM_DOCUMENT_NAME_CHARACTERS = 200
 """Longest document name forwarded; Bedrock caps its ``name`` at 200."""
 
+MediaHandleProvider = Literal["openai", "anthropic", "gemini", "vertex", "bedrock"]
+"""Providers whose wire accepts a reference to media the caller already
+uploaded to that provider. A handle is scoped to exactly one of them."""
+
+MEDIA_HANDLE_PROVIDERS: frozenset[str] = frozenset(
+    {"openai", "anthropic", "gemini", "vertex", "bedrock"}
+)
+"""Every provider a media handle can name."""
+
+MEDIA_TYPE_BOUND_HANDLE_PROVIDERS: frozenset[str] = frozenset({"vertex", "bedrock"})
+"""Handle providers whose wire needs the media type next to the reference:
+Vertex ``file_data`` requires ``mime_type`` for a ``gs://`` object and
+Bedrock Converse requires ``format`` next to an ``s3Location``."""
+
+GEMINI_FILE_URI_PREFIX = "https://generativelanguage.googleapis.com/v1beta/files/"
+"""Prefix of every URI the Gemini Files API mints."""
+
+_OPENAI_FILE_ID = re.compile(r"^file-[A-Za-z0-9_-]{1,256}$")
+_ANTHROPIC_FILE_ID = re.compile(r"^file_[A-Za-z0-9_-]{1,256}$")
+_GEMINI_FILE_NAME = re.compile(r"^[a-z0-9-]{1,128}$")
+_BUCKET_OBJECT_URI = re.compile(r"^(?P<bucket>[a-z0-9][a-z0-9._-]{1,254})/(?P<key>.+)$", re.DOTALL)
+_AWS_ACCOUNT_ID = re.compile(r"^[0-9]{12}$")
+
+_MEDIA_HANDLE_SCHEMES: dict[str, MediaHandleProvider] = {
+    "s3://": "bedrock",
+    "gs://": "vertex",
+    GEMINI_FILE_URI_PREFIX: "gemini",
+}
+"""URI prefixes a caller URL field may carry that name a provider handle."""
+
+
+class MediaHandle(ContractModel):
+    """One reference to media the caller already uploaded to a provider.
+
+    Handles are provider scoped and never portable: an OpenAI ``file_id``
+    means nothing to Gemini, and an ``s3://`` object is readable only by the
+    caller's Bedrock identity. The gateway forwards a handle verbatim to a
+    route on the same provider and never uploads, fetches, or mints one.
+    """
+
+    provider: MediaHandleProvider
+    reference: str = Field(min_length=1, max_length=8_192)
+    """The provider's own identifier: an OpenAI or Anthropic file id, a Gemini
+    Files API URI, a ``gs://bucket/object`` URI, or an ``s3://bucket/key``
+    URI."""
+    bucket_owner: str | None = None
+    """AWS account id that owns a cross-account S3 bucket (Bedrock only)."""
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> MediaHandle:
+        """Require the reference to have the named provider's handle shape.
+
+        Returns:
+            The validated handle.
+
+        Raises:
+            ValueError: The reference does not match the provider's handle
+                form, or a bucket owner accompanies a non-Bedrock handle.
+        """
+        if self.bucket_owner is not None:
+            if self.provider != "bedrock":
+                raise ValueError("bucket_owner applies only to bedrock s3 handles")
+            if _AWS_ACCOUNT_ID.match(self.bucket_owner) is None:
+                raise ValueError("bucket_owner must be a 12 digit AWS account id")
+        reference = self.reference
+        if self.provider == "openai":
+            if _OPENAI_FILE_ID.match(reference) is None:
+                raise ValueError("an openai file handle looks like file-...")
+        elif self.provider == "anthropic":
+            if _ANTHROPIC_FILE_ID.match(reference) is None:
+                raise ValueError("an anthropic file handle looks like file_...")
+        elif self.provider == "gemini":
+            if not reference.startswith(GEMINI_FILE_URI_PREFIX) or (
+                _GEMINI_FILE_NAME.match(reference.removeprefix(GEMINI_FILE_URI_PREFIX)) is None
+            ):
+                raise ValueError(f"a gemini file handle looks like {GEMINI_FILE_URI_PREFIX}<name>")
+        elif self.provider == "vertex":
+            if not reference.startswith("gs://") or (
+                _BUCKET_OBJECT_URI.match(reference.removeprefix("gs://")) is None
+            ):
+                raise ValueError("a vertex handle looks like gs://bucket/object")
+        elif not reference.startswith("s3://") or (
+            _BUCKET_OBJECT_URI.match(reference.removeprefix("s3://")) is None
+        ):
+            raise ValueError("a bedrock handle looks like s3://bucket/key")
+        return self
+
+
+def media_handle_from_uri(uri: str, *, bucket_owner: str | None = None) -> MediaHandle | None:
+    """Recognize a provider handle written into a caller URL field.
+
+    Args:
+        uri: Caller value from a URL field such as ``image_url.url``.
+        bucket_owner: Optional AWS account id for a cross-account bucket.
+
+    Returns:
+        The handle for an ``s3://``, ``gs://``, or Gemini Files URI, or
+        ``None`` for a URL that is not a handle.
+
+    Raises:
+        ValueError: The URI has a handle scheme but a malformed body.
+    """
+    for prefix, provider in _MEDIA_HANDLE_SCHEMES.items():
+        if uri.startswith(prefix):
+            return MediaHandle(provider=provider, reference=uri, bucket_owner=bucket_owner)
+    return None
+
+
+def _validate_handle_media_type(handle: MediaHandle, media_type: str | None, noun: str) -> None:
+    """Require a media type where the handle's wire cannot do without one.
+
+    Args:
+        handle: The provider handle carried by the part.
+        media_type: The part's declared media type, if any.
+        noun: Media kind for the error message.
+
+    Raises:
+        ValueError: The handle's provider needs a media type and none is set.
+    """
+    if media_type is None and handle.provider in MEDIA_TYPE_BOUND_HANDLE_PROVIDERS:
+        raise ValueError(f"a {handle.provider} {noun} handle needs its media type")
+
+
 _DATA_URL = re.compile(
     r"^data:(?P<media_type>[\w.+-]+/[\w.+-]+)(?P<parameters>;[^,]*)?,(?P<data>.*)$",
     re.DOTALL,
@@ -126,6 +249,11 @@ requires a MIME type alongside a fetched HTTP URL, so the suffix is recorded
 when it is unambiguous; other URLs carry no media type."""
 
 
+def _carrier_count(*carriers: str | MediaHandle | None) -> int:
+    """Count the carriers a part actually sets."""
+    return sum(carrier is not None for carrier in carriers)
+
+
 class TextContentPart(ContractModel):
     """One text run of a message that also carries images or videos."""
 
@@ -145,6 +273,7 @@ class ImageContentPart(ContractModel):
     media_type: ImageMediaType | None = None
     data: str | None = Field(default=None, max_length=MAXIMUM_IMAGE_BASE64_BYTES)
     url: str | None = Field(default=None, max_length=8_192)
+    handle: MediaHandle | None = None
     detail: Literal["auto", "low", "high"] | None = None
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Prompt-cache breakpoint the caller placed on this image, re-emitted
@@ -161,11 +290,12 @@ class ImageContentPart(ContractModel):
             The validated image part.
 
         Raises:
-            ValueError: Both or neither carrier is present, the inline
-                payload is not base64, or a remote URL is not http(s).
+            ValueError: Not exactly one carrier is present, the inline
+                payload is not base64, a remote URL is not http(s), or a
+                handle whose wire needs a media type has none.
         """
-        if (self.data is None) == (self.url is None):
-            raise ValueError("an image needs either inline data or a URL")
+        if _carrier_count(self.data, self.url, self.handle) != 1:
+            raise ValueError("an image needs exactly one of inline data, a URL, or a handle")
         if self.data is not None:
             if self.media_type is None:
                 raise ValueError("inline image data needs its media type")
@@ -175,6 +305,8 @@ class ImageContentPart(ContractModel):
                 raise ValueError("inline image data must be base64") from exc
         elif self.url is not None and not self.url.startswith(("http://", "https://")):
             raise ValueError("an image URL must be an http(s) URL")
+        elif self.handle is not None:
+            _validate_handle_media_type(self.handle, self.media_type, "image")
         return self
 
     def data_url(self) -> str:
@@ -202,6 +334,7 @@ class VideoContentPart(ContractModel):
     media_type: VideoMediaType | None = None
     data: str | None = Field(default=None, max_length=MAXIMUM_VIDEO_BASE64_BYTES)
     url: str | None = Field(default=None, max_length=8_192)
+    handle: MediaHandle | None = None
 
     @model_validator(mode="after")
     def _require_one_carrier(self) -> VideoContentPart:
@@ -211,11 +344,12 @@ class VideoContentPart(ContractModel):
             The validated video part.
 
         Raises:
-            ValueError: Both or neither carrier is present, the inline
-                payload is not base64, or a remote URL is not http(s).
+            ValueError: Not exactly one carrier is present, the inline
+                payload is not base64, a remote URL is not http(s), or a
+                handle whose wire needs a media type has none.
         """
-        if (self.data is None) == (self.url is None):
-            raise ValueError("a video needs either inline data or a URL")
+        if _carrier_count(self.data, self.url, self.handle) != 1:
+            raise ValueError("a video needs exactly one of inline data, a URL, or a handle")
         if self.data is not None:
             if self.media_type is None:
                 raise ValueError("inline video data needs its media type")
@@ -225,6 +359,8 @@ class VideoContentPart(ContractModel):
                 raise ValueError("inline video data must be base64") from exc
         elif self.url is not None and not self.url.startswith(("http://", "https://")):
             raise ValueError("a video URL must be an http(s) URL")
+        elif self.handle is not None:
+            _validate_handle_media_type(self.handle, self.media_type, "video")
         return self
 
     def data_url(self) -> str:
@@ -248,6 +384,7 @@ class DocumentContentPart(ContractModel):
     media_type: DocumentMediaType = "application/pdf"
     data: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_BASE64_BYTES)
     url: str | None = Field(default=None, max_length=8_192)
+    handle: MediaHandle | None = None
     name: str | None = Field(
         default=None, min_length=1, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS
     )
@@ -265,11 +402,11 @@ class DocumentContentPart(ContractModel):
             The validated document part.
 
         Raises:
-            ValueError: Both or neither carrier is present, the inline
+            ValueError: Not exactly one carrier is present, the inline
                 payload is not base64, or a remote URL is not http(s).
         """
-        if (self.data is None) == (self.url is None):
-            raise ValueError("a document needs either inline data or a URL")
+        if _carrier_count(self.data, self.url, self.handle) != 1:
+            raise ValueError("a document needs exactly one of inline data, a URL, or a handle")
         if self.data is not None:
             try:
                 base64.b64decode(self.data, validate=True)
@@ -311,6 +448,11 @@ def image_part_from_url(
     """
     match = _DATA_URL.match(url)
     if match is None:
+        handle = media_handle_from_uri(url)
+        if handle is not None:
+            return ImageContentPart(
+                handle=handle, media_type=_image_media_type_from_url(url), detail=detail
+            )
         return ImageContentPart(url=url, detail=detail)
     media_type = IMAGE_MEDIA_TYPES.get(match["media_type"].lower())
     if media_type is None:
@@ -321,6 +463,26 @@ def image_part_from_url(
     if len(data) > MAXIMUM_IMAGE_BASE64_BYTES:
         raise ValueError("inline image exceeds the maximum encoded size")
     return ImageContentPart(media_type=media_type, data=data, detail=detail)
+
+
+_IMAGE_URL_EXTENSIONS: dict[str, ImageMediaType] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+"""Image suffixes whose media type an object URI states on its own; Bedrock
+and Vertex need it next to a bucket handle."""
+
+
+def _image_media_type_from_url(url: str) -> ImageMediaType | None:
+    """Return the image media type a URI's path suffix states, if any."""
+    path = urlsplit(url).path.lower()
+    for suffix, media_type in _IMAGE_URL_EXTENSIONS.items():
+        if path.endswith(suffix):
+            return media_type
+    return None
 
 
 def _media_type_from_url(url: str) -> VideoMediaType | None:
@@ -355,6 +517,9 @@ def video_part_from_url(url: str) -> VideoContentPart:
     """
     match = _DATA_URL.match(url)
     if match is None:
+        handle = media_handle_from_uri(url)
+        if handle is not None:
+            return VideoContentPart(handle=handle, media_type=_media_type_from_url(url))
         return VideoContentPart(url=url, media_type=_media_type_from_url(url))
     media_type = VIDEO_MEDIA_TYPES.get(match["media_type"].lower())
     if media_type is None:

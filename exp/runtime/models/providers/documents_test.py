@@ -7,7 +7,7 @@ from collections.abc import Callable
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import DocumentContentPart
+from exp.common.models.content import GEMINI_FILE_URI_PREFIX, DocumentContentPart, MediaHandle
 from exp.runtime.models.providers.documents import (
     PDF_URL_DIALECTS,
     anthropic_document_block,
@@ -134,3 +134,75 @@ def test_inline_only_wires_reject_a_remote_url_as_a_capability(
 def test_only_responses_and_anthropic_fetch_urls() -> None:
     """The URL dialect set matches the encoders that emit a URL carrier."""
     assert PDF_URL_DIALECTS == {"openai_responses", "anthropic_messages"}
+
+
+_OPENAI_HANDLE = DocumentContentPart(handle=MediaHandle(provider="openai", reference="file-abc"))
+_ANTHROPIC_HANDLE = DocumentContentPart(
+    handle=MediaHandle(provider="anthropic", reference="file_abc"), name="Brief"
+)
+_GEMINI_HANDLE = DocumentContentPart(
+    handle=MediaHandle(provider="gemini", reference=f"{GEMINI_FILE_URI_PREFIX}doc")
+)
+_BEDROCK_HANDLE = DocumentContentPart(
+    handle=MediaHandle(provider="bedrock", reference="s3://bkt/brief.pdf"), name="brief.pdf"
+)
+
+
+def test_openai_wires_carry_a_files_handle_as_file_id() -> None:
+    """Chat ``file`` and Responses ``input_file`` both ride ``file_id`` alone."""
+    assert openai_chat_document_part(_OPENAI_HANDLE) == {
+        "type": "file",
+        "file": {"file_id": "file-abc"},
+    }
+    assert responses_document_part(_OPENAI_HANDLE) == {"type": "input_file", "file_id": "file-abc"}
+
+
+def test_anthropic_carries_a_files_handle_with_its_title() -> None:
+    """An Anthropic Files handle becomes ``source.type: file`` and keeps the title."""
+    assert anthropic_document_block(_ANTHROPIC_HANDLE) == {
+        "type": "document",
+        "source": {"type": "file", "file_id": "file_abc"},
+        "title": "Brief",
+    }
+
+
+def test_gemini_carries_a_document_handle_with_its_mime_type() -> None:
+    """``file_data`` always names the PDF MIME type for a document."""
+    assert gemini_document_part(_GEMINI_HANDLE) == {
+        "file_data": {"file_uri": f"{GEMINI_FILE_URI_PREFIX}doc", "mime_type": "application/pdf"}
+    }
+
+
+def test_bedrock_carries_an_s3_document_handle() -> None:
+    """A Bedrock handle becomes ``s3Location`` beside the format and name."""
+    block = bedrock_document_block(_BEDROCK_HANDLE, 1)
+    assert block == {
+        "document": {
+            "format": "pdf",
+            "name": bedrock_document_name(_BEDROCK_HANDLE, 1),
+            "source": {"s3Location": {"uri": "s3://bkt/brief.pdf"}},
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("encode", "document"),
+    [
+        (openai_chat_document_part, _ANTHROPIC_HANDLE),
+        (responses_document_part, _GEMINI_HANDLE),
+        (anthropic_document_block, _OPENAI_HANDLE),
+        (gemini_document_part, _BEDROCK_HANDLE),
+    ],
+)
+def test_a_document_handle_from_another_provider_is_refused(
+    encode: Callable[[DocumentContentPart], JsonObject], document: DocumentContentPart
+) -> None:
+    """Every document encoder refuses a foreign handle before dispatch."""
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider"):
+        encode(document)
+
+
+def test_bedrock_refuses_a_foreign_document_handle() -> None:
+    """The Converse encoder only resolves ``s3://`` handles."""
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider"):
+        bedrock_document_block(_GEMINI_HANDLE, 1)

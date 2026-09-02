@@ -1983,3 +1983,62 @@ def test_direct_alias_declares_video_capabilities_per_provider(tmp_path: Path) -
         )
     assert declarations == {"gem-video": (True, True), "nova-video": (True, False)}
     assert "oai-video" not in catalog.models
+
+
+def test_direct_alias_declares_media_handle_input_per_provider(tmp_path: Path) -> None:
+    """Handles are admitted only with a media flag and only on a provider with a handle wire."""
+    runner = CliRunner()
+    common = ["--root", str(tmp_path), "--non-interactive", "--json"]
+    commands = (
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+        ["config", "gateway", "provider", "add", "oai", "--provider", "openai"]
+        + ["--credential-env", "OPENAI_API_KEY"]
+        + common,
+        ["config", "gateway", "provider", "add", "orx", "--provider", "openrouter"]
+        + ["--credential-env", "OPENROUTER_API_KEY"]
+        + common,
+    )
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+
+    def create(alias: str, deployment: str, *flags: str) -> int:
+        """Create one alias with the given handle flags and return the exit code."""
+        created = runner.invoke(
+            app,
+            ["config", "gateway", "alias", "create", alias, "--deployment", deployment]
+            + ["--exact-model", alias, *flags]
+            + common,
+        )
+        return created.exit_code
+
+    assert (
+        create(
+            "oai-handles",
+            "oai:gpt-fixture",
+            "--supports-image-input",
+            "--supports-media-handle-input",
+        )
+        == 0
+    )
+    assert create("oai-plain", "oai:gpt-fixture", "--supports-image-input") == 0
+    assert create("oai-no-media", "oai:gpt-fixture", "--supports-media-handle-input") != 0
+    assert (
+        create(
+            "orx-handles",
+            "orx:openai/gpt-fixture",
+            "--supports-image-input",
+            "--supports-media-handle-input",
+        )
+        != 0
+    )
+
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    declarations: dict[str, bool] = {}
+    for alias in ("oai-handles", "oai-plain"):
+        gateway = catalog.models[alias].gateway
+        assert gateway is not None
+        declarations[alias] = gateway.capabilities.supports_media_handle_input
+    assert declarations == {"oai-handles": True, "oai-plain": False}
+    assert "oai-no-media" not in catalog.models
+    assert "orx-handles" not in catalog.models

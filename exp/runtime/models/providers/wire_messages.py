@@ -255,6 +255,9 @@ ANTHROPIC_FAST_MODE_BETA = "fast-mode-2026-02-01"
 """Beta token Anthropic requires before it accepts ``speed``
 (verified live 2026-08-30)."""
 
+ANTHROPIC_FILES_API_BETA = "files-api-2025-04-14"
+"""Beta token Anthropic requires before a ``file`` source resolves an uploaded file."""
+
 
 def anthropic_request_headers(
     profile_headers: dict[str, str],
@@ -266,6 +269,7 @@ def anthropic_request_headers(
     behind an ``anthropic-beta`` token (each verified live: the bare field
     is "Extra inputs are not permitted"), so their tokens join the
     connection's static headers exactly when the request carries the field.
+    An Anthropic Files handle likewise needs the Files API token.
     Allowlisted caller-forwarded tokens (``request.provider_beta_tokens``,
     e.g. the 1M context window) merge the same way. The merged list keeps
     operator tokens first, then caller tokens, then field-required tokens,
@@ -286,6 +290,8 @@ def anthropic_request_headers(
         required.append(ANTHROPIC_DIAGNOSTICS_BETA)
     if request.speed is not None:
         required.append(ANTHROPIC_FAST_MODE_BETA)
+    if any(handle.provider == "anthropic" for handle in request.media_handles):
+        required.append(ANTHROPIC_FILES_API_BETA)
     if not required:
         return headers
     existing = headers.get("anthropic-beta")

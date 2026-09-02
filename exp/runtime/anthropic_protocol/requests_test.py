@@ -517,8 +517,29 @@ def test_unservable_document_blocks_are_rejected_at_their_path(
     assert excinfo.value.detail.param == param
 
 
-def test_files_api_document_sources_are_rejected() -> None:
-    """A ``file`` source names an upload this gateway does not host."""
+def test_files_api_document_sources_decode_to_anthropic_handles() -> None:
+    """A ``file`` source becomes an Anthropic-scoped handle, never bytes or a URL."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "document", "source": {"type": "file", "file_id": "file_011abc"}}
+                    ],
+                }
+            ]
+        )
+    )
+    (document,) = decoded.request.documents
+    assert document.handle is not None
+    assert document.handle.provider == "anthropic"
+    assert document.handle.reference == "file_011abc"
+    assert document.data is None and document.url is None
+
+
+def test_malformed_files_api_ids_are_rejected() -> None:
+    """A ``file`` source whose id is not an Anthropic Files id fails closed."""
     with pytest.raises(OpenAIProtocolError):
         decode_messages(
             _body(
@@ -526,7 +547,7 @@ def test_files_api_document_sources_are_rejected() -> None:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "document", "source": {"type": "file", "file_id": "file_1"}}
+                            {"type": "document", "source": {"type": "file", "file_id": "file-1"}}
                         ],
                     }
                 ]

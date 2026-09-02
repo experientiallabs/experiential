@@ -2,9 +2,9 @@
 
 Video is narrower than images: only three provider wires define a video
 carrier. Gemini ``generateContent`` takes ``inline_data`` bytes or a
-``file_data`` URI it fetches itself; Bedrock Converse takes a ``video``
-block with inline bytes (an S3 location is a provider-side resource the
-gateway does not author); and the OpenAI-compatible Chat wire served by
+``file_data`` URI it fetches itself, which also carries a Gemini Files or
+``gs://`` handle; Bedrock Converse takes a ``video`` block with inline bytes
+or an ``s3Location`` handle the caller owns; and the OpenAI-compatible Chat wire served by
 OpenRouter and Fireworks takes a ``video_url`` content part holding a data
 URL or an http(s) URL. The OpenAI Responses and Anthropic Messages wires
 define no video content at all, so a video part reaching them is a
@@ -16,6 +16,13 @@ from __future__ import annotations
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import VideoContentPart, VideoMediaType
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.media_handles import (
+    BEDROCK_HANDLE_PROVIDERS,
+    GEMINI_HANDLE_PROVIDERS,
+    MEDIA_HANDLE_CAPABILITY,
+    bedrock_s3_location,
+    require_handle_provider,
+)
 
 VIDEO_DIALECTS = frozenset(
     {"openai_compatible", "gemini_generate_content", "bedrock_converse_stream"}
@@ -48,7 +55,13 @@ def openai_chat_video_part(video: VideoContentPart) -> JsonObject:
 
     OpenRouter and Fireworks document this exact shape; OpenAI itself does
     not define it, so route declaration keeps it off OpenAI routes.
+
+    Raises:
+        ProviderCapabilityError: The video is a provider handle; neither
+            OpenRouter nor Fireworks resolves an uploaded-media reference.
     """
+    if video.handle is not None:
+        raise ProviderCapabilityError(capability=MEDIA_HANDLE_CAPABILITY)
     return {"type": "video_url", "video_url": {"url": video.data_url()}}
 
 
@@ -60,9 +73,16 @@ def gemini_video_part(video: VideoContentPart) -> JsonObject:
 
     Returns:
         The native Gemini part carrying the video bytes or its URI.
+
+    Raises:
+        ProviderCapabilityError: The video is a handle from another provider.
     """
     if video.data is None:
-        file_data: JsonObject = {"file_uri": video.url}
+        if video.handle is not None:
+            require_handle_provider(video.handle, GEMINI_HANDLE_PROVIDERS)
+        file_data: JsonObject = {
+            "file_uri": video.url if video.handle is None else video.handle.reference
+        }
         if video.media_type is not None:
             file_data["mime_type"] = video.media_type
         return {"file_data": file_data}
@@ -76,12 +96,24 @@ def bedrock_video_block(video: VideoContentPart) -> JsonObject:
         video: Canonical video part from the caller's message.
 
     Returns:
-        The native Converse block carrying the video bytes.
+        The native Converse block carrying the video bytes or its
+        ``s3Location``.
 
     Raises:
         ProviderCapabilityError: The video is a remote URL, which this wire
-            cannot fetch on the caller's behalf.
+            cannot fetch on the caller's behalf, or a handle from another
+            provider.
     """
+    if video.handle is not None:
+        require_handle_provider(video.handle, BEDROCK_HANDLE_PROVIDERS)
+        if video.media_type is None:
+            raise ProviderCapabilityError(capability=VIDEO_URL_CAPABILITY)
+        return {
+            "video": {
+                "format": _BEDROCK_VIDEO_FORMATS[video.media_type],
+                "source": {"s3Location": bedrock_s3_location(video.handle)},
+            }
+        }
     if video.data is None or video.media_type is None:
         raise ProviderCapabilityError(capability=VIDEO_URL_CAPABILITY)
     return {

@@ -69,18 +69,31 @@ class _ChatImagePart(_WireModel):
     image_url: _ChatImageUrl
 
 
+_MAXIMUM_FILE_ID_CHARACTERS = 512
+"""Longest OpenAI Files handle accepted on the wire."""
+
+
 class _ResponsesImagePart(_WireModel):
     """One Responses ``input_image`` content part.
 
-    Responses carries the reference as a bare string, and ``file_id`` names
-    an uploaded file this gateway does not host, so only the null form of
-    that field is accepted.
+    Responses carries the reference as a bare ``image_url`` string, or as the
+    ``file_id`` of an image the caller already uploaded to OpenAI Files.
+    Exactly one of the two is present.
     """
 
     type: Literal["input_image"]
-    image_url: str = Field(min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS)
+    image_url: str | None = Field(
+        default=None, min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS
+    )
     detail: _ImageDetail | None = None
-    file_id: None = None
+    file_id: str | None = Field(default=None, min_length=1, max_length=_MAXIMUM_FILE_ID_CHARACTERS)
+
+    @model_validator(mode="after")
+    def _require_one_carrier(self) -> _ResponsesImagePart:
+        """Require exactly one of ``image_url`` or ``file_id``."""
+        if (self.image_url is None) == (self.file_id is None):
+            raise ValueError("input_image needs exactly one of image_url or file_id")
+        return self
 
 
 _MAXIMUM_VIDEO_URL_CHARACTERS = MAXIMUM_VIDEO_BASE64_BYTES + 128
@@ -109,15 +122,24 @@ _MAXIMUM_FILE_DATA_CHARACTERS = MAXIMUM_DOCUMENT_BASE64_BYTES + 128
 
 
 class _ChatFile(_WireModel):
-    """Chat Completions ``file`` payload: inline ``file_data`` with a filename.
+    """Chat Completions ``file`` payload: inline ``file_data`` or a ``file_id``.
 
-    ``file_id`` names an uploaded file this gateway does not host, so only
-    the null form of that field is accepted.
+    Exactly one of the inline bytes or the OpenAI Files handle is present;
+    the optional filename accompanies either.
     """
 
-    file_data: str = Field(min_length=1, max_length=_MAXIMUM_FILE_DATA_CHARACTERS)
+    file_data: str | None = Field(
+        default=None, min_length=1, max_length=_MAXIMUM_FILE_DATA_CHARACTERS
+    )
     filename: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
-    file_id: None = None
+    file_id: str | None = Field(default=None, min_length=1, max_length=_MAXIMUM_FILE_ID_CHARACTERS)
+
+    @model_validator(mode="after")
+    def _require_one_carrier(self) -> _ChatFile:
+        """Require exactly one of ``file_data`` or ``file_id``."""
+        if (self.file_data is None) == (self.file_id is None):
+            raise ValueError("file needs exactly one of file_data or file_id")
+        return self
 
 
 class _ChatFilePart(_WireModel):
@@ -130,9 +152,9 @@ class _ChatFilePart(_WireModel):
 class _ResponsesFilePart(_WireModel):
     """One Responses ``input_file`` content part.
 
-    Exactly one of inline ``file_data`` or a remote ``file_url`` is present;
-    ``file_id`` names an uploaded file this gateway does not host, so only
-    the null form of that field is accepted.
+    Exactly one of inline ``file_data``, a remote ``file_url``, or the
+    ``file_id`` of a file the caller already uploaded to OpenAI Files is
+    present.
     """
 
     type: Literal["input_file"]
@@ -141,13 +163,14 @@ class _ResponsesFilePart(_WireModel):
     )
     file_url: str | None = Field(default=None, min_length=1, max_length=8_192)
     filename: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
-    file_id: None = None
+    file_id: str | None = Field(default=None, min_length=1, max_length=_MAXIMUM_FILE_ID_CHARACTERS)
 
     @model_validator(mode="after")
     def _require_one_carrier(self) -> _ResponsesFilePart:
-        """Require exactly one of ``file_data`` or ``file_url``."""
-        if (self.file_data is None) == (self.file_url is None):
-            raise ValueError("input_file needs exactly one of file_data or file_url")
+        """Require exactly one of ``file_data``, ``file_url``, or ``file_id``."""
+        carriers = sum(value is not None for value in (self.file_data, self.file_url, self.file_id))
+        if carriers != 1:
+            raise ValueError("input_file needs exactly one of file_data, file_url, or file_id")
         return self
 
 

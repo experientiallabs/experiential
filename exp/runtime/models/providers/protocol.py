@@ -18,6 +18,7 @@ from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
 )
+from exp.runtime.models.providers.media_handles import preflight_media_handles
 
 
 class AsyncCompletedModelClient(Protocol):
@@ -187,6 +188,7 @@ def preflight_gateway_request(
     *,
     model_capabilities: ModelCapabilities | None = None,
     public_stream: bool | None = None,
+    route_provider: str | None = None,
 ) -> None:
     """Reject gateway semantics a deployment cannot preserve before provider dispatch.
 
@@ -199,6 +201,9 @@ def preflight_gateway_request(
         public_stream: Whether the caller requested streaming. ``None`` uses
             ``request.stream`` for standalone callers. Hosted execution passes
             this explicitly because its provider request is always streamed.
+        route_provider: The deployment's catalog provider. A provider media
+            handle is admissible only when this equals the handle's provider;
+            ``None`` (standalone callers) admits no handle.
 
     Raises:
         ProviderCapabilityError: A present request feature is unsupported.
@@ -278,6 +283,11 @@ def preflight_gateway_request(
     for requested, supported, capability in requirements:
         if requested and not supported:
             raise ProviderCapabilityError(capability=capability)
+    preflight_media_handles(
+        request.media_handles,
+        supports_media_handle_input=capabilities.supports_media_handle_input,
+        route_provider=route_provider,
+    )
     stop_limit = capabilities.maximum_stop_sequences
     if stop_limit is not None and len(request.stop) > stop_limit:
         raise ProviderParameterError(

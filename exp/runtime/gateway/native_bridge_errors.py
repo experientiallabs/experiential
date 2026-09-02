@@ -18,6 +18,8 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
         "video_url_input": "messages",
         "pdf_input": "messages",
         "pdf_url_input": "messages",
+        "media_handle_input": "messages",
+        "media_handle_provider": "messages",
         "parallel_tool_calls": "parallel_tool_calls",
         "stop_sequences": "stop",
         "streaming": "stream",
@@ -35,6 +37,8 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
         "video_url_input": "input",
         "pdf_input": "input",
         "pdf_url_input": "input",
+        "media_handle_input": "input",
+        "media_handle_provider": "input",
         "parallel_tool_calls": "parallel_tool_calls",
         "streaming": "stream",
         "streaming_tool_arguments": "stream",
@@ -51,6 +55,8 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
         "video_url_input": "messages",
         "pdf_input": "messages",
         "pdf_url_input": "messages",
+        "media_handle_input": "messages",
+        "media_handle_provider": "messages",
         "parallel_tool_calls": "tool_choice.disable_parallel_tool_use",
         "stop_sequences": "stop_sequences",
         "streaming": "stream",
@@ -85,12 +91,23 @@ _ATTACHMENT_CAPABILITY_MESSAGES = {
         "The selected model route accepts inline PDF data only. "
         "Send the document as base64 file data or choose a different model alias."
     ),
+    "media_handle_input": (
+        "The selected model route cannot reference media uploaded to a provider. "
+        "Send the media inline or choose a model alias that accepts provider file handles."
+    ),
+    "media_handle_provider": (
+        "The request references media uploaded to a different provider than the "
+        "selected model route. Send the media inline or choose a model alias "
+        "served by the provider that holds the upload."
+    ),
 }
 """Why an attachment was refused, since the field itself is the caller's message.
 
 The shared unsupported-field wording asks the caller to remove the named
 field, which no image or document request can do: the field is the
-conversation."""
+conversation. A capability error carrying its own caller-safe ``detail`` (a
+media handle naming which provider holds the upload) wins over the generic
+wording for its capability."""
 
 
 def capability_param(
@@ -133,7 +150,7 @@ def public_capability_error(
         return OpenAIProtocolError(
             status_code=400,
             code="unsupported_capability",
-            message=attachment_reason,
+            message=error.detail or attachment_reason,
             param=param,
         )
     if param is not None:

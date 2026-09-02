@@ -20,6 +20,7 @@ from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.common.models.content import (
     DocumentContentPart,
     ImageContentPart,
+    MediaHandle,
     TextContentPart,
     VideoContentPart,
 )
@@ -427,3 +428,56 @@ def test_preflight_rejects_a_document_url_on_an_inline_only_route() -> None:
         request,
         GatewayDeploymentCapabilities(supports_pdf_input=True, supports_pdf_url_input=True),
     )
+
+
+def _handle_request(handle: MediaHandle) -> GatewayRequest:
+    """Build one Chat request carrying a single image handle beside text."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="describe",
+                content_parts=(
+                    TextContentPart(text="describe"),
+                    ImageContentPart(handle=handle),
+                ),
+            ),
+        ),
+    )
+
+
+def test_preflight_refuses_a_handle_without_the_route_declaration() -> None:
+    """An image route that never declared handles refuses one before dispatch."""
+    request = _handle_request(MediaHandle(provider="openai", reference="file-abc"))
+    with pytest.raises(ProviderCapabilityError, match="media_handle_input"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_image_input=True),
+            route_provider="openai",
+        )
+
+
+def test_preflight_refuses_a_handle_on_another_providers_route() -> None:
+    """A declared route still refuses a handle uploaded to a different provider."""
+    request = _handle_request(MediaHandle(provider="openai", reference="file-abc"))
+    capabilities = GatewayDeploymentCapabilities(
+        supports_image_input=True, supports_media_handle_input=True
+    )
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider") as error:
+        preflight_gateway_request(request, capabilities, route_provider="anthropic")
+    assert error.value.detail is not None and "uploaded to openai" in error.value.detail
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider"):
+        preflight_gateway_request(request, capabilities)
+    preflight_gateway_request(request, capabilities, route_provider="openai")
+
+
+def test_preflight_checks_the_media_kind_before_the_handle() -> None:
+    """A handle never bypasses the image, video, or PDF declaration."""
+    request = _handle_request(MediaHandle(provider="openai", reference="file-abc"))
+    with pytest.raises(ProviderCapabilityError, match="image_input"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_media_handle_input=True),
+            route_provider="openai",
+        )

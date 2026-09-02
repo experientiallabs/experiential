@@ -55,14 +55,17 @@ class ProviderRefusalError(ProviderResponseError):
 class ProviderCapabilityError(ValueError):
     """A request requires gateway behavior the deployment cannot preserve."""
 
-    def __init__(self, *, capability: str) -> None:
+    def __init__(self, *, capability: str, detail: str | None = None) -> None:
         """Name the unsupported public capability without provider content.
 
         Args:
             capability: Stable capability field rejected before dispatch.
+            detail: Optional caller-safe sentence completing the public
+                message, such as which provider a media handle names.
         """
         super().__init__(f"provider deployment does not support {capability}")
         self.capability = capability
+        self.detail = detail
 
 
 class ProviderParameterError(ValueError):

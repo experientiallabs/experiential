@@ -31,22 +31,22 @@ from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
-    DOCUMENT_MEDIA_TYPES,
-    IMAGE_MEDIA_TYPES,
-    MAXIMUM_DOCUMENT_BASE64_BYTES,
-    MAXIMUM_DOCUMENT_NAME_CHARACTERS,
-    MAXIMUM_IMAGE_BASE64_BYTES,
-    DocumentContentPart,
-    ImageContentPart,
     MessageContentPart,
     TextContentPart,
-    image_part_from_url,
 )
 from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FORWARDED,
     MESSAGES_MANIFEST,
     MESSAGES_SERVER_TOOL_TYPES_ACCEPTED,
+)
+from exp.runtime.anthropic_protocol.media_blocks import (
+    AnthropicWireModel,
+    CacheControl,
+    DocumentBlock,
+    ImageBlock,
+    document_part_from_block,
+    image_part_from_block,
 )
 from exp.runtime.gateway.compatibility import CompatibilityDisposition
 from exp.runtime.gateway.contracts import (
@@ -79,20 +79,7 @@ _REJECTED_TOOL_RESULT_BLOCK_HINTS = {
 }
 
 
-class _WireModel(BaseModel):
-    """Strict private Anthropic wire model rejecting unknown nested fields."""
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class _CacheControl(_WireModel):
-    """Anthropic prompt-caching annotation, validated and then dropped."""
-
-    type: Literal["ephemeral"]
-    ttl: Literal["5m", "1h"] | None = None
-
-
-class _TextBlock(_WireModel):
+class _TextBlock(AnthropicWireModel):
     """One plain text content block.
 
     ``citations`` exists only as server-tool output echoed back in assistant
@@ -104,59 +91,11 @@ class _TextBlock(_WireModel):
 
     type: Literal["text"]
     text: str
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
     citations: tuple[JsonObject, ...] | None = None
 
 
-class _ImageSource(_WireModel):
-    """Where one image block's bytes come from: inline base64 or a URL."""
-
-    type: Literal["base64", "url"]
-    media_type: str | None = Field(default=None, max_length=64)
-    data: str | None = Field(default=None, max_length=MAXIMUM_IMAGE_BASE64_BYTES)
-    url: str | None = Field(default=None, max_length=8_192)
-
-
-class _ImageBlock(_WireModel):
-    """One caller image content block."""
-
-    type: Literal["image"]
-    source: _ImageSource
-    cache_control: _CacheControl | None = None
-
-
-class _DocumentSource(_WireModel):
-    """Where one document block's bytes come from: inline base64 or a URL.
-
-    ``file`` sources name an uploaded Files API object this gateway does not
-    host and ``text``/``content`` sources carry non-PDF documents no other
-    wire accepts, so only the two carriers every declared route can serve
-    are accepted.
-    """
-
-    type: Literal["base64", "url"]
-    media_type: str | None = Field(default=None, max_length=64)
-    data: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_BASE64_BYTES)
-    url: str | None = Field(default=None, max_length=8_192)
-
-
-class _DocumentCitations(_WireModel):
-    """Per-document citations toggle; only the disabled form is servable."""
-
-    enabled: bool
-
-
-class _DocumentBlock(_WireModel):
-    """One caller PDF document content block."""
-
-    type: Literal["document"]
-    source: _DocumentSource
-    title: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
-    citations: _DocumentCitations | None = None
-    cache_control: _CacheControl | None = None
-
-
-class _ThinkingBlock(_WireModel):
+class _ThinkingBlock(AnthropicWireModel):
     """Extended-thinking assistant history block, carried verbatim."""
 
     type: Literal["thinking"]
@@ -164,24 +103,24 @@ class _ThinkingBlock(_WireModel):
     signature: str | None = None
 
 
-class _RedactedThinkingBlock(_WireModel):
+class _RedactedThinkingBlock(AnthropicWireModel):
     """Redacted-thinking assistant history block, carried verbatim."""
 
     type: Literal["redacted_thinking"]
     data: str = ""
 
 
-class _ToolUseBlock(_WireModel):
+class _ToolUseBlock(AnthropicWireModel):
     """One assistant tool invocation retained in request history."""
 
     type: Literal["tool_use"]
     id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     input: JsonObject
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
 
 
-class _ToolResultBlock(_WireModel):
+class _ToolResultBlock(AnthropicWireModel):
     """One tool result the caller returns for a prior assistant tool call.
 
     ``is_error`` rides the canonical tool message (``GatewayMessage.tool_is_error``)
@@ -193,7 +132,7 @@ class _ToolResultBlock(_WireModel):
     tool_use_id: str = Field(min_length=1, max_length=256)
     content: str | tuple[_TextBlock, ...] | None = None
     is_error: bool = False
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
 
 
 class _ServerToolUseBlock(BaseModel):
@@ -219,8 +158,8 @@ class _WebSearchToolResultBlock(BaseModel):
 
 _ContentBlock = (
     _TextBlock
-    | _ImageBlock
-    | _DocumentBlock
+    | ImageBlock
+    | DocumentBlock
     | _ThinkingBlock
     | _RedactedThinkingBlock
     | _ToolUseBlock
@@ -230,7 +169,7 @@ _ContentBlock = (
 )
 
 
-class _Message(_WireModel):
+class _Message(AnthropicWireModel):
     """One Anthropic conversation turn.
 
     ``system`` is a first-class mid-conversation role on the live API (the
@@ -240,10 +179,10 @@ class _Message(_WireModel):
 
     role: Literal["user", "assistant", "system"]
     content: str | tuple[_ContentBlock, ...]
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
 
 
-class _Tool(_WireModel):
+class _Tool(AnthropicWireModel):
     """One caller-defined custom tool with its JSON Schema declaration.
 
     The description bound is generous on purpose: the provider accepts 40k
@@ -261,7 +200,7 @@ class _Tool(_WireModel):
     name: str = Field(min_length=1, max_length=256)
     description: str | None = Field(default=None, max_length=65_536)
     input_schema: JsonObject
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
     type: Literal["custom"] | None = None
     strict: bool = False
     eager_input_streaming: bool | None = None
@@ -292,7 +231,7 @@ class _ServerTool(BaseModel):
         return self
 
 
-class _ToolChoice(_WireModel):
+class _ToolChoice(AnthropicWireModel):
     """Anthropic tool-choice selector."""
 
     type: Literal["auto", "any", "tool", "none"]
@@ -300,13 +239,13 @@ class _ToolChoice(_WireModel):
     disable_parallel_tool_use: bool | None = None
 
 
-class _Metadata(_WireModel):
+class _Metadata(AnthropicWireModel):
     """Request metadata; only ``user_id`` is defined by the public API."""
 
     user_id: str | None = Field(default=None, max_length=256)
 
 
-class _ThinkingConfig(_WireModel):
+class _ThinkingConfig(AnthropicWireModel):
     """Extended-thinking configuration validated closed, then forwarded verbatim."""
 
     type: Literal["enabled", "disabled", "adaptive"]
@@ -326,7 +265,7 @@ class _ThinkingConfig(_WireModel):
         return self
 
 
-class _MessagesRequest(_WireModel):
+class _MessagesRequest(AnthropicWireModel):
     """Closed gateway Anthropic Messages request profile."""
 
     model: str = Field(min_length=1, max_length=256)
@@ -350,7 +289,7 @@ class _MessagesRequest(_WireModel):
     accepted live behind its beta header, 2026-08-30). Bounded but
     deliberately not enumerated: the value set is an evolving provider
     surface."""
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
     """Top-level automatic prompt-caching marker (accepted live without a
     beta, 2026-08-30). Validated closed, forwarded verbatim on Anthropic
     rungs, and dropped with disclosure elsewhere: a cache hint changes
@@ -649,85 +588,6 @@ def _rejected_block_hint(payload: JsonObject) -> str | None:
     return None
 
 
-def _image_part(block: _ImageBlock, param: str) -> ImageContentPart:
-    """Convert one Anthropic image block into the canonical image part.
-
-    Args:
-        block: Validated caller image block.
-        param: Public parameter path used to report an invalid image.
-
-    Returns:
-        The canonical image part carrying the caller's bytes or URL.
-
-    Raises:
-        OpenAIProtocolError: The source is not a supported image.
-    """
-    source = block.source
-    marker = (
-        block.cache_control.model_dump(mode="json", exclude_none=True)
-        if block.cache_control is not None
-        else None
-    )
-    try:
-        if source.type == "url":
-            part = image_part_from_url(source.url or "")
-            return part.model_copy(update={"cache_control": marker})
-        return ImageContentPart(
-            media_type=IMAGE_MEDIA_TYPES[source.media_type or ""],
-            data=source.data,
-            cache_control=marker,
-        )
-    except (KeyError, ValueError) as exc:
-        raise invalid_field(
-            f"{param}.source",
-            f"'{param}.source' must carry an http(s) URL or base64 data "
-            "for a PNG, JPEG, GIF, or WebP image.",
-        ) from exc
-
-
-def _document_part(block: _DocumentBlock, param: str) -> DocumentContentPart:
-    """Convert one Anthropic document block into the canonical document part.
-
-    Args:
-        block: Validated caller document block.
-        param: Public parameter path used to report an invalid document.
-
-    Returns:
-        The canonical document part carrying the caller's bytes or URL.
-
-    Raises:
-        OpenAIProtocolError: The source is not a PDF this gateway forwards,
-            or the block enables citations.
-    """
-    if block.citations is not None and block.citations.enabled:
-        raise invalid_field(
-            f"{param}.citations",
-            "document citations are not supported over this gateway; "
-            "send citations.enabled as false or omit the field.",
-        )
-    source = block.source
-    marker = (
-        block.cache_control.model_dump(mode="json", exclude_none=True)
-        if block.cache_control is not None
-        else None
-    )
-    try:
-        if source.type == "url":
-            return DocumentContentPart(url=source.url, name=block.title, cache_control=marker)
-        return DocumentContentPart(
-            media_type=DOCUMENT_MEDIA_TYPES[source.media_type or ""],
-            data=source.data,
-            name=block.title,
-            cache_control=marker,
-        )
-    except (KeyError, ValueError) as exc:
-        raise invalid_field(
-            f"{param}.source",
-            f"'{param}.source' must carry an http(s) URL or base64 data for a PDF "
-            "(media_type application/pdf).",
-        ) from exc
-
-
 def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
     """Flatten the system prompt; blocks join with a blank line."""
     if system is None or isinstance(system, str):
@@ -896,20 +756,20 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             # rejects a standalone empty block, so it never becomes a part.
             if block.text:
                 content_parts.append(TextContentPart(text=block.text))
-        elif isinstance(block, _ImageBlock):
+        elif isinstance(block, ImageBlock):
             if message.role != "user":
                 raise invalid_field(
                     f"{param}.content.{block_index}",
                     "image blocks are only valid in user messages.",
                 )
-            content_parts.append(_image_part(block, f"{param}.content.{block_index}"))
-        elif isinstance(block, _DocumentBlock):
+            content_parts.append(image_part_from_block(block, f"{param}.content.{block_index}"))
+        elif isinstance(block, DocumentBlock):
             if message.role != "user":
                 raise invalid_field(
                     f"{param}.content.{block_index}",
                     "document blocks are only valid in user messages.",
                 )
-            content_parts.append(_document_part(block, f"{param}.content.{block_index}"))
+            content_parts.append(document_part_from_block(block, f"{param}.content.{block_index}"))
         elif isinstance(block, (_ThinkingBlock, _RedactedThinkingBlock)):
             if message.role != "assistant":
                 raise invalid_field(

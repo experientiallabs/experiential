@@ -151,3 +151,34 @@ def test_parity_row_forwards_pdf_urls_only_on_a_fetching_dialect() -> None:
     assert (fetching.supports_pdf_input, fetching.forwards_pdf_urls) == (True, True)
     assert (inline_only.supports_pdf_input, inline_only.forwards_pdf_urls) == (True, False)
     assert (text_only.supports_pdf_input, text_only.forwards_pdf_urls) == (False, False)
+
+
+def test_parity_row_forwards_media_handles_only_on_a_handle_provider() -> None:
+    """Handle forwarding follows the declaration and the provider's wire."""
+    declared = GatewayDeploymentCapabilities(
+        supports_streaming=True, supports_image_input=True, supports_media_handle_input=True
+    )
+    anthropic = deployment_capability_parity(
+        provider="anthropic",
+        model_id="claude-fixture",
+        dialect="anthropic_messages",
+        capabilities=declared,
+        reasoning_wire_format="anthropic_thinking",
+    )
+    assert anthropic.forwards_media_handles is True
+    fireworks = deployment_capability_parity(
+        provider="fireworks",
+        model_id="accounts/fireworks/models/fixture",
+        dialect="openai_compatible",
+        capabilities=declared,
+        reasoning_wire_format="openai_compatible",
+    )
+    assert fireworks.forwards_media_handles is False
+    undeclared = deployment_capability_parity(
+        provider="anthropic",
+        model_id="claude-fixture",
+        dialect="anthropic_messages",
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        reasoning_wire_format="anthropic_thinking",
+    )
+    assert undeclared.forwards_media_handles is False

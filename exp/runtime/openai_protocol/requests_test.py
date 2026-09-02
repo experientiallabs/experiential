@@ -9,7 +9,12 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject, sha256_json
-from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST, VideoContentPart
+from exp.common.models.content import (
+    GEMINI_FILE_URI_PREFIX,
+    MAXIMUM_DOCUMENTS_PER_REQUEST,
+    MediaHandle,
+    VideoContentPart,
+)
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayApiSurface,
@@ -1983,7 +1988,10 @@ def test_documents_change_the_canonical_request_digest() -> None:
     [
         (_chat_file("data:text/plain;base64,aGk="), "messages.0.content.0.file.file_data"),
         (_chat_file("!!not base64"), "messages.0.content.0.file.file_data"),
-        ({"type": "file", "file": {"file_id": "file_1"}}, "messages.0.content.0.file.file_data"),
+        (
+            {"type": "file", "file": {"file_id": "not-a-file-id"}},
+            "messages.0.content.0.file.file_id",
+        ),
         ({"type": "image_url", "image_url": {}}, "messages.0.content.0.image_url.url"),
     ],
 )
@@ -2374,3 +2382,134 @@ def test_responses_surface_defines_no_video_part() -> None:
                 ],
             }
         )
+
+
+def test_responses_decoder_wraps_file_ids_as_openai_handles() -> None:
+    """``input_image.file_id`` and ``input_file.file_id`` become OpenAI handles in order."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "file_id": "file-img", "detail": "low"},
+                        {"type": "input_text", "text": "and this"},
+                        {"type": "input_file", "file_id": "file-doc"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert [part.kind for part in message.content_parts] == ["image", "text", "document"]
+    (image,) = decoded.request.images
+    (document,) = decoded.request.documents
+    assert image.handle == MediaHandle(provider="openai", reference="file-img")
+    assert (image.detail, image.data, image.url) == ("low", None, None)
+    assert document.handle == MediaHandle(provider="openai", reference="file-doc")
+    assert decoded.request.media_handles == (image.handle, document.handle)
+
+
+def test_chat_decoder_wraps_file_part_ids_as_openai_handles() -> None:
+    """A Chat ``file.file_id`` becomes an OpenAI handle beside inline siblings."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        _chat_file(),
+                        {"type": "file", "file": {"file_id": "file-doc", "filename": "b.pdf"}},
+                        {"type": "text", "text": "compare"},
+                    ],
+                }
+            ],
+        }
+    )
+    inline, handled = decoded.request.documents
+    assert inline.data == _PDF_BASE64 and inline.handle is None
+    assert handled.handle == MediaHandle(provider="openai", reference="file-doc")
+    assert handled.name == "b.pdf"
+
+
+def test_provider_uris_in_url_fields_decode_as_handles() -> None:
+    """``s3://``, ``gs://``, and Gemini Files URIs are handles on every URL field."""
+    gemini = f"{GEMINI_FILE_URI_PREFIX}abc123"
+
+    def chat(part: JsonObject) -> GatewayRequest:
+        """Decode one Chat request carrying a single media part and a text run."""
+        return decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {"role": "user", "content": [part, {"type": "text", "text": "describe"}]}
+                ],
+            }
+        ).request
+
+    (image,) = chat({"type": "image_url", "image_url": {"url": "s3://bkt/cat.png"}}).images
+    assert image.handle == MediaHandle(provider="bedrock", reference="s3://bkt/cat.png")
+    assert image.media_type == "image/png" and image.url is None
+    (video,) = chat({"type": "video_url", "video_url": {"url": "gs://bkt/clip.mp4"}}).videos
+    assert video.handle == MediaHandle(provider="vertex", reference="gs://bkt/clip.mp4")
+    assert video.media_type == "video/mp4"
+    responses = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_file", "file_url": gemini},
+                        {"type": "input_image", "image_url": gemini},
+                    ],
+                }
+            ],
+        }
+    )
+    assert [handle.provider for handle in responses.request.media_handles] == ["gemini", "gemini"]
+    assert responses.request.media_handles[0].reference == gemini
+
+
+def test_handles_from_two_providers_in_one_request_are_rejected() -> None:
+    """No route can resolve both, so the decoder refuses the request as a whole."""
+    with pytest.raises(OpenAIProtocolError, match="same provider"):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "s3://bkt/cat.png"}},
+                            {"type": "video_url", "video_url": {"url": "gs://bkt/clip.mp4"}},
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("part", "suffix"),
+    [
+        (
+            {"type": "input_image", "file_id": "file-img", "image_url": "https://x.test/a.png"},
+            "content.0.input_image",
+        ),
+        ({"type": "input_image", "file_id": "not-openai"}, "content.0.file_id"),
+        (
+            {"type": "input_file", "file_id": "file-a", "file_data": _PDF_DATA_URL},
+            "content.0.input_file",
+        ),
+        ({"type": "input_image", "image_url": "s3://bkt/no-suffix"}, "content.0.image_url"),
+    ],
+)
+def test_malformed_or_doubled_responses_handles_are_rejected(part: JsonObject, suffix: str) -> None:
+    """A handle beside another carrier, a foreign id, or a suffixless object fails at its field."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses({"model": "coding", "input": [{"role": "user", "content": [part]}]})
+    assert error.value.detail.param is not None
+    assert error.value.detail.param.endswith(suffix)

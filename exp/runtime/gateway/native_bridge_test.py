@@ -162,6 +162,48 @@ def test_pdf_capability_errors_explain_the_document_refusal(
     assert "pdf_input" not in inline.detail.message
 
 
+@pytest.mark.parametrize(
+    ("surface", "param"),
+    [
+        (GatewayApiSurface.CHAT_COMPLETIONS, "messages"),
+        (GatewayApiSurface.RESPONSES, "input"),
+        (GatewayApiSurface.MESSAGES, "messages"),
+    ],
+)
+def test_media_handle_capability_errors_name_the_provider_holding_the_upload(
+    surface: GatewayApiSurface, param: str
+) -> None:
+    """A refused handle names the conversation field and, when known, the provider."""
+    undeclared = _public_capability_error(
+        ProviderCapabilityError(capability="media_handle_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    detail = (
+        "The request references media uploaded to openai, which only an openai route "
+        "can resolve, but the selected model alias routes to gemini."
+    )
+    mismatched = _public_capability_error(
+        ProviderCapabilityError(capability="media_handle_provider", detail=detail),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    generic = _public_capability_error(
+        ProviderCapabilityError(capability="media_handle_provider"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    assert (undeclared.detail.param, mismatched.detail.param) == (param, param)
+    assert undeclared.detail.code == mismatched.detail.code == "unsupported_capability"
+    assert "cannot reference media uploaded to a provider" in undeclared.detail.message
+    assert mismatched.detail.message == detail
+    assert "different provider than the selected model route" in generic.detail.message
+    assert "media_handle" not in undeclared.detail.message
+
+
 def test_public_capability_error_never_exposes_internal_labels() -> None:
     """Internal route requirements fail against model without leaking their names."""
     error = _public_capability_error(

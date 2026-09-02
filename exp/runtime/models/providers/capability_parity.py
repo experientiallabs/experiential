@@ -16,6 +16,7 @@ from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.models.catalog import GatewayDeploymentCapabilities
+from exp.common.models.content import MEDIA_HANDLE_PROVIDERS
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.models.providers.documents import PDF_URL_DIALECTS
 from exp.runtime.models.providers.images import IMAGE_URL_DIALECTS
@@ -25,7 +26,7 @@ from exp.runtime.models.providers.reasoning_compat import (
 )
 from exp.runtime.models.providers.videos import VIDEO_DIALECTS, VIDEO_URL_DIALECTS
 
-CAPABILITY_PARITY_SCHEMA_VERSION = 4
+CAPABILITY_PARITY_SCHEMA_VERSION = 5
 """Version of the parity-row contract; bump on any field change."""
 
 
@@ -66,6 +67,14 @@ class DeploymentCapabilityParity(ContractModel):
     Only the OpenAI Responses and Anthropic Messages wires carry a remote
     document reference; Chat Completions, Gemini, and Bedrock need the
     caller to inline the bytes.
+    """
+    forwards_media_handles: bool
+    """Whether this rung forwards handles to media uploaded to its own provider.
+
+    Handles are provider scoped: a catalog routes a request carrying an
+    OpenAI ``file_id`` only to a rung whose ``provider`` is ``openai`` and
+    which declares this. Fireworks and OpenRouter wires define no
+    uploaded-media reference, so the flag is always false there.
     """
     maximum_stop_sequences: int | None
     reasoning_efforts: tuple[ReasoningEffort, ...]
@@ -146,6 +155,9 @@ def deployment_capability_parity(
             capabilities.supports_pdf_input
             and capabilities.supports_pdf_url_input
             and dialect in PDF_URL_DIALECTS
+        ),
+        forwards_media_handles=(
+            capabilities.supports_media_handle_input and provider in MEDIA_HANDLE_PROVIDERS
         ),
         maximum_stop_sequences=capabilities.maximum_stop_sequences,
         reasoning_efforts=efforts,

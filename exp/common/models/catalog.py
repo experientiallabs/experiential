@@ -427,6 +427,16 @@ class GatewayDeploymentCapabilities(ContractModel):
     source) wires fetch a remote document; Chat Completions ``file`` parts,
     Gemini, and Bedrock accept inline bytes only.
     """
+    supports_media_handle_input: bool = False
+    """Whether this route forwards handles to media the caller uploaded to its provider.
+
+    A handle (an OpenAI or Anthropic ``file_id``, a Gemini Files URI, a
+    ``gs://`` object on Vertex, an ``s3://`` object on Bedrock) is scoped to
+    the provider that minted it and never portable, so admission requires
+    both this declaration and a handle provider equal to the route's
+    provider. Providers whose inference wire defines no uploaded-media
+    reference (Fireworks, OpenRouter) never declare it.
+    """
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
     """Largest stop-sequence count this route accepts, when the provider caps it.
 

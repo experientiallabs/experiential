@@ -6,7 +6,11 @@ about roles and ordering. Inline base64 rides every document-capable wire; a
 remote URL is a provider-side fetch that only the OpenAI Responses and
 Anthropic Messages wires perform, so every other wire rejects it as a
 capability the rung cannot preserve, which lets a waterfall narrow past it
-instead of dropping the caller's document.
+instead of dropping the caller's document. A provider handle rides only the
+wire of the provider that minted it: an OpenAI ``file_id`` on the Chat
+``file`` part and the Responses ``input_file`` part, an Anthropic ``file``
+source, a Gemini Files or ``gs://`` ``file_data`` URI, or a Bedrock
+``s3Location``.
 """
 
 from __future__ import annotations
@@ -16,6 +20,14 @@ import re
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MAXIMUM_DOCUMENT_NAME_CHARACTERS, DocumentContentPart
 from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.media_handles import (
+    ANTHROPIC_HANDLE_PROVIDERS,
+    BEDROCK_HANDLE_PROVIDERS,
+    GEMINI_HANDLE_PROVIDERS,
+    OPENAI_HANDLE_PROVIDERS,
+    bedrock_s3_location,
+    require_handle_provider,
+)
 
 PDF_URL_DIALECTS = frozenset({"openai_responses", "anthropic_messages"})
 """Dialects whose provider fetches a caller document URL on the gateway's behalf.
@@ -45,12 +57,17 @@ def openai_chat_document_part(document: DocumentContentPart) -> JsonObject:
 
     Returns:
         The ``{"type": "file", "file": {...}}`` part with inline
-        ``file_data`` and the caller's filename (or a neutral default).
+        ``file_data`` and the caller's filename (or a neutral default), or
+        with the OpenAI Files ``file_id`` for a handle.
 
     Raises:
         ProviderCapabilityError: The document is a remote URL, which the
-            Chat Completions ``file`` part cannot carry.
+            Chat Completions ``file`` part cannot carry, or a handle from
+            another provider.
     """
+    if document.handle is not None:
+        require_handle_provider(document.handle, OPENAI_HANDLE_PROVIDERS)
+        return {"type": "file", "file": {"file_id": document.handle.reference}}
     if document.data is None:
         raise ProviderCapabilityError(capability=PDF_URL_CAPABILITY)
     return {
@@ -66,8 +83,15 @@ def responses_document_part(document: DocumentContentPart) -> JsonObject:
     """Encode one document as a Responses ``input_file`` content part.
 
     Inline bytes ride ``file_data`` beside a filename; a remote document
-    rides ``file_url``, which the provider fetches itself.
+    rides ``file_url``, which the provider fetches itself; an OpenAI Files
+    handle rides ``file_id``.
+
+    Raises:
+        ProviderCapabilityError: The document is a handle from another provider.
     """
+    if document.handle is not None:
+        require_handle_provider(document.handle, OPENAI_HANDLE_PROVIDERS)
+        return {"type": "input_file", "file_id": document.handle.reference}
     if document.data is None:
         return {"type": "input_file", "file_url": document.url or ""}
     return {
@@ -84,12 +108,18 @@ def anthropic_document_block(document: DocumentContentPart) -> JsonObject:
     breakpoint re-emits on the block it was placed on: this wire caches a
     marked document, and a lost marker silently returns the whole prefix to
     full input billing.
+
+    Raises:
+        ProviderCapabilityError: The document is a handle from another provider.
     """
-    source: JsonObject = (
-        {"type": "url", "url": document.url or ""}
-        if document.data is None
-        else {"type": "base64", "media_type": document.media_type, "data": document.data}
-    )
+    source: JsonObject
+    if document.handle is not None:
+        require_handle_provider(document.handle, ANTHROPIC_HANDLE_PROVIDERS)
+        source = {"type": "file", "file_id": document.handle.reference}
+    elif document.data is None:
+        source = {"type": "url", "url": document.url or ""}
+    else:
+        source = {"type": "base64", "media_type": document.media_type, "data": document.data}
     block: JsonObject = {"type": "document", "source": source}
     if document.name is not None:
         block["title"] = document.name
@@ -99,18 +129,28 @@ def anthropic_document_block(document: DocumentContentPart) -> JsonObject:
 
 
 def gemini_document_part(document: DocumentContentPart) -> JsonObject:
-    """Encode one document as a Gemini ``inline_data`` part.
+    """Encode one document as a Gemini ``inline_data`` or ``file_data`` part.
 
     Args:
         document: Canonical document part from the caller's message.
 
     Returns:
-        The native Gemini part carrying the PDF bytes.
+        The native Gemini part carrying the PDF bytes, or the ``file_data``
+        reference for a Gemini Files or ``gs://`` handle.
 
     Raises:
         ProviderCapabilityError: The document is a remote URL, which this
-            wire cannot fetch on the caller's behalf.
+            wire cannot fetch on the caller's behalf, or a handle from
+            another provider.
     """
+    if document.handle is not None:
+        require_handle_provider(document.handle, GEMINI_HANDLE_PROVIDERS)
+        return {
+            "file_data": {
+                "file_uri": document.handle.reference,
+                "mime_type": document.media_type,
+            }
+        }
     if document.data is None:
         raise ProviderCapabilityError(capability=PDF_URL_CAPABILITY)
     return {"inline_data": {"mime_type": document.media_type, "data": document.data}}
@@ -155,14 +195,21 @@ def bedrock_document_block(document: DocumentContentPart, ordinal: int) -> JsonO
 
     Raises:
         ProviderCapabilityError: The document is a remote URL, which this
-            wire cannot fetch on the caller's behalf.
+            wire cannot fetch on the caller's behalf, or a handle from
+            another provider.
     """
-    if document.data is None:
+    source: JsonObject
+    if document.handle is not None:
+        require_handle_provider(document.handle, BEDROCK_HANDLE_PROVIDERS)
+        source = {"s3Location": bedrock_s3_location(document.handle)}
+    elif document.data is None:
         raise ProviderCapabilityError(capability=PDF_URL_CAPABILITY)
+    else:
+        source = {"bytes": document.data}
     return {
         "document": {
             "name": bedrock_document_name(document, ordinal),
             "format": "pdf",
-            "source": {"bytes": document.data},
+            "source": source,
         }
     }
