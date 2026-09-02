@@ -469,6 +469,63 @@ def select_route_deployments(
     )
 
 
+def request_carries_cache_markers(request: GatewayRequest) -> bool:
+    """Whether any prompt-cache marker rides this request.
+
+    Markers live on the top-level automatic carrier, tool definitions,
+    assistant tool calls, message text runs, and tool-result breakpoints;
+    every one of them is honored only by the Anthropic Messages wire.
+    """
+    return (
+        request.provider_cache_control is not None
+        or any(tool.cache_control is not None for tool in request.tools)
+        or any(
+            message.provider_text_blocks
+            or message.cache_control is not None
+            or any(call.cache_control is not None for call in message.tool_calls)
+            for message in request.messages
+        )
+    )
+
+
+def reorder_route_deployments(
+    route: GatewayRoute,
+    order: tuple[int, ...],
+) -> GatewayRoute:
+    """Return the route with its deployments in the given permutation.
+
+    Unlike :func:`select_route_deployments` this changes dispatch order
+    without narrowing: ``order`` must be a permutation of every current
+    deployment index.
+
+    Args:
+        route: Frozen ordered deployment route selected for the request.
+        order: Permutation of ``range(len(route.deployments))``.
+
+    Returns:
+        The original route when the order is unchanged, otherwise a new
+        execution snapshot naming the same deployments in dispatch order.
+
+    Raises:
+        ValueError: The order is not a permutation of the route.
+    """
+    deployments = route.deployments
+    if sorted(order) != list(range(len(deployments))):
+        raise ValueError("route reorder requires a permutation of every deployment")
+    if order == tuple(range(len(deployments))):
+        return route
+    selected = tuple(deployments[index] for index in order)
+    return GatewayRoute(
+        snapshot=route.snapshot.model_copy(
+            update={"deployment_ids": tuple(item.deployment_id for item in selected)}
+        ),
+        deployment=selected[0],
+        fallback_deployments=selected[1:],
+        route_reason=route.route_reason,
+        fallback_reason=route.fallback_reason,
+    )
+
+
 def deployment_wire_entry(
     route: GatewayRoute,
     deployment: ExactModelDeployment,

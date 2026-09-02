@@ -40,7 +40,7 @@ STRICT_TOOLS_DISCLOSURE = "tools.strict->false"
 """Disclosure recorded when strict tools degrade to best-effort schemas."""
 
 EFFORT_DROP_DISCLOSURE = "reasoning_effort"
-"""Disclosure recorded when a no-reasoning route drops an explicit 'none'."""
+"""Disclosure recorded when a zero-reasoning route drops the caller effort."""
 
 
 @dataclass(frozen=True)
@@ -62,11 +62,14 @@ def coerce_generation_parameters(
     Only substitutions whose semantics survive are offered: a reasoning
     effort snaps to the nearest level any rung supports on the canonical
     ladder (ties prefer the lower level, so a coercion never spends more
-    than requested), and an explicit ``none`` on a route with no reasoning
-    support at all is dropped, because a non-reasoning model already delivers
-    exactly what ``none`` asks for. A request whose effort exceeds a
-    zero-reasoning route stays a named rejection: deleting the feature is
-    not a nearest level.
+    than requested), and ANY effort on a route with no reasoning support at
+    all is dropped with disclosure. A zero-reasoning route cannot honor any
+    depth, so the only serviceable semantic is the model's sole behavior,
+    and first-party clients pin effort globally (Claude Code sends its
+    configured effortLevel to every model), so a named rejection here makes
+    whole sessions unusable against non-reasoning models the provider
+    itself serves fine without the parameter (owner decision, 2026-09-01;
+    previously only an explicit ``none`` dropped).
 
     Args:
         profiles: Ordered wire profiles for every live route deployment.
@@ -87,9 +90,18 @@ def coerce_generation_parameters(
     for profile in profiles:
         ladder.update(profile_reasoning_efforts(profile))
     if not ladder:
-        if request.reasoning_effort != "none":
-            return None
-        dropped_request = request.model_copy(update={"reasoning_effort": None})
+        updates: dict[str, object] = {"reasoning_effort": None}
+        if request.provider_output_config is not None:
+            # The Messages surface carries the same effort verbatim inside
+            # output_config; a dropped effort must not reach the provider
+            # through that channel (the provider rejects it by name).
+            remaining = {
+                key: value
+                for key, value in request.provider_output_config.items()
+                if key != "effort"
+            }
+            updates["provider_output_config"] = remaining or None
+        dropped_request = request.model_copy(update=updates)
         if admits is not None and not admits(dropped_request):
             return None
         return RequestCoercion(

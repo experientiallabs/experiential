@@ -203,19 +203,20 @@ def _admit(
     raw_key: str,
     body: str,
     *,
+    surface: str | None = None,
     idempotency_key: str | None = None,
     client_request_id: str | None = None,
 ) -> JsonObject:
     """Run one admission call and decode its JSON response."""
-    argument = json.dumps(
-        {
-            "raw_key": raw_key,
-            "body": body,
-            "idempotency_key": idempotency_key,
-            "client_request_id": client_request_id,
-        }
-    )
-    return json.loads(control.admit(argument))
+    payload: JsonObject = {
+        "raw_key": raw_key,
+        "body": body,
+        "idempotency_key": idempotency_key,
+        "client_request_id": client_request_id,
+    }
+    if surface is not None:
+        payload["surface"] = surface
+    return json.loads(control.admit(json.dumps(payload)))
 
 
 def _claim_scope(
@@ -2937,21 +2938,23 @@ def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path)
     assert report["totals"]["requests"] == 1
 
 
-def test_responses_admission_rejects_unsupported_reasoning_effort(tmp_path: Path) -> None:
-    """Native admission returns the same local parameter error before Rust dispatch."""
+def test_responses_admission_drops_effort_on_a_reasoning_less_route(tmp_path: Path) -> None:
+    """A Responses effort on a zero-reasoning route serves without it, disclosed.
+
+    This surface previously answered the named 400; the owner-approved drop
+    policy (2026-09-01) serves the request effortless instead, because a
+    zero-reasoning route cannot honor any depth and first-party clients pin
+    effort globally.
+    """
     control, raw_key = _control_plane(tmp_path)
     payload = json.loads(_responses_body())
     payload["reasoning"] = {"effort": "high"}
 
-    with pytest.raises(NativeBridgeError) as raised:
-        _admit_responses(control, raw_key, json.dumps(payload))
-
-    error = json.loads(raised.value.public_error_json)
-    assert error["status_code"] == 400
-    assert error["code"] == "unsupported_parameter"
-    assert error["error_type"] == "invalid_request_error"
-    assert error["param"] == "reasoning.effort"
-    assert "not supported by this model route" in error["message"]
+    admission = _flatten_started(control, _admit_responses(control, raw_key, json.dumps(payload)))
+    assert admission["ignored_parameters"] == ["reasoning_effort"]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "reasoning" not in upstream
 
 
 def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> None:
@@ -4329,16 +4332,17 @@ def test_strict_tools_degrade_with_disclosure_when_no_rung_declares_them(
     assert control_plane["admission_parameter_coercions"] == 1
 
 
-def test_effort_none_drops_with_disclosure_on_a_reasoning_less_route(
+def test_any_effort_drops_with_disclosure_on_a_reasoning_less_route(
     tmp_path: Path,
 ) -> None:
-    """reasoning_effort none is satisfied by a non-reasoning route.
+    """Every effort level is dropped with disclosure by a non-reasoning route.
 
-    The kimi-k3 shape: a route whose rungs declare no reasoning support
-    rejected the parameter wholesale. An explicit 'none' now drops with
-    disclosure (the model already does exactly what none asks for), while a
-    real effort stays the named rejection because deleting the feature is
-    not a nearest supported level.
+    The kimi-k3 shape dropped only an explicit 'none'; the haiku-4.5 shape
+    proved a real effort must drop too. First-party clients pin effort
+    globally (Claude Code sends its configured effortLevel to every model),
+    so a named rejection made whole sessions unusable against non-reasoning
+    models the provider itself serves fine without the parameter (owner
+    decision, 2026-09-01).
     """
     control, raw_key = _control_plane(tmp_path)
 
@@ -4352,21 +4356,61 @@ def test_effort_none_drops_with_disclosure_on_a_reasoning_less_route(
             }
         )
 
-    admission = _flatten_started(control, _admit(control, raw_key, chat_body("none")))
+    for attempt, effort in enumerate(("none", "high"), start=1):
+        admission = _flatten_started(control, _admit(control, raw_key, chat_body(effort)))
+        assert admission["ignored_parameters"] == ["reasoning_effort"], effort
+        upstream = admission["upstream_payload"]
+        assert isinstance(upstream, dict)
+        assert "reasoning_effort" not in upstream
+        assert "reasoning" not in upstream
+        control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
+        assert control_plane["admission_parameter_coercions"] == attempt
+
+
+def test_effort_carrying_marked_request_serves_native_with_caching_intact(
+    tmp_path: Path,
+) -> None:
+    """The haiku-4.5 regression: effort drops, cache markers reach the wire.
+
+    A Claude Code session pinning effortLevel against a non-reasoning
+    Anthropic model must serve on the native rung with its prompt-cache
+    markers preserved and the dropped effort disclosed, not 400 and not
+    narrow onto a marker-dropping shim.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(root, provider="anthropic")
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=120.0)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "system": [
+                {"type": "text", "text": "You are terse."},
+                {
+                    "type": "text",
+                    "text": "Big cached block.",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "high"},
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body, surface="messages"))
     assert admission["ignored_parameters"] == ["reasoning_effort"]
     upstream = admission["upstream_payload"]
     assert isinstance(upstream, dict)
+    # The dropped effort reaches the provider through NO channel.
+    assert "output_config" not in upstream
     assert "reasoning_effort" not in upstream
-    assert "reasoning" not in upstream
-    control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
-    assert control_plane["admission_parameter_coercions"] == 1
-
-    with pytest.raises(NativeBridgeError) as raised:
-        _admit(control, raw_key, chat_body("high"))
-    payload = json.loads(raised.value.public_error_json)
-    assert payload["status_code"] == 400
-    assert payload["param"] == "reasoning_effort"
-    assert payload["code"] == "unsupported_parameter"
+    # The cache markers survive to the native wire, block structure intact.
+    system = cast("list[JsonObject]", upstream["system"])
+    assert system[-1]["cache_control"] == {"type": "ephemeral"}
 
 
 def _web_search_fixture_json() -> str:

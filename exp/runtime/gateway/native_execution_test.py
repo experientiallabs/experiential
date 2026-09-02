@@ -15,6 +15,7 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayRequest,
 )
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
@@ -511,3 +512,76 @@ def test_native_serving_blockers_name_reasoning_wire_contract_conflicts(
     assert len(blockers) == 1
     assert blockers[0].startswith("reasoning: ")
     assert "invalid reasoning wire contract" in blockers[0]
+
+
+def test_route_reorder_permutes_dispatch_order_and_rejects_non_permutations() -> None:
+    """Reordering changes dispatch order over exactly the same deployments."""
+    from exp.runtime.gateway.native_execution import reorder_route_deployments
+
+    route = _route()
+    unchanged = reorder_route_deployments(route, (0, 1, 2))
+    assert unchanged is route
+    rotated = reorder_route_deployments(route, (2, 0, 1))
+    assert rotated.deployment.deployment_id == "three"
+    assert tuple(item.deployment_id for item in rotated.fallback_deployments) == ("one", "two")
+    assert rotated.snapshot.deployment_ids == ("three", "one", "two")
+    assert rotated.route_reason == route.route_reason
+    with pytest.raises(ValueError, match="permutation"):
+        reorder_route_deployments(route, (0, 1))
+    with pytest.raises(ValueError, match="permutation"):
+        reorder_route_deployments(route, (0, 1, 1))
+
+
+def test_cache_marker_predicate_sees_every_marker_carrier() -> None:
+    """Each cache-marker position makes the request marker-carrying."""
+    from exp.common.models.model import ToolCall
+    from exp.runtime.gateway.contracts import GatewayMessage, GatewayToolDefinition
+    from exp.runtime.gateway.native_execution import request_carries_cache_markers
+
+    def request(**updates: object) -> GatewayRequest:
+        base = GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+        )
+        return base.model_copy(update=updates)
+
+    assert request_carries_cache_markers(request()) is False
+    assert request_carries_cache_markers(request(provider_cache_control={"type": "ephemeral"}))
+    assert request_carries_cache_markers(
+        request(
+            tools=(
+                GatewayToolDefinition(
+                    name="bash",
+                    parameters={"type": "object"},
+                    cache_control={"type": "ephemeral"},
+                ),
+            )
+        )
+    )
+    marked_text = GatewayMessage(
+        role="user",
+        content="hi",
+        provider_text_blocks=(
+            {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}},
+        ),
+    )
+    assert request_carries_cache_markers(request(messages=(marked_text,)))
+    marked_tool_result = GatewayMessage(
+        role="tool",
+        content="ok",
+        tool_call_id="call-1",
+        cache_control={"type": "ephemeral"},
+    )
+    assert request_carries_cache_markers(request(messages=(marked_tool_result,)))
+    marked_call = GatewayMessage(
+        role="assistant",
+        tool_calls=(
+            ToolCall(
+                call_id="call-1",
+                name="bash",
+                arguments={},
+                cache_control={"type": "ephemeral"},
+            ),
+        ),
+    )
+    assert request_carries_cache_markers(request(messages=(marked_call,)))

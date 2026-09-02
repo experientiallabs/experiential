@@ -18,7 +18,11 @@ import logging
 
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
-from exp.runtime.gateway.native_execution import select_route_deployments
+from exp.runtime.gateway.native_execution import (
+    reorder_route_deployments,
+    request_carries_cache_markers,
+    select_route_deployments,
+)
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers import preflight_gateway_request
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -169,7 +173,47 @@ def admitted_route_requests(
                 )
             }
         )
+    route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
     return route, resolved_wires, public_request, provider_request
+
+
+def _prefer_cache_capable_rungs(
+    route: GatewayRoute,
+    resolved_wires: _ResolvedWires,
+    provider_request: GatewayRequest,
+) -> tuple[GatewayRoute, _ResolvedWires]:
+    """Dispatch marker-honoring rungs first on cache-preserving pools.
+
+    Under ``maximize_cache`` a cache-marked request must never start on a
+    wire that structurally drops its markers while a marker-honoring rung
+    stands ready: the pool's whole policy is prefix-cache preservation, and
+    a marker-dropping first rung silently bills every turn's full context
+    uncached (measured ~10x on a large system prompt). The reorder is
+    stable within each group, so certified order still breaks ties, and a
+    route that narrowing left with NO marker-honoring rung is unchanged
+    here: the dropped markers are already disclosed through the
+    ``cache_control`` ``ignored_parameters`` entries. ``maximize_availability``
+    pools keep their certified order untouched.
+    """
+    if route.snapshot.failover_mode != "maximize_cache":
+        return route, resolved_wires
+    if len(resolved_wires) < 2 or not request_carries_cache_markers(provider_request):
+        return route, resolved_wires
+    marker_capable = tuple(
+        index
+        for index, (profile, _client) in enumerate(resolved_wires)
+        if profile.dialect == "anthropic_messages"
+    )
+    if not marker_capable or len(marker_capable) == len(resolved_wires):
+        return route, resolved_wires
+    order = (
+        *marker_capable,
+        *(index for index in range(len(resolved_wires)) if index not in marker_capable),
+    )
+    return (
+        reorder_route_deployments(route, order),
+        tuple(resolved_wires[index] for index in order),
+    )
 
 
 def _candidate_serves(

@@ -785,6 +785,7 @@ def _configured_gateway(
     *,
     base_url: str = "http://127.0.0.1:9/v1",
     capabilities: ModelCapabilities | None = None,
+    provider: str = "openai-compatible",
 ) -> tuple[GatewayManagement, str]:
     """Create one explicit direct alias, identity, grant, and key in real SQLite."""
     manager = GatewayManagement(root)
@@ -793,8 +794,9 @@ def _configured_gateway(
         root,
         name="provider-main",
         connection=ConnectionConfig(
-            provider="openai-compatible",
-            base_url=base_url,
+            provider=provider,
+            # Fixed-origin providers (anthropic and friends) reject a base_url.
+            base_url=None if provider == "anthropic" else base_url,
             api_key_env="TEST_PROVIDER_KEY",
         ),
         replace=False,

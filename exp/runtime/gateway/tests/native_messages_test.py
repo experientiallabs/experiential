@@ -893,10 +893,17 @@ def test_protocol_and_key_failures_are_anthropic_shaped(engine: _ServingEngine) 
     assert count_tokens.json()["error"]["type"] == "not_found_error"
 
 
-def test_native_rejects_unsupported_reasoning_effort_with_the_public_field_error(
+def test_native_serves_an_effort_on_a_reasoning_less_route_by_dropping_it(
     engine: _ServingEngine,
 ) -> None:
-    """The native plane returns the local field error before any provider dispatch."""
+    """An effort on a zero-reasoning route serves without it, end to end.
+
+    This surface previously answered a named 400 before any dispatch; the
+    owner-approved drop policy (2026-09-01) serves the request effortless
+    with the drop disclosed through admission accounting, because
+    first-party clients pin effort globally and a zero-reasoning route
+    cannot honor any depth.
+    """
     payload = {
         "model": "coding",
         "input": "hello",
@@ -909,20 +916,9 @@ def test_native_rejects_unsupported_reasoning_effort_with_the_public_field_error
         json=payload,
         timeout=10.0,
     )
-
-    expected = {
-        "error": {
-            "message": (
-                "The parameter 'reasoning.effort' is not supported by this model route. "
-                "Remove the field or choose a different model."
-            ),
-            "type": "invalid_request_error",
-            "param": "reasoning.effort",
-            "code": "unsupported_parameter",
-        }
-    }
-    assert native.status_code == 400
-    assert native.json() == expected
+    assert native.status_code == 200
+    body = native.json()
+    assert body["status"] == "completed"
 
 
 def test_native_rejects_unsupported_sampling_with_the_public_field_error(

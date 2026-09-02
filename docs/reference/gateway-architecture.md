@@ -281,9 +281,16 @@ controls narrow the waterfall to the rungs that preserve every exact value
 capability preflight plus payload build. Only when zero rungs survive does the
 capability-preservation policy (`exp/runtime/models/providers/capability_policy.py`) attempt one
 minimal COERCE-WITH-DISCLOSURE: a reasoning effort snaps to the nearest level any rung supports
-on the canonical ladder (ties prefer the lower level), an explicit `none` on a route with no
-reasoning support drops (the model already delivers what `none` asks for), and `strict: true`
-tools degrade to best-effort schemas. Every coercion is disclosed in `path->effective` form
+on the canonical ladder (ties prefer the lower level), ANY effort on a route with no reasoning
+support at all drops (first-party clients pin effort globally, so a named rejection made whole
+sessions unusable against non-reasoning models the provider itself serves fine without the
+parameter; the Messages surface's verbatim `output_config.effort` is stripped with it so the
+dropped value reaches the provider through no channel), and `strict: true` tools degrade to
+best-effort schemas. On `maximize_cache` pools, a cache-marked request dispatches
+marker-honoring (Anthropic Messages) rungs before marker-dropping wires, stably within each
+group, so a shim rung can no longer silently bill every turn's full context uncached while the
+native rung stands ready; routes narrowing to only marker-dropping wires keep disclosing the
+dropped markers. Every coercion is disclosed in `path->effective` form
 through `ignored_parameters`, logged, and counted in the `admission_parameter_coercions`
 metric; nothing coercible keeps the first rung's own field-scoped rejection.
 The per-deployment `capability_parity` export joins catalog declarations with the engine's
