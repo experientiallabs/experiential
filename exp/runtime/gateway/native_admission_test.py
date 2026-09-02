@@ -17,6 +17,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.native_admission import (
     _prefer_cache_capable_rungs,
     protocol_compatible_indexes,
+    route_rejection,
 )
 from exp.runtime.gateway.native_dispatch import NativeWireClient
 from exp.runtime.gateway.routing import GatewayRoute
@@ -105,6 +106,24 @@ def _marked_request() -> GatewayRequest:
             GatewayMessage(role="user", content="hi"),
         ),
     )
+
+
+def test_remote_url_refusal_outranks_a_text_only_rung_refusing_every_image() -> None:
+    """A text-only rung ahead of an inline-only rung reports the URL, not the image."""
+    text_only = ProviderCapabilityError(capability="image_input")
+    inline_only = ProviderCapabilityError(capability="image_url_input")
+    assert route_rejection((text_only, inline_only, inline_only)) is inline_only
+    assert route_rejection((inline_only, text_only)) is inline_only
+
+
+def test_route_rejection_keeps_the_first_rung_without_a_url_refusal() -> None:
+    """Mixed rejections that never name the URL surface the first rung's reason."""
+    tools = ProviderCapabilityError(capability="function_tools")
+    parameter = ProviderParameterError(message="unsupported", param="top_k", code="unsupported")
+    text_only = ProviderCapabilityError(capability="image_input")
+    assert route_rejection((tools, text_only)) is tools
+    assert route_rejection((parameter, text_only)) is parameter
+    assert route_rejection((text_only,)) is text_only
 
 
 def test_cache_marked_requests_dispatch_marker_honoring_rungs_first() -> None:
