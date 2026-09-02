@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from exp.common.models.content import (
     DOCUMENT_MEDIA_TYPES,
@@ -46,14 +46,48 @@ class CacheControl(AnthropicWireModel):
     ttl: Literal["5m", "1h"] | None = None
 
 
-class ImageSource(AnthropicWireModel):
-    """Where one image block's bytes come from: base64, a URL, or a file id."""
+class MediaSource(AnthropicWireModel):
+    """Where one media block's bytes come from: base64, a URL, or a file id.
+
+    The ``type`` selects the carrier, and only that carrier's fields may be
+    present, so a block never names two sources at once.
+    """
 
     type: Literal["base64", "url", "file"]
     media_type: str | None = Field(default=None, max_length=64)
-    data: str | None = Field(default=None, max_length=MAXIMUM_IMAGE_BASE64_BYTES)
+    data: str | None = None
     url: str | None = Field(default=None, max_length=8_192)
     file_id: str | None = Field(default=None, max_length=_MAXIMUM_FILE_ID_CHARACTERS)
+
+    @model_validator(mode="after")
+    def _require_matching_carrier(self) -> MediaSource:
+        """Reject carrier fields that belong to a different source type."""
+        expected = {"base64": ("data", "media_type"), "url": ("url",), "file": ("file_id",)}[
+            self.type
+        ]
+        present = {
+            name
+            for name, value in (
+                ("data", self.data),
+                ("media_type", self.media_type),
+                ("url", self.url),
+                ("file_id", self.file_id),
+            )
+            if value is not None
+        }
+        stray = sorted(present - set(expected))
+        if stray:
+            raise ValueError(
+                f"a {self.type} source accepts only {', '.join(expected)}; "
+                f"remove {', '.join(stray)}"
+            )
+        return self
+
+
+class ImageSource(MediaSource):
+    """Where one image block's bytes come from: base64, a URL, or a file id."""
+
+    data: str | None = Field(default=None, max_length=MAXIMUM_IMAGE_BASE64_BYTES)
 
 
 class ImageBlock(AnthropicWireModel):
@@ -64,7 +98,7 @@ class ImageBlock(AnthropicWireModel):
     cache_control: CacheControl | None = None
 
 
-class DocumentSource(AnthropicWireModel):
+class DocumentSource(MediaSource):
     """Where one document block's bytes come from: base64, a URL, or a file id.
 
     ``text`` and ``content`` sources carry non-PDF documents no other wire
@@ -72,11 +106,7 @@ class DocumentSource(AnthropicWireModel):
     accepted.
     """
 
-    type: Literal["base64", "url", "file"]
-    media_type: str | None = Field(default=None, max_length=64)
     data: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_BASE64_BYTES)
-    url: str | None = Field(default=None, max_length=8_192)
-    file_id: str | None = Field(default=None, max_length=_MAXIMUM_FILE_ID_CHARACTERS)
 
 
 class DocumentCitations(AnthropicWireModel):

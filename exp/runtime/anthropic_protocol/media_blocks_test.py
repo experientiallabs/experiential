@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from exp.common.models.content import MediaHandle
 from exp.runtime.anthropic_protocol.media_blocks import (
@@ -101,3 +102,22 @@ def test_malformed_handle_sources_fail_at_the_source_field(source: dict[str, str
         )
     assert error.value.detail.param == "messages.0.content.0.source"
     assert "Anthropic Files id" in error.value.detail.message
+
+
+@pytest.mark.parametrize(
+    ("block_type", "source"),
+    [
+        ("image", {"type": "file", "file_id": "file_abc", "url": "https://x.test/a.png"}),
+        ("image", {"type": "url", "url": "https://x.test/a.png", "data": _PNG_BASE64}),
+        ("document", {"type": "file", "file_id": "file_abc", "data": "JVBERi0x"}),
+        ("document", {"type": "base64", "media_type": "application/pdf", "file_id": "file_abc"}),
+    ],
+)
+def test_sources_carrying_two_carriers_fail_validation(
+    block_type: str, source: dict[str, str]
+) -> None:
+    """A source may only carry the fields of the carrier its ``type`` selects."""
+    model = ImageBlock if block_type == "image" else DocumentBlock
+    with pytest.raises(ValidationError) as error:
+        model.model_validate({"type": block_type, "source": source})
+    assert "accepts only" in str(error.value)

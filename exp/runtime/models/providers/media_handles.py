@@ -51,8 +51,8 @@ def handle_provider_mismatch(handle: MediaHandle, route_provider: str | None) ->
         else f"the selected model alias has no {handle.provider} route"
     )
     return (
-        f"The request references media uploaded to {handle.provider}, which only a "
-        f"{handle.provider} route can resolve, but {route}. Send the media inline or "
+        f"The request references media uploaded to {handle.provider}, which only a route "
+        f"on {handle.provider} can resolve, but {route}. Send the media inline or "
         f"choose a model alias served by {handle.provider}."
     )
 
