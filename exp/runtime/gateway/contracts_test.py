@@ -875,3 +875,34 @@ def test_audio_joins_semantic_identity_while_cache_markers_stay_out() -> None:
     assert sha256_json(first) != sha256_json(second)
     assert sha256_json(first) == sha256_json(marked)
     assert first.audios == (first.messages[0].content_parts[1],)
+
+
+def test_service_tier_is_serialization_inert_but_binds_replay_identity() -> None:
+    """The same body at a different provider tier is a different operation."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    messages = (GatewayMessage(role="user", content="hi"),)
+    bare = GatewayRequest(surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=messages)
+    flex = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=messages,
+        service_tier="flex",
+    )
+    assert flex.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(flex) == sha256_json(bare)
+    assert canonical_request_sha256(bare) == sha256_json(bare)
+    assert canonical_request_sha256(flex) != canonical_request_sha256(bare)
+    assert canonical_request_sha256(flex) != canonical_request_sha256(
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            service_tier="priority",
+        )
+    )
+    with pytest.raises(ValidationError, match="not valid for Messages"):
+        GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=messages,
+            service_tier="flex",
+        )

@@ -77,39 +77,25 @@ class GatewayToolDefinition(ContractModel):
     parameters: JsonObject
     strict: bool = False
     cache_control: JsonObject | None = Field(default=None, exclude=True)
-    """Validated caller prompt-caching hint attached to this tool definition.
-
-    Forwarded onto the native Anthropic tool block and dropped with
+    """Validated caller prompt-caching hint attached to this tool definition,
+    forwarded onto the native Anthropic tool block and dropped with
     disclosure on other wires. Like ``ToolCall.cache_control``, a cache hint
-    changes cost, not semantics, so it joins neither serialization nor
-    replay identity: two requests differing only here are the same request.
-    """
+    changes cost, not semantics: it joins neither serialization nor replay
+    identity."""
     eager_input_streaming: bool | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic fine-grained tool-input streaming selector.
-
-    Accepted bare by the provider (verified live 2026-08-30; no beta header).
-    Claude Code sends it conditionally. It changes how the provider frames
-    tool-input deltas, so like the other Anthropic-native carriers it is excluded
-    from serialization (tool digests predate it) and a present value joins
-    replay identity through :func:`canonical_request_sha256`.
-    """
+    """Verbatim Anthropic fine-grained tool-input streaming selector, sent
+    conditionally by Claude Code and accepted bare by the provider (verified
+    live 2026-08-30, no beta header). Excluded from serialization (tool
+    digests predate it); a present value joins replay identity through
+    :func:`canonical_request_sha256`, like every carrier below."""
     defer_loading: bool | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic tool-search deferred-loading selector.
-
-    Accepted bare by the provider, which owns the cross-tool validity rules
-    (verified live 2026-08-30: ``false`` is a no-op and an all-deferred toolset
-    is the provider's own 400). Excluded from serialization; a present value
-    changes what the model initially sees, so it joins replay identity through
-    :func:`canonical_request_sha256`.
-    """
+    """Verbatim Anthropic tool-search deferred-loading selector; the provider
+    owns the cross-tool validity rules (verified live 2026-08-30: ``false``
+    is a no-op and an all-deferred toolset is the provider's own 400)."""
     allowed_callers: tuple[str, ...] | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic programmatic-tool-calling caller allowlist.
-
-    Accepted bare by the provider even without a companion server tool
-    (verified live 2026-08-30), so the provider stays the authority on the
-    combination rules. Excluded from serialization; a present value joins
-    replay identity through :func:`canonical_request_sha256`.
-    """
+    """Verbatim Anthropic programmatic-tool-calling caller allowlist,
+    accepted bare by the provider even without a companion server tool
+    (verified live 2026-08-30), which stays the combination authority."""
     input_examples: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
     """Verbatim Anthropic example tool inputs.
 
@@ -613,7 +599,13 @@ class GatewayRequest(ContractModel):
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
-    service_tier: str | None = Field(default=None, max_length=64)
+    service_tier: str | None = Field(default=None, max_length=64, exclude=True)
+    """Caller provider processing tier, forwarded only on BYOK OpenAI-family
+    rungs (routing and billing rules live at streaming_requests and
+    capability_policy). Excluded from serialization so tier-free digests are
+    unperturbed; a present value joins replay identity through
+    :func:`canonical_request_sha256`: the same body at a different tier is a
+    different provider price and schedule."""
     ignored_parameters: tuple[str, ...] = Field(default=(), exclude=True)
     """Disclosed compatibility decisions applied to this request.
 
@@ -745,6 +737,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("Anthropic tool carriers are valid only for Messages requests")
         if self.provider_beta_tokens and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_beta_tokens are valid only for Messages requests")
+        if self.service_tier is not None and self.surface == GatewayApiSurface.MESSAGES:
+            raise ValueError("service_tier is not valid for Messages requests")
         if self.provider_server_tools and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_server_tools are valid only for Messages requests")
         if self.provider_native_tools and self.surface != GatewayApiSurface.RESPONSES:
