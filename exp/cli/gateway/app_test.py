@@ -652,7 +652,9 @@ def test_direct_alias_declares_pdf_capabilities_per_provider(tmp_path: Path) -> 
         ],
     )
     assert url_without_pdf.exit_code != 0
-    assert "requires --supports-pdf-input" in url_without_pdf.output
+    # Rich wraps the error panel to the terminal width, so compare without layout.
+    flattened = "".join(url_without_pdf.output.split()).replace("│", "")
+    assert "requires--supports-pdf-input" in flattened
 
 
 def test_direct_alias_preserves_tool_streaming_across_credential_env_rotation(
