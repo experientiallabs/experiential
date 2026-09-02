@@ -17,6 +17,7 @@ from pydantic import Field
 from exp.common.core.artifacts import ContractModel
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.common.models.model import ReasoningEffort
+from exp.runtime.models.providers.documents import PDF_URL_DIALECTS
 from exp.runtime.models.providers.images import IMAGE_URL_DIALECTS
 from exp.runtime.models.providers.reasoning_compat import (
     anthropic_adaptive_only_thinking,
@@ -24,7 +25,7 @@ from exp.runtime.models.providers.reasoning_compat import (
 )
 from exp.runtime.models.providers.videos import VIDEO_DIALECTS, VIDEO_URL_DIALECTS
 
-CAPABILITY_PARITY_SCHEMA_VERSION = 3
+CAPABILITY_PARITY_SCHEMA_VERSION = 4
 """Version of the parity-row contract; bump on any field change."""
 
 
@@ -57,6 +58,15 @@ class DeploymentCapabilityParity(ContractModel):
     forwards_video_urls: bool
     """Whether this rung's provider fetches a caller video URL itself; only
     the Gemini and OpenAI-compatible video wires do."""
+    supports_pdf_input: bool
+    """Whether the catalog declares caller PDF document parts servable on this rung."""
+    forwards_pdf_urls: bool
+    """Whether this rung's wire fetches a caller document URL itself.
+
+    Only the OpenAI Responses and Anthropic Messages wires carry a remote
+    document reference; Chat Completions, Gemini, and Bedrock need the
+    caller to inline the bytes.
+    """
     maximum_stop_sequences: int | None
     reasoning_efforts: tuple[ReasoningEffort, ...]
     """Exact efforts this rung preserves: the declared set when the catalog
@@ -130,6 +140,12 @@ def deployment_capability_parity(
             capabilities.supports_video_input
             and capabilities.supports_video_url_input
             and dialect in VIDEO_URL_DIALECTS
+        ),
+        supports_pdf_input=capabilities.supports_pdf_input,
+        forwards_pdf_urls=(
+            capabilities.supports_pdf_input
+            and capabilities.supports_pdf_url_input
+            and dialect in PDF_URL_DIALECTS
         ),
         maximum_stop_sequences=capabilities.maximum_stop_sequences,
         reasoning_efforts=efforts,

@@ -24,6 +24,7 @@ class PublishedAliasMetadata:
     supports_completions: bool | None = None
     supports_image_input: bool | None = None
     supports_video_input: bool | None = None
+    supports_pdf_input: bool | None = None
     supports_tools: bool | None = None
     supports_structured_output: bool | None = None
     supports_temperature: bool | None = None
@@ -52,6 +53,7 @@ class PublishedAliasMetadata:
         _put_optional(fields, "supports_completions", self.supports_completions)
         _put_optional(fields, "supports_image_input", self.supports_image_input)
         _put_optional(fields, "supports_video_input", self.supports_video_input)
+        _put_optional(fields, "supports_pdf_input", self.supports_pdf_input)
         _put_optional(fields, "supports_tools", self.supports_tools)
         _put_optional(fields, "supports_structured_output", self.supports_structured_output)
         _put_optional(fields, "supports_temperature", self.supports_temperature)
@@ -117,6 +119,7 @@ def published_alias_metadata(
         # serves media only when its deployment's wire carries it.
         supports_image_input=deployment.gateway.capabilities.supports_image_input,
         supports_video_input=deployment.gateway.capabilities.supports_video_input,
+        supports_pdf_input=deployment.gateway.capabilities.supports_pdf_input,
         supports_tools=None if capabilities is None else capabilities.supports_tools,
         supports_structured_output=(
             None if capabilities is None else capabilities.supports_structured_output

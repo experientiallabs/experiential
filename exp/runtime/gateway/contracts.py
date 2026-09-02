@@ -9,8 +9,10 @@ from pydantic import Field, field_validator, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
 from exp.common.models.content import (
+    MAXIMUM_DOCUMENTS_PER_REQUEST,
     MAXIMUM_IMAGES_PER_REQUEST,
     MAXIMUM_VIDEOS_PER_REQUEST,
+    DocumentContentPart,
     ImageContentPart,
     MessageContentPart,
     VideoContentPart,
@@ -86,21 +88,20 @@ class GatewayToolDefinition(ContractModel):
     eager_input_streaming: bool | None = Field(default=None, exclude=True)
     """Verbatim Anthropic fine-grained tool-input streaming selector.
 
-    Accepted bare by the provider (verified live 2026-08-30; no beta
-    header). Claude Code sends it conditionally. It changes how the
-    provider frames tool-input deltas, so like the other Anthropic-native
-    carriers it is excluded from serialization (tool digests predate it)
-    and a present value joins replay identity through
-    :func:`canonical_request_sha256`.
+    Accepted bare by the provider (verified live 2026-08-30; no beta header).
+    Claude Code sends it conditionally. It changes how the provider frames
+    tool-input deltas, so like the other Anthropic-native carriers it is excluded
+    from serialization (tool digests predate it) and a present value joins
+    replay identity through :func:`canonical_request_sha256`.
     """
     defer_loading: bool | None = Field(default=None, exclude=True)
     """Verbatim Anthropic tool-search deferred-loading selector.
 
     Accepted bare by the provider, which owns the cross-tool validity rules
-    (verified live 2026-08-30: ``false`` is a no-op and an all-deferred
-    toolset is the provider's own 400). Excluded from serialization; a
-    present value changes what the model initially sees, so it joins replay
-    identity through :func:`canonical_request_sha256`.
+    (verified live 2026-08-30: ``false`` is a no-op and an all-deferred toolset
+    is the provider's own 400). Excluded from serialization; a present value
+    changes what the model initially sees, so it joins replay identity through
+    :func:`canonical_request_sha256`.
     """
     allowed_callers: tuple[str, ...] | None = Field(default=None, exclude=True)
     """Verbatim Anthropic programmatic-tool-calling caller allowlist.
@@ -142,15 +143,13 @@ class StructuredTextFormat(ContractModel):
 class GatewayProviderNativeTool(ContractModel):
     """One verbatim non-function OpenAI Responses tool declaration.
 
-    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool
-    tree), ``web_search``, and ``tool_search`` declarations whose shapes
-    exist on no other wire; each is validated shallowly at decode and
-    re-emitted byte-for-byte on native Responses rungs only, with the
-    provider owning the declaration's internal shape (each type captured
-    live from Codex 0.151.0 and accepted with a plain API key, 2026-09-01).
-    ``index`` is the declaration's position in the caller's ``tools`` array
-    so re-emission preserves the caller's exact interleaving with the
-    converted function tools.
+    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool tree),
+    ``web_search``, and ``tool_search`` declarations whose shapes exist on no
+    other wire; each is validated shallowly at decode and re-emitted byte-for-byte
+    on native Responses rungs only, with the provider owning the declaration's
+    internal shape (each type captured live from Codex 0.151.0 and accepted with
+    a plain API key, 2026-09-01). ``index`` is the declaration's position in the
+    caller's ``tools`` array so re-emission preserves the caller's interleaving.
     """
 
     index: int = Field(ge=0)
@@ -317,15 +316,14 @@ class GatewayMessage(ContractModel):
     replay identity.
     """
     content_parts: tuple[MessageContentPart, ...] = ()
-    """Ordered caller content parts for a message that carries images or videos.
+    """Ordered caller content parts for a message that carries attachments.
 
     Empty on every text-only message, so a text-only request serializes and
-    digests exactly as it did before media existed. When present, the text
-    parts concatenate to ``content`` byte-for-byte and at least one image or
-    video part is included, so a route that cannot carry the media is
-    rejected at admission instead of silently serving the text alone. Media
-    changes what the model sees, so unlike the cache carriers this field is
-    serialized and joins request identity.
+    digests exactly as before attachments existed. When present, the text parts
+    concatenate to ``content`` byte-for-byte and at least one image, video, or
+    document part is included, so a route that cannot carry it is rejected at
+    admission instead of silently serving the text alone. Attachments change
+    what the model sees, so this field is serialized and joins request identity.
     """
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Validated caller prompt-caching marker on this tool-result message.
@@ -431,6 +429,11 @@ class GatewayMessage(ContractModel):
     def videos(self) -> tuple[VideoContentPart, ...]:
         """Return this message's retained video parts in caller order."""
         return tuple(part for part in self.content_parts if part.kind == "video")
+
+    @property
+    def documents(self) -> tuple[DocumentContentPart, ...]:
+        """Return this message's retained document parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "document")
 
 
 class GatewayRequest(ContractModel):
@@ -647,6 +650,11 @@ class GatewayRequest(ContractModel):
         """Return every video this request carries, in message and part order."""
         return tuple(video for message in self.messages for video in message.videos)
 
+    @property
+    def documents(self) -> tuple[DocumentContentPart, ...]:
+        """Return every document this request carries, in message and part order."""
+        return tuple(part for message in self.messages for part in message.documents)
+
     @field_validator("stop")
     @classmethod
     def _require_unique_stop_sequences(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -704,6 +712,8 @@ class GatewayRequest(ContractModel):
             raise ValueError(f"a request carries at most {MAXIMUM_IMAGES_PER_REQUEST} images")
         if len(self.videos) > MAXIMUM_VIDEOS_PER_REQUEST:
             raise ValueError(f"a request carries at most {MAXIMUM_VIDEOS_PER_REQUEST} videos")
+        if len(self.documents) > MAXIMUM_DOCUMENTS_PER_REQUEST:
+            raise ValueError(f"a request carries at most {MAXIMUM_DOCUMENTS_PER_REQUEST} documents")
         if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("reasoning_summary is valid only for Responses requests")
         if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:

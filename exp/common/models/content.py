@@ -1,10 +1,11 @@
 """Multimodal message content parts shared by the gateway and model clients.
 
 A caller message is canonically one flattened text string. When the caller
-also sends images or videos, the ordered parts that produced that string are
-retained here so every provider wire can re-emit the caller's exact
+also sends images, videos, or documents, the ordered parts that produced that
+string are retained here so every provider wire can re-emit the caller's exact
 interleaving. The text parts always flatten to the message's canonical
-content, so a text-only route sees exactly what it saw before media existed.
+content, so a text-only route sees exactly what it saw before attachments
+existed.
 """
 
 from __future__ import annotations
@@ -76,6 +77,33 @@ MAXIMUM_VIDEOS_PER_REQUEST = 10
 Gemini accepts at most ten videos per request; Bedrock Nova accepts one, and
 that narrower model limit surfaces as a provider error rather than a gateway
 ceiling."""
+
+DocumentMediaType = Literal["application/pdf"]
+
+DOCUMENT_MEDIA_TYPES: dict[str, DocumentMediaType] = {"application/pdf": "application/pdf"}
+"""Media types every document-capable provider wire in this gateway accepts.
+
+PDF is the one document format that every wire carries natively (OpenAI
+``file`` and ``input_file``, Anthropic ``document``, Gemini ``inline_data``,
+Bedrock ``document``); other office formats differ per provider and are not
+forwarded."""
+
+MAXIMUM_DOCUMENT_BASE64_BYTES = 6 * 1024 * 1024
+"""Largest encoded document this gateway forwards.
+
+Bedrock Converse caps one document at 4.5 MB of raw bytes, the narrowest
+provider cap (OpenAI and Gemini accept 50 MB, Anthropic a 32 MB request);
+6 MiB of base64 is that many raw bytes, so every declared rung can carry
+every admitted document."""
+
+MAXIMUM_DOCUMENTS_PER_REQUEST = 5
+"""Largest number of documents one request may carry across all its messages.
+
+Bedrock Converse accepts at most five document blocks per request, the
+narrowest provider cap."""
+
+MAXIMUM_DOCUMENT_NAME_CHARACTERS = 200
+"""Longest document name forwarded; Bedrock caps its ``name`` at 200."""
 
 _DATA_URL = re.compile(
     r"^data:(?P<media_type>[\w.+-]+/[\w.+-]+)(?P<parameters>;[^,]*)?,(?P<data>.*)$",
@@ -206,8 +234,58 @@ class VideoContentPart(ContractModel):
         return f"data:{self.media_type};base64,{self.data}"
 
 
+class DocumentContentPart(ContractModel):
+    """One caller-supplied PDF document, either inline bytes or a remote URL.
+
+    Exactly one carrier is present. Inline documents hold standard base64 of
+    the PDF bytes; remote documents hold the caller's URL and are forwarded
+    only on wires that fetch it themselves. The optional name is the
+    caller's filename or title: providers show it to the model, so it is
+    part of what the model sees and joins request identity.
+    """
+
+    kind: Literal["document"] = "document"
+    media_type: DocumentMediaType = "application/pdf"
+    data: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_BASE64_BYTES)
+    url: str | None = Field(default=None, max_length=8_192)
+    name: str | None = Field(
+        default=None, min_length=1, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS
+    )
+    cache_control: JsonObject | None = Field(default=None, exclude=True)
+    """Prompt-cache breakpoint the caller placed on this document, re-emitted
+    verbatim on wires that cache a marked block natively and dropped
+    elsewhere. Cost, not semantics: never in serialization or replay
+    identity."""
+
+    @model_validator(mode="after")
+    def _require_one_carrier(self) -> DocumentContentPart:
+        """Require exactly one well-formed document carrier.
+
+        Returns:
+            The validated document part.
+
+        Raises:
+            ValueError: Both or neither carrier is present, the inline
+                payload is not base64, or a remote URL is not http(s).
+        """
+        if (self.data is None) == (self.url is None):
+            raise ValueError("a document needs either inline data or a URL")
+        if self.data is not None:
+            try:
+                base64.b64decode(self.data, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("inline document data must be base64") from exc
+        elif self.url is not None and not self.url.startswith(("http://", "https://")):
+            raise ValueError("a document URL must be an http(s) URL")
+        return self
+
+    def data_url(self) -> str:
+        """Return the inline bytes as one OpenAI ``file_data`` value."""
+        return f"data:{self.media_type};base64,{self.data or ''}"
+
+
 MessageContentPart = Annotated[
-    TextContentPart | ImageContentPart | VideoContentPart,
+    TextContentPart | ImageContentPart | VideoContentPart | DocumentContentPart,
     Field(discriminator="kind"),
 ]
 
@@ -287,3 +365,37 @@ def video_part_from_url(url: str) -> VideoContentPart:
     if len(data) > MAXIMUM_VIDEO_BASE64_BYTES:
         raise ValueError("inline video exceeds the maximum encoded size")
     return VideoContentPart(media_type=media_type, data=data)
+
+
+def document_part_from_file_data(
+    file_data: str,
+    *,
+    name: str | None = None,
+) -> DocumentContentPart:
+    """Build one inline document part from an OpenAI ``file_data`` value.
+
+    Args:
+        file_data: Caller value from a ``file`` or ``input_file`` part:
+            either a ``data:application/pdf;base64,...`` URL or the bare
+            base64 of the PDF bytes (the official documentation shows both).
+        name: Caller filename preserved for the wires that show it.
+
+    Returns:
+        The canonical document part for that value.
+
+    Raises:
+        ValueError: The data URL is malformed, is not base64, names a media
+            type this gateway does not forward, or exceeds the size ceiling.
+    """
+    match = _DATA_URL.match(file_data)
+    if match is None:
+        data = file_data.strip()
+    else:
+        if DOCUMENT_MEDIA_TYPES.get(match["media_type"].lower()) is None:
+            raise ValueError(f"unsupported document media type {match['media_type']!r}")
+        if ";base64" not in (match["parameters"] or ""):
+            raise ValueError("inline documents must be base64 encoded")
+        data = match["data"].strip()
+    if len(data) > MAXIMUM_DOCUMENT_BASE64_BYTES:
+        raise ValueError("inline document exceeds the maximum encoded size")
+    return DocumentContentPart(data=data, name=name or None)

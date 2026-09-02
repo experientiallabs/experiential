@@ -7,7 +7,12 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
-from exp.common.models.content import ImageContentPart, TextContentPart, VideoContentPart
+from exp.common.models.content import (
+    DocumentContentPart,
+    ImageContentPart,
+    TextContentPart,
+    VideoContentPart,
+)
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.bedrock_requests import converse_request
 from exp.runtime.models.providers.errors import ProviderParameterError
@@ -186,3 +191,40 @@ def test_converse_request_sums_inline_images_and_videos_together() -> None:
     assert [next(iter(block)) for block in blocks] == ["video", "image", "text"]
     with pytest.raises(ProviderParameterError):
         converse_request("amazon.nova-lite-v1:0", _inline_media_request(video, large))
+
+
+def test_converse_request_emits_named_document_blocks_in_caller_order() -> None:
+    """PDF parts become ``document`` blocks with per-turn ordinal names when unnamed."""
+    pdf = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+    request = ModelRequest(
+        messages=(
+            ModelMessage(
+                role="user",
+                content="compare these",
+                content_parts=(
+                    DocumentContentPart(data=pdf, name="Report (Q3).pdf"),
+                    TextContentPart(text="compare these"),
+                    DocumentContentPart(data="JVBERi0xLjcK"),
+                ),
+            ),
+        ),
+    )
+    payload = converse_request("anthropic.claude-fixture", request)
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {
+            "document": {
+                "name": "Report (Q3)-pdf",
+                "format": "pdf",
+                "source": {"bytes": pdf},
+            }
+        },
+        {"text": "compare these"},
+        {
+            "document": {
+                "name": "document-2",
+                "format": "pdf",
+                "source": {"bytes": "JVBERi0xLjcK"},
+            }
+        },
+    ]

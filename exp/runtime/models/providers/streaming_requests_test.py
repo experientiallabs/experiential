@@ -5,7 +5,12 @@ from typing import Literal, cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import ImageContentPart, TextContentPart, VideoContentPart
+from exp.common.models.content import (
+    DocumentContentPart,
+    ImageContentPart,
+    TextContentPart,
+    VideoContentPart,
+)
 from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -2791,3 +2796,111 @@ def test_wires_without_a_video_carrier_narrow_past_the_rung() -> None:
         )
     with pytest.raises(ProviderCapabilityError, match="video_input"):
         anthropic_messages_stream_payload("claude-fable-5", _video_request())
+
+
+_PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+"""One short PDF header, base64 encoded."""
+
+
+def _document_request(surface: GatewayApiSurface) -> GatewayRequest:
+    """Build one streaming request with two PDFs interleaved with text."""
+    return GatewayRequest(
+        surface=surface,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="first: second: compare",
+                content_parts=(
+                    TextContentPart(text="first:"),
+                    DocumentContentPart(data=_PDF_BASE64, name="a.pdf"),
+                    TextContentPart(text=" second:"),
+                    DocumentContentPart(data="JVBERi0xLjcK"),
+                    TextContentPart(text=" compare"),
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_openai_chat_payload_carries_file_parts_in_caller_order() -> None:
+    """The Chat wire carries each PDF as a ``file`` part at its position."""
+    payload = openai_compatible_stream_payload(
+        "exact-model", _document_request(GatewayApiSurface.CHAT_COMPLETIONS)
+    )
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "first:"},
+        {
+            "type": "file",
+            "file": {
+                "filename": "a.pdf",
+                "file_data": f"data:application/pdf;base64,{_PDF_BASE64}",
+            },
+        },
+        {"type": "text", "text": " second:"},
+        {
+            "type": "file",
+            "file": {
+                "filename": "document.pdf",
+                "file_data": "data:application/pdf;base64,JVBERi0xLjcK",
+            },
+        },
+        {"type": "text", "text": " compare"},
+    ]
+
+
+def test_openai_responses_payload_carries_input_file_parts_in_caller_order() -> None:
+    """The Responses wire carries each PDF as an ``input_file`` part at its position."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.2",
+        _document_request(GatewayApiSurface.RESPONSES),
+        supports_temperature=False,
+    )
+    items = cast(list[JsonObject], payload["input"])
+    assert items[0]["content"] == [
+        {"type": "input_text", "text": "first:"},
+        {
+            "type": "input_file",
+            "filename": "a.pdf",
+            "file_data": f"data:application/pdf;base64,{_PDF_BASE64}",
+        },
+        {"type": "input_text", "text": " second:"},
+        {
+            "type": "input_file",
+            "filename": "document.pdf",
+            "file_data": "data:application/pdf;base64,JVBERi0xLjcK",
+        },
+        {"type": "input_text", "text": " compare"},
+    ]
+
+
+def test_anthropic_payload_carries_document_blocks_in_caller_order() -> None:
+    """The Messages wire carries each PDF as a ``document`` block at its position."""
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", _document_request(GatewayApiSurface.MESSAGES)
+    )
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "first:"},
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": _PDF_BASE64,
+            },
+            "title": "a.pdf",
+        },
+        {"type": "text", "text": " second:"},
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjcK",
+            },
+        },
+        {"type": "text", "text": " compare"},
+    ]

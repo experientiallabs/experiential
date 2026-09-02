@@ -6,6 +6,7 @@ import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -390,6 +391,168 @@ def test_document_block_inside_tool_result_is_rejected() -> None:
             )
         )
     assert "document blocks are not supported" in excinfo.value.detail.message
+
+
+_PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+"""One short PDF header, base64 encoded."""
+
+
+def _pdf_block(data: str = _PDF_BASE64, **extra: JsonValue) -> JsonObject:
+    """Build one base64 Anthropic PDF document block with optional extra fields."""
+    block: JsonObject = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": data},
+    }
+    block.update(extra)
+    return block
+
+
+def test_document_blocks_are_retained_in_caller_order_with_interleaved_text() -> None:
+    """PDF blocks ride the canonical parts at their positions among the text."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first: "},
+                        _pdf_block(title="one.pdf"),
+                        {"type": "text", "text": " second: "},
+                        _pdf_block("JVBERi0xLjcK"),
+                        {"type": "text", "text": " compare them"},
+                    ],
+                }
+            ]
+        )
+    )
+    message = decoded.request.messages[-1]
+    assert message.content == "first:  second:  compare them"
+    assert [part.kind for part in message.content_parts] == [
+        "text",
+        "document",
+        "text",
+        "document",
+        "text",
+    ]
+    documents = decoded.request.documents
+    assert [document.data for document in documents] == [_PDF_BASE64, "JVBERi0xLjcK"]
+    assert [document.name for document in documents] == ["one.pdf", None]
+    assert documents[0].media_type == "application/pdf"
+
+
+def test_a_document_url_source_and_cache_marker_are_retained() -> None:
+    """A remote document and a breakpoint placed on it both reach the canonical part."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {"type": "url", "url": "https://example.com/brief.pdf"},
+                            "cache_control": {"type": "ephemeral"},
+                            "citations": {"enabled": False},
+                        },
+                        {"type": "text", "text": "summarize"},
+                    ],
+                }
+            ]
+        )
+    )
+    document = decoded.request.documents[0]
+    assert document.url == "https://example.com/brief.pdf"
+    assert document.data is None
+    assert document.cache_control == {"type": "ephemeral"}
+
+
+def test_document_sent_once_survives_a_multi_turn_thread() -> None:
+    """A PDF in an earlier user turn is retained when later turns reference it."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [_pdf_block(), {"type": "text", "text": "what is the title"}],
+                },
+                {"role": "assistant", "content": "Minimal PDF."},
+                {"role": "user", "content": "and the page count?"},
+            ]
+        )
+    )
+    assert [len(message.documents) for message in decoded.request.messages] == [1, 0, 0]
+    assert decoded.request.messages[-1].content_parts == ()
+
+
+@pytest.mark.parametrize(
+    ("block", "param"),
+    [
+        (
+            {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "text/plain", "data": "aGk="},
+            },
+            "messages.0.content.0.source",
+        ),
+        (
+            {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "!!"},
+            },
+            "messages.0.content.0.source",
+        ),
+        (
+            {"type": "document", "source": {"type": "url", "url": "ftp://example.com/a.pdf"}},
+            "messages.0.content.0.source",
+        ),
+        (_pdf_block(citations={"enabled": True}), "messages.0.content.0.citations"),
+    ],
+)
+def test_unservable_document_blocks_are_rejected_at_their_path(
+    block: JsonObject, param: str
+) -> None:
+    """A document the gateway cannot forward is rejected loudly, never dropped."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(_body(messages=[{"role": "user", "content": [block]}]))
+    assert excinfo.value.detail.param == param
+
+
+def test_files_api_document_sources_are_rejected() -> None:
+    """A ``file`` source names an upload this gateway does not host."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "document", "source": {"type": "file", "file_id": "file_1"}}
+                        ],
+                    }
+                ]
+            )
+        )
+
+
+def test_assistant_document_blocks_are_rejected() -> None:
+    """Only a caller message may carry a document."""
+    with pytest.raises(OpenAIProtocolError, match="only valid in user messages"):
+        decode_messages(_body(messages=[{"role": "assistant", "content": [_pdf_block()]}]))
+
+
+def test_too_many_documents_are_rejected() -> None:
+    """The per-request document ceiling fails closed with the ceiling named."""
+    with pytest.raises(OpenAIProtocolError, match="at most 5 documents"):
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [_pdf_block() for _ in range(MAXIMUM_DOCUMENTS_PER_REQUEST + 1)],
+                    }
+                ]
+            )
+        )
 
 
 def test_role_misplaced_blocks_and_empty_content_are_rejected() -> None:

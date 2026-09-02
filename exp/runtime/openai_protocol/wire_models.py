@@ -13,7 +13,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.types import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import MAXIMUM_IMAGE_BASE64_BYTES, MAXIMUM_VIDEO_BASE64_BYTES
+from exp.common.models.content import (
+    MAXIMUM_DOCUMENT_BASE64_BYTES,
+    MAXIMUM_DOCUMENT_NAME_CHARACTERS,
+    MAXIMUM_IMAGE_BASE64_BYTES,
+    MAXIMUM_VIDEO_BASE64_BYTES,
+)
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
@@ -99,8 +104,60 @@ class _ChatVideoPart(_WireModel):
     video_url: _ChatVideoUrl
 
 
+_MAXIMUM_FILE_DATA_CHARACTERS = MAXIMUM_DOCUMENT_BASE64_BYTES + 128
+"""Room for the largest inline document plus its ``data:`` URL preamble."""
+
+
+class _ChatFile(_WireModel):
+    """Chat Completions ``file`` payload: inline ``file_data`` with a filename.
+
+    ``file_id`` names an uploaded file this gateway does not host, so only
+    the null form of that field is accepted.
+    """
+
+    file_data: str = Field(min_length=1, max_length=_MAXIMUM_FILE_DATA_CHARACTERS)
+    filename: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
+    file_id: None = None
+
+
+class _ChatFilePart(_WireModel):
+    """One Chat Completions ``file`` content part."""
+
+    type: Literal["file"]
+    file: _ChatFile
+
+
+class _ResponsesFilePart(_WireModel):
+    """One Responses ``input_file`` content part.
+
+    Exactly one of inline ``file_data`` or a remote ``file_url`` is present;
+    ``file_id`` names an uploaded file this gateway does not host, so only
+    the null form of that field is accepted.
+    """
+
+    type: Literal["input_file"]
+    file_data: str | None = Field(
+        default=None, min_length=1, max_length=_MAXIMUM_FILE_DATA_CHARACTERS
+    )
+    file_url: str | None = Field(default=None, min_length=1, max_length=8_192)
+    filename: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
+    file_id: None = None
+
+    @model_validator(mode="after")
+    def _require_one_carrier(self) -> _ResponsesFilePart:
+        """Require exactly one of ``file_data`` or ``file_url``."""
+        if (self.file_data is None) == (self.file_url is None):
+            raise ValueError("input_file needs exactly one of file_data or file_url")
+        return self
+
+
 _ContentPart = Annotated[
-    _TextPart | _ChatImagePart | _ResponsesImagePart | _ChatVideoPart,
+    _TextPart
+    | _ChatImagePart
+    | _ResponsesImagePart
+    | _ChatVideoPart
+    | _ChatFilePart
+    | _ResponsesFilePart,
     Field(discriminator="type"),
 ]
 """One accepted content part on either OpenAI-style request surface."""

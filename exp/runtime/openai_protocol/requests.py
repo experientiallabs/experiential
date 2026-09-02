@@ -20,8 +20,10 @@ from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.content import (
+    DocumentContentPart,
     MessageContentPart,
     TextContentPart,
+    document_part_from_file_data,
     image_part_from_url,
     video_part_from_url,
 )
@@ -68,6 +70,7 @@ from exp.runtime.openai_protocol.responses_input import (
 from exp.runtime.openai_protocol.wire_models import (
     _AdditionalToolsItem,
     _AssistantToolCall,
+    _ChatFilePart,
     _ChatImagePart,
     _ChatRequest,
     _ChatResponseFormat,
@@ -82,6 +85,7 @@ from exp.runtime.openai_protocol.wire_models import (
     _ResponseFunctionCall,
     _ResponseMessage,
     _ResponseReasoningItem,
+    _ResponsesFilePart,
     _ResponsesInputItem,
     _ResponsesRequest,
     _ResponseText,
@@ -491,6 +495,10 @@ def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
             continue
         if text in _OUTPUT_ITEM_VARIANTS and cleaned and cleaned[-1].isdigit():
             continue
+        # A discriminated part whose tag is also its payload field name
+        # (``file.file``, ``image_url.image_url``) reports the tag once.
+        if cleaned and cleaned[-1] == text and not text.isdigit():
+            continue
         cleaned.append(text)
     return tuple(cleaned)
 
@@ -584,6 +592,12 @@ def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     location = max((cleaned for cleaned, _ in best), key=len, default=())
     param = ".".join(location) or "body"
     details = [detail for cleaned, detail in best if cleaned == location]
+    if param == "body":
+        # A whole-request rule (such as the attachment count ceiling) has no
+        # field of its own, so its own wording is the only useful message.
+        for detail in details:
+            if detail["type"] == "value_error":
+                return invalid_field(param, detail["msg"].removeprefix("Value error, ") + ".")
     return invalid_field(param, _shape_message(param, details))
 
 
@@ -647,20 +661,21 @@ def _message_content(
     content: str | tuple[_ContentPart, ...] | None,
     param: str,
 ) -> tuple[str | None, tuple[MessageContentPart, ...]]:
-    """Flatten wire content parts, retaining media in the caller's order.
+    """Flatten wire content parts, retaining attachments in the caller's order.
 
     Args:
         content: Wire content: plain text, ordered parts, or absent.
-        param: Public parameter path used to report an invalid image or video.
+        param: Public parameter path used to report an invalid attachment.
 
     Returns:
-        The flattened text and, only for a message that carries an image or
-        a video, the ordered canonical parts. A text-only message keeps its
-        previous representation exactly, so nothing downstream changes for it.
+        The flattened text and, only for a message that carries an image,
+        a video, or a document, the ordered canonical parts. A text-only
+        message keeps its previous representation exactly, so nothing
+        downstream changes for it.
 
     Raises:
         OpenAIProtocolError: An image or video reference is not a supported
-            URL or base64 data URL.
+            URL or base64 data URL, or a file is not an inline PDF.
     """
     if content is None or isinstance(content, str):
         return content, ()
@@ -686,6 +701,9 @@ def _message_content(
                     "of an MP4, MPEG, QuickTime, WebM, FLV, 3GPP, or WMV video.",
                 ) from exc
             continue
+        if isinstance(part, (_ChatFilePart, _ResponsesFilePart)):
+            parts.append(_document_part(part, f"{param}.{index}"))
+            continue
         url, detail = (
             (part.image_url.url, part.image_url.detail)
             if isinstance(part, _ChatImagePart)
@@ -704,6 +722,40 @@ def _message_content(
     if all(part.kind == "text" for part in parts):
         return text, ()
     return text, tuple(parts)
+
+
+def _document_part(part: _ChatFilePart | _ResponsesFilePart, param: str) -> DocumentContentPart:
+    """Convert one ``file`` or ``input_file`` part into the canonical document.
+
+    Args:
+        part: Validated caller file part.
+        param: Public parameter path of the part, used to report an invalid file.
+
+    Returns:
+        The canonical document part carrying the caller's bytes or URL.
+
+    Raises:
+        OpenAIProtocolError: The file data is not an inline PDF.
+    """
+    if isinstance(part, _ChatFilePart):
+        file_data, filename, location = part.file.file_data, part.file.filename, f"{param}.file"
+    elif part.file_data is None:
+        try:
+            return DocumentContentPart(url=part.file_url, name=part.filename or None)
+        except ValueError as exc:
+            raise invalid_field(
+                f"{param}.file_url", f"'{param}.file_url' must be an http(s) URL."
+            ) from exc
+    else:
+        file_data, filename, location = part.file_data, part.filename, param
+    try:
+        return document_part_from_file_data(file_data, name=filename)
+    except ValueError as exc:
+        raise invalid_field(
+            f"{location}.file_data",
+            f"'{location}.file_data' must be the base64 bytes of a PDF, bare or as a "
+            "data:application/pdf;base64 URL, within the size limit.",
+        ) from exc
 
 
 def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:

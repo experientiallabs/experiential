@@ -18,7 +18,12 @@ from pydantic import (
 )
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
-from exp.common.models.content import ImageContentPart, MessageContentPart, VideoContentPart
+from exp.common.models.content import (
+    DocumentContentPart,
+    ImageContentPart,
+    MessageContentPart,
+    VideoContentPart,
+)
 from exp.common.tasks import ToolSchema
 
 ModelAlias = ArtifactId
@@ -273,7 +278,7 @@ class ModelMessage(ContractModel):
     tool_call_id: str | None = None
     assistant_action: AssistantAction | None = None
     content_parts: tuple[MessageContentPart, ...] = Field(default=(), exclude=True)
-    """Ordered caller content parts when a user message carries images or videos.
+    """Ordered caller content parts when a user message carries attachments.
 
     Empty on every text-only message. The text parts concatenate to
     ``content``, so selectors, simulators, and persisted artifacts keep
@@ -310,6 +315,11 @@ class ModelMessage(ContractModel):
     def videos(self) -> tuple[VideoContentPart, ...]:
         """Return this message's video parts in caller order."""
         return tuple(part for part in self.content_parts if part.kind == "video")
+
+    @property
+    def documents(self) -> tuple[DocumentContentPart, ...]:
+        """Return this message's document parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "document")
 
 
 class ModelFinishReason(StrEnum):

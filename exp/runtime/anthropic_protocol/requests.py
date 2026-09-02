@@ -10,11 +10,12 @@ Anthropic rungs; ``cache_control`` annotations are validated
 everywhere and carried on the surfaces the Anthropic wire caches natively
 (text and image content blocks, tool_use blocks, tool definitions, and the
 top-level automatic marker), and dropped on wires that do not cache a marked
-block because a cache hint changes cost, not semantics; ``image`` blocks are
-retained as canonical content parts so a
-route that declares image input carries them, and ``document`` blocks are
-rejected loudly because the serving surface cannot preserve them.
-Unknown or unsupported fields are rejected with a
+block because a cache hint changes cost, not semantics; ``image`` and PDF
+``document`` blocks are retained as canonical content parts so a route that
+declares the matching input capability carries them, while a document
+inside ``tool_result`` content is rejected loudly because the serving
+surface cannot preserve it there; ``video`` blocks are rejected because the
+wire defines none. Unknown or unsupported fields are rejected with a
 field-specific error, never silently dropped. Errors raise
 :class:`OpenAIProtocolError` so the shared boundary stays single-authority;
 the HTTP layer renders them in the Anthropic envelope.
@@ -30,8 +31,12 @@ from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
+    DOCUMENT_MEDIA_TYPES,
     IMAGE_MEDIA_TYPES,
+    MAXIMUM_DOCUMENT_BASE64_BYTES,
+    MAXIMUM_DOCUMENT_NAME_CHARACTERS,
     MAXIMUM_IMAGE_BASE64_BYTES,
+    DocumentContentPart,
     ImageContentPart,
     MessageContentPart,
     TextContentPart,
@@ -63,12 +68,14 @@ from exp.runtime.openai_protocol.errors import (
 from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 
-_REJECTED_BLOCK_HINTS = {
-    "document": "document blocks are not supported: this gateway surface serves text and images",
-    "video": (
-        "video blocks are not supported: the Anthropic Messages wire defines no video "
-        "content, so send video on the Chat Completions surface"
-    ),
+_VIDEO_HINT = (
+    "video blocks are not supported: the Anthropic Messages wire defines no video "
+    "content, so send video on the Chat Completions surface"
+)
+_REJECTED_BLOCK_HINTS = {"video": _VIDEO_HINT}
+_REJECTED_TOOL_RESULT_BLOCK_HINTS = {
+    "document": "document blocks are not supported inside tool_result content",
+    "video": _VIDEO_HINT,
 }
 
 
@@ -118,6 +125,37 @@ class _ImageBlock(_WireModel):
     cache_control: _CacheControl | None = None
 
 
+class _DocumentSource(_WireModel):
+    """Where one document block's bytes come from: inline base64 or a URL.
+
+    ``file`` sources name an uploaded Files API object this gateway does not
+    host and ``text``/``content`` sources carry non-PDF documents no other
+    wire accepts, so only the two carriers every declared route can serve
+    are accepted.
+    """
+
+    type: Literal["base64", "url"]
+    media_type: str | None = Field(default=None, max_length=64)
+    data: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_BASE64_BYTES)
+    url: str | None = Field(default=None, max_length=8_192)
+
+
+class _DocumentCitations(_WireModel):
+    """Per-document citations toggle; only the disabled form is servable."""
+
+    enabled: bool
+
+
+class _DocumentBlock(_WireModel):
+    """One caller PDF document content block."""
+
+    type: Literal["document"]
+    source: _DocumentSource
+    title: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
+    citations: _DocumentCitations | None = None
+    cache_control: _CacheControl | None = None
+
+
 class _ThinkingBlock(_WireModel):
     """Extended-thinking assistant history block, carried verbatim."""
 
@@ -146,11 +184,9 @@ class _ToolUseBlock(_WireModel):
 class _ToolResultBlock(_WireModel):
     """One tool result the caller returns for a prior assistant tool call.
 
-    ``is_error`` is carried on the canonical tool message
-    (``GatewayMessage.tool_is_error``) so the Anthropic upstream dialect can
-    round-trip it losslessly; the OpenAI-family wire formats have no
-    tool-error flag, so on those routes the error state travels in the
-    result text the model reads.
+    ``is_error`` rides the canonical tool message (``GatewayMessage.tool_is_error``)
+    so Anthropic rungs round-trip it losslessly; OpenAI-family wires have no
+    tool-error flag, so there the error state travels in the result text.
     """
 
     type: Literal["tool_result"]
@@ -163,10 +199,9 @@ class _ToolResultBlock(_WireModel):
 class _ServerToolUseBlock(BaseModel):
     """One server-tool invocation echoed in history, carried shallowly.
 
-    Server-tool block shapes are an evolving provider surface; a closed
-    model here would recreate the reject-what-real-clients-send incident
-    class, so only the discriminator is validated and the raw block forwards
-    byte-for-byte on native Anthropic rungs.
+    Server-tool block shapes are an evolving provider surface; a closed model
+    here would recreate the reject-what-real-clients-send incident class, so only
+    the discriminator is validated and the raw block forwards byte-for-byte.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -185,6 +220,7 @@ class _WebSearchToolResultBlock(BaseModel):
 _ContentBlock = (
     _TextBlock
     | _ImageBlock
+    | _DocumentBlock
     | _ThinkingBlock
     | _RedactedThinkingBlock
     | _ToolUseBlock
@@ -210,10 +246,9 @@ class _Message(_WireModel):
 class _Tool(_WireModel):
     """One caller-defined custom tool with its JSON Schema declaration.
 
-    The description bound is generous on purpose: the provider accepts
-    40k-character descriptions live (verified 2026-08-30) and a real Claude
-    Code toolset exceeded the earlier 8k bound; the request-body size cap
-    remains the effective total limit.
+    The description bound is generous on purpose: the provider accepts 40k
+    character descriptions live (verified 2026-08-30) and a real Claude Code
+    toolset exceeded an 8k bound; the request-body cap is the effective limit.
 
     ``eager_input_streaming``, ``defer_loading``, ``allowed_callers``, and
     ``input_examples`` are provider-native tool annotations the live API
@@ -238,10 +273,10 @@ class _Tool(_WireModel):
 class _ServerTool(BaseModel):
     """One Anthropic server tool, validated shallowly and carried verbatim.
 
-    Server tools (``web_search_20250305``-style) execute at the provider and
-    carry no ``input_schema``; their per-type configuration is an evolving
-    provider surface, so only the discriminator pair is validated and the
-    raw entry forwards byte-for-byte on native Anthropic rungs.
+    Server tools (``web_search_20250305``-style) execute at the provider and carry
+    no ``input_schema``; their per-type configuration is an evolving provider
+    surface, so only the discriminator pair is validated and the raw entry
+    forwards byte-for-byte on native Anthropic rungs.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -578,6 +613,10 @@ def _validation_error(first: ErrorDetails) -> OpenAIProtocolError:
             param,
             f"Unknown parameter '{param}'. Remove the field and resend the request.",
         )
+    if param == "body" and first["type"] == "value_error":
+        # A whole-request rule (such as the attachment count ceiling) has no
+        # field of its own, so its own wording is the only useful message.
+        return invalid_field(param, first["msg"].removeprefix("Value error, ") + ".")
     return invalid_field(param, f"Invalid value for '{param}': {first['msg']}.")
 
 
@@ -600,11 +639,13 @@ def _rejected_block_hint(payload: JsonObject) -> str | None:
                 block_object.get("content"), list
             ):
                 for inner in cast(list[object], block_object["content"]):
-                    if (
-                        isinstance(inner, dict)
-                        and str(cast(JsonObject, inner).get("type")) in _REJECTED_BLOCK_HINTS
-                    ):
-                        return _REJECTED_BLOCK_HINTS[str(cast(JsonObject, inner).get("type"))]
+                    if not isinstance(inner, dict):
+                        continue
+                    hint = _REJECTED_TOOL_RESULT_BLOCK_HINTS.get(
+                        str(cast(JsonObject, inner).get("type"))
+                    )
+                    if hint is not None:
+                        return hint
     return None
 
 
@@ -641,6 +682,49 @@ def _image_part(block: _ImageBlock, param: str) -> ImageContentPart:
             f"{param}.source",
             f"'{param}.source' must carry an http(s) URL or base64 data "
             "for a PNG, JPEG, GIF, or WebP image.",
+        ) from exc
+
+
+def _document_part(block: _DocumentBlock, param: str) -> DocumentContentPart:
+    """Convert one Anthropic document block into the canonical document part.
+
+    Args:
+        block: Validated caller document block.
+        param: Public parameter path used to report an invalid document.
+
+    Returns:
+        The canonical document part carrying the caller's bytes or URL.
+
+    Raises:
+        OpenAIProtocolError: The source is not a PDF this gateway forwards,
+            or the block enables citations.
+    """
+    if block.citations is not None and block.citations.enabled:
+        raise invalid_field(
+            f"{param}.citations",
+            "document citations are not supported over this gateway; "
+            "send citations.enabled as false or omit the field.",
+        )
+    source = block.source
+    marker = (
+        block.cache_control.model_dump(mode="json", exclude_none=True)
+        if block.cache_control is not None
+        else None
+    )
+    try:
+        if source.type == "url":
+            return DocumentContentPart(url=source.url, name=block.title, cache_control=marker)
+        return DocumentContentPart(
+            media_type=DOCUMENT_MEDIA_TYPES[source.media_type or ""],
+            data=source.data,
+            name=block.title,
+            cache_control=marker,
+        )
+    except (KeyError, ValueError) as exc:
+        raise invalid_field(
+            f"{param}.source",
+            f"'{param}.source' must carry an http(s) URL or base64 data for a PDF "
+            "(media_type application/pdf).",
         ) from exc
 
 
@@ -763,14 +847,14 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
     def flush() -> None:
         """Emit the pending content, tool calls, and reasoning as one message."""
         content = "".join(part.text for part in text_parts) if text_parts else None
-        images = any(part.kind == "image" for part in content_parts)
-        if content is None and not tool_calls and not reasoning and not images:
+        attachments = any(part.kind != "text" for part in content_parts)
+        if content is None and not tool_calls and not reasoning and not attachments:
             return
         out.append(
             GatewayMessage(
                 role=message.role,
-                content=content or ("" if images else None),
-                content_parts=tuple(content_parts) if images else (),
+                content=content or ("" if attachments else None),
+                content_parts=tuple(content_parts) if attachments else (),
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
                 # The marked run is carried alongside the retained parts: its
@@ -819,6 +903,13 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     "image blocks are only valid in user messages.",
                 )
             content_parts.append(_image_part(block, f"{param}.content.{block_index}"))
+        elif isinstance(block, _DocumentBlock):
+            if message.role != "user":
+                raise invalid_field(
+                    f"{param}.content.{block_index}",
+                    "document blocks are only valid in user messages.",
+                )
+            content_parts.append(_document_part(block, f"{param}.content.{block_index}"))
         elif isinstance(block, (_ThinkingBlock, _RedactedThinkingBlock)):
             if message.role != "assistant":
                 raise invalid_field(
