@@ -48,6 +48,22 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
 }
 
 
+_IMAGE_CAPABILITY_MESSAGES = {
+    "image_input": (
+        "The selected model route cannot accept image input. "
+        "Send text only or choose an image-capable model alias."
+    ),
+    "image_url_input": (
+        "The selected model route accepts inline image data only. "
+        "Send the image as a base64 data URL or choose a different model alias."
+    ),
+}
+"""Why an image was refused, since the field itself is the caller's message.
+
+The shared unsupported-field wording asks the caller to remove the named
+field, which no image request can do: the field is the conversation."""
+
+
 def capability_param(
     capability: str,
     surface: GatewayApiSurface,
@@ -83,6 +99,14 @@ def public_capability_error(
             public_tools=public_tools,
         )
     )
+    image_reason = _IMAGE_CAPABILITY_MESSAGES.get(error.capability)
+    if param is not None and image_reason is not None:
+        return OpenAIProtocolError(
+            status_code=400,
+            code="unsupported_capability",
+            message=image_reason,
+            param=param,
+        )
     if param is not None:
         return unsupported_field(param, capability=True)
     return OpenAIProtocolError(

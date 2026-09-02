@@ -49,6 +49,48 @@ _STREAMING_TOOL_ARGUMENTS_OPTION = typer.Option(
     None,
     "--supports-streaming-tool-arguments/--no-supports-streaming-tool-arguments",
 )
+_IMAGE_INPUT_OPTION = typer.Option(False, "--supports-image-input")
+_IMAGE_URL_INPUT_OPTION = typer.Option(
+    None,
+    "--supports-image-url-input/--no-supports-image-url-input",
+)
+
+IMAGE_URL_PROVIDERS = frozenset({"anthropic", "azure", "openai", "openrouter"})
+"""Providers whose wire fetches a caller image URL on the gateway's behalf.
+
+Every other adapter, notably Gemini, Vertex, and Bedrock, accepts inline bytes
+only, so a route on one of those providers must not claim URL input."""
+
+
+def _declared_image_url_input(
+    *,
+    provider: str,
+    supports_image_input: bool,
+    supports_image_url_input: bool | None,
+) -> bool:
+    """Resolve the route's remote image URL declaration.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        supports_image_input: Whether the route carries image content at all.
+        supports_image_url_input: Explicit operator declaration, if any.
+
+    Returns:
+        Whether the route may forward a caller-supplied image URL.
+
+    Raises:
+        ValueError: URL input is claimed without image input, or on a provider
+            whose wire cannot fetch a caller URL.
+    """
+    if supports_image_url_input is None:
+        return supports_image_input and provider in IMAGE_URL_PROVIDERS
+    if not supports_image_url_input:
+        return False
+    if not supports_image_input:
+        raise ValueError("--supports-image-url-input requires --supports-image-input")
+    if provider not in IMAGE_URL_PROVIDERS:
+        raise ValueError(f"provider {provider!r} accepts inline image bytes only")
+    return True
 
 
 @alias_app.command("list")
@@ -73,6 +115,8 @@ def alias_create(
     supports_strict_tools: bool = typer.Option(False, "--supports-strict-tools"),
     supports_parallel_tool_calls: bool = typer.Option(False, "--supports-parallel-tool-calls"),
     supports_streaming_tool_arguments: bool | None = _STREAMING_TOOL_ARGUMENTS_OPTION,
+    supports_image_input: bool = _IMAGE_INPUT_OPTION,
+    supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
     input_price: int | None = typer.Option(None, "--input-price", min=0),
     cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
@@ -102,6 +146,8 @@ def alias_create(
             supports_strict_tools=supports_strict_tools,
             supports_parallel_tool_calls=supports_parallel_tool_calls,
             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
+            supports_image_input=supports_image_input,
+            supports_image_url_input=supports_image_url_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
                 input_micro_usd_per_million_tokens=input_price,
@@ -152,6 +198,8 @@ def alias_update(
     supports_strict_tools: bool = typer.Option(False, "--supports-strict-tools"),
     supports_parallel_tool_calls: bool = typer.Option(False, "--supports-parallel-tool-calls"),
     supports_streaming_tool_arguments: bool | None = _STREAMING_TOOL_ARGUMENTS_OPTION,
+    supports_image_input: bool = _IMAGE_INPUT_OPTION,
+    supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
     input_price: int | None = typer.Option(None, "--input-price", min=0),
     cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
@@ -181,6 +229,8 @@ def alias_update(
             supports_strict_tools=supports_strict_tools,
             supports_parallel_tool_calls=supports_parallel_tool_calls,
             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
+            supports_image_input=supports_image_input,
+            supports_image_url_input=supports_image_url_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
                 input_micro_usd_per_million_tokens=input_price,
@@ -254,6 +304,8 @@ def _activate(
     supports_strict_tools: bool,
     supports_parallel_tool_calls: bool,
     supports_streaming_tool_arguments: bool | None,
+    supports_image_input: bool,
+    supports_image_url_input: bool | None,
     maximum_output_tokens: int | None,
     prices: GatewayTokenPrices,
     pricing_source: str | None,
@@ -312,6 +364,12 @@ def _activate(
                 supports_strict_tools=supports_strict_tools,
                 supports_parallel_tool_calls=supports_parallel_tool_calls,
                 supports_structured_text=supports_structured_output,
+                supports_image_input=supports_image_input,
+                supports_image_url_input=_declared_image_url_input(
+                    provider=provider,
+                    supports_image_input=supports_image_input,
+                    supports_image_url_input=supports_image_url_input,
+                ),
             ),
             prices=prices,
             pricing_source=pricing_source,

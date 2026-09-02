@@ -365,6 +365,125 @@ def test_direct_alias_uses_provider_certification_for_tool_streaming(
     assert not replaced_custom.gateway.capabilities.supports_streaming_tool_arguments
 
 
+def test_direct_alias_declares_image_capabilities_per_provider(tmp_path: Path) -> None:
+    """Only a URL-fetching provider may carry a caller's remote image URL."""
+    runner = CliRunner()
+    commands = (
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "oai",
+            "--provider",
+            "openai",
+            "--credential-env",
+            "OPENAI_API_KEY",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "google",
+            "--provider",
+            "gemini",
+            "--credential-env",
+            "GEMINI_API_KEY",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+    for alias, deployment in (("oai-vision", "oai:gpt-fixture"), ("gem-vision", "google:gem")):
+        created = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "alias",
+                "create",
+                alias,
+                "--deployment",
+                deployment,
+                "--exact-model",
+                alias,
+                "--supports-image-input",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        assert created.exit_code == 0, created.output
+    text_only = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "create",
+            "oai-text",
+            "--deployment",
+            "oai:gpt-fixture",
+            "--exact-model",
+            "oai-text",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert text_only.exit_code == 0, text_only.output
+
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    declarations: dict[str, tuple[bool, bool]] = {}
+    for alias in ("oai-vision", "gem-vision", "oai-text"):
+        gateway = catalog.models[alias].gateway
+        assert gateway is not None
+        declarations[alias] = (
+            gateway.capabilities.supports_image_input,
+            gateway.capabilities.supports_image_url_input,
+        )
+    assert declarations == {
+        "oai-vision": (True, True),
+        "gem-vision": (True, False),
+        "oai-text": (False, False),
+    }
+
+    inline_only = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "update",
+            "gem-vision",
+            "--deployment",
+            "google:gem",
+            "--exact-model",
+            "gem-vision",
+            "--supports-image-input",
+            "--supports-image-url-input",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert inline_only.exit_code != 0
+    assert "inline image bytes only" in inline_only.output
+
+
 def test_direct_alias_preserves_tool_streaming_across_credential_env_rotation(
     tmp_path: Path,
 ) -> None:
