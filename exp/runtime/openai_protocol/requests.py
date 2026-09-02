@@ -391,6 +391,7 @@ def decode_responses(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            service_tier=request.service_tier,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
         )

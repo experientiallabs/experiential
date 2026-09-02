@@ -679,3 +679,4 @@ class _ResponsesRequest(_WireModel):
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
+    service_tier: Literal["auto", "default", "flex", "scale", "priority", "fast"] | None = None

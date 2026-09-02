@@ -860,6 +860,8 @@ def openai_responses_stream_payload(
     top_p_supported = supports_temperature if supports_top_p is None else supports_top_p
     if request.top_p is not None and top_p_supported:
         payload["top_p"] = request.top_p
+    if request.service_tier is not None:
+        payload["service_tier"] = request.service_tier
     # Native OpenAI Responses has no top-k request field. Never trust a
     # mistaken route declaration to send this extension to the API.
     del supports_top_k
