@@ -29,10 +29,10 @@ from exp.runtime.gateway.contracts import (
     DirectTarget,
     ExecutionSnapshot,
     GatewayApiSurface,
-    GatewayRequest,
     GatewayTarget,
     ProjectTarget,
 )
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
@@ -351,7 +351,7 @@ class _ReadyControlStore:
         *,
         raw_key: str,
         alias: str,
-        request: GatewayRequest,
+        request: ServingRequest,
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,

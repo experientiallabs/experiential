@@ -24,6 +24,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.execution_resolution import (
     GatewayWireContractError,
     _require_deployment_identity,
@@ -95,7 +96,7 @@ class InflightRequest:
 
     authorization: AuthorizationSnapshot
     route: GatewayRoute
-    request: GatewayRequest
+    request: ServingRequest
     deadline_monotonic: float
     attempt_counts: list[int] = field(default_factory=list)
     total_attempts: int = 0

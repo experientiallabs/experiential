@@ -765,6 +765,12 @@ class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
             authority = entry.reasoning_carrier_authorities[route_depth]
             if authority is None or authority.reasoning_route_sha256 != route_sha256:
                 raise ValueError("reasoning carrier route differs from the active attempt")
+            # Reasoning carriers exist only on the message-bearing completion
+            # surfaces; the embeddings dispatch never seals one, so a non-chat
+            # request reaching here is a fail-loud contract violation, not a
+            # silent access of an absent ``messages`` leg.
+            if not isinstance(entry.request, GatewayRequest):
+                raise ValueError("reasoning carrier is not valid for this request surface")
             carrier = seal_reasoning_content(
                 authority,
                 issuing_request_id=request_id,

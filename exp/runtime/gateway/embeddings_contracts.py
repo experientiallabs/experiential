@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import Field, field_validator
 
 from exp.common.core.artifacts import ContractModel
-from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 
 
 class EmbeddingsRequest(ContractModel):
@@ -46,3 +46,13 @@ class EmbeddingsRequest(ContractModel):
         if any(not text for text in value):
             raise ValueError("embedding inputs must not be empty strings")
         return value
+
+
+ServingRequest = GatewayRequest | EmbeddingsRequest
+"""One admitted serving request across every public surface.
+
+The money, auth, and accounting seams widen from ``GatewayRequest`` to this
+union so a chat-assuming reader cannot duck-type onto an embeddings request and
+touch an absent leg (messages, output tokens): ``ty`` enumerates every reader
+that must now handle the embeddings arm, and each branches exhaustively.
+"""

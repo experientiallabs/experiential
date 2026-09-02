@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from typing import assert_never
+
 from exp.common.core.artifacts import JsonObject, Sha256, sha256_json
 from exp.runtime.gateway.contracts import EncryptedReasoningBlock, GatewayRequest
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 
 
 def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
@@ -132,7 +135,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
     return envelope
 
 
-def canonical_request_sha256(request: GatewayRequest) -> Sha256:
+def canonical_request_sha256(request: ServingRequest) -> Sha256:
     """Digest one canonical request including excluded provider replay authority.
 
     A caller operation key reused with different replayed reasoning must be
@@ -140,13 +143,22 @@ def canonical_request_sha256(request: GatewayRequest) -> Sha256:
     request with no carrier digests exactly as its plain serialization, so
     every request decoded before the carriers existed keeps its identity.
 
+    The embeddings surface has no messages, tools, or provider carriers, so it
+    digests exactly as its plain serialization with no replay envelope.
+
     Args:
-        request: Canonical gateway request as decoded from the public wire.
+        request: Canonical serving request as decoded from the public wire.
 
     Returns:
         The stable canonical request digest.
     """
-    envelope = provider_replay_authority(request)
-    if envelope is None:
-        return sha256_json(request)
-    return sha256_json({"request_sha256": sha256_json(request), **envelope})
+    match request:
+        case EmbeddingsRequest():
+            return sha256_json(request)
+        case GatewayRequest():
+            envelope = provider_replay_authority(request)
+            if envelope is None:
+                return sha256_json(request)
+            return sha256_json({"request_sha256": sha256_json(request), **envelope})
+        case _:  # pragma: no cover - exhaustive over the ServingRequest union.
+            assert_never(request)

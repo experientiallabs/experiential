@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import assert_never
 
 from exp.common.core.artifacts import Sha256, sha256_json
 from exp.runtime.gateway.auth import (
@@ -29,6 +30,7 @@ from exp.runtime.gateway.contracts import (
     GatewayTarget,
     ProjectTarget,
 )
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.sqlite import key_delivery
@@ -643,7 +645,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         *,
         raw_key: str,
         alias: str,
-        request: GatewayRequest,
+        request: ServingRequest,
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,
@@ -700,7 +702,15 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 activation_ref=str(row["activation_ref"]),
                 catalog_sha256=str(row["catalog_sha256"]),
             )
-        caller_operation = _caller_operation_sha256(request)
+        match request:
+            case EmbeddingsRequest():
+                # Keyed replay is deferred for the embeddings surface: it carries
+                # no idempotency key and never claims a caller-operation scope.
+                caller_operation = None
+            case GatewayRequest():
+                caller_operation = _caller_operation_sha256(request)
+            case _:  # pragma: no cover - exhaustive over the ServingRequest union.
+                assert_never(request)
         return AuthorizationSnapshot(
             request_id=f"request-{uuid.uuid4().hex}",
             organization_id=organization_id,

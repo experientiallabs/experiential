@@ -17,6 +17,7 @@ from exp.runtime.gateway.contracts import (
     ProjectSelection,
     ProjectTarget,
 )
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
 
 
 class GatewayControlStore(Protocol):
@@ -35,7 +36,7 @@ class GatewayControlStore(Protocol):
         *,
         raw_key: str,
         alias: str,
-        request: GatewayRequest,
+        request: ServingRequest,
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,

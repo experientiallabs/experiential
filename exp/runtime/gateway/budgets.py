@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import assert_never
 
 from pydantic import Field, model_validator
 
@@ -20,6 +21,7 @@ from exp.common.models.gateway_catalog import (
 )
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
@@ -531,10 +533,50 @@ def budget_period_start(period: str) -> str:
 
 
 def maximum_attempt_cost_micro_usd(
-    request: GatewayRequest,
+    request: ServingRequest,
     deployment: ExactModelDeployment,
 ) -> int | None:
     """Return a conservative integer micro-USD ceiling for one physical call.
+
+    Dispatches on the serving surface: chat/responses/messages price an input
+    and an output leg, while embeddings price an input leg only (no output, no
+    provider replay carriers). Both reserve against the canonical byte length,
+    which never undercounts tokens, so the ceiling stays a hard upper bound and
+    a single call can never breach its budget; settlement charges actual tokens.
+    """
+    match request:
+        case EmbeddingsRequest():
+            return _embeddings_attempt_cost_micro_usd(request, deployment)
+        case GatewayRequest():
+            return _completion_attempt_cost_micro_usd(request, deployment)
+        case _:  # pragma: no cover - exhaustive over the ServingRequest union.
+            assert_never(request)
+
+
+def _embeddings_attempt_cost_micro_usd(
+    request: EmbeddingsRequest,
+    deployment: ExactModelDeployment,
+) -> int | None:
+    """Return a conservative input-only micro-USD ceiling for one embeddings call.
+
+    Embeddings have no output leg and carry no excluded provider input, so the
+    request's canonical UTF-8 byte length is the whole input upper bound and
+    only the input rate applies. A missing input rate unprices the route and
+    fails closed (``None``), matching the completion path's price discipline.
+    """
+    input_tokens = len(canonical_json_bytes(request))
+    input_rate = deployment.gateway.prices.input_micro_usd_per_million_tokens
+    if input_rate is None:
+        return None
+    maximum = (input_tokens * input_rate + 999_999) // 1_000_000
+    return maximum if maximum <= MAXIMUM_MICRO_USD else None
+
+
+def _completion_attempt_cost_micro_usd(
+    request: GatewayRequest,
+    deployment: ExactModelDeployment,
+) -> int | None:
+    """Return a conservative integer micro-USD ceiling for one chat/responses call.
 
     Canonical UTF-8 bytes conservatively upper-bound input tokens. The caller's output ceiling
     wins when present, then the frozen deployment limit, then a reservation-only default bounded
