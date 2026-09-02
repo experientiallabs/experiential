@@ -493,6 +493,10 @@ def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
             continue
         if text in _OUTPUT_ITEM_VARIANTS and cleaned and cleaned[-1].isdigit():
             continue
+        # A discriminated part whose tag is also its payload field name
+        # (``file.file``, ``image_url.image_url``) reports the tag once.
+        if cleaned and cleaned[-1] == text and not text.isdigit():
+            continue
         cleaned.append(text)
     return tuple(cleaned)
 
@@ -586,6 +590,12 @@ def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     location = max((cleaned for cleaned, _ in best), key=len, default=())
     param = ".".join(location) or "body"
     details = [detail for cleaned, detail in best if cleaned == location]
+    if param == "body":
+        # A whole-request rule (such as the attachment count ceiling) has no
+        # field of its own, so its own wording is the only useful message.
+        for detail in details:
+            if detail["type"] == "value_error":
+                return invalid_field(param, detail["msg"].removeprefix("Value error, ") + ".")
     return invalid_field(param, _shape_message(param, details))
 
 

@@ -1981,17 +1981,18 @@ def test_documents_change_the_canonical_request_digest() -> None:
     [
         (_chat_file("data:text/plain;base64,aGk="), "messages.0.content.0.file.file_data"),
         (_chat_file("!!not base64"), "messages.0.content.0.file.file_data"),
-        ({"type": "file", "file": {"file_id": "file_1"}}, "messages.0.content.0"),
+        ({"type": "file", "file": {"file_id": "file_1"}}, "messages.0.content.0.file.file_data"),
+        ({"type": "image_url", "image_url": {}}, "messages.0.content.0.image_url.url"),
     ],
 )
 def test_unservable_chat_file_parts_are_rejected_at_their_field(
     part: JsonObject, param: str
 ) -> None:
-    """A file the gateway cannot forward names the offending field, never drops."""
+    """A part the gateway cannot forward names its real field (the union tag
+    that doubles as the payload key is reported once), never drops."""
     with pytest.raises(OpenAIProtocolError) as error:
         decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part]}]})
-    assert error.value.detail.param is not None
-    assert error.value.detail.param.startswith(param)
+    assert error.value.detail.param == param
 
 
 @pytest.mark.parametrize(
@@ -2018,8 +2019,8 @@ def test_assistant_file_parts_are_rejected() -> None:
 
 
 def test_too_many_chat_files_are_rejected() -> None:
-    """The per-request document ceiling fails closed."""
-    with pytest.raises(OpenAIProtocolError):
+    """The per-request document ceiling fails closed with the ceiling named."""
+    with pytest.raises(OpenAIProtocolError, match="at most 5 documents"):
         decode_chat(
             {
                 "model": "coding",

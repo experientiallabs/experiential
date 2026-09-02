@@ -611,6 +611,10 @@ def _validation_error(first: ErrorDetails) -> OpenAIProtocolError:
             param,
             f"Unknown parameter '{param}'. Remove the field and resend the request.",
         )
+    if param == "body" and first["type"] == "value_error":
+        # A whole-request rule (such as the attachment count ceiling) has no
+        # field of its own, so its own wording is the only useful message.
+        return invalid_field(param, first["msg"].removeprefix("Value error, ") + ".")
     return invalid_field(param, f"Invalid value for '{param}': {first['msg']}.")
 
 

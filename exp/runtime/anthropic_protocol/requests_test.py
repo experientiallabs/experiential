@@ -541,8 +541,8 @@ def test_assistant_document_blocks_are_rejected() -> None:
 
 
 def test_too_many_documents_are_rejected() -> None:
-    """The per-request document ceiling fails closed."""
-    with pytest.raises(OpenAIProtocolError):
+    """The per-request document ceiling fails closed with the ceiling named."""
+    with pytest.raises(OpenAIProtocolError, match="at most 5 documents"):
         decode_messages(
             _body(
                 messages=[
