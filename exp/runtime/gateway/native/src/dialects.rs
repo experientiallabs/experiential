@@ -373,7 +373,15 @@ impl Normalizer {
     /// failure (retry same deployment, then fail over) instead of a hard
     /// malformed reject. Any non-Gemini dialect, or a stream already terminated,
     /// keeps the original failure unchanged.
+    ///
+    /// A retained-output overflow is never recovered: it is a deliberate gateway
+    /// limit (`provider_output_too_large`), not a provider abnormality, so
+    /// converting it to `Incomplete` would deliver and bill an over-limit partial
+    /// instead of surfacing the overflow — regardless of dialect or content.
     pub fn recover_abnormal_end(&mut self, failure: Failure) -> Result<Vec<Event>, Failure> {
+        if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
+            return Err(failure);
+        }
         if self.terminal || self.dialect != Dialect::GeminiGenerateContent {
             return Err(failure);
         }
@@ -519,6 +527,22 @@ mod recover_abnormal_end_tests {
         assert!(matches!(recovered.first(), Some(Event::Usage(_))));
         assert!(matches!(recovered.last(), Some(Event::Incomplete)));
         assert!(normalizer.saw_terminal());
+    }
+
+    #[test]
+    fn an_output_overflow_is_never_recovered_even_after_content() {
+        // The retained-output ceiling is a deliberate gateway limit: a Gemini
+        // stream that emitted content and then overflowed must still surface
+        // `provider_output_too_large`, not be delivered and billed as a partial.
+        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+        feed_text(&mut normalizer, "hi");
+        let overflow = Failure::new(FailureClass::ProviderInternal, OUTPUT_OVERFLOW_MESSAGE);
+        let failure = normalizer
+            .recover_abnormal_end(overflow)
+            .expect_err("an overflow is not an abnormal end to salvage");
+        assert_eq!(failure.safe_message, OUTPUT_OVERFLOW_MESSAGE);
+        assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
+        assert!(!normalizer.saw_terminal());
     }
 
     #[test]
