@@ -62,7 +62,10 @@ def gemini_video_part(video: VideoContentPart) -> JsonObject:
         The native Gemini part carrying the video bytes or its URI.
     """
     if video.data is None:
-        return {"file_data": {"file_uri": video.url}}
+        file_data: JsonObject = {"file_uri": video.url}
+        if video.media_type is not None:
+            file_data["mime_type"] = video.media_type
+        return {"file_data": file_data}
     return {"inline_data": {"mime_type": video.media_type, "data": video.data}}
 
 

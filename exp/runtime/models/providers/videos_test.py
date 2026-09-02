@@ -47,7 +47,10 @@ def test_gemini_splits_inline_data_and_file_data() -> None:
         "inline_data": {"mime_type": "video/mp4", "data": _MP4_BASE64}
     }
     assert gemini_video_part(_REMOTE) == {
-        "file_data": {"file_uri": "https://example.com/clip.webm"}
+        "file_data": {"file_uri": "https://example.com/clip.webm", "mime_type": "video/webm"}
+    }
+    assert gemini_video_part(VideoContentPart(url="https://example.com/watch?v=abc")) == {
+        "file_data": {"file_uri": "https://example.com/watch?v=abc"}
     }
 
 

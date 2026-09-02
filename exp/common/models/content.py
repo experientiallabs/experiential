@@ -13,6 +13,7 @@ import base64
 import binascii
 import re
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, model_validator
 
@@ -80,6 +81,21 @@ _DATA_URL = re.compile(
     r"^data:(?P<media_type>[\w.+-]+/[\w.+-]+)(?P<parameters>;[^,]*)?,(?P<data>.*)$",
     re.DOTALL,
 )
+
+_VIDEO_URL_EXTENSIONS: dict[str, VideoMediaType] = {
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".flv": "video/x-flv",
+    ".3gp": "video/3gpp",
+    ".wmv": "video/x-ms-wmv",
+}
+"""Container suffixes whose media type a remote URL states on its own. Gemini
+requires a MIME type alongside a fetched HTTP URL, so the suffix is recorded
+when it is unambiguous; other URLs carry no media type."""
 
 
 class TextContentPart(ContractModel):
@@ -229,6 +245,22 @@ def image_part_from_url(
     return ImageContentPart(media_type=media_type, data=data, detail=detail)
 
 
+def _media_type_from_url(url: str) -> VideoMediaType | None:
+    """Return the media type a remote video URL's path suffix states, if any.
+
+    Args:
+        url: Remote http(s) URL of a video.
+
+    Returns:
+        The container media type for a known suffix, otherwise ``None``.
+    """
+    path = urlsplit(url).path.lower()
+    for suffix, media_type in _VIDEO_URL_EXTENSIONS.items():
+        if path.endswith(suffix):
+            return media_type
+    return None
+
+
 def video_part_from_url(url: str) -> VideoContentPart:
     """Build one video part from a caller URL, inlining a data URL's bytes.
 
@@ -245,7 +277,7 @@ def video_part_from_url(url: str) -> VideoContentPart:
     """
     match = _DATA_URL.match(url)
     if match is None:
-        return VideoContentPart(url=url)
+        return VideoContentPart(url=url, media_type=_media_type_from_url(url))
     media_type = VIDEO_MEDIA_TYPES.get(match["media_type"].lower())
     if media_type is None:
         raise ValueError(f"unsupported video media type {match['media_type']!r}")

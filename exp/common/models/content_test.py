@@ -137,7 +137,9 @@ def test_video_remote_url_keeps_no_bytes() -> None:
     part = video_part_from_url("https://example.com/clip.mp4")
     assert part.url == "https://example.com/clip.mp4"
     assert part.data is None
+    assert part.media_type == "video/mp4"
     assert part.data_url() == "https://example.com/clip.mp4"
+    assert video_part_from_url("https://example.com/clip?id=1").media_type is None
 
 
 def test_video_inline_requires_strict_base64() -> None:
