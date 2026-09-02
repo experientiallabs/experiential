@@ -246,11 +246,6 @@ def test_responses_decoder_rejects_conflicting_reasoning_summary_aliases() -> No
     ("decoder", "payload", "param"),
     (
         (
-            decode_chat,
-            {"model": "coding", "messages": [{"role": "user", "content": "x"}], "n": 2},
-            "n",
-        ),
-        (
             decode_responses,
             {"model": "coding", "input": "x", "background": True},
             "background",
@@ -2374,3 +2369,92 @@ def test_responses_surface_defines_no_video_part() -> None:
                 ],
             }
         )
+
+
+def test_copilot_hardcoded_no_op_values_decode_on_both_openai_surfaces() -> None:
+    """The exact VS Code Copilot custom-endpoint shapes decode end to end.
+
+    Wire-captured from VS Code 1.136 (2026-09-02): Copilot hardcodes ``n: 1``
+    (with ``stream_options.include_usage``, ``temperature: 0.1``,
+    ``top_p: 1``) on every Chat request and ``truncation: "disabled"`` plus
+    ``prompt_cache_options: {"mode": "implicit"}`` on every Responses
+    request; each rejection blocked the whole lane. The values are accepted
+    as already satisfied (this gateway serves one completion, never
+    truncates, and caches implicitly on served routes), never forwarded, and
+    disclose nothing because nothing is ignored.
+    """
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": 0.1,
+            "top_p": 1,
+            "n": 1,
+        }
+    )
+    assert chat.request.temperature == 0.1
+    assert chat.request.include_usage is True
+    assert chat.request.ignored_parameters == ()
+    assert "n" not in chat.request.model_dump(mode="json")
+
+    responses = decode_responses(
+        {
+            "model": "coding",
+            "input": "hello",
+            "truncation": "disabled",
+            "prompt_cache_options": {"mode": "implicit"},
+        }
+    )
+    assert responses.request.ignored_parameters == ()
+    dumped = responses.request.model_dump(mode="json")
+    assert "truncation" not in dumped
+    assert "prompt_cache_options" not in dumped
+
+
+@pytest.mark.parametrize(
+    ("decoder", "payload", "param", "fragment"),
+    (
+        (
+            decode_chat,
+            {"model": "coding", "messages": [{"role": "user", "content": "x"}], "n": 2},
+            "n",
+            "default of 1",
+        ),
+        (
+            decode_responses,
+            {"model": "coding", "input": "x", "truncation": "auto"},
+            "truncation",
+            "never truncates",
+        ),
+        (
+            decode_responses,
+            {"model": "coding", "input": "x", "prompt_cache_options": {"mode": "explicit"}},
+            "prompt_cache_options.mode",
+            "implicit",
+        ),
+        (
+            decode_responses,
+            {
+                "model": "coding",
+                "input": "x",
+                "prompt_cache_options": {"mode": "implicit", "ttl": "5m"},
+            },
+            "prompt_cache_options.ttl",
+            "",
+        ),
+    ),
+)
+def test_non_default_values_of_accepted_no_op_fields_stay_named_rejections(
+    decoder: Callable[[JsonObject], DecodedGatewayRequest],
+    payload: JsonObject,
+    param: str,
+    fragment: str,
+) -> None:
+    """Only the semantically satisfied value of each field is accepted."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decoder(payload)
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == param
+    assert fragment in captured.value.detail.message
