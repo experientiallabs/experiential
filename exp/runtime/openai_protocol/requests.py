@@ -289,12 +289,9 @@ def decode_responses(
         # 2026-08-29). The strict wire model owns those contracts, so the
         # official probe sees a normalized item.
         adapted: list[JsonValue] = []
-        for index, original in enumerate(cast("list[JsonValue]", raw)):
-            entry = (
-                _official_image_details(original, f"input.{index}")
-                if isinstance(original, dict)
-                else original
-            )
+        for index, entry in enumerate(cast("list[JsonValue]", raw)):
+            if isinstance(entry, dict):
+                entry = _official_image_details(entry, f"input.{index}")
             if isinstance(entry, dict) and entry.get("type") == "message":
                 item = {key: value for key, value in entry.items() if key != "phase"}
                 if item.get("id") is not None and "status" not in item:
@@ -426,8 +423,7 @@ def _official_image_details(entry: JsonObject, param: str) -> JsonObject:
     resolves an omitted level to ``auto``, while the installed SDK marks the
     field required. Only the official probe sees the resolved default: the
     strict wire model owns the real contract and keeps an unstated level
-    unstated on the provider wire. An ``input_audio`` part is refused by name,
-    since the live Responses API accepts no audio input on any model.
+    unstated on the provider wire. An ``input_audio`` part is refused by name.
     """
     content = entry.get("content")
     if not isinstance(content, list):
@@ -435,11 +431,9 @@ def _official_image_details(entry: JsonObject, param: str) -> JsonObject:
     parts: list[JsonValue] = []
     for index, part in enumerate(cast("list[JsonValue]", content)):
         if isinstance(part, dict) and part.get("type") == "input_audio":
-            raise OpenAIProtocolError(
-                status_code=400,
-                code="unsupported_parameter",
+            raise unsupported_field(
+                f"{param}.content.{index}.input_audio",
                 message="Audio input is not available on Responses; use Chat Completions.",
-                param=f"{param}.content.{index}.input_audio",
             )
         if isinstance(part, dict) and part.get("type") == "input_image" and "detail" not in part:
             parts.append({**part, "detail": "auto"})
@@ -728,16 +722,13 @@ def _message_content(
                 ) from exc
             continue
         if isinstance(part, _ChatAudioPart):
+            audio = part.input_audio
             try:
-                parts.append(
-                    audio_part_from_input_audio(part.input_audio.data, part.input_audio.format)
-                )
+                parts.append(audio_part_from_input_audio(audio.data, audio.format))
             except ValueError as exc:
                 location = f"{param}.{index}.input_audio"
-                raise invalid_field(
-                    location,
-                    f"'{location}' must carry base64 audio data with format 'wav' or 'mp3'.",
-                ) from exc
+                hint = f"'{location}' must carry base64 audio data with format 'wav' or 'mp3'."
+                raise invalid_field(location, hint) from exc
             continue
         if isinstance(part, (_ChatFilePart, _ResponsesFilePart)):
             parts.append(_document_part(part, f"{param}.{index}"))
