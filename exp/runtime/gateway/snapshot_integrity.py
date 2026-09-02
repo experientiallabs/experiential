@@ -16,6 +16,26 @@ from exp.common.models.gateway_catalog import read_pinned_normalized_snapshot
 _logger = logging.getLogger(__name__)
 
 
+def _has_symlink_component(root: Path, reference: Path) -> bool:
+    """Whether any path component from ``root`` up to ``reference`` is a symlink.
+
+    A symlink anywhere on the reference path (the file itself or any parent
+    directory) makes a read failure a present-but-unusable local entry rather
+    than a genuine remote-node absence, so the caller must fail closed.
+    """
+    current = reference
+    while current != root:
+        if current.is_symlink():
+            return True
+        parent = current.parent
+        if parent == current:
+            # Reached the filesystem root without meeting ``root``: treat as
+            # suspect rather than a clean absence.
+            return True
+        current = parent
+    return False
+
+
 def refuse_self_inconsistent_snapshot(
     state_dir: Path, snapshot_ref: str, catalog_sha256: str
 ) -> None:
@@ -47,34 +67,31 @@ def refuse_self_inconsistent_snapshot(
         raise ValueError("catalog snapshot reference escapes gateway state")
     try:
         data = snapshot_path.read_bytes()
-    except FileNotFoundError as exc:
-        # A broken symlink (or any dangling entry) at the reference is a PRESENT
-        # local filesystem object, not a genuine absence: it fails closed like an
-        # unreadable file rather than being waved through as a remote-node pin.
-        if reference_path.is_symlink():
-            _logger.error(
-                "gateway refused a catalog snapshot reference that is a broken symlink"
-            )
-            raise ValueError(
-                "catalog snapshot path is a broken symlink; refusing to pin"
-            ) from exc
-        # Genuinely absent: a pin whose content lives on another node. It cannot
-        # be verified here, so flag and proceed rather than block a legitimate
-        # cross-node activation (topology-agnostic).
-        _logger.warning(
-            "gateway snapshot content unverifiable at activation: the pinned "
-            "snapshot file is not present on this node; pinning without a content check"
-        )
-        return
     except OSError as exc:
-        # Present but unreadable (a permission or partial/corrupt-write fault):
-        # NOT the remote-node topology case, so fail the activation closed rather
-        # than pin a snapshot whose content was never verified.
+        # The ONLY tolerated failure is a genuine remote-node absence: the
+        # reference resolves through a real directory tree (no symlink at ANY
+        # component) and simply names a file not present on this node. Anything
+        # else -- a broken/dangling symlink at the reference or any parent, a
+        # non-regular entry, a permission or partial-read fault -- is a present-
+        # but-unusable LOCAL reference, so it fails closed rather than pinning a
+        # snapshot whose content was never verified.
+        if (
+            isinstance(exc, FileNotFoundError)
+            and not _has_symlink_component(root, reference_path)
+            and reference_path.parent.is_dir()
+        ):
+            _logger.warning(
+                "gateway snapshot content unverifiable at activation: the pinned "
+                "snapshot file is not present on this node; pinning without a content check"
+            )
+            return
         _logger.error(
-            "gateway refused an unreadable local catalog snapshot at activation (%s)",
+            "gateway refused an unusable local catalog snapshot reference at activation (%s)",
             type(exc).__name__,
         )
-        raise ValueError("catalog snapshot is present but unreadable; refusing to pin") from exc
+        raise ValueError(
+            "catalog snapshot reference is not a readable local file; refusing to pin"
+        ) from exc
     try:
         read_pinned_normalized_snapshot(data, catalog_sha256)
     except ValueError as exc:

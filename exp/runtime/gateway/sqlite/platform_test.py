@@ -244,15 +244,20 @@ def test_activation_refuses_a_self_inconsistent_snapshot(tmp_path: Path) -> None
     # Present but unreadable (here a directory at the path -> a non-absent OSError):
     # NOT the remote-node case, so it fails closed rather than pinning unverified.
     (tmp_path / "catalog-snapshots" / "unreadable.json").mkdir()
-    with pytest.raises(ValueError, match="present but unreadable"):
+    with pytest.raises(ValueError, match="not a readable local file"):
         refuse_self_inconsistent_snapshot(tmp_path, "catalog-snapshots/unreadable.json", digest)
 
-    # Broken symlink: a PRESENT dangling entry, not a genuine absence -> fails
-    # closed rather than being waved through as a remote-node pin.
+    # Broken symlink at the reference: a present dangling entry -> fails closed.
     broken = tmp_path / "catalog-snapshots" / "broken.json"
     broken.symlink_to(tmp_path / "catalog-snapshots" / "does-not-exist.json")
-    with pytest.raises(ValueError, match="broken symlink"):
+    with pytest.raises(ValueError, match="not a readable local file"):
         refuse_self_inconsistent_snapshot(tmp_path, "catalog-snapshots/broken.json", digest)
+
+    # A broken symlink at a PARENT component (the snapshots directory itself)
+    # also fails closed -- the reference is not a symlink but its parent is.
+    (tmp_path / "linked").symlink_to(tmp_path / "missing-dir")
+    with pytest.raises(ValueError, match="not a readable local file"):
+        refuse_self_inconsistent_snapshot(tmp_path, "linked/x.json", digest)
 
 
 def test_default_adapter_reads_complete_local_pool_revisions(tmp_path: Path) -> None:
