@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from typing import ClassVar, cast
+from typing import ClassVar, Literal, cast
 
 from pydantic import JsonValue
 
@@ -18,6 +18,8 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    RawEmbedding,
+    RawEmbeddingBatch,
     ToolCall,
     Usage,
 )
@@ -154,9 +156,32 @@ def openai_compatible_request(
     return payload
 
 
-def openai_embedding_request(model_id: str, texts: Sequence[str]) -> JsonObject:
-    """Convert ordered text into one OpenAI-compatible embedding request."""
-    return {"model": model_id, "input": list(texts)}
+def openai_embedding_request(
+    model_id: str,
+    texts: Sequence[str],
+    *,
+    dimensions: int | None = None,
+    encoding_format: Literal["float", "base64"] | None = None,
+) -> JsonObject:
+    """Convert ordered text into one OpenAI-compatible embedding request.
+
+    Args:
+        model_id: Served embedding model id.
+        texts: Ordered visible text values to embed.
+        dimensions: Optional output dimensionality the caller requested. Omitted
+            from the wire when absent so the provider's native width applies.
+        encoding_format: Optional caller vector encoding. Omitted when absent so
+            the provider default (``float``) applies.
+
+    Returns:
+        The OpenAI-compatible ``/embeddings`` request body.
+    """
+    request: JsonObject = {"model": model_id, "input": list(texts)}
+    if dimensions is not None:
+        request["dimensions"] = dimensions
+    if encoding_format is not None:
+        request["encoding_format"] = encoding_format
+    return request
 
 
 def openai_compatible_response(
@@ -247,6 +272,54 @@ def openai_embedding_response(payload: JsonObject, *, expected_count: int) -> tu
     return tuple(cast("Embedding", item) for item in ordered)
 
 
+def openai_embedding_response_raw(payload: JsonObject, *, expected_count: int) -> RawEmbeddingBatch:
+    """Convert an OpenAI-compatible embedding response without renormalizing.
+
+    The public embeddings surface returns the provider's exact vectors and
+    bills the reported input tokens, so this parser preserves raw magnitudes
+    and requires the ``usage.prompt_tokens`` count the normalized router-facing
+    :func:`openai_embedding_response` discards.
+
+    Args:
+        payload: Decoded ``/embeddings`` response.
+        expected_count: Number of requested input strings.
+
+    Returns:
+        Ordered raw embeddings with the provider's input-token usage.
+
+    Raises:
+        ProviderResponseError: The provider omitted, duplicated, or malformed
+            vectors, or omitted the input-token usage the surface bills on.
+    """
+    data = require_array(payload.get("data"), "data")
+    if len(data) != expected_count:
+        raise OpenAICompatibleResponseError(
+            f"embedding response count {len(data)} does not match request count {expected_count}"
+        )
+    ordered: list[RawEmbedding | None] = [None] * expected_count
+    for position, value in enumerate(data):
+        item = require_object(value, f"data[{position}]")
+        index_value = item.get("index", position)
+        if not isinstance(index_value, int) or isinstance(index_value, bool):
+            raise OpenAICompatibleResponseError(f"data[{position}].index must be an integer")
+        if index_value < 0 or index_value >= expected_count or ordered[index_value] is not None:
+            raise OpenAICompatibleResponseError(
+                "embedding response indexes must be unique input indexes"
+            )
+        vector = require_array(item.get("embedding"), f"data[{position}].embedding")
+        ordered[index_value] = RawEmbedding(values=_finite_embedding_vector(vector))
+    if any(item is None for item in ordered):
+        raise OpenAICompatibleResponseError("embedding response omitted an input index")
+    usage = require_object(payload.get("usage"), "usage")
+    prompt_tokens = require_integer(usage.get("prompt_tokens"), "usage.prompt_tokens")
+    served_model = payload.get("model")
+    return RawEmbeddingBatch(
+        embeddings=tuple(cast("RawEmbedding", item) for item in ordered),
+        prompt_tokens=prompt_tokens,
+        served_model_id=served_model if isinstance(served_model, str) else None,
+    )
+
+
 class OpenAIEmbeddingMixin(ProviderHttpClient):
     """Adds the shared OpenAI-wire embeddings endpoint to one HTTP provider client."""
 
@@ -263,6 +336,47 @@ class OpenAIEmbeddingMixin(ProviderHttpClient):
             return ()
         response = self._post("embeddings", openai_embedding_request(self._model.model_id, texts))
         return openai_embedding_response(response, expected_count=len(texts))
+
+    def embed_raw(
+        self,
+        texts: Sequence[str],
+        *,
+        dimensions: int | None = None,
+        encoding_format: Literal["float"] | None = None,
+    ) -> RawEmbeddingBatch:
+        """Embed ordered text and return raw vectors with input-token usage.
+
+        The public ``/v1/embeddings`` surface serves the provider's exact
+        vectors and bills input tokens, so this sibling of :meth:`embed` keeps
+        raw magnitudes and the ``prompt_tokens`` count. ``base64`` re-emission
+        belongs to the surface response builder, so this convenience wrapper
+        parses numeric vectors only and does not accept ``encoding_format``
+        other than ``float``.
+
+        Args:
+            texts: Ordered visible text values to embed; at least one.
+            dimensions: Optional output dimensionality the caller requested.
+            encoding_format: Optional wire encoding; only ``float`` is decoded here.
+
+        Returns:
+            Ordered raw embeddings with the provider's input-token usage.
+
+        Raises:
+            ValueError: No input text was supplied.
+            ProviderResponseError: The provider response was malformed.
+        """
+        if not texts:
+            raise ValueError("embed_raw requires at least one input text")
+        response = self._post(
+            "embeddings",
+            openai_embedding_request(
+                self._model.model_id,
+                texts,
+                dimensions=dimensions,
+                encoding_format=encoding_format,
+            ),
+        )
+        return openai_embedding_response_raw(response, expected_count=len(texts))
 
 
 class OpenAICompatibleClient(OpenAIEmbeddingMixin):
@@ -465,6 +579,31 @@ def _usage(payload: JsonObject) -> Usage | None:
     )
 
 
+def _finite_embedding_vector(values: Sequence[JsonValue]) -> tuple[float, ...]:
+    """Return one finite, non-empty vector from a provider response, unnormalized.
+
+    Args:
+        values: Numeric values in one provider-returned embedding vector.
+
+    Returns:
+        The provider's vector as finite floats in wire order.
+
+    Raises:
+        OpenAICompatibleResponseError: A value is nonnumeric or nonfinite, or the vector is empty.
+    """
+    vector: list[float] = []
+    for index, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise OpenAICompatibleResponseError(f"embedding values[{index}] must be numeric")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise OpenAICompatibleResponseError(f"embedding values[{index}] must be finite")
+        vector.append(numeric)
+    if not vector:
+        raise OpenAICompatibleResponseError("embedding vectors cannot be empty")
+    return tuple(vector)
+
+
 def normalize_embedding_vector(values: Sequence[JsonValue]) -> tuple[float, ...]:
     """Return one finite, non-zero unit vector from a provider response.
 
@@ -477,16 +616,7 @@ def normalize_embedding_vector(values: Sequence[JsonValue]) -> tuple[float, ...]
     Raises:
         OpenAICompatibleResponseError: A value is nonnumeric, nonfinite, or the vector is zero.
     """
-    vector: list[float] = []
-    for index, value in enumerate(values):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise OpenAICompatibleResponseError(f"embedding values[{index}] must be numeric")
-        numeric = float(value)
-        if not math.isfinite(numeric):
-            raise OpenAICompatibleResponseError(f"embedding values[{index}] must be finite")
-        vector.append(numeric)
-    if not vector:
-        raise OpenAICompatibleResponseError("embedding vectors cannot be empty")
+    vector = _finite_embedding_vector(values)
     norm = math.sqrt(sum(item * item for item in vector))
     if norm == 0:
         raise OpenAICompatibleResponseError("embedding vectors cannot have zero norm")

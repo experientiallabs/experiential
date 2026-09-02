@@ -537,3 +537,35 @@ class Embedding(ContractModel):
         if not math.isclose(norm, 1.0, rel_tol=1e-6, abs_tol=1e-6):
             raise ValueError("embedding values must have unit norm")
         return value
+
+
+class RawEmbedding(ContractModel):
+    """One provider-returned embedding vector preserved without renormalization.
+
+    Unlike :class:`Embedding`, which unit-normalizes for cosine routing, the
+    public ``/v1/embeddings`` surface must return the provider's exact vector,
+    so this carrier keeps the raw magnitude and validates finiteness only.
+    """
+
+    values: tuple[float, ...] = Field(min_length=1)
+
+    @field_validator("values")
+    @classmethod
+    def _require_finite_values(cls, value: tuple[float, ...]) -> tuple[float, ...]:
+        if not all(math.isfinite(item) for item in value):
+            raise ValueError("embedding values must be finite")
+        return value
+
+
+class RawEmbeddingBatch(ContractModel):
+    """Ordered raw embeddings with the provider's input-token usage.
+
+    The public embeddings surface bills input tokens, so the provider's
+    ``prompt_tokens`` count is carried alongside the vectors rather than
+    dropped. ``served_model_id`` is the exact model the provider reported, kept
+    for attribution and never invented when the provider omits it.
+    """
+
+    embeddings: tuple[RawEmbedding, ...] = Field(min_length=1)
+    prompt_tokens: int = Field(ge=0)
+    served_model_id: str | None = None
