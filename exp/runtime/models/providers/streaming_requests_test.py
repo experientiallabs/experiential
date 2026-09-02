@@ -2731,6 +2731,17 @@ def _video_request(
     )
 
 
+def _tiered_request(surface: GatewayApiSurface) -> GatewayRequest:
+    """Build one streaming request carrying an explicit service tier."""
+    return GatewayRequest(
+        surface=surface,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        service_tier="flex",
+        stream=True,
+        include_usage=True,
+    )
+
+
 def test_openai_compatible_payload_carries_video_url_parts_in_order() -> None:
     """The OpenRouter and Fireworks wire gets a ``video_url`` part between its text."""
     payload = openai_compatible_stream_payload("qwen3-omni", _video_request())
@@ -2973,3 +2984,48 @@ def test_wires_without_an_audio_carrier_narrow_past_the_rung() -> None:
         anthropic_messages_stream_payload("claude-fable-5", _audio_request())
     with pytest.raises(ProviderCapabilityError, match="audio_input"):
         bedrock_converse_stream_payload("us.amazon.nova-lite-v1:0", _audio_request())
+
+
+@pytest.mark.parametrize(
+    ("dialect", "surface"),
+    (
+        ("openai_compatible", GatewayApiSurface.CHAT_COMPLETIONS),
+        ("openai_responses", GatewayApiSurface.RESPONSES),
+    ),
+)
+def test_service_tier_forwards_on_tier_preserving_dialects(
+    dialect: str,
+    surface: GatewayApiSurface,
+) -> None:
+    """Both OpenAI wire dialects carry the caller's tier verbatim."""
+    profile = GatewayWireProfile(
+        dialect=dialect,
+        url="https://provider.test",
+        model_id="model-x",
+    )
+
+    payload = dialect_stream_payload(profile, _tiered_request(surface))
+
+    assert payload["service_tier"] == "flex"
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    ("anthropic_messages", "gemini_generate_content", "bedrock_converse_stream"),
+)
+def test_service_tier_declines_dialects_without_a_wire_field(dialect: str) -> None:
+    """A rung that would drop the tier silently rejects it as a capability."""
+    profile = GatewayWireProfile(
+        dialect=dialect,
+        url="https://provider.test",
+        model_id="model-x",
+    )
+    request = _tiered_request(GatewayApiSurface.CHAT_COMPLETIONS)
+
+    with pytest.raises(ProviderCapabilityError) as excinfo:
+        dialect_stream_payload(profile, request)
+
+    assert excinfo.value.capability == "service_tier"
+    # The same rungs serve as soon as the tier is gone.
+    untiered = request.model_copy(update={"service_tier": None})
+    assert dialect_stream_payload(profile, untiered)

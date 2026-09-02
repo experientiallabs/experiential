@@ -54,6 +54,9 @@ CLOSED_SCHEMA_DISCLOSURE = "json_schema.additionalProperties->false"
 _SCHEMA_DIALECTS_REQUIRING_CLOSED_OBJECTS = frozenset({"anthropic_messages"})
 """Wire dialects whose structured-output validator rejects open objects."""
 
+SERVICE_TIER_DROP_DISCLOSURE = "service_tier"
+"""Disclosure recorded when no route rung can carry a processing-tier hint."""
+
 
 @dataclass(frozen=True)
 class RequestCoercion:
@@ -163,11 +166,13 @@ def coerce_generation_parameters(
 def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:
     """Build the disclosed coercion for one preflight capability rejection.
 
-    Strict tools are the one coercible capability: degrading ``strict: true``
-    to best-effort schemas weakens a correctness guarantee, so it happens
-    only here, after every rung declined the verbatim request, and only as a
-    disclosed drop. Every other capability names a feature with no
-    approximation and stays fail-closed.
+    Two capabilities are coercible, both only here — after every rung declined
+    the verbatim request — and both only as a disclosed drop. Degrading
+    ``strict: true`` tools to best-effort schemas weakens a correctness
+    guarantee. Dropping ``service_tier`` changes pricing and latency
+    semantics, which the caller can act on only when told, so the drop is
+    disclosed rather than silent. Every other capability names a feature with
+    no approximation and stays fail-closed.
 
     Args:
         capability: Stable capability literal from the preflight rejection.
@@ -177,6 +182,13 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
         The disclosed substitution to retry with, or ``None`` when the
         capability cannot be coerced.
     """
+    if capability == "service_tier":
+        if request.service_tier is None:
+            return None
+        return RequestCoercion(
+            request=request.model_copy(update={"service_tier": None}),
+            disclosures=(SERVICE_TIER_DROP_DISCLOSURE,),
+        )
     if capability != "strict_tools" or not any(tool.strict for tool in request.tools):
         return None
     return RequestCoercion(

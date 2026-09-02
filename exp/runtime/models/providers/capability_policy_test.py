@@ -192,6 +192,19 @@ def test_strict_tools_degrade_only_as_a_disclosed_drop() -> None:
     assert coerce_capability("strict_tools", _request()) is None
 
 
+def test_service_tier_drops_only_as_a_disclosed_coercion() -> None:
+    """A route with no tier-preserving rung serves with the drop disclosed."""
+    request = _request(service_tier="flex")
+
+    coercion = coerce_capability("service_tier", request)
+
+    assert coercion is not None
+    assert coercion.request.service_tier is None
+    assert coercion.disclosures == ("service_tier",)
+    # A rejection that names the capability without the field stays closed.
+    assert coerce_capability("service_tier", _request()) is None
+
+
 def test_route_wide_capability_requires_unanimous_rejection() -> None:
     """Mixed per-rung rejections never produce the route-wide claim."""
     from exp.runtime.models.providers.capability_policy import route_wide_capability

@@ -95,6 +95,10 @@ def _fireworks_continuation_required(profile: GatewayWireProfile, request: Gatew
     )
 
 
+SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
+"""Wire dialects with a request field that preserves the caller's service tier."""
+
+
 def dialect_stream_payload(
     profile: GatewayWireProfile,
     provider_request: GatewayRequest,
@@ -114,6 +118,12 @@ def dialect_stream_payload(
     """
     if _fireworks_continuation_required(profile, provider_request):
         require_responses_continuation_channel(provider_request)
+    if provider_request.service_tier is not None and profile.dialect not in SERVICE_TIER_DIALECTS:
+        # A processing-tier hint changes pricing and latency semantics, so a
+        # dialect with no wire field for it declines instead of dropping the
+        # field silently: admission then prefers a tier-preserving rung and
+        # otherwise retries with the disclosed drop in capability_policy.
+        raise ProviderCapabilityError(capability="service_tier")
     required_reasoning_effort = (
         profile.reasoning_effort if profile.reasoning_effort_required else None
     )
