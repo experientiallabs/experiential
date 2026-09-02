@@ -82,3 +82,32 @@ def test_parity_row_reports_thinking_generations_and_declared_ladders() -> None:
     )
     # No declaration and no family ground truth: the row shows the gap.
     assert unknown.reasoning_efforts == ()
+
+
+def test_parity_row_forwards_pdf_urls_only_on_a_fetching_dialect() -> None:
+    """A PDF URL declaration counts only where the wire itself fetches the URL."""
+    declared = GatewayDeploymentCapabilities(supports_pdf_input=True, supports_pdf_url_input=True)
+    fetching = deployment_capability_parity(
+        provider="anthropic",
+        model_id="claude-fixture",
+        dialect="anthropic_messages",
+        capabilities=declared,
+        reasoning_wire_format="anthropic_thinking",
+    )
+    inline_only = deployment_capability_parity(
+        provider="gemini",
+        model_id="gemini-fixture",
+        dialect="gemini_generate_content",
+        capabilities=declared,
+        reasoning_wire_format="none",
+    )
+    text_only = deployment_capability_parity(
+        provider="openai",
+        model_id="gpt-fixture",
+        dialect="openai_responses",
+        capabilities=GatewayDeploymentCapabilities(supports_pdf_url_input=True),
+        reasoning_wire_format="openai_responses",
+    )
+    assert (fetching.supports_pdf_input, fetching.forwards_pdf_urls) == (True, True)
+    assert (inline_only.supports_pdf_input, inline_only.forwards_pdf_urls) == (True, False)
+    assert (text_only.supports_pdf_input, text_only.forwards_pdf_urls) == (False, False)

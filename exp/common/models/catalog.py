@@ -397,6 +397,20 @@ class GatewayDeploymentCapabilities(ContractModel):
     remote URL. A route that does not declare this rejects a URL image at
     admission, which lets a waterfall narrow to a rung that can carry it.
     """
+    supports_pdf_input: bool = False
+    """Whether this deployment's wire and model can carry caller PDF documents.
+
+    Like image input this is declaration-driven and never assumed: a route
+    that does not declare it rejects a document request at admission, so a
+    PDF is never dropped and answered from the surrounding text alone.
+    """
+    supports_pdf_url_input: bool = False
+    """Whether this route's provider fetches a caller PDF URL itself.
+
+    Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url``
+    source) wires fetch a remote document; Chat Completions ``file`` parts,
+    Gemini, and Bedrock accept inline bytes only.
+    """
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
     """Largest stop-sequence count this route accepts, when the provider caps it.
 

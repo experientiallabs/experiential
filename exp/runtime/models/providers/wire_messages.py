@@ -14,6 +14,11 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.models.providers.documents import (
+    anthropic_document_block,
+    openai_chat_document_part,
+    responses_document_part,
+)
 from exp.runtime.models.providers.errors import ProviderResponseError
 from exp.runtime.models.providers.images import (
     anthropic_image_block,
@@ -41,6 +46,8 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
                         {"type": "input_text", "text": part.text}
                         if part.kind == "text"
                         else responses_image_part(part)
+                        if part.kind == "image"
+                        else responses_document_part(part)
                         for part in message.content_parts
                     ],
                 }
@@ -145,6 +152,9 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
     for part in message.content_parts:
         if part.kind == "image":
             blocks.append(anthropic_image_block(part))
+            continue
+        if part.kind == "document":
+            blocks.append(anthropic_document_block(part))
             continue
         blocks.append(
             marked[text_index] if text_index < len(marked) else {"type": "text", "text": part.text}
@@ -300,6 +310,8 @@ def openai_chat_message(
                 {"type": "text", "text": part.text}
                 if part.kind == "text"
                 else openai_chat_image_part(part)
+                if part.kind == "image"
+                else openai_chat_document_part(part)
                 for part in message.content_parts
             ]
             if message.content_parts

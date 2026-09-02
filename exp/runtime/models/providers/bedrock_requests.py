@@ -15,6 +15,7 @@ from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.models.providers.documents import bedrock_document_block
 from exp.runtime.models.providers.images import bedrock_image_block
 
 
@@ -187,6 +188,26 @@ def converse_body(
     return payload
 
 
+def _multimodal_blocks(message: ModelMessage) -> list[JsonObject]:
+    """Emit one multimodal user turn in caller order.
+
+    Documents are named by their one-based position within the turn when the
+    caller sent no filename, since Converse requires a name on every block.
+    Empty text parts drop because Converse rejects an empty text block.
+    """
+    blocks: list[JsonObject] = []
+    document_ordinal = 0
+    for part in message.content_parts:
+        if part.kind == "image":
+            blocks.append(bedrock_image_block(part))
+        elif part.kind == "document":
+            document_ordinal += 1
+            blocks.append(bedrock_document_block(part, document_ordinal))
+        elif part.text:
+            blocks.append({"text": part.text})
+    return blocks
+
+
 def _message_blocks(message: ModelMessage) -> list[JsonObject]:
     """Convert one user or assistant message into Converse content blocks.
 
@@ -204,11 +225,7 @@ def _message_blocks(message: ModelMessage) -> list[JsonObject]:
     if message.role == "user" and message.content is None:
         raise ValueError("user messages need text content")
     if message.content_parts:
-        return [
-            {"text": part.text} if part.kind == "text" else bedrock_image_block(part)
-            for part in message.content_parts
-            if part.kind == "image" or part.text
-        ]
+        return _multimodal_blocks(message)
     blocks: list[JsonObject] = []
     action = message.assistant_action
     text = message.content if message.content is not None else action.content if action else None

@@ -484,6 +484,147 @@ def test_direct_alias_declares_image_capabilities_per_provider(tmp_path: Path) -
     assert "inline image bytes only" in inline_only.output
 
 
+def test_direct_alias_declares_pdf_capabilities_per_provider(tmp_path: Path) -> None:
+    """Only a URL-fetching provider may carry a caller's remote PDF URL."""
+    runner = CliRunner()
+    commands = (
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "claude",
+            "--provider",
+            "anthropic",
+            "--credential-env",
+            "ANTHROPIC_API_KEY",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "google",
+            "--provider",
+            "gemini",
+            "--credential-env",
+            "GEMINI_API_KEY",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+    for alias, deployment in (("claude-docs", "claude:claude-fixture"), ("gem-docs", "google:gem")):
+        created = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "alias",
+                "create",
+                alias,
+                "--deployment",
+                deployment,
+                "--exact-model",
+                alias,
+                "--supports-pdf-input",
+                "--root",
+                str(tmp_path),
+                "--non-interactive",
+                "--json",
+            ],
+        )
+        assert created.exit_code == 0, created.output
+    text_only = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "create",
+            "gem-text",
+            "--deployment",
+            "google:gem",
+            "--exact-model",
+            "gem-text",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert text_only.exit_code == 0, text_only.output
+
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    declarations: dict[str, tuple[bool, bool]] = {}
+    for alias in ("claude-docs", "gem-docs", "gem-text"):
+        gateway = catalog.models[alias].gateway
+        assert gateway is not None
+        declarations[alias] = (
+            gateway.capabilities.supports_pdf_input,
+            gateway.capabilities.supports_pdf_url_input,
+        )
+    assert declarations == {
+        "claude-docs": (True, True),
+        "gem-docs": (True, False),
+        "gem-text": (False, False),
+    }
+
+    inline_only = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "update",
+            "gem-docs",
+            "--deployment",
+            "google:gem",
+            "--exact-model",
+            "gem-docs",
+            "--supports-pdf-input",
+            "--supports-pdf-url-input",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert inline_only.exit_code != 0
+    assert "inline PDF bytes only" in inline_only.output
+
+    url_without_pdf = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "update",
+            "claude-docs",
+            "--deployment",
+            "claude:claude-fixture",
+            "--exact-model",
+            "claude-docs",
+            "--supports-pdf-url-input",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert url_without_pdf.exit_code != 0
+    assert "requires --supports-pdf-input" in url_without_pdf.output
+
+
 def test_direct_alias_preserves_tool_streaming_across_credential_env_rotation(
     tmp_path: Path,
 ) -> None:

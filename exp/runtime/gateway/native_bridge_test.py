@@ -131,6 +131,37 @@ def test_internal_text_streaming_failure_has_no_fake_public_field() -> None:
         assert "Choose a different model alias" in error.detail.message
 
 
+@pytest.mark.parametrize(
+    ("surface", "param"),
+    [
+        (GatewayApiSurface.CHAT_COMPLETIONS, "messages"),
+        (GatewayApiSurface.RESPONSES, "input"),
+        (GatewayApiSurface.MESSAGES, "messages"),
+    ],
+)
+def test_pdf_capability_errors_explain_the_document_refusal(
+    surface: GatewayApiSurface, param: str
+) -> None:
+    """A refused PDF names the conversation field and says why, on every surface."""
+    inline = _public_capability_error(
+        ProviderCapabilityError(capability="pdf_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    remote = _public_capability_error(
+        ProviderCapabilityError(capability="pdf_url_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    assert (inline.detail.param, remote.detail.param) == (param, param)
+    assert inline.detail.code == remote.detail.code == "unsupported_capability"
+    assert "cannot accept PDF document input" in inline.detail.message
+    assert "inline PDF data only" in remote.detail.message
+    assert "pdf_input" not in inline.detail.message
+
+
 def test_public_capability_error_never_exposes_internal_labels() -> None:
     """Internal route requirements fail against model without leaking their names."""
     error = _public_capability_error(

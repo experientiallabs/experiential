@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject, sha256_json
+from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayApiSurface,
@@ -1858,6 +1859,174 @@ def test_assistant_image_parts_are_rejected() -> None:
                                 "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
                             }
                         ],
+                    }
+                ],
+            }
+        )
+
+
+_PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+"""One short PDF header, base64 encoded."""
+
+_PDF_DATA_URL = f"data:application/pdf;base64,{_PDF_BASE64}"
+"""The same PDF as an OpenAI ``file_data`` value."""
+
+
+def _chat_file(file_data: str = _PDF_DATA_URL, filename: str | None = "brief.pdf") -> JsonObject:
+    """Build one Chat Completions ``file`` content part."""
+    file: JsonObject = {"file_data": file_data}
+    if filename is not None:
+        file["filename"] = filename
+    return {"type": "file", "file": file}
+
+
+def test_chat_decoder_retains_file_parts_interleaved_with_text() -> None:
+    """Chat ``file`` parts keep their positions among the caller's text."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first: "},
+                        _chat_file(),
+                        {"type": "text", "text": " second: "},
+                        _chat_file("JVBERi0xLjcK", filename=None),
+                        {"type": "text", "text": " compare"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert message.content == "first:  second:  compare"
+    assert [part.kind for part in message.content_parts] == [
+        "text",
+        "document",
+        "text",
+        "document",
+        "text",
+    ]
+    documents = decoded.request.documents
+    assert [document.data for document in documents] == [_PDF_BASE64, "JVBERi0xLjcK"]
+    assert [document.name for document in documents] == ["brief.pdf", None]
+    assert all(document.media_type == "application/pdf" for document in documents)
+
+
+def test_chat_file_sent_once_survives_a_multi_turn_thread() -> None:
+    """A PDF in an earlier user turn is retained when later turns reference it."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": [_chat_file(), {"type": "text", "text": "title?"}]},
+                {"role": "assistant", "content": "Minimal PDF."},
+                {"role": "user", "content": "page count?"},
+            ],
+        }
+    )
+    assert [len(message.documents) for message in decoded.request.messages] == [1, 0, 0]
+
+
+def test_responses_decoder_retains_input_file_parts() -> None:
+    """Responses ``input_file`` decodes inline data and remote URLs separately."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "compare"},
+                        {"type": "input_file", "filename": "a.pdf", "file_data": _PDF_DATA_URL},
+                        {"type": "input_file", "file_url": "https://example.com/b.pdf"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert [part.kind for part in message.content_parts] == ["text", "document", "document"]
+    inline, remote = decoded.request.documents
+    assert (inline.data, inline.name, inline.url) == (_PDF_BASE64, "a.pdf", None)
+    assert (remote.data, remote.url) == (None, "https://example.com/b.pdf")
+
+
+def test_documents_change_the_canonical_request_digest() -> None:
+    """Document bytes, names, and order all change what the model is asked."""
+
+    def digest(*parts: JsonObject) -> str:
+        """Digest one chat request whose user turn carries the given parts."""
+        decoded = decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}, *parts]}],
+            }
+        )
+        return sha256_json(decoded.request)
+
+    text_only = digest()
+    one = digest(_chat_file())
+    other_bytes = digest(_chat_file("JVBERi0xLjcK"))
+    renamed = digest(_chat_file(filename="other.pdf"))
+    assert len({text_only, one, other_bytes, renamed}) == 4
+    assert digest(_chat_file(), _chat_file("JVBERi0xLjcK")) != digest(
+        _chat_file("JVBERi0xLjcK"), _chat_file()
+    )
+
+
+@pytest.mark.parametrize(
+    ("part", "param"),
+    [
+        (_chat_file("data:text/plain;base64,aGk="), "messages.0.content.0.file.file_data"),
+        (_chat_file("!!not base64"), "messages.0.content.0.file.file_data"),
+        ({"type": "file", "file": {"file_id": "file_1"}}, "messages.0.content.0"),
+    ],
+)
+def test_unservable_chat_file_parts_are_rejected_at_their_field(
+    part: JsonObject, param: str
+) -> None:
+    """A file the gateway cannot forward names the offending field, never drops."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part]}]})
+    assert error.value.detail.param is not None
+    assert error.value.detail.param.startswith(param)
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "input_file", "file_url": "ftp://example.com/a.pdf"},
+        {"type": "input_file", "file_data": _PDF_DATA_URL, "file_url": "https://example.com/a.pdf"},
+        {"type": "input_file", "filename": "a.pdf"},
+        {"type": "input_file", "file_id": "file_1"},
+    ],
+)
+def test_unservable_responses_input_file_parts_are_rejected(part: JsonObject) -> None:
+    """Responses files need exactly one servable carrier."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses({"model": "coding", "input": [{"role": "user", "content": [part]}]})
+
+
+def test_assistant_file_parts_are_rejected() -> None:
+    """Only a caller message may carry a document."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {"model": "coding", "messages": [{"role": "assistant", "content": [_chat_file()]}]}
+        )
+
+
+def test_too_many_chat_files_are_rejected() -> None:
+    """The per-request document ceiling fails closed."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [_chat_file() for _ in range(MAXIMUM_DOCUMENTS_PER_REQUEST + 1)],
                     }
                 ],
             }

@@ -239,6 +239,12 @@ def preflight_gateway_request(
             capabilities.supports_image_url_input,
             "image_url_input",
         ),
+        (bool(request.documents), capabilities.supports_pdf_input, "pdf_input"),
+        (
+            any(document.url is not None for document in request.documents),
+            capabilities.supports_pdf_url_input,
+            "pdf_url_input",
+        ),
         (bool(request.stop), capabilities.supports_stop_sequences, "stop_sequences"),
         (
             any(tool.strict for tool in request.tools),

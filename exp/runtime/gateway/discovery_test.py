@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import pytest
 
+from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.discovery import (
     public_model_list,
     public_model_object,
+    published_alias_metadata,
     require_granted_authority,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
@@ -54,3 +57,31 @@ def test_unknown_and_ungranted_aliases_raise_the_identical_404() -> None:
         "GET /v1/models lists the model aliases available to this key."
         in ungranted.value.detail.message
     )
+
+
+def test_published_metadata_projects_route_attachment_capabilities() -> None:
+    """Image and PDF input publish as route facts from the deployment's declaration."""
+    deployment = ExactModelDeployment(
+        deployment_id="dep-1",
+        source_alias="coding",
+        exact_model_id="exact-one",
+        connection="hosted",
+        provider="anthropic",
+        provider_model="claude-fixture",
+        connection_sha256="b" * 64,
+        capabilities_sha256="c" * 64,
+        gateway=GatewayDeploymentMetadata(
+            capabilities=GatewayDeploymentCapabilities(
+                supports_image_input=True,
+                supports_pdf_input=True,
+                supports_pdf_url_input=True,
+            )
+        ),
+    )
+    metadata = published_alias_metadata(deployment)
+    assert metadata is not None
+    fields = metadata.extension_fields()
+    assert fields["supports_image_input"] is True
+    assert fields["supports_pdf_input"] is True
+    assert "supports_pdf_url_input" not in fields
+    assert published_alias_metadata(None) is None

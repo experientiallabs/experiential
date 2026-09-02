@@ -17,7 +17,7 @@ from exp.common.models import (
     ModelSnapshot,
 )
 from exp.common.models.catalog import GatewayDeploymentCapabilities
-from exp.common.models.content import ImageContentPart, TextContentPart
+from exp.common.models.content import DocumentContentPart, ImageContentPart, TextContentPart
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -321,4 +321,53 @@ def test_preflight_rejects_an_image_url_on_an_inline_only_route() -> None:
     preflight_gateway_request(
         request,
         GatewayDeploymentCapabilities(supports_image_input=True, supports_image_url_input=True),
+    )
+
+
+_PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+"""One short PDF header, base64 encoded."""
+
+
+def _document_request(document: DocumentContentPart) -> GatewayRequest:
+    """Build one caller request carrying a document beside its text."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="summarize this",
+                content_parts=(TextContentPart(text="summarize this"), document),
+            ),
+        ),
+    )
+
+
+def test_preflight_rejects_a_document_on_a_route_that_does_not_declare_it() -> None:
+    """A PDF is never dropped and answered from the surrounding text alone."""
+    request = _document_request(DocumentContentPart(data=_PDF_BASE64))
+    with pytest.raises(ProviderCapabilityError, match="pdf_input"):
+        preflight_gateway_request(request, GatewayDeploymentCapabilities())
+    with pytest.raises(ProviderCapabilityError, match="pdf_input"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_image_input=True, supports_image_url_input=True),
+        )
+
+
+def test_preflight_admits_an_inline_document_on_a_pdf_route() -> None:
+    """A declared PDF route serves inline bytes without declaring URL support."""
+    preflight_gateway_request(
+        _document_request(DocumentContentPart(data=_PDF_BASE64)),
+        GatewayDeploymentCapabilities(supports_pdf_input=True),
+    )
+
+
+def test_preflight_rejects_a_document_url_on_an_inline_only_route() -> None:
+    """A remote PDF URL needs its own declaration, so a waterfall can narrow to it."""
+    request = _document_request(DocumentContentPart(url="https://example.com/brief.pdf"))
+    with pytest.raises(ProviderCapabilityError, match="pdf_url_input"):
+        preflight_gateway_request(request, GatewayDeploymentCapabilities(supports_pdf_input=True))
+    preflight_gateway_request(
+        request,
+        GatewayDeploymentCapabilities(supports_pdf_input=True, supports_pdf_url_input=True),
     )

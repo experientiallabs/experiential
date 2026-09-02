@@ -6,6 +6,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
+from exp.common.models.content import DocumentContentPart, TextContentPart
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.gemini_requests import (
     gemini_generate_request,
@@ -124,3 +125,34 @@ def test_gemini_generate_request_rejects_an_unlinked_tool_result() -> None:
     )
     with pytest.raises(ValueError, match="no preceding tool-call name"):
         gemini_generate_request("gemini-2.5-pro", request)
+
+
+def test_gemini_generate_request_inlines_documents_in_caller_order() -> None:
+    """PDF parts ride the user turn as ``inline_data`` at their positions among text."""
+    pdf = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+    request = ModelRequest(
+        messages=(
+            ModelMessage(
+                role="user",
+                content="first second",
+                content_parts=(
+                    TextContentPart(text="first "),
+                    DocumentContentPart(data=pdf, name="a.pdf"),
+                    TextContentPart(text="second"),
+                    DocumentContentPart(data="JVBERi0xLjcK"),
+                ),
+            ),
+        ),
+    )
+    payload = gemini_generate_request("gemini-2.5-pro", request)
+    assert payload["contents"] == [
+        {
+            "role": "user",
+            "parts": [
+                {"text": "first "},
+                {"inline_data": {"mime_type": "application/pdf", "data": pdf}},
+                {"text": "second"},
+                {"inline_data": {"mime_type": "application/pdf", "data": "JVBERi0xLjcK"}},
+            ],
+        }
+    ]
