@@ -19,6 +19,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pydantic import JsonValue
+
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -41,6 +44,15 @@ STRICT_TOOLS_DISCLOSURE = "tools.strict->false"
 
 EFFORT_DROP_DISCLOSURE = "reasoning_effort"
 """Disclosure recorded when a zero-reasoning route drops the caller effort."""
+
+THINKING_DROP_DISCLOSURE = "thinking"
+"""Disclosure recorded when a zero-reasoning route drops adaptive thinking."""
+
+CLOSED_SCHEMA_DISCLOSURE = "json_schema.additionalProperties->false"
+"""Disclosure recorded when an open structured-output schema is closed."""
+
+_SCHEMA_DIALECTS_REQUIRING_CLOSED_OBJECTS = frozenset({"anthropic_messages"})
+"""Wire dialects whose structured-output validator rejects open objects."""
 
 
 @dataclass(frozen=True)
@@ -91,6 +103,7 @@ def coerce_generation_parameters(
         ladder.update(profile_reasoning_efforts(profile))
     if not ladder:
         updates: dict[str, object] = {"reasoning_effort": None}
+        disclosures: tuple[str, ...] = (EFFORT_DROP_DISCLOSURE,)
         if request.provider_output_config is not None:
             # The Messages surface carries the same effort verbatim inside
             # output_config; a dropped effort must not reach the provider
@@ -101,13 +114,21 @@ def coerce_generation_parameters(
                 if key != "effort"
             }
             updates["provider_output_config"] = remaining or None
+        if (
+            request.provider_thinking_config is not None
+            and request.provider_thinking_config.get("type") == "adaptive"
+        ):
+            # Adaptive thinking is the effort's own channel on the Messages
+            # surface (the model picks its depth from output_config.effort),
+            # so a route with no reasoning rung cannot honor it either and
+            # the provider rejects it by name. A budgeted config is left
+            # verbatim: its semantics do not depend on an effort level.
+            updates["provider_thinking_config"] = None
+            disclosures = (EFFORT_DROP_DISCLOSURE, THINKING_DROP_DISCLOSURE)
         dropped_request = request.model_copy(update=updates)
         if admits is not None and not admits(dropped_request):
             return None
-        return RequestCoercion(
-            request=dropped_request,
-            disclosures=(EFFORT_DROP_DISCLOSURE,),
-        )
+        return RequestCoercion(request=dropped_request, disclosures=disclosures)
     if request.reasoning_effort in ladder:
         # The effort itself is portable; the verbatim failure lies elsewhere
         # and a snap would change semantics for nothing.
@@ -199,3 +220,110 @@ def route_wide_capability(
     ):
         return next(iter(capabilities))
     return None
+
+
+def coerce_structured_text_schema(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Close every object in a structured-output schema for a rung that needs it.
+
+    The Anthropic Messages validator rejects a structured-output schema whose
+    objects leave ``additionalProperties`` open, while the OpenAI-family
+    validators accept the same schema, so a caller who tested against one
+    provider gets a post-dispatch 400 from the other. Closing the objects is
+    the only serviceable reading of the request (the provider has no open
+    mode), and it tightens the output contract rather than loosening it, so
+    it happens here as a disclosed coercion instead of a rejection. Schemas
+    already closed everywhere, and routes with no rung on such a dialect,
+    pass through untouched.
+
+    Args:
+        profiles: Ordered wire profiles for the rungs the request will reach.
+        request: Admitted request, after generation-parameter narrowing.
+
+    Returns:
+        The disclosed substitution to dispatch, or ``None`` when nothing
+        needs closing.
+    """
+    if request.structured_text is None:
+        return None
+    if not any(
+        profile.dialect in _SCHEMA_DIALECTS_REQUIRING_CLOSED_OBJECTS for profile in profiles
+    ):
+        return None
+    closed, changed = _close_schema_objects(request.structured_text.json_schema)
+    if not changed:
+        return None
+    return RequestCoercion(
+        request=request.model_copy(
+            update={
+                "structured_text": request.structured_text.model_copy(
+                    update={"json_schema": closed}
+                )
+            }
+        ),
+        disclosures=(CLOSED_SCHEMA_DISCLOSURE,),
+    )
+
+
+_SCHEMA_CHILD_KEYS = ("properties", "$defs", "definitions", "patternProperties")
+"""Schema keys whose values map names to subschemas."""
+
+_SCHEMA_LIST_KEYS = ("anyOf", "oneOf", "allOf", "prefixItems")
+"""Schema keys whose values list subschemas."""
+
+_SCHEMA_SINGLE_KEYS = ("items", "not", "if", "then", "else")
+"""Schema keys whose values are one subschema."""
+
+
+def _close_schema_objects(schema: JsonObject) -> tuple[JsonObject, bool]:
+    """Return ``schema`` with ``additionalProperties: false`` on every object.
+
+    An object is any node typed ``object`` or carrying ``properties``. The
+    walk descends through the standard composition and container keywords
+    and copies only the nodes it changes.
+
+    Args:
+        schema: One JSON Schema node.
+
+    Returns:
+        The closed node and whether any node changed.
+    """
+    changed = False
+    closed: JsonObject = dict(schema)
+    is_object = schema.get("type") == "object" or "properties" in schema
+    if is_object and schema.get("additionalProperties") is not False:
+        closed["additionalProperties"] = False
+        changed = True
+    for key in _SCHEMA_CHILD_KEYS:
+        children = schema.get(key)
+        if isinstance(children, dict):
+            closed_children: dict[str, JsonValue] = {}
+            for name, child in children.items():
+                if isinstance(child, dict):
+                    closed_child, child_changed = _close_schema_objects(child)
+                    changed = changed or child_changed
+                    closed_children[name] = closed_child
+                else:
+                    closed_children[name] = child
+            closed[key] = closed_children
+    for key in _SCHEMA_LIST_KEYS:
+        members = schema.get(key)
+        if isinstance(members, list):
+            closed_members: list[JsonValue] = []
+            for member in members:
+                if isinstance(member, dict):
+                    closed_member, member_changed = _close_schema_objects(member)
+                    changed = changed or member_changed
+                    closed_members.append(closed_member)
+                else:
+                    closed_members.append(member)
+            closed[key] = closed_members
+    for key in _SCHEMA_SINGLE_KEYS:
+        single = schema.get(key)
+        if isinstance(single, dict):
+            closed_single, single_changed = _close_schema_objects(single)
+            changed = changed or single_changed
+            closed[key] = closed_single
+    return (closed if changed else schema), changed
