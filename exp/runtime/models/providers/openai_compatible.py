@@ -311,7 +311,11 @@ def openai_embedding_response_raw(payload: JsonObject, *, expected_count: int) -
     if any(item is None for item in ordered):
         raise OpenAICompatibleResponseError("embedding response omitted an input index")
     usage = require_object(payload.get("usage"), "usage")
-    prompt_tokens = require_integer(usage.get("prompt_tokens"), "usage.prompt_tokens")
+    # The surface bills on this count, so an omitted prompt_tokens is a malformed
+    # response, never the zero that require_integer folds an absent usage field to.
+    prompt_tokens = usage.get("prompt_tokens")
+    if not isinstance(prompt_tokens, int) or isinstance(prompt_tokens, bool) or prompt_tokens < 0:
+        raise OpenAICompatibleResponseError("usage.prompt_tokens must be a non-negative integer")
     served_model = payload.get("model")
     return RawEmbeddingBatch(
         embeddings=tuple(cast("RawEmbedding", item) for item in ordered),

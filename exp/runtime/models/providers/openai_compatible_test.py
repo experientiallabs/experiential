@@ -334,6 +334,15 @@ def test_openai_embedding_response_raw_requires_usage_for_billing() -> None:
             {"data": [{"index": 0, "embedding": [1.0, 2.0]}]},
             expected_count=1,
         )
+    # A present usage object with an omitted prompt_tokens must not bill as zero.
+    with pytest.raises(ProviderResponseError, match="usage.prompt_tokens"):
+        openai_embedding_response_raw(
+            {
+                "data": [{"index": 0, "embedding": [1.0, 2.0]}],
+                "usage": {"total_tokens": 5},
+            },
+            expected_count=1,
+        )
 
 
 def test_embed_raw_rejects_empty_input() -> None:
