@@ -2609,3 +2609,36 @@ def test_non_default_values_of_accepted_no_op_fields_stay_named_rejections(
     assert captured.value.detail.code == "invalid_parameter"
     assert captured.value.detail.param == param
     assert fragment in captured.value.detail.message
+
+
+def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values() -> None:
+    """Doubleword's tier passthrough (PR #728): valid tiers land on the
+    carrier for BYOK forwarding; unknown values (including Anthropic's
+    'fast', which is a speed selector, not an OpenAI tier) reject by name."""
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "x"}],
+            "service_tier": "flex",
+        }
+    )
+    assert chat.request.service_tier == "flex"
+    assert "service_tier" not in chat.request.model_dump(mode="json")
+    responses = decode_responses({"model": "coding", "input": "x", "service_tier": "priority"})
+    assert responses.request.service_tier == "priority"
+
+    invalid_cases: tuple[tuple[JsonObject, Callable[[JsonObject], DecodedGatewayRequest]], ...] = (
+        (
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "x"}],
+                "service_tier": "fast",
+            },
+            decode_chat,
+        ),
+        ({"model": "coding", "input": "x", "service_tier": "turbo"}, decode_responses),
+    )
+    for payload, decoder in invalid_cases:
+        with pytest.raises(OpenAIProtocolError) as captured:
+            decoder(payload)
+        assert captured.value.detail.param == "service_tier"
