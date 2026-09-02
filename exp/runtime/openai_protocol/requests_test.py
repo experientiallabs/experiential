@@ -9,7 +9,11 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject, sha256_json
-from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST, VideoContentPart
+from exp.common.models.content import (
+    MAXIMUM_DOCUMENTS_PER_REQUEST,
+    AudioContentPart,
+    VideoContentPart,
+)
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayApiSurface,
@@ -2374,3 +2378,150 @@ def test_responses_surface_defines_no_video_part() -> None:
                 ],
             }
         )
+
+
+_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA="
+"""A 44-byte WAV header with an empty data chunk, base64 encoded."""
+
+
+def _input_audio(data: str = _WAV_BASE64, audio_format: str = "wav") -> JsonObject:
+    """Build one Chat ``input_audio`` content part."""
+    return {"type": "input_audio", "input_audio": {"data": data, "format": audio_format}}
+
+
+def test_chat_decoder_retains_audio_parts_in_caller_order() -> None:
+    """A chat ``input_audio`` part is kept beside its text and images in caller order."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first "},
+                        _input_audio(),
+                        {"type": "text", "text": "then "},
+                        _input_audio("SUQzBAAAAAAAAA==", "mp3"),
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        },
+                        {"type": "text", "text": "compare"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert message.content == "first then compare"
+    assert [part.kind for part in message.content_parts] == [
+        "text",
+        "audio",
+        "text",
+        "audio",
+        "image",
+        "text",
+    ]
+    wav, mp3 = decoded.request.audios
+    assert (wav.media_type, wav.data, wav.audio_format()) == ("audio/wav", _WAV_BASE64, "wav")
+    assert (mp3.media_type, mp3.audio_format()) == ("audio/mpeg", "mp3")
+    assert len(decoded.request.images) == 1
+    assert [part.kind for part in model_request(decoded.request).messages[0].content_parts] == [
+        part.kind for part in message.content_parts
+    ]
+
+
+def test_audio_changes_the_canonical_request_digest() -> None:
+    """A clip changes what the model is asked, so it changes replay identity."""
+    text_only = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "what is said"}]}
+    )
+    with_audio = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "what is said"}, _input_audio()],
+                }
+            ],
+        }
+    )
+    other_audio = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is said"},
+                        _input_audio(_WAV_BASE64, "mp3"),
+                    ],
+                }
+            ],
+        }
+    )
+    digests = {
+        sha256_json(text_only.request),
+        sha256_json(with_audio.request),
+        sha256_json(other_audio.request),
+    }
+    assert len(digests) == 3
+    assert "audio" in with_audio.request.model_dump_json()
+
+
+def test_malformed_chat_input_audio_is_rejected_with_its_field() -> None:
+    """An unusable clip names the exact offending request field."""
+    for part in (_input_audio(audio_format="flac"), _input_audio(data="not base64!")):
+        with pytest.raises(OpenAIProtocolError) as error:
+            decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part]}]})
+        assert error.value.detail.param == "messages.0.content.0.input_audio"
+        assert "'wav' or 'mp3'" in error.value.detail.message
+
+
+def test_a_request_carries_at_most_the_audio_ceiling() -> None:
+    """The eleventh clip in one request is refused rather than dropped."""
+    part = _input_audio()
+    decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part] * 10}]})
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part] * 11}]})
+    with pytest.raises(ValueError, match="at most 10 audio clips"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(
+                GatewayMessage(
+                    role="user",
+                    content="",
+                    content_parts=tuple(
+                        AudioContentPart(media_type="audio/wav", data=_WAV_BASE64)
+                        for _ in range(11)
+                    ),
+                ),
+            ),
+        )
+
+
+def test_assistant_audio_parts_are_rejected() -> None:
+    """Only a caller message may carry a clip."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {"model": "coding", "messages": [{"role": "assistant", "content": [_input_audio()]}]}
+        )
+
+
+def test_responses_surface_refuses_audio_by_name() -> None:
+    """The Responses API serves no audio input, so a clip is refused, not dropped."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "describe"}, _input_audio()],
+                    }
+                ],
+            }
+        )
+    assert error.value.detail.param == "input.0.content.1.input_audio"
+    assert "Chat Completions" in error.value.detail.message

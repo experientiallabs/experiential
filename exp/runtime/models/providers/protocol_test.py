@@ -18,6 +18,7 @@ from exp.common.models import (
 )
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.common.models.content import (
+    AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
     TextContentPart,
@@ -426,4 +427,41 @@ def test_preflight_rejects_a_document_url_on_an_inline_only_route() -> None:
     preflight_gateway_request(
         request,
         GatewayDeploymentCapabilities(supports_pdf_input=True, supports_pdf_url_input=True),
+    )
+
+
+def _audio_request() -> GatewayRequest:
+    """Build one caller request carrying a clip beside its text."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="what is said",
+                content_parts=(
+                    TextContentPart(text="what is said"),
+                    AudioContentPart(media_type="audio/wav", data="UklGRgAAAABXQVZF"),
+                ),
+            ),
+        ),
+    )
+
+
+def test_preflight_rejects_audio_on_a_route_that_does_not_declare_it() -> None:
+    """A clip is never dropped and answered from the surrounding text alone."""
+    with pytest.raises(ProviderCapabilityError, match="audio_input"):
+        preflight_gateway_request(_audio_request(), GatewayDeploymentCapabilities())
+    with pytest.raises(ProviderCapabilityError, match="audio_input"):
+        preflight_gateway_request(
+            _audio_request(),
+            GatewayDeploymentCapabilities(
+                supports_image_input=True, supports_video_input=True, supports_pdf_input=True
+            ),
+        )
+
+
+def test_preflight_admits_audio_on_a_declared_audio_route() -> None:
+    """A declared audio route serves the inline clip."""
+    preflight_gateway_request(
+        _audio_request(), GatewayDeploymentCapabilities(supports_audio_input=True)
     )

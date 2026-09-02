@@ -19,6 +19,7 @@ from pydantic import (
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
 from exp.common.models.content import (
+    AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
     MessageContentPart,
@@ -315,6 +316,11 @@ class ModelMessage(ContractModel):
     def videos(self) -> tuple[VideoContentPart, ...]:
         """Return this message's video parts in caller order."""
         return tuple(part for part in self.content_parts if part.kind == "video")
+
+    @property
+    def audios(self) -> tuple[AudioContentPart, ...]:
+        """Return this message's audio parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "audio")
 
     @property
     def documents(self) -> tuple[DocumentContentPart, ...]:

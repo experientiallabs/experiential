@@ -61,6 +61,9 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field("safety_identifier", CompatibilityDisposition.METADATA_ONLY),
         _field("user", CompatibilityDisposition.METADATA_ONLY),
         _field("prompt_cache_key", CompatibilityDisposition.METADATA_ONLY),
+        # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
+        # is admitted per route; ``audio`` and ``modalities`` request audio
+        # OUTPUT, which no route serves.
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (

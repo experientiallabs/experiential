@@ -413,6 +413,17 @@ class GatewayDeploymentCapabilities(ContractModel):
     author) only; Gemini and the OpenAI-compatible video wires fetch an
     http(s) URL on the caller's behalf.
     """
+    supports_audio_input: bool = False
+    """Whether this deployment's wire and model can carry caller audio parts.
+
+    Audio is the narrowest attachment: only the OpenAI-compatible Chat
+    ``input_audio`` wire and the Gemini ``inline_data`` wire carry a clip a
+    model serves, and on those wires only specific models (the gpt-audio
+    family, audio-capable Gemini models) accept one. The declaration is never
+    assumed, so a route without it rejects audio at admission rather than
+    answering from the surrounding text. Audio has no remote URL carrier on
+    any public surface, so there is no separate URL declaration.
+    """
     supports_pdf_input: bool = False
     """Whether this deployment's wire and model can carry caller PDF documents.
 

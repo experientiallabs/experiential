@@ -9,13 +9,12 @@ from pydantic import Field, field_validator, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
 from exp.common.models.content import (
-    MAXIMUM_DOCUMENTS_PER_REQUEST,
-    MAXIMUM_IMAGES_PER_REQUEST,
-    MAXIMUM_VIDEOS_PER_REQUEST,
+    AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
     MessageContentPart,
     VideoContentPart,
+    require_attachment_ceilings,
 )
 from exp.common.models.gateway_catalog import (
     DeploymentId,
@@ -320,10 +319,10 @@ class GatewayMessage(ContractModel):
 
     Empty on every text-only message, so a text-only request serializes and
     digests exactly as before attachments existed. When present, the text parts
-    concatenate to ``content`` byte-for-byte and at least one image, video, or
-    document part is included, so a route that cannot carry it is rejected at
-    admission instead of silently serving the text alone. Attachments change
-    what the model sees, so this field is serialized and joins request identity.
+    concatenate to ``content`` byte-for-byte and at least one attachment (image,
+    video, audio, or document) is included, so a route that cannot carry it is
+    rejected at admission instead of silently serving the text alone. Attachments
+    change what the model sees, so the field is serialized and joins request identity.
     """
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Validated caller prompt-caching marker on this tool-result message.
@@ -651,6 +650,12 @@ class GatewayRequest(ContractModel):
         return tuple(video for message in self.messages for video in message.videos)
 
     @property
+    def audios(self) -> tuple[AudioContentPart, ...]:
+        """Return every audio clip this request carries, in message and part order."""
+        parts = (part for message in self.messages for part in message.content_parts)
+        return tuple(part for part in parts if part.kind == "audio")
+
+    @property
     def documents(self) -> tuple[DocumentContentPart, ...]:
         """Return every document this request carries, in message and part order."""
         return tuple(part for message in self.messages for part in message.documents)
@@ -699,21 +704,13 @@ class GatewayRequest(ContractModel):
             and self.tool_choice.name not in server_names
         ):
             raise ValueError("named gateway tool choice must name a request tool")
-        if (
-            self.tool_choice == "required"
-            and not self.tools
-            and not self.provider_server_tools
-            and not self.provider_native_tools
-        ):
+        has_tools = bool(self.tools or self.provider_server_tools or self.provider_native_tools)
+        if self.tool_choice == "required" and not has_tools:
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
-        if len(self.images) > MAXIMUM_IMAGES_PER_REQUEST:
-            raise ValueError(f"a request carries at most {MAXIMUM_IMAGES_PER_REQUEST} images")
-        if len(self.videos) > MAXIMUM_VIDEOS_PER_REQUEST:
-            raise ValueError(f"a request carries at most {MAXIMUM_VIDEOS_PER_REQUEST} videos")
-        if len(self.documents) > MAXIMUM_DOCUMENTS_PER_REQUEST:
-            raise ValueError(f"a request carries at most {MAXIMUM_DOCUMENTS_PER_REQUEST} documents")
+        parts = (part for message in self.messages for part in message.content_parts)
+        require_attachment_ceilings(parts)
         if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("reasoning_summary is valid only for Responses requests")
         if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:

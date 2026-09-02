@@ -4,7 +4,7 @@ import base64
 from typing import Literal, cast
 
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
-from exp.common.models.content import TextContentPart, VideoContentPart
+from exp.common.models.content import AudioContentPart, TextContentPart, VideoContentPart
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -257,3 +257,48 @@ def test_oversized_inline_media_skips_the_bedrock_rung() -> None:
     assert len(errors) == 1
     assert isinstance(errors[0], ProviderParameterError)
     assert errors[0].param == "messages"
+
+
+def test_audio_requests_skip_rungs_whose_wire_cannot_carry_them() -> None:
+    """A clip lands on the declared Chat rung, past Anthropic, Bedrock, and undeclared Gemini."""
+    audio_route = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_audio_input=True
+        )
+    )
+    deployments = (
+        _deployment("claude", provider="anthropic"),
+        _deployment("nova", provider="bedrock", gateway=audio_route),
+        _deployment("gemini", provider="gemini"),
+        _deployment("router", provider="openrouter", gateway=audio_route),
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
+        (GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test"), client),
+        (GatewayWireProfile(dialect="gemini_generate_content", url="https://gemini.test"), client),
+        (GatewayWireProfile(dialect="openai_compatible", url="https://openrouter.test"), client),
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="what is said",
+                content_parts=(
+                    AudioContentPart(media_type="audio/wav", data="UklGRgAAAABXQVZF"),
+                    TextContentPart(text="what is said"),
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    indexes, errors = protocol_compatible_indexes(route, wires, request, public_stream=False)
+    assert indexes == (3,)
+    capabilities = [
+        error.capability for error in errors if isinstance(error, ProviderCapabilityError)
+    ]
+    assert capabilities == ["audio_input", "audio_input", "audio_input"]
+    assert len(errors) == 3

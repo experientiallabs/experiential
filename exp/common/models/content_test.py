@@ -5,14 +5,19 @@ from __future__ import annotations
 import pytest
 
 from exp.common.models.content import (
+    MAXIMUM_AUDIO_BASE64_BYTES,
+    MAXIMUM_AUDIOS_PER_REQUEST,
     MAXIMUM_DOCUMENT_BASE64_BYTES,
     MAXIMUM_IMAGE_BASE64_BYTES,
     MAXIMUM_VIDEO_BASE64_BYTES,
+    AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
     VideoContentPart,
+    audio_part_from_input_audio,
     document_part_from_file_data,
     image_part_from_url,
+    require_attachment_ceilings,
     video_part_from_url,
 )
 
@@ -252,3 +257,68 @@ def test_document_name_joins_serialization_but_a_cache_marker_does_not() -> None
     assert plain.model_dump(mode="json") != named.model_dump(mode="json")
     assert marked.cache_control == {"type": "ephemeral"}
     assert plain.model_dump(mode="json") == marked.model_dump(mode="json")
+
+
+_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA="
+"""A 44-byte WAV header with an empty data chunk, base64 encoded."""
+
+
+@pytest.mark.parametrize(
+    ("audio_format", "media_type"),
+    [("wav", "audio/wav"), ("WAV", "audio/wav"), ("mp3", "audio/mpeg"), ("Mp3", "audio/mpeg")],
+)
+def test_every_supported_audio_format_inlines(audio_format: str, media_type: str) -> None:
+    """Each Chat ``input_audio`` format maps to its canonical media type and back."""
+    part = audio_part_from_input_audio(_WAV_BASE64, audio_format)
+    assert part.kind == "audio"
+    assert part.media_type == media_type
+    assert part.data == _WAV_BASE64
+    assert part.audio_format() == audio_format.lower()
+
+
+def test_unsupported_audio_format_is_rejected() -> None:
+    """A format outside ``wav``/``mp3`` is refused by name, never coerced."""
+    for audio_format in ("flac", "ogg", "m4a", "audio/wav", ""):
+        with pytest.raises(ValueError, match="unsupported audio format"):
+            audio_part_from_input_audio(_WAV_BASE64, audio_format)
+
+
+def test_audio_requires_strict_base64() -> None:
+    """Audio bytes must be strict standard base64."""
+    with pytest.raises(ValueError, match="must be base64"):
+        audio_part_from_input_audio("not base64!", "wav")
+    with pytest.raises(ValueError, match="must be base64"):
+        AudioContentPart(media_type="audio/wav", data="AAA")
+
+
+def test_audio_has_exactly_one_carrier_and_a_required_media_type() -> None:
+    """An audio part carries inline bytes with a media type and no URL field."""
+    with pytest.raises(ValueError):
+        AudioContentPart(media_type="audio/wav", data="")
+    with pytest.raises(ValueError):
+        AudioContentPart.model_validate({"media_type": "audio/flac", "data": _WAV_BASE64})
+    with pytest.raises(ValueError):
+        AudioContentPart.model_validate(
+            {"media_type": "audio/wav", "data": _WAV_BASE64, "url": "https://a.example/x.wav"}
+        )
+
+
+def test_inline_audio_exceeding_the_ceiling_is_rejected() -> None:
+    """One clip above the encoded ceiling is refused before any provider sees it."""
+    oversized = "A" * (MAXIMUM_AUDIO_BASE64_BYTES + 4)
+    with pytest.raises(ValueError, match="maximum encoded size"):
+        audio_part_from_input_audio(oversized, "wav")
+    with pytest.raises(ValueError):
+        AudioContentPart(media_type="audio/wav", data=oversized)
+
+
+def test_attachment_ceilings_count_each_kind_separately() -> None:
+    """Every attachment kind has its own per-request ceiling with a named error."""
+    audio = AudioContentPart(media_type="audio/wav", data=_WAV_BASE64)
+    require_attachment_ceilings([audio] * MAXIMUM_AUDIOS_PER_REQUEST)
+    with pytest.raises(ValueError, match="at most 10 audio clips"):
+        require_attachment_ceilings([audio] * (MAXIMUM_AUDIOS_PER_REQUEST + 1))
+    with pytest.raises(ValueError, match="at most 5 documents"):
+        require_attachment_ceilings(
+            [DocumentContentPart(url="https://example.com/a.pdf") for _ in range(6)]
+        )

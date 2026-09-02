@@ -66,6 +66,7 @@ _VIDEO_URL_INPUT_OPTION = typer.Option(
     None,
     "--supports-video-url-input/--no-supports-video-url-input",
 )
+_AUDIO_INPUT_OPTION = typer.Option(False, "--supports-audio-input")
 
 IMAGE_URL_PROVIDERS = frozenset({"anthropic", "azure", "openai", "openrouter"})
 """Providers whose wire fetches a caller image URL on the gateway's behalf.
@@ -83,6 +84,19 @@ video input, so a route on those providers must not claim it."""
 
 VIDEO_URL_PROVIDERS = frozenset({"gemini", "openai-compatible", "openrouter", "vertex"})
 """Video providers whose wire fetches a caller video URL on the gateway's behalf."""
+
+AUDIO_PROVIDERS = frozenset({"azure", "gemini", "openai-compatible", "openrouter", "vertex"})
+"""Providers whose wire defines a caller audio carrier some model serves.
+
+The Chat Completions ``input_audio`` part (Azure OpenAI deployments,
+OpenRouter, and an OpenAI-compatible connection such as api.openai.com's own
+Chat endpoint) and the Gemini ``inline_data`` part carry audio. The ``openai``
+adapter speaks the Responses wire, which refuses audio input on every model;
+Anthropic defines no audio block; and no Bedrock Converse model accepts the
+``audio`` block its schema lists. A route on those providers must not claim
+audio. Audio has no remote URL carrier, so there is no URL declaration.
+An Azure connection serving a known Anthropic model resolves to the
+Anthropic Messages wire and is refused for the same reason."""
 
 PDF_URL_PROVIDERS = frozenset({"anthropic", "openai"})
 """Providers whose wire fetches a caller PDF URL on the gateway's behalf.
@@ -167,6 +181,35 @@ def _declared_video_input(
     return True, supports_video_url_input
 
 
+def _declared_audio_input(
+    *,
+    provider: str,
+    provider_model: str,
+    supports_audio_input: bool,
+) -> bool:
+    """Resolve the route's audio declaration against its wire.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        provider_model: Provider-side model name of the deployment.
+        supports_audio_input: Whether the operator declares audio content.
+
+    Returns:
+        Whether the route may carry caller audio.
+
+    Raises:
+        ValueError: Audio is claimed on a provider whose wire has no audio
+            carrier any model serves.
+    """
+    if not supports_audio_input:
+        return False
+    if provider not in AUDIO_PROVIDERS:
+        raise ValueError(f"provider {provider!r} has no audio input wire")
+    if provider == "azure" and known_model_metadata("anthropic", provider_model) is not None:
+        raise ValueError("an Azure Anthropic deployment has no audio input wire")
+    return True
+
+
 def _declared_pdf_url_input(
     *,
     provider: str,
@@ -227,6 +270,7 @@ def alias_create(
     supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
     supports_video_input: bool = _VIDEO_INPUT_OPTION,
     supports_video_url_input: bool | None = _VIDEO_URL_INPUT_OPTION,
+    supports_audio_input: bool = _AUDIO_INPUT_OPTION,
     supports_pdf_input: bool = _PDF_INPUT_OPTION,
     supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
@@ -262,6 +306,7 @@ def alias_create(
             supports_image_url_input=supports_image_url_input,
             supports_video_input=supports_video_input,
             supports_video_url_input=supports_video_url_input,
+            supports_audio_input=supports_audio_input,
             supports_pdf_input=supports_pdf_input,
             supports_pdf_url_input=supports_pdf_url_input,
             maximum_output_tokens=maximum_output_tokens,
@@ -318,6 +363,7 @@ def alias_update(
     supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
     supports_video_input: bool = _VIDEO_INPUT_OPTION,
     supports_video_url_input: bool | None = _VIDEO_URL_INPUT_OPTION,
+    supports_audio_input: bool = _AUDIO_INPUT_OPTION,
     supports_pdf_input: bool = _PDF_INPUT_OPTION,
     supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
@@ -353,6 +399,7 @@ def alias_update(
             supports_image_url_input=supports_image_url_input,
             supports_video_input=supports_video_input,
             supports_video_url_input=supports_video_url_input,
+            supports_audio_input=supports_audio_input,
             supports_pdf_input=supports_pdf_input,
             supports_pdf_url_input=supports_pdf_url_input,
             maximum_output_tokens=maximum_output_tokens,
@@ -432,6 +479,7 @@ def _activate(
     supports_image_url_input: bool | None,
     supports_video_input: bool,
     supports_video_url_input: bool | None,
+    supports_audio_input: bool,
     supports_pdf_input: bool,
     supports_pdf_url_input: bool | None,
     maximum_output_tokens: int | None,
@@ -505,6 +553,11 @@ def _activate(
                 ),
                 supports_video_input=declared_video_input,
                 supports_video_url_input=declared_video_url_input,
+                supports_audio_input=_declared_audio_input(
+                    provider=provider,
+                    provider_model=provider_model,
+                    supports_audio_input=supports_audio_input,
+                ),
                 supports_pdf_input=supports_pdf_input,
                 supports_pdf_url_input=_declared_pdf_url_input(
                     provider=provider,

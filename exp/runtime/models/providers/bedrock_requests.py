@@ -15,6 +15,7 @@ from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.models.providers.audios import reject_audio_part
 from exp.runtime.models.providers.documents import bedrock_document_block
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.images import bedrock_image_block
@@ -253,6 +254,8 @@ def _multimodal_blocks(message: ModelMessage) -> list[JsonObject]:
             blocks.append(bedrock_document_block(part, document_ordinal))
         elif part.kind == "video":
             blocks.append(bedrock_video_block(part))
+        elif part.kind == "audio":
+            blocks.append(reject_audio_part(part))
         elif part.text:
             blocks.append({"text": part.text})
     return blocks

@@ -1249,3 +1249,46 @@ def test_video_block_is_rejected_with_a_surface_hint() -> None:
             )
         )
     assert "video blocks are not supported" in excinfo.value.detail.message
+
+
+def test_audio_block_is_rejected_with_a_surface_hint() -> None:
+    """The Messages wire defines no audio block, so one is refused by name, not dropped."""
+    for body in (
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is said"},
+                        {"type": "audio", "source": {"type": "base64", "data": "UklGRg=="}},
+                    ],
+                }
+            ]
+        ),
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": [
+                                {"type": "audio", "source": {"type": "base64", "data": "UklGRg=="}}
+                            ],
+                        }
+                    ],
+                },
+            ]
+        ),
+    ):
+        with pytest.raises(OpenAIProtocolError) as excinfo:
+            decode_messages(body)
+        assert "audio blocks are not supported" in excinfo.value.detail.message
+        assert "input_audio" not in excinfo.value.detail.message
+        assert "Chat Completions" in excinfo.value.detail.message

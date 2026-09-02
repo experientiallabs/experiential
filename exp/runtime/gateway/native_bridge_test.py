@@ -162,6 +162,26 @@ def test_pdf_capability_errors_explain_the_document_refusal(
     assert "pdf_input" not in inline.detail.message
 
 
+@pytest.mark.parametrize(
+    ("surface", "param"),
+    [(GatewayApiSurface.CHAT_COMPLETIONS, "messages"), (GatewayApiSurface.RESPONSES, "input")],
+)
+def test_audio_capability_error_explains_the_refusal(
+    surface: GatewayApiSurface, param: str
+) -> None:
+    """A refused clip names the conversation field and says why, on every surface."""
+    error = _public_capability_error(
+        ProviderCapabilityError(capability="audio_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    assert error.detail.param == param
+    assert error.detail.code == "unsupported_capability"
+    assert "cannot accept audio input" in error.detail.message
+    assert "audio_input" not in error.detail.message
+
+
 def test_public_capability_error_never_exposes_internal_labels() -> None:
     """Internal route requirements fail against model without leaking their names."""
     error = _public_capability_error(

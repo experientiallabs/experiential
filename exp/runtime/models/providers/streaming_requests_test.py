@@ -6,6 +6,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
+    AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
     TextContentPart,
@@ -2904,3 +2905,71 @@ def test_anthropic_payload_carries_document_blocks_in_caller_order() -> None:
         },
         {"type": "text", "text": " compare"},
     ]
+
+
+_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA="
+"""A 44-byte WAV header with an empty data chunk, base64 encoded."""
+
+
+def _audio_request(
+    surface: GatewayApiSurface = GatewayApiSurface.CHAT_COMPLETIONS,
+) -> GatewayRequest:
+    """Build one streaming request with text on both sides of a clip."""
+    return GatewayRequest(
+        surface=surface,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="listen: what is said?",
+                content_parts=(
+                    TextContentPart(text="listen: "),
+                    AudioContentPart(media_type="audio/wav", data=_WAV_BASE64),
+                    TextContentPart(text="what is said?"),
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_openai_compatible_payload_carries_input_audio_parts_in_order() -> None:
+    """The Chat wire (OpenRouter, Azure, gpt-audio) gets ``input_audio`` between its text."""
+    payload = openai_compatible_stream_payload("gpt-audio-mini", _audio_request())
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "listen: "},
+        {"type": "input_audio", "input_audio": {"data": _WAV_BASE64, "format": "wav"}},
+        {"type": "text", "text": "what is said?"},
+    ]
+
+
+def test_gemini_payload_carries_inline_audio_parts() -> None:
+    """Gemini gets ``inline_data`` with the audio MIME type at the clip's position."""
+    payload = gemini_generate_content_stream_payload("gemini-3-flash-preview", _audio_request())
+    assert payload["contents"] == [
+        {
+            "role": "user",
+            "parts": [
+                {"text": "listen: "},
+                {"inline_data": {"mime_type": "audio/wav", "data": _WAV_BASE64}},
+                {"text": "what is said?"},
+            ],
+        }
+    ]
+
+
+def test_wires_without_an_audio_carrier_narrow_past_the_rung() -> None:
+    """Responses, Anthropic, and Bedrock payloads refuse a clip instead of dropping it."""
+    with pytest.raises(ProviderCapabilityError, match="audio_input"):
+        openai_responses_stream_payload(
+            "gpt-fixture",
+            _audio_request(),
+            supports_temperature=True,
+            supports_reasoning=False,
+            reasoning_effort=None,
+        )
+    with pytest.raises(ProviderCapabilityError, match="audio_input"):
+        anthropic_messages_stream_payload("claude-fable-5", _audio_request())
+    with pytest.raises(ProviderCapabilityError, match="audio_input"):
+        bedrock_converse_stream_payload("us.amazon.nova-lite-v1:0", _audio_request())

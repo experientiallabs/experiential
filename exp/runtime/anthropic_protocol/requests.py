@@ -60,22 +60,20 @@ from exp.runtime.gateway.contracts import (
     ThinkingBlock,
 )
 from exp.runtime.models.providers.reasoning_compat import REASONING_EFFORTS
-from exp.runtime.openai_protocol.errors import (
-    OpenAIProtocolError,
-    invalid_field,
-    unsupported_field,
-)
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import disposition_map
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 
-_VIDEO_HINT = (
-    "video blocks are not supported: the Anthropic Messages wire defines no video "
-    "content, so send video on the Chat Completions surface"
-)
-_REJECTED_BLOCK_HINTS = {"video": _VIDEO_HINT}
+_REJECTED_BLOCK_HINTS = {
+    kind: (
+        f"{kind} blocks are not supported: the Anthropic Messages wire defines no "
+        f"{kind} content, so send {kind} on the Chat Completions surface"
+    )
+    for kind in ("video", "audio")
+}
 _REJECTED_TOOL_RESULT_BLOCK_HINTS = {
     "document": "document blocks are not supported inside tool_result content",
-    "video": _VIDEO_HINT,
+    **_REJECTED_BLOCK_HINTS,
 }
 
 
