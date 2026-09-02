@@ -28,9 +28,8 @@ from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers import preflight_gateway_request
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import (
-    coerce_capability,
     coerce_generation_parameters,
-    route_wide_capability,
+    coerce_route_rejections,
 )
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -124,12 +123,13 @@ def admitted_route_requests(
         provider_request,
         public_stream=public_request.stream,
     )
-    blocking_capability = route_wide_capability(protocol_errors, len(route.deployments))
-    if not protocol_indexes and blocking_capability is not None:
-        # Every rung declined the same capability verbatim; degrade
-        # once with disclosure where semantics allow (strict tools
-        # only).
-        coercion = coerce_capability(blocking_capability, admitted_request)
+    if not protocol_indexes:
+        # Degrade once with disclosure where the rejection set allows it:
+        # a unanimous capability rejection coerces any coercible capability,
+        # mixed rejections only the service-tier hint.
+        coercion = coerce_route_rejections(
+            protocol_errors, len(route.deployments), admitted_request
+        )
         if coercion is not None:
             admitted_request = coercion.request
             coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
@@ -146,7 +146,6 @@ def admitted_route_requests(
                 provider_request,
                 public_stream=public_request.stream,
             )
-            blocking_capability = route_wide_capability(protocol_errors, len(route.deployments))
     if not protocol_indexes:
         if not protocol_errors:
             raise GatewayRoutingError("authorized route has no compatible deployment")
@@ -288,10 +287,9 @@ def _candidate_serves(
     )
     if indexes:
         return True
-    blocking = route_wide_capability(errors, len(candidate_route.deployments))
-    if blocking is None:
-        return False
-    capability_coercion = coerce_capability(blocking, candidate)
+    capability_coercion = coerce_route_rejections(
+        errors, len(candidate_route.deployments), candidate
+    )
     if capability_coercion is None:
         return False
     try:
