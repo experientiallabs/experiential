@@ -15,6 +15,7 @@ admission metrics.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
@@ -149,10 +150,9 @@ def admitted_route_requests(
     if not protocol_indexes:
         if not protocol_errors:
             raise GatewayRoutingError("authorized route has no compatible deployment")
-        # Nothing coercible remains; the first rung's own rejection stays the
-        # accurate answer, and the shared admit handler scopes capability
-        # rejections to their exact public request field.
-        raise protocol_errors[0]
+        # Nothing coercible remains; the shared admit handler scopes
+        # capability rejections to their exact public request field.
+        raise route_rejection(protocol_errors)
     if len(protocol_indexes) != len(route.deployments):
         selected_indexes = tuple(protocol_indexes)
         route = select_route_deployments(route, selected_indexes)
@@ -175,6 +175,31 @@ def admitted_route_requests(
         )
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, provider_request)
     return route, resolved_wires, public_request, provider_request
+
+
+def route_rejection(
+    errors: Sequence[ProviderParameterError | ProviderCapabilityError],
+) -> ProviderParameterError | ProviderCapabilityError:
+    """Choose the one rejection the caller can act on when no rung serves.
+
+    Rungs decline for their own reasons, and the first rung's reason is not
+    always the caller's remedy. A ladder whose text-only rung refuses any
+    image while an inline-only rung refuses just the remote URL can still
+    carry the picture: the caller inlines the bytes. Reporting the text-only
+    rung's refusal would tell them to drop the image instead. The URL
+    rejection therefore wins whenever some rung raised it; otherwise the
+    first rung's own rejection stays the answer.
+
+    Args:
+        errors: One rejection per declined deployment, in route order.
+
+    Returns:
+        The rejection to surface to the caller.
+    """
+    for error in errors:
+        if isinstance(error, ProviderCapabilityError) and error.capability == "image_url_input":
+            return error
+    return errors[0]
 
 
 def _prefer_cache_capable_rungs(

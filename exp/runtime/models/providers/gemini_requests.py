@@ -17,6 +17,16 @@ from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
 from exp.runtime.models.providers.images import gemini_image_part
 from exp.runtime.models.providers.reasoning_compat import gemini_thinking_level
 
+GEMINI_THOUGHT_SIGNATURE_BYPASS = "skip_thought_signature_validator"
+"""Gemini's documented placeholder for a function call whose signature is gone.
+
+Gemini 3 answers a function call with an opaque ``thoughtSignature`` and
+rejects the next turn with HTTP 400 unless that part comes back carrying it.
+The gateway's public OpenAI and Anthropic surfaces have no field for it, so
+no client can round-trip the real value; Google documents this literal as the
+way to replay a function call whose signature was not retained.
+"""
+
 
 def gemini_model_path(model_id: str) -> str:
     """Remove the optional wire prefix before placing a model in a Gemini path.
@@ -173,7 +183,12 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
     if action is not None:
         for call in action.tool_calls:
             tool_names[call.call_id] = call.name
-            parts.append({"functionCall": {"name": call.name, "args": call.arguments}})
+            parts.append(
+                {
+                    "functionCall": {"name": call.name, "args": call.arguments},
+                    "thoughtSignature": GEMINI_THOUGHT_SIGNATURE_BYPASS,
+                }
+            )
     if not parts:
         raise ValueError("assistant messages need text or tool calls")
     return {"role": "model", "parts": parts}

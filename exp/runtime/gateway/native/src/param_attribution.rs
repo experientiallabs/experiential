@@ -67,6 +67,36 @@ pub fn rejected_parameter(dialect: Dialect, body: &str) -> Option<String> {
     valid_parameter_path(&candidate).then_some(candidate)
 }
 
+/// OpenAI-family `error.code` naming a deployment model the provider cannot serve.
+const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
+
+/// Whether one client-error body reports that the dispatched model does not exist.
+///
+/// The OpenAI Responses surface answers an unknown model with HTTP 400 and
+/// `error.code = "model_not_found"` rather than the 404 that Chat Completions,
+/// Anthropic, and Gemini return. The model ID comes from the catalog, never
+/// from the caller, so that body is an operator misconfiguration of one rung
+/// and the certified ladder must advance past it exactly as it does for a 404.
+/// Only the documented code field is read; the message is never inspected.
+pub fn rejected_model_not_found(dialect: Dialect, body: &str) -> bool {
+    let value: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    match dialect {
+        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
+            value
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                == Some(MODEL_NOT_FOUND_CODE)
+        }
+        Dialect::AnthropicMessages
+        | Dialect::GeminiGenerateContent
+        | Dialect::BedrockConverseStream => false,
+    }
+}
+
 /// Extract the provider's own explanation from one client-error body.
 ///
 /// A client-error body explains what the caller got wrong, and the caller is
@@ -539,6 +569,38 @@ mod tests {
             rejected_detail(Dialect::OpenAiCompatible, padded).as_deref(),
             Some("Unknown parameter: 'top_k'.")
         );
+    }
+
+    #[test]
+    fn openai_responses_model_not_found_code_marks_a_missing_deployment() {
+        // Exact 400 body captured live from api.openai.com/v1/responses (2026-09-02).
+        let body = r#"{"error": {"message": "The requested model 'gpt-5-mini-does-not-exist' does not exist.",
+            "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}"#;
+        assert!(rejected_model_not_found(Dialect::OpenAiResponses, body));
+        assert!(rejected_model_not_found(Dialect::OpenAiCompatible, body));
+    }
+
+    #[test]
+    fn other_client_errors_and_dialects_are_not_missing_deployments() {
+        let body = r#"{"error": {"message": "The requested model 'x' does not exist.",
+            "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}"#;
+        for dialect in [
+            Dialect::AnthropicMessages,
+            Dialect::GeminiGenerateContent,
+            Dialect::BedrockConverseStream,
+        ] {
+            assert!(!rejected_model_not_found(dialect, body), "{dialect:?}");
+        }
+        let unknown = r#"{"error": {"message": "Unknown parameter: 'top_k'.",
+            "type": "invalid_request_error", "param": "top_k", "code": "unknown_parameter"}}"#;
+        assert!(!rejected_model_not_found(Dialect::OpenAiResponses, unknown));
+        let prose =
+            r#"{"error": {"message": "The requested model does not exist.", "code": null}}"#;
+        assert!(!rejected_model_not_found(Dialect::OpenAiResponses, prose));
+        assert!(!rejected_model_not_found(
+            Dialect::OpenAiResponses,
+            "model_not_found"
+        ));
     }
 
     #[test]

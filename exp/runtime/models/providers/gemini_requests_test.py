@@ -8,6 +8,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.gemini_requests import (
+    GEMINI_THOUGHT_SIGNATURE_BYPASS,
     gemini_generate_request,
     gemini_model_path,
 )
@@ -109,12 +110,55 @@ def test_gemini_generate_request_links_tool_results_to_prior_calls() -> None:
     assert isinstance(contents, list)
     assert contents[1] == {
         "role": "model",
-        "parts": [{"functionCall": {"name": "lookup", "args": {"q": "x"}}}],
+        "parts": [
+            {
+                "functionCall": {"name": "lookup", "args": {"q": "x"}},
+                "thoughtSignature": GEMINI_THOUGHT_SIGNATURE_BYPASS,
+            }
+        ],
     }
     assert contents[2] == {
         "role": "user",
         "parts": [{"functionResponse": {"name": "lookup", "response": {"content": "answer"}}}],
     }
+
+
+def test_gemini_generate_request_replays_every_function_call_with_the_bypass_signature() -> None:
+    """Each replayed function call carries Gemini's documented placeholder signature.
+
+    Gemini 3 rejects a follow-up turn (HTTP 400, ``missing a thought_signature``)
+    when a replayed ``functionCall`` part has no signature, and the gateway's
+    public surfaces cannot carry the real one back from the client.
+    """
+    calls = (
+        ToolCall(call_id="call-1", name="write", arguments={"path": "a"}),
+        ToolCall(call_id="call-2", name="read", arguments={"path": "b"}),
+    )
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="go"),
+            ModelMessage(
+                role="assistant",
+                content="working",
+                assistant_action=AssistantAction(tool_calls=calls),
+            ),
+            ModelMessage(role="tool", content="ok", tool_call_id="call-1"),
+            ModelMessage(role="tool", content="ok", tool_call_id="call-2"),
+        ),
+    )
+    payload = gemini_generate_request("gemini-3-flash-preview", request)
+
+    contents = payload["contents"]
+    assert isinstance(contents, list)
+    model_turn = contents[1]
+    assert isinstance(model_turn, dict)
+    parts = model_turn["parts"]
+    assert isinstance(parts, list)
+    assert parts[0] == {"text": "working"}
+    for part in parts[1:]:
+        assert isinstance(part, dict)
+        assert "functionCall" in part
+        assert part["thoughtSignature"] == "skip_thought_signature_validator"
 
 
 def test_gemini_generate_request_rejects_an_unlinked_tool_result() -> None:
