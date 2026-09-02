@@ -34,6 +34,7 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "top_p",
                 "stream",
                 "stream_options",
+                "service_tier",
             )
         ),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
@@ -77,7 +78,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "prompt_cache_options",
                 "prompt_cache_retention",
                 "seed",
-                "service_tier",
                 "store",
                 "verbosity",
                 "web_search_options",

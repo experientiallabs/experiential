@@ -545,6 +545,8 @@ class GatewayRequest(ContractModel):
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
+    service_tier: str | None = Field(default=None, max_length=64)
+    """Caller processing-tier hint, forwarded verbatim to openai_compatible rungs."""
     ignored_parameters: tuple[str, ...] = Field(default=(), exclude=True)
     """Disclosed compatibility decisions applied to this request.
 

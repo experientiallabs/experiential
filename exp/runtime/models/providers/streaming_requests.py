@@ -949,6 +949,8 @@ def openai_compatible_stream_payload(
     del supports_logprobs
     if request.stop:
         payload["stop"] = list(request.stop)
+    if request.service_tier is not None:
+        payload["service_tier"] = request.service_tier
     if supports_reasoning and effective_reasoning_effort is not None:
         if reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
