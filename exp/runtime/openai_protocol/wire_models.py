@@ -269,6 +269,36 @@ class _ChatRequest(_WireModel):
         return self
 
 
+class _EmbeddingsRequest(_WireModel):
+    """Closed gateway embeddings request profile.
+
+    ``input`` narrows the official OpenAI union to text only: the token-array
+    forms (``list[int]`` / ``list[list[int]]``) pass official validation but
+    are rejected here with a field-specific 400, since this surface serves
+    visible text, not pre-tokenized ids.
+    """
+
+    model: str = Field(min_length=1, max_length=256)
+    input: str | tuple[str, ...]
+    dimensions: int | None = Field(default=None, gt=0)
+    encoding_format: Literal["float", "base64"] | None = None
+    user: str | None = Field(default=None, max_length=1024)
+
+    @field_validator("input")
+    @classmethod
+    def _require_nonempty_input(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
+        """Reject empty text, an empty array, or empty array members."""
+        if isinstance(value, str):
+            if not value:
+                raise ValueError("input must not be an empty string")
+            return value
+        if not value:
+            raise ValueError("input must not be an empty array")
+        if any(not text for text in value):
+            raise ValueError("input array must not contain empty strings")
+        return value
+
+
 class _ResponseTool(_WireModel):
     """Responses API function tool declaration."""
 

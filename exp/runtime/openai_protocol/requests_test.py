@@ -21,6 +21,7 @@ from exp.runtime.openai_protocol.model_adapter import model_request
 from exp.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
     decode_chat,
+    decode_embeddings,
     decode_responses,
 )
 
@@ -1948,3 +1949,65 @@ def test_a_malformed_function_tool_declaration_still_fails_closed() -> None:
         )
     assert rejection.value.status_code == 400
     assert "tools" in (rejection.value.detail.param or "")
+
+
+def test_embeddings_decoder_preserves_supported_fields() -> None:
+    """Embeddings conversion keeps the alias, inputs, dimensions, encoding, and attribution."""
+    decoded = decode_embeddings(
+        {
+            "model": "text-embedding-3-small",
+            "input": "hello world",
+            "dimensions": 256,
+            "encoding_format": "float",
+            "user": "end-user-7",
+        }
+    )
+
+    assert decoded.alias == "text-embedding-3-small"
+    assert decoded.request.surface == GatewayApiSurface.EMBEDDINGS
+    assert decoded.request.inputs == ("hello world",)
+    assert decoded.request.dimensions == 256
+    assert decoded.request.encoding_format == "float"
+    assert decoded.request.user == "end-user-7"
+
+
+def test_embeddings_decoder_accepts_a_list_of_inputs() -> None:
+    """An array of texts decodes in order with defaults for the optional fields."""
+    decoded = decode_embeddings({"model": "m", "input": ["first", "second"]})
+
+    assert decoded.request.inputs == ("first", "second")
+    assert decoded.request.dimensions is None
+    assert decoded.request.encoding_format is None
+    assert decoded.request.user is None
+
+
+def test_embeddings_decoder_rejects_unknown_and_streaming_fields() -> None:
+    """A field outside the closed embeddings manifest is a named 400, never silently dropped."""
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_embeddings({"model": "m", "input": "x", "stream": True})
+    assert rejection.value.status_code == 400
+    assert "stream" in rejection.value.detail.message
+
+
+def test_embeddings_decoder_rejects_token_array_input() -> None:
+    """Pre-tokenized id arrays pass official validation but this text surface rejects them."""
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_embeddings({"model": "m", "input": [1, 2, 3]})
+    assert rejection.value.status_code == 400
+    assert "input" in (rejection.value.detail.param or "")
+
+
+def test_embeddings_decoder_rejects_empty_and_malformed_inputs() -> None:
+    """Empty strings, an empty array, a missing input, and bad options each fail with a param."""
+    cases: tuple[tuple[JsonObject, str], ...] = (
+        ({"model": "m", "input": ""}, "input"),
+        ({"model": "m", "input": []}, "input"),
+        ({"model": "m"}, "input"),
+        ({"model": "m", "input": "x", "dimensions": 0}, "dimensions"),
+        ({"model": "m", "input": "x", "encoding_format": "weird"}, "encoding_format"),
+    )
+    for payload, param in cases:
+        with pytest.raises(OpenAIProtocolError) as rejection:
+            decode_embeddings(payload)
+        assert rejection.value.status_code == 400
+        assert param in (rejection.value.detail.param or "")

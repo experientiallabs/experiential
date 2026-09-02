@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
+from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.runtime.gateway.native_decode import (
+    NativeDecodeError,
+    decode_native_body,
+    decode_native_embeddings_body,
+)
 
 
 def test_decode_native_body_accepts_chat_and_responses() -> None:
@@ -40,3 +45,23 @@ def test_messages_surface_threads_the_caller_beta_header() -> None:
     )
     assert decoded.request.provider_beta_tokens == ("context-1m-2025-08-07",)
     assert decoded.request.ignored_parameters == ("anthropic-beta.claude-code-20250219",)
+
+
+def test_decode_native_embeddings_body_accepts_the_embeddings_surface() -> None:
+    """The embeddings surface decodes through its own message-less entrypoint."""
+    decoded = decode_native_embeddings_body('{"model":"text-embedding-3-small","input":"hi"}')
+
+    assert decoded.alias == "text-embedding-3-small"
+    assert decoded.request.surface == GatewayApiSurface.EMBEDDINGS
+    assert decoded.request.inputs == ("hi",)
+
+
+def test_decode_native_embeddings_body_rejects_malformed_bodies() -> None:
+    """Invalid JSON and non-object bodies keep the shared public error shapes."""
+    with pytest.raises(NativeDecodeError) as invalid_json:
+        decode_native_embeddings_body("{not json")
+    assert invalid_json.value.error.detail.code == "invalid_json"
+
+    with pytest.raises(NativeDecodeError) as not_object:
+        decode_native_embeddings_body("[]")
+    assert not_object.value.error.status_code == 400

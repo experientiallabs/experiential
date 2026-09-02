@@ -239,6 +239,27 @@ caching natively, and non-Anthropic routes disclose the omission through
 """
 
 
+EMBEDDINGS_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.EMBEDDINGS,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in (
+                "model",
+                "input",
+                "dimensions",
+                "encoding_format",
+            )
+        ),
+        # End-user attribution (OpenAI spec): accepted and recorded gateway-side,
+        # never forwarded to the provider. The embeddings body carries no
+        # safety_identifier / prompt_cache_key, so `user` is the only one.
+        _field("user", CompatibilityDisposition.METADATA_ONLY),
+    ),
+)
+
+
 def disposition_map(manifest: CompatibilityManifest) -> dict[str, CompatibilityDisposition]:
     """Index one manifest by exact top-level request field.
 

@@ -57,6 +57,7 @@ class GatewayApiSurface(StrEnum):
     CHAT_COMPLETIONS = "chat_completions"
     RESPONSES = "responses"
     MESSAGES = "messages"
+    EMBEDDINGS = "embeddings"
 
 
 class GatewayToolDefinition(ContractModel):
