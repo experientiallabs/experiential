@@ -322,3 +322,12 @@ def test_attachment_ceilings_count_each_kind_separately() -> None:
         require_attachment_ceilings(
             [DocumentContentPart(url="https://example.com/a.pdf") for _ in range(6)]
         )
+
+
+def test_audio_clips_share_one_request_wide_encoded_budget() -> None:
+    """Clips that each fit the ceiling are refused once their sum exceeds it."""
+    half = "A" * (MAXIMUM_AUDIO_BASE64_BYTES // 2)
+    clip = AudioContentPart(media_type="audio/wav", data=half)
+    require_attachment_ceilings([clip, clip])
+    with pytest.raises(ValueError, match="together exceed"):
+        require_attachment_ceilings([clip, clip, clip])

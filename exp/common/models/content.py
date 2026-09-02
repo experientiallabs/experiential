@@ -102,12 +102,13 @@ Gemini ``inline_data`` accepts ``audio/wav`` and ``audio/mpeg`` (as well as
 ``audio/mp3``); the standard registered type is recorded."""
 
 MAXIMUM_AUDIO_BASE64_BYTES = 20 * 1024 * 1024
-"""Largest encoded audio clip this gateway forwards inline.
+"""Largest encoded audio payload one request may carry, summed over its clips.
 
 Gemini caps an inline ``generateContent`` request at 20 MB in total, the
 narrowest documented ceiling across the audio-capable wires; OpenAI publishes
-no separate per-part audio limit. Audio has no URL carrier on any public
-surface, so a larger clip cannot be sent."""
+no separate per-part audio limit. The same bound applies to every single clip
+and to the request-wide sum. Audio has no URL carrier on any public surface,
+so a larger clip cannot be sent."""
 
 MAXIMUM_AUDIOS_PER_REQUEST = 10
 """Largest number of audio clips one request may carry across all its messages.
@@ -515,9 +516,14 @@ def require_attachment_ceilings(parts: Iterable[MessageContentPart]) -> None:
         parts: Every content part of the request, across all its messages.
 
     Raises:
-        ValueError: One attachment kind exceeds its per-request ceiling.
+        ValueError: One attachment kind exceeds its per-request ceiling, or the
+            request's audio clips together exceed the encoded audio budget.
     """
+    parts = tuple(parts)
     counts = Counter(part.kind for part in parts)
     for kind, ceiling, noun in ATTACHMENT_CEILINGS:
         if counts[kind] > ceiling:
             raise ValueError(f"a request carries at most {ceiling} {noun}")
+    audio_bytes = sum(len(part.data) for part in parts if part.kind == "audio")
+    if audio_bytes > MAXIMUM_AUDIO_BASE64_BYTES:
+        raise ValueError("a request's audio clips together exceed the maximum encoded size")
