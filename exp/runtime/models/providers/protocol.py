@@ -206,7 +206,15 @@ def preflight_gateway_request(
     requirements: tuple[tuple[bool, bool, str], ...] = ()
     if model_capabilities is not None:
         requirements += (
-            (bool(request.tools), model_capabilities.supports_tools is not False, "function_tools"),
+            (
+                # Verbatim native declarations are tools too: a rung that
+                # declares no tool support must reject a native-tools-only
+                # request locally instead of dispatching a known-unsupported
+                # provider call.
+                bool(request.tools) or bool(request.provider_native_tools),
+                model_capabilities.supports_tools is not False,
+                "function_tools",
+            ),
             (
                 request.structured_text is not None,
                 model_capabilities.supports_structured_output,
@@ -224,6 +232,24 @@ def preflight_gateway_request(
             ),
             capabilities.supports_developer_messages,
             "developer_messages",
+        ),
+        (bool(request.images), capabilities.supports_image_input, "image_input"),
+        (
+            any(image.url is not None for image in request.images),
+            capabilities.supports_image_url_input,
+            "image_url_input",
+        ),
+        (bool(request.videos), capabilities.supports_video_input, "video_input"),
+        (
+            any(video.url is not None for video in request.videos),
+            capabilities.supports_video_url_input,
+            "video_url_input",
+        ),
+        (bool(request.documents), capabilities.supports_pdf_input, "pdf_input"),
+        (
+            any(document.url is not None for document in request.documents),
+            capabilities.supports_pdf_url_input,
+            "pdf_url_input",
         ),
         (bool(request.stop), capabilities.supports_stop_sequences, "stop_sequences"),
         (

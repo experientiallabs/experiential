@@ -105,6 +105,13 @@
    },
    "type": "error"
   },
+  "unavailable": {
+   "error": {
+    "message": "parity probe message",
+    "type": "overloaded_error"
+   },
+   "type": "error"
+  },
   "unsupported_capability": {
    "error": {
     "message": "parity probe message",
@@ -233,6 +240,14 @@
    "param": null,
    "retry_after_seconds": null,
    "status_code": 502
+  },
+  "unavailable": {
+   "code": "gateway_unavailable",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": 2,
+   "status_code": 503
   },
   "unsupported_capability": {
    "code": "unsupported_capability",

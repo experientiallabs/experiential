@@ -7,6 +7,7 @@ are imported by `azure_test` and `native_test` so every adapter exercises one tr
 from __future__ import annotations
 
 import math
+import os
 from typing import Literal
 
 import pytest
@@ -24,12 +25,15 @@ from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
+    ProviderResponseError,
 )
 from exp.runtime.models.providers.openai_compatible import (
     OpenAICompatibleClient,
     OpenAICompatibleResponseError,
     openai_compatible_request,
     openai_compatible_response,
+    openai_embedding_request,
+    openai_embedding_response_raw,
 )
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
@@ -289,6 +293,93 @@ def test_openai_compatible_embedding_response_is_ordered_and_normalized() -> Non
         math.isclose(sum(value * value for value in item.values), 1.0) for item in embeddings
     )
     assert transport.requests[0][0] == "https://example.test/v1/embeddings"
+
+
+def test_openai_embedding_request_carries_optional_dimensions_and_encoding() -> None:
+    """Optional dimensions and encoding_format ride the wire only when supplied."""
+    assert openai_embedding_request("m", ("a", "b")) == {"model": "m", "input": ["a", "b"]}
+    assert openai_embedding_request("m", ("a",), dimensions=256, encoding_format="float") == {
+        "model": "m",
+        "input": ["a"],
+        "dimensions": 256,
+        "encoding_format": "float",
+    }
+
+
+def test_openai_embedding_response_raw_preserves_vectors_and_reads_usage() -> None:
+    """The raw parser restores input order, keeps raw magnitude, and reads prompt tokens."""
+    batch = openai_embedding_response_raw(
+        {
+            "model": "text-embedding-3-small",
+            "data": [
+                {"index": 1, "embedding": [0.0, 3.0]},
+                {"index": 0, "embedding": [4.0, 0.0]},
+            ],
+            "usage": {"prompt_tokens": 7, "total_tokens": 7},
+        },
+        expected_count=2,
+    )
+
+    # Raw magnitudes are preserved, not renormalized to unit length.
+    assert batch.embeddings[0].values == (4.0, 0.0)
+    assert batch.embeddings[1].values == (0.0, 3.0)
+    assert batch.prompt_tokens == 7
+    assert batch.served_model_id == "text-embedding-3-small"
+
+
+def test_openai_embedding_response_raw_requires_usage_for_billing() -> None:
+    """The billed surface refuses a response missing the input-token count."""
+    with pytest.raises(ProviderResponseError, match="usage"):
+        openai_embedding_response_raw(
+            {"data": [{"index": 0, "embedding": [1.0, 2.0]}]},
+            expected_count=1,
+        )
+    # A present usage object with an omitted prompt_tokens must not bill as zero.
+    with pytest.raises(ProviderResponseError, match="usage.prompt_tokens"):
+        openai_embedding_response_raw(
+            {
+                "data": [{"index": 0, "embedding": [1.0, 2.0]}],
+                "usage": {"total_tokens": 5},
+            },
+            expected_count=1,
+        )
+
+
+def test_embed_raw_rejects_empty_input() -> None:
+    """Embedding no text is a caller error on the public surface, not an empty request."""
+    client = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+        transport=ScriptedJsonTransport([]),
+    )
+    with pytest.raises(ValueError, match="at least one input text"):
+        client.embed_raw(())
+
+
+@pytest.mark.skipif(
+    not os.environ.get("OPENAI_API_KEY"),
+    reason="live OpenAI embeddings test requires OPENAI_API_KEY",
+)
+def test_embed_raw_against_live_openai() -> None:
+    """A real text-embedding-3-small call returns raw vectors and billed input tokens."""
+    client = OpenAICompatibleClient(
+        model=_snapshot(provider="openai", model_id="text-embedding-3-small"),
+        base_url="https://api.openai.com/v1",
+        api_key=os.environ["OPENAI_API_KEY"],
+    )
+
+    batch = client.embed_raw(("hello world", "second input"))
+
+    assert len(batch.embeddings) == 2
+    assert len(batch.embeddings[0].values) == 1536
+    # Distinct inputs yield distinct vectors: the raw parser preserved order and content.
+    assert batch.embeddings[0].values != batch.embeddings[1].values
+    # The surface bills the provider's reported input tokens, so they must be present.
+    assert batch.prompt_tokens > 0
+    # A reduced-dimension request rides the wire and returns the narrower vector.
+    batch_dim = client.embed_raw(("hello world",), dimensions=256)
+    assert len(batch_dim.embeddings[0].values) == 256
 
 
 def test_openai_compatible_conversion_rejects_malformed_tool_arguments() -> None:

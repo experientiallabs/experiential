@@ -14,7 +14,20 @@ from typing import Literal
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
+from exp.runtime.models.providers.documents import gemini_document_part
+from exp.runtime.models.providers.images import gemini_image_part
 from exp.runtime.models.providers.reasoning_compat import gemini_thinking_level
+from exp.runtime.models.providers.videos import gemini_video_part
+
+GEMINI_THOUGHT_SIGNATURE_BYPASS = "skip_thought_signature_validator"
+"""Gemini's documented placeholder for a function call whose signature is gone.
+
+Gemini 3 answers a function call with an opaque ``thoughtSignature`` and
+rejects the next turn with HTTP 400 unless that part comes back carrying it.
+The gateway's public OpenAI and Anthropic surfaces have no field for it, so
+no client can round-trip the real value; Google documents this literal as the
+way to replay a function call whose signature was not retained.
+"""
 
 
 def gemini_model_path(model_id: str) -> str:
@@ -151,6 +164,20 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
             ],
         }
     if message.role == "user":
+        if message.content_parts:
+            return {
+                "role": "user",
+                "parts": [
+                    {"text": part.text}
+                    if part.kind == "text"
+                    else gemini_image_part(part)
+                    if part.kind == "image"
+                    else gemini_video_part(part)
+                    if part.kind == "video"
+                    else gemini_document_part(part)
+                    for part in message.content_parts
+                ],
+            }
         if message.content is None:
             raise ValueError("user messages need text content")
         return {"role": "user", "parts": [{"text": message.content}]}
@@ -164,7 +191,12 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
     if action is not None:
         for call in action.tool_calls:
             tool_names[call.call_id] = call.name
-            parts.append({"functionCall": {"name": call.name, "args": call.arguments}})
+            parts.append(
+                {
+                    "functionCall": {"name": call.name, "args": call.arguments},
+                    "thoughtSignature": GEMINI_THOUGHT_SIGNATURE_BYPASS,
+                }
+            )
     if not parts:
         raise ValueError("assistant messages need text or tool calls")
     return {"role": "model", "parts": parts}

@@ -6,6 +6,7 @@ import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -13,7 +14,14 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
+from exp.runtime.models.providers.wire_messages import anthropic_blocks
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+
+_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+    "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
+"""One valid single-pixel PNG, base64 encoded."""
 
 
 def _body(**overrides: JsonValue) -> JsonObject:
@@ -259,8 +267,96 @@ def test_missing_max_tokens_is_rejected_with_its_field() -> None:
     assert excinfo.value.detail.param == "max_tokens"
 
 
-def test_image_blocks_are_rejected_with_a_targeted_hint() -> None:
-    """A known-but-unsupported block gets its own explanation."""
+def test_image_blocks_are_retained_in_caller_order() -> None:
+    """An image block rides the canonical parts beside its text."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                        },
+                    ],
+                }
+            ]
+        )
+    )
+    message = decoded.request.messages[-1]
+    assert message.content == "what is this"
+    assert [part.kind for part in message.content_parts] == ["text", "image"]
+    assert message.images[0].data == _PNG_BASE64
+
+
+def test_a_cache_marker_on_an_image_block_is_retained() -> None:
+    """A breakpoint the caller placed on the image reaches the wire."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    assert decoded.request.messages[-1].images[0].cache_control == {"type": "ephemeral"}
+
+
+def test_an_empty_text_block_beside_an_image_never_re_emits() -> None:
+    """An attachment's empty text block never reaches the Anthropic wire."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ""},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                        },
+                        {"type": "text", "text": "read it", "cache_control": {"type": "ephemeral"}},
+                    ],
+                }
+            ]
+        )
+    )
+    message = decoded.request.messages[-1]
+    assert [part.kind for part in message.content_parts] == ["image", "text"]
+    _role, blocks = anthropic_blocks(message)
+    assert blocks == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+        },
+        {"type": "text", "text": "read it", "cache_control": {"type": "ephemeral"}},
+    ]
+
+
+def test_malformed_image_source_is_rejected() -> None:
+    """An image the gateway cannot forward is rejected at its own path."""
     with pytest.raises(OpenAIProtocolError) as excinfo:
         decode_messages(
             _body(
@@ -272,7 +368,7 @@ def test_image_blocks_are_rejected_with_a_targeted_hint() -> None:
                 ]
             )
         )
-    assert "image blocks are not supported" in excinfo.value.detail.message
+    assert excinfo.value.detail.param == "messages.0.content.0.source"
 
 
 def test_document_block_inside_tool_result_is_rejected() -> None:
@@ -295,6 +391,168 @@ def test_document_block_inside_tool_result_is_rejected() -> None:
             )
         )
     assert "document blocks are not supported" in excinfo.value.detail.message
+
+
+_PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+"""One short PDF header, base64 encoded."""
+
+
+def _pdf_block(data: str = _PDF_BASE64, **extra: JsonValue) -> JsonObject:
+    """Build one base64 Anthropic PDF document block with optional extra fields."""
+    block: JsonObject = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": data},
+    }
+    block.update(extra)
+    return block
+
+
+def test_document_blocks_are_retained_in_caller_order_with_interleaved_text() -> None:
+    """PDF blocks ride the canonical parts at their positions among the text."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first: "},
+                        _pdf_block(title="one.pdf"),
+                        {"type": "text", "text": " second: "},
+                        _pdf_block("JVBERi0xLjcK"),
+                        {"type": "text", "text": " compare them"},
+                    ],
+                }
+            ]
+        )
+    )
+    message = decoded.request.messages[-1]
+    assert message.content == "first:  second:  compare them"
+    assert [part.kind for part in message.content_parts] == [
+        "text",
+        "document",
+        "text",
+        "document",
+        "text",
+    ]
+    documents = decoded.request.documents
+    assert [document.data for document in documents] == [_PDF_BASE64, "JVBERi0xLjcK"]
+    assert [document.name for document in documents] == ["one.pdf", None]
+    assert documents[0].media_type == "application/pdf"
+
+
+def test_a_document_url_source_and_cache_marker_are_retained() -> None:
+    """A remote document and a breakpoint placed on it both reach the canonical part."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {"type": "url", "url": "https://example.com/brief.pdf"},
+                            "cache_control": {"type": "ephemeral"},
+                            "citations": {"enabled": False},
+                        },
+                        {"type": "text", "text": "summarize"},
+                    ],
+                }
+            ]
+        )
+    )
+    document = decoded.request.documents[0]
+    assert document.url == "https://example.com/brief.pdf"
+    assert document.data is None
+    assert document.cache_control == {"type": "ephemeral"}
+
+
+def test_document_sent_once_survives_a_multi_turn_thread() -> None:
+    """A PDF in an earlier user turn is retained when later turns reference it."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [_pdf_block(), {"type": "text", "text": "what is the title"}],
+                },
+                {"role": "assistant", "content": "Minimal PDF."},
+                {"role": "user", "content": "and the page count?"},
+            ]
+        )
+    )
+    assert [len(message.documents) for message in decoded.request.messages] == [1, 0, 0]
+    assert decoded.request.messages[-1].content_parts == ()
+
+
+@pytest.mark.parametrize(
+    ("block", "param"),
+    [
+        (
+            {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "text/plain", "data": "aGk="},
+            },
+            "messages.0.content.0.source",
+        ),
+        (
+            {
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "!!"},
+            },
+            "messages.0.content.0.source",
+        ),
+        (
+            {"type": "document", "source": {"type": "url", "url": "ftp://example.com/a.pdf"}},
+            "messages.0.content.0.source",
+        ),
+        (_pdf_block(citations={"enabled": True}), "messages.0.content.0.citations"),
+    ],
+)
+def test_unservable_document_blocks_are_rejected_at_their_path(
+    block: JsonObject, param: str
+) -> None:
+    """A document the gateway cannot forward is rejected loudly, never dropped."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(_body(messages=[{"role": "user", "content": [block]}]))
+    assert excinfo.value.detail.param == param
+
+
+def test_files_api_document_sources_are_rejected() -> None:
+    """A ``file`` source names an upload this gateway does not host."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "document", "source": {"type": "file", "file_id": "file_1"}}
+                        ],
+                    }
+                ]
+            )
+        )
+
+
+def test_assistant_document_blocks_are_rejected() -> None:
+    """Only a caller message may carry a document."""
+    with pytest.raises(OpenAIProtocolError, match="only valid in user messages"):
+        decode_messages(_body(messages=[{"role": "assistant", "content": [_pdf_block()]}]))
+
+
+def test_too_many_documents_are_rejected() -> None:
+    """The per-request document ceiling fails closed with the ceiling named."""
+    with pytest.raises(OpenAIProtocolError, match="at most 5 documents"):
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [_pdf_block() for _ in range(MAXIMUM_DOCUMENTS_PER_REQUEST + 1)],
+                    }
+                ]
+            )
+        )
 
 
 def test_role_misplaced_blocks_and_empty_content_are_rejected() -> None:
@@ -969,3 +1227,25 @@ def test_decode_carries_block_level_cache_markers_like_a_live_claude_code_turn()
     plain = decode_messages(_body(system=[{"type": "text", "text": "You are terse."}])).request
     assert plain.messages[0].provider_text_blocks == ()
     assert plain.messages[1].provider_text_blocks == ()
+
+
+def test_video_block_is_rejected_with_a_surface_hint() -> None:
+    """The Messages wire defines no video block, so one is refused loudly."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what happens"},
+                            {
+                                "type": "video",
+                                "source": {"type": "url", "url": "https://example.com/a.mp4"},
+                            },
+                        ],
+                    }
+                ]
+            )
+        )
+    assert "video blocks are not supported" in excinfo.value.detail.message

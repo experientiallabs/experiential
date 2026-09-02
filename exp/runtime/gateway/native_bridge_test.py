@@ -46,6 +46,7 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
@@ -130,6 +131,37 @@ def test_internal_text_streaming_failure_has_no_fake_public_field() -> None:
         assert "Choose a different model alias" in error.detail.message
 
 
+@pytest.mark.parametrize(
+    ("surface", "param"),
+    [
+        (GatewayApiSurface.CHAT_COMPLETIONS, "messages"),
+        (GatewayApiSurface.RESPONSES, "input"),
+        (GatewayApiSurface.MESSAGES, "messages"),
+    ],
+)
+def test_pdf_capability_errors_explain_the_document_refusal(
+    surface: GatewayApiSurface, param: str
+) -> None:
+    """A refused PDF names the conversation field and says why, on every surface."""
+    inline = _public_capability_error(
+        ProviderCapabilityError(capability="pdf_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    remote = _public_capability_error(
+        ProviderCapabilityError(capability="pdf_url_input"),
+        surface,
+        public_stream=False,
+        public_tools=False,
+    )
+    assert (inline.detail.param, remote.detail.param) == (param, param)
+    assert inline.detail.code == remote.detail.code == "unsupported_capability"
+    assert "cannot accept PDF document input" in inline.detail.message
+    assert "inline PDF data only" in remote.detail.message
+    assert "pdf_input" not in inline.detail.message
+
+
 def test_public_capability_error_never_exposes_internal_labels() -> None:
     """Internal route requirements fail against model without leaking their names."""
     error = _public_capability_error(
@@ -202,19 +234,20 @@ def _admit(
     raw_key: str,
     body: str,
     *,
+    surface: str | None = None,
     idempotency_key: str | None = None,
     client_request_id: str | None = None,
 ) -> JsonObject:
     """Run one admission call and decode its JSON response."""
-    argument = json.dumps(
-        {
-            "raw_key": raw_key,
-            "body": body,
-            "idempotency_key": idempotency_key,
-            "client_request_id": client_request_id,
-        }
-    )
-    return json.loads(control.admit(argument))
+    payload: JsonObject = {
+        "raw_key": raw_key,
+        "body": body,
+        "idempotency_key": idempotency_key,
+        "client_request_id": client_request_id,
+    }
+    if surface is not None:
+        payload["surface"] = surface
+    return json.loads(control.admit(json.dumps(payload)))
 
 
 def _claim_scope(
@@ -1730,10 +1763,43 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
         )
     error = json.loads(rejected.value.public_error_json)
     assert error["status_code"] == 400
-    assert error["code"] == "continuation_unavailable"
+    assert error["code"] == "previous_response_not_found"
     assert error["param"] == "previous_response_id"
     assert recorded, "the unavailable continuation must record a durable failure"
     assert recorded[-1].failure_class == GatewayFailureClass.INVALID_REQUEST
+
+
+def test_admission_maps_a_route_build_failure_to_a_retryable_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A route/catalog that cannot be built during a rolling deploy records a
+    retryable UNAVAILABLE ledger failure and answers a retryable 503, never the
+    paging INTERNAL that turned the last catalog-schema roll into a fleet-wide
+    incident.
+    """
+    control, raw_key = _control_plane(tmp_path)
+
+    def _raise_routing(*_args: object, **_kwargs: object) -> object:
+        raise GatewayRoutingError("authorized catalog snapshot is not active for this revision")
+
+    monkeypatch.setattr(control, "_resolve_route", _raise_routing)  # noqa: SLF001
+    recorded: list[GatewayFailure] = []
+    original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
+
+    def _capture(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+        recorded.append(failure)
+        return original_finish(authorization, failure)
+
+    monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
+
+    with pytest.raises(NativeBridgeError) as rejected:
+        _admit(control, raw_key, _chat_body())
+
+    error = json.loads(rejected.value.public_error_json)
+    assert error["status_code"] == 503
+    assert recorded, "the roll condition must record a durable failure"
+    assert recorded[-1].failure_class == GatewayFailureClass.UNAVAILABLE
+    assert recorded[-1].safe_message == "the gateway is updating; retry the request"
 
 
 def test_admit_skips_a_dead_lead_rung_and_serves_the_fallback(tmp_path: Path) -> None:
@@ -2903,21 +2969,23 @@ def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path)
     assert report["totals"]["requests"] == 1
 
 
-def test_responses_admission_rejects_unsupported_reasoning_effort(tmp_path: Path) -> None:
-    """Native admission returns the same local parameter error before Rust dispatch."""
+def test_responses_admission_drops_effort_on_a_reasoning_less_route(tmp_path: Path) -> None:
+    """A Responses effort on a zero-reasoning route serves without it, disclosed.
+
+    This surface previously answered the named 400; the owner-approved drop
+    policy (2026-09-01) serves the request effortless instead, because a
+    zero-reasoning route cannot honor any depth and first-party clients pin
+    effort globally.
+    """
     control, raw_key = _control_plane(tmp_path)
     payload = json.loads(_responses_body())
     payload["reasoning"] = {"effort": "high"}
 
-    with pytest.raises(NativeBridgeError) as raised:
-        _admit_responses(control, raw_key, json.dumps(payload))
-
-    error = json.loads(raised.value.public_error_json)
-    assert error["status_code"] == 400
-    assert error["code"] == "unsupported_parameter"
-    assert error["error_type"] == "invalid_request_error"
-    assert error["param"] == "reasoning.effort"
-    assert "not supported by this model route" in error["message"]
+    admission = _flatten_started(control, _admit_responses(control, raw_key, json.dumps(payload)))
+    assert admission["ignored_parameters"] == ["reasoning_effort"]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "reasoning" not in upstream
 
 
 def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> None:
@@ -2946,7 +3014,7 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
         _admit_responses(control, raw_key, _responses_body(previous_response_id="resp_missing"))
     payload = json.loads(unknown.value.public_error_json)
     assert payload["status_code"] == 400
-    assert payload["code"] == "continuation_unavailable"
+    assert payload["code"] == "previous_response_not_found"
     assert payload["param"] == "previous_response_id"
 
     refused = _admit_responses(control, raw_key, _responses_body())
@@ -2971,7 +3039,9 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
                 previous_response_id=stable_public_id("resp", _admitted_request_id(refused))
             ),
         )
-    assert json.loads(after_refusal.value.public_error_json)["code"] == "continuation_unavailable"
+    assert (
+        json.loads(after_refusal.value.public_error_json)["code"] == "previous_response_not_found"
+    )
 
     foreign = ProtocolNamespace(
         organization_id="other-org",
@@ -2983,7 +3053,7 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
             namespace=foreign,
             previous_response_id=response_id,
         )
-    assert crossed.value.detail.code == "continuation_unavailable"
+    assert crossed.value.detail.code == "previous_response_not_found"
 
 
 def test_responses_tool_call_retention_survives_continuation(tmp_path: Path) -> None:
@@ -3739,7 +3809,7 @@ def test_rust_messages_interleaved_parallel_tools_match_the_goldens() -> None:
 
 def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
     """A store:false response is never remembered, so continuing from it fails
-    closed with the shared continuation_unavailable error."""
+    closed with the shared previous_response_not_found error."""
     control, raw_key = _control_plane(tmp_path)
     first = _admit_responses(control, raw_key, _responses_body(store=False))
     assert (
@@ -3759,7 +3829,7 @@ def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
     with pytest.raises(NativeBridgeError) as raised:
         _admit_responses(control, raw_key, _responses_body(previous_response_id=response_id))
     payload = json.loads(raised.value.public_error_json)
-    assert payload["code"] == "continuation_unavailable"
+    assert payload["code"] == "previous_response_not_found"
 
     # An explicit store:true keeps the default retention behavior.
     stored = _admit_responses(control, raw_key, _responses_body(store=True))
@@ -4010,7 +4080,7 @@ def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None
 def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) -> None:
     """An Idempotency-Key on a store:false request opens no side door into
     continuation state: the retention callback stays a no-op, the response ID
-    resolves to continuation_unavailable in its own namespace, and keyed
+    resolves to previous_response_not_found in its own namespace, and keyed
     admission replays the operation without manufacturing stored history."""
     control, raw_key = _control_plane(tmp_path)
     body = _responses_body(store=False)
@@ -4051,7 +4121,7 @@ def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) 
             namespace=entry.continuation.namespace,
             previous_response_id=response_id,
         )
-    assert direct.value.detail.code == "continuation_unavailable"
+    assert direct.value.detail.code == "previous_response_not_found"
     # Continuing from the ID through the public path fails closed too, with
     # or without the original caller operation key.
     for key in (None, "codex-op-next"):
@@ -4066,7 +4136,9 @@ def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) 
                     }
                 )
             )
-        assert json.loads(continued.value.public_error_json)["code"] == "continuation_unavailable"
+        assert (
+            json.loads(continued.value.public_error_json)["code"] == "previous_response_not_found"
+        )
 
 
 def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
@@ -4291,16 +4363,17 @@ def test_strict_tools_degrade_with_disclosure_when_no_rung_declares_them(
     assert control_plane["admission_parameter_coercions"] == 1
 
 
-def test_effort_none_drops_with_disclosure_on_a_reasoning_less_route(
+def test_any_effort_drops_with_disclosure_on_a_reasoning_less_route(
     tmp_path: Path,
 ) -> None:
-    """reasoning_effort none is satisfied by a non-reasoning route.
+    """Every effort level is dropped with disclosure by a non-reasoning route.
 
-    The kimi-k3 shape: a route whose rungs declare no reasoning support
-    rejected the parameter wholesale. An explicit 'none' now drops with
-    disclosure (the model already does exactly what none asks for), while a
-    real effort stays the named rejection because deleting the feature is
-    not a nearest supported level.
+    The kimi-k3 shape dropped only an explicit 'none'; the haiku-4.5 shape
+    proved a real effort must drop too. First-party clients pin effort
+    globally (Claude Code sends its configured effortLevel to every model),
+    so a named rejection made whole sessions unusable against non-reasoning
+    models the provider itself serves fine without the parameter (owner
+    decision, 2026-09-01).
     """
     control, raw_key = _control_plane(tmp_path)
 
@@ -4314,21 +4387,61 @@ def test_effort_none_drops_with_disclosure_on_a_reasoning_less_route(
             }
         )
 
-    admission = _flatten_started(control, _admit(control, raw_key, chat_body("none")))
+    for attempt, effort in enumerate(("none", "high"), start=1):
+        admission = _flatten_started(control, _admit(control, raw_key, chat_body(effort)))
+        assert admission["ignored_parameters"] == ["reasoning_effort"], effort
+        upstream = admission["upstream_payload"]
+        assert isinstance(upstream, dict)
+        assert "reasoning_effort" not in upstream
+        assert "reasoning" not in upstream
+        control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
+        assert control_plane["admission_parameter_coercions"] == attempt
+
+
+def test_effort_carrying_marked_request_serves_native_with_caching_intact(
+    tmp_path: Path,
+) -> None:
+    """The haiku-4.5 regression: effort drops, cache markers reach the wire.
+
+    A Claude Code session pinning effortLevel against a non-reasoning
+    Anthropic model must serve on the native rung with its prompt-cache
+    markers preserved and the dropped effort disclosed, not 400 and not
+    narrow onto a marker-dropping shim.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(root, provider="anthropic")
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=120.0)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "system": [
+                {"type": "text", "text": "You are terse."},
+                {
+                    "type": "text",
+                    "text": "Big cached block.",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "high"},
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body, surface="messages"))
     assert admission["ignored_parameters"] == ["reasoning_effort"]
     upstream = admission["upstream_payload"]
     assert isinstance(upstream, dict)
+    # The dropped effort reaches the provider through NO channel.
+    assert "output_config" not in upstream
     assert "reasoning_effort" not in upstream
-    assert "reasoning" not in upstream
-    control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
-    assert control_plane["admission_parameter_coercions"] == 1
-
-    with pytest.raises(NativeBridgeError) as raised:
-        _admit(control, raw_key, chat_body("high"))
-    payload = json.loads(raised.value.public_error_json)
-    assert payload["status_code"] == 400
-    assert payload["param"] == "reasoning_effort"
-    assert payload["code"] == "unsupported_parameter"
+    # The cache markers survive to the native wire, block structure intact.
+    system = cast("list[JsonObject]", upstream["system"])
+    assert system[-1]["cache_control"] == {"type": "ephemeral"}
 
 
 def _web_search_fixture_json() -> str:

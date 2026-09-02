@@ -15,6 +15,16 @@ from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.models.providers.documents import bedrock_document_block
+from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.images import bedrock_image_block
+from exp.runtime.models.providers.videos import bedrock_video_block
+
+BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES = 25_000_000
+"""Converse accepts inline media only while the whole request payload stays
+under 25 MB. Per-file gateway ceilings do not bound the sum, so a request that
+carries inline media is measured as the complete serialized body: media, text,
+system prompts, tools, and output configuration together."""
 
 
 def converse_request(
@@ -105,6 +115,8 @@ def converse_body(
 
     Raises:
         ValueError: A message cannot be represented without dropping tool context.
+        ProviderParameterError: The request carries inline media and its
+            complete serialized body exceeds the Converse payload ceiling.
     """
     # Converse has no provider-neutral logprobs field. Keep the flag in the
     # shared signature so all provider lanes use one capability contract, but
@@ -183,7 +195,67 @@ def converse_body(
     tool_config = _tool_config(request, strict_tool_names=strict_tool_names)
     if tool_config is not None:
         payload["toolConfig"] = tool_config
+    _require_inline_media_within_payload(request, payload)
     return payload
+
+
+def _carries_inline_media(request: ModelRequest) -> bool:
+    """Return whether any message carries an inline image, video, or document."""
+    return any(
+        part.kind != "text" and part.data is not None
+        for message in request.messages
+        for part in message.content_parts
+    )
+
+
+def _require_inline_media_within_payload(request: ModelRequest, payload: JsonObject) -> None:
+    """Reject an inline-media request whose complete body exceeds the Converse payload cap.
+
+    Text-only requests are not measured here: the ceiling is documented for
+    inline media, and text limits are enforced by the model's token budget.
+
+    Args:
+        request: Typed EXP request whose user messages may carry inline media.
+        payload: The fully assembled Converse body about to be dispatched.
+
+    Raises:
+        ProviderParameterError: The serialized body exceeds
+            ``BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES``.
+    """
+    if not _carries_inline_media(request):
+        return
+    encoded = len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode())
+    if encoded > BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES:
+        raise ProviderParameterError(
+            message=(
+                "This model route accepts requests of at most 25 MB including inline "
+                "image and video data. Send fewer or smaller files or less text."
+            ),
+            param="messages",
+            code="invalid_parameter",
+        )
+
+
+def _multimodal_blocks(message: ModelMessage) -> list[JsonObject]:
+    """Emit one multimodal user turn in caller order.
+
+    Documents are named by their one-based position within the turn when the
+    caller sent no filename, since Converse requires a name on every block.
+    Empty text parts drop because Converse rejects an empty text block.
+    """
+    blocks: list[JsonObject] = []
+    document_ordinal = 0
+    for part in message.content_parts:
+        if part.kind == "image":
+            blocks.append(bedrock_image_block(part))
+        elif part.kind == "document":
+            document_ordinal += 1
+            blocks.append(bedrock_document_block(part, document_ordinal))
+        elif part.kind == "video":
+            blocks.append(bedrock_video_block(part))
+        elif part.text:
+            blocks.append({"text": part.text})
+    return blocks
 
 
 def _message_blocks(message: ModelMessage) -> list[JsonObject]:
@@ -202,6 +274,8 @@ def _message_blocks(message: ModelMessage) -> list[JsonObject]:
         raise ValueError("user messages cannot carry assistant actions")
     if message.role == "user" and message.content is None:
         raise ValueError("user messages need text content")
+    if message.content_parts:
+        return _multimodal_blocks(message)
     blocks: list[JsonObject] = []
     action = message.assistant_action
     text = message.content if message.content is not None else action.content if action else None

@@ -907,6 +907,17 @@ def converse_response(
         if "toolUse" in block:
             tool_calls.append(_tool_use(block["toolUse"], index))
             continue
+        if "reasoningContent" in block:
+            # Converse leads a reasoning model's turn with its thinking blocks
+            # (captured live 2026-09-02 on us.anthropic.claude-opus-5). The
+            # non-streaming completion contract carries answer text and tool
+            # calls only, so the thinking is read and dropped rather than
+            # failing the response.
+            require_object(
+                block["reasoningContent"],
+                f"Bedrock output.message.content[{index}].reasoningContent",
+            )
+            continue
         raise ProviderResponseError(
             f"Bedrock output.message.content[{index}] has an unsupported block"
         )

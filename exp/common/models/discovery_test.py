@@ -218,3 +218,28 @@ def test_connection_names_and_aliases_are_readable_and_collision_safe() -> None:
     assert (
         derive_model_alias("gemini", "models/gemini-3.5-flash", frozenset()) == "gemini-3-5-flash"
     )
+
+
+def test_anthropic_point_release_resolves_a_reasoning_route_without_prices() -> None:
+    """A freshly launched point release must not degrade to a non-reasoning route.
+
+    claude-fable-5-1 reached production as a non-reasoning route (every
+    effort-carrying Claude Code request got a named 400) because the bare
+    listing entry resolved no metadata. With the explicit 5.1 record the
+    route carries its full verified contract; a future unrecorded minor
+    (sonnet-5-2 here) still inherits the generation's controls while its
+    prices stay unknown so priced lanes fail closed.
+    """
+    recorded = resolve_discovered_model(
+        DiscoveredModel(provider="anthropic", model="claude-fable-5-1")
+    )
+    assert recorded.capabilities.supports_reasoning is True
+    assert recorded.capabilities.supports_top_k is False
+    assert recorded.capabilities.input_cost_per_million_tokens_usd == 10.0
+    assert recorded.capabilities.cached_input_cost_per_million_tokens_usd == 0.25
+
+    inherited = resolve_discovered_model(
+        DiscoveredModel(provider="anthropic", model="claude-sonnet-5-2")
+    )
+    assert inherited.capabilities.supports_reasoning is True
+    assert inherited.capabilities.input_cost_per_million_tokens_usd is None

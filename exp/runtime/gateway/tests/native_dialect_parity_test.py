@@ -224,10 +224,24 @@ def test_native_gemini_normalizer_matches_the_golden_fixture() -> None:
     ]
 
 
-def test_native_gemini_normalizer_fails_streams_without_a_terminal() -> None:
-    """A stream that closes before its terminal candidate fails as malformed."""
+def test_native_gemini_normalizer_completes_a_clean_end_after_content() -> None:
+    """A stream that closes after content, with no finishReason frame, is a
+    normal completion: Gemini legitimately ends some streams that way, and the
+    real answer must not be thrown away as malformed."""
     result = _native_normalized("gemini_generate_content", GEMINI_GOLDEN_CHUNKS[:1])
-    assert result["events"] == [{"kind": "text_delta", "text": "Hel"}]
+    assert result["failure"] is None
+    assert result["events"] == [
+        {"kind": "text_delta", "text": "Hel"},
+        {"kind": "completed"},
+    ]
+
+
+def test_native_gemini_normalizer_fails_streams_that_produced_no_content() -> None:
+    """A stream that closes having emitted NO content at all stays malformed:
+    a usage-only trailer with no candidates has no answer to complete."""
+    trailer = _sse({"usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 0}})
+    result = _native_normalized("gemini_generate_content", (trailer,))
+    assert result["events"] == []
     failure = result["failure"]
     assert isinstance(failure, dict)
     assert failure["failure_class"] == "malformed_response"

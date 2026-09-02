@@ -14,7 +14,7 @@ zero means the provider documents no separate charge for that cache operation.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 _SNAPSHOT_SUFFIX_PATTERN = re.compile(r"(?:[-@]\d{8}|-\d{4}-\d{2}-\d{2}|-latest)$")
@@ -487,6 +487,29 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
 }
 
 _ANTHROPIC_MODELS: dict[str, KnownModel] = {
+    # Verified live 2026-09-01: claude-fable-5-1 keeps claude-fable-5's exact
+    # generation contract (adaptive-only thinking, low..max efforts,
+    # temperature pinned to 1, top_p floor 0.99, top_k rejected; 1M input,
+    # 128k output per the Models API) but discounts cache reads to 0.025x
+    # ($0.25/MTok), so its prices are recorded explicitly, never inherited.
+    "claude-fable-5-1": _anthropic_chat(
+        input_usd=10.0,
+        cached_input_usd=0.25,
+        cache_write_usd=12.5,
+        output_usd=50.0,
+        context_window_tokens=1_000_000,
+        maximum_output_tokens=128_000,
+        adaptive_reasoning=True,
+    ),
+    "claude-mythos-5-1": _anthropic_chat(
+        input_usd=10.0,
+        cached_input_usd=0.25,
+        cache_write_usd=12.5,
+        output_usd=50.0,
+        context_window_tokens=1_000_000,
+        maximum_output_tokens=128_000,
+        adaptive_reasoning=True,
+    ),
     "claude-fable-5": _anthropic_chat(
         input_usd=10.0,
         cached_input_usd=1.0,
@@ -622,8 +645,47 @@ def canonical_model_id(provider: str, model: str) -> str:
     return _SNAPSHOT_SUFFIX_PATTERN.sub("", identity)
 
 
+_ANTHROPIC_POINT_RELEASE_PATTERN = re.compile(r"^(?P<generation>.+-\d+)-\d+$")
+
+
+def _anthropic_generation_contract(identity: str) -> KnownModel | None:
+    """Inherit generation controls, never prices, for an unrecorded point release.
+
+    The matching rule: an Anthropic id of the form ``<generation>-<minor>``
+    whose ``<generation>`` (itself ending in a digit) is a recorded model
+    inherits that generation's wire contract. Point releases keep their
+    generation's exact controls (claude-fable-5-1 launched with
+    claude-fable-5's thinking, effort, and sampling rules, verified live
+    2026-09-01) but not necessarily its prices (5.1 discounts cache reads
+    4x versus 5), so every price field is cleared: the point release stays
+    servable with the right reasoning contract the day it launches, while
+    priced lanes keep failing closed until its real prices are recorded.
+    ``claude-haiku-4-5`` never falls through here: its would-be generation
+    ``claude-haiku-4`` is not a recorded model.
+    """
+    match = _ANTHROPIC_POINT_RELEASE_PATTERN.match(identity)
+    if match is None:
+        return None
+    generation = _ANTHROPIC_MODELS.get(match.group("generation"))
+    if generation is None:
+        return None
+    return replace(
+        generation,
+        input_cost_per_million_tokens_usd=None,
+        output_cost_per_million_tokens_usd=None,
+        cached_input_cost_per_million_tokens_usd=None,
+        cache_write_cost_per_million_tokens_usd=None,
+    )
+
+
 def known_model_metadata(provider: str, model: str) -> KnownModel | None:
     """Look up verified metadata for one provider model.
+
+    Anthropic point releases resolve through
+    :func:`_anthropic_generation_contract` when no exact record exists, so a
+    newly launched minor version (5.1, 5.2, ...) inherits its generation's
+    wire contract instead of degrading to a non-reasoning route; prices
+    never inherit.
 
     Args:
         provider: Setup provider kind such as ``openai`` or ``anthropic``.
@@ -635,7 +697,11 @@ def known_model_metadata(provider: str, model: str) -> KnownModel | None:
     models = _KNOWN_MODELS.get(provider)
     if models is None:
         return None
-    return models.get(canonical_model_id(provider, model))
+    identity = canonical_model_id(provider, model)
+    known = models.get(identity)
+    if known is None and provider == "anthropic":
+        return _anthropic_generation_contract(identity)
+    return known
 
 
 _RECOMMENDED_MODELS: dict[

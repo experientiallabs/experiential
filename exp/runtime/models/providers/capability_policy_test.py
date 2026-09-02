@@ -87,17 +87,43 @@ def test_effort_snap_skips_levels_that_admit_no_rung() -> None:
     assert coercion.disclosures == ("reasoning_effort->high",)
 
 
-def test_effort_none_drops_on_a_route_with_no_reasoning_at_all() -> None:
-    """A non-reasoning route already delivers what 'none' asks for."""
-    bare = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
-    coercion = coerce_generation_parameters((bare,), _request(reasoning_effort="none"))
-    assert coercion is not None
-    assert coercion.request.reasoning_effort is None
-    assert coercion.disclosures == ("reasoning_effort",)
+def test_any_effort_drops_on_a_route_with_no_reasoning_at_all() -> None:
+    """A zero-reasoning route serves the request without its effort, disclosed.
 
-    # Any real effort on a zero-reasoning route stays a named rejection:
-    # deleting the feature is not a nearest level.
-    assert coerce_generation_parameters((bare,), _request(reasoning_effort="high")) is None
+    First-party clients pin effort globally (Claude Code sends its
+    configured effortLevel to every model), so a named rejection here made
+    whole sessions unusable against non-reasoning models the provider
+    itself serves fine without the parameter (owner decision, 2026-09-01).
+    """
+    bare = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+    for effort in ("none", "high", "xhigh"):
+        coercion = coerce_generation_parameters((bare,), _request(reasoning_effort=effort))
+        assert coercion is not None, effort
+        assert coercion.request.reasoning_effort is None
+        assert coercion.disclosures == ("reasoning_effort",)
+
+    # The Messages surface carries the same effort inside output_config; the
+    # drop strips exactly that key so nothing effort-shaped reaches a
+    # provider that rejects it by name, while other verbatim keys survive.
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    marked = _request(reasoning_effort="high").model_copy(
+        update={
+            "surface": GatewayApiSurface.MESSAGES,
+            "provider_output_config": {"effort": "high", "format": {"type": "text"}},
+        }
+    )
+    coercion = coerce_generation_parameters((anthropic,), marked)
+    assert coercion is not None
+    assert coercion.request.provider_output_config == {"format": {"type": "text"}}
+    effort_only = _request(reasoning_effort="high").model_copy(
+        update={
+            "surface": GatewayApiSurface.MESSAGES,
+            "provider_output_config": {"effort": "high"},
+        }
+    )
+    coercion = coerce_generation_parameters((anthropic,), effort_only)
+    assert coercion is not None
+    assert coercion.request.provider_output_config is None
 
 
 def test_portable_effort_is_never_snapped() -> None:

@@ -9,10 +9,16 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.types import JsonValue
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import (
+    MAXIMUM_DOCUMENT_BASE64_BYTES,
+    MAXIMUM_DOCUMENT_NAME_CHARACTERS,
+    MAXIMUM_IMAGE_BASE64_BYTES,
+    MAXIMUM_VIDEO_BASE64_BYTES,
+)
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
@@ -42,6 +48,121 @@ class _TextPart(_WireModel):
     logprobs: tuple[()] | None = None
 
 
+_ImageDetail = Literal["auto", "low", "high"]
+"""Caller fidelity hint forwarded verbatim to the wires that accept it."""
+
+_MAXIMUM_IMAGE_URL_CHARACTERS = MAXIMUM_IMAGE_BASE64_BYTES + 128
+"""Room for the largest inline image plus its ``data:`` URL preamble."""
+
+
+class _ChatImageUrl(_WireModel):
+    """Chat Completions image reference: a remote URL or a base64 data URL."""
+
+    url: str = Field(min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS)
+    detail: _ImageDetail | None = None
+
+
+class _ChatImagePart(_WireModel):
+    """One Chat Completions ``image_url`` content part."""
+
+    type: Literal["image_url"]
+    image_url: _ChatImageUrl
+
+
+class _ResponsesImagePart(_WireModel):
+    """One Responses ``input_image`` content part.
+
+    Responses carries the reference as a bare string, and ``file_id`` names
+    an uploaded file this gateway does not host, so only the null form of
+    that field is accepted.
+    """
+
+    type: Literal["input_image"]
+    image_url: str = Field(min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS)
+    detail: _ImageDetail | None = None
+    file_id: None = None
+
+
+_MAXIMUM_VIDEO_URL_CHARACTERS = MAXIMUM_VIDEO_BASE64_BYTES + 128
+"""Room for the largest inline video plus its ``data:`` URL preamble."""
+
+
+class _ChatVideoUrl(_WireModel):
+    """Chat Completions video reference: a remote URL or a base64 data URL."""
+
+    url: str = Field(min_length=1, max_length=_MAXIMUM_VIDEO_URL_CHARACTERS)
+
+
+class _ChatVideoPart(_WireModel):
+    """One Chat Completions ``video_url`` content part.
+
+    This is the OpenAI-compatible shape OpenRouter and Fireworks document.
+    The Responses surface defines no video part, so none is accepted there.
+    """
+
+    type: Literal["video_url"]
+    video_url: _ChatVideoUrl
+
+
+_MAXIMUM_FILE_DATA_CHARACTERS = MAXIMUM_DOCUMENT_BASE64_BYTES + 128
+"""Room for the largest inline document plus its ``data:`` URL preamble."""
+
+
+class _ChatFile(_WireModel):
+    """Chat Completions ``file`` payload: inline ``file_data`` with a filename.
+
+    ``file_id`` names an uploaded file this gateway does not host, so only
+    the null form of that field is accepted.
+    """
+
+    file_data: str = Field(min_length=1, max_length=_MAXIMUM_FILE_DATA_CHARACTERS)
+    filename: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
+    file_id: None = None
+
+
+class _ChatFilePart(_WireModel):
+    """One Chat Completions ``file`` content part."""
+
+    type: Literal["file"]
+    file: _ChatFile
+
+
+class _ResponsesFilePart(_WireModel):
+    """One Responses ``input_file`` content part.
+
+    Exactly one of inline ``file_data`` or a remote ``file_url`` is present;
+    ``file_id`` names an uploaded file this gateway does not host, so only
+    the null form of that field is accepted.
+    """
+
+    type: Literal["input_file"]
+    file_data: str | None = Field(
+        default=None, min_length=1, max_length=_MAXIMUM_FILE_DATA_CHARACTERS
+    )
+    file_url: str | None = Field(default=None, min_length=1, max_length=8_192)
+    filename: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
+    file_id: None = None
+
+    @model_validator(mode="after")
+    def _require_one_carrier(self) -> _ResponsesFilePart:
+        """Require exactly one of ``file_data`` or ``file_url``."""
+        if (self.file_data is None) == (self.file_url is None):
+            raise ValueError("input_file needs exactly one of file_data or file_url")
+        return self
+
+
+_ContentPart = Annotated[
+    _TextPart
+    | _ChatImagePart
+    | _ResponsesImagePart
+    | _ChatVideoPart
+    | _ChatFilePart
+    | _ResponsesFilePart,
+    Field(discriminator="type"),
+]
+"""One accepted content part on either OpenAI-style request surface."""
+
+
 class _FunctionCall(_WireModel):
     """Function name and raw JSON argument string."""
 
@@ -65,7 +186,7 @@ class _AssistantToolCall(_WireModel):
 
 
 class _Message(_WireModel):
-    """Text-only OpenAI message with complete assistant tool history.
+    """One OpenAI message with its content parts and assistant tool history.
 
     Assistant messages returned by this gateway (and by official OpenAI SDK
     clients) carry `refusal`, `annotations`, `audio`, and `function_call`
@@ -75,7 +196,7 @@ class _Message(_WireModel):
     """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: str | tuple[_TextPart, ...] | None = None
+    content: str | tuple[_ContentPart, ...] | None = None
     tool_calls: tuple[_AssistantToolCall, ...] | None = None
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
     refusal: None = None
@@ -86,6 +207,11 @@ class _Message(_WireModel):
         default=None,
         max_length=MAXIMUM_REASONING_CARRIER_BYTES,
     )
+
+    @property
+    def image_capable_parts(self) -> tuple[_ContentPart, ...]:
+        """Return this message's structured content parts, empty for plain text."""
+        return () if self.content is None or isinstance(self.content, str) else self.content
 
     @property
     def history_tool_calls(self) -> tuple[_AssistantToolCall, ...]:
@@ -105,6 +231,10 @@ class _Message(_WireModel):
             raise ValueError("tool_calls are valid only for assistant messages")
         if self.role != "assistant" and self.reasoning_content is not None:
             raise ValueError("reasoning_content is valid only for assistant messages")
+        if self.role != "user" and any(
+            not isinstance(part, _TextPart) for part in self.image_capable_parts
+        ):
+            raise ValueError("image and video parts are valid only for user messages")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")
@@ -218,6 +348,36 @@ class _ChatRequest(_WireModel):
         return self
 
 
+class _EmbeddingsRequest(_WireModel):
+    """Closed gateway embeddings request profile.
+
+    ``input`` narrows the official OpenAI union to text only: the token-array
+    forms (``list[int]`` / ``list[list[int]]``) pass official validation but
+    are rejected here with a field-specific 400, since this surface serves
+    visible text, not pre-tokenized ids.
+    """
+
+    model: str = Field(min_length=1, max_length=256)
+    input: str | tuple[str, ...]
+    dimensions: int | None = Field(default=None, gt=0)
+    encoding_format: Literal["float", "base64"] | None = None
+    user: str | None = Field(default=None, max_length=1024)
+
+    @field_validator("input")
+    @classmethod
+    def _require_nonempty_input(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
+        """Reject empty text, an empty array, or empty array members."""
+        if isinstance(value, str):
+            if not value:
+                raise ValueError("input must not be an empty string")
+            return value
+        if not value:
+            raise ValueError("input must not be an empty array")
+        if any(not text for text in value):
+            raise ValueError("input array must not contain empty strings")
+        return value
+
+
 class _ResponseTool(_WireModel):
     """Responses API function tool declaration."""
 
@@ -226,6 +386,31 @@ class _ResponseTool(_WireModel):
     description: str | None = Field(default=None, max_length=8_192)
     parameters: JsonObject = Field(default_factory=dict)
     strict: bool | None = None
+
+
+class _NativeResponseTool(BaseModel):
+    """One non-function Responses tool declaration carried opaquely.
+
+    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool
+    tree), ``web_search``, and ``tool_search`` declarations whose shapes
+    exist on no other wire. Like ``_AdditionalToolsItem``, validation is
+    deliberately shallow and the raw declaration forwards byte-for-byte on
+    native Responses rungs only (each type captured live from Codex 0.151.0
+    and accepted by the provider with a plain API key, 2026-09-01); the
+    provider stays the authority on each declaration's internal shape.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str = Field(min_length=1, max_length=64)
+
+    @field_validator("type")
+    @classmethod
+    def _require_non_function(cls, value: str) -> str:
+        """Keep typed function declarations on the strict model."""
+        if value == "function":
+            raise ValueError("function tool declarations use the typed profile")
+        return value
 
 
 class _ResponseFunctionCall(_WireModel):
@@ -399,7 +584,7 @@ class _ResponsesRequest(_WireModel):
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     store: bool | None = None
     include: tuple[str, ...] | None = None
-    tools: tuple[_ResponseTool, ...] = ()
+    tools: tuple[_ResponseTool | _NativeResponseTool, ...] = ()
     tool_choice: JsonValue = None
     parallel_tool_calls: bool | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)

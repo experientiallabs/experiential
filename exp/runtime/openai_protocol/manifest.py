@@ -185,9 +185,10 @@ RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
         "web_search_call.results",
     }
 )
-"""``include`` selectors consciously rejected: each names a server-tool or
-multimodal surface this gateway does not serve, so honoring the selector is
-impossible and accepting it would be silent."""
+"""``include`` selectors consciously rejected: each asks the response to echo
+a server-tool or stored-content surface this gateway does not retain (image
+input is served, but the gateway does not echo the caller's image back), so
+honoring the selector is impossible and accepting it would be silent."""
 
 
 RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {
@@ -236,6 +237,27 @@ Only the tool-call placement forwards: Anthropic defines tool_use-block
 caching natively, and non-Anthropic routes disclose the omission through
 ``ignored_parameters``.
 """
+
+
+EMBEDDINGS_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.EMBEDDINGS,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in (
+                "model",
+                "input",
+                "dimensions",
+                "encoding_format",
+            )
+        ),
+        # End-user attribution (OpenAI spec): accepted and recorded gateway-side,
+        # never forwarded to the provider. The embeddings body carries no
+        # safety_identifier / prompt_cache_key, so `user` is the only one.
+        _field("user", CompatibilityDisposition.METADATA_ONLY),
+    ),
+)
 
 
 def disposition_map(manifest: CompatibilityManifest) -> dict[str, CompatibilityDisposition]:

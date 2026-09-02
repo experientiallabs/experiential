@@ -5,11 +5,18 @@ from typing import Literal, cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import (
+    DocumentContentPart,
+    ImageContentPart,
+    TextContentPart,
+    VideoContentPart,
+)
 from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
+    GatewayProviderNativeTool,
     GatewayRequest,
     GatewayToolDefinition,
     StructuredTextFormat,
@@ -35,6 +42,12 @@ from exp.runtime.models.providers.streaming_requests import (
     route_generation_parameter_requests,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request
+
+_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+    "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
+"""One valid single-pixel PNG, base64 encoded."""
 
 
 def _chat_request(
@@ -1220,6 +1233,30 @@ def test_anthropic_messages_stream_payload_round_trips_tool_error_state() -> Non
     }
     # An ordinary result stays byte-identical to the pre-existing payload shape.
     assert blocks[1] == {"type": "tool_result", "tool_use_id": "call-2", "content": "fine"}
+
+
+def test_an_empty_assistant_text_never_reaches_the_anthropic_wire() -> None:
+    """A tool-call-only assistant turn omits the empty text block."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="look it up"),
+            GatewayMessage(
+                role="assistant",
+                content="",
+                tool_calls=(
+                    ToolCall(call_id="call-1", name="lookup", arguments={}, raw_arguments="{}"),
+                ),
+            ),
+            GatewayMessage(role="tool", content="found", tool_call_id="call-1"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("exact-model", request)
+    messages = cast("list[dict[str, object]]", payload["messages"])
+    blocks = cast("list[dict[str, object]]", messages[1]["content"])
+    assert [block["type"] for block in blocks] == ["tool_use"]
 
 
 def test_tool_error_state_requires_an_anthropic_only_waterfall() -> None:
@@ -2495,6 +2532,49 @@ def test_block_cache_markers_reach_the_anthropic_wire_and_survive_mixed_routes()
     assert "messages.content.cache_control" in foreign_public.ignored_parameters
 
 
+def test_block_cache_markers_survive_a_multimodal_user_turn() -> None:
+    """An image in the marked turn must not cost the caller its cache prefix.
+
+    Claude Code marks the last text block of recent user turns, and a turn
+    that attaches a screenshot is exactly such a turn: the image joins the
+    caller's blocks at its position and the marker re-emits with its text.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="contextdescribe this",
+                content_parts=(
+                    TextContentPart(text="context"),
+                    ImageContentPart(media_type="image/png", data=_PNG_BASE64),
+                    TextContentPart(text="describe this"),
+                ),
+                provider_text_blocks=(
+                    {"type": "text", "text": "context"},
+                    {
+                        "type": "text",
+                        "text": "describe this",
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = anthropic_messages_stream_payload("claude-fable-5", request)
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "context"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+        },
+        {"type": "text", "text": "describe this", "cache_control": {"type": "ephemeral"}},
+    ]
+
+
 def test_marked_system_prompt_keeps_the_exact_unmarked_text_bytes() -> None:
     """Marked and unmarked payloads carry byte-identical system TEXT.
 
@@ -2545,6 +2625,285 @@ def test_marked_system_prompt_keeps_the_exact_unmarked_text_bytes() -> None:
         "text": "\n\nLong env block.",
         "cache_control": {"type": "ephemeral"},
     }
+
+
+def test_native_tool_declarations_require_a_homogeneous_responses_route() -> None:
+    """Non-function tool declarations (custom, namespace, web_search,
+    tool_search) forward byte-for-byte at their caller positions on native
+    Responses rungs; any other rung in the route is a named rejection
+    (dropping an agent's tool definitions would silently degrade it)."""
+    custom_tool: JsonObject = {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Edit files.",
+        "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"},
+    }
+    web_search_tool: JsonObject = {"type": "web_search", "external_web_access": False}
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        tools=(
+            GatewayToolDefinition(name="exec_command", parameters={"type": "object"}),
+            GatewayToolDefinition(name="view_image", parameters={"type": "object"}),
+        ),
+        provider_native_tools=(
+            GatewayProviderNativeTool(index=1, tool=custom_tool),
+            GatewayProviderNativeTool(index=3, tool=web_search_tool),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = openai_responses_stream_payload("gpt-5.2", request, supports_temperature=False)
+    tools = payload["tools"]
+    assert isinstance(tools, list)
+    assert [entry.get("type") for entry in tools if isinstance(entry, dict)] == [
+        "function",
+        "custom",
+        "function",
+        "web_search",
+    ]
+    assert tools[1] == custom_tool
+    assert tools[3] == web_search_tool
+
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
+    chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
+    public, _provider = route_generation_parameter_requests((responses,), request)
+    assert public.ignored_parameters == ()
+    with pytest.raises(ProviderParameterError) as mixed:
+        route_generation_parameter_requests((responses, chat), request)
+    assert mixed.value.param == "tools"
+
+
+def test_native_tool_declarations_count_as_tools_for_capability_preflight() -> None:
+    """A rung that declares no tool support rejects a native-tools-only
+    request locally instead of dispatching a known-unsupported call."""
+    from exp.common.models import GatewayDeploymentCapabilities, ModelCapabilities
+    from exp.runtime.models.providers.protocol import preflight_gateway_request
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        provider_native_tools=(GatewayProviderNativeTool(index=0, tool={"type": "web_search"}),),
+        stream=True,
+        include_usage=True,
+    )
+    capabilities = GatewayDeploymentCapabilities(supports_streaming=True)
+    with pytest.raises(ProviderCapabilityError) as rejection:
+        preflight_gateway_request(
+            request,
+            capabilities,
+            model_capabilities=ModelCapabilities(supports_tools=False),
+        )
+    assert rejection.value.capability == "function_tools"
+
+
+_MP4_BASE64 = "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDE="
+"""A base64 prefix of an MP4 ``ftyp`` box, enough for a carrier fixture."""
+
+
+def _video_request(
+    surface: GatewayApiSurface = GatewayApiSurface.CHAT_COMPLETIONS,
+    *,
+    remote: bool = False,
+) -> GatewayRequest:
+    """Build one streaming request with text on both sides of a video."""
+    video = (
+        VideoContentPart(url="https://example.com/clip.mp4")
+        if remote
+        else VideoContentPart(media_type="video/mp4", data=_MP4_BASE64)
+    )
+    return GatewayRequest(
+        surface=surface,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="watch this: what happens?",
+                content_parts=(
+                    TextContentPart(text="watch this: "),
+                    video,
+                    TextContentPart(text="what happens?"),
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_openai_compatible_payload_carries_video_url_parts_in_order() -> None:
+    """The OpenRouter and Fireworks wire gets a ``video_url`` part between its text."""
+    payload = openai_compatible_stream_payload("qwen3-omni", _video_request())
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "watch this: "},
+        {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{_MP4_BASE64}"}},
+        {"type": "text", "text": "what happens?"},
+    ]
+    remote = openai_compatible_stream_payload("qwen3-omni", _video_request(remote=True))
+    remote_content = cast(
+        list[JsonObject], cast(list[JsonObject], remote["messages"])[0]["content"]
+    )
+    assert remote_content[1] == {
+        "type": "video_url",
+        "video_url": {"url": "https://example.com/clip.mp4"},
+    }
+
+
+def test_gemini_payload_carries_inline_and_file_video_parts() -> None:
+    """Gemini gets ``inline_data`` for bytes and ``file_data`` for a fetched URI."""
+    payload = gemini_generate_content_stream_payload("gemini-2.5-flash", _video_request())
+    assert payload["contents"] == [
+        {
+            "role": "user",
+            "parts": [
+                {"text": "watch this: "},
+                {"inline_data": {"mime_type": "video/mp4", "data": _MP4_BASE64}},
+                {"text": "what happens?"},
+            ],
+        }
+    ]
+    remote = gemini_generate_content_stream_payload("gemini-2.5-flash", _video_request(remote=True))
+    parts = cast(list[JsonObject], cast(list[JsonObject], remote["contents"])[0]["parts"])
+    assert parts[1] == {"file_data": {"file_uri": "https://example.com/clip.mp4"}}
+
+
+def test_bedrock_payload_carries_a_video_block_and_declines_a_url() -> None:
+    """Converse gets a ``video`` block for bytes and narrows past a URL it cannot fetch."""
+    payload = bedrock_converse_stream_payload("us.amazon.nova-lite-v1:0", _video_request())
+    assert payload["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"text": "watch this: "},
+                {"video": {"format": "mp4", "source": {"bytes": _MP4_BASE64}}},
+                {"text": "what happens?"},
+            ],
+        }
+    ]
+    with pytest.raises(ProviderCapabilityError, match="video_url_input"):
+        bedrock_converse_stream_payload("us.amazon.nova-lite-v1:0", _video_request(remote=True))
+
+
+def test_wires_without_a_video_carrier_narrow_past_the_rung() -> None:
+    """Responses and Anthropic payloads refuse a video instead of dropping it."""
+    with pytest.raises(ProviderCapabilityError, match="video_input"):
+        openai_responses_stream_payload(
+            "gpt-fixture",
+            _video_request(),
+            supports_temperature=True,
+            supports_reasoning=False,
+            reasoning_effort=None,
+        )
+    with pytest.raises(ProviderCapabilityError, match="video_input"):
+        anthropic_messages_stream_payload("claude-fable-5", _video_request())
+
+
+_PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+"""One short PDF header, base64 encoded."""
+
+
+def _document_request(surface: GatewayApiSurface) -> GatewayRequest:
+    """Build one streaming request with two PDFs interleaved with text."""
+    return GatewayRequest(
+        surface=surface,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="first: second: compare",
+                content_parts=(
+                    TextContentPart(text="first:"),
+                    DocumentContentPart(data=_PDF_BASE64, name="a.pdf"),
+                    TextContentPart(text=" second:"),
+                    DocumentContentPart(data="JVBERi0xLjcK"),
+                    TextContentPart(text=" compare"),
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_openai_chat_payload_carries_file_parts_in_caller_order() -> None:
+    """The Chat wire carries each PDF as a ``file`` part at its position."""
+    payload = openai_compatible_stream_payload(
+        "exact-model", _document_request(GatewayApiSurface.CHAT_COMPLETIONS)
+    )
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "first:"},
+        {
+            "type": "file",
+            "file": {
+                "filename": "a.pdf",
+                "file_data": f"data:application/pdf;base64,{_PDF_BASE64}",
+            },
+        },
+        {"type": "text", "text": " second:"},
+        {
+            "type": "file",
+            "file": {
+                "filename": "document.pdf",
+                "file_data": "data:application/pdf;base64,JVBERi0xLjcK",
+            },
+        },
+        {"type": "text", "text": " compare"},
+    ]
+
+
+def test_openai_responses_payload_carries_input_file_parts_in_caller_order() -> None:
+    """The Responses wire carries each PDF as an ``input_file`` part at its position."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.2",
+        _document_request(GatewayApiSurface.RESPONSES),
+        supports_temperature=False,
+    )
+    items = cast(list[JsonObject], payload["input"])
+    assert items[0]["content"] == [
+        {"type": "input_text", "text": "first:"},
+        {
+            "type": "input_file",
+            "filename": "a.pdf",
+            "file_data": f"data:application/pdf;base64,{_PDF_BASE64}",
+        },
+        {"type": "input_text", "text": " second:"},
+        {
+            "type": "input_file",
+            "filename": "document.pdf",
+            "file_data": "data:application/pdf;base64,JVBERi0xLjcK",
+        },
+        {"type": "input_text", "text": " compare"},
+    ]
+
+
+def test_anthropic_payload_carries_document_blocks_in_caller_order() -> None:
+    """The Messages wire carries each PDF as a ``document`` block at its position."""
+    payload = anthropic_messages_stream_payload(
+        "claude-fable-5", _document_request(GatewayApiSurface.MESSAGES)
+    )
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "first:"},
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": _PDF_BASE64,
+            },
+            "title": "a.pdf",
+        },
+        {"type": "text", "text": " second:"},
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjcK",
+            },
+        },
+        {"type": "text", "text": " compare"},
+    ]
 
 
 def _tiered_request(surface: GatewayApiSurface) -> GatewayRequest:

@@ -971,6 +971,30 @@ def test_converse_response_normalizes_cache_legs_without_double_counting() -> No
     assert response.economics.usage.cache_write_input_tokens == 2
 
 
+def test_converse_response_reads_past_a_reasoning_block() -> None:
+    """A reasoning model's thinking leads its turn and never fails the response."""
+    response = converse_response(
+        {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"reasoningContent": {"reasoningText": {"text": "a circle"}}},
+                        {"text": "Circle"},
+                    ],
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 9, "outputTokens": 2},
+        },
+        configured_model=_snapshot(),
+        latency_seconds=0.2,
+    )
+
+    assert response.output.content == "Circle"
+    assert response.finish_reason == ModelFinishReason.COMPLETED
+
+
 def test_converse_response_maps_length_and_rejects_unsupported_blocks() -> None:
     """max_tokens becomes length, and unknown content blocks fail closed."""
     length = converse_response(

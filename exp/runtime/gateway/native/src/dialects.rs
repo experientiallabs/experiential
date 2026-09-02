@@ -177,6 +177,10 @@ pub struct Normalizer {
     tools: BTreeMap<u32, ToolAccumulator>,
     refusal_seen: bool,
     terminal: bool,
+    // Whether any gateway-visible output token (content, reasoning, or a tool
+    // call) has been emitted. A clean stream close after content but without a
+    // terminal frame can then finish normally instead of failing malformed.
+    emitted_output: bool,
     accumulated_tool_bytes: usize,
     accumulated_summary_bytes: usize,
     reasoning_summaries: BTreeMap<(u32, u32), String>,
@@ -213,6 +217,7 @@ impl Normalizer {
             tools: BTreeMap::new(),
             refusal_seen: false,
             terminal: false,
+            emitted_output: false,
             accumulated_tool_bytes: 0,
             accumulated_summary_bytes: 0,
             reasoning_summaries: BTreeMap::new(),
@@ -328,6 +333,28 @@ impl Normalizer {
         ))
     }
 
+    /// Synthesize the terminal events for a stream that closed cleanly without
+    /// an explicit terminal frame.
+    ///
+    /// Gemini legitimately ends some streams right after its last content frame
+    /// without a `finishReason` frame. When content was already emitted, fold
+    /// the last-seen usage and complete normally instead of rejecting a real
+    /// answer as malformed; a stream that produced no content at all stays
+    /// terminal-less so `stream_ended` (or the relay) still fails it closed.
+    /// Returns no events when a terminal already ended the stream.
+    pub fn on_stream_end(&mut self) -> Vec<Event> {
+        if self.terminal || self.dialect != Dialect::GeminiGenerateContent || !self.emitted_output {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if let Some(usage) = self.usage.take() {
+            events.push(Event::Usage(usage));
+        }
+        events.push(Event::Completed);
+        self.terminal = true;
+        events
+    }
+
     /// Feed one decoded SSE frame; a terminal event ends the stream.
     pub fn feed(&mut self, frame: &SseEvent) -> Result<Vec<Event>, Failure> {
         if self.terminal {
@@ -340,6 +367,9 @@ impl Normalizer {
             Dialect::GeminiGenerateContent => self.feed_gemini(frame),
             Dialect::BedrockConverseStream => self.feed_bedrock(frame),
         }?;
+        if events.iter().any(Event::is_output_token) {
+            self.emitted_output = true;
+        }
         if events.iter().any(Event::is_terminal) {
             self.terminal = true;
         }
@@ -380,6 +410,13 @@ pub fn drain_stream_fixture(dialect: Dialect, chunks: &[Vec<u8>]) -> (Vec<Value>
         Err(message) => return (simplified, Some(malformed(&message))),
     }
     if normalizer.saw_terminal() {
+        return (simplified, None);
+    }
+    // A clean stream close after content, with no terminal frame, completes
+    // normally (mirroring the relay's EOF handling) instead of failing closed.
+    let synthesized = normalizer.on_stream_end();
+    if !synthesized.is_empty() {
+        simplified.extend(synthesized.iter().map(simplified_event));
         return (simplified, None);
     }
     match normalizer.stream_ended() {

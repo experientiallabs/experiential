@@ -8,10 +8,20 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
+from exp.common.models.content import (
+    MAXIMUM_DOCUMENTS_PER_REQUEST,
+    MAXIMUM_IMAGES_PER_REQUEST,
+    MAXIMUM_VIDEOS_PER_REQUEST,
+    DocumentContentPart,
+    ImageContentPart,
+    MessageContentPart,
+    VideoContentPart,
+)
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelId,
     ExactModelPoolId,
+    FailoverMode,
 )
 from exp.common.models.model import ReasoningEffort, ToolCall
 
@@ -51,6 +61,7 @@ class GatewayApiSurface(StrEnum):
     CHAT_COMPLETIONS = "chat_completions"
     RESPONSES = "responses"
     MESSAGES = "messages"
+    EMBEDDINGS = "embeddings"
 
 
 class GatewayToolDefinition(ContractModel):
@@ -77,21 +88,20 @@ class GatewayToolDefinition(ContractModel):
     eager_input_streaming: bool | None = Field(default=None, exclude=True)
     """Verbatim Anthropic fine-grained tool-input streaming selector.
 
-    Accepted bare by the provider (verified live 2026-08-30; no beta
-    header). Claude Code sends it conditionally. It changes how the
-    provider frames tool-input deltas, so like the other Anthropic-native
-    carriers it is excluded from serialization (tool digests predate it)
-    and a present value joins replay identity through
-    :func:`canonical_request_sha256`.
+    Accepted bare by the provider (verified live 2026-08-30; no beta header).
+    Claude Code sends it conditionally. It changes how the provider frames
+    tool-input deltas, so like the other Anthropic-native carriers it is excluded
+    from serialization (tool digests predate it) and a present value joins
+    replay identity through :func:`canonical_request_sha256`.
     """
     defer_loading: bool | None = Field(default=None, exclude=True)
     """Verbatim Anthropic tool-search deferred-loading selector.
 
     Accepted bare by the provider, which owns the cross-tool validity rules
-    (verified live 2026-08-30: ``false`` is a no-op and an all-deferred
-    toolset is the provider's own 400). Excluded from serialization; a
-    present value changes what the model initially sees, so it joins replay
-    identity through :func:`canonical_request_sha256`.
+    (verified live 2026-08-30: ``false`` is a no-op and an all-deferred toolset
+    is the provider's own 400). Excluded from serialization; a present value
+    changes what the model initially sees, so it joins replay identity through
+    :func:`canonical_request_sha256`.
     """
     allowed_callers: tuple[str, ...] | None = Field(default=None, exclude=True)
     """Verbatim Anthropic programmatic-tool-calling caller allowlist.
@@ -128,6 +138,22 @@ class StructuredTextFormat(ContractModel):
     description: str | None = Field(default=None, max_length=8_192)
     json_schema: JsonObject
     strict: bool = True
+
+
+class GatewayProviderNativeTool(ContractModel):
+    """One verbatim non-function OpenAI Responses tool declaration.
+
+    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool tree),
+    ``web_search``, and ``tool_search`` declarations whose shapes exist on no
+    other wire; each is validated shallowly at decode and re-emitted byte-for-byte
+    on native Responses rungs only, with the provider owning the declaration's
+    internal shape (each type captured live from Codex 0.151.0 and accepted with
+    a plain API key, 2026-09-01). ``index`` is the declaration's position in the
+    caller's ``tools`` array so re-emission preserves the caller's interleaving.
+    """
+
+    index: int = Field(ge=0)
+    tool: JsonObject
 
 
 class GatewayNamedToolChoice(ContractModel):
@@ -289,6 +315,16 @@ class GatewayMessage(ContractModel):
     so like the other cache carriers this joins neither serialization nor
     replay identity.
     """
+    content_parts: tuple[MessageContentPart, ...] = ()
+    """Ordered caller content parts for a message that carries attachments.
+
+    Empty on every text-only message, so a text-only request serializes and
+    digests exactly as before attachments existed. When present, the text parts
+    concatenate to ``content`` byte-for-byte and at least one image, video, or
+    document part is included, so a route that cannot carry it is rejected at
+    admission instead of silently serving the text alone. Attachments change
+    what the model sees, so this field is serialized and joins request identity.
+    """
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Validated caller prompt-caching marker on this tool-result message.
 
@@ -374,7 +410,30 @@ class GatewayMessage(ContractModel):
             texts = [str(block.get("text", "")) for block in self.provider_text_blocks]
             if (self.content or "") not in ("".join(texts), "\n\n".join(texts)):
                 raise ValueError("provider text blocks must flatten to the message content")
+        if self.content_parts:
+            if self.role != "user":
+                raise ValueError("content parts are valid only for user messages")
+            if all(part.kind == "text" for part in self.content_parts):
+                raise ValueError("content parts are retained only for multimodal messages")
+            texts = [part.text for part in self.content_parts if part.kind == "text"]
+            if (self.content or "") != "".join(texts):
+                raise ValueError("content parts must flatten to the message content")
         return self
+
+    @property
+    def images(self) -> tuple[ImageContentPart, ...]:
+        """Return this message's retained image parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "image")
+
+    @property
+    def videos(self) -> tuple[VideoContentPart, ...]:
+        """Return this message's retained video parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "video")
+
+    @property
+    def documents(self) -> tuple[DocumentContentPart, ...]:
+        """Return this message's retained document parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "document")
 
 
 class GatewayRequest(ContractModel):
@@ -520,6 +579,16 @@ class GatewayRequest(ContractModel):
     other Anthropic-only carriers; a present value joins replay identity
     through :func:`canonical_request_sha256`.
     """
+    provider_native_tools: tuple[GatewayProviderNativeTool, ...] = Field(default=(), exclude=True)
+    """Verbatim non-function OpenAI Responses tool declarations.
+
+    See :class:`GatewayProviderNativeTool`. Rungs that are not native
+    Responses cannot serve these, so route admission rejects by name instead
+    of silently dropping a capability the caller asked for. Excluded from
+    serialization like the other carriers so declaration-free digests are
+    unperturbed; present entries join replay identity through
+    :func:`canonical_request_sha256`.
+    """
     provider_server_tools: tuple[JsonObject, ...] = Field(default=(), exclude=True)
     """Verbatim Anthropic server-tool entries from the Messages ``tools`` array.
 
@@ -578,6 +647,21 @@ class GatewayRequest(ContractModel):
         """
         return self.safety_identifier or self.user
 
+    @property
+    def images(self) -> tuple[ImageContentPart, ...]:
+        """Return every image this request carries, in message and part order."""
+        return tuple(image for message in self.messages for image in message.images)
+
+    @property
+    def videos(self) -> tuple[VideoContentPart, ...]:
+        """Return every video this request carries, in message and part order."""
+        return tuple(video for message in self.messages for video in message.videos)
+
+    @property
+    def documents(self) -> tuple[DocumentContentPart, ...]:
+        """Return every document this request carries, in message and part order."""
+        return tuple(part for message in self.messages for part in message.documents)
+
     @field_validator("stop")
     @classmethod
     def _require_unique_stop_sequences(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -622,10 +706,21 @@ class GatewayRequest(ContractModel):
             and self.tool_choice.name not in server_names
         ):
             raise ValueError("named gateway tool choice must name a request tool")
-        if self.tool_choice == "required" and not self.tools and not self.provider_server_tools:
+        if (
+            self.tool_choice == "required"
+            and not self.tools
+            and not self.provider_server_tools
+            and not self.provider_native_tools
+        ):
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
+        if len(self.images) > MAXIMUM_IMAGES_PER_REQUEST:
+            raise ValueError(f"a request carries at most {MAXIMUM_IMAGES_PER_REQUEST} images")
+        if len(self.videos) > MAXIMUM_VIDEOS_PER_REQUEST:
+            raise ValueError(f"a request carries at most {MAXIMUM_VIDEOS_PER_REQUEST} videos")
+        if len(self.documents) > MAXIMUM_DOCUMENTS_PER_REQUEST:
+            raise ValueError(f"a request carries at most {MAXIMUM_DOCUMENTS_PER_REQUEST} documents")
         if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("reasoning_summary is valid only for Responses requests")
         if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:
@@ -661,6 +756,20 @@ class GatewayRequest(ContractModel):
             raise ValueError("provider_beta_tokens are valid only for Messages requests")
         if self.provider_server_tools and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_server_tools are valid only for Messages requests")
+        if self.provider_native_tools and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("provider_native_tools are valid only for Responses requests")
+        if self.provider_native_tools:
+            # Positions must tile one tools array with the converted function
+            # tools exactly, so native re-emission is total by construction.
+            positions = tuple(entry.index for entry in self.provider_native_tools)
+            declaration_count = len(self.tools) + len(positions)
+            if len(set(positions)) != len(positions) or any(
+                position >= declaration_count for position in positions
+            ):
+                raise ValueError(
+                    "provider_native_tools positions must be distinct indexes "
+                    "into the caller's tools array"
+                )
         if self.maximum_output_tokens_parameter is not None and self.maximum_output_tokens is None:
             raise ValueError("maximum output parameter requires a maximum output value")
         if self.reasoning_summary_parameters and self.reasoning_summary is None:
@@ -828,6 +937,11 @@ class GatewayFailureClass(StrEnum):
     CANCELLED = "cancelled"
     GUARDRAIL = "guardrail"
     INTERNAL = "internal"
+    # A transient control-plane condition (a rolling deploy building the
+    # authorized catalog revision) that the caller should simply retry. Unlike
+    # INTERNAL it is not a bug signal and does not page; unlike a provider class
+    # it never opens a deployment circuit.
+    UNAVAILABLE = "unavailable"
 
 
 class GatewayFailure(ContractModel):
@@ -885,3 +999,7 @@ class ExecutionSnapshot(ContractModel):
     exact_model_id: ExactModelId
     pool_id: ExactModelPoolId
     deployment_ids: tuple[DeploymentId, ...] = Field(min_length=1)
+    # The pool's per-model failover policy, carried onto the route so the
+    # per-attempt retry/failover decision can honor it. Defaults to the
+    # historical maximize_availability.
+    failover_mode: FailoverMode = "maximize_availability"

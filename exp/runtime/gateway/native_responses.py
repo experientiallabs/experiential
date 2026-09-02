@@ -206,7 +206,7 @@ def remember_turn(
     if not context.retain:
         # A store:false caller opted out of server-side continuation state;
         # a later previous_response_id naming this response answers the
-        # shared continuation_unavailable error because it was never stored.
+        # shared previous_response_not_found error because it was never stored.
         return
     if bool(data.get("refusal")):
         return

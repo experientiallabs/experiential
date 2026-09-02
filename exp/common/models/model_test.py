@@ -18,6 +18,8 @@ from exp.common.models import (
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
+    RawEmbedding,
+    RawEmbeddingBatch,
     RoutedCandidateSnapshot,
     ToolCall,
     ToolChoice,
@@ -261,6 +263,26 @@ def test_embeddings_require_nonempty_finite_vectors() -> None:
         Embedding(values=(float("nan"),))
     with pytest.raises(ValidationError, match="unit norm"):
         Embedding(values=(0.1, -0.2))
+
+
+def test_raw_embeddings_preserve_magnitude_but_still_reject_bad_vectors() -> None:
+    """The public-surface carrier keeps raw magnitude yet enforces finiteness."""
+    # A non-unit vector that Embedding would reject is valid raw output.
+    assert RawEmbedding(values=(0.1, -0.2)).values == (0.1, -0.2)
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        RawEmbedding(values=())
+    with pytest.raises(ValidationError, match="finite"):
+        RawEmbedding(values=(float("inf"),))
+    batch = RawEmbeddingBatch(
+        embeddings=(RawEmbedding(values=(0.1, -0.2)),),
+        prompt_tokens=5,
+        served_model_id="text-embedding-3-small",
+    )
+    assert batch.prompt_tokens == 5
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        RawEmbeddingBatch(embeddings=(), prompt_tokens=0)
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        RawEmbeddingBatch(embeddings=(RawEmbedding(values=(1.0,)),), prompt_tokens=-1)
 
 
 def test_combine_economics_sums_present_usage_and_complete_measurements() -> None:

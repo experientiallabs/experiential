@@ -12,6 +12,7 @@ from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 
 THROTTLED_RETRY_AFTER_SECONDS = 5
+UNAVAILABLE_RETRY_AFTER_SECONDS = 2
 
 
 class OpenAIErrorDetail(ContractModel):
@@ -179,6 +180,7 @@ def public_failure_error(
         GatewayFailureClass.TIMEOUT: (504, "deadline_exceeded", "api_error"),
         GatewayFailureClass.CANCELLED: (499, "request_cancelled", "api_error"),
         GatewayFailureClass.GUARDRAIL: (400, "content_filter", "invalid_request_error"),
+        GatewayFailureClass.UNAVAILABLE: (503, "gateway_unavailable", "api_error"),
     }
     status, code, error_type = mappings.get(
         failure.failure_class,
@@ -220,6 +222,8 @@ def public_failure_error(
     retry_after_seconds: int | None = None
     if failure.failure_class is GatewayFailureClass.THROTTLED:
         retry_after_seconds = THROTTLED_RETRY_AFTER_SECONDS
+    elif failure.failure_class is GatewayFailureClass.UNAVAILABLE:
+        retry_after_seconds = UNAVAILABLE_RETRY_AFTER_SECONDS
     elif failure.failure_class is GatewayFailureClass.QUOTA_EXCEEDED:
         moment = now if now is not None else datetime.now(UTC)
         reset = _next_utc_month_start(moment)

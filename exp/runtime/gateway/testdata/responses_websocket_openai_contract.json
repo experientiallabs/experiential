@@ -1,0 +1,60 @@
+{
+  "source": "api.openai.com wss:///v1/responses, captured 2026-09-01 with a live API key; identifiers, cookies, and header values removed",
+  "upgrade": {
+    "path": "/v1/responses",
+    "required_headers": [
+      "authorization"
+    ],
+    "optional_headers": [
+      "openai-beta"
+    ],
+    "accepted_status": 101,
+    "bad_key_status": 401
+  },
+  "request_frame": {
+    "tag": {
+      "type": "response.create"
+    },
+    "prewarm_field": {
+      "generate": false
+    },
+    "stream_absent_streams": true
+  },
+  "text_response_event_types": [
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.content_part.done",
+    "response.output_item.done",
+    "response.completed"
+  ],
+  "prewarm_event_types": [
+    "response.created",
+    "response.in_progress",
+    "response.completed"
+  ],
+  "prewarm_completed_output": [],
+  "stream_false_error_frame": {
+    "type": "error",
+    "error": {
+      "type": "invalid_request_error",
+      "code": null,
+      "message": "The 'stream' parameter is not supported on /v1/responses.",
+      "param": null
+    },
+    "status": 400
+  },
+  "wrapped_error_keys": [
+    "type",
+    "error",
+    "status"
+  ],
+  "connection": {
+    "sequential_requests_per_connection": true,
+    "connection_limit_error_code": "websocket_connection_limit_reached",
+    "previous_response_not_found_error_code": "previous_response_not_found"
+  }
+}

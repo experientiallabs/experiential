@@ -15,6 +15,7 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayRequest,
 )
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
@@ -265,6 +266,96 @@ def test_caller_invalid_request_never_advances() -> None:
     assert candidate is None
 
 
+def test_maximize_cache_returns_a_throttle_without_failing_over() -> None:
+    """maximize_cache surfaces a throttle to the caller instead of failing over cold.
+
+    A same-request redial is infeasible -- the 429 records the rung's throttle
+    window before the next candidate is chosen -- so the cache-preserving move is
+    to stop the ladder and let the caller retry the warm rung after backoff. The
+    default policy still fails over on the same throttle.
+    """
+    health = DeploymentHealthRegistry()
+    # Under maximize_cache a throttle ends the ladder (no cold failover)...
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=1,
+            refusal_failover=False,
+            failover_mode="maximize_cache",
+        )
+        is None
+    )
+    # ...while the default maximize_availability policy fails over to the next rung.
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=1,
+            refusal_failover=False,
+            failover_mode="maximize_availability",
+        )
+        == 1
+    )
+
+
+def test_maximize_cache_does_not_redial_a_stalled_timeout_lane() -> None:
+    """A stalled-lane timeout fails over even under maximize_cache.
+
+    The engine marks first-byte and header-phase stalls as ``TIMEOUT`` with
+    ``retryable_same_deployment=False`` precisely so a dead lane advances instead
+    of burning another fail-fast window. maximize_cache must respect that signal:
+    a lane that accepted the connection but never answered has no warm cache to
+    preserve, so it is not redialed.
+    """
+    health = DeploymentHealthRegistry()
+    stalled = GatewayFailure(
+        failure_class=GatewayFailureClass.TIMEOUT,
+        safe_message="provider did not send the first token in time",
+        retryable_same_deployment=False,
+        failover_eligible=True,
+    )
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=stalled,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode="maximize_cache",
+    )
+    assert candidate == 1
+
+
+def test_maximize_cache_still_fails_over_on_operational_deadness() -> None:
+    """A dead rung (auth failure) fails over even under maximize_cache."""
+    health = DeploymentHealthRegistry()
+    dead = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+        safe_message="provider authentication failed",
+        failover_eligible=True,
+    )
+    candidate = next_route_candidate(
+        health=health,
+        keys=_KEYS,
+        failure=dead,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode="maximize_cache",
+    )
+    # No cache to preserve on a rung that cannot authenticate -> advance.
+    assert candidate == 1
+
+
 def test_native_serving_blockers_name_dialectless_providers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -421,3 +512,76 @@ def test_native_serving_blockers_name_reasoning_wire_contract_conflicts(
     assert len(blockers) == 1
     assert blockers[0].startswith("reasoning: ")
     assert "invalid reasoning wire contract" in blockers[0]
+
+
+def test_route_reorder_permutes_dispatch_order_and_rejects_non_permutations() -> None:
+    """Reordering changes dispatch order over exactly the same deployments."""
+    from exp.runtime.gateway.native_execution import reorder_route_deployments
+
+    route = _route()
+    unchanged = reorder_route_deployments(route, (0, 1, 2))
+    assert unchanged is route
+    rotated = reorder_route_deployments(route, (2, 0, 1))
+    assert rotated.deployment.deployment_id == "three"
+    assert tuple(item.deployment_id for item in rotated.fallback_deployments) == ("one", "two")
+    assert rotated.snapshot.deployment_ids == ("three", "one", "two")
+    assert rotated.route_reason == route.route_reason
+    with pytest.raises(ValueError, match="permutation"):
+        reorder_route_deployments(route, (0, 1))
+    with pytest.raises(ValueError, match="permutation"):
+        reorder_route_deployments(route, (0, 1, 1))
+
+
+def test_cache_marker_predicate_sees_every_marker_carrier() -> None:
+    """Each cache-marker position makes the request marker-carrying."""
+    from exp.common.models.model import ToolCall
+    from exp.runtime.gateway.contracts import GatewayMessage, GatewayToolDefinition
+    from exp.runtime.gateway.native_execution import request_carries_cache_markers
+
+    def request(**updates: object) -> GatewayRequest:
+        base = GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+        )
+        return base.model_copy(update=updates)
+
+    assert request_carries_cache_markers(request()) is False
+    assert request_carries_cache_markers(request(provider_cache_control={"type": "ephemeral"}))
+    assert request_carries_cache_markers(
+        request(
+            tools=(
+                GatewayToolDefinition(
+                    name="bash",
+                    parameters={"type": "object"},
+                    cache_control={"type": "ephemeral"},
+                ),
+            )
+        )
+    )
+    marked_text = GatewayMessage(
+        role="user",
+        content="hi",
+        provider_text_blocks=(
+            {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}},
+        ),
+    )
+    assert request_carries_cache_markers(request(messages=(marked_text,)))
+    marked_tool_result = GatewayMessage(
+        role="tool",
+        content="ok",
+        tool_call_id="call-1",
+        cache_control={"type": "ephemeral"},
+    )
+    assert request_carries_cache_markers(request(messages=(marked_tool_result,)))
+    marked_call = GatewayMessage(
+        role="assistant",
+        tool_calls=(
+            ToolCall(
+                call_id="call-1",
+                name="bash",
+                arguments={},
+                cache_control={"type": "ephemeral"},
+            ),
+        ),
+    )
+    assert request_carries_cache_markers(request(messages=(marked_call,)))

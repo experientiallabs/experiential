@@ -8,11 +8,14 @@ from typing import cast
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
+from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST, VideoContentPart
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayApiSurface,
+    GatewayMessage,
     GatewayNamedToolChoice,
+    GatewayRequest,
 )
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
@@ -21,6 +24,7 @@ from exp.runtime.openai_protocol.model_adapter import model_request
 from exp.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
     decode_chat,
+    decode_embeddings,
     decode_responses,
 )
 
@@ -1696,3 +1700,677 @@ def test_decode_errors_name_the_expected_shape_against_the_arriving_type() -> No
     assert summary.value.detail.message == (
         "Invalid value for 'input.0.summary': expected an array, but got null instead."
     )
+
+
+_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+    "z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+)
+"""One valid single-pixel PNG, base64 encoded."""
+
+
+def test_chat_decoder_retains_image_parts_in_caller_order() -> None:
+    """A chat image part is kept beside its text in the order the caller sent."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{_PNG_BASE64}",
+                                "detail": "high",
+                            },
+                        },
+                        {"type": "text", "text": "be brief"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert message.content == "what is thisbe brief"
+    assert [part.kind for part in message.content_parts] == ["text", "image", "text"]
+    image = decoded.request.images[0]
+    assert image.data == _PNG_BASE64
+    assert image.media_type == "image/png"
+    assert image.detail == "high"
+
+
+def test_an_empty_text_part_beside_an_image_drops() -> None:
+    """A client's empty text part never reaches a wire that rejects one."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ""},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        },
+                        {"type": "text", "text": "read it"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert message.content == "read it"
+    assert [part.kind for part in message.content_parts] == ["image", "text"]
+
+
+def test_responses_decoder_retains_input_image_parts() -> None:
+    """A Responses ``input_image`` survives decoding as a canonical image."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "describe"},
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/cat.png",
+                            "detail": "auto",
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    assert [part.kind for part in decoded.request.messages[0].content_parts] == ["text", "image"]
+    assert decoded.request.images[0].url == "https://example.com/cat.png"
+
+
+def test_text_only_chat_messages_keep_no_content_parts() -> None:
+    """Text-only requests decode exactly as before, with no retained parts."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        }
+    )
+    assert decoded.request.messages[0].content_parts == ()
+    assert decoded.request.images == ()
+
+
+def test_images_change_the_canonical_request_digest() -> None:
+    """An image changes what the model is asked, so it changes replay identity."""
+    text_only = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "what is this"}]}
+    )
+    with_image = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    assert sha256_json(text_only.request) != sha256_json(with_image.request)
+
+
+def test_malformed_chat_image_url_is_rejected_with_its_field() -> None:
+    """An unusable image carrier names the exact offending request field."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png"}}
+                        ],
+                    }
+                ],
+            }
+        )
+    assert error.value.detail.param == "messages.0.content.0.image_url"
+
+
+def test_assistant_image_parts_are_rejected() -> None:
+    """Only a caller message may carry an image."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+_PDF_BASE64 = "JVBERi0xLjQKJSBtaW5pbWFsIHBkZgo="
+"""One short PDF header, base64 encoded."""
+
+_PDF_DATA_URL = f"data:application/pdf;base64,{_PDF_BASE64}"
+"""The same PDF as an OpenAI ``file_data`` value."""
+
+
+def _chat_file(file_data: str = _PDF_DATA_URL, filename: str | None = "brief.pdf") -> JsonObject:
+    """Build one Chat Completions ``file`` content part."""
+    file: JsonObject = {"file_data": file_data}
+    if filename is not None:
+        file["filename"] = filename
+    return {"type": "file", "file": file}
+
+
+def test_chat_decoder_retains_file_parts_interleaved_with_text() -> None:
+    """Chat ``file`` parts keep their positions among the caller's text."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first: "},
+                        _chat_file(),
+                        {"type": "text", "text": " second: "},
+                        _chat_file("JVBERi0xLjcK", filename=None),
+                        {"type": "text", "text": " compare"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert message.content == "first:  second:  compare"
+    assert [part.kind for part in message.content_parts] == [
+        "text",
+        "document",
+        "text",
+        "document",
+        "text",
+    ]
+    documents = decoded.request.documents
+    assert [document.data for document in documents] == [_PDF_BASE64, "JVBERi0xLjcK"]
+    assert [document.name for document in documents] == ["brief.pdf", None]
+    assert all(document.media_type == "application/pdf" for document in documents)
+
+
+def test_chat_file_sent_once_survives_a_multi_turn_thread() -> None:
+    """A PDF in an earlier user turn is retained when later turns reference it."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": [_chat_file(), {"type": "text", "text": "title?"}]},
+                {"role": "assistant", "content": "Minimal PDF."},
+                {"role": "user", "content": "page count?"},
+            ],
+        }
+    )
+    assert [len(message.documents) for message in decoded.request.messages] == [1, 0, 0]
+
+
+def test_responses_decoder_retains_input_file_parts() -> None:
+    """Responses ``input_file`` decodes inline data and remote URLs separately."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "compare"},
+                        {"type": "input_file", "filename": "a.pdf", "file_data": _PDF_DATA_URL},
+                        {"type": "input_file", "file_url": "https://example.com/b.pdf"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert [part.kind for part in message.content_parts] == ["text", "document", "document"]
+    inline, remote = decoded.request.documents
+    assert (inline.data, inline.name, inline.url) == (_PDF_BASE64, "a.pdf", None)
+    assert (remote.data, remote.url) == (None, "https://example.com/b.pdf")
+
+
+def test_documents_change_the_canonical_request_digest() -> None:
+    """Document bytes, names, and order all change what the model is asked."""
+
+    def digest(*parts: JsonObject) -> str:
+        """Digest one chat request whose user turn carries the given parts."""
+        decoded = decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}, *parts]}],
+            }
+        )
+        return sha256_json(decoded.request)
+
+    text_only = digest()
+    one = digest(_chat_file())
+    other_bytes = digest(_chat_file("JVBERi0xLjcK"))
+    renamed = digest(_chat_file(filename="other.pdf"))
+    assert len({text_only, one, other_bytes, renamed}) == 4
+    assert digest(_chat_file(), _chat_file("JVBERi0xLjcK")) != digest(
+        _chat_file("JVBERi0xLjcK"), _chat_file()
+    )
+
+
+@pytest.mark.parametrize(
+    ("part", "param"),
+    [
+        (_chat_file("data:text/plain;base64,aGk="), "messages.0.content.0.file.file_data"),
+        (_chat_file("!!not base64"), "messages.0.content.0.file.file_data"),
+        ({"type": "file", "file": {"file_id": "file_1"}}, "messages.0.content.0.file.file_data"),
+        ({"type": "image_url", "image_url": {}}, "messages.0.content.0.image_url.url"),
+    ],
+)
+def test_unservable_chat_file_parts_are_rejected_at_their_field(
+    part: JsonObject, param: str
+) -> None:
+    """A part the gateway cannot forward names its real field (the union tag
+    that doubles as the payload key is reported once), never drops."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part]}]})
+    assert error.value.detail.param == param
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "input_file", "file_url": "ftp://example.com/a.pdf"},
+        {"type": "input_file", "file_data": _PDF_DATA_URL, "file_url": "https://example.com/a.pdf"},
+        {"type": "input_file", "filename": "a.pdf"},
+        {"type": "input_file", "file_id": "file_1"},
+    ],
+)
+def test_unservable_responses_input_file_parts_are_rejected(part: JsonObject) -> None:
+    """Responses files need exactly one servable carrier."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses({"model": "coding", "input": [{"role": "user", "content": [part]}]})
+
+
+def test_assistant_file_parts_are_rejected() -> None:
+    """Only a caller message may carry a document."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {"model": "coding", "messages": [{"role": "assistant", "content": [_chat_file()]}]}
+        )
+
+
+def test_too_many_chat_files_are_rejected() -> None:
+    """The per-request document ceiling fails closed with the ceiling named."""
+    with pytest.raises(OpenAIProtocolError, match="at most 5 documents"):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [_chat_file() for _ in range(MAXIMUM_DOCUMENTS_PER_REQUEST + 1)],
+                    }
+                ],
+            }
+        )
+
+
+def test_non_function_tool_declarations_carry_verbatim_at_their_positions() -> None:
+    """Regression fixture: the top-level tools array real Codex (0.151.0)
+    sends by default on gpt-5.x models, trimmed from a live capture
+    (2026-09-01). Every non-function declaration type api.openai.com accepts
+    with a plain key (custom, namespace, web_search, tool_search; each
+    verified live 2026-09-01) carries byte-for-byte with its position;
+    function declarations keep the strict typed profile."""
+    function_tool = {
+        "type": "function",
+        "name": "exec_command",
+        "description": "Execute shell commands",
+        "strict": False,
+        "parameters": {"type": "object", "properties": {}},
+    }
+    custom_tool = {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Use the `apply_patch` tool to edit files.",
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": 'start: begin_patch hunk+ end_patch\nbegin_patch: "*** Begin Patch"',
+        },
+    }
+    namespace_tool = {
+        "type": "namespace",
+        "name": "multi_agent_v1",
+        "description": "Tools for spawning and managing sub-agents.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "close_agent",
+                "description": "Close an agent.",
+                "strict": False,
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    }
+    web_search_tool = {"type": "web_search", "external_web_access": False}
+    tool_search_tool = {
+        "type": "tool_search",
+        "description": "Search for additional tools.",
+        "parameters": {"type": "object", "properties": {}},
+        "execution": {"type": "server"},
+    }
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.2",
+            "store": False,
+            "stream": True,
+            "tool_choice": "required",
+            "input": "Run ls.",
+            "tools": [
+                function_tool,
+                custom_tool,
+                namespace_tool,
+                web_search_tool,
+                tool_search_tool,
+            ],
+        }
+    )
+    request = decoded.request
+    assert [tool.name for tool in request.tools] == ["exec_command"]
+    assert [(entry.index, entry.tool) for entry in request.provider_native_tools] == [
+        (1, custom_tool),
+        (2, namespace_tool),
+        (3, web_search_tool),
+        (4, tool_search_tool),
+    ]
+
+
+def test_a_malformed_function_tool_declaration_still_fails_closed() -> None:
+    """The opaque carrier accepts only non-function types; a function
+    declaration missing its name is a named validation error, never an
+    opaque forward."""
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_responses(
+            {
+                "model": "gpt-5.2",
+                "input": "hi",
+                "tools": [{"type": "function", "description": "nameless"}],
+            }
+        )
+    assert rejection.value.status_code == 400
+    assert "tools" in (rejection.value.detail.param or "")
+
+
+def test_embeddings_decoder_preserves_supported_fields() -> None:
+    """Embeddings conversion keeps the alias, inputs, dimensions, encoding, and attribution."""
+    decoded = decode_embeddings(
+        {
+            "model": "text-embedding-3-small",
+            "input": "hello world",
+            "dimensions": 256,
+            "encoding_format": "float",
+            "user": "end-user-7",
+        }
+    )
+
+    assert decoded.alias == "text-embedding-3-small"
+    assert decoded.request.surface == GatewayApiSurface.EMBEDDINGS
+    assert decoded.request.inputs == ("hello world",)
+    assert decoded.request.dimensions == 256
+    assert decoded.request.encoding_format == "float"
+    assert decoded.request.user == "end-user-7"
+
+
+def test_embeddings_decoder_accepts_a_list_of_inputs() -> None:
+    """An array of texts decodes in order with defaults for the optional fields."""
+    decoded = decode_embeddings({"model": "m", "input": ["first", "second"]})
+
+    assert decoded.request.inputs == ("first", "second")
+    assert decoded.request.dimensions is None
+    assert decoded.request.encoding_format is None
+    assert decoded.request.user is None
+
+
+def test_embeddings_decoder_rejects_unknown_and_streaming_fields() -> None:
+    """A field outside the closed embeddings manifest is a named 400, never silently dropped."""
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_embeddings({"model": "m", "input": "x", "stream": True})
+    assert rejection.value.status_code == 400
+    assert "stream" in rejection.value.detail.message
+
+
+def test_embeddings_decoder_rejects_token_array_input() -> None:
+    """Pre-tokenized id arrays pass official validation but this text surface rejects them."""
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_embeddings({"model": "m", "input": [1, 2, 3]})
+    assert rejection.value.status_code == 400
+    assert "input" in (rejection.value.detail.param or "")
+
+
+def test_embeddings_decoder_rejects_empty_and_malformed_inputs() -> None:
+    """Empty strings, an empty array, a missing input, and bad options each fail with a param."""
+    cases: tuple[tuple[JsonObject, str], ...] = (
+        ({"model": "m", "input": ""}, "input"),
+        ({"model": "m", "input": []}, "input"),
+        ({"model": "m"}, "input"),
+        ({"model": "m", "input": "x", "dimensions": 0}, "dimensions"),
+        ({"model": "m", "input": "x", "encoding_format": "weird"}, "encoding_format"),
+    )
+    for payload, param in cases:
+        with pytest.raises(OpenAIProtocolError) as rejection:
+            decode_embeddings(payload)
+        assert rejection.value.status_code == 400
+        assert param in (rejection.value.detail.param or "")
+
+
+_MP4_BASE64 = "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDE="
+"""A base64 prefix of an MP4 ``ftyp`` box, enough for a carrier fixture."""
+
+
+def test_chat_decoder_retains_video_parts_in_caller_order() -> None:
+    """A chat ``video_url`` part is kept beside its text and images in caller order."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first "},
+                        {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}},
+                        {"type": "text", "text": "then "},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": f"data:video/webm;base64,{_MP4_BASE64}"},
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        },
+                        {"type": "text", "text": "compare"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert message.content == "first then compare"
+    assert [part.kind for part in message.content_parts] == [
+        "text",
+        "video",
+        "text",
+        "video",
+        "image",
+        "text",
+    ]
+    remote, inline = decoded.request.videos
+    assert remote.url == "https://example.com/a.mp4"
+    assert inline.media_type == "video/webm"
+    assert inline.data == _MP4_BASE64
+    assert len(decoded.request.images) == 1
+    assert [part.kind for part in model_request(decoded.request).messages[0].content_parts] == [
+        part.kind for part in message.content_parts
+    ]
+
+
+def test_videos_change_the_canonical_request_digest() -> None:
+    """A video changes what the model is asked, so it changes replay identity."""
+    text_only = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "what happens"}]}
+    )
+    with_video = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what happens"},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": f"data:video/mp4;base64,{_MP4_BASE64}"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    other_video = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what happens"},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": f"data:video/mp4;base64,{_MP4_BASE64[:-4]}"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    digests = {
+        sha256_json(text_only.request),
+        sha256_json(with_video.request),
+        sha256_json(other_video.request),
+    }
+    assert len(digests) == 3
+    assert "video" in with_video.request.model_dump_json()
+
+
+def test_malformed_chat_video_url_is_rejected_with_its_field() -> None:
+    """An unusable video carrier names the exact offending request field."""
+    for url in ("ftp://example.com/a.mp4", f"data:video/x-matroska;base64,{_MP4_BASE64}"):
+        with pytest.raises(OpenAIProtocolError) as error:
+            decode_chat(
+                {
+                    "model": "coding",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "video_url", "video_url": {"url": url}}],
+                        }
+                    ],
+                }
+            )
+        assert error.value.detail.param == "messages.0.content.0.video_url"
+
+
+def test_a_request_carries_at_most_the_video_ceiling() -> None:
+    """The eleventh video in one request is refused rather than dropped."""
+    part: JsonObject = {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
+    decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part] * 10}]})
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part] * 11}]})
+    with pytest.raises(ValueError, match="at most 10 videos"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(
+                GatewayMessage(
+                    role="user",
+                    content="",
+                    content_parts=tuple(
+                        VideoContentPart(url="https://example.com/a.mp4") for _ in range(11)
+                    ),
+                ),
+            ),
+        )
+
+
+def test_assistant_video_parts_are_rejected() -> None:
+    """Only a caller message may carry a video."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+def test_responses_surface_defines_no_video_part() -> None:
+    """The Responses wire has no video content type, so one is refused, not dropped."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "describe"},
+                            {
+                                "type": "video_url",
+                                "video_url": {"url": "https://example.com/a.mp4"},
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_video", "video_url": "https://example.com/a.mp4"}
+                        ],
+                    }
+                ],
+            }
+        )

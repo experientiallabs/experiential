@@ -23,6 +23,7 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayMessage,
     GatewayNamedToolChoice,
+    GatewayProviderNativeTool,
     GatewayRequest,
     GatewayToolDefinition,
     ProjectTarget,
@@ -727,3 +728,108 @@ def test_block_cache_markers_are_identity_inert_and_role_scoped() -> None:
             tool_call_id="call-1",
             provider_text_blocks=({"type": "text", "text": "ok"},),
         )
+
+
+def test_native_tool_carriers_are_scoped_verbatim_and_join_replay_identity() -> None:
+    """Non-function Responses tool declarations are Responses-only carriers."""
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    native_entry = GatewayProviderNativeTool(
+        index=1,
+        tool={"type": "custom", "name": "apply_patch", "format": {"type": "grammar"}},
+    )
+    bare = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="edit"),),
+        tools=(GatewayToolDefinition(name="exec_command", parameters={"type": "object"}),),
+    )
+    carried = bare.model_copy(update={"provider_native_tools": (native_entry,)})
+    # Excluded from serialization, distinct in replay identity.
+    assert carried.model_dump() == bare.model_dump()
+    assert canonical_request_sha256(carried) != canonical_request_sha256(bare)
+    moved = bare.model_copy(
+        update={"provider_native_tools": (native_entry.model_copy(update={"index": 0}),)}
+    )
+    assert canonical_request_sha256(moved) != canonical_request_sha256(carried)
+
+    with pytest.raises(ValidationError, match="valid only for Responses"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            provider_native_tools=(native_entry,),
+        )
+
+
+def test_required_tool_choice_counts_native_tool_declarations() -> None:
+    """A toolset made only of verbatim native declarations satisfies required."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        provider_native_tools=(GatewayProviderNativeTool(index=0, tool={"type": "web_search"}),),
+        tool_choice="required",
+    )
+    assert request.provider_native_tools[0].tool == {"type": "web_search"}
+
+
+def test_native_tool_positions_must_tile_the_tools_array() -> None:
+    """Duplicate or out-of-range positions are construction errors, keeping
+    the native re-emission interleave total by construction."""
+    entry = GatewayProviderNativeTool(index=0, tool={"type": "web_search"})
+    with pytest.raises(ValidationError, match="distinct indexes"):
+        GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            provider_native_tools=(entry, entry),
+        )
+    with pytest.raises(ValidationError, match="distinct indexes"):
+        GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            provider_native_tools=(
+                GatewayProviderNativeTool(index=2, tool={"type": "web_search"}),
+            ),
+        )
+
+
+def test_videos_join_semantic_identity_while_cache_markers_stay_out() -> None:
+    """Video parts change the canonical digest; cache-only markers never do.
+
+    Two requests that differ only in the video they carry must digest apart,
+    and a request carrying a provider cache marker on its text must digest
+    identically to the same request without it.
+    """
+    from exp.common.core.artifacts import sha256_json
+    from exp.common.models.content import TextContentPart, VideoContentPart
+
+    def request(video_url: str, *, marked: bool) -> GatewayRequest:
+        """Build one Chat request with a video, optionally cache-marked."""
+        blocks: tuple[JsonObject, ...] = (
+            ({"type": "text", "text": "what happens?", "cache_control": {"type": "ephemeral"}},)
+            if marked
+            else ()
+        )
+        return GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(
+                GatewayMessage(
+                    role="user",
+                    content="what happens?",
+                    content_parts=(
+                        VideoContentPart(url=video_url),
+                        TextContentPart(text="what happens?"),
+                    ),
+                    provider_text_blocks=blocks,
+                ),
+            ),
+        )
+
+    first = request("https://example.com/a.mp4", marked=False)
+    second = request("https://example.com/b.mp4", marked=False)
+    marked = request("https://example.com/a.mp4", marked=True)
+    dumped = first.model_dump(mode="json")
+    parts = dumped["messages"][0]["content_parts"]
+    assert parts[0]["kind"] == "video"
+    assert parts[0]["url"] == "https://example.com/a.mp4"
+    assert sha256_json(first) != sha256_json(second)
+    assert sha256_json(first) == sha256_json(marked)
+    assert first.videos == (first.messages[0].content_parts[0],)

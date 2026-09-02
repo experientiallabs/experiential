@@ -17,6 +17,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
+    is_foreign_snapshot,
 )
 from exp.common.routing.policy import RoutingDecision
 from exp.runtime.gateway.contracts import (
@@ -340,6 +341,7 @@ class CatalogRouteResolver:
                 exact_model_id=pool.exact_model_id,
                 pool_id=pool.pool_id,
                 deployment_ids=(deployment_id,),
+                failover_mode=pool.failover_mode,
             ),
             deployment=deployment,
             route_reason="reasoning_continuation",
@@ -421,6 +423,7 @@ class CatalogRouteResolver:
                 exact_model_id=pool.exact_model_id,
                 pool_id=pool.pool_id,
                 deployment_ids=pool.deployment_ids,
+                failover_mode=pool.failover_mode,
             ),
             deployment=deployments[0],
             fallback_deployments=tuple(deployments[1:]),
@@ -434,6 +437,13 @@ def _index_catalogs(
 ) -> dict[tuple[str, str], _CatalogView]:
     """Index digest-verified catalogs by alias revision and catalog digest.
 
+    The pinned ``catalog_sha256`` stays the identity/attribution key for every
+    revision. A same-version catalog must reproduce it exactly, so a mismatch is
+    corruption and still raises. A cross-version snapshot (served through the
+    hydration reader's tolerant path during a rolling deploy) is expected not to
+    reproduce it; that catalog is indexed under its pinned digest without the
+    byte-exact check, so a roll never hard-fails route resolution.
+
     Args:
         catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
 
@@ -441,12 +451,12 @@ def _index_catalogs(
         Fully built revision-scoped catalog views.
 
     Raises:
-        ValueError: One catalog does not match its declared digest.
+        ValueError: A same-version catalog does not match its declared digest.
     """
     indexed: dict[tuple[str, str], _CatalogView] = {}
     for key, catalog in catalogs.items():
         revision_id, catalog_sha256 = key
-        if catalog.identity_sha256() != catalog_sha256:
+        if not is_foreign_snapshot(catalog) and catalog.identity_sha256() != catalog_sha256:
             raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
         indexed[key] = _CatalogView(
             catalog=catalog,

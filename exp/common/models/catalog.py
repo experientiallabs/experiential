@@ -45,6 +45,20 @@ _FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openroute
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
 AzureApiSurface = Literal["openai_deployments", "model_inference"]
+
+FailoverMode = Literal["maximize_availability", "maximize_cache"]
+"""How a pool's waterfall reacts to a failed attempt.
+
+``maximize_availability`` (the default, historical behavior) fails over to the
+next rung on any failover-eligible error. ``maximize_cache`` does NOT fail over on
+a throttle (429) -- it returns the throttle so the caller retries the warm rung
+after backoff, preserving its prompt cache rather than restarting cold on another
+provider -- while STILL failing over on operational deadness
+(auth/not-found/5xx/transport) and on a stalled lane (a first-byte or
+header-phase timeout that never answered), for which there is no warm cache to
+preserve. A genuinely retryable timeout (provider 408) redials the warm rung in
+both modes. Client errors reject without failover in both modes.
+"""
 """Azure wire surface a connection speaks: classic deployments or Foundry model inference."""
 
 _FOUNDRY_HOST_SUFFIXES = (".services.ai.azure.com", ".inference.ai.azure.com")
@@ -369,6 +383,50 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_parallel_tool_calls: bool = False
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
+    supports_image_input: bool = False
+    """Whether this deployment's wire and model can carry caller image parts.
+
+    Image input is declaration-driven and never assumed: a route that does
+    not declare it rejects an image request at admission, so a picture is
+    never dropped and answered from the surrounding text alone.
+    """
+    supports_image_url_input: bool = False
+    """Whether this route's provider fetches a caller image URL itself.
+
+    Inline base64 rides every image-capable wire, but only some wires accept a
+    remote URL. A route that does not declare this rejects a URL image at
+    admission, which lets a waterfall narrow to a rung that can carry it.
+    """
+    supports_video_input: bool = False
+    """Whether this deployment's wire and model can carry caller video parts.
+
+    Video is narrower than images: only the Gemini, Bedrock Converse, and
+    OpenAI-compatible ``video_url`` wires define a video carrier, and only
+    some models on those wires accept one. Like images the declaration is
+    never assumed, so a route without it rejects a video at admission rather
+    than answering from the surrounding text.
+    """
+    supports_video_url_input: bool = False
+    """Whether this route's provider fetches a caller video URL itself.
+
+    Bedrock accepts inline bytes (or an S3 location the gateway does not
+    author) only; Gemini and the OpenAI-compatible video wires fetch an
+    http(s) URL on the caller's behalf.
+    """
+    supports_pdf_input: bool = False
+    """Whether this deployment's wire and model can carry caller PDF documents.
+
+    Like image input this is declaration-driven and never assumed: a route
+    that does not declare it rejects a document request at admission, so a
+    PDF is never dropped and answered from the surrounding text alone.
+    """
+    supports_pdf_url_input: bool = False
+    """Whether this route's provider fetches a caller PDF URL itself.
+
+    Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url``
+    source) wires fetch a remote document; Chat Completions ``file`` parts,
+    Gemini, and Bedrock accept inline bytes only.
+    """
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
     """Largest stop-sequence count this route accepts, when the provider caps it.
 
@@ -523,6 +581,9 @@ class GatewayPoolRecord(ContractModel):
     exact_model_id: ArtifactId
     deployment_aliases: tuple[ArtifactId, ...] = Field(min_length=2)
     equivalence: GatewayEquivalenceCertification
+    # Per-model failover policy for this pool's waterfall. Defaults to the
+    # historical maximize_availability so an unset authored pool is unchanged.
+    failover_mode: FailoverMode = "maximize_availability"
 
     @model_validator(mode="after")
     def _require_unique_deployments(self) -> GatewayPoolRecord:

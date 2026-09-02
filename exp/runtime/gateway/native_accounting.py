@@ -116,6 +116,21 @@ def all_routes_unavailable_failure() -> GatewayFailure:
     )
 
 
+def gateway_updating_failure() -> GatewayFailure:
+    """Return the sanitized retryable failure for a transient roll condition.
+
+    A pod that cannot build the authorized catalog revision during a rolling
+    deploy (a snapshot authored by another engine version it cannot reconcile)
+    surfaces this instead of a closed INTERNAL: the condition clears on its own
+    once the roll settles, so the honest answer is a retryable 503, never a bug
+    signal that pages or opens a deployment circuit.
+    """
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.UNAVAILABLE,
+        safe_message="the gateway is updating; retry the request",
+    )
+
+
 def _failure_from_payload(payload: object) -> GatewayFailure | None:
     """Parse one optional classified failure from a boundary payload."""
     if not isinstance(payload, dict):
@@ -312,6 +327,7 @@ class NativeAttemptAccounting:
                 attempt_counts=entry.attempt_counts,
                 total_attempts=entry.total_attempts,
                 refusal_failover=entry.authorization.refusal_failover,
+                failover_mode=route.snapshot.failover_mode,
             )
             last_failure: GatewayFailure | None = failure
         else:

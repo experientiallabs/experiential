@@ -13,9 +13,10 @@ from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, canonical_json_bytes, stable_id
 from exp.common.models.gateway_catalog import (
+    CatalogSnapshotDigestError,
     ExactModelDeployment,
     ExactModelPool,
-    NormalizedGatewayCatalog,
+    read_pinned_normalized_snapshot,
 )
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.contracts import GatewayRequest
@@ -479,11 +480,13 @@ class SQLiteBudgetStore:
         if not snapshot.is_relative_to(state_dir):
             raise ValueError("budget catalog snapshot reference escapes gateway state")
         try:
-            catalog = NormalizedGatewayCatalog.model_validate_json(snapshot.read_bytes())
+            # Roll-tolerant read: a newer build's snapshot is scoped under its
+            # pinned digest; a same-version one still verifies byte-for-byte.
+            catalog = read_pinned_normalized_snapshot(snapshot.read_bytes(), catalog_sha256)
+        except CatalogSnapshotDigestError:
+            raise
         except (OSError, ValueError) as exc:
             raise ValueError("budget scope catalog snapshot is unreadable") from exc
-        if catalog.identity_sha256() != catalog_sha256:
-            raise ValueError("budget scope catalog snapshot digest does not match")
         return catalog.pools
 
     @contextmanager

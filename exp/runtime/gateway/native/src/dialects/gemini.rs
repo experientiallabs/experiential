@@ -23,10 +23,16 @@ impl Normalizer {
                 self.usage = Some(gemini_usage(raw_usage).map_err(|message| malformed(&message))?);
             }
         }
-        let candidates = payload
-            .get("candidates")
-            .and_then(Value::as_array)
-            .ok_or_else(|| malformed("Gemini candidates must be an array"))?;
+        let candidates = match payload.get("candidates") {
+            // A usage-only trailer frame legitimately carries no candidates at
+            // all; its usageMetadata was already folded above, so continue the
+            // stream instead of rejecting the whole answer as malformed. This
+            // mirrors the already-handled empty-candidates case below.
+            None | Some(Value::Null) => return Ok(Vec::new()),
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| malformed("Gemini candidates must be an array"))?,
+        };
         let mut events = Vec::new();
         if candidates.is_empty() {
             return Ok(events);
@@ -339,16 +345,76 @@ mod gemini_tests {
             FailureClass::MalformedResponse
         );
 
-        // A stream that closes without a terminal candidate fails.
-        let unterminated = [sse(
-            &json!({"candidates": [{"content": {"parts": [{"text": "a"}]}}]}),
-        )];
-        let refs: Vec<&[u8]> = unterminated.iter().map(Vec::as_slice).collect();
+        // A stream that closes having emitted NO content at all (here only a
+        // usage-only trailer) still fails malformed: there is no real answer to
+        // complete, so the clean-end tolerance does not apply.
+        let empty = [sse(&json!({
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 0},
+        }))];
+        let refs: Vec<&[u8]> = empty.iter().map(Vec::as_slice).collect();
         let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert_eq!(events, vec![json!({"kind": "text_delta", "text": "a"})]);
+        assert!(events.is_empty());
         assert_eq!(
             failure.expect("must fail").failure_class,
             FailureClass::MalformedResponse
+        );
+    }
+
+    #[test]
+    fn gemini_usage_only_trailer_frame_folds_usage_without_failing() {
+        // A trailer frame that carries only usageMetadata (no candidates array)
+        // must not fail: its usage is folded and the stream continues to its
+        // real terminal candidate, which flushes the last-seen usage.
+        let chunks = [
+            sse(&json!({"candidates": [{"content": {"parts": [{"text": "hi"}]}}]})),
+            sse(&json!({"usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 2}})),
+            sse(&json!({"candidates": [{"finishReason": "STOP"}]})),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![
+                json!({"kind": "text_delta", "text": "hi"}),
+                json!({
+                    "kind": "usage",
+                    "input_tokens": 7,
+                    "output_tokens": 2,
+                    "cached_input_tokens": 0,
+                    "reasoning_tokens": null,
+                }),
+                json!({"kind": "completed"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn gemini_clean_end_after_content_completes_with_folded_usage() {
+        // Gemini sometimes ends the stream right after its last content frame
+        // with no finishReason frame; the relay/drain closes it as a normal
+        // completion (folding the last-seen usage) rather than throwing the
+        // real answer away as malformed.
+        let chunks = [
+            sse(&json!({"candidates": [{"content": {"parts": [{"text": "done"}]}}]})),
+            sse(&json!({"usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 1}})),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![
+                json!({"kind": "text_delta", "text": "done"}),
+                json!({
+                    "kind": "usage",
+                    "input_tokens": 4,
+                    "output_tokens": 1,
+                    "cached_input_tokens": 0,
+                    "reasoning_tokens": null,
+                }),
+                json!({"kind": "completed"}),
+            ]
         );
     }
 

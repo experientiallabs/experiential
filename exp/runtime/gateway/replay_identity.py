@@ -97,6 +97,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and request.inference_geo is None
         and not request.provider_beta_tokens
         and not request.provider_server_tools
+        and not request.provider_native_tools
     ):
         return None
     envelope: JsonObject = {
@@ -120,6 +121,10 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         envelope["provider_beta_tokens"] = list(request.provider_beta_tokens)
     if request.provider_server_tools:
         envelope["provider_server_tools"] = list(request.provider_server_tools)
+    if request.provider_native_tools:
+        envelope["provider_native_tools"] = [
+            {"index": entry.index, "tool": entry.tool} for entry in request.provider_native_tools
+        ]
     return envelope
 
 

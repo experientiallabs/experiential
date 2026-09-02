@@ -18,7 +18,11 @@ def continuation_binding_error() -> OpenAIProtocolError:
     """Return the public fail-closed error for unavailable replay authority."""
     return OpenAIProtocolError(
         status_code=400,
-        code="continuation_unavailable",
+        # api.openai.com's code for an unusable previous_response_id; the
+        # Codex client auto-recovers on exactly this string by resending the
+        # full conversation, which is the wanted recovery when the original
+        # provider authority is gone.
+        code="previous_response_not_found",
         message=(
             "previous_response_id cannot be replayed on its original provider authority. "
             "Resend the full conversation history in this request."

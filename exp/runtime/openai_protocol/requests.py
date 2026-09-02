@@ -6,6 +6,7 @@ import json
 from collections.abc import Collection, Sequence
 from typing import Literal, cast
 
+from openai.types import EmbeddingCreateParams
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import (
@@ -18,6 +19,14 @@ from pydantic import (
 from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import ContractModel, JsonObject
+from exp.common.models.content import (
+    DocumentContentPart,
+    MessageContentPart,
+    TextContentPart,
+    document_part_from_file_data,
+    image_part_from_url,
+    video_part_from_url,
+)
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
@@ -28,11 +37,13 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
+    GatewayProviderNativeTool,
     GatewayRequest,
     GatewayToolDefinition,
     SealedReasoningContentBlock,
     StructuredTextFormat,
 )
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.reasoning_carrier import (
     FIREWORKS_REASONING_CONTENT_PREFIX,
     parse_reasoning_content_carrier,
@@ -43,6 +54,7 @@ from exp.runtime.openai_protocol.cache_control import (
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
+    EMBEDDINGS_MANIFEST,
     RESPONSES_MANIFEST,
     disposition_map,
 )
@@ -58,16 +70,22 @@ from exp.runtime.openai_protocol.responses_input import (
 from exp.runtime.openai_protocol.wire_models import (
     _AdditionalToolsItem,
     _AssistantToolCall,
+    _ChatFilePart,
+    _ChatImagePart,
     _ChatRequest,
     _ChatResponseFormat,
     _ChatTool,
+    _ChatVideoPart,
+    _ContentPart,
     _CustomToolCall,
     _CustomToolCallOutput,
+    _EmbeddingsRequest,
     _FunctionCall,
     _Message,
     _ResponseFunctionCall,
     _ResponseMessage,
     _ResponseReasoningItem,
+    _ResponsesFilePart,
     _ResponsesInputItem,
     _ResponsesRequest,
     _ResponseText,
@@ -77,6 +95,9 @@ from exp.runtime.openai_protocol.wire_models import (
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
 _RESPONSES_OFFICIAL = TypeAdapter(ResponseCreateParams)
+# Parametrized to object so the invariant TypeAdapter matches _validate_official;
+# EmbeddingCreateParams is a single TypedDict, unlike the union-typed chat/responses params.
+_EMBEDDINGS_OFFICIAL: TypeAdapter[object] = TypeAdapter[object](EmbeddingCreateParams)
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 
 
@@ -86,6 +107,17 @@ class DecodedGatewayRequest(ContractModel):
     alias: str = Field(min_length=1, max_length=256)
     request: GatewayRequest
     developer_messages_param: str | None = None
+
+
+class DecodedEmbeddingsRequest(ContractModel):
+    """Public alias plus its canonical embeddings request.
+
+    Distinct from :class:`DecodedGatewayRequest` because the embeddings surface
+    carries its own message-less, non-streaming request contract.
+    """
+
+    alias: str = Field(min_length=1, max_length=256)
+    request: EmbeddingsRequest
 
 
 def _without_chat_reasoning_content(payload: JsonObject) -> JsonObject:
@@ -191,6 +223,38 @@ def decode_chat(
     return DecodedGatewayRequest(alias=request.model, request=canonical)
 
 
+def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
+    """Decode one Embeddings body into the canonical embeddings surface.
+
+    The embeddings surface has no idempotency protocol yet: keyed replay is a
+    future add, so an inbound ``Idempotency-Key`` header is ignored upstream
+    rather than keying this decode (which therefore takes no header arguments).
+
+    Args:
+        payload: Parsed JSON request body.
+
+    Returns:
+        Public alias and canonical embeddings request.
+
+    Raises:
+        OpenAIProtocolError: The body is invalid, unknown, or unsupported.
+    """
+    _validate_manifest(payload, EMBEDDINGS_MANIFEST)
+    _validate_official(_EMBEDDINGS_OFFICIAL, payload)
+    request = _validate_wire(_EmbeddingsRequest, payload)
+    inputs = (request.input,) if isinstance(request.input, str) else request.input
+    try:
+        canonical = EmbeddingsRequest(
+            inputs=inputs,
+            dimensions=request.dimensions,
+            encoding_format=request.encoding_format,
+            user=request.user,
+        )
+    except ValidationError as exc:
+        raise _validation_protocol_error(exc) from exc
+    return DecodedEmbeddingsRequest(alias=request.model, request=canonical)
+
+
 def decode_responses(
     payload: JsonObject,
     *,
@@ -224,7 +288,8 @@ def decode_responses(
         # 2026-08-29). The strict wire model owns those contracts, so the
         # official probe sees a normalized item.
         adapted: list[JsonValue] = []
-        for entry in cast("list[JsonValue]", raw):
+        for original in cast("list[JsonValue]", raw):
+            entry = _official_image_details(original) if isinstance(original, dict) else original
             if isinstance(entry, dict) and entry.get("type") == "message":
                 item = {key: value for key, value in entry.items() if key != "phase"}
                 if item.get("id") is not None and "status" not in item:
@@ -250,6 +315,22 @@ def decode_responses(
         idempotency_key, client_request_id
     )
     raw_input = payload.get("input")
+    raw_tools = payload.get("tools")
+    function_tools: list[GatewayToolDefinition] = []
+    native_tools: list[GatewayProviderNativeTool] = []
+    for tool_index, declared in enumerate(request.tools):
+        if isinstance(declared, _ResponseTool):
+            function_tools.append(_response_tool(declared))
+        else:
+            # The raw caller declaration, not the re-serialized wire model,
+            # so the native rung receives it byte-for-byte at its position.
+            assert isinstance(raw_tools, list)
+            native_tools.append(
+                GatewayProviderNativeTool(
+                    index=tool_index,
+                    tool=cast("JsonObject", raw_tools[tool_index]),
+                )
+            )
     messages = list(
         _response_input_messages(
             request.input,
@@ -262,7 +343,8 @@ def decode_responses(
         canonical = GatewayRequest(
             surface=GatewayApiSurface.RESPONSES,
             messages=tuple(messages),
-            tools=tuple(_response_tool(tool) for tool in request.tools),
+            tools=tuple(function_tools),
+            provider_native_tools=tuple(native_tools),
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=_responses_structured_text(request.text),
@@ -333,6 +415,27 @@ def decode_responses(
     )
 
 
+def _official_image_details(entry: JsonObject) -> JsonObject:
+    """Default the detail level of every ``input_image`` part of one item.
+
+    The Responses surface treats ``input_image.detail`` as optional and
+    resolves an omitted level to ``auto``, while the installed SDK marks the
+    field required. Only the official probe sees the resolved default: the
+    strict wire model owns the real contract and keeps an unstated level
+    unstated on the provider wire.
+    """
+    content = entry.get("content")
+    if not isinstance(content, list):
+        return entry
+    parts: list[JsonValue] = []
+    for part in cast("list[JsonValue]", content):
+        if isinstance(part, dict) and part.get("type") == "input_image" and "detail" not in part:
+            parts.append({**part, "detail": "auto"})
+        else:
+            parts.append(part)
+    return {**entry, "content": parts}
+
+
 def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:
     """Reject unsupported and unknown top-level fields before responder work."""
     decisions = disposition_map(manifest)
@@ -386,11 +489,17 @@ def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
         text = str(part)
         if text in _LOCATION_NOISE:
             continue
+        # Typed-dict union branches are labeled with their class name, which
+        # no request field ever shares: every public field is lower case.
         if isinstance(part, str) and (
-            part.startswith("_") or "[" in text or text in _UNION_BRANCH_TYPES
+            part.startswith("_") or "[" in text or text in _UNION_BRANCH_TYPES or text[:1].isupper()
         ):
             continue
         if text in _OUTPUT_ITEM_VARIANTS and cleaned and cleaned[-1].isdigit():
+            continue
+        # A discriminated part whose tag is also its payload field name
+        # (``file.file``, ``image_url.image_url``) reports the tag once.
+        if cleaned and cleaned[-1] == text and not text.isdigit():
             continue
         cleaned.append(text)
     return tuple(cleaned)
@@ -485,6 +594,12 @@ def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     location = max((cleaned for cleaned, _ in best), key=len, default=())
     param = ".".join(location) or "body"
     details = [detail for cleaned, detail in best if cleaned == location]
+    if param == "body":
+        # A whole-request rule (such as the attachment count ceiling) has no
+        # field of its own, so its own wording is the only useful message.
+        for detail in details:
+            if detail["type"] == "value_error":
+                return invalid_field(param, detail["msg"].removeprefix("Value error, ") + ".")
     return invalid_field(param, _shape_message(param, details))
 
 
@@ -528,10 +643,14 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
             except ValueError as exc:
                 param = f"{prefix}.{message_index}.reasoning_content"
                 raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
+        content, content_parts = _message_content(
+            message.content, f"{prefix}.{message_index}.content"
+        )
         converted.append(
             GatewayMessage(
                 role=message.role,
-                content=_content(message.content),
+                content=content,
+                content_parts=content_parts,
                 tool_call_id=message.tool_call_id,
                 tool_calls=calls,
                 provider_reasoning=provider_reasoning,
@@ -540,11 +659,105 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
     return tuple(converted)
 
 
-def _content(content: str | tuple[_TextPart, ...] | None) -> str | None:
-    """Join supported text parts without accepting multimodal loss."""
+def _message_content(
+    content: str | tuple[_ContentPart, ...] | None,
+    param: str,
+) -> tuple[str | None, tuple[MessageContentPart, ...]]:
+    """Flatten wire content parts, retaining attachments in the caller's order.
+
+    Args:
+        content: Wire content: plain text, ordered parts, or absent.
+        param: Public parameter path used to report an invalid attachment.
+
+    Returns:
+        The flattened text and, only for a message that carries an image,
+        a video, or a document, the ordered canonical parts. A text-only
+        message keeps its previous representation exactly, so nothing
+        downstream changes for it.
+
+    Raises:
+        OpenAIProtocolError: An image or video reference is not a supported
+            URL or base64 data URL, or a file is not an inline PDF.
+    """
     if content is None or isinstance(content, str):
-        return content
-    return "".join(part.text for part in content)
+        return content, ()
+    parts: list[MessageContentPart] = []
+    for index, part in enumerate(content):
+        if isinstance(part, _TextPart):
+            # An empty text part carries no content and contributes nothing to
+            # the flattened text, while Anthropic and Gemini reject an empty
+            # block outright. Real clients emit one beside an attachment
+            # (OpenCode 1.18.26, captured live 2026-09-02), so it is dropped
+            # here rather than failing a turn that does carry an image.
+            if part.text:
+                parts.append(TextContentPart(text=part.text))
+            continue
+        if isinstance(part, _ChatVideoPart):
+            try:
+                parts.append(video_part_from_url(part.video_url.url))
+            except ValueError as exc:
+                location = f"{param}.{index}.video_url"
+                raise invalid_field(
+                    location,
+                    f"'{location}' must be an http(s) URL or a base64 data URL "
+                    "of an MP4, MPEG, QuickTime, WebM, FLV, 3GPP, or WMV video.",
+                ) from exc
+            continue
+        if isinstance(part, (_ChatFilePart, _ResponsesFilePart)):
+            parts.append(_document_part(part, f"{param}.{index}"))
+            continue
+        url, detail = (
+            (part.image_url.url, part.image_url.detail)
+            if isinstance(part, _ChatImagePart)
+            else (part.image_url, part.detail)
+        )
+        try:
+            parts.append(image_part_from_url(url, detail=detail))
+        except ValueError as exc:
+            location = f"{param}.{index}.image_url"
+            raise invalid_field(
+                location,
+                f"'{location}' must be an http(s) URL or a base64 data URL "
+                "of a PNG, JPEG, GIF, or WebP image.",
+            ) from exc
+    text = "".join(part.text for part in parts if part.kind == "text")
+    if all(part.kind == "text" for part in parts):
+        return text, ()
+    return text, tuple(parts)
+
+
+def _document_part(part: _ChatFilePart | _ResponsesFilePart, param: str) -> DocumentContentPart:
+    """Convert one ``file`` or ``input_file`` part into the canonical document.
+
+    Args:
+        part: Validated caller file part.
+        param: Public parameter path of the part, used to report an invalid file.
+
+    Returns:
+        The canonical document part carrying the caller's bytes or URL.
+
+    Raises:
+        OpenAIProtocolError: The file data is not an inline PDF.
+    """
+    if isinstance(part, _ChatFilePart):
+        file_data, filename, location = part.file.file_data, part.file.filename, f"{param}.file"
+    elif part.file_data is None:
+        try:
+            return DocumentContentPart(url=part.file_url, name=part.filename or None)
+        except ValueError as exc:
+            raise invalid_field(
+                f"{param}.file_url", f"'{param}.file_url' must be an http(s) URL."
+            ) from exc
+    else:
+        file_data, filename, location = part.file_data, part.filename, param
+    try:
+        return document_part_from_file_data(file_data, name=filename)
+    except ValueError as exc:
+        raise invalid_field(
+            f"{location}.file_data",
+            f"'{location}.file_data' must be the base64 bytes of a PDF, bare or as a "
+            "data:application/pdf;base64 URL, within the size limit.",
+        ) from exc
 
 
 def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:

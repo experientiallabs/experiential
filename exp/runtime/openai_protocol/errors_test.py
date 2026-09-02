@@ -14,6 +14,7 @@ from exp.runtime.models.providers.errors import (
 )
 from exp.runtime.openai_protocol.errors import (
     THROTTLED_RETRY_AFTER_SECONDS,
+    UNAVAILABLE_RETRY_AFTER_SECONDS,
     OpenAIProtocolError,
     public_failure_error,
 )
@@ -73,6 +74,22 @@ def test_throttled_failure_advertises_a_default_retry_after() -> None:
     assert error.detail.code == "unavailable_route"
     assert error.retry_after_seconds == THROTTLED_RETRY_AFTER_SECONDS
     assert error.headers() == {"Retry-After": str(THROTTLED_RETRY_AFTER_SECONDS)}
+
+
+def test_unavailable_failure_is_a_retryable_503() -> None:
+    """A transient roll condition is a retryable 503, never a closed 5xx."""
+    error = public_failure_error(
+        GatewayFailure(
+            failure_class=GatewayFailureClass.UNAVAILABLE,
+            safe_message="the gateway is updating; retry the request",
+        )
+    )
+
+    assert error.status_code == 503
+    assert error.detail.code == "gateway_unavailable"
+    assert error.detail.type == "api_error"
+    assert error.retry_after_seconds == UNAVAILABLE_RETRY_AFTER_SECONDS
+    assert error.headers() == {"Retry-After": str(UNAVAILABLE_RETRY_AFTER_SECONDS)}
 
 
 def test_guardrail_failure_uses_content_filter_shape() -> None:

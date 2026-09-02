@@ -4,6 +4,7 @@ import pytest
 
 from exp.runtime.models.providers.errors import UnsupportedReasoningEffortError
 from exp.runtime.models.providers.reasoning_compat import (
+    anthropic_adaptive_only_thinking,
     anthropic_reasoning_effort,
     default_reasoning_effort,
     gemini_thinking_level,
@@ -146,3 +147,21 @@ def test_adaptive_only_thinking_families_match_the_live_api_boundary() -> None:
         assert anthropic_adaptive_only_thinking(model), model
     for model in ("claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5", "claude-haiku-4.5"):
         assert not anthropic_adaptive_only_thinking(model), model
+
+
+def test_anthropic_point_releases_inherit_their_generation_effort_contract() -> None:
+    """Generation prefixes match point releases by construction.
+
+    claude-fable-5-1 (launched 2026-09-01, verified live: adaptive-only
+    thinking, efforts low through max with ultra rejected by name) must
+    resolve claude-fable-5's family without a table edit, and so must the
+    next minor.
+    """
+    for model_id in ("claude-fable-5-1", "claude-fable-5.1", "claude-sonnet-5-2"):
+        assert anthropic_adaptive_only_thinking(model_id) is True, model_id
+        assert anthropic_reasoning_effort(model_id, "xhigh") == "xhigh"
+        assert anthropic_reasoning_effort(model_id, "max") == "max"
+    with pytest.raises(UnsupportedReasoningEffortError):
+        anthropic_reasoning_effort("claude-fable-5-1", "ultra")
+    # Pre-adaptive families stay budgeted.
+    assert anthropic_adaptive_only_thinking("claude-haiku-4-5") is False

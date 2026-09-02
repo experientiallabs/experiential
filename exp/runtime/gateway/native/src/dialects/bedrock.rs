@@ -73,7 +73,7 @@ impl Normalizer {
         };
         let raw_tool = match start.get("toolUse") {
             None | Some(Value::Null) => {
-                if start.is_empty() {
+                if start.is_empty() || start.contains_key("reasoningContent") {
                     return Ok(Vec::new());
                 }
                 return Err(malformed("Bedrock content block start is unsupported"));
@@ -120,7 +120,15 @@ impl Normalizer {
         }
         let raw_tool = match delta.get("toolUse") {
             None | Some(Value::Null) => {
-                return Err(malformed("Bedrock content block delta is unsupported"))
+                // A reasoning model streams its thinking as its own indexed
+                // block ahead of the answer text. The canonical event stream
+                // carries answer text and tool calls, so the thinking block
+                // and its deltas are accepted and dropped instead of failing
+                // the stream.
+                if delta.contains_key("reasoningContent") {
+                    return Ok(Vec::new());
+                }
+                return Err(malformed("Bedrock content block delta is unsupported"));
             }
             Some(value) => value,
         };
@@ -292,6 +300,60 @@ mod bedrock_tests {
                     "input_tokens": 12,
                     "output_tokens": 4,
                     "cached_input_tokens": 2,
+                    "reasoning_tokens": null,
+                }),
+                json!({"kind": "completed"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn bedrock_reasoning_blocks_stream_without_failing_the_answer() {
+        // A reasoning model leads its turn with an indexed thinking block; only
+        // the answer text reaches the canonical stream.
+        let chunks = vec![
+            event("messageStart", &json!({"role": "assistant"})),
+            event(
+                "contentBlockStart",
+                &json!({"contentBlockIndex": 0, "start": {"reasoningContent": {}}}),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"text": "a circle"}},
+                }),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({
+                    "contentBlockIndex": 0,
+                    "delta": {"reasoningContent": {"signature": "sig"}},
+                }),
+            ),
+            event("contentBlockStop", &json!({"contentBlockIndex": 0})),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 1, "delta": {"text": "Circle"}}),
+            ),
+            event("contentBlockStop", &json!({"contentBlockIndex": 1})),
+            event("messageStop", &json!({"stopReason": "end_turn"})),
+            event(
+                "metadata",
+                &json!({"usage": {"inputTokens": 9, "outputTokens": 4}}),
+            ),
+        ];
+        let (events, failure) = run_stream(&chunks);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![
+                json!({"kind": "text_delta", "text": "Circle"}),
+                json!({
+                    "kind": "usage",
+                    "input_tokens": 9,
+                    "output_tokens": 4,
+                    "cached_input_tokens": 0,
                     "reasoning_tokens": null,
                 }),
                 json!({"kind": "completed"}),

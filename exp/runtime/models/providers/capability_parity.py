@@ -17,12 +17,15 @@ from pydantic import Field
 from exp.common.core.artifacts import ContractModel
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.common.models.model import ReasoningEffort
+from exp.runtime.models.providers.documents import PDF_URL_DIALECTS
+from exp.runtime.models.providers.images import IMAGE_URL_DIALECTS
 from exp.runtime.models.providers.reasoning_compat import (
     anthropic_adaptive_only_thinking,
     supported_reasoning_efforts,
 )
+from exp.runtime.models.providers.videos import VIDEO_DIALECTS, VIDEO_URL_DIALECTS
 
-CAPABILITY_PARITY_SCHEMA_VERSION = 1
+CAPABILITY_PARITY_SCHEMA_VERSION = 4
 """Version of the parity-row contract; bump on any field change."""
 
 
@@ -39,6 +42,31 @@ class DeploymentCapabilityParity(ContractModel):
     supports_parallel_tool_calls: bool
     supports_structured_text: bool
     supports_stop_sequences: bool
+    supports_image_input: bool
+    """Whether the catalog declares caller image parts servable on this rung."""
+    forwards_image_urls: bool
+    """Whether this rung's wire fetches a caller image URL itself.
+
+    Inline base64 images ride every image-capable wire. A remote URL is a
+    provider-side fetch, so the wires without one (Gemini and Bedrock) need
+    the caller to inline the bytes; a catalog can route an image-URL request
+    to a rung that declares this instead.
+    """
+    supports_video_input: bool
+    """Whether this rung carries caller video parts: declared by the catalog
+    and defined by the wire, since Responses and Anthropic have no carrier."""
+    forwards_video_urls: bool
+    """Whether this rung's provider fetches a caller video URL itself; only
+    the Gemini and OpenAI-compatible video wires do."""
+    supports_pdf_input: bool
+    """Whether the catalog declares caller PDF document parts servable on this rung."""
+    forwards_pdf_urls: bool
+    """Whether this rung's wire fetches a caller document URL itself.
+
+    Only the OpenAI Responses and Anthropic Messages wires carry a remote
+    document reference; Chat Completions, Gemini, and Bedrock need the
+    caller to inline the bytes.
+    """
     maximum_stop_sequences: int | None
     reasoning_efforts: tuple[ReasoningEffort, ...]
     """Exact efforts this rung preserves: the declared set when the catalog
@@ -99,6 +127,26 @@ def deployment_capability_parity(
         supports_parallel_tool_calls=capabilities.supports_parallel_tool_calls,
         supports_structured_text=capabilities.supports_structured_text,
         supports_stop_sequences=capabilities.supports_stop_sequences,
+        supports_image_input=capabilities.supports_image_input,
+        # Declaration and ground truth must agree: a rung forwards a URL only
+        # when the catalog declares it and the wire actually has that carrier.
+        forwards_image_urls=(
+            capabilities.supports_image_input
+            and capabilities.supports_image_url_input
+            and dialect in IMAGE_URL_DIALECTS
+        ),
+        supports_video_input=(capabilities.supports_video_input and dialect in VIDEO_DIALECTS),
+        forwards_video_urls=(
+            capabilities.supports_video_input
+            and capabilities.supports_video_url_input
+            and dialect in VIDEO_URL_DIALECTS
+        ),
+        supports_pdf_input=capabilities.supports_pdf_input,
+        forwards_pdf_urls=(
+            capabilities.supports_pdf_input
+            and capabilities.supports_pdf_url_input
+            and dialect in PDF_URL_DIALECTS
+        ),
         maximum_stop_sequences=capabilities.maximum_stop_sequences,
         reasoning_efforts=efforts,
         thinking_config_support=thinking,

@@ -14,6 +14,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
     ProviderParameterError,
     ProviderResponseError,
 )
@@ -267,6 +268,8 @@ def gemini_generate_content_stream_payload(
         Native generation request for the SSE streaming route.
 
     Raises:
+        ProviderCapabilityError: The request carries an image URL this wire
+            cannot fetch, so route selection can narrow past this rung.
         ProviderResponseError: A message cannot preserve its tool linkage on
             Gemini's wire.
     """
@@ -285,7 +288,7 @@ def gemini_generate_content_stream_payload(
                 request.structured_text.json_schema if request.structured_text is not None else None
             ),
         )
-    except ProviderParameterError:
+    except (ProviderParameterError, ProviderCapabilityError):
         raise
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc
@@ -317,6 +320,10 @@ def bedrock_converse_stream_payload(
         Native Converse request body for the streaming REST route.
 
     Raises:
+        ProviderCapabilityError: The request carries an image URL this wire
+            cannot fetch, so route selection can narrow past this rung.
+        ProviderParameterError: Inline media exceeds the Converse payload
+            ceiling, so route selection can narrow past this rung.
         ProviderResponseError: A message cannot be represented without
             dropping tool context.
     """
@@ -340,5 +347,7 @@ def bedrock_converse_stream_payload(
             ),
             strict_tool_names=tuple(tool.name for tool in request.tools if tool.strict),
         )
+    except (ProviderParameterError, ProviderCapabilityError):
+        raise
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc

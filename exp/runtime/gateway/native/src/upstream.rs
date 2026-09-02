@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
-use crate::param_attribution::{rejected_detail, rejected_parameter};
+use crate::param_attribution::{rejected_detail, rejected_model_not_found, rejected_parameter};
 
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a
@@ -168,6 +168,15 @@ pub async fn open_stream(
             Ok(Some(body)) => Some(body),
             _ => None,
         };
+        // A client-error status whose body names a missing model is the
+        // catalog's fault, not the caller's: it takes the 404 policy so the
+        // ladder advances instead of surfacing one dead rung as a 400.
+        if body
+            .as_deref()
+            .is_some_and(|body| rejected_model_not_found(dialect, body))
+        {
+            return Err(transport_failure(Some(404)));
+        }
         let parameter = body
             .as_deref()
             .and_then(|body| rejected_parameter(dialect, body));

@@ -45,12 +45,14 @@ from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
+    gateway_updating_failure,
     record_dead_admission_rungs,
 )
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
 from exp.runtime.gateway.native_admission import admitted_route_requests
+from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
 from exp.runtime.gateway.native_bridge_errors import (
     escalation as _escalation,
 )
@@ -136,7 +138,7 @@ from exp.runtime.openai_protocol.state import (
 _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
-class NativeControlPlane(NativeObservabilityMixin):
+class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
     """Authority and accounting callbacks for the native data plane.
 
     Rust worker threads share the group-commit writer and the locked in-flight
@@ -178,6 +180,9 @@ class NativeControlPlane(NativeObservabilityMixin):
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
+        # The optional batch lane: hosts without it leave every batch route
+        # answering the uniform not-enabled error below.
+        self._batches = getattr(components, "batches", None)
         # Hosted compositions have no local group-commit writer; they settle
         # directly through their own synchronous ledger.
         group_writer = getattr(components, "write_ledger", None)
@@ -289,7 +294,11 @@ class NativeControlPlane(NativeObservabilityMixin):
                 app_title=optional_text(data.get("app_title")),
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-            raise _authority_error(exc) from exc
+            mapped = _authority_error(exc)
+            pointer = self._batch_pointer_error(alias=decoded.alias, mapped=mapped)
+            if pointer is not None:
+                raise pointer from exc
+            raise mapped from exc
 
         # Responses continuation resolves after authorization and before any
         # ledger write; unavailable, expired, evicted, or cross-namespace
@@ -428,7 +437,7 @@ class NativeControlPlane(NativeObservabilityMixin):
             return self._escalate_accepted(authorization, str(exc))
         except OpenAIProtocolError as exc:
             # A continuation whose bound provider authority is no longer
-            # available is a CLIENT error (400 continuation_unavailable: resend
+            # available is a CLIENT error (400 previous_response_not_found: resend
             # the full conversation), not a gateway-internal fault. Class the
             # durable failure by the public status so usage and health read it
             # as a client failure and it never pages as internal; the caller
@@ -553,6 +562,13 @@ class NativeControlPlane(NativeObservabilityMixin):
                 else public_failure_error(failure, param=exc.param)
             )
             raise NativeBridgeError(public_error) from exc
+        except GatewayRoutingError as exc:
+            # A route/catalog that cannot be built during a rolling deploy is a
+            # transient control-plane condition, not a bug: record it retryable
+            # so it never pages as INTERNAL. The public error is already a 503.
+            failure = gateway_updating_failure()
+            self._accounting.finish_request_quietly(authorization, failure)
+            raise _authority_error(exc) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             error = _authority_error(exc)
             failure = GatewayFailure(

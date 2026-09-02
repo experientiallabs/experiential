@@ -10,6 +10,12 @@ It serves:
 - `GET /v1/models/{model_id}`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
+- `GET /v1/responses` as a WebSocket upgrade (the Responses-over-WebSocket transport used by
+  the Codex CLI against api.openai.com: `response.create` request frames, one standard
+  Responses stream event JSON per text frame, wrapped `{"type": "error", ...}` frames for
+  request-level failures, and a `generate: false` prewarm answered without provider work; the
+  bearer key is authenticated before the upgrade is accepted, and a GET without a well-formed
+  upgrade answers 426, the status the Codex client maps to its HTTP fallback)
 - `POST /v1/messages` (the Anthropic Messages API; `POST /v1/messages/count_tokens` answers an
   explicit Anthropic-shaped refusal because the gateway has no tokenizer authority)
 - `GET /health/live` and `GET /health/ready`
@@ -152,8 +158,10 @@ A caller `anthropic-beta` header forwards through an exact token allowlist (nota
 provider serves 200K); non-allowlisted tokens drop with a per-token
 `anthropic-beta.<token>` disclosure, never a rejection and never a blind forward. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
 and drop with disclosure elsewhere; Codex-native input items (`additional_tools` tool namespaces,
-`custom_tool_call`/`custom_tool_call_output` freeform history) carry byte-for-byte and require a
-homogeneous native Responses route; echoed message items accept `id`/`phase` with `status`
+`custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
+declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,
+`tool_search`) carry byte-for-byte at their caller positions and require a homogeneous native
+Responses route; echoed message items accept `id`/`phase` with `status`
 optional (non-assistant identity drops); and freeform custom tool calls stream end to end with
 their native event names, including continuation retention.
 
@@ -243,23 +251,26 @@ later turns. Routes with no Anthropic rung disclose the dropped markers through
 bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with
 disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
 decision behind an SDK-surface drift gate in
-`exp/runtime/anthropic_protocol/manifest.py`, and rejects image and document blocks loudly
-because the surface is text-only. Anthropic server tools are decided per type by the same
-manifest: verified `web_search_*` entries forward verbatim after the converted custom tools,
-their streamed output (`server_tool_use`, `web_search_tool_result`, citation-bearing text
-blocks, and the `pause_turn` stop reason) reaches the caller intact on both response paths, and
-a next-turn echo of those blocks (each carried verbatim as a whole-message block) re-serves
-byte-for-byte; every other Anthropic-defined tool type is rejected by name because the data
-plane does not yet carry its result blocks. Like the thinking carriers, server tools replay
-only on the Anthropic wire, so a route with any other rung rejects them by name instead of
-dropping a requested capability. The terminal `message_delta` usage report supersedes the
-`message_start` input legs when present, because server-tool turns re-read fetched results as
-input and the start-frame count severely undercounts the billed total. Thinking carriers
-replay only on the Anthropic wire, so route admission requires every waterfall rung to speak the
-`anthropic_messages` dialect; on the Responses surface over Anthropic routes, thinking text is
-projected onto the reasoning-summary channel (signatures deliberately dropped) so callers receive
-the reasoning they pay for, while the Chat surface has no reasoning representation and drops it
-like summary deltas. Streaming emits the Anthropic
+`exp/runtime/anthropic_protocol/manifest.py`, and carries user `image` and PDF `document` blocks
+as typed content parts (base64 or URL source, optional `title`, cache marker) that admission
+checks against the route's `supports_image_input` / `supports_pdf_input` (and the `_url_input`
+variants for remote sources) before dispatch, so a rung that cannot carry the attachment
+rejects it loudly instead of answering from the surrounding text. Anthropic server tools are
+decided per type by the same manifest: verified `web_search_*` entries forward verbatim after
+the converted custom tools, their streamed output (`server_tool_use`, `web_search_tool_result`,
+citation-bearing text blocks, and the `pause_turn` stop reason) reaches the caller intact on
+both response paths, and a next-turn echo of those blocks (each carried verbatim as a
+whole-message block) re-serves byte-for-byte; every other Anthropic-defined tool type is
+rejected by name because the data plane does not yet carry its result blocks. Like the thinking
+carriers, server tools replay only on the Anthropic wire, so a route with any other rung rejects
+them by name instead of dropping a requested capability. The terminal `message_delta` usage
+report supersedes the `message_start` input legs when present, because server-tool turns re-read
+fetched results as input and the start-frame count severely undercounts the billed total.
+Thinking carriers replay only on the Anthropic wire, so route admission requires every waterfall
+rung to speak the `anthropic_messages` dialect; on the Responses surface over Anthropic routes,
+thinking text is projected onto the reasoning-summary channel (signatures deliberately dropped)
+so callers receive the reasoning they pay for, while the Chat surface has no reasoning
+representation and drops it like summary deltas. Streaming emits the Anthropic
 lifecycle (`message_start`, `ping`, content blocks, `message_delta` with the mapped stop reason
 and usage, `message_stop`, or one terminal `error` event); the non-streaming body is the
 Anthropic message object. Completed streams stop with `end_turn` (`tool_use` when tool calls are
@@ -273,9 +284,16 @@ controls narrow the waterfall to the rungs that preserve every exact value
 capability preflight plus payload build. Only when zero rungs survive does the
 capability-preservation policy (`exp/runtime/models/providers/capability_policy.py`) attempt one
 minimal COERCE-WITH-DISCLOSURE: a reasoning effort snaps to the nearest level any rung supports
-on the canonical ladder (ties prefer the lower level), an explicit `none` on a route with no
-reasoning support drops (the model already delivers what `none` asks for), and `strict: true`
-tools degrade to best-effort schemas. Every coercion is disclosed in `path->effective` form
+on the canonical ladder (ties prefer the lower level), ANY effort on a route with no reasoning
+support at all drops (first-party clients pin effort globally, so a named rejection made whole
+sessions unusable against non-reasoning models the provider itself serves fine without the
+parameter; the Messages surface's verbatim `output_config.effort` is stripped with it so the
+dropped value reaches the provider through no channel), and `strict: true` tools degrade to
+best-effort schemas. On `maximize_cache` pools, a cache-marked request dispatches
+marker-honoring (Anthropic Messages) rungs before marker-dropping wires, stably within each
+group, so a shim rung can no longer silently bill every turn's full context uncached while the
+native rung stands ready; routes narrowing to only marker-dropping wires keep disclosing the
+dropped markers. Every coercion is disclosed in `path->effective` form
 through `ignored_parameters`, logged, and counted in the `admission_parameter_coercions`
 metric; nothing coercible keeps the first rung's own field-scoped rejection.
 The per-deployment `capability_parity` export joins catalog declarations with the engine's

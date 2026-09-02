@@ -18,6 +18,12 @@ from pydantic import (
 )
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256, sha256_json
+from exp.common.models.content import (
+    DocumentContentPart,
+    ImageContentPart,
+    MessageContentPart,
+    VideoContentPart,
+)
 from exp.common.tasks import ToolSchema
 
 ModelAlias = ArtifactId
@@ -271,6 +277,16 @@ class ModelMessage(ContractModel):
     content: str | None = None
     tool_call_id: str | None = None
     assistant_action: AssistantAction | None = None
+    content_parts: tuple[MessageContentPart, ...] = Field(default=(), exclude=True)
+    """Ordered caller content parts when a user message carries attachments.
+
+    Empty on every text-only message. The text parts concatenate to
+    ``content``, so selectors, simulators, and persisted artifacts keep
+    seeing exactly the text they saw before media existed; provider clients
+    that can carry media read the parts and emit the caller's exact
+    interleaving. Excluded from serialization so identities of text-only
+    requests are byte-identical to pre-media traffic.
+    """
 
     @model_validator(mode="after")
     def _require_message_payload(self) -> ModelMessage:
@@ -282,7 +298,28 @@ class ModelMessage(ContractModel):
             raise ValueError("assistant_action is valid only for assistant messages")
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
+        if self.content_parts:
+            if self.role != "user":
+                raise ValueError("content parts are valid only for user messages")
+            texts = [part.text for part in self.content_parts if part.kind == "text"]
+            if (self.content or "") != "".join(texts):
+                raise ValueError("content parts must flatten to the message content")
         return self
+
+    @property
+    def images(self) -> tuple[ImageContentPart, ...]:
+        """Return this message's image parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "image")
+
+    @property
+    def videos(self) -> tuple[VideoContentPart, ...]:
+        """Return this message's video parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "video")
+
+    @property
+    def documents(self) -> tuple[DocumentContentPart, ...]:
+        """Return this message's document parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "document")
 
 
 class ModelFinishReason(StrEnum):
@@ -537,3 +574,35 @@ class Embedding(ContractModel):
         if not math.isclose(norm, 1.0, rel_tol=1e-6, abs_tol=1e-6):
             raise ValueError("embedding values must have unit norm")
         return value
+
+
+class RawEmbedding(ContractModel):
+    """One provider-returned embedding vector preserved without renormalization.
+
+    Unlike :class:`Embedding`, which unit-normalizes for cosine routing, the
+    public ``/v1/embeddings`` surface must return the provider's exact vector,
+    so this carrier keeps the raw magnitude and validates finiteness only.
+    """
+
+    values: tuple[float, ...] = Field(min_length=1)
+
+    @field_validator("values")
+    @classmethod
+    def _require_finite_values(cls, value: tuple[float, ...]) -> tuple[float, ...]:
+        if not all(math.isfinite(item) for item in value):
+            raise ValueError("embedding values must be finite")
+        return value
+
+
+class RawEmbeddingBatch(ContractModel):
+    """Ordered raw embeddings with the provider's input-token usage.
+
+    The public embeddings surface bills input tokens, so the provider's
+    ``prompt_tokens`` count is carried alongside the vectors rather than
+    dropped. ``served_model_id`` is the exact model the provider reported, kept
+    for attribution and never invented when the provider omits it.
+    """
+
+    embeddings: tuple[RawEmbedding, ...] = Field(min_length=1)
+    prompt_tokens: int = Field(ge=0)
+    served_model_id: str | None = None

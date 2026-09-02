@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -20,13 +21,158 @@ from exp.common.models.catalog import (
     SFTModelProvenance,
 )
 from exp.common.models.gateway_catalog import (
+    SANE_MAX_SNAPSHOT_SCHEMA_VERSION,
+    SNAPSHOT_SCHEMA_VERSION,
+    CatalogSnapshotDigestError,
     ExactModelDeployment,
     ExactModelPool,
+    NormalizedGatewayCatalog,
+    is_foreign_snapshot,
+    load_forward_compatible,
     normalize_gateway_catalog,
+    read_pinned_normalized_snapshot,
 )
 from exp.common.models.model import ModelCapabilities, ModelSnapshot
 
 _DIGEST = "a" * 64
+
+
+def _minimal_normalized() -> NormalizedGatewayCatalog:
+    """One valid single-deployment normalized catalog for the reader tests."""
+    deployment = ExactModelDeployment(
+        deployment_id="dep-1",
+        source_alias="dep-1",
+        exact_model_id="exact-1",
+        connection="conn",
+        provider="openai",
+        provider_model="m-1",
+        connection_sha256=_DIGEST,
+        capabilities_sha256=_DIGEST,
+    )
+    pool = ExactModelPool(pool_id="dep-1", exact_model_id="exact-1", deployment_ids=("dep-1",))
+    return NormalizedGatewayCatalog(deployments=(deployment,), pools=(pool,))
+
+
+def test_load_forward_compatible_drops_unknown_fields_and_reports_them() -> None:
+    """A snapshot authored by a newer build (unknown top-level and nested pool
+    fields) parses with those fields dropped and reported, so an old pod reading
+    it mid-roll never hard-fails on ``extra="forbid"``."""
+    catalog = _minimal_normalized()
+    raw = json.loads(catalog.model_dump_json())
+    raw["future_top_level"] = {"anything": 1}
+    raw["pools"][0]["future_pool_field"] = "maximize_something_new"
+    parsed, dropped = load_forward_compatible(NormalizedGatewayCatalog, json.dumps(raw))
+    assert parsed == catalog
+    assert ("future_top_level",) in dropped
+    assert ("pools", 0, "future_pool_field") in dropped
+
+
+def test_load_forward_compatible_still_enforces_required_fields_and_invariants() -> None:
+    """Only unknown extras are tolerated: a genuinely malformed snapshot (a
+    required field removed) still raises instead of being silently served."""
+    raw = json.loads(_minimal_normalized().model_dump_json())
+    del raw["pools"][0]["exact_model_id"]
+    with pytest.raises(ValidationError):
+        load_forward_compatible(NormalizedGatewayCatalog, json.dumps(raw))
+
+
+def test_load_forward_compatible_is_strict_when_there_are_no_extras() -> None:
+    """A same-version snapshot parses exactly, reporting no dropped fields."""
+    catalog = _minimal_normalized()
+    parsed, dropped = load_forward_compatible(NormalizedGatewayCatalog, catalog.model_dump_json())
+    assert parsed == catalog
+    assert dropped == ()
+
+
+def test_is_foreign_snapshot_tracks_the_schema_version() -> None:
+    """Only a schema-version skew marks a snapshot foreign."""
+    assert not is_foreign_snapshot(_minimal_normalized())
+    bumped = _minimal_normalized().model_copy(
+        update={"schema_version": SNAPSHOT_SCHEMA_VERSION + 1}
+    )
+    assert is_foreign_snapshot(bumped)
+
+
+def test_wild_schema_version_is_not_foreign_and_fails_closed() -> None:
+    """Corruption guard: a schema_version beyond the sane range is NOT trusted as
+    a real cross-build skew, so it takes the strict digest path and fails closed
+    (never served unverified) instead of suppressing the pinned-digest check."""
+    wild = _minimal_normalized().model_copy(
+        update={"schema_version": SANE_MAX_SNAPSHOT_SCHEMA_VERSION + 1}
+    )
+    assert not is_foreign_snapshot(wild)
+    with pytest.raises(CatalogSnapshotDigestError):
+        read_pinned_normalized_snapshot(wild.model_dump_json().encode(), "b" * 64)
+
+
+def test_read_pinned_snapshot_same_version_requires_the_exact_digest() -> None:
+    """A same-version snapshot must reproduce its pinned digest; a mismatch is
+    content tampering and fails closed with a distinct error."""
+    catalog = _minimal_normalized()
+    assert (
+        read_pinned_normalized_snapshot(
+            catalog.model_dump_json().encode(), catalog.identity_sha256()
+        )
+        == catalog
+    )
+    with pytest.raises(CatalogSnapshotDigestError):
+        read_pinned_normalized_snapshot(catalog.model_dump_json().encode(), "b" * 64)
+
+
+def test_read_pinned_snapshot_serves_a_cross_version_snapshot_without_the_digest_check() -> None:
+    """Roll-safety guard: a snapshot from a NEWER build (higher schema_version,
+    an unknown pool field, a digest this build cannot recompute) is SERVED under
+    its pinned digest rather than raising, so a rolling deploy never hard-fails.
+    """
+    raw = json.loads(_minimal_normalized().model_dump_json())
+    raw["schema_version"] = SNAPSHOT_SCHEMA_VERSION + 1
+    raw["pools"][0]["future_pool_field"] = "maximize_something_new"
+    served = read_pinned_normalized_snapshot(json.dumps(raw).encode(), "b" * 64)
+    assert served.schema_version == SNAPSHOT_SCHEMA_VERSION + 1
+    assert served.pools[0].pool_id == "dep-1"
+
+
+def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
+    """Anti-regression change-detector for the roll-safety contract.
+
+    A rolling deploy detects a cross-version snapshot only by ``schema_version``,
+    so every change to the normalized-catalog schema (or its normalization
+    output) MUST bump ``SNAPSHOT_SCHEMA_VERSION`` in the same change. If this
+    fails, you changed the schema: bump ``SNAPSHOT_SCHEMA_VERSION`` and update
+    the pinned fingerprint below together, so the reader keeps serving old and
+    new pods through a roll instead of hard-failing.
+    """
+    fingerprint = {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "normalized": sorted(NormalizedGatewayCatalog.model_fields),
+        "deployment": sorted(ExactModelDeployment.model_fields),
+        "pool": sorted(ExactModelPool.model_fields),
+    }
+    assert fingerprint == {
+        "schema_version": 1,
+        "normalized": ["deployments", "pools", "schema_version"],
+        "deployment": [
+            "billing_source",
+            "capabilities",
+            "capabilities_sha256",
+            "connection",
+            "connection_sha256",
+            "deployment_id",
+            "exact_model_id",
+            "gateway",
+            "provider",
+            "provider_model",
+            "revision",
+            "source_alias",
+        ],
+        "pool": [
+            "deployment_ids",
+            "equivalence",
+            "exact_model_id",
+            "failover_mode",
+            "pool_id",
+        ],
+    }
 
 
 def test_singleton_identity_includes_connection_model_revision_and_full_capabilities() -> None:
@@ -280,6 +426,54 @@ def test_operator_certified_pool_preserves_explicit_deployment_order_and_provena
         ),
     )
     assert normalized.identity_sha256() == normalize_gateway_catalog(catalog).identity_sha256()
+
+
+def test_authored_pool_failover_mode_carries_into_the_normalized_pool() -> None:
+    """A maximize_cache authored pool normalizes to a maximize_cache exact-model pool."""
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-cache",
+        provenance="operator comparison run 2026-09-01",
+        evidence_sha256=_DIGEST,
+        certified_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    catalog = ModelCatalog(
+        connections={"openai": ConnectionConfig(provider="openai")},
+        models={
+            "route-a": ModelRecord(
+                connection="openai",
+                model="m-a",
+                billing_source=BillingSource.HOST_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id="exact-cache"),
+            ),
+            "route-b": ModelRecord(
+                connection="openai",
+                model="m-b",
+                billing_source=BillingSource.HOST_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id="exact-cache"),
+            ),
+        },
+        gateway_pools={
+            "cache-pool": GatewayPoolRecord(
+                exact_model_id="exact-cache",
+                deployment_aliases=("route-a", "route-b"),
+                equivalence=certification,
+                failover_mode="maximize_cache",
+            )
+        },
+    )
+
+    normalized = normalize_gateway_catalog(catalog)
+
+    assert normalized.pools[0].failover_mode == "maximize_cache"
+    # An unset authored pool stays on the historical default.
+    assert (
+        GatewayPoolRecord(
+            exact_model_id="x",
+            deployment_aliases=("a", "b"),
+            equivalence=certification,
+        ).failover_mode
+        == "maximize_availability"
+    )
 
 
 def test_equivalence_catalog_rejects_implicit_false_or_ambiguous_grouping() -> None:
