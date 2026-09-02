@@ -485,10 +485,33 @@ def test_direct_alias_declares_image_capabilities_per_provider(tmp_path: Path) -
 
 
 def test_direct_alias_declares_pdf_capabilities_per_provider(tmp_path: Path) -> None:
-    """Only a URL-fetching provider may carry a caller's remote PDF URL."""
+    """Only a URL-fetching wire may carry a caller's remote PDF URL.
+
+    An Azure connection is inline-only for its OpenAI deployments but resolves
+    a known Anthropic model to the native Messages wire, which fetches URLs.
+    """
     runner = CliRunner()
     commands = (
         ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "foundry",
+            "--provider",
+            "azure",
+            "--base-url",
+            "https://resource.services.ai.azure.com/models",
+            "--credential-env",
+            "AZURE_FOUNDRY_API_KEY",
+            "--api-version",
+            "2024-05-01-preview",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
         [
             "config",
             "gateway",
@@ -523,7 +546,12 @@ def test_direct_alias_declares_pdf_capabilities_per_provider(tmp_path: Path) -> 
     for command in commands:
         result = runner.invoke(app, command)
         assert result.exit_code == 0, result.output
-    for alias, deployment in (("claude-docs", "claude:claude-fixture"), ("gem-docs", "google:gem")):
+    for alias, deployment in (
+        ("claude-docs", "claude:claude-fixture"),
+        ("gem-docs", "google:gem"),
+        ("foundry-claude-docs", "foundry:claude-sonnet-4-6"),
+        ("foundry-gpt-docs", "foundry:gpt-5-mini"),
+    ):
         created = runner.invoke(
             app,
             [
@@ -566,7 +594,7 @@ def test_direct_alias_declares_pdf_capabilities_per_provider(tmp_path: Path) -> 
 
     catalog = load_model_catalog(tmp_path / "models.toml")
     declarations: dict[str, tuple[bool, bool]] = {}
-    for alias in ("claude-docs", "gem-docs", "gem-text"):
+    for alias in ("claude-docs", "gem-docs", "gem-text", "foundry-claude-docs", "foundry-gpt-docs"):
         gateway = catalog.models[alias].gateway
         assert gateway is not None
         declarations[alias] = (
@@ -577,6 +605,8 @@ def test_direct_alias_declares_pdf_capabilities_per_provider(tmp_path: Path) -> 
         "claude-docs": (True, True),
         "gem-docs": (True, False),
         "gem-text": (False, False),
+        "foundry-claude-docs": (True, True),
+        "foundry-gpt-docs": (True, False),
     }
 
     inline_only = runner.invoke(
