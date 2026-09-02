@@ -102,6 +102,7 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "top_p",
                 "stream",
                 "store",
+                "service_tier",
             )
         ),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
@@ -138,7 +139,6 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "prompt",
                 "prompt_cache_options",
                 "prompt_cache_retention",
-                "service_tier",
                 "stream_options",
                 "truncation",
             )
