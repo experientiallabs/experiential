@@ -615,12 +615,6 @@ class GatewayRequest(ContractModel):
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
     service_tier: str | None = Field(default=None, max_length=64)
-    """Caller processing-tier hint.
-
-    Forwarded verbatim on tier-preserving wire dialects; a dialect with no
-    wire field for it declines the rung, and a route with no preserving rung
-    serves only as the disclosed drop in ``capability_policy``.
-    """
     ignored_parameters: tuple[str, ...] = Field(default=(), exclude=True)
     """Disclosed compatibility decisions applied to this request.
 
