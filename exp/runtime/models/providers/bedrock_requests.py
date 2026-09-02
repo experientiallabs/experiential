@@ -15,8 +15,14 @@ from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.images import bedrock_image_block
 from exp.runtime.models.providers.videos import bedrock_video_block
+
+BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES = 25_000_000
+"""Converse accepts inline media only while the whole request payload stays
+under 25 MB. Per-file gateway ceilings do not bound the sum, so the encoded
+bytes of every inline image and video in a request are checked together."""
 
 
 def converse_request(
@@ -107,7 +113,10 @@ def converse_body(
 
     Raises:
         ValueError: A message cannot be represented without dropping tool context.
+        ProviderParameterError: Inline media across the request exceeds the
+            Converse payload ceiling.
     """
+    _require_inline_media_within_payload(request)
     # Converse has no provider-neutral logprobs field. Keep the flag in the
     # shared signature so all provider lanes use one capability contract, but
     # omit the request until response projection exists.
@@ -186,6 +195,33 @@ def converse_body(
     if tool_config is not None:
         payload["toolConfig"] = tool_config
     return payload
+
+
+def _require_inline_media_within_payload(request: ModelRequest) -> None:
+    """Reject a request whose inline images and videos exceed the Converse payload cap.
+
+    Args:
+        request: Typed EXP request whose user messages may carry inline media.
+
+    Raises:
+        ProviderParameterError: The encoded inline media bytes together
+            exceed ``BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES``.
+    """
+    encoded = sum(
+        len(part.data)
+        for message in request.messages
+        for part in message.content_parts
+        if part.kind != "text" and part.data is not None
+    )
+    if encoded > BEDROCK_MAXIMUM_INLINE_MEDIA_BYTES:
+        raise ProviderParameterError(
+            message=(
+                "This model route accepts at most 25 MB of inline image and video "
+                "data per request. Send fewer or smaller files."
+            ),
+            param="messages",
+            code="invalid_parameter",
+        )
 
 
 def _message_blocks(message: ModelMessage) -> list[JsonObject]:

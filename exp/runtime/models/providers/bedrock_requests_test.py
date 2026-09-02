@@ -1,11 +1,16 @@
 """Tests for the shared native Bedrock Converse payload builders."""
 
+import base64
 from typing import cast
+
+import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
+from exp.common.models.content import ImageContentPart, TextContentPart, VideoContentPart
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.bedrock_requests import converse_request
+from exp.runtime.models.providers.errors import ProviderParameterError
 
 
 def _tool_transcript_request() -> ModelRequest:
@@ -139,3 +144,45 @@ def test_converse_request_adds_stop_schema_and_strict_tool_fields() -> None:
             },
         }
     }
+
+
+def _inline_media_request(*parts: ImageContentPart | VideoContentPart) -> ModelRequest:
+    """Build one user message carrying the given inline media parts and a caption."""
+    return ModelRequest(
+        messages=(
+            ModelMessage(
+                role="user",
+                content="describe",
+                content_parts=(*parts, TextContentPart(text="describe")),
+            ),
+        ),
+        maximum_output_tokens=32,
+    )
+
+
+def test_converse_request_rejects_inline_media_over_the_payload_ceiling() -> None:
+    """Inline media that individually fits but jointly exceeds 25 MB is refused pre-dispatch."""
+    chunk = base64.b64encode(b"\0" * (6 * 1024 * 1024)).decode()
+    videos = tuple(VideoContentPart(media_type="video/mp4", data=chunk) for _ in range(3))
+    with pytest.raises(ProviderParameterError, match="25 MB of inline image and video") as info:
+        converse_request("amazon.nova-lite-v1:0", _inline_media_request(*videos))
+    assert info.value.param == "messages"
+    assert info.value.code == "invalid_parameter"
+
+
+def test_converse_request_sums_inline_images_and_videos_together() -> None:
+    """The payload ceiling counts images and videos as one inline budget."""
+    video = VideoContentPart(
+        media_type="video/mp4",
+        data=base64.b64encode(b"\0" * (15 * 1024 * 1024)).decode(),
+    )
+    small = ImageContentPart(media_type="image/png", data=base64.b64encode(b"\0" * 1024).decode())
+    large = ImageContentPart(
+        media_type="image/png",
+        data=base64.b64encode(b"\0" * (3600 * 1024)).decode(),
+    )
+    payload = converse_request("amazon.nova-lite-v1:0", _inline_media_request(video, small))
+    blocks = cast("list[JsonObject]", cast("list[JsonObject]", payload["messages"])[0]["content"])
+    assert [next(iter(block)) for block in blocks] == ["video", "image", "text"]
+    with pytest.raises(ProviderParameterError):
+        converse_request("amazon.nova-lite-v1:0", _inline_media_request(video, large))

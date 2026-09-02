@@ -1,5 +1,6 @@
 """Rung-preference units; admission coercions are exercised e2e in native_bridge_test.py."""
 
+import base64
 from typing import Literal, cast
 
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
@@ -20,7 +21,7 @@ from exp.runtime.gateway.native_admission import (
 from exp.runtime.gateway.native_dispatch import NativeWireClient
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 
 
 def _deployment(
@@ -196,3 +197,44 @@ def test_video_requests_skip_rungs_whose_wire_cannot_carry_them() -> None:
     ]
     assert capabilities == ["video_input", "video_url_input"]
     assert len(errors) == 2
+
+
+def test_oversized_inline_media_skips_the_bedrock_rung() -> None:
+    """Inline videos that jointly exceed Converse's 25 MB payload cap fall through to Gemini."""
+    video_route = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_video_input=True
+        )
+    )
+    deployments = (
+        _deployment("nova", provider="bedrock", gateway=video_route),
+        _deployment("gemini", provider="gemini", gateway=video_route),
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test"), client),
+        (GatewayWireProfile(dialect="gemini_generate_content", url="https://gemini.test"), client),
+    )
+    chunk = base64.b64encode(b"\0" * (10 * 1024 * 1024)).decode()
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="describe",
+                content_parts=(
+                    VideoContentPart(media_type="video/mp4", data=chunk),
+                    VideoContentPart(media_type="video/mp4", data=chunk),
+                    TextContentPart(text="describe"),
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    indexes, errors = protocol_compatible_indexes(route, wires, request, public_stream=False)
+    assert indexes == (1,)
+    assert len(errors) == 1
+    assert isinstance(errors[0], ProviderParameterError)
+    assert errors[0].param == "messages"

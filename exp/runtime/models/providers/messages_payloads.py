@@ -322,6 +322,8 @@ def bedrock_converse_stream_payload(
     Raises:
         ProviderCapabilityError: The request carries an image URL this wire
             cannot fetch, so route selection can narrow past this rung.
+        ProviderParameterError: Inline media exceeds the Converse payload
+            ceiling, so route selection can narrow past this rung.
         ProviderResponseError: A message cannot be represented without
             dropping tool context.
     """
@@ -345,7 +347,7 @@ def bedrock_converse_stream_payload(
             ),
             strict_tool_names=tuple(tool.name for tool in request.tools if tool.strict),
         )
-    except ProviderCapabilityError:
+    except (ProviderParameterError, ProviderCapabilityError):
         raise
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc
