@@ -789,3 +789,47 @@ def test_native_tool_positions_must_tile_the_tools_array() -> None:
                 GatewayProviderNativeTool(index=2, tool={"type": "web_search"}),
             ),
         )
+
+
+def test_videos_join_semantic_identity_while_cache_markers_stay_out() -> None:
+    """Video parts change the canonical digest; cache-only markers never do.
+
+    Two requests that differ only in the video they carry must digest apart,
+    and a request carrying a provider cache marker on its text must digest
+    identically to the same request without it.
+    """
+    from exp.common.core.artifacts import sha256_json
+    from exp.common.models.content import TextContentPart, VideoContentPart
+
+    def request(video_url: str, *, marked: bool) -> GatewayRequest:
+        """Build one Chat request with a video, optionally cache-marked."""
+        blocks: tuple[JsonObject, ...] = (
+            ({"type": "text", "text": "what happens?", "cache_control": {"type": "ephemeral"}},)
+            if marked
+            else ()
+        )
+        return GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(
+                GatewayMessage(
+                    role="user",
+                    content="what happens?",
+                    content_parts=(
+                        VideoContentPart(url=video_url),
+                        TextContentPart(text="what happens?"),
+                    ),
+                    provider_text_blocks=blocks,
+                ),
+            ),
+        )
+
+    first = request("https://example.com/a.mp4", marked=False)
+    second = request("https://example.com/b.mp4", marked=False)
+    marked = request("https://example.com/a.mp4", marked=True)
+    dumped = first.model_dump(mode="json")
+    parts = dumped["messages"][0]["content_parts"]
+    assert parts[0]["kind"] == "video"
+    assert parts[0]["url"] == "https://example.com/a.mp4"
+    assert sha256_json(first) != sha256_json(second)
+    assert sha256_json(first) == sha256_json(marked)
+    assert first.videos == (first.messages[0].content_parts[0],)

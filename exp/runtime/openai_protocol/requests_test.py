@@ -9,10 +9,13 @@ from typing import cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject, sha256_json
+from exp.common.models.content import VideoContentPart
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayApiSurface,
+    GatewayMessage,
     GatewayNamedToolChoice,
+    GatewayRequest,
 )
 from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
@@ -2011,3 +2014,194 @@ def test_embeddings_decoder_rejects_empty_and_malformed_inputs() -> None:
             decode_embeddings(payload)
         assert rejection.value.status_code == 400
         assert param in (rejection.value.detail.param or "")
+
+
+_MP4_BASE64 = "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDE="
+"""A base64 prefix of an MP4 ``ftyp`` box, enough for a carrier fixture."""
+
+
+def test_chat_decoder_retains_video_parts_in_caller_order() -> None:
+    """A chat ``video_url`` part is kept beside its text and images in caller order."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "first "},
+                        {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}},
+                        {"type": "text", "text": "then "},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": f"data:video/webm;base64,{_MP4_BASE64}"},
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                        },
+                        {"type": "text", "text": "compare"},
+                    ],
+                }
+            ],
+        }
+    )
+    message = decoded.request.messages[0]
+    assert message.content == "first then compare"
+    assert [part.kind for part in message.content_parts] == [
+        "text",
+        "video",
+        "text",
+        "video",
+        "image",
+        "text",
+    ]
+    remote, inline = decoded.request.videos
+    assert remote.url == "https://example.com/a.mp4"
+    assert inline.media_type == "video/webm"
+    assert inline.data == _MP4_BASE64
+    assert len(decoded.request.images) == 1
+    assert [part.kind for part in model_request(decoded.request).messages[0].content_parts] == [
+        part.kind for part in message.content_parts
+    ]
+
+
+def test_videos_change_the_canonical_request_digest() -> None:
+    """A video changes what the model is asked, so it changes replay identity."""
+    text_only = decode_chat(
+        {"model": "coding", "messages": [{"role": "user", "content": "what happens"}]}
+    )
+    with_video = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what happens"},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": f"data:video/mp4;base64,{_MP4_BASE64}"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    other_video = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what happens"},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": f"data:video/mp4;base64,{_MP4_BASE64[:-4]}"},
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+    digests = {
+        sha256_json(text_only.request),
+        sha256_json(with_video.request),
+        sha256_json(other_video.request),
+    }
+    assert len(digests) == 3
+    assert "video" in with_video.request.model_dump_json()
+
+
+def test_malformed_chat_video_url_is_rejected_with_its_field() -> None:
+    """An unusable video carrier names the exact offending request field."""
+    for url in ("ftp://example.com/a.mp4", f"data:video/x-matroska;base64,{_MP4_BASE64}"):
+        with pytest.raises(OpenAIProtocolError) as error:
+            decode_chat(
+                {
+                    "model": "coding",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "video_url", "video_url": {"url": url}}],
+                        }
+                    ],
+                }
+            )
+        assert error.value.detail.param == "messages.0.content.0.video_url"
+
+
+def test_a_request_carries_at_most_the_video_ceiling() -> None:
+    """The eleventh video in one request is refused rather than dropped."""
+    part: JsonObject = {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
+    decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part] * 10}]})
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat({"model": "coding", "messages": [{"role": "user", "content": [part] * 11}]})
+    with pytest.raises(ValueError, match="at most 10 videos"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(
+                GatewayMessage(
+                    role="user",
+                    content="",
+                    content_parts=tuple(
+                        VideoContentPart(url="https://example.com/a.mp4") for _ in range(11)
+                    ),
+                ),
+            ),
+        )
+
+
+def test_assistant_video_parts_are_rejected() -> None:
+    """Only a caller message may carry a video."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+def test_responses_surface_defines_no_video_part() -> None:
+    """The Responses wire has no video content type, so one is refused, not dropped."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "describe"},
+                            {
+                                "type": "video_url",
+                                "video_url": {"url": "https://example.com/a.mp4"},
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_video", "video_url": "https://example.com/a.mp4"}
+                        ],
+                    }
+                ],
+            }
+        )

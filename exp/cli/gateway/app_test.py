@@ -1751,3 +1751,61 @@ def test_definite_key_commit_failure_is_content_free_and_removes_output(
     retried = runner.invoke(app, arguments)
     assert retried.exit_code == 0, retried.output
     assert output.read_text(encoding="utf-8").strip().startswith("exp_vk_")
+
+
+def test_direct_alias_declares_video_capabilities_per_provider(tmp_path: Path) -> None:
+    """Video is admitted only on providers with a video wire; URLs only where fetched."""
+    runner = CliRunner()
+    common = ["--root", str(tmp_path), "--non-interactive", "--json"]
+    commands = (
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+        ["config", "gateway", "provider", "add", "oai", "--provider", "openai"]
+        + ["--credential-env", "OPENAI_API_KEY"]
+        + common,
+        ["config", "gateway", "provider", "add", "google", "--provider", "gemini"]
+        + ["--credential-env", "GEMINI_API_KEY"]
+        + common,
+        ["config", "gateway", "provider", "add", "aws", "--provider", "bedrock"]
+        + ["--credential-env", "AWS_SECRET_ACCESS_KEY", "--access-key-id-env"]
+        + ["AWS_ACCESS_KEY_ID", "--region", "us-east-1"]
+        + common,
+    )
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+
+    def create(alias: str, deployment: str, *flags: str) -> int:
+        """Create one alias with the given video flags and return the exit code."""
+        created = runner.invoke(
+            app,
+            ["config", "gateway", "alias", "create", alias, "--deployment", deployment]
+            + ["--exact-model", alias, *flags]
+            + common,
+        )
+        return created.exit_code
+
+    assert create("gem-video", "google:gem", "--supports-video-input") == 0
+    assert create("nova-video", "aws:nova", "--supports-video-input") == 0
+    assert create("oai-video", "oai:gpt-fixture", "--supports-video-input") != 0
+    assert (
+        create(
+            "nova-url",
+            "aws:nova",
+            "--supports-video-input",
+            "--supports-video-url-input",
+        )
+        != 0
+    )
+    assert create("gem-text", "google:gem", "--supports-video-url-input") != 0
+
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    declarations: dict[str, tuple[bool, bool]] = {}
+    for alias in ("gem-video", "nova-video"):
+        gateway = catalog.models[alias].gateway
+        assert gateway is not None
+        declarations[alias] = (
+            gateway.capabilities.supports_video_input,
+            gateway.capabilities.supports_video_url_input,
+        )
+    assert declarations == {"gem-video": (True, True), "nova-video": (True, False)}
+    assert "oai-video" not in catalog.models

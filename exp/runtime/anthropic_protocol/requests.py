@@ -65,6 +65,10 @@ from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 
 _REJECTED_BLOCK_HINTS = {
     "document": "document blocks are not supported: this gateway surface serves text and images",
+    "video": (
+        "video blocks are not supported: the Anthropic Messages wire defines no video "
+        "content, so send video on the Chat Completions surface"
+    ),
 }
 
 

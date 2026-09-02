@@ -22,8 +22,9 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_adaptive_only_thinking,
     supported_reasoning_efforts,
 )
+from exp.runtime.models.providers.videos import VIDEO_DIALECTS, VIDEO_URL_DIALECTS
 
-CAPABILITY_PARITY_SCHEMA_VERSION = 2
+CAPABILITY_PARITY_SCHEMA_VERSION = 3
 """Version of the parity-row contract; bump on any field change."""
 
 
@@ -50,6 +51,12 @@ class DeploymentCapabilityParity(ContractModel):
     the caller to inline the bytes; a catalog can route an image-URL request
     to a rung that declares this instead.
     """
+    supports_video_input: bool
+    """Whether this rung carries caller video parts: declared by the catalog
+    and defined by the wire, since Responses and Anthropic have no carrier."""
+    forwards_video_urls: bool
+    """Whether this rung's provider fetches a caller video URL itself; only
+    the Gemini and OpenAI-compatible video wires do."""
     maximum_stop_sequences: int | None
     reasoning_efforts: tuple[ReasoningEffort, ...]
     """Exact efforts this rung preserves: the declared set when the catalog
@@ -117,6 +124,12 @@ def deployment_capability_parity(
             capabilities.supports_image_input
             and capabilities.supports_image_url_input
             and dialect in IMAGE_URL_DIALECTS
+        ),
+        supports_video_input=(capabilities.supports_video_input and dialect in VIDEO_DIALECTS),
+        forwards_video_urls=(
+            capabilities.supports_video_input
+            and capabilities.supports_video_url_input
+            and dialect in VIDEO_URL_DIALECTS
         ),
         maximum_stop_sequences=capabilities.maximum_stop_sequences,
         reasoning_efforts=efforts,

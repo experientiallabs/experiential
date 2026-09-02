@@ -14,6 +14,8 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
         "function_tools": "tools",
         "image_input": "messages",
         "image_url_input": "messages",
+        "video_input": "messages",
+        "video_url_input": "messages",
         "parallel_tool_calls": "parallel_tool_calls",
         "stop_sequences": "stop",
         "streaming": "stream",
@@ -27,6 +29,8 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
         "function_tools": "tools",
         "image_input": "input",
         "image_url_input": "input",
+        "video_input": "input",
+        "video_url_input": "input",
         "parallel_tool_calls": "parallel_tool_calls",
         "streaming": "stream",
         "streaming_tool_arguments": "stream",
@@ -39,6 +43,8 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
         "function_tools": "tools",
         "image_input": "messages",
         "image_url_input": "messages",
+        "video_input": "messages",
+        "video_url_input": "messages",
         "parallel_tool_calls": "tool_choice.disable_parallel_tool_use",
         "stop_sequences": "stop_sequences",
         "streaming": "stream",
@@ -48,7 +54,7 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
 }
 
 
-_IMAGE_CAPABILITY_MESSAGES = {
+_MEDIA_CAPABILITY_MESSAGES = {
     "image_input": (
         "The selected model route cannot accept image input. "
         "Send text only or choose an image-capable model alias."
@@ -57,8 +63,16 @@ _IMAGE_CAPABILITY_MESSAGES = {
         "The selected model route accepts inline image data only. "
         "Send the image as a base64 data URL or choose a different model alias."
     ),
+    "video_input": (
+        "The selected model route cannot accept video input. "
+        "Send text only or choose a video-capable model alias."
+    ),
+    "video_url_input": (
+        "The selected model route accepts inline video data only. "
+        "Send the video as a base64 data URL or choose a different model alias."
+    ),
 }
-"""Why an image was refused, since the field itself is the caller's message.
+"""Why an image or video was refused, since the field itself is the caller's message.
 
 The shared unsupported-field wording asks the caller to remove the named
 field, which no image request can do: the field is the conversation."""
@@ -99,12 +113,12 @@ def public_capability_error(
             public_tools=public_tools,
         )
     )
-    image_reason = _IMAGE_CAPABILITY_MESSAGES.get(error.capability)
-    if param is not None and image_reason is not None:
+    media_reason = _MEDIA_CAPABILITY_MESSAGES.get(error.capability)
+    if param is not None and media_reason is not None:
         return OpenAIProtocolError(
             status_code=400,
             code="unsupported_capability",
-            message=image_reason,
+            message=media_reason,
             param=param,
         )
     if param is not None:

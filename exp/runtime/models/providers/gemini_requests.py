@@ -16,6 +16,7 @@ from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
 from exp.runtime.models.providers.images import gemini_image_part
 from exp.runtime.models.providers.reasoning_compat import gemini_thinking_level
+from exp.runtime.models.providers.videos import gemini_video_part
 
 
 def gemini_model_path(model_id: str) -> str:
@@ -156,7 +157,11 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
             return {
                 "role": "user",
                 "parts": [
-                    {"text": part.text} if part.kind == "text" else gemini_image_part(part)
+                    {"text": part.text}
+                    if part.kind == "text"
+                    else gemini_image_part(part)
+                    if part.kind == "image"
+                    else gemini_video_part(part)
                     for part in message.content_parts
                 ],
             }

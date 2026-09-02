@@ -16,6 +16,7 @@ from typing import cast
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 from exp.runtime.models.providers.images import bedrock_image_block
+from exp.runtime.models.providers.videos import bedrock_video_block
 
 
 def converse_request(
@@ -205,9 +206,13 @@ def _message_blocks(message: ModelMessage) -> list[JsonObject]:
         raise ValueError("user messages need text content")
     if message.content_parts:
         return [
-            {"text": part.text} if part.kind == "text" else bedrock_image_block(part)
+            {"text": part.text}
+            if part.kind == "text"
+            else bedrock_image_block(part)
+            if part.kind == "image"
+            else bedrock_video_block(part)
             for part in message.content_parts
-            if part.kind == "image" or part.text
+            if part.kind != "text" or part.text
         ]
     blocks: list[JsonObject] = []
     action = message.assistant_action

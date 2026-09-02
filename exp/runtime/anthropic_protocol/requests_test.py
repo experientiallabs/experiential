@@ -1064,3 +1064,25 @@ def test_decode_carries_block_level_cache_markers_like_a_live_claude_code_turn()
     plain = decode_messages(_body(system=[{"type": "text", "text": "You are terse."}])).request
     assert plain.messages[0].provider_text_blocks == ()
     assert plain.messages[1].provider_text_blocks == ()
+
+
+def test_video_block_is_rejected_with_a_surface_hint() -> None:
+    """The Messages wire defines no video block, so one is refused loudly."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what happens"},
+                            {
+                                "type": "video",
+                                "source": {"type": "url", "url": "https://example.com/a.mp4"},
+                            },
+                        ],
+                    }
+                ]
+            )
+        )
+    assert "video blocks are not supported" in excinfo.value.detail.message

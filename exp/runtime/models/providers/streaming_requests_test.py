@@ -5,7 +5,7 @@ from typing import Literal, cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import ImageContentPart, TextContentPart
+from exp.common.models.content import ImageContentPart, TextContentPart, VideoContentPart
 from exp.common.models.model import ReasoningEffort, ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -19,6 +19,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
@@ -2672,7 +2673,6 @@ def test_native_tool_declarations_count_as_tools_for_capability_preflight() -> N
     """A rung that declares no tool support rejects a native-tools-only
     request locally instead of dispatching a known-unsupported call."""
     from exp.common.models import GatewayDeploymentCapabilities, ModelCapabilities
-    from exp.runtime.models.providers.errors import ProviderCapabilityError
     from exp.runtime.models.providers.protocol import preflight_gateway_request
 
     request = GatewayRequest(
@@ -2690,3 +2690,104 @@ def test_native_tool_declarations_count_as_tools_for_capability_preflight() -> N
             model_capabilities=ModelCapabilities(supports_tools=False),
         )
     assert rejection.value.capability == "function_tools"
+
+
+_MP4_BASE64 = "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDE="
+"""A base64 prefix of an MP4 ``ftyp`` box, enough for a carrier fixture."""
+
+
+def _video_request(
+    surface: GatewayApiSurface = GatewayApiSurface.CHAT_COMPLETIONS,
+    *,
+    remote: bool = False,
+) -> GatewayRequest:
+    """Build one streaming request with text on both sides of a video."""
+    video = (
+        VideoContentPart(url="https://example.com/clip.mp4")
+        if remote
+        else VideoContentPart(media_type="video/mp4", data=_MP4_BASE64)
+    )
+    return GatewayRequest(
+        surface=surface,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="watch this: what happens?",
+                content_parts=(
+                    TextContentPart(text="watch this: "),
+                    video,
+                    TextContentPart(text="what happens?"),
+                ),
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_openai_compatible_payload_carries_video_url_parts_in_order() -> None:
+    """The OpenRouter and Fireworks wire gets a ``video_url`` part between its text."""
+    payload = openai_compatible_stream_payload("qwen3-omni", _video_request())
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "watch this: "},
+        {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{_MP4_BASE64}"}},
+        {"type": "text", "text": "what happens?"},
+    ]
+    remote = openai_compatible_stream_payload("qwen3-omni", _video_request(remote=True))
+    remote_content = cast(
+        list[JsonObject], cast(list[JsonObject], remote["messages"])[0]["content"]
+    )
+    assert remote_content[1] == {
+        "type": "video_url",
+        "video_url": {"url": "https://example.com/clip.mp4"},
+    }
+
+
+def test_gemini_payload_carries_inline_and_file_video_parts() -> None:
+    """Gemini gets ``inline_data`` for bytes and ``file_data`` for a fetched URI."""
+    payload = gemini_generate_content_stream_payload("gemini-2.5-flash", _video_request())
+    assert payload["contents"] == [
+        {
+            "role": "user",
+            "parts": [
+                {"text": "watch this: "},
+                {"inline_data": {"mime_type": "video/mp4", "data": _MP4_BASE64}},
+                {"text": "what happens?"},
+            ],
+        }
+    ]
+    remote = gemini_generate_content_stream_payload("gemini-2.5-flash", _video_request(remote=True))
+    parts = cast(list[JsonObject], cast(list[JsonObject], remote["contents"])[0]["parts"])
+    assert parts[1] == {"file_data": {"file_uri": "https://example.com/clip.mp4"}}
+
+
+def test_bedrock_payload_carries_a_video_block_and_declines_a_url() -> None:
+    """Converse gets a ``video`` block for bytes and narrows past a URL it cannot fetch."""
+    payload = bedrock_converse_stream_payload("us.amazon.nova-lite-v1:0", _video_request())
+    assert payload["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"text": "watch this: "},
+                {"video": {"format": "mp4", "source": {"bytes": _MP4_BASE64}}},
+                {"text": "what happens?"},
+            ],
+        }
+    ]
+    with pytest.raises(ProviderCapabilityError, match="video_url_input"):
+        bedrock_converse_stream_payload("us.amazon.nova-lite-v1:0", _video_request(remote=True))
+
+
+def test_wires_without_a_video_carrier_narrow_past_the_rung() -> None:
+    """Responses and Anthropic payloads refuse a video instead of dropping it."""
+    with pytest.raises(ProviderCapabilityError, match="video_input"):
+        openai_responses_stream_payload(
+            "gpt-fixture",
+            _video_request(),
+            supports_temperature=True,
+            supports_reasoning=False,
+            reasoning_effort=None,
+        )
+    with pytest.raises(ProviderCapabilityError, match="video_input"):
+        anthropic_messages_stream_payload("claude-fable-5", _video_request())

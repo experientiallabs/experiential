@@ -23,6 +23,7 @@ from exp.common.models.content import (
     MessageContentPart,
     TextContentPart,
     image_part_from_url,
+    video_part_from_url,
 )
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.compatibility import (
@@ -71,6 +72,7 @@ from exp.runtime.openai_protocol.wire_models import (
     _ChatRequest,
     _ChatResponseFormat,
     _ChatTool,
+    _ChatVideoPart,
     _ContentPart,
     _CustomToolCall,
     _CustomToolCallOutput,
@@ -645,20 +647,20 @@ def _message_content(
     content: str | tuple[_ContentPart, ...] | None,
     param: str,
 ) -> tuple[str | None, tuple[MessageContentPart, ...]]:
-    """Flatten wire content parts, retaining images in the caller's order.
+    """Flatten wire content parts, retaining media in the caller's order.
 
     Args:
         content: Wire content: plain text, ordered parts, or absent.
-        param: Public parameter path used to report an invalid image.
+        param: Public parameter path used to report an invalid image or video.
 
     Returns:
-        The flattened text and, only for a message that carries an image,
-        the ordered canonical parts. A text-only message keeps its previous
-        representation exactly, so nothing downstream changes for it.
+        The flattened text and, only for a message that carries an image or
+        a video, the ordered canonical parts. A text-only message keeps its
+        previous representation exactly, so nothing downstream changes for it.
 
     Raises:
-        OpenAIProtocolError: An image reference is not a supported URL or
-            base64 data URL.
+        OpenAIProtocolError: An image or video reference is not a supported
+            URL or base64 data URL.
     """
     if content is None or isinstance(content, str):
         return content, ()
@@ -672,6 +674,17 @@ def _message_content(
             # here rather than failing a turn that does carry an image.
             if part.text:
                 parts.append(TextContentPart(text=part.text))
+            continue
+        if isinstance(part, _ChatVideoPart):
+            try:
+                parts.append(video_part_from_url(part.video_url.url))
+            except ValueError as exc:
+                location = f"{param}.{index}.video_url"
+                raise invalid_field(
+                    location,
+                    f"'{location}' must be an http(s) URL or a base64 data URL "
+                    "of an MP4, MPEG, QuickTime, WebM, FLV, 3GPP, or WMV video.",
+                ) from exc
             continue
         url, detail = (
             (part.image_url.url, part.image_url.detail)
@@ -688,7 +701,7 @@ def _message_content(
                 "of a PNG, JPEG, GIF, or WebP image.",
             ) from exc
     text = "".join(part.text for part in parts if part.kind == "text")
-    if not any(part.kind == "image" for part in parts):
+    if all(part.kind == "text" for part in parts):
         return text, ()
     return text, tuple(parts)
 

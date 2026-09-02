@@ -239,6 +239,12 @@ def preflight_gateway_request(
             capabilities.supports_image_url_input,
             "image_url_input",
         ),
+        (bool(request.videos), capabilities.supports_video_input, "video_input"),
+        (
+            any(video.url is not None for video in request.videos),
+            capabilities.supports_video_url_input,
+            "video_url_input",
+        ),
         (bool(request.stop), capabilities.supports_stop_sequences, "stop_sequences"),
         (
             any(tool.strict for tool in request.tools),

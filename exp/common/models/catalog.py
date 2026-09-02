@@ -397,6 +397,22 @@ class GatewayDeploymentCapabilities(ContractModel):
     remote URL. A route that does not declare this rejects a URL image at
     admission, which lets a waterfall narrow to a rung that can carry it.
     """
+    supports_video_input: bool = False
+    """Whether this deployment's wire and model can carry caller video parts.
+
+    Video is narrower than images: only the Gemini, Bedrock Converse, and
+    OpenAI-compatible ``video_url`` wires define a video carrier, and only
+    some models on those wires accept one. Like images the declaration is
+    never assumed, so a route without it rejects a video at admission rather
+    than answering from the surrounding text.
+    """
+    supports_video_url_input: bool = False
+    """Whether this route's provider fetches a caller video URL itself.
+
+    Bedrock accepts inline bytes (or an S3 location the gateway does not
+    author) only; Gemini and the OpenAI-compatible video wires fetch an
+    http(s) URL on the caller's behalf.
+    """
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
     """Largest stop-sequence count this route accepts, when the provider caps it.
 

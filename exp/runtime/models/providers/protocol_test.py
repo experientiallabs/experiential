@@ -17,7 +17,7 @@ from exp.common.models import (
     ModelSnapshot,
 )
 from exp.common.models.catalog import GatewayDeploymentCapabilities
-from exp.common.models.content import ImageContentPart, TextContentPart
+from exp.common.models.content import ImageContentPart, TextContentPart, VideoContentPart
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -321,4 +321,55 @@ def test_preflight_rejects_an_image_url_on_an_inline_only_route() -> None:
     preflight_gateway_request(
         request,
         GatewayDeploymentCapabilities(supports_image_input=True, supports_image_url_input=True),
+    )
+
+
+def _video_request(*, remote: bool = False) -> GatewayRequest:
+    """Build one caller request carrying a video beside its text."""
+    video = (
+        VideoContentPart(url="https://example.com/clip.mp4")
+        if remote
+        else VideoContentPart(media_type="video/mp4", data="AAAAIGZ0eXBpc29t")
+    )
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="what happens",
+                content_parts=(TextContentPart(text="what happens"), video),
+            ),
+        ),
+    )
+
+
+def test_preflight_rejects_a_video_on_a_route_that_does_not_declare_it() -> None:
+    """A video is never dropped and answered from the surrounding text alone."""
+    with pytest.raises(ProviderCapabilityError, match="video_input"):
+        preflight_gateway_request(_video_request(), GatewayDeploymentCapabilities())
+    with pytest.raises(ProviderCapabilityError, match="video_input"):
+        preflight_gateway_request(
+            _video_request(),
+            GatewayDeploymentCapabilities(supports_image_input=True, supports_image_url_input=True),
+        )
+
+
+def test_preflight_admits_an_inline_video_on_a_video_route() -> None:
+    """A declared video route serves inline bytes without declaring URL support."""
+    preflight_gateway_request(
+        _video_request(),
+        GatewayDeploymentCapabilities(supports_video_input=True),
+    )
+
+
+def test_preflight_rejects_a_video_url_on_an_inline_only_route() -> None:
+    """A remote video URL needs its own declaration, so a waterfall can narrow to it."""
+    with pytest.raises(ProviderCapabilityError, match="video_url_input"):
+        preflight_gateway_request(
+            _video_request(remote=True),
+            GatewayDeploymentCapabilities(supports_video_input=True),
+        )
+    preflight_gateway_request(
+        _video_request(remote=True),
+        GatewayDeploymentCapabilities(supports_video_input=True, supports_video_url_input=True),
     )

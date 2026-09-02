@@ -10,8 +10,10 @@ from pydantic import Field, field_validator, model_validator
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
 from exp.common.models.content import (
     MAXIMUM_IMAGES_PER_REQUEST,
+    MAXIMUM_VIDEOS_PER_REQUEST,
     ImageContentPart,
     MessageContentPart,
+    VideoContentPart,
 )
 from exp.common.models.gateway_catalog import (
     DeploymentId,
@@ -315,15 +317,15 @@ class GatewayMessage(ContractModel):
     replay identity.
     """
     content_parts: tuple[MessageContentPart, ...] = ()
-    """Ordered caller content parts for a message that carries images.
+    """Ordered caller content parts for a message that carries images or videos.
 
     Empty on every text-only message, so a text-only request serializes and
-    digests exactly as it did before images existed. When present, the text
-    parts concatenate to ``content`` byte-for-byte and at least one image
-    part is included, so a route that cannot carry images is rejected at
-    admission instead of silently serving the text alone. Images change what
-    the model sees, so unlike the cache carriers this field is serialized and
-    joins request identity.
+    digests exactly as it did before media existed. When present, the text
+    parts concatenate to ``content`` byte-for-byte and at least one image or
+    video part is included, so a route that cannot carry the media is
+    rejected at admission instead of silently serving the text alone. Media
+    changes what the model sees, so unlike the cache carriers this field is
+    serialized and joins request identity.
     """
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Validated caller prompt-caching marker on this tool-result message.
@@ -413,7 +415,7 @@ class GatewayMessage(ContractModel):
         if self.content_parts:
             if self.role != "user":
                 raise ValueError("content parts are valid only for user messages")
-            if not any(part.kind == "image" for part in self.content_parts):
+            if all(part.kind == "text" for part in self.content_parts):
                 raise ValueError("content parts are retained only for multimodal messages")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
@@ -424,6 +426,11 @@ class GatewayMessage(ContractModel):
     def images(self) -> tuple[ImageContentPart, ...]:
         """Return this message's retained image parts in caller order."""
         return tuple(part for part in self.content_parts if part.kind == "image")
+
+    @property
+    def videos(self) -> tuple[VideoContentPart, ...]:
+        """Return this message's retained video parts in caller order."""
+        return tuple(part for part in self.content_parts if part.kind == "video")
 
 
 class GatewayRequest(ContractModel):
@@ -635,6 +642,11 @@ class GatewayRequest(ContractModel):
         """Return every image this request carries, in message and part order."""
         return tuple(image for message in self.messages for image in message.images)
 
+    @property
+    def videos(self) -> tuple[VideoContentPart, ...]:
+        """Return every video this request carries, in message and part order."""
+        return tuple(video for message in self.messages for video in message.videos)
+
     @field_validator("stop")
     @classmethod
     def _require_unique_stop_sequences(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -690,6 +702,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("include_usage is valid only for streaming requests")
         if len(self.images) > MAXIMUM_IMAGES_PER_REQUEST:
             raise ValueError(f"a request carries at most {MAXIMUM_IMAGES_PER_REQUEST} images")
+        if len(self.videos) > MAXIMUM_VIDEOS_PER_REQUEST:
+            raise ValueError(f"a request carries at most {MAXIMUM_VIDEOS_PER_REQUEST} videos")
         if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("reasoning_summary is valid only for Responses requests")
         if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:
