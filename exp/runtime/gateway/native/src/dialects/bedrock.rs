@@ -353,7 +353,7 @@ mod bedrock_tests {
                     "kind": "usage",
                     "input_tokens": 9,
                     "output_tokens": 4,
-                    "cached_input_tokens": null,
+                    "cached_input_tokens": 0,
                     "reasoning_tokens": null,
                 }),
                 json!({"kind": "completed"}),
