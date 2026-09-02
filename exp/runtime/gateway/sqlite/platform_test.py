@@ -241,6 +241,12 @@ def test_activation_refuses_a_self_inconsistent_snapshot(tmp_path: Path) -> None
     # Absent file: unverifiable on this node, flagged and allowed.
     refuse_self_inconsistent_snapshot(tmp_path, "catalog-snapshots/missing.json", "a" * 64)
 
+    # Present but unreadable (here a directory at the path -> a non-absent OSError):
+    # NOT the remote-node case, so it fails closed rather than pinning unverified.
+    (tmp_path / "catalog-snapshots" / "unreadable.json").mkdir()
+    with pytest.raises(ValueError, match="present but unreadable"):
+        refuse_self_inconsistent_snapshot(tmp_path, "catalog-snapshots/unreadable.json", digest)
+
 
 def test_default_adapter_reads_complete_local_pool_revisions(tmp_path: Path) -> None:
     """SQLite resolves complete pools from its pinned immutable local snapshots."""

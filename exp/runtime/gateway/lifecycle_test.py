@@ -36,10 +36,20 @@ from exp.runtime.gateway.catalog_authority import (
     upsert_connection,
     upsert_singleton_deployment,
 )
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    DirectTarget,
+    ExecutionSnapshot,
+    GatewayApiSurface,
+)
 from exp.runtime.gateway.lifecycle import (
     GatewayLifecycleError,
     LocalGatewayComponents,
+    _AliasAuthorityState,
     _ReadyControlStore,
+    _serve_or_fallback,
+    _served_triple,
+    _ServedFallback,
     gateway_instance_lock,
     load_gateway_components,
 )
@@ -563,6 +573,65 @@ def test_invalid_new_revision_serves_last_good_and_recovers_after_fix(tmp_path: 
 
     assert _granted_authorities(components, raw_key) == {"coding": "revision-repaired"}
     assert _authorize(components, raw_key, "coding") == "revision-repaired"
+
+
+def _fallback_auth(alias: str, revision: str, digest: str) -> AuthorizationSnapshot:
+    """One minimal authorization snapshot for the fallback-scoping unit test."""
+    return AuthorizationSnapshot(
+        request_id="req",
+        organization_id="org",
+        identity_id="id",
+        virtual_key_id="key",
+        alias=alias,
+        alias_revision_id=revision,
+        target=DirectTarget(pool_id="pool"),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256=digest,
+        canonical_request_sha256="c" * 64,
+        refusal_failover=False,
+        deadline_monotonic=1.0,
+    )
+
+
+def test_fallback_lookup_is_alias_scoped_not_revision_id_only() -> None:
+    """A fallback recorded for one alias is never returned for a different alias
+    that happens to share the active revision id — the fallback map is keyed by
+    (alias, revision), so it cannot cross an alias authorization boundary."""
+    shared_revision = "revision-shared"
+    fallback = _ServedFallback(
+        alias_revision_id="revision-a-prior",
+        catalog_sha256="d" * 64,
+        target=DirectTarget(pool_id="pool-a-prior"),
+    )
+    proof = ExecutionSnapshot(
+        authorization=_fallback_auth("alias-a", "revision-a-prior", "d" * 64),
+        exact_model_id="exact-a",
+        pool_id="pool-a-prior",
+        deployment_ids=("deployment-a",),
+    )
+    state = _AliasAuthorityState(
+        authorities=frozenset(),
+        normalized_catalogs={},
+        runtime_catalogs={},
+        activations={},
+        exact_models={},
+        listing_pools={},
+        proof=proof,
+        fallback_revisions={("alias-a", shared_revision): fallback},
+    )
+
+    # alias-a with the shared revision id resolves to its own fallback...
+    served_a = _serve_or_fallback(state, _fallback_auth("alias-a", shared_revision, "e" * 64))
+    assert served_a is not None
+    assert served_a.alias_revision_id == "revision-a-prior"
+    assert _served_triple(state, ("alias-a", shared_revision, "e" * 64)) == (
+        "alias-a",
+        "revision-a-prior",
+        "d" * 64,
+    )
+    # ...but alias-b with the SAME revision id gets nothing (no cross-alias leak).
+    assert _serve_or_fallback(state, _fallback_auth("alias-b", shared_revision, "e" * 64)) is None
+    assert _served_triple(state, ("alias-b", shared_revision, "e" * 64)) is None
 
 
 def test_cold_start_clears_a_dead_active_pin_via_last_good(tmp_path: Path) -> None:

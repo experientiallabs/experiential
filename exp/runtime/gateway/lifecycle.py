@@ -90,9 +90,11 @@ class _AliasAuthorityState:
     listing_pools: Mapping[tuple[str, str, str], str]
     proof: ExecutionSnapshot
     unavailable_aliases: tuple[tuple[str, str], ...] = ()
-    # Dead active revision_id -> the last-good prior revision serving it. Empty
-    # unless an alias's active pinned snapshot was unservable at load.
-    fallback_revisions: Mapping[str, _ServedFallback] = field(default_factory=dict)
+    # (alias, dead active revision_id) -> the last-good prior revision serving
+    # it. Keyed by alias too (not the revision id alone) so a shared revision id
+    # can never route one alias's request to another alias's fallback target.
+    # Empty unless an alias's active pinned snapshot was unservable at load.
+    fallback_revisions: Mapping[tuple[str, str], _ServedFallback] = field(default_factory=dict)
 
 
 class _AliasAuthorityReloader:
@@ -265,7 +267,7 @@ def _served_triple(
     if triple in state.authorities:
         return triple
     alias, active_revision_id, _digest = triple
-    fallback = state.fallback_revisions.get(active_revision_id)
+    fallback = state.fallback_revisions.get((alias, active_revision_id))
     if fallback is None:
         return None
     return (alias, fallback.alias_revision_id, fallback.catalog_sha256)
@@ -291,7 +293,7 @@ def _serve_or_fallback(
     )
     if authority in state.authorities or _revision_served(state, authorization):
         return authorization
-    fallback = state.fallback_revisions.get(authorization.alias_revision_id)
+    fallback = state.fallback_revisions.get((authorization.alias, authorization.alias_revision_id))
     if fallback is None:
         return None
     return authorization.model_copy(
@@ -588,7 +590,7 @@ def _load_alias_state(
     readiness: list[ExecutionSnapshot] = []
     unavailable_aliases: list[tuple[str, str]] = []
     missing_credential_variables: set[str] = set()
-    fallback_revisions: dict[str, _ServedFallback] = {}
+    fallback_revisions: dict[tuple[str, str], _ServedFallback] = {}
 
     for alias in aliases:
         try:
@@ -621,7 +623,7 @@ def _load_alias_state(
             readiness.append(fallback.proof)
             served = fallback.proof.authorization
             if alias.revision_id is not None:
-                fallback_revisions[alias.revision_id] = _ServedFallback(
+                fallback_revisions[(alias.alias_name, alias.revision_id)] = _ServedFallback(
                     alias_revision_id=served.alias_revision_id,
                     catalog_sha256=served.catalog_sha256,
                     target=served.target,
