@@ -6,6 +6,7 @@ import json
 from collections.abc import Collection, Sequence
 from typing import Literal, cast
 
+from openai.types import EmbeddingCreateParams
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import (
@@ -24,6 +25,7 @@ from exp.runtime.gateway.compatibility import (
     CompatibilityManifest,
 )
 from exp.runtime.gateway.contracts import (
+    EmbeddingsRequest,
     EncryptedReasoningBlock,
     GatewayApiSurface,
     GatewayMessage,
@@ -44,6 +46,7 @@ from exp.runtime.openai_protocol.cache_control import (
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
+    EMBEDDINGS_MANIFEST,
     RESPONSES_MANIFEST,
     disposition_map,
 )
@@ -64,6 +67,7 @@ from exp.runtime.openai_protocol.wire_models import (
     _ChatTool,
     _CustomToolCall,
     _CustomToolCallOutput,
+    _EmbeddingsRequest,
     _FunctionCall,
     _Message,
     _ResponseFunctionCall,
@@ -78,6 +82,9 @@ from exp.runtime.openai_protocol.wire_models import (
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
 _RESPONSES_OFFICIAL = TypeAdapter(ResponseCreateParams)
+# Parametrized to object so the invariant TypeAdapter matches _validate_official;
+# EmbeddingCreateParams is a single TypedDict, unlike the union-typed chat/responses params.
+_EMBEDDINGS_OFFICIAL: TypeAdapter[object] = TypeAdapter[object](EmbeddingCreateParams)
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 
 
@@ -87,6 +94,17 @@ class DecodedGatewayRequest(ContractModel):
     alias: str = Field(min_length=1, max_length=256)
     request: GatewayRequest
     developer_messages_param: str | None = None
+
+
+class DecodedEmbeddingsRequest(ContractModel):
+    """Public alias plus its canonical embeddings request.
+
+    Distinct from :class:`DecodedGatewayRequest` because the embeddings surface
+    carries its own message-less, non-streaming request contract.
+    """
+
+    alias: str = Field(min_length=1, max_length=256)
+    request: EmbeddingsRequest
 
 
 def _without_chat_reasoning_content(payload: JsonObject) -> JsonObject:
@@ -189,6 +207,38 @@ def decode_chat(
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
+
+
+def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
+    """Decode one Embeddings body into the canonical embeddings surface.
+
+    The embeddings surface has no idempotency protocol yet: keyed replay is a
+    future add, so an inbound ``Idempotency-Key`` header is ignored upstream
+    rather than keying this decode (which therefore takes no header arguments).
+
+    Args:
+        payload: Parsed JSON request body.
+
+    Returns:
+        Public alias and canonical embeddings request.
+
+    Raises:
+        OpenAIProtocolError: The body is invalid, unknown, or unsupported.
+    """
+    _validate_manifest(payload, EMBEDDINGS_MANIFEST)
+    _validate_official(_EMBEDDINGS_OFFICIAL, payload)
+    request = _validate_wire(_EmbeddingsRequest, payload)
+    inputs = (request.input,) if isinstance(request.input, str) else request.input
+    try:
+        canonical = EmbeddingsRequest(
+            inputs=inputs,
+            dimensions=request.dimensions,
+            encoding_format=request.encoding_format,
+            user=request.user,
+        )
+    except ValidationError as exc:
+        raise _validation_protocol_error(exc) from exc
+    return DecodedEmbeddingsRequest(alias=request.model, request=canonical)
 
 
 def decode_responses(

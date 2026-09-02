@@ -17,6 +17,7 @@ from exp.runtime.gateway.compatibility import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
+    EmbeddingsRequest,
     ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
@@ -789,3 +790,24 @@ def test_native_tool_positions_must_tile_the_tools_array() -> None:
                 GatewayProviderNativeTool(index=2, tool={"type": "web_search"}),
             ),
         )
+
+
+def test_embeddings_request_is_message_less_and_defaults_optionals() -> None:
+    """The parallel embeddings contract needs only inputs and pins its surface."""
+    request = EmbeddingsRequest(inputs=("hello",))
+
+    assert request.surface == GatewayApiSurface.EMBEDDINGS
+    assert request.inputs == ("hello",)
+    assert request.dimensions is None
+    assert request.encoding_format is None
+    assert request.user is None
+
+
+def test_embeddings_request_rejects_empty_input_sets() -> None:
+    """An empty input list or an empty input string is invalid at the contract boundary."""
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        EmbeddingsRequest(inputs=())
+    with pytest.raises(ValidationError, match="must not be empty"):
+        EmbeddingsRequest(inputs=("ok", ""))
+    with pytest.raises(ValidationError, match="greater than 0"):
+        EmbeddingsRequest(inputs=("ok",), dimensions=0)
