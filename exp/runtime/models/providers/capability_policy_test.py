@@ -372,3 +372,32 @@ def test_open_structured_output_schema_closes_for_an_anthropic_rung() -> None:
     assert coerce_structured_text_schema((anthropic,), closed_request) is None
     # No structured output, nothing to close.
     assert coerce_structured_text_schema((anthropic,), _request()) is None
+
+
+def test_mixed_rejections_coerce_only_the_service_tier() -> None:
+    """Rungs declining differently drop the tier but never a guarantee."""
+    from exp.runtime.models.providers.capability_policy import coerce_route_rejections
+    from exp.runtime.models.providers.errors import ProviderCapabilityError
+
+    tier = ProviderCapabilityError(capability="service_tier")
+    parallel = ProviderCapabilityError(capability="parallel_tool_calls")
+    strict = ProviderCapabilityError(capability="strict_tools")
+    tiered = _request(service_tier="flex")
+
+    # The Greptile mixed-waterfall shape: one rung declines parallel tool
+    # calls, the other declines the tier; the disclosed drop serves it.
+    mixed = coerce_route_rejections((parallel, tier), 2, tiered)
+    assert mixed is not None
+    assert mixed.request.service_tier is None
+    assert mixed.disclosures == ("service_tier",)
+
+    # A unanimous rejection keeps the existing coercion path.
+    unanimous = coerce_route_rejections((tier, tier), 2, tiered)
+    assert unanimous is not None and unanimous.disclosures == ("service_tier",)
+
+    # Mixed rejections never degrade strict tools: some rung offered to
+    # preserve the guarantee, so the named rejection stays the answer.
+    strict_request = _request(
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}, strict=True),)
+    )
+    assert coerce_route_rejections((parallel, strict), 2, strict_request) is None

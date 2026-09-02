@@ -204,6 +204,42 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
     )
 
 
+def coerce_route_rejections(
+    errors: Sequence[ProviderParameterError | ProviderCapabilityError],
+    deployment_count: int,
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Pick the one disclosed coercion a set of per-rung rejections allows.
+
+    A unanimous capability rejection may coerce any coercible capability.
+    Mixed rejections may drop only the service tier: rungs declining for
+    different reasons mean some rung offered to preserve any given guarantee,
+    so degrading one (strict tools) would weaken semantics a rung could have
+    kept — but the tier is a routing hint whose only alternative is a
+    rejection the caller cannot act on, so the disclosed drop is offered
+    whenever any rung named it and the per-rung probe decides whether the
+    dropped request actually serves.
+
+    Args:
+        errors: One rejection per declined deployment, in route order.
+        deployment_count: Number of deployments the route offered.
+        request: Decoded request no rung could preserve.
+
+    Returns:
+        The disclosed substitution to retry with, or ``None`` when nothing
+        coercible applies.
+    """
+    capability = route_wide_capability(errors, deployment_count)
+    if capability is not None:
+        return coerce_capability(capability, request)
+    if any(
+        isinstance(error, ProviderCapabilityError) and error.capability == "service_tier"
+        for error in errors
+    ):
+        return coerce_capability("service_tier", request)
+    return None
+
+
 def route_wide_capability(
     errors: Sequence[ProviderParameterError | ProviderCapabilityError],
     deployment_count: int,
