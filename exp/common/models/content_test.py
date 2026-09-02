@@ -81,3 +81,15 @@ def test_non_http_url_is_rejected() -> None:
     """A non-http(s) URL is never forwarded to a provider."""
     with pytest.raises(ValueError, match="http"):
         ImageContentPart(url="file:///etc/passwd")
+
+
+def test_a_cache_marker_never_changes_the_serialized_image() -> None:
+    """A cost-only cache hint leaves replay identity untouched."""
+    plain = ImageContentPart(media_type="image/png", data=_PNG_BASE64)
+    marked = ImageContentPart(
+        media_type="image/png",
+        data=_PNG_BASE64,
+        cache_control={"type": "ephemeral"},
+    )
+    assert marked.cache_control == {"type": "ephemeral"}
+    assert plain.model_dump(mode="json") == marked.model_dump(mode="json")

@@ -60,10 +60,12 @@ class ImageContentPart(ContractModel):
     data: str | None = Field(default=None, max_length=MAXIMUM_IMAGE_BASE64_BYTES)
     url: str | None = Field(default=None, max_length=8_192)
     detail: Literal["auto", "low", "high"] | None = None
-    cache_control: JsonObject | None = None
+    cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Prompt-cache breakpoint the caller placed on this image, re-emitted
     verbatim on wires that cache a marked block natively and dropped
-    elsewhere: a cache hint changes cost, not semantics."""
+    elsewhere: a cache hint changes cost, not semantics. Like the other
+    cache carriers it joins neither serialization nor replay identity, so
+    two otherwise identical requests differing only here are one request."""
 
     @model_validator(mode="after")
     def _require_one_carrier(self) -> ImageContentPart:
