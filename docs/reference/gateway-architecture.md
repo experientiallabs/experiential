@@ -289,7 +289,11 @@ support at all drops (first-party clients pin effort globally, so a named reject
 sessions unusable against non-reasoning models the provider itself serves fine without the
 parameter; the Messages surface's verbatim `output_config.effort` is stripped with it so the
 dropped value reaches the provider through no channel), and `strict: true` tools degrade to
-best-effort schemas. On `maximize_cache` pools, a cache-marked request dispatches
+best-effort schemas. A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
+only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
+directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
+bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own
+`service_tier` stays a recorded Messages-surface rejection. On `maximize_cache` pools, a cache-marked request dispatches
 marker-honoring (Anthropic Messages) rungs before marker-dropping wires, stably within each
 group, so a shim rung can no longer silently bill every turn's full context uncached while the
 native rung stands ready; routes narrowing to only marker-dropping wires keep disclosing the

@@ -142,6 +142,7 @@ def dialect_stream_payload(
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
+            forwards_service_tier=profile.billing_customer_managed,
         )
     if profile.dialect == "anthropic_messages":
         return anthropic_messages_stream_payload(
@@ -206,6 +207,7 @@ def dialect_stream_payload(
             reasoning_effort=required_reasoning_effort,
             sampling_requires_reasoning_none=profile.sampling_requires_reasoning_none,
             fireworks_reasoning_route_sha256=profile.fireworks_reasoning_route_sha256,
+            forwards_service_tier=profile.billing_customer_managed,
         )
     raise ProviderCapabilityError(capability=f"wire_dialect:{profile.dialect}")
 
@@ -464,6 +466,21 @@ def route_generation_parameter_requests(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
         ignore("inference_geo")
+    # A provider tier forwards only where the caller pays that provider
+    # directly (BYOK) on a tier-preserving wire; a route with no such rung
+    # strips the tier up front with the same 'service_tier' disclosure the
+    # capability_policy drop path uses, so every rung serves and waterfalls
+    # stay deterministic. Host-funded rungs never emit it (they bill catalog
+    # rates while the tier changes provider pricing: flex discounted,
+    # priority premium) but stay in the route as untiered fallbacks; the
+    # dialect decline in dialect_stream_payload still guards mixed routes
+    # where an eligible rung keeps the tier alive.
+    if request.service_tier is not None and not any(
+        profile.dialect in SERVICE_TIER_DIALECTS and profile.billing_customer_managed
+        for profile in profiles
+    ):
+        ignore("service_tier")
+        provider_updates["service_tier"] = None
     if request.provider_beta_tokens and not all(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
@@ -781,6 +798,7 @@ def openai_responses_stream_payload(
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
     sampling_requires_reasoning_none: bool = False,
+    forwards_service_tier: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Responses JSON.
 
@@ -870,7 +888,9 @@ def openai_responses_stream_payload(
     top_p_supported = supports_temperature if supports_top_p is None else supports_top_p
     if request.top_p is not None and top_p_supported:
         payload["top_p"] = request.top_p
-    if request.service_tier is not None:
+    if request.service_tier is not None and forwards_service_tier:
+        # BYOK-only: the caller pays this provider directly, so their tier
+        # selection (and its pricing) is between them and the provider.
         payload["service_tier"] = request.service_tier
     # Native OpenAI Responses has no top-k request field. Never trust a
     # mistaken route declaration to send this extension to the API.
@@ -906,6 +926,7 @@ def openai_compatible_stream_payload(
     reasoning_effort: str | None = None,
     sampling_requires_reasoning_none: bool = False,
     fireworks_reasoning_route_sha256: str | None = None,
+    forwards_service_tier: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -974,7 +995,8 @@ def openai_compatible_stream_payload(
     del supports_logprobs
     if request.stop:
         payload["stop"] = list(request.stop)
-    if request.service_tier is not None:
+    if request.service_tier is not None and forwards_service_tier:
+        # BYOK-only, matching the native Responses lane.
         payload["service_tier"] = request.service_tier
     if supports_reasoning and effective_reasoning_effort is not None:
         if reasoning_wire_format == "reasoning":

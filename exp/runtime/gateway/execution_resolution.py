@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.model import BillingSource
 from exp.runtime.models import ResolvedModel
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.protocol import NativeWireClient
@@ -54,6 +55,7 @@ def _resolved_wire_profile(
         return replace(
             profile,
             model_id=profile.model_id or runtime_model.snapshot.model_id,
+            billing_customer_managed=(deployment.billing_source == BillingSource.CUSTOMER_MANAGED),
             minimum_temperature=(
                 max(profile.minimum_temperature, capabilities.minimum_temperature)
                 if capabilities.minimum_temperature is not None

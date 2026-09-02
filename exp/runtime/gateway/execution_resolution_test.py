@@ -195,3 +195,20 @@ def test_identity_check_rejects_a_drifted_provider() -> None:
             deployment,
             _resolved(_NativeClient(profile), capabilities),
         )
+
+
+def test_profile_resolution_binds_the_deployment_billing_source() -> None:
+    """The wire profile learns whether its rung dispatches BYOK credentials.
+
+    Tier forwarding (service_tier) keys on this flag: the caller pays the
+    provider directly only on customer-managed rungs.
+    """
+    base = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+    byok = _resolved_wire_profile(
+        _deployment(None), _resolved(_NativeClient(base), ModelCapabilities())
+    )
+    assert byok.billing_customer_managed is True
+
+    hosted = _deployment(None).model_copy(update={"billing_source": BillingSource.HOST_MANAGED})
+    house = _resolved_wire_profile(hosted, _resolved(_NativeClient(base), ModelCapabilities()))
+    assert house.billing_customer_managed is False

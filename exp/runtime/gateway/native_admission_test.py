@@ -353,9 +353,25 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
             self.recorded += count
 
     accounting = _CoercionCounter()
+    # The shim rung is BYOK (tier-eligible), so the tier survives route
+    # shaping and the mixed-rejection coercion path is what drops it; a
+    # house-funded shim would instead strip the tier during route shaping
+    # with the same disclosure and no coercion retry.
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://shim.test",
+                billing_customer_managed=True,
+            ),
+            client,
+        ),
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
+    )
     narrowed, _wires_out, public, provider = admitted_route_requests(
         route,
-        _wires(),
+        wires,
         request,
         accounting=cast(NativeAttemptAccounting, accounting),
         authorization=route.snapshot.authorization,

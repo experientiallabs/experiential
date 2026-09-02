@@ -107,6 +107,15 @@ class GatewayWireProfile:
     supports_temperature: bool = True
     """Whether the exact model accepts explicit sampling temperature."""
 
+    billing_customer_managed: bool = False
+    """Whether this rung dispatches on tenant-owned (BYOK) credentials.
+
+    Tier selectors (``service_tier``) forward only where the caller pays the
+    provider directly: on host-funded rungs a tier changes what the provider
+    charges while the gateway bills catalog rates, so the field never
+    reaches the provider there.
+    """
+
     minimum_temperature: float = 0.0
     """Smallest temperature value accepted by this provider wire."""
 

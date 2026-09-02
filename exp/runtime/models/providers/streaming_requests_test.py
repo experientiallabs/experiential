@@ -2993,20 +2993,32 @@ def test_wires_without_an_audio_carrier_narrow_past_the_rung() -> None:
         ("openai_responses", GatewayApiSurface.RESPONSES),
     ),
 )
-def test_service_tier_forwards_on_tier_preserving_dialects(
+def test_service_tier_forwards_on_byok_tier_preserving_dialects(
     dialect: str,
     surface: GatewayApiSurface,
 ) -> None:
-    """Both OpenAI wire dialects carry the caller's tier verbatim."""
-    profile = GatewayWireProfile(
+    """Both OpenAI wire dialects carry the caller's tier verbatim on BYOK rungs.
+
+    Adapted from the tier-preserving-dialect test: forwarding now also
+    requires tenant-owned (BYOK) credentials, because on host-funded rungs
+    the tier changes what the provider charges (flex discounted, priority
+    premium) while the gateway bills catalog rates.
+    """
+    byok = GatewayWireProfile(
         dialect=dialect,
         url="https://provider.test",
         model_id="model-x",
+        billing_customer_managed=True,
     )
-
-    payload = dialect_stream_payload(profile, _tiered_request(surface))
-
+    payload = dialect_stream_payload(byok, _tiered_request(surface))
     assert payload["service_tier"] == "flex"
+
+    # The same dialect on house-funded credentials serves WITHOUT the tier:
+    # a structural non-emission, never a decline, so the rung stays in the
+    # route as a fallback.
+    hosted = GatewayWireProfile(dialect=dialect, url="https://provider.test", model_id="model-x")
+    hosted_payload = dialect_stream_payload(hosted, _tiered_request(surface))
+    assert "service_tier" not in hosted_payload
 
 
 @pytest.mark.parametrize(
@@ -3029,3 +3041,40 @@ def test_service_tier_declines_dialects_without_a_wire_field(dialect: str) -> No
     # The same rungs serve as soon as the tier is gone.
     untiered = request.model_copy(update={"service_tier": None})
     assert dialect_stream_payload(profile, untiered)
+
+
+def test_service_tier_route_shaping_forwards_on_byok_and_discloses_elsewhere() -> None:
+    """A route with no BYOK OpenAI rung strips the tier with disclosure.
+
+    Route shaping keeps the certified waterfall intact: a mixed route with
+    one eligible rung keeps the tier (the eligible rung emits it, the
+    house-funded rung serves untiered), and a route with no eligible rung
+    drops the tier up front so every rung serves and the drop is disclosed
+    through the same 'service_tier' entry the coercion path uses.
+    """
+    request = _tiered_request(GatewayApiSurface.CHAT_COMPLETIONS)
+    byok = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://byok.test",
+        billing_customer_managed=True,
+    )
+    hosted = GatewayWireProfile(dialect="openai_compatible", url="https://house.test")
+    public, provider = route_generation_parameter_requests((byok, hosted), request)
+    assert "service_tier" not in public.ignored_parameters
+    assert provider.service_tier == "flex"
+
+    hosted_public, hosted_provider = route_generation_parameter_requests((hosted,), request)
+    assert "service_tier" in hosted_public.ignored_parameters
+    assert hosted_provider.service_tier is None
+
+    # A BYOK rung on a non-OpenAI wire cannot carry the OpenAI tier either.
+    anthropic_byok = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        billing_customer_managed=True,
+    )
+    foreign_public, foreign_provider = route_generation_parameter_requests(
+        (anthropic_byok,), request
+    )
+    assert "service_tier" in foreign_public.ignored_parameters
+    assert foreign_provider.service_tier is None
