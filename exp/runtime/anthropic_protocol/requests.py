@@ -804,7 +804,10 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             # carries no information and drops; a cache marker on the block
             # survives through the marked-run carrier.
             text_parts.append(block)
-            content_parts.append(TextContentPart(text=block.text))
+            # An empty text block cannot ride a multimodal turn: Anthropic
+            # rejects a standalone empty block, so it never becomes a part.
+            if block.text:
+                content_parts.append(TextContentPart(text=block.text))
         elif isinstance(block, _ImageBlock):
             if message.role != "user":
                 raise invalid_field(

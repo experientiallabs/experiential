@@ -139,7 +139,7 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
     Returns:
         The ordered Anthropic content blocks for the turn.
     """
-    marked = list(message.provider_text_blocks)
+    marked = [block for block in message.provider_text_blocks if block.get("text")]
     blocks: list[JsonObject] = []
     text_index = 0
     for part in message.content_parts:

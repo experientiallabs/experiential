@@ -13,6 +13,7 @@ from exp.runtime.gateway.contracts import (
     RedactedThinkingBlock,
     ThinkingBlock,
 )
+from exp.runtime.models.providers.wire_messages import anthropic_blocks
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 _PNG_BASE64 = (
@@ -316,6 +317,41 @@ def test_a_cache_marker_on_an_image_block_is_retained() -> None:
         )
     )
     assert decoded.request.messages[-1].images[0].cache_control == {"type": "ephemeral"}
+
+
+def test_an_empty_text_block_beside_an_image_never_re_emits() -> None:
+    """An attachment's empty text block never reaches the Anthropic wire."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ""},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _PNG_BASE64,
+                            },
+                        },
+                        {"type": "text", "text": "read it", "cache_control": {"type": "ephemeral"}},
+                    ],
+                }
+            ]
+        )
+    )
+    message = decoded.request.messages[-1]
+    assert [part.kind for part in message.content_parts] == ["image", "text"]
+    _role, blocks = anthropic_blocks(message)
+    assert blocks == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+        },
+        {"type": "text", "text": "read it", "cache_control": {"type": "ephemeral"}},
+    ]
 
 
 def test_malformed_image_source_is_rejected() -> None:
