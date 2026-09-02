@@ -205,6 +205,18 @@ impl UpstreamRelay {
         self.first_token_at
     }
 
+    /// Route an abnormal stream termination through the normalizer's recovery.
+    /// The relay is done either way, so mark EOF; when recovery applies (a
+    /// Gemini stream that emitted content) the synthesized terminal is buffered
+    /// for the caller to drain, otherwise the (possibly reclassified) failure
+    /// propagates. See `Normalizer::recover_abnormal_end`.
+    fn recover_or_fail(&mut self, failure: Failure) -> Result<(), Failure> {
+        self.eof = true;
+        let events = self.normalizer.recover_abnormal_end(failure)?;
+        self.pending.extend(events);
+        Ok(())
+    }
+
     /// Yield the next normalized event. `Ok(None)` means the upstream closed
     /// without a terminal event (the caller synthesizes that failure); a
     /// stream whose terminal was already yielded returns `Ok(None)` too, but
@@ -242,24 +254,45 @@ impl UpstreamRelay {
             let chunk = match tokio::time::timeout(bound, self.stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(Some(Err(_))) => {
-                    return Err(Failure::new(
-                        FailureClass::Transport,
-                        "provider transport failed; retry the request",
-                    )
-                    .with_retry(true, true))
+                    // A transport break mid-stream: recover a Gemini partial as
+                    // Incomplete, otherwise surface the retryable transport
+                    // failure. Pre-content it stays a retryable transport error
+                    // either way.
+                    self.recover_or_fail(
+                        Failure::new(
+                            FailureClass::Transport,
+                            "provider transport failed; retry the request",
+                        )
+                        .with_retry(true, true),
+                    )?;
+                    continue;
                 }
                 Ok(None) => {
                     self.eof = true;
                     // Recover a final unterminated SSE frame at EOF, exactly
                     // like the python decoder, so a provider that omits the
                     // closing blank line still settles by its terminal event.
-                    let tail = self.decoder.finish().map_err(|message| {
-                        Failure::new(FailureClass::MalformedResponse, &message)
-                            .with_retry(false, true)
-                    })?;
+                    // A malformed trailing frame, or a normalizer that rejects
+                    // it, is an abnormal end: recover a Gemini partial as
+                    // Incomplete instead of discarding the answer.
+                    let tail = match self.decoder.finish() {
+                        Ok(tail) => tail,
+                        Err(message) => {
+                            self.recover_or_fail(
+                                Failure::new(FailureClass::MalformedResponse, &message)
+                                    .with_retry(false, true),
+                            )?;
+                            continue;
+                        }
+                    };
                     if let Some(frame) = tail {
-                        let events = self.normalizer.feed(&frame)?;
-                        self.pending.extend(events);
+                        match self.normalizer.feed(&frame) {
+                            Ok(events) => self.pending.extend(events),
+                            Err(failure) => {
+                                self.recover_or_fail(failure)?;
+                                continue;
+                            }
+                        }
                     }
                     // A Gemini stream may end cleanly after its last content
                     // frame without a finishReason frame; synthesize the
@@ -288,12 +321,28 @@ impl UpstreamRelay {
                     .record(request_started.elapsed());
                 self.first_byte_recorded = true;
             }
-            let frames = self.decoder.feed(&chunk).map_err(|message| {
-                Failure::new(FailureClass::MalformedResponse, &message).with_retry(false, true)
-            })?;
+            // A malformed frame, or a normalizer that rejects one, is an
+            // abnormal end: recover a Gemini partial as Incomplete, otherwise
+            // surface the failure. Recovery buffers a terminal and marks EOF,
+            // so stop draining this chunk and let the outer loop yield it.
+            let frames = match self.decoder.feed(&chunk) {
+                Ok(frames) => frames,
+                Err(message) => {
+                    self.recover_or_fail(
+                        Failure::new(FailureClass::MalformedResponse, &message)
+                            .with_retry(false, true),
+                    )?;
+                    continue;
+                }
+            };
             for frame in frames {
-                let events = self.normalizer.feed(&frame)?;
-                self.pending.extend(events);
+                match self.normalizer.feed(&frame) {
+                    Ok(events) => self.pending.extend(events),
+                    Err(failure) => {
+                        self.recover_or_fail(failure)?;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -395,6 +444,61 @@ mod tests {
         // A stalled lane is skipped, not redialed: redialing it would only
         // stall again for another window.
         assert!(!failure.retryable_same_deployment);
+    }
+
+    #[tokio::test]
+    async fn a_gemini_partial_then_abnormal_frame_ends_incomplete_not_failed() {
+        // A Gemini content frame, its usage, then a structurally malformed frame
+        // (a non-string text part). The relay must route the abnormal end
+        // through recovery: yield the content, fold the usage, and end on an
+        // Incomplete terminal instead of surfacing the malformed failure.
+        let frames = vec![
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+            )),
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"usageMetadata\":{\"promptTokenCount\":9,\"candidatesTokenCount\":3}}\n\n",
+            )),
+            Ok::<_, reqwest::Error>(Bytes::from(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":5}]}}]}\n\n",
+            )),
+        ];
+        let mut relay = UpstreamRelay::from_stream(
+            stream::iter(frames).boxed(),
+            Dialect::GeminiGenerateContent,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let per_chunk = Duration::from_secs(5);
+        let mut seen: Vec<Event> = Vec::new();
+        loop {
+            let event = relay
+                .next_event(deadline, per_chunk, Instant::now())
+                .await
+                .expect("recovery yields events, never the malformed failure");
+            match event {
+                Some(event) => {
+                    let terminal = event.is_terminal();
+                    seen.push(event);
+                    if terminal {
+                        break;
+                    }
+                }
+                None => panic!("the recovered terminal must arrive before EOF"),
+            }
+        }
+        assert!(
+            matches!(seen.first(), Some(Event::TextDelta(text)) if text == "partial"),
+            "the partial content is delivered"
+        );
+        assert!(
+            seen.iter().any(|event| matches!(event, Event::Usage(_))),
+            "last-seen usage is folded so delivered tokens bill"
+        );
+        assert!(
+            matches!(seen.last(), Some(Event::Incomplete)),
+            "the turn ends incomplete, not failed"
+        );
     }
 
     #[tokio::test]

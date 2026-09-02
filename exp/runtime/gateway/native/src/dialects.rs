@@ -355,6 +355,44 @@ impl Normalizer {
         events
     }
 
+    /// Recover a Gemini stream that emitted content and then terminated
+    /// *abnormally* — a broken transport read, a malformed frame, or a decoder
+    /// error — rather than closing cleanly. `on_stream_end` covers the clean
+    /// end (last content frame, then EOF, no terminal frame); this covers the
+    /// abnormal end, where the underlying failure would otherwise discard a
+    /// real partial answer.
+    ///
+    /// Scoped to Gemini: Gemini uniquely ends legitimate turns without a
+    /// terminal frame, so a break after content is far more likely a
+    /// truncated-but-usable answer than corruption. When content was already
+    /// emitted, synthesize an `Incomplete` terminal (folding last-seen usage)
+    /// so the caller receives the partial content with an early-termination
+    /// finish reason and a retryable settlement (`incomplete`, not `failed`),
+    /// and the delivered tokens still bill. Before any content there is nothing
+    /// to preserve, so reclassify the abnormal end as a retryable transport
+    /// failure (retry same deployment, then fail over) instead of a hard
+    /// malformed reject. Any non-Gemini dialect, or a stream already terminated,
+    /// keeps the original failure unchanged.
+    pub fn recover_abnormal_end(&mut self, failure: Failure) -> Result<Vec<Event>, Failure> {
+        if self.terminal || self.dialect != Dialect::GeminiGenerateContent {
+            return Err(failure);
+        }
+        if !self.emitted_output {
+            return Err(Failure::new(
+                FailureClass::Transport,
+                "provider transport failed; retry the request",
+            )
+            .with_retry(true, true));
+        }
+        let mut events = Vec::new();
+        if let Some(usage) = self.usage.take() {
+            events.push(Event::Usage(usage));
+        }
+        events.push(Event::Incomplete);
+        self.terminal = true;
+        Ok(events)
+    }
+
     /// Feed one decoded SSE frame; a terminal event ends the stream.
     pub fn feed(&mut self, frame: &SseEvent) -> Result<Vec<Event>, Failure> {
         if self.terminal {
@@ -389,12 +427,14 @@ pub fn drain_stream_fixture(dialect: Dialect, chunks: &[Vec<u8>]) -> (Vec<Value>
     for chunk in chunks {
         let frames = match decoder.feed(chunk) {
             Ok(frames) => frames,
-            Err(message) => return (simplified, Some(malformed(&message))),
+            Err(message) => {
+                return recover_or_report(&mut normalizer, simplified, malformed(&message))
+            }
         };
         for frame in frames {
             match normalizer.feed(&frame) {
                 Ok(events) => simplified.extend(events.iter().map(simplified_event)),
-                Err(failure) => return (simplified, Some(failure)),
+                Err(failure) => return recover_or_report(&mut normalizer, simplified, failure),
             }
             if normalizer.saw_terminal() {
                 return (simplified, None);
@@ -404,10 +444,10 @@ pub fn drain_stream_fixture(dialect: Dialect, chunks: &[Vec<u8>]) -> (Vec<Value>
     match decoder.finish() {
         Ok(Some(frame)) => match normalizer.feed(&frame) {
             Ok(events) => simplified.extend(events.iter().map(simplified_event)),
-            Err(failure) => return (simplified, Some(failure)),
+            Err(failure) => return recover_or_report(&mut normalizer, simplified, failure),
         },
         Ok(None) => {}
-        Err(message) => return (simplified, Some(malformed(&message))),
+        Err(message) => return recover_or_report(&mut normalizer, simplified, malformed(&message)),
     }
     if normalizer.saw_terminal() {
         return (simplified, None);
@@ -422,5 +462,107 @@ pub fn drain_stream_fixture(dialect: Dialect, chunks: &[Vec<u8>]) -> (Vec<Value>
     match normalizer.stream_ended() {
         Ok(()) => (simplified, None),
         Err(failure) => (simplified, Some(failure)),
+    }
+}
+
+/// Mirror the relay's abnormal-end handling for the fixture drive loop: route a
+/// terminating failure through `recover_abnormal_end`, appending any recovered
+/// terminal to the collected events, and report the (possibly reclassified)
+/// failure when recovery does not apply. Keeps the fixture drain a faithful
+/// mirror of `UpstreamRelay::next_event`.
+fn recover_or_report(
+    normalizer: &mut Normalizer,
+    mut simplified: Vec<Value>,
+    failure: Failure,
+) -> (Vec<Value>, Option<Failure>) {
+    match normalizer.recover_abnormal_end(failure) {
+        Ok(events) => {
+            simplified.extend(events.iter().map(simplified_event));
+            (simplified, None)
+        }
+        Err(failure) => (simplified, Some(failure)),
+    }
+}
+
+#[cfg(test)]
+mod recover_abnormal_end_tests {
+    use super::*;
+
+    fn feed_text(normalizer: &mut Normalizer, text: &str) {
+        let frame = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "candidates": [{"content": {"parts": [{"text": text}]}}]
+            })
+            .to_string(),
+        };
+        let events = normalizer.feed(&frame).expect("content frame normalizes");
+        assert!(events.iter().any(Event::is_output_token));
+    }
+
+    fn incoming() -> Failure {
+        Failure::new(FailureClass::MalformedResponse, "boom").with_retry(false, true)
+    }
+
+    #[test]
+    fn gemini_after_content_recovers_incomplete_and_folds_usage() {
+        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+        feed_text(&mut normalizer, "hi");
+        normalizer.usage = Some(Usage {
+            input_tokens: Some(5),
+            output_tokens: Some(2),
+            ..Usage::default()
+        });
+        let recovered = normalizer
+            .recover_abnormal_end(incoming())
+            .expect("a partial answer recovers instead of failing");
+        assert!(matches!(recovered.first(), Some(Event::Usage(_))));
+        assert!(matches!(recovered.last(), Some(Event::Incomplete)));
+        assert!(normalizer.saw_terminal());
+    }
+
+    #[test]
+    fn gemini_before_content_reclassifies_to_retryable_transport() {
+        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+        let failure = normalizer
+            .recover_abnormal_end(incoming())
+            .expect_err("nothing to salvage before content");
+        assert_eq!(failure.failure_class, FailureClass::Transport);
+        assert!(failure.retryable_same_deployment);
+        assert!(failure.failover_eligible);
+        assert!(!normalizer.saw_terminal());
+    }
+
+    #[test]
+    fn non_gemini_keeps_the_original_failure_even_after_content() {
+        // Recovery is scoped to Gemini; an OpenAI-compatible stream that emitted
+        // content and then broke keeps its original malformed classification.
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        let frame = SseEvent {
+            event: None,
+            data: serde_json::json!({"choices": [{"delta": {"content": "hi"}}]}).to_string(),
+        };
+        normalizer.feed(&frame).expect("content normalizes");
+        let failure = normalizer
+            .recover_abnormal_end(incoming())
+            .expect_err("non-gemini keeps the original failure");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        assert!(!normalizer.saw_terminal());
+    }
+
+    #[test]
+    fn an_already_terminal_stream_keeps_the_original_failure() {
+        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+        feed_text(&mut normalizer, "hi");
+        let terminal = SseEvent {
+            event: None,
+            data: serde_json::json!({"candidates": [{"finishReason": "STOP"}]}).to_string(),
+        };
+        normalizer.feed(&terminal).expect("terminal normalizes");
+        assert!(normalizer.saw_terminal());
+        let failure = normalizer
+            .recover_abnormal_end(incoming())
+            .expect_err("a terminated stream does not re-recover");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
     }
 }

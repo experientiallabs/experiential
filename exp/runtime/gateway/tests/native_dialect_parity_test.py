@@ -247,6 +247,46 @@ def test_native_gemini_normalizer_fails_streams_that_produced_no_content() -> No
     assert failure["failure_class"] == "malformed_response"
 
 
+def test_native_gemini_normalizer_recovers_a_partial_before_an_abnormal_frame() -> None:
+    """Content, then a structurally malformed frame: the partial answer is kept
+    and the turn ends `incomplete` (an early-termination finish reason) with the
+    last-seen usage folded, never discarded as malformed. Gemini uniquely ends
+    legitimate turns abnormally, so a break after content is a truncated answer,
+    not corruption."""
+    chunks = (
+        _sse({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]}),
+        _sse({"usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 3}}),
+        # A non-string text part after content: malformed mid-stream frame.
+        _sse({"candidates": [{"content": {"parts": [{"text": 5}]}}]}),
+    )
+    result = _native_normalized("gemini_generate_content", chunks)
+    assert result["failure"] is None
+    assert result["events"] == [
+        {"kind": "text_delta", "text": "partial"},
+        {
+            "kind": "usage",
+            "input_tokens": 9,
+            "output_tokens": 3,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": None,
+        },
+        {"kind": "incomplete"},
+    ]
+
+
+def test_native_gemini_normalizer_reclassifies_a_pre_content_abnormal_frame() -> None:
+    """A malformed frame before any content is a Gemini abnormal end with
+    nothing to salvage: it is reclassified from a hard malformed reject to a
+    retryable transport failure (retry the lane, then fail over), and no content
+    is emitted."""
+    chunk = _sse({"candidates": [{"content": {"parts": [{"text": 5}]}}]})
+    result = _native_normalized("gemini_generate_content", (chunk,))
+    assert result["events"] == []
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "transport"
+
+
 def _eventstream_message(name: str, payload: JsonObject, *, exception: bool = False) -> bytes:
     """Encode one AWS event-stream message the way Bedrock frames its stream.
 
