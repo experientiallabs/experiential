@@ -18,6 +18,7 @@ from exp.common.core.artifacts import ContractModel
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.common.models.content import MEDIA_HANDLE_PROVIDERS
 from exp.common.models.model import ReasoningEffort
+from exp.runtime.models.providers.audios import AUDIO_DIALECTS
 from exp.runtime.models.providers.documents import PDF_URL_DIALECTS
 from exp.runtime.models.providers.images import IMAGE_URL_DIALECTS
 from exp.runtime.models.providers.reasoning_compat import (
@@ -59,6 +60,10 @@ class DeploymentCapabilityParity(ContractModel):
     forwards_video_urls: bool
     """Whether this rung's provider fetches a caller video URL itself; only
     the Gemini and OpenAI-compatible video wires do."""
+    supports_audio_input: bool
+    """Whether this rung carries caller audio parts: declared by the catalog
+    and defined by the wire, since only the OpenAI-compatible Chat and Gemini
+    wires carry a clip a model serves."""
     supports_pdf_input: bool
     """Whether the catalog declares caller PDF document parts servable on this rung."""
     forwards_pdf_urls: bool
@@ -150,6 +155,7 @@ def deployment_capability_parity(
             and capabilities.supports_video_url_input
             and dialect in VIDEO_URL_DIALECTS
         ),
+        supports_audio_input=(capabilities.supports_audio_input and dialect in AUDIO_DIALECTS),
         supports_pdf_input=capabilities.supports_pdf_input,
         forwards_pdf_urls=(
             capabilities.supports_pdf_input

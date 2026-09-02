@@ -57,6 +57,7 @@ from exp.runtime.gateway.platform import (
     UsageTerminalCount,
     VirtualKeyRecord,
 )
+from exp.runtime.gateway.snapshot_integrity import refuse_self_inconsistent_snapshot
 from exp.runtime.gateway.sqlite.migrations import connect_database
 from exp.runtime.gateway.sqlite.platform_records import (
     alias_record as _alias_record,
@@ -832,11 +833,7 @@ class SQLiteGatewayPlatform:
                 snapshot_ref = ? OR catalog_sha256 = ?
             )
             """,
-            (
-                command.organization_id,
-                command.snapshot_ref,
-                command.catalog_sha256,
-            ),
+            (command.organization_id, command.snapshot_ref, command.catalog_sha256),
         )
         if rows:
             if len(rows) != 1 or (
@@ -845,6 +842,10 @@ class SQLiteGatewayPlatform:
             ) != (command.snapshot_ref, command.catalog_sha256):
                 raise ValueError("catalog snapshot reference conflicts with existing authority")
             return
+        # Never pin a self-inconsistent snapshot (the persistent hydration bug).
+        refuse_self_inconsistent_snapshot(
+            self.database_path.parent, command.snapshot_ref, command.catalog_sha256
+        )
         try:
             self.control.register_catalog_snapshot(
                 organization_id=command.organization_id,
@@ -857,11 +858,7 @@ class SQLiteGatewayPlatform:
                 SELECT snapshot_ref, catalog_sha256 FROM catalog_snapshot_refs
                 WHERE organization_id = ? AND snapshot_ref = ? AND catalog_sha256 = ?
                 """,
-                (
-                    command.organization_id,
-                    command.snapshot_ref,
-                    command.catalog_sha256,
-                ),
+                (command.organization_id, command.snapshot_ref, command.catalog_sha256),
             )
             if len(concurrent) != 1:
                 raise

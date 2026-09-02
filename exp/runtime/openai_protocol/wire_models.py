@@ -14,6 +14,7 @@ from pydantic.types import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
+    MAXIMUM_AUDIO_BASE64_BYTES,
     MAXIMUM_DOCUMENT_BASE64_BYTES,
     MAXIMUM_DOCUMENT_NAME_CHARACTERS,
     MAXIMUM_IMAGE_BASE64_BYTES,
@@ -117,6 +118,29 @@ class _ChatVideoPart(_WireModel):
     video_url: _ChatVideoUrl
 
 
+class _ChatInputAudio(_WireModel):
+    """Chat Completions ``input_audio`` payload: base64 bytes plus a format name.
+
+    The format is validated as free text here so the decoder can name the
+    exact field when a value outside ``wav``/``mp3`` is refused.
+    """
+
+    data: str = Field(min_length=1, max_length=MAXIMUM_AUDIO_BASE64_BYTES)
+    format: str = Field(min_length=1, max_length=16)
+
+
+class _ChatAudioPart(_WireModel):
+    """One Chat Completions ``input_audio`` content part.
+
+    The Responses surface's official request schema defines no audio part on
+    an input message and the live Responses API refuses audio input, so the
+    part is decoded on the Chat surface only.
+    """
+
+    type: Literal["input_audio"]
+    input_audio: _ChatInputAudio
+
+
 _MAXIMUM_FILE_DATA_CHARACTERS = MAXIMUM_DOCUMENT_BASE64_BYTES + 128
 """Room for the largest inline document plus its ``data:`` URL preamble."""
 
@@ -179,6 +203,7 @@ _ContentPart = Annotated[
     | _ChatImagePart
     | _ResponsesImagePart
     | _ChatVideoPart
+    | _ChatAudioPart
     | _ChatFilePart
     | _ResponsesFilePart,
     Field(discriminator="type"),
@@ -257,7 +282,7 @@ class _Message(_WireModel):
         if self.role != "user" and any(
             not isinstance(part, _TextPart) for part in self.image_capable_parts
         ):
-            raise ValueError("image and video parts are valid only for user messages")
+            raise ValueError("image, video, and audio parts are valid only for user messages")
         call_ids = tuple(call.id for call in self.history_tool_calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("assistant tool call IDs must be unique")

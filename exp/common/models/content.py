@@ -1,11 +1,11 @@
 """Multimodal message content parts shared by the gateway and model clients.
 
 A caller message is canonically one flattened text string. When the caller
-also sends images, videos, or documents, the ordered parts that produced that
-string are retained here so every provider wire can re-emit the caller's exact
-interleaving. The text parts always flatten to the message's canonical
-content, so a text-only route sees exactly what it saw before attachments
-existed.
+also sends images, videos, audio, or documents, the ordered parts that
+produced that string are retained here so every provider wire can re-emit
+the caller's exact interleaving. The text parts always flatten to the
+message's canonical content, so a text-only route sees exactly what it saw
+before attachments existed.
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+from collections import Counter
+from collections.abc import Iterable
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
@@ -77,6 +79,42 @@ MAXIMUM_VIDEOS_PER_REQUEST = 10
 Gemini accepts at most ten videos per request; Bedrock Nova accepts one, and
 that narrower model limit surfaces as a provider error rather than a gateway
 ceiling."""
+
+AudioMediaType = Literal["audio/wav", "audio/mpeg"]
+
+AudioFormat = Literal["wav", "mp3"]
+
+AUDIO_FORMATS: dict[str, AudioFormat] = {"wav": "wav", "mp3": "mp3"}
+"""Caller ``input_audio.format`` values the Chat Completions wire defines.
+
+The OpenAI Chat Completions ``input_audio`` part accepts exactly ``wav`` and
+``mp3`` (the live API rejects every other value by name), and it is the only
+public surface of this gateway that carries audio, so the canonical audio
+contract is exactly as wide as that wire."""
+
+AUDIO_MEDIA_TYPES: dict[AudioFormat, AudioMediaType] = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+}
+"""Canonical MIME type of each accepted audio format.
+
+Gemini ``inline_data`` accepts ``audio/wav`` and ``audio/mpeg`` (as well as
+``audio/mp3``); the standard registered type is recorded."""
+
+MAXIMUM_AUDIO_BASE64_BYTES = 20 * 1024 * 1024
+"""Largest encoded audio payload one request may carry, summed over its clips.
+
+Gemini caps an inline ``generateContent`` request at 20 MB in total, the
+narrowest documented ceiling across the audio-capable wires; OpenAI publishes
+no separate per-part audio limit. The same bound applies to every single clip
+and to the request-wide sum. Audio has no URL carrier on any public surface,
+so a larger clip cannot be sent."""
+
+MAXIMUM_AUDIOS_PER_REQUEST = 10
+"""Largest number of audio clips one request may carry across all its messages.
+
+Neither audio wire documents a per-request clip count; this gateway ceiling
+bounds the admitted payload so the per-part ceiling stays meaningful."""
 
 DocumentMediaType = Literal["application/pdf"]
 
@@ -370,6 +408,42 @@ class VideoContentPart(ContractModel):
         return f"data:{self.media_type};base64,{self.data}"
 
 
+class AudioContentPart(ContractModel):
+    """One caller-supplied audio clip carried as inline base64 bytes.
+
+    Audio has exactly one carrier: the Chat Completions ``input_audio`` part
+    holds base64 bytes plus a format name and defines no URL form, so unlike
+    images and videos there is no remote carrier to admit. The media type is
+    always present because every audio wire requires the format alongside
+    the bytes. No wire caches an audio block, so the part carries no cache
+    marker.
+    """
+
+    kind: Literal["audio"] = "audio"
+    media_type: AudioMediaType
+    data: str = Field(min_length=1, max_length=MAXIMUM_AUDIO_BASE64_BYTES)
+
+    @model_validator(mode="after")
+    def _require_base64(self) -> AudioContentPart:
+        """Require strict standard base64 audio bytes.
+
+        Returns:
+            The validated audio part.
+
+        Raises:
+            ValueError: The inline payload is not base64.
+        """
+        try:
+            base64.b64decode(self.data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("inline audio data must be base64") from exc
+        return self
+
+    def audio_format(self) -> AudioFormat:
+        """Return the OpenAI-style ``format`` name of this clip."""
+        return "wav" if self.media_type == "audio/wav" else "mp3"
+
+
 class DocumentContentPart(ContractModel):
     """One caller-supplied PDF document, either inline bytes or a remote URL.
 
@@ -422,9 +496,32 @@ class DocumentContentPart(ContractModel):
 
 
 MessageContentPart = Annotated[
-    TextContentPart | ImageContentPart | VideoContentPart | DocumentContentPart,
+    TextContentPart | ImageContentPart | VideoContentPart | AudioContentPart | DocumentContentPart,
     Field(discriminator="kind"),
 ]
+
+
+def audio_part_from_input_audio(data: str, audio_format: str) -> AudioContentPart:
+    """Build one audio part from a Chat Completions ``input_audio`` payload.
+
+    Args:
+        data: Caller base64 of the audio bytes.
+        audio_format: Caller ``format`` name of the encoded audio.
+
+    Returns:
+        The canonical audio part for that payload.
+
+    Raises:
+        ValueError: The format is not one this gateway forwards, the data is
+            not base64, or it exceeds the inline ceiling.
+    """
+    known_format = AUDIO_FORMATS.get(audio_format.lower())
+    if known_format is None:
+        raise ValueError(f"unsupported audio format {audio_format!r}")
+    data = data.strip()
+    if len(data) > MAXIMUM_AUDIO_BASE64_BYTES:
+        raise ValueError("inline audio exceeds the maximum encoded size")
+    return AudioContentPart(media_type=AUDIO_MEDIA_TYPES[known_format], data=data)
 
 
 def image_part_from_url(
@@ -564,3 +661,34 @@ def document_part_from_file_data(
     if len(data) > MAXIMUM_DOCUMENT_BASE64_BYTES:
         raise ValueError("inline document exceeds the maximum encoded size")
     return DocumentContentPart(data=data, name=name or None)
+
+
+AttachmentKind = Literal["image", "video", "audio", "document"]
+
+ATTACHMENT_CEILINGS: tuple[tuple[AttachmentKind, int, str], ...] = (
+    ("image", MAXIMUM_IMAGES_PER_REQUEST, "images"),
+    ("video", MAXIMUM_VIDEOS_PER_REQUEST, "videos"),
+    ("audio", MAXIMUM_AUDIOS_PER_REQUEST, "audio clips"),
+    ("document", MAXIMUM_DOCUMENTS_PER_REQUEST, "documents"),
+)
+"""Per-request count ceiling of every attachment kind: ``(kind, ceiling, noun)``."""
+
+
+def require_attachment_ceilings(parts: Iterable[MessageContentPart]) -> None:
+    """Reject a request carrying more attachments of one kind than its ceiling.
+
+    Args:
+        parts: Every content part of the request, across all its messages.
+
+    Raises:
+        ValueError: One attachment kind exceeds its per-request ceiling, or the
+            request's audio clips together exceed the encoded audio budget.
+    """
+    parts = tuple(parts)
+    counts = Counter(part.kind for part in parts)
+    for kind, ceiling, noun in ATTACHMENT_CEILINGS:
+        if counts[kind] > ceiling:
+            raise ValueError(f"a request carries at most {ceiling} {noun}")
+    audio_bytes = sum(len(part.data) for part in parts if part.kind == "audio")
+    if audio_bytes > MAXIMUM_AUDIO_BASE64_BYTES:
+        raise ValueError("a request's audio clips together exceed the maximum encoded size")

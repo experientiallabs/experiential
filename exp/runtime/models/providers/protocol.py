@@ -250,6 +250,7 @@ def preflight_gateway_request(
             capabilities.supports_video_url_input,
             "video_url_input",
         ),
+        (bool(request.audios), capabilities.supports_audio_input, "audio_input"),
         (bool(request.documents), capabilities.supports_pdf_input, "pdf_input"),
         (
             any(document.url is not None for document in request.documents),

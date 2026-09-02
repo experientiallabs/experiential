@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
     GatewayToolDefinition,
+    StructuredTextFormat,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import (
     coerce_capability,
     coerce_generation_parameters,
+    coerce_structured_text_schema,
 )
 from exp.runtime.models.providers.reasoning_compat import efforts_by_nearness
 
@@ -124,6 +127,41 @@ def test_any_effort_drops_on_a_route_with_no_reasoning_at_all() -> None:
     coercion = coerce_generation_parameters((anthropic,), effort_only)
     assert coercion is not None
     assert coercion.request.provider_output_config is None
+
+
+def test_effort_drop_takes_adaptive_thinking_with_it_but_keeps_a_budget() -> None:
+    """Adaptive thinking is the effort's own channel; a budget is not.
+
+    Claude Code pins ``thinking: {type: adaptive}`` alongside effortLevel, and
+    a route with no reasoning rung rejects the adaptive object by name after
+    dispatch, so it drops with the effort and is disclosed as ``thinking``.
+    A budgeted config carries semantics of its own and travels verbatim.
+    """
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    adaptive = _request(reasoning_effort="high").model_copy(
+        update={
+            "surface": GatewayApiSurface.MESSAGES,
+            "provider_output_config": {"effort": "high"},
+            "provider_thinking_config": {"type": "adaptive"},
+        }
+    )
+    coercion = coerce_generation_parameters((anthropic,), adaptive)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort is None
+    assert coercion.request.provider_output_config is None
+    assert coercion.request.provider_thinking_config is None
+    assert coercion.disclosures == ("reasoning_effort", "thinking")
+
+    budgeted = adaptive.model_copy(
+        update={"provider_thinking_config": {"type": "enabled", "budget_tokens": 2048}}
+    )
+    coercion = coerce_generation_parameters((anthropic,), budgeted)
+    assert coercion is not None
+    assert coercion.request.provider_thinking_config == {
+        "type": "enabled",
+        "budget_tokens": 2048,
+    }
+    assert coercion.disclosures == ("reasoning_effort",)
 
 
 def test_portable_effort_is_never_snapped() -> None:
@@ -260,3 +298,64 @@ def test_effort_none_drop_honors_the_admission_probe() -> None:
         )
         is None
     )
+
+
+def test_open_structured_output_schema_closes_for_an_anthropic_rung() -> None:
+    """Every object gains additionalProperties false, once, with disclosure.
+
+    The Anthropic Messages validator rejects open objects that the
+    OpenAI-family validators accept, so a caller who tested against one
+    provider otherwise takes a post-dispatch 400 from the other.
+    """
+    schema: JsonObject = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "address": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "tags": {"type": "array", "items": {"properties": {"label": {"type": "string"}}}},
+            "either": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+        },
+        "$defs": {"leaf": {"type": "object", "additionalProperties": True}},
+    }
+    request = _request(structured_text=StructuredTextFormat(name="answer", json_schema=schema))
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    openai = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+
+    coercion = coerce_structured_text_schema((openai, anthropic), request)
+    assert coercion is not None
+    assert coercion.disclosures == ("json_schema.additionalProperties->false",)
+    assert coercion.request.structured_text is not None
+    closed = coercion.request.structured_text.json_schema
+    assert closed["additionalProperties"] is False
+    properties = closed["properties"]
+    assert isinstance(properties, dict)
+    address = properties["address"]
+    assert isinstance(address, dict)
+    assert address["additionalProperties"] is False
+    tags = properties["tags"]
+    assert isinstance(tags, dict)
+    items = tags["items"]
+    assert isinstance(items, dict)
+    assert items["additionalProperties"] is False
+    assert "additionalProperties" not in tags
+    either = properties["either"]
+    assert isinstance(either, dict)
+    assert either["anyOf"] == [{"type": "object", "additionalProperties": False}, {"type": "null"}]
+    assert closed["$defs"] == {"leaf": {"type": "object", "additionalProperties": False}}
+    assert properties["name"] == {"type": "string"}
+    # The caller's own schema object is never mutated in place.
+    assert "additionalProperties" not in schema
+
+    # A route with no Anthropic rung dispatches the schema verbatim.
+    assert coerce_structured_text_schema((openai,), request) is None
+    # An already-closed schema needs no coercion and discloses nothing.
+    closed_request = _request(
+        structured_text=StructuredTextFormat(name="answer", json_schema=closed)
+    )
+    assert coerce_structured_text_schema((anthropic,), closed_request) is None
+    # No structured output, nothing to close.
+    assert coerce_structured_text_schema((anthropic,), _request()) is None

@@ -274,8 +274,9 @@ def decode_responses(
         # 2026-08-29). The strict wire model owns those contracts, so the
         # official probe sees a normalized item.
         adapted: list[JsonValue] = []
-        for original in cast("list[JsonValue]", raw):
-            entry = _official_image_details(original) if isinstance(original, dict) else original
+        for index, entry in enumerate(cast("list[JsonValue]", raw)):
+            if isinstance(entry, dict):
+                entry = _official_image_details(entry, f"input.{index}")
             if isinstance(entry, dict) and entry.get("type") == "message":
                 item = {key: value for key, value in entry.items() if key != "phase"}
                 if item.get("id") is not None and "status" not in item:
@@ -400,20 +401,25 @@ def decode_responses(
     )
 
 
-def _official_image_details(entry: JsonObject) -> JsonObject:
+def _official_image_details(entry: JsonObject, param: str) -> JsonObject:
     """Default the detail level of every ``input_image`` part of one item.
 
     The Responses surface treats ``input_image.detail`` as optional and
     resolves an omitted level to ``auto``, while the installed SDK marks the
     field required. Only the official probe sees the resolved default: the
     strict wire model owns the real contract and keeps an unstated level
-    unstated on the provider wire.
+    unstated on the provider wire. An ``input_audio`` part is refused by name.
     """
     content = entry.get("content")
     if not isinstance(content, list):
         return entry
     parts: list[JsonValue] = []
-    for part in cast("list[JsonValue]", content):
+    for index, part in enumerate(cast("list[JsonValue]", content)):
+        if isinstance(part, dict) and part.get("type") == "input_audio":
+            raise unsupported_field(
+                f"{param}.content.{index}.input_audio",
+                message="Audio input is not available on Responses; use Chat Completions.",
+            )
         if isinstance(part, dict) and part.get("type") == "input_image" and "detail" not in part:
             parts.append({**part, "detail": "auto"})
         else:

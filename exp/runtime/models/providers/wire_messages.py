@@ -14,6 +14,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.models.providers.audios import openai_chat_audio_part, reject_audio_part
 from exp.runtime.models.providers.documents import (
     anthropic_document_block,
     openai_chat_document_part,
@@ -50,6 +51,8 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
                         if part.kind == "image"
                         else reject_video_part(part)
                         if part.kind == "video"
+                        else reject_audio_part(part)
+                        if part.kind == "audio"
                         else responses_document_part(part)
                         for part in message.content_parts
                     ],
@@ -158,6 +161,9 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
             continue
         if part.kind == "video":
             blocks.append(reject_video_part(part))
+            continue
+        if part.kind == "audio":
+            blocks.append(reject_audio_part(part))
             continue
         if part.kind == "document":
             blocks.append(anthropic_document_block(part))
@@ -325,6 +331,8 @@ def openai_chat_message(
                 if part.kind == "image"
                 else openai_chat_video_part(part)
                 if part.kind == "video"
+                else openai_chat_audio_part(part)
+                if part.kind == "audio"
                 else openai_chat_document_part(part)
                 for part in message.content_parts
             ]

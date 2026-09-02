@@ -1,6 +1,6 @@
 """Decode OpenAI Chat and Responses media content parts into canonical parts.
 
-Text, image, video, and file parts are flattened in the caller's order. Each
+Text, image, video, audio, and file parts are flattened in the caller's order. Each
 media part carries exactly one of inline data, an http(s) URL, or a provider
 handle: an OpenAI Files ``file_id`` becomes an OpenAI-scoped handle, and an
 ``s3://``, ``gs://``, or Gemini Files URI becomes a Bedrock, Vertex, or Gemini
@@ -15,6 +15,7 @@ from exp.common.models.content import (
     MediaHandle,
     MessageContentPart,
     TextContentPart,
+    audio_part_from_input_audio,
     document_part_from_file_data,
     image_part_from_url,
     media_handle_from_uri,
@@ -22,6 +23,7 @@ from exp.common.models.content import (
 )
 from exp.runtime.openai_protocol.errors import invalid_field
 from exp.runtime.openai_protocol.wire_models import (
+    _ChatAudioPart,
     _ChatFilePart,
     _ChatImagePart,
     _ChatVideoPart,
@@ -44,13 +46,14 @@ def message_content(
 
     Returns:
         The flattened text and, only for a message that carries an image,
-        a video, or a document, the ordered canonical parts. A text-only
+        a video, audio, or a document, the ordered canonical parts. A text-only
         message keeps its previous representation exactly, so nothing
         downstream changes for it.
 
     Raises:
         OpenAIProtocolError: An image or video reference is not a supported
-            URL or base64 data URL, or a file is not an inline PDF.
+            URL or base64 data URL, an audio part is not base64 WAV or MP3,
+            or a file is not an inline PDF.
     """
     if content is None or isinstance(content, str):
         return content, ()
@@ -76,6 +79,15 @@ def message_content(
                     "MPEG, QuickTime, WebM, FLV, 3GPP, or WMV video, or an s3://, gs://, "
                     "or Gemini Files URI of an uploaded video.",
                 ) from exc
+            continue
+        if isinstance(part, _ChatAudioPart):
+            audio = part.input_audio
+            try:
+                parts.append(audio_part_from_input_audio(audio.data, audio.format))
+            except ValueError as exc:
+                location = f"{param}.{index}.input_audio"
+                hint = f"'{location}' must carry base64 audio data with format 'wav' or 'mp3'."
+                raise invalid_field(location, hint) from exc
             continue
         if isinstance(part, (_ChatFilePart, _ResponsesFilePart)):
             parts.append(_document_part(part, f"{param}.{index}"))

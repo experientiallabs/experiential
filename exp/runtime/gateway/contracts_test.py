@@ -898,3 +898,45 @@ def test_media_handles_join_semantic_identity_and_never_mix_providers() -> None:
             ImageContentPart(handle=openai_a),
             ImageContentPart(handle=MediaHandle(provider="anthropic", reference="file_a")),
         )
+
+
+def test_audio_joins_semantic_identity_while_cache_markers_stay_out() -> None:
+    """Audio parts change the canonical digest; cache-only markers never do."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.common.models.content import AudioContentPart, TextContentPart
+
+    def request(data: str, *, marked: bool) -> GatewayRequest:
+        """Build one Chat request with a clip between two texts, optionally cache-marked."""
+        blocks: tuple[JsonObject, ...] = (
+            (
+                {"type": "text", "text": "listen: "},
+                {"type": "text", "text": "what is said?", "cache_control": {"type": "ephemeral"}},
+            )
+            if marked
+            else ()
+        )
+        return GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(
+                GatewayMessage(
+                    role="user",
+                    content="listen: what is said?",
+                    content_parts=(
+                        TextContentPart(text="listen: "),
+                        AudioContentPart(media_type="audio/wav", data=data),
+                        TextContentPart(text="what is said?"),
+                    ),
+                    provider_text_blocks=blocks,
+                ),
+            ),
+        )
+
+    first = request("UklGRgAAAABXQVZF", marked=False)
+    second = request("UklGRgQAAABXQVZF", marked=False)
+    marked = request("UklGRgAAAABXQVZF", marked=True)
+    parts = first.model_dump(mode="json")["messages"][0]["content_parts"]
+    assert [part["kind"] for part in parts] == ["text", "audio", "text"]
+    assert parts[1] == {"kind": "audio", "media_type": "audio/wav", "data": "UklGRgAAAABXQVZF"}
+    assert sha256_json(first) != sha256_json(second)
+    assert sha256_json(first) == sha256_json(marked)
+    assert first.audios == (first.messages[0].content_parts[1],)

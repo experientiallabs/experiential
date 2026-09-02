@@ -2042,3 +2042,57 @@ def test_direct_alias_declares_media_handle_input_per_provider(tmp_path: Path) -
     assert declarations == {"oai-handles": True, "oai-plain": False}
     assert "oai-no-media" not in catalog.models
     assert "orx-handles" not in catalog.models
+
+
+def test_direct_alias_declares_audio_capability_per_provider(tmp_path: Path) -> None:
+    """Audio is admitted only on providers whose wire carries a servable clip."""
+    runner = CliRunner()
+    common = ["--root", str(tmp_path), "--non-interactive", "--json"]
+    commands = (
+        ["config", "gateway", "init", "--root", str(tmp_path), "--json"],
+        ["config", "gateway", "provider", "add", "oai", "--provider", "openai"]
+        + ["--credential-env", "OPENAI_API_KEY"]
+        + common,
+        ["config", "gateway", "provider", "add", "router", "--provider", "openrouter"]
+        + ["--credential-env", "OPENROUTER_API_KEY"]
+        + common,
+        ["config", "gateway", "provider", "add", "google", "--provider", "gemini"]
+        + ["--credential-env", "GEMINI_API_KEY"]
+        + common,
+        ["config", "gateway", "provider", "add", "claude", "--provider", "anthropic"]
+        + ["--credential-env", "ANTHROPIC_API_KEY"]
+        + common,
+        ["config", "gateway", "provider", "add", "aws", "--provider", "bedrock"]
+        + ["--credential-env", "AWS_SECRET_ACCESS_KEY", "--access-key-id-env"]
+        + ["AWS_ACCESS_KEY_ID", "--region", "us-east-1"]
+        + common,
+    )
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+
+    def create(alias: str, deployment: str, *flags: str) -> int:
+        """Create one alias with the given audio flags and return the exit code."""
+        created = runner.invoke(
+            app,
+            ["config", "gateway", "alias", "create", alias, "--deployment", deployment]
+            + ["--exact-model", alias, *flags]
+            + common,
+        )
+        return created.exit_code
+
+    assert create("router-audio", "router:openai/gpt-audio-mini", "--supports-audio-input") == 0
+    assert create("gem-audio", "google:gemini-3-flash-preview", "--supports-audio-input") == 0
+    assert create("gem-text", "google:gemini-3-flash-preview") == 0
+    assert create("oai-audio", "oai:gpt-audio-mini", "--supports-audio-input") != 0
+    assert create("claude-audio", "claude:claude-fixture", "--supports-audio-input") != 0
+    assert create("nova-audio", "aws:nova", "--supports-audio-input") != 0
+
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    declarations: dict[str, bool] = {}
+    for alias in ("router-audio", "gem-audio", "gem-text"):
+        gateway = catalog.models[alias].gateway
+        assert gateway is not None
+        declarations[alias] = gateway.capabilities.supports_audio_input
+    assert declarations == {"router-audio": True, "gem-audio": True, "gem-text": False}
+    assert {"oai-audio", "claude-audio", "nova-audio"}.isdisjoint(catalog.models)

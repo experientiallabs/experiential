@@ -594,6 +594,56 @@ class GatewayManagement:
             for row in rows
         )
 
+    def prior_alias_revisions(
+        self, alias: GatewayAliasView, *, limit: int
+    ) -> tuple[GatewayAliasView, ...]:
+        """Return an alias's non-active revisions, newest first, as servable views.
+
+        Used only as a last-good fallback: when an alias's active revision pins an
+        unservable snapshot, the pod walks these newest-first to serve the most
+        recent prior revision whose snapshot is present and valid. Each view keeps
+        the alias identity but carries that prior revision's pinned target and
+        snapshot, so serving and attribution follow the revision actually served.
+
+        Args:
+            alias: The active alias view whose pinned revision is unservable.
+            limit: Maximum number of prior revisions to return (bounds the walk).
+
+        Returns:
+            Prior revision views ordered newest revision first, excluding the
+            active revision; empty when the alias has no prior revisions.
+        """
+        if not self.initialized or alias.revision_id is None:
+            return ()
+        rows = self._rows(
+            f"""
+            SELECT r.revision_id, r.target_kind, r.pool_id, r.project_ref,
+                   r.activation_ref, r.snapshot_ref, r.catalog_sha256, r.refusal_failover
+            FROM alias_revisions AS r
+            WHERE r.organization_id = ? AND r.alias_id = ? AND r.revision_id != ?
+            ORDER BY r.revision_number DESC
+            LIMIT {int(limit)}
+            """,
+            (self.organization_id, alias.alias_id, alias.revision_id),
+        )
+        return tuple(
+            alias.model_copy(
+                update={
+                    "revision_id": str(row["revision_id"]),
+                    "target_kind": str(row["target_kind"]),
+                    "pool_id": None if row["pool_id"] is None else str(row["pool_id"]),
+                    "project_ref": None if row["project_ref"] is None else str(row["project_ref"]),
+                    "activation_ref": (
+                        None if row["activation_ref"] is None else str(row["activation_ref"])
+                    ),
+                    "snapshot_ref": str(row["snapshot_ref"]),
+                    "catalog_sha256": str(row["catalog_sha256"]),
+                    "refusal_failover": bool(row["refusal_failover"]),
+                }
+            )
+            for row in rows
+        )
+
     def activate_direct_alias(
         self,
         *,

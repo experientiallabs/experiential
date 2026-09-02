@@ -182,3 +182,53 @@ def test_parity_row_forwards_media_handles_only_on_a_handle_provider() -> None:
         reasoning_wire_format="anthropic_thinking",
     )
     assert undeclared.forwards_media_handles is False
+
+
+def test_parity_row_projects_audio_declarations_onto_the_wire() -> None:
+    """Audio parity holds only where the catalog declares it and the wire carries it."""
+    chat = deployment_capability_parity(
+        provider="openrouter",
+        model_id="openai/gpt-audio-mini",
+        dialect="openai_compatible",
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_audio_input=True
+        ),
+        reasoning_wire_format="openai_chat",
+    )
+    assert chat.supports_audio_input is True
+
+    gemini = deployment_capability_parity(
+        provider="gemini",
+        model_id="gemini-3-flash-preview",
+        dialect="gemini_generate_content",
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_audio_input=True
+        ),
+        reasoning_wire_format="gemini_thinking",
+    )
+    assert gemini.supports_audio_input is True
+
+    for provider, dialect, wire in (
+        ("openai", "openai_responses", "openai_responses"),
+        ("anthropic", "anthropic_messages", "anthropic_thinking"),
+        ("bedrock", "bedrock_converse_stream", "bedrock_reasoning_config"),
+    ):
+        declared_off_wire = deployment_capability_parity(
+            provider=provider,
+            model_id="fixture",
+            dialect=dialect,
+            capabilities=GatewayDeploymentCapabilities(
+                supports_streaming=True, supports_audio_input=True
+            ),
+            reasoning_wire_format=wire,
+        )
+        assert declared_off_wire.supports_audio_input is False
+
+    undeclared = deployment_capability_parity(
+        provider="gemini",
+        model_id="gemini-3-flash-preview",
+        dialect="gemini_generate_content",
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        reasoning_wire_format="gemini_thinking",
+    )
+    assert undeclared.supports_audio_input is False

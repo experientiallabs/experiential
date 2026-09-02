@@ -577,8 +577,15 @@ def _write_catalog_snapshot(
         # so new alias revisions bind the current provider authority.
         write_bytes_atomic(authored, authored_bytes, follow_symlinks=False)
         os.chmod(authored, 0o600)
-    if not snapshot.exists():
-        write_bytes_atomic(snapshot, canonical_json_bytes(normalized), follow_symlinks=False)
+    normalized_bytes = canonical_json_bytes(normalized)
+    if not snapshot.exists() or snapshot.read_bytes() != normalized_bytes:
+        # Content-addressed, but never trust a pre-existing file blindly: a
+        # stale or partially written `<sha>.json` (a crash between the atomic
+        # temp write and its rename, a restored backup) whose bytes no longer
+        # hash to its own name would otherwise be pinned as a self-inconsistent
+        # snapshot and 503 every alias on it. Rewrite whenever the on-disk bytes
+        # differ, exactly as the authored companion above already does.
+        write_bytes_atomic(snapshot, normalized_bytes, follow_symlinks=False)
         os.chmod(snapshot, 0o600)
     return snapshot
 

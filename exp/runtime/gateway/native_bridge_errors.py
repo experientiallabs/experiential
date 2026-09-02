@@ -16,6 +16,7 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
         "image_url_input": "messages",
         "video_input": "messages",
         "video_url_input": "messages",
+        "audio_input": "messages",
         "pdf_input": "messages",
         "pdf_url_input": "messages",
         "media_handle_input": "messages",
@@ -35,6 +36,7 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
         "image_url_input": "input",
         "video_input": "input",
         "video_url_input": "input",
+        "audio_input": "input",
         "pdf_input": "input",
         "pdf_url_input": "input",
         "media_handle_input": "input",
@@ -53,6 +55,7 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
         "image_url_input": "messages",
         "video_input": "messages",
         "video_url_input": "messages",
+        "audio_input": "messages",
         "pdf_input": "messages",
         "pdf_url_input": "messages",
         "media_handle_input": "messages",
@@ -82,6 +85,10 @@ _ATTACHMENT_CAPABILITY_MESSAGES = {
     "video_url_input": (
         "The selected model route accepts inline video data only. "
         "Send the video as a base64 data URL or choose a different model alias."
+    ),
+    "audio_input": (
+        "The selected model route cannot accept audio input. "
+        "Send text only or choose an audio-capable model alias."
     ),
     "pdf_input": (
         "The selected model route cannot accept PDF document input. "

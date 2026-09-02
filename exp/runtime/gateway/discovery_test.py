@@ -60,7 +60,7 @@ def test_unknown_and_ungranted_aliases_raise_the_identical_404() -> None:
 
 
 def test_published_metadata_projects_route_attachment_capabilities() -> None:
-    """Image and PDF input publish as route facts from the deployment's declaration."""
+    """Image, audio, and PDF input publish as route facts from the deployment's declaration."""
     deployment = ExactModelDeployment(
         deployment_id="dep-1",
         source_alias="coding",
@@ -73,6 +73,7 @@ def test_published_metadata_projects_route_attachment_capabilities() -> None:
         gateway=GatewayDeploymentMetadata(
             capabilities=GatewayDeploymentCapabilities(
                 supports_image_input=True,
+                supports_audio_input=True,
                 supports_pdf_input=True,
                 supports_pdf_url_input=True,
             )
@@ -82,6 +83,7 @@ def test_published_metadata_projects_route_attachment_capabilities() -> None:
     assert metadata is not None
     fields = metadata.extension_fields()
     assert fields["supports_image_input"] is True
+    assert fields["supports_audio_input"] is True
     assert fields["supports_pdf_input"] is True
     assert "supports_pdf_url_input" not in fields
     assert published_alias_metadata(None) is None
