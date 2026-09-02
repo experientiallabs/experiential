@@ -309,6 +309,102 @@ def test_combine_economics_sums_present_usage_and_complete_measurements() -> Non
     assert combine_economics(()) == OperationEconomics()
 
 
+def test_combine_economics_preserves_cache_write_when_every_record_reports_it() -> None:
+    """Aggregated usage keeps cache-write counts only when every record carries them."""
+    first = OperationEconomics(
+        usage=Usage(
+            input_tokens=100,
+            output_tokens=10,
+            cached_input_tokens=20,
+            cache_write_input_tokens=30,
+        ),
+        cost_usd=NumericMeasurement(value=0.2, provenance="observed"),
+        latency_seconds=NumericMeasurement(value=0.4, provenance="observed"),
+    )
+    second = OperationEconomics(
+        usage=Usage(
+            input_tokens=50,
+            output_tokens=5,
+            cached_input_tokens=10,
+            cache_write_input_tokens=15,
+        ),
+        cost_usd=NumericMeasurement(value=0.1, provenance="observed"),
+        latency_seconds=NumericMeasurement(value=0.2, provenance="observed"),
+    )
+    partial = OperationEconomics(
+        usage=Usage(input_tokens=20, output_tokens=2, cached_input_tokens=5),
+        cost_usd=NumericMeasurement(value=0.05, provenance="observed"),
+    )
+
+    complete = combine_economics((first, second))
+    mixed = combine_economics((first, partial))
+    zero_write = combine_economics(
+        (
+            OperationEconomics(
+                usage=Usage(
+                    input_tokens=10,
+                    output_tokens=1,
+                    cached_input_tokens=2,
+                    cache_write_input_tokens=0,
+                ),
+            ),
+            OperationEconomics(
+                usage=Usage(
+                    input_tokens=10,
+                    output_tokens=1,
+                    cached_input_tokens=3,
+                    cache_write_input_tokens=0,
+                ),
+            ),
+        )
+    )
+
+    assert complete.usage == Usage(
+        input_tokens=150,
+        output_tokens=15,
+        cached_input_tokens=30,
+        cache_write_input_tokens=45,
+    )
+    assert mixed.usage == Usage(
+        input_tokens=120,
+        output_tokens=12,
+        cached_input_tokens=25,
+        cache_write_input_tokens=None,
+    )
+    assert zero_write.usage == Usage(
+        input_tokens=20,
+        output_tokens=2,
+        cached_input_tokens=5,
+        cache_write_input_tokens=0,
+    )
+    assert zero_write.usage is not None
+    assert zero_write.usage.cache_write_input_tokens == 0
+
+
+def test_combine_economics_cache_write_partial_mode_keeps_only_complete_subset() -> None:
+    """Partial aggregation keeps cache-write totals only from the present subset."""
+    priced = OperationEconomics(
+        usage=Usage(
+            input_tokens=10,
+            output_tokens=2,
+            cached_input_tokens=4,
+            cache_write_input_tokens=2,
+        ),
+        cost_usd=NumericMeasurement(value=0.5, provenance="observed"),
+    )
+    unmetered = OperationEconomics()
+
+    strict = combine_economics((priced, unmetered))
+    relaxed = combine_economics((priced, unmetered), require_complete_usage=False)
+    empty_relaxed = combine_economics((unmetered,), require_complete_usage=False)
+
+    assert strict.usage is None
+    assert relaxed.usage == priced.usage
+    assert relaxed.usage is not None
+    assert relaxed.usage.cache_write_input_tokens == 2
+    assert empty_relaxed.usage is None
+
+
 def test_unknown_support_flags_change_the_frozen_capability_identity_digest() -> None:
     """Unknown tool and embedding support hash as their own tri-state value.
 

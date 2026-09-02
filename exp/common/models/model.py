@@ -145,17 +145,22 @@ def _sum_usage(values: Sequence[Usage]) -> Usage:
         values: Usage records reported by the aggregated operations.
 
     Returns:
-        Summed input and output tokens, with cached input tokens summed only when every
-        record reports them.
+        Summed input and output tokens, with cached and cache-write input tokens
+        summed only when every record reports them.
     """
     cached = tuple(value.cached_input_tokens for value in values)
     cached_total: int | None = None
     if all(item is not None for item in cached):
         cached_total = sum(item for item in cached if item is not None)
+    written = tuple(value.cache_write_input_tokens for value in values)
+    written_total: int | None = None
+    if all(item is not None for item in written):
+        written_total = sum(item for item in written if item is not None)
     return Usage(
         input_tokens=sum(value.input_tokens for value in values),
         output_tokens=sum(value.output_tokens for value in values),
         cached_input_tokens=cached_total,
+        cache_write_input_tokens=written_total,
     )
 
 
