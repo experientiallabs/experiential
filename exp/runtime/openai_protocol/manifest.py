@@ -52,6 +52,9 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field("reasoning_effort", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
+        # Accepted only at its no-op default of 1 (the wire model enforces
+        # the value): Copilot hardcodes n:1 on every Chat request.
+        _field("n", CompatibilityDisposition.SUPPORTED),
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
@@ -74,7 +77,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "logit_bias",
                 "modalities",
                 "moderation",
-                "n",
                 "prediction",
                 "presence_penalty",
                 "prompt_cache_options",
@@ -124,6 +126,13 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
+        # Accepted only at their no-op values (the wire models enforce them):
+        # Copilot hardcodes truncation:"disabled" and
+        # prompt_cache_options:{"mode":"implicit"} on every Responses request,
+        # and both describe exactly the behavior this gateway already serves
+        # (context is never truncated; served routes cache implicitly).
+        _field("truncation", CompatibilityDisposition.SUPPORTED),
+        _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec), same handling as the
         # Chat surface: accepted and recorded gateway-side, never forwarded.
@@ -139,11 +148,9 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "max_tool_calls",
                 "moderation",
                 "prompt",
-                "prompt_cache_options",
                 "prompt_cache_retention",
                 "service_tier",
                 "stream_options",
-                "truncation",
             )
         ),
     ),

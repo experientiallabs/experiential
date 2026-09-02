@@ -612,6 +612,17 @@ def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
         for detail in details:
             if detail["type"] == "value_error":
                 return invalid_field(param, detail["msg"].removeprefix("Value error, ") + ".")
+    for detail in details:
+        # A field validator's own wording states this gateway's exact value
+        # constraint (only our wire models raise these, so the text is
+        # display-safe and never echoes the caller's value).
+        if detail["type"] == "value_error":
+            return invalid_field(
+                param,
+                f"Invalid value for {param!r}: "
+                + detail["msg"].removeprefix("Value error, ")
+                + ".",
+            )
     return invalid_field(param, _shape_message(param, details))
 
 

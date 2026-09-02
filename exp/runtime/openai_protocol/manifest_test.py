@@ -48,7 +48,12 @@ def test_manifests_classify_explicit_exclusions() -> None:
     chat = disposition_map(CHAT_MANIFEST)
     responses = disposition_map(RESPONSES_MANIFEST)
     assert chat["audio"] == CompatibilityDisposition.UNSUPPORTED
-    assert chat["n"] == CompatibilityDisposition.UNSUPPORTED
+    # Value-constrained acceptances: the wire models admit only the no-op
+    # values Copilot hardcodes (n:1, truncation:"disabled",
+    # prompt_cache_options:{"mode":"implicit"}).
+    assert chat["n"] == CompatibilityDisposition.SUPPORTED
+    assert responses["truncation"] == CompatibilityDisposition.SUPPORTED
+    assert responses["prompt_cache_options"] == CompatibilityDisposition.SUPPORTED
     assert chat["logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_logprobs"] == CompatibilityDisposition.UNSUPPORTED
     assert chat["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED

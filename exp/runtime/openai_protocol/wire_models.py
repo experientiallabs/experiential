@@ -347,6 +347,26 @@ class _ChatRequest(_WireModel):
     max_tokens: int | None = Field(default=None, gt=0)
     max_completion_tokens: int | None = Field(default=None, gt=0)
     stop: str | tuple[str, ...] | None = None
+    n: int | None = None
+    """Completion-count selector, accepted only at its no-op default of 1.
+
+    VS Code Copilot's custom-endpoint provider hardcodes ``n: 1`` on every
+    Chat request (wire-captured 2026-09-02); this gateway serves exactly one
+    completion per request, so 1 is accepted as already satisfied and any
+    other value stays a named rejection.
+    """
+
+    @field_validator("n")
+    @classmethod
+    def _require_single_completion(cls, value: int | None) -> int | None:
+        """Accept the completion count only as already satisfied."""
+        if value is not None and value != 1:
+            raise ValueError(
+                "supported only at its default of 1: this gateway serves "
+                "exactly one completion per request"
+            )
+        return value
+
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
@@ -599,6 +619,20 @@ _ResponsesOutputItem = Annotated[
 _ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem
 
 
+class _PromptCacheOptions(_WireModel):
+    """Responses prompt-cache selector, accepted only in its implicit mode.
+
+    VS Code Copilot's custom-endpoint provider hardcodes
+    ``{"mode": "implicit"}`` on every Responses request (wire-captured
+    2026-09-02). Implicit prefix caching is exactly what served routes
+    already do, so the value is accepted as already satisfied; any other
+    mode names behavior this gateway does not provide and stays a closed
+    rejection.
+    """
+
+    mode: Literal["implicit"]
+
+
 class _ResponsesRequest(_WireModel):
     """Closed gateway Responses request profile."""
 
@@ -618,6 +652,25 @@ class _ResponsesRequest(_WireModel):
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning: _ResponseReasoning | None = None
     text: _ResponseText | None = None
+    truncation: str | None = Field(default=None, max_length=64)
+    """Context-truncation selector, accepted only at its no-op default.
+
+    VS Code Copilot's custom-endpoint provider hardcodes
+    ``truncation: "disabled"`` on every Responses request (wire-captured
+    2026-09-02). This gateway never truncates context, so "disabled" is
+    accepted as already satisfied; "auto" asks for dropping context the
+    gateway does not implement and stays a closed rejection.
+    """
+
+    @field_validator("truncation")
+    @classmethod
+    def _require_no_truncation(cls, value: str | None) -> str | None:
+        """Accept the truncation selector only as already satisfied."""
+        if value is not None and value != "disabled":
+            raise ValueError("supported only as 'disabled': this gateway never truncates context")
+        return value
+
+    prompt_cache_options: _PromptCacheOptions | None = None
     stream: bool = False
     client_metadata: JsonObject | None = None
     metadata: JsonObject = Field(default_factory=dict)
