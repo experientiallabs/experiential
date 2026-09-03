@@ -35,3 +35,9 @@ thiserror = "2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[dev-dependencies]
+# Frame-level HTTP/2 server control for the reset/goaway regression tests:
+# the production wire to fronting proxies negotiates h2, so mid-stream aborts
+# arrive as RST_STREAM/GOAWAY, a different reqwest path than h1 truncation.
+h2 = "0.4"
