@@ -277,7 +277,7 @@ def test_official_client_round_trips_base64_vectors_and_settles(engine: _Serving
 def test_raw_float_request_forwards_every_field_and_ignores_idempotency_key(
     engine: _ServingEngine,
 ) -> None:
-    """A string input with dimensions and float encoding crosses verbatim; user stays gateway-side."""
+    """Dimensions and float encoding cross verbatim; ``user`` stays gateway-side."""
     response = _post(
         engine,
         {
