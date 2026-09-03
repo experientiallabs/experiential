@@ -28,6 +28,7 @@ from exp.runtime.gateway.batch.providers import (
     AnthropicBatchClient,
     DoublewordBatchClient,
     OpenAIBatchClient,
+    OpenAICompatibleBatchClient,
     OpenRouterBatchClient,
     require_exact_host,
 )
@@ -385,3 +386,23 @@ def test_doubleword_results_download_from_the_doubleword_host() -> None:
     results = asyncio.run(client.results(job=_job("doubleword"), api_key="sk"))
     assert results[0].custom_id == "line-0" and results[0].output_tokens == 5
     assert set(hosts) == {"api.doubleword.ai"}
+
+
+def test_openai_compatible_client_targets_its_configured_base() -> None:
+    """A configured provider and base URL drive the OpenAI batch dialect there."""
+    hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        if request.url.path == "/v1/files":
+            return httpx.Response(200, json={"id": "file_x"})
+        assert request.url.path == "/v1/batches"
+        return httpx.Response(200, json={"id": "pb_x"})
+
+    client = OpenAICompatibleBatchClient(
+        provider="acme", base_url="https://batch.acme.example/v1", transport=_transport(handler)
+    )
+    assert client.provider == "acme"
+    provider_id = asyncio.run(client.submit(job=_job("acme"), api_key="sk-acme"))
+    assert provider_id == "pb_x"
+    assert set(hosts) == {"batch.acme.example"}

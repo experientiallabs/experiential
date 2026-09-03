@@ -517,11 +517,36 @@ class OpenRouterBatchClient:
         )
 
 
-class DoublewordBatchClient(OpenAIBatchClient):
+class OpenAICompatibleBatchClient(OpenAIBatchClient):
+    """The OpenAI batch dialect at a configurable base URL and provider name.
+
+    Any provider that serves the OpenAI Batch API verbatim (file upload plus
+    ``/batches`` create, poll, cancel, and file-id results) is reachable by
+    binding its ``base_url`` and provider identity on the instance.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        base_url: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        """Bind the provider identity and endpoint for this instance."""
+        super().__init__(transport=transport)
+        self.provider = provider
+        self._base = base_url
+
+
+class DoublewordBatchClient(OpenAICompatibleBatchClient):
     """Doubleword Batch API: the OpenAI batch dialect at Doubleword's endpoint."""
 
     provider = "doubleword"
     _base = "https://api.doubleword.ai/v1"
+
+    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        """Bind the Doubleword endpoint, with an optional injected transport."""
+        super().__init__(provider=self.provider, base_url=self._base, transport=transport)
 
 
 PROVIDER_CLIENTS: dict[str, ProviderBatchClient] = {
