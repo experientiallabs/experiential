@@ -329,3 +329,79 @@ fn completed_reasoning_items_pass_encrypted_content_through() {
         ] if item_id.as_deref() == Some("rs_2")
     ));
 }
+
+#[test]
+fn compatible_stream_folds_additive_reasoning_into_the_terminal_usage() {
+    // Verbatim final frames from Azure Foundry grok-4.3 (silen-resource,
+    // 2026-09-03, stream_options.include_usage): xAI reports 655 reasoning
+    // tokens OUTSIDE completion_tokens=8 (its total_tokens 677 = 14 + 8 + 655),
+    // so the normalized usage carries the folded output total with the
+    // reasoning subset intact, and the cached prompt leg passes through.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let text = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "id": "8ca8705f-1504-4bec-a739-38e3726ff3d4",
+            "object": "chat.completion.chunk",
+            "created": 1788425522,
+            "model": "grok-4.3",
+            "choices": [{"index": 0, "delta": {"content": "Because"}, "finish_reason": null}],
+            "system_fingerprint": "fp_39c5j0a3e9",
+        })
+        .to_string(),
+    };
+    assert!(matches!(
+        normalizer.feed(&text).expect("text").as_slice(),
+        [Event::TextDelta(delta)] if delta == "Because"
+    ));
+    let finish = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "id": "8ca8705f-1504-4bec-a739-38e3726ff3d4",
+            "object": "chat.completion.chunk",
+            "created": 1788425522,
+            "model": "grok-4.3",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "system_fingerprint": "fp_39c5j0a3e9",
+        })
+        .to_string(),
+    };
+    assert!(normalizer.feed(&finish).expect("finish").is_empty());
+    let usage = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "id": "8ca8705f-1504-4bec-a739-38e3726ff3d4",
+            "object": "chat.completion.chunk",
+            "created": 1788425522,
+            "model": "grok-4.3",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 14,
+                "completion_tokens": 8,
+                "total_tokens": 677,
+                "prompt_tokens_details": {"text_tokens": 14, "audio_tokens": 0, "image_tokens": 0, "cached_tokens": 4},
+                "completion_tokens_details": {"reasoning_tokens": 655, "audio_tokens": 0, "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0},
+                "num_sources_used": 0,
+                "cost_in_usd_ticks": 0,
+            },
+            "system_fingerprint": "fp_39c5j0a3e9",
+            "service_tier": "default",
+        })
+        .to_string(),
+    };
+    assert!(normalizer.feed(&usage).expect("usage").is_empty());
+    let done = SseEvent {
+        event: None,
+        data: "[DONE]".to_string(),
+    };
+    let events = normalizer.feed(&done).expect("terminal");
+    match events.as_slice() {
+        [Event::Usage(usage), Event::Completed] => {
+            assert_eq!(usage.input_tokens, Some(14));
+            assert_eq!(usage.output_tokens, Some(663));
+            assert_eq!(usage.cached_input_tokens, Some(4));
+            assert_eq!(usage.reasoning_tokens, Some(655));
+        }
+        other => panic!("unexpected events: {other:?}"),
+    }
+}
