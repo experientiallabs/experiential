@@ -921,10 +921,13 @@ def test_native_serves_an_effort_on_a_reasoning_less_route_by_dropping_it(
     assert body["status"] == "completed"
 
 
-def test_native_rejects_unsupported_sampling_with_the_public_field_error(
+def test_native_drops_unsupported_top_k_with_disclosure(
     engine: _ServingEngine,
 ) -> None:
-    """A route without top-k support fails the request locally with the field name."""
+    """A route without top-k support serves the request with top_k dropped and disclosed,
+    not a hard field-error reject (the owner-approved adapt-on-disagreement policy): top_k
+    is a sampling preference whose absence still returns a valid answer, and the /v1/messages
+    envelope discloses the drop the same way the Chat path does."""
     payload = {**_messages_body("fast-token"), "top_k": 3}
     headers = {"x-api-key": engine.raw_key}
     native = httpx.post(
@@ -934,8 +937,11 @@ def test_native_rejects_unsupported_sampling_with_the_public_field_error(
         timeout=10.0,
     )
 
-    assert native.status_code == 400
-    assert "top_k" in native.json()["error"]["message"]
+    assert native.status_code == 200
+    assert (
+        "top_k->dropped(unsupported_by_provider)"
+        in native.json()["x-experiential-ignored-parameters"]
+    )
 
 
 @pytest.mark.parametrize(
