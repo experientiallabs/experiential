@@ -149,7 +149,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
         "pool": sorted(ExactModelPool.model_fields),
     }
     assert fingerprint == {
-        "schema_version": 1,
+        "schema_version": 2,
         "normalized": ["deployments", "pools", "schema_version"],
         "deployment": [
             "billing_source",

@@ -416,6 +416,9 @@ class ModelCapabilities(ContractModel):
 
     supports_tools: bool | None = None
     supports_embeddings: bool | None = None
+    # Image generation is served only on a positive claim, like embeddings:
+    # ``None`` is unknown and never dispatches to the images surface.
+    supports_image_generation: bool | None = None
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True

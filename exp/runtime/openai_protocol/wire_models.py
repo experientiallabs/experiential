@@ -424,6 +424,35 @@ class _EmbeddingsRequest(_WireModel):
         return value
 
 
+class _ImagesRequest(_WireModel):
+    """Closed gateway image-generation request profile (OpenAI Images API)."""
+
+    model: str = Field(min_length=1, max_length=256)
+    prompt: str = Field(min_length=1, max_length=32_000)
+    n: int | None = Field(default=None, ge=1, le=10)
+    size: (
+        Literal[
+            "auto",
+            "256x256",
+            "512x512",
+            "1024x1024",
+            "1536x1024",
+            "1024x1536",
+            "1792x1024",
+            "1024x1792",
+        ]
+        | None
+    ) = None
+    quality: Literal["standard", "hd", "low", "medium", "high", "auto"] | None = None
+    background: Literal["transparent", "opaque", "auto"] | None = None
+    output_format: Literal["png", "jpeg", "webp"] | None = None
+    output_compression: int | None = Field(default=None, ge=0, le=100)
+    moderation: Literal["low", "auto"] | None = None
+    response_format: Literal["url", "b64_json"] | None = None
+    style: Literal["vivid", "natural"] | None = None
+    user: str | None = Field(default=None, max_length=1024)
+
+
 class _ResponseTool(_WireModel):
     """Responses API function tool declaration."""
 

@@ -184,6 +184,10 @@ class GatewayWireProfile:
     ``headers``; ``None`` when the connection speaks no embeddings wire, so the
     embeddings surface excludes the rung instead of dispatching a chat URL."""
 
+    images_url: str | None = None
+    """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
+    sharing ``headers``; ``None`` when the connection speaks no images wire."""
+
     def __post_init__(self) -> None:
         """Reject malformed operator wire contracts before admission."""
         if self.dialect not in {

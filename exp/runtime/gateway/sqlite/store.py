@@ -31,6 +31,7 @@ from exp.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
+from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.sqlite import key_delivery
@@ -703,9 +704,10 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 catalog_sha256=str(row["catalog_sha256"]),
             )
         match request:
-            case EmbeddingsRequest():
-                # Keyed replay is deferred for the embeddings surface: it carries
-                # no idempotency key and never claims a caller-operation scope.
+            case EmbeddingsRequest() | ImagesRequest():
+                # Keyed replay is deferred for the embeddings and images
+                # surfaces: they carry no idempotency key and never claim a
+                # caller-operation scope.
                 caller_operation = None
             case GatewayRequest():
                 caller_operation = _caller_operation_sha256(request)

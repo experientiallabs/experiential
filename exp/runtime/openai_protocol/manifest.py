@@ -275,6 +275,37 @@ EMBEDDINGS_MANIFEST = CompatibilityManifest(
 )
 
 
+IMAGES_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.IMAGES,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in (
+                "model",
+                "prompt",
+                "n",
+                "size",
+                "quality",
+                "background",
+                "output_format",
+                "output_compression",
+                "moderation",
+                "response_format",
+                "style",
+            )
+        ),
+        # End-user attribution: recorded gateway-side, never forwarded.
+        _field("user", CompatibilityDisposition.METADATA_ONLY),
+        # Streaming partial images is a Responses-style event stream the
+        # buffered images surface does not carry; a request asking for it is
+        # refused explicitly rather than silently answered whole.
+        _field("stream", CompatibilityDisposition.UNSUPPORTED),
+        _field("partial_images", CompatibilityDisposition.UNSUPPORTED),
+    ),
+)
+
+
 def disposition_map(manifest: CompatibilityManifest) -> dict[str, CompatibilityDisposition]:
     """Index one manifest by exact top-level request field.
 

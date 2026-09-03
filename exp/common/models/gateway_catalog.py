@@ -24,7 +24,7 @@ ExactModelPoolId = ArtifactId
 GATEWAY_EXCLUDED_PROVIDERS = frozenset({"tinker"})
 """Runtime-resolvable providers whose records never become gateway deployments."""
 
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
 """Normalized-catalog schema version this engine build reads and writes.
 
 Every change to the normalized catalog schema or its normalization output MUST

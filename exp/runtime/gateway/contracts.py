@@ -61,6 +61,7 @@ class GatewayApiSurface(StrEnum):
     RESPONSES = "responses"
     MESSAGES = "messages"
     EMBEDDINGS = "embeddings"
+    IMAGES = "images"
 
 
 class GatewayToolDefinition(ContractModel):

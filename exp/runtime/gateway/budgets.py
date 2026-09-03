@@ -26,6 +26,7 @@ from exp.runtime.gateway.embeddings_contracts import (
     ServingRequest,
     embeddings_input_ceiling_micro_usd,
 )
+from exp.runtime.gateway.images_contracts import ImagesRequest, images_ceiling_micro_usd
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
@@ -550,6 +551,13 @@ def maximum_attempt_cost_micro_usd(
             return embeddings_input_ceiling_micro_usd(
                 request,
                 input_rate=deployment.gateway.prices.input_micro_usd_per_million_tokens,
+                maximum=MAXIMUM_MICRO_USD,
+            )
+        case ImagesRequest():
+            return images_ceiling_micro_usd(
+                request,
+                input_rate=deployment.gateway.prices.input_micro_usd_per_million_tokens,
+                output_rate=deployment.gateway.prices.output_micro_usd_per_million_tokens,
                 maximum=MAXIMUM_MICRO_USD,
             )
         case GatewayRequest():

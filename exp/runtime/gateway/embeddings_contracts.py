@@ -8,6 +8,7 @@ from pydantic import Field, field_validator
 
 from exp.common.core.artifacts import ContractModel, canonical_json_bytes
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
+from exp.runtime.gateway.images_contracts import ImagesRequest
 
 
 class EmbeddingsRequest(ContractModel):
@@ -61,13 +62,14 @@ class EmbeddingsRequest(ContractModel):
         return value
 
 
-ServingRequest = GatewayRequest | EmbeddingsRequest
+ServingRequest = GatewayRequest | EmbeddingsRequest | ImagesRequest
 """One admitted serving request across every public surface.
 
 The money, auth, and accounting seams widen from ``GatewayRequest`` to this
 union so a chat-assuming reader cannot duck-type onto an embeddings request and
 touch an absent leg (messages, output tokens): ``ty`` enumerates every reader
-that must now handle the embeddings arm, and each branches exhaustively.
+that must now handle the embeddings and images arms, and each branches
+exhaustively.
 """
 
 

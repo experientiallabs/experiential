@@ -23,6 +23,11 @@ It serves:
   connection, billed on the provider's reported `prompt_tokens` with no output leg, and
   returned with the provider's exact vectors in `float` or `base64` form; an inbound
   `Idempotency-Key` is ignored because the surface has no replay protocol)
+- `POST /v1/images/generations` (the OpenAI Images API, generations only: prompt in, images
+  out, never streamed; served only by aliases whose catalog capabilities declare
+  `supports_image_generation` on an OpenAI-wire connection, billed on the provider's reported
+  prompt and image tokens, so a model that answers without token usage is refused as
+  unbillable rather than served for free)
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 
