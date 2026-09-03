@@ -92,6 +92,28 @@ def test_unavailable_failure_is_a_retryable_503() -> None:
     assert error.headers() == {"Retry-After": str(UNAVAILABLE_RETRY_AFTER_SECONDS)}
 
 
+def test_refusal_failure_is_a_request_error_not_a_routing_failure() -> None:
+    """A text-less provider refusal is a 400 with its own code, never a 502.
+
+    The provider processed (and billed) the prompt and answered with a
+    refusal; describing that as ``all_routes_failed`` misfiles the model's
+    verdict as an infrastructure fault. OpenAI's own convention for a prompt
+    its safety system rejects is a 400 ``invalid_request_error``.
+    """
+    error = public_failure_error(
+        GatewayFailure(
+            failure_class=GatewayFailureClass.REFUSAL,
+            safe_message="provider refused the request",
+        )
+    )
+
+    assert error.status_code == 400
+    assert error.detail.code == "refusal"
+    assert error.detail.type == "invalid_request_error"
+    assert error.detail.message == "provider refused the request"
+    assert error.retry_after_seconds is None
+
+
 def test_guardrail_failure_uses_content_filter_shape() -> None:
     """A guardrail block is a sanitized 400 with no request content."""
     error = public_failure_error(

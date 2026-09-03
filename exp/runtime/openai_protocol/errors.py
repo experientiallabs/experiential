@@ -184,6 +184,12 @@ def public_failure_error(
         GatewayFailureClass.TIMEOUT: (504, "deadline_exceeded", "api_error"),
         GatewayFailureClass.CANCELLED: (499, "request_cancelled", "api_error"),
         GatewayFailureClass.GUARDRAIL: (400, "content_filter", "invalid_request_error"),
+        # A refusal with no visible refusal text is the model's answer to the
+        # request content, not a routing failure. OpenAI rejects such prompts
+        # as a 400 ``invalid_request_error`` ("rejected as a result of our
+        # safety system"); the provider billed the processed input, so a 502
+        # would misdescribe a charged call as an infrastructure fault.
+        GatewayFailureClass.REFUSAL: (400, "refusal", "invalid_request_error"),
         GatewayFailureClass.UNAVAILABLE: (503, "gateway_unavailable", "api_error"),
     }
     status, code, error_type = mappings.get(

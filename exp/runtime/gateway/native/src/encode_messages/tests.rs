@@ -50,6 +50,24 @@ fn error_body_folds_param_and_maps_status_first() {
 }
 
 #[test]
+fn a_text_less_refusal_is_an_invalid_request_error_on_the_messages_surface() {
+    // The Messages envelope maps by status first, so the refusal's 400 lands
+    // on Anthropic's own invalid_request_error type instead of the api_error
+    // a 502 routing failure would have produced.
+    let refused = Failure::new(FailureClass::Refusal, "provider refused the request");
+    assert_eq!(
+        anthropic_error_body(&refused.public_error()),
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "provider refused the request",
+            },
+        })
+    );
+}
+
+#[test]
 fn completed_body_orders_text_before_tool_use_blocks() {
     let events = vec![
         Event::TextDelta("hi".to_string()),

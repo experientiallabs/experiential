@@ -262,6 +262,13 @@ impl Failure {
             FailureClass::Timeout => (504, "deadline_exceeded", "api_error"),
             FailureClass::Cancelled => (499, "request_cancelled", "api_error"),
             FailureClass::Guardrail => (400, "content_filter", "invalid_request_error"),
+            // A provider refusal with no visible refusal text is the model's
+            // answer to the request content, not a routing failure: OpenAI
+            // rejects such prompts as a 400 `invalid_request_error` ("rejected
+            // as a result of our safety system"), so the closest error-shaped
+            // convention is that status with its own code. The provider billed
+            // the processed input, so a 502 would misdescribe a charged call.
+            FailureClass::Refusal => (400, "refusal", "invalid_request_error"),
             FailureClass::Unavailable => (503, "gateway_unavailable", "api_error"),
             _ => (502, "all_routes_failed", "api_error"),
         };
@@ -294,6 +301,24 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_is_a_request_error_with_its_own_code_never_a_routing_failure() {
+        // The provider processed (and billed) the prompt and answered with a
+        // refusal; `all_routes_failed` would file the model's verdict as an
+        // infrastructure fault. Mirrors `public_failure_error`.
+        let refused = Failure::new(FailureClass::Refusal, "provider refused the request");
+        let error = refused.public_error();
+        assert_eq!(error.status_code, 400);
+        assert_eq!(error.code, "refusal");
+        assert_eq!(error.error_type, "invalid_request_error");
+        assert_eq!(error.message, "provider refused the request");
+        assert_eq!(error.retry_after_seconds, None);
+        // Untyped provider failures keep the routing-failure shape.
+        let internal = Failure::new(FailureClass::ProviderInternal, "provider failed");
+        assert_eq!(internal.public_error().status_code, 502);
+        assert_eq!(internal.public_error().code, "all_routes_failed");
+    }
 
     #[test]
     fn rejected_parameter_reaches_the_public_error_only_for_invalid_requests() {
