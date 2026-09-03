@@ -2,13 +2,18 @@
 
 import pytest
 
-from exp.runtime.models.providers.errors import UnsupportedReasoningEffortError
+from exp.common.models.known_models import known_model_metadata
+from exp.runtime.models.providers.errors import (
+    ProviderParameterError,
+    UnsupportedReasoningEffortError,
+)
 from exp.runtime.models.providers.reasoning_compat import (
     anthropic_adaptive_only_thinking,
     anthropic_reasoning_effort,
     default_reasoning_effort,
     gemini_thinking_level,
     openai_reasoning_effort,
+    require_sampling_reasoning_compatibility,
     supported_reasoning_efforts,
 )
 
@@ -76,6 +81,96 @@ def test_openai_reasoning_efforts_follow_exact_model_tables() -> None:
         openai_reasoning_effort("openai/gpt-5-pro", "low")
     assert openai_reasoning_effort("gpt-5.6-sol", "xhigh") == "xhigh"
     assert openai_reasoning_effort("third-party-reasoner", "minimal") == "minimal"
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "gpt-5.2",
+        "gpt-5.2-2025-12-11",
+        "gpt-5.4",
+        "gpt-5.4-2026-03-05",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.5",
+        "gpt-5.5-2026-04-23",
+    ],
+)
+@pytest.mark.parametrize("wire_format", ["openai_responses", "reasoning_effort"])
+def test_gpt_5x_ladders_reach_the_none_sampling_hatch(model_id: str, wire_format: str) -> None:
+    """The documented ladder for gpt-5.2/5.4/5.5 starts at "none" on both OpenAI wires.
+
+    Provider-verified 2026-09-03 on direct OpenAI (every model here) and on
+    Azure OpenAI (gpt-5.4, which shares the reasoning_effort wire): "none"
+    returns zero reasoning tokens and is the only effort at which temperature
+    and top_p are honored. The maintained metadata declares that hatch through
+    sampling_requires_reasoning_none, so the ladder must contain "none" or the
+    declared sampling support is unreachable.
+
+    Args:
+        model_id: Pointer or dated snapshot id of one affected model.
+        wire_format: Direct OpenAI or Azure OpenAI reasoning wire.
+    """
+    assert supported_reasoning_efforts(model_id, wire_format) == (
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    )
+    assert openai_reasoning_effort(model_id, "none") == "none"
+    with pytest.raises(UnsupportedReasoningEffortError):
+        openai_reasoning_effort(model_id, "minimal")
+    known = known_model_metadata("openai", model_id)
+    assert known is not None
+    assert known.supports_temperature is True
+    assert known.supports_top_p is True
+    assert known.sampling_requires_reasoning_none is True
+
+
+@pytest.mark.parametrize("model_id", ["gpt-5.2-pro", "gpt-5.4-pro", "gpt-5.5-pro", "gpt-5"])
+def test_gpt_5x_siblings_without_a_documented_none_keep_their_ladders(model_id: str) -> None:
+    """The pro tiers and gpt-5 document no "none" effort and expose no sampling hatch.
+
+    Args:
+        model_id: One neighbor of the gpt-5.2/5.4/5.5 base models.
+    """
+    assert "none" not in supported_reasoning_efforts(model_id, "reasoning_effort")
+    known = known_model_metadata("openai", model_id)
+    assert known is not None
+    assert known.supports_temperature is False
+    assert known.sampling_requires_reasoning_none is False
+
+
+def test_sampling_hatch_still_rejects_temperature_at_every_effort_but_none() -> None:
+    """Declaring the hatch admits sampling only at exact effort "none".
+
+    Mirrors the provider's live 400 ("'temperature' does not support 0.3 with
+    this model") at low and high, and its 200 at none, for gpt-5.2/5.4/5.5.
+    """
+    for effort in ("low", "medium", "high", "xhigh", None):
+        with pytest.raises(ProviderParameterError) as excinfo:
+            require_sampling_reasoning_compatibility(
+                reasoning_effort=effort,
+                sampling_requires_reasoning_none=True,
+                temperature_requested=True,
+                top_p_requested=False,
+            )
+        assert excinfo.value.param == "temperature"
+    with pytest.raises(ProviderParameterError) as excinfo:
+        require_sampling_reasoning_compatibility(
+            reasoning_effort="high",
+            sampling_requires_reasoning_none=True,
+            temperature_requested=False,
+            top_p_requested=True,
+        )
+    assert excinfo.value.param == "top_p"
+    require_sampling_reasoning_compatibility(
+        reasoning_effort="none",
+        sampling_requires_reasoning_none=True,
+        temperature_requested=True,
+        top_p_requested=True,
+    )
 
 
 def test_exact_effort_support_covers_each_reasoning_wire_family() -> None:

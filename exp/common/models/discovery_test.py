@@ -128,10 +128,17 @@ def test_router_candidate_role_requires_prices_and_both_token_limits() -> None:
 
 
 def test_catalog_request_shaping_capability_reaches_openai_runtime_metadata() -> None:
-    """OpenAI reasoning models resolve with temperature disabled for request shaping."""
-    resolved = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.4-mini"))
+    """Reasoning-only OpenAI models resolve with temperature disabled for request shaping.
+
+    Models with a documented "none" effort (gpt-5.4-mini here) instead keep
+    temperature enabled behind the sampling_requires_reasoning_none hatch.
+    """
+    resolved = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5-mini"))
+    hatch = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.4-mini"))
 
     assert not resolved.capabilities.supports_temperature
+    assert hatch.capabilities.supports_temperature
+    assert hatch.capabilities.sampling_requires_reasoning_none
 
 
 def test_reasoning_capable_models_resolve_with_the_default_medium_pin() -> None:

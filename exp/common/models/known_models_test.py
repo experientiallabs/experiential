@@ -59,8 +59,8 @@ def test_documented_chat_model_carries_verified_capabilities_and_prices() -> Non
 
 
 def test_reasoning_models_pin_sampling_and_small_models_carry_token_limits() -> None:
-    """OpenAI reasoning models reject explicit temperature and small tiers state both limits."""
-    mini = known_model_metadata("openai", "gpt-5.4-mini")
+    """Reasoning-only OpenAI models reject temperature and small tiers state both limits."""
+    mini = known_model_metadata("openai", "gpt-5-mini")
     embedding = known_model_metadata("openai", "text-embedding-3-large")
 
     assert mini is not None
@@ -71,6 +71,11 @@ def test_reasoning_models_pin_sampling_and_small_models_carry_token_limits() -> 
     assert embedding is not None
     assert embedding.supports_temperature is None
     assert not embedding.supports_reasoning_effort
+
+
+_SAMPLING_AT_NONE_MODELS = frozenset(
+    {"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.2", "gpt-5.1"}
+)
 
 
 @pytest.mark.parametrize(
@@ -130,8 +135,13 @@ def test_every_openai_chat_entry_has_complete_verified_metadata(
     assert known is not None
     assert known.supports_completions
     assert known.supports_tools
-    assert known.supports_temperature is (model == "gpt-5.1")
-    assert known.sampling_requires_reasoning_none is (model == "gpt-5.1")
+    # Models whose pages document effort "none" honor temperature and top_p
+    # at exactly that effort (provider-verified 2026-09-03); the pro tiers,
+    # gpt-5, and the 5.6 line reject explicit sampling at every effort.
+    sampling_at_none = model in _SAMPLING_AT_NONE_MODELS
+    assert known.supports_temperature is sampling_at_none
+    assert known.supports_top_p is sampling_at_none
+    assert known.sampling_requires_reasoning_none is sampling_at_none
     assert known.reasoning_effort == ("high" if model == "gpt-5-pro" else "medium")
     assert known.context_window_tokens == context_window_tokens
     assert known.maximum_output_tokens == maximum_output_tokens

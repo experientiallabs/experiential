@@ -262,7 +262,14 @@ def _openai_supported_efforts(model_id: str) -> Collection[str] | None:
         "gpt-5.4-nano",
         "gpt-5.5",
     }:
-        supported = ("low", "medium", "high", "xhigh")
+        # Each model page documents "none, low, medium, high and xhigh".
+        # Provider-verified 2026-09-03 on direct OpenAI (all five) and Azure
+        # OpenAI (gpt-5.4): "none" answers with zero reasoning tokens and is
+        # the only effort at which temperature and top_p are honored; every
+        # other effort rejects them with 400 unsupported_value. Without
+        # "none" on this ladder the sampling hatch declared by
+        # sampling_requires_reasoning_none is unreachable.
+        supported = ("none", "low", "medium", "high", "xhigh")
     elif identity == "gpt-5.1":
         supported = ("none", "low", "medium", "high")
     elif identity in {"gpt-5", "gpt-5-mini", "gpt-5-nano"}:
