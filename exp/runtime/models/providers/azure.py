@@ -27,6 +27,13 @@ DEFAULT_AZURE_API_SURFACE: AzureApiSurface = "openai_deployments"
 # The Foundry model-inference surface requires a dated API version, so an endpoint left on the
 # Azure OpenAI ``v1`` spelling still resolves to a version that surface accepts.
 MODEL_INFERENCE_FALLBACK_API_VERSION = "2024-05-01-preview"
+# The ``api-version`` values the model-inference surface (``{resource}/models``) answers. Every
+# other dated version belongs to the Azure OpenAI deployments vocabulary: a Foundry resource
+# answers ``/models/chat/completions?api-version=2024-10-21`` with a bare 404 ``Resource not
+# found`` while serving the same deployment at ``/openai/deployments/{name}`` on that version.
+MODEL_INFERENCE_API_VERSIONS: frozenset[str] = frozenset(
+    {MODEL_INFERENCE_FALLBACK_API_VERSION, "2025-04-01-preview"}
+)
 
 
 def resolve_azure_api_surface(
@@ -40,7 +47,10 @@ def resolve_azure_api_surface(
     An explicitly configured surface always wins. Otherwise the surface follows the endpoint
     host, so a Foundry resource reaches the model-inference surface without an operator having to
     name it. An inferred model-inference surface also upgrades the Azure OpenAI ``v1`` API
-    version, which that surface rejects.
+    version, which that surface rejects, and keeps a dated Azure OpenAI version (``2024-10-21``)
+    on the deployments surface that version belongs to: a Foundry resource serves that surface as
+    well, whereas the model-inference surface 404s every version outside its own vocabulary.
+    Inference never sends a version to a surface that rejects it.
 
     Args:
         endpoint: Azure resource endpoint from the connection.
@@ -55,8 +65,11 @@ def resolve_azure_api_surface(
     inferred = infer_azure_api_surface(endpoint)
     if inferred is None:
         return DEFAULT_AZURE_API_SURFACE, api_version
-    if inferred == "model_inference" and api_version == _V1_API_VERSION:
-        return inferred, MODEL_INFERENCE_FALLBACK_API_VERSION
+    if inferred == "model_inference":
+        if api_version == _V1_API_VERSION:
+            return inferred, MODEL_INFERENCE_FALLBACK_API_VERSION
+        if api_version not in MODEL_INFERENCE_API_VERSIONS:
+            return DEFAULT_AZURE_API_SURFACE, api_version
     return inferred, api_version
 
 

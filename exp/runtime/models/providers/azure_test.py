@@ -20,6 +20,7 @@ from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.azure import (
     AZURE_OPENAI_API_KEY_ENV,
     AZURE_OPENAI_ENDPOINT_ENV,
+    MODEL_INFERENCE_API_VERSIONS,
     MODEL_INFERENCE_FALLBACK_API_VERSION,
     AzureClient,
     bind_azure_api_key,
@@ -520,11 +521,32 @@ def test_resolution_upgrades_an_unconfigured_foundry_connection() -> None:
         api_version="v1",
         configured_surface=None,
     ) == ("model_inference", MODEL_INFERENCE_FALLBACK_API_VERSION)
+    for version in sorted(MODEL_INFERENCE_API_VERSIONS):
+        assert resolve_azure_api_surface(
+            endpoint="https://resource.services.ai.azure.com",
+            api_version=version,
+            configured_surface=None,
+        ) == ("model_inference", version)
+
+
+def test_resolution_keeps_a_dated_azure_openai_version_on_the_deployments_surface() -> None:
+    """A Foundry host with an Azure OpenAI dated version serves /openai/deployments, not /models.
+
+    Live-tested 2026-09-03 against a Foundry resource: ``/models/chat/completions`` answers
+    ``api-version=2024-10-21`` with a bare 404 ``Resource not found`` while
+    ``/openai/deployments/{name}/chat/completions`` serves the same deployment on that version.
+    """
     assert resolve_azure_api_surface(
         endpoint="https://resource.services.ai.azure.com",
-        api_version="2024-05-01-preview",
+        api_version="2024-10-21",
         configured_surface=None,
-    ) == ("model_inference", "2024-05-01-preview")
+    ) == ("openai_deployments", "2024-10-21")
+    # An operator who declares the surface keeps authority over the version sent with it.
+    assert resolve_azure_api_surface(
+        endpoint="https://resource.services.ai.azure.com",
+        api_version="2024-10-21",
+        configured_surface="model_inference",
+    ) == ("model_inference", "2024-10-21")
 
 
 def test_resolution_leaves_unrecognized_and_azure_openai_hosts_on_deployments() -> None:
