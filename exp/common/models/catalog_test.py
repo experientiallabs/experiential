@@ -25,7 +25,10 @@ from exp.common.models import (
     load_model_catalog,
     write_model_catalog,
 )
-from exp.common.models.catalog import infer_azure_api_surface
+from exp.common.models.catalog import (
+    SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION,
+    infer_azure_api_surface,
+)
 
 
 def _catalog() -> ModelCatalog:
@@ -169,6 +172,34 @@ def test_legacy_catalog_rejects_noninteger_schema_one_lookalikes(
 
     with pytest.raises(ModelCatalogError, match="schema_version must be an integer"):
         load_model_catalog(path)
+
+
+def test_authored_schema_version_window_and_shape_are_pinned() -> None:
+    """Change-detector for the authored catalog contract every hydration parses first.
+
+    The version is a sane-ranged int, never a ``Literal``: a changed literal on
+    a known field raises ``literal_error``, which the forward-compatible read
+    path cannot drop, so a literal bump would warm-fail every older pod (the
+    09-02 incident class on the authored side). If this test fails you changed
+    the authored contract: an additive field is fine (old read-tolerant parsers
+    drop it) — update the fingerprint; narrowing the version window back to a
+    literal, or a revision that reinterprets existing fields, needs a new field
+    name or a fleet-first tolerance release instead.
+    """
+    authored = _catalog().model_dump(mode="json")
+    for accepted in (2, 3, SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION):
+        parsed = ModelCatalog.model_validate({**authored, "schema_version": accepted})
+        assert parsed.schema_version == accepted
+    for rejected in (0, 1, SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION + 1):
+        with pytest.raises(ValidationError):
+            ModelCatalog.model_validate({**authored, "schema_version": rejected})
+    assert sorted(ModelCatalog.model_fields) == [
+        "connections",
+        "gateway_pools",
+        "models",
+        "roles",
+        "schema_version",
+    ]
 
 
 def test_legacy_catalog_recursively_migrates_sft_base_model_billing(tmp_path: Path) -> None:
