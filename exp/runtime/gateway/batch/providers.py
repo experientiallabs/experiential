@@ -517,8 +517,16 @@ class OpenRouterBatchClient:
         )
 
 
+class DoublewordBatchClient(OpenAIBatchClient):
+    """Doubleword Batch API: the OpenAI batch dialect at Doubleword's endpoint."""
+
+    provider = "doubleword"
+    _base = "https://api.doubleword.ai/v1"
+
+
 PROVIDER_CLIENTS: dict[str, ProviderBatchClient] = {
     OpenAIBatchClient.provider: OpenAIBatchClient(),
     AnthropicBatchClient.provider: AnthropicBatchClient(),
     OpenRouterBatchClient.provider: OpenRouterBatchClient(),
+    DoublewordBatchClient.provider: DoublewordBatchClient(),
 }

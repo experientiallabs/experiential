@@ -26,6 +26,7 @@ from exp.runtime.gateway.batch.contracts import (
 from exp.runtime.gateway.batch.providers import (
     ANTHROPIC_HOST,
     AnthropicBatchClient,
+    DoublewordBatchClient,
     OpenAIBatchClient,
     OpenRouterBatchClient,
     require_exact_host,
@@ -333,3 +334,54 @@ def test_require_exact_host_accepts_the_exact_authority() -> None:
     """The exact https host with the default port passes unchanged."""
     url = f"https://{ANTHROPIC_HOST}/v1/results?page=1"
     assert require_exact_host(url, ANTHROPIC_HOST) == url
+
+
+def test_doubleword_speaks_the_openai_dialect_at_the_doubleword_host() -> None:
+    """The client uploads then creates the batch against api.doubleword.ai."""
+    hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        if request.url.path == "/v1/files":
+            return httpx.Response(200, json={"id": "file_dw"})
+        assert request.url.path == "/v1/batches"
+        assert json.loads(request.content) == {
+            "input_file_id": "file_dw",
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+        }
+        return httpx.Response(200, json={"id": "pb_dw"})
+
+    client = DoublewordBatchClient(transport=_transport(handler))
+    provider_id = asyncio.run(client.submit(job=_job("doubleword"), api_key="sk-dw"))
+    assert provider_id == "pb_dw"
+    assert hosts == ["api.doubleword.ai", "api.doubleword.ai"]
+
+
+def test_doubleword_results_download_from_the_doubleword_host() -> None:
+    """Result files are fetched from Doubleword, not the OpenAI host."""
+    hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        if request.url.path == "/v1/batches/pb_1":
+            return httpx.Response(200, json={"status": "completed", "output_file_id": "fo"})
+        assert request.url.path == "/v1/files/fo/content"
+        return httpx.Response(
+            200,
+            text=json.dumps(
+                {
+                    "custom_id": "line-0",
+                    "response": {
+                        "status_code": 200,
+                        "body": {"usage": {"prompt_tokens": 3, "completion_tokens": 5}},
+                    },
+                    "error": None,
+                }
+            ),
+        )
+
+    client = DoublewordBatchClient(transport=_transport(handler))
+    results = asyncio.run(client.results(job=_job("doubleword"), api_key="sk"))
+    assert results[0].custom_id == "line-0" and results[0].output_tokens == 5
+    assert set(hosts) == {"api.doubleword.ai"}
