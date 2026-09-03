@@ -1,6 +1,6 @@
 [package]
 name = "exp-gateway-native"
-version = "0.3.22"
+version = "0.3.23"
 edition = "2021"
 description = "Rust data plane for the Experiential local gateway (PoC), embedded as a PyO3 extension."
 license = "Apache-2.0"
@@ -31,6 +31,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 thiserror = "2"
+
+[dev-dependencies]
+# Frame-level HTTP/2 server control for the reset/goaway regression tests:
+# the production wire to fronting proxies negotiates h2, so mid-stream aborts
+# arrive as RST_STREAM/GOAWAY, a different reqwest path than h1 truncation.
+h2 = "0.4"
 
 [profile.release]
 lto = "thin"
