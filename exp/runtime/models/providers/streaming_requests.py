@@ -295,32 +295,55 @@ def route_generation_parameter_requests(
         """Return the caller effort or this wire's required provider default."""
         return _effective_profile_reasoning_effort(profile, request.reasoning_effort)
 
+    def sampling_declared(profile: GatewayWireProfile, *, top_p: bool = False) -> bool:
+        """Return whether one rung declares this sampling control at all."""
+        return profile.supports_top_p is True if top_p else profile.supports_temperature
+
     def sampling_supported(profile: GatewayWireProfile, *, top_p: bool = False) -> bool:
         """Return whether one rung accepts this request's sampling mode."""
-        declared = profile.supports_top_p is True if top_p else profile.supports_temperature
-        return declared and (
+        return sampling_declared(profile, top_p=top_p) and (
             not profile.sampling_requires_reasoning_none
             or profile_reasoning_effort(profile) == "none"
         )
 
+    def srn_only_block(*, top_p: bool = False) -> bool:
+        """Return whether the ONLY reason the route blocks this control is srn.
+
+        Every rung declares the control, but at least one is a reasoning route
+        that accepts sampling only at ``reasoning_effort=none`` and is not at
+        none here. Such a control is dropped-and-disclosed rather than rejected:
+        the model does accept it, just not at this effort. A rung that does not
+        declare the control at all (Anthropic constrained sampling) is a genuine
+        unsupported case and is NOT covered here, so it still hard-rejects.
+        """
+        return all(sampling_declared(profile, top_p=top_p) for profile in profiles) and not all(
+            sampling_supported(profile, top_p=top_p) for profile in profiles
+        )
+
     if request.temperature is not None:
-        _require_route_numeric_parameter(
-            profiles,
-            param="temperature",
-            value=request.temperature,
-            supported=sampling_supported,
-            minimum=lambda profile: profile.minimum_temperature,
-            maximum=lambda profile: profile.maximum_temperature,
-        )
+        if srn_only_block():
+            ignore("temperature", "temperature->dropped(set_reasoning_effort_none)")
+        else:
+            _require_route_numeric_parameter(
+                profiles,
+                param="temperature",
+                value=request.temperature,
+                supported=sampling_supported,
+                minimum=lambda profile: profile.minimum_temperature,
+                maximum=lambda profile: profile.maximum_temperature,
+            )
     if request.top_p is not None:
-        _require_route_numeric_parameter(
-            profiles,
-            param="top_p",
-            value=request.top_p,
-            supported=lambda profile: sampling_supported(profile, top_p=True),
-            minimum=lambda profile: profile.minimum_top_p,
-            maximum=lambda profile: profile.maximum_top_p,
-        )
+        if srn_only_block(top_p=True):
+            ignore("top_p", "top_p->dropped(set_reasoning_effort_none)")
+        else:
+            _require_route_numeric_parameter(
+                profiles,
+                param="top_p",
+                value=request.top_p,
+                supported=lambda profile: sampling_supported(profile, top_p=True),
+                minimum=lambda profile: profile.minimum_top_p,
+                maximum=lambda profile: profile.maximum_top_p,
+            )
     if request.top_k is not None:
         _require_route_numeric_parameter(
             profiles,

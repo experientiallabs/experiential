@@ -36,15 +36,40 @@ def compatible_generation_parameter_profile_indexes(
     """
     if not profiles:
         raise ValueError("generation parameter selection requires at least one wire profile")
-    compatible: list[int] = []
+    # Prefer rungs that HONOR the caller's sampling exactly over rungs that can
+    # only serve it by dropping temperature/top_p (a reasoning route at an effort
+    # other than none). Both are servable, but preserving the caller's intent
+    # wins when a rung can — the drop is a last resort, not a peer of an exact
+    # rung. Only if no rung honors it do the serve-with-drop rungs stand in.
+    exact: list[int] = []
+    serviceable: list[int] = []
     rejections: list[ProviderParameterError] = []
     for index, profile in enumerate(profiles):
         try:
-            route_generation_parameter_requests((profile,), request)
+            _public, provider = route_generation_parameter_requests((profile,), request)
         except ProviderParameterError as exc:
             rejections.append(exc)
             continue
-        compatible.append(index)
-    if compatible:
-        return tuple(compatible)
+        serviceable.append(index)
+        if _honors_requested_sampling(request, provider):
+            exact.append(index)
+    if exact:
+        return tuple(exact)
+    if serviceable:
+        return tuple(serviceable)
+    # No rung can serve the request: raise the first rung's OWN rejection — it
+    # names the field the caller can act on, whereas re-checking the whole route
+    # would report the route's mixed wire shape and hide that reason.
     raise rejections[0]
+
+
+def _honors_requested_sampling(request: GatewayRequest, provider_request: GatewayRequest) -> bool:
+    """Return whether a rung kept every sampling control the caller actually sent.
+
+    A rung that dropped a requested ``temperature``/``top_p`` (the srn drop) did
+    not preserve the caller's intent exactly, so it is only a fallback behind any
+    rung that honors the value.
+    """
+    if request.temperature is not None and provider_request.temperature is None:
+        return False
+    return not (request.top_p is not None and provider_request.top_p is None)
