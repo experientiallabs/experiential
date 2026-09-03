@@ -11,7 +11,7 @@ from exp.runtime.openai_protocol.wire_models import _ChatResponseFormat, _Respon
 JSON_OBJECT_TRANSLATION_DISCLOSURE = "response_format->translated(json_object)"
 
 
-def _chat_structured_text(value: _ChatResponseFormat | None) -> StructuredTextFormat | None:
+def chat_structured_text(value: _ChatResponseFormat | None) -> StructuredTextFormat | None:
     """Convert the Chat response format to the internal structured-text shape.
 
     ``json_object`` translates to a permissive non-strict json_schema so the
@@ -35,7 +35,7 @@ def _chat_structured_text(value: _ChatResponseFormat | None) -> StructuredTextFo
     )
 
 
-def _responses_structured_text(value: _ResponseText | None) -> StructuredTextFormat | None:
+def responses_structured_text(value: _ResponseText | None) -> StructuredTextFormat | None:
     """Convert the Responses JSON Schema text format when requested."""
     if value is None or value.format is None or value.format.type == "text":
         return None

@@ -63,8 +63,8 @@ from exp.runtime.openai_protocol.responses_input import (
 )
 from exp.runtime.openai_protocol.structured_text import (
     JSON_OBJECT_TRANSLATION_DISCLOSURE,
-    _chat_structured_text,
-    _responses_structured_text,
+    chat_structured_text,
+    responses_structured_text,
 )
 from exp.runtime.openai_protocol.wire_models import (
     _AdditionalToolsItem,
@@ -187,7 +187,7 @@ def decode_chat(
             tools=tuple(_chat_tool(tool) for tool in request.tools),
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
-            structured_text=_chat_structured_text(request.response_format),
+            structured_text=chat_structured_text(request.response_format),
             ignored_parameters=(
                 (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
                 if request.response_format is not None
@@ -353,7 +353,7 @@ def decode_responses(
             provider_native_tools=tuple(native_tools),
             tool_choice=_responses_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
-            structured_text=_responses_structured_text(request.text),
+            structured_text=responses_structured_text(request.text),
             maximum_output_tokens=request.max_output_tokens,
             maximum_output_tokens_parameter=(
                 "max_output_tokens" if request.max_output_tokens is not None else None

@@ -579,6 +579,31 @@ def test_penalties_honor_where_supported_and_drop_with_disclosure_otherwise() ->
     )
 
 
+def test_penalty_flag_on_a_non_emitting_dialect_still_drops_and_discloses() -> None:
+    """A supports_*_penalty flag stamped on a dialect that cannot EMIT penalties
+    (only openai_compatible does) must NOT claim honored — it drops+discloses, never a
+    silent undisclosed omission (a catalog could mis-stamp e.g. an openai_responses rung)."""
+    responses_rung = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://r.test",
+        model_id="gpt-5",
+        supports_frequency_penalty=True,
+        supports_presence_penalty=True,
+    )
+    request = _chat_request().model_copy(
+        update={"frequency_penalty": 0.5, "presence_penalty": -0.2}
+    )
+
+    public, provider = route_generation_parameter_requests((responses_rung,), request)
+
+    assert provider.frequency_penalty is None
+    assert provider.presence_penalty is None
+    assert public.ignored_parameters == (
+        "frequency_penalty->dropped(unsupported_by_provider)",
+        "presence_penalty->dropped(unsupported_by_provider)",
+    )
+
+
 def test_route_rejects_effort_not_preserved_by_the_whole_waterfall() -> None:
     """An exact effort mismatch fails locally instead of clamping on a fallback."""
     request = GatewayRequest(
@@ -1133,6 +1158,35 @@ def test_srn_sampling_is_honored_at_explicit_none_reasoning() -> None:
     assert provider_request.top_p == 0.9
     assert provider_request.reasoning_effort == "none"
     assert public_request.ignored_parameters == ()
+
+
+def test_temperature_narrows_to_a_honoring_rung_over_an_srn_rung() -> None:
+    """A mixed route [srn rung + a plain rung that honors sampling] narrows temperature/
+    top_p to the honoring rung rather than dropping them on the srn rung — preserving the
+    caller's value when a rung can serve it."""
+    srn_rung = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://srn.test",
+        model_id="gpt-5.1",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        reasoning_effort="medium",
+        supports_temperature=True,
+        supports_top_p=True,
+        sampling_requires_reasoning_none=True,
+    )
+    plain_rung = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://plain.test",
+        model_id="provider/plain",
+        supports_temperature=True,
+        supports_top_p=True,
+    )
+    request = _chat_request(temperature=0.5, top_p=0.9)
+
+    # The srn rung would drop sampling at effort=medium; the plain rung honors it, so
+    # selection narrows to the honoring rung.
+    assert compatible_generation_parameter_profile_indexes((srn_rung, plain_rung), request) == (1,)
 
 
 def test_genuinely_unsupported_sampling_still_hard_rejects() -> None:

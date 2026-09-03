@@ -367,16 +367,26 @@ def route_generation_parameter_requests(
                 minimum=lambda profile: profile.minimum_top_k,
                 maximum=lambda profile: profile.maximum_top_k,
             )
+
     # Sampling penalties are soft preferences: a rung that does not carry them
     # still returns a valid answer, so a route with any rung that lacks support
-    # drops them with disclosure rather than rejecting. Honored (emitted) only
-    # when every rung supports the control.
+    # drops them with disclosure rather than rejecting. Honoring is gated on the
+    # openai_compatible dialect — the ONLY payload that emits penalties — so a
+    # capability flag stamped on a non-emitting dialect (e.g. openai_responses)
+    # can never claim "honored" and then silently omit the field. Emission stays
+    # in one place; if another dialect ever emits penalties, add it here too.
+    def penalty_honored(profile: GatewayWireProfile, *, presence: bool) -> bool:
+        supported = (
+            profile.supports_presence_penalty if presence else profile.supports_frequency_penalty
+        )
+        return supported and profile.dialect == "openai_compatible"
+
     if request.frequency_penalty is not None and not all(
-        profile.supports_frequency_penalty for profile in profiles
+        penalty_honored(profile, presence=False) for profile in profiles
     ):
         ignore("frequency_penalty", "frequency_penalty->dropped(unsupported_by_provider)")
     if request.presence_penalty is not None and not all(
-        profile.supports_presence_penalty for profile in profiles
+        penalty_honored(profile, presence=True) for profile in profiles
     ):
         ignore("presence_penalty", "presence_penalty->dropped(unsupported_by_provider)")
     if request.reasoning_effort is not None:
