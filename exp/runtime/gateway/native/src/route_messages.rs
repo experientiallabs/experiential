@@ -21,7 +21,9 @@ use crate::admission::{
     Admission,
 };
 use crate::encode::compact_json;
-use crate::encode_messages::{anthropic_error_body, completed_messages_body, MessagesSseEncoder};
+use crate::encode_messages::{
+    anthropic_error_body, completed_messages_body_with_ignored, MessagesSseEncoder,
+};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::{classify_escalation, METRICS};
@@ -247,8 +249,12 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
         };
         return sse_body_response(&headers, body);
     }
-    let aggregated = match completed_messages_body(&admission.request_id, &admission.alias, &events)
-    {
+    let aggregated = match completed_messages_body_with_ignored(
+        &admission.request_id,
+        &admission.alias,
+        &events,
+        &admission.ignored_parameters,
+    ) {
         Ok(aggregated) => aggregated,
         Err(error) => return messages_error_response(&error),
     };
@@ -271,8 +277,12 @@ async fn respond_from_messages_events(
     stream_body: bool,
 ) -> Response {
     let refusal_completed = complete_visible_refusal(&mut events);
-    let aggregated = match completed_messages_body(&admission.request_id, &admission.alias, &events)
-    {
+    let aggregated = match completed_messages_body_with_ignored(
+        &admission.request_id,
+        &admission.alias,
+        &events,
+        &admission.ignored_parameters,
+    ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
             guard
@@ -352,7 +362,11 @@ async fn respond_from_messages_events(
 }
 
 fn encode_messages_sse(admission: &Admission, events: &[Event]) -> Result<Vec<u8>, PublicError> {
-    let mut encoder = MessagesSseEncoder::new(&admission.request_id, &admission.alias);
+    let mut encoder = MessagesSseEncoder::new_with_ignored(
+        &admission.request_id,
+        &admission.alias,
+        admission.ignored_parameters.clone(),
+    );
     let mut body = Vec::new();
     for frame in encoder.start()? {
         body.extend_from_slice(frame.as_bytes());
@@ -480,6 +494,7 @@ async fn stream_messages(
     };
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();
+    let ignored_parameters = admission.ignored_parameters.clone();
     let phase_timeout = admission.phase_timeout(committed.depth);
     let task_hold = guard.hold_task();
     tokio::spawn(async move {
@@ -487,7 +502,8 @@ async fn stream_messages(
         let _permit = permit;
         let mut guard = guard;
         let mut committed = committed;
-        let mut encoder = MessagesSseEncoder::new(&request_id, &alias);
+        let mut encoder =
+            MessagesSseEncoder::new_with_ignored(&request_id, &alias, ignored_parameters);
         let mut usage: Option<Usage> = committed.usage.take();
         let mut tool_names: Vec<String> = std::mem::take(&mut committed.tool_names);
         let mut visible_refusal = committed.visible_refusal;

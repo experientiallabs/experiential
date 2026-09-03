@@ -29,6 +29,17 @@ pub fn completed_messages_body(
     model: &str,
     events: &[Event],
 ) -> Result<AggregatedMessage, PublicError> {
+    completed_messages_body_with_ignored(request_id, model, events, &[])
+}
+
+/// Build one non-streaming Anthropic message with ignored-control disclosure,
+/// mirroring `completed_chat_body_with_ignored`.
+pub fn completed_messages_body_with_ignored(
+    request_id: &str,
+    model: &str,
+    events: &[Event],
+    ignored_parameters: &[String],
+) -> Result<AggregatedMessage, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
         Some(event) => event,
@@ -219,7 +230,7 @@ pub fn completed_messages_body(
         }
     }
     let content: Vec<Value> = slots.into_iter().flatten().collect();
-    let body = json!({
+    let mut body = json!({
         "id": stable_public_id("msg", request_id),
         "type": "message",
         "role": "assistant",
@@ -229,6 +240,7 @@ pub fn completed_messages_body(
         "stop_sequence": Value::Null,
         "usage": messages_usage(usage.as_ref()),
     });
+    super::disclose_ignored_parameters(&mut body, ignored_parameters);
     Ok(AggregatedMessage {
         body,
         failure: None,

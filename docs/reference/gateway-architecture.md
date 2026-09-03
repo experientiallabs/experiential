@@ -324,7 +324,9 @@ group, so a shim rung can no longer silently bill every turn's full context unca
 native rung stands ready; routes narrowing to only marker-dropping wires keep disclosing the
 dropped markers. Every coercion is disclosed in `path->effective` form
 through `ignored_parameters`, logged, and counted in the `admission_parameter_coercions`
-metric; nothing coercible keeps the first rung's own field-scoped rejection.
+metric; every serving surface carries that list to the caller as a body-level
+`x-experiential-ignored-parameters` key (Chat chunk and completion, Responses envelope, and the
+Anthropic message on both `message_start` and the aggregated body), so a drop is never silent; nothing coercible keeps the first rung's own field-scoped rejection.
 The per-deployment `capability_parity` export joins catalog declarations with the engine's
 provider-family ground truth so a catalog can pre-warn on gaps and route around them before a
 caller hits that 400.

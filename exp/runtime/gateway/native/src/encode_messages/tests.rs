@@ -612,3 +612,46 @@ fn usage_reports_both_cache_legs_out_of_the_folded_input_total() {
         })
     );
 }
+
+#[test]
+fn ignored_generation_controls_are_disclosed_by_both_messages_encoders() {
+    // A dropped `output_config.effort` on an empty-ladder Claude (or a
+    // dropped beta token) must reach the caller on the Messages surface the
+    // same way Chat and Responses disclose it: a body-level key on the
+    // message object, both on `message_start` and on the aggregated body.
+    let ignored = vec![
+        "reasoning_effort".to_string(),
+        "anthropic-beta.claude-code-20250219".to_string(),
+    ];
+    let mut stream = MessagesSseEncoder::new_with_ignored("request-abc", "coding", ignored.clone());
+    let frames = stream.start().expect("stream start must encode");
+    let message_start = frames
+        .iter()
+        .find(|frame| frame.starts_with("event: message_start"))
+        .expect("message_start frame");
+    assert!(message_start.contains(
+        "\"x-experiential-ignored-parameters\":[\"reasoning_effort\",\"anthropic-beta.claude-code-20250219\"]"
+    ));
+
+    let events = vec![Event::TextDelta("hi".to_string()), Event::Completed];
+    let aggregated =
+        completed_messages_body_with_ignored("request-abc", "coding", &events, &ignored)
+            .expect("aggregates");
+    assert_eq!(
+        aggregated.body["x-experiential-ignored-parameters"],
+        json!(["reasoning_effort", "anthropic-beta.claude-code-20250219"])
+    );
+
+    // Nothing dropped, nothing disclosed: the plain envelope stays byte-identical.
+    let mut plain = MessagesSseEncoder::new("request-abc", "coding");
+    assert!(!plain
+        .start()
+        .expect("plain start must encode")
+        .concat()
+        .contains("x-experiential-ignored-parameters"));
+    let plain_body = completed_messages_body("request-abc", "coding", &events).expect("aggregates");
+    assert!(plain_body
+        .body
+        .get("x-experiential-ignored-parameters")
+        .is_none());
+}

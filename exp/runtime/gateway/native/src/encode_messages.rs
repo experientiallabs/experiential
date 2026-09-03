@@ -188,13 +188,25 @@ pub struct MessagesSseEncoder {
     saw_tool_use: bool,
     refusal_seen: bool,
     usage: Option<Usage>,
+    ignored_parameters: Vec<String>,
 }
 
 impl MessagesSseEncoder {
     pub fn new(request_id: &str, model: &str) -> Self {
+        Self::new_with_ignored(request_id, model, Vec::new())
+    }
+
+    /// Build an encoder that discloses controls omitted by route shaping,
+    /// mirroring `ChatSseEncoder::new_with_ignored`.
+    pub fn new_with_ignored(
+        request_id: &str,
+        model: &str,
+        ignored_parameters: Vec<String>,
+    ) -> Self {
         Self {
             message_id: stable_public_id("msg", request_id),
             model: model.to_string(),
+            ignored_parameters,
             started: false,
             terminal: false,
             draining: false,
@@ -223,7 +235,7 @@ impl MessagesSseEncoder {
             ));
         }
         self.started = true;
-        let message = json!({
+        let mut message = json!({
             "id": self.message_id,
             "type": "message",
             "role": "assistant",
@@ -233,6 +245,11 @@ impl MessagesSseEncoder {
             "stop_sequence": Value::Null,
             "usage": {"input_tokens": 0, "output_tokens": 0},
         });
+        // Same body-level disclosure as the Chat and Responses encoders: the
+        // Anthropic envelope has no field for it, and the official SDK
+        // tolerates extra keys, so a dropped control (an empty-ladder
+        // `output_config.effort`, a dropped beta token) is never silent.
+        disclose_ignored_parameters(&mut message, &self.ignored_parameters);
         Ok(vec![
             event_frame(
                 "message_start",
@@ -811,7 +828,22 @@ impl MessagesSseEncoder {
 
 mod aggregate;
 
-pub use aggregate::completed_messages_body;
+pub use aggregate::{completed_messages_body, completed_messages_body_with_ignored};
+
+/// Attach the `x-experiential-ignored-parameters` disclosure to one message
+/// object when any control was dropped; an empty list adds nothing.
+pub(super) fn disclose_ignored_parameters(message: &mut Value, ignored_parameters: &[String]) {
+    if ignored_parameters.is_empty() {
+        return;
+    }
+    message
+        .as_object_mut()
+        .expect("Anthropic message is an object")
+        .insert(
+            "x-experiential-ignored-parameters".to_string(),
+            json!(ignored_parameters),
+        );
+}
 
 #[cfg(test)]
 mod tests;
