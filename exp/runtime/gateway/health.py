@@ -14,6 +14,11 @@ DeploymentHealthKey = tuple[str, str, str]
 _HARD_FAILURES = {
     GatewayFailureClass.PROVIDER_AUTHENTICATION,
     GatewayFailureClass.PROVIDER_NOT_FOUND,
+    # An unfunded provider account (402) is the same sticky operator-actionable
+    # deadness as a bad credential: open the circuit immediately so the dead
+    # rung stops being attempted first, and let the half-open probe rediscover
+    # it once the operator funds or enables the account.
+    GatewayFailureClass.PROVIDER_QUOTA,
 }
 _OPERATIONAL_FAILURES = {
     GatewayFailureClass.TRANSPORT,

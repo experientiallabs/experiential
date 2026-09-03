@@ -68,6 +68,21 @@ def test_operational_failures_still_open_the_circuit() -> None:
         assert not registry.claim(_KEY)
 
 
+def test_provider_quota_opens_the_circuit_immediately_like_other_hard_deadness() -> None:
+    """An unfunded provider account (402) suppresses the rung after ONE failure.
+
+    Without this, the billing-dead deployment stays first-in-line and burns one
+    wasted attempt per request before every failover; with it, the circuit opens
+    at once and the half-open probe rediscovers the rung when the operator
+    funds or enables the account.
+    """
+    registry = DeploymentHealthRegistry(failure_threshold=2, clock=lambda: 100.0)
+
+    registry.failed(_KEY, _failure(GatewayFailureClass.PROVIDER_QUOTA))
+
+    assert not registry.claim(_KEY)
+
+
 def test_throttle_storms_still_suppress_the_deployment() -> None:
     """Provider throttling keeps its authoritative suppression window."""
     registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: 100.0)
