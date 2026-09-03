@@ -162,6 +162,7 @@ def openai_embedding_request(
     *,
     dimensions: int | None = None,
     encoding_format: Literal["float", "base64"] | None = None,
+    user: str | None = None,
 ) -> JsonObject:
     """Convert ordered text into one OpenAI-compatible embedding request.
 
@@ -172,6 +173,8 @@ def openai_embedding_request(
             from the wire when absent so the provider's native width applies.
         encoding_format: Optional caller vector encoding. Omitted when absent so
             the provider default (``float``) applies.
+        user: Optional end-user attribution forwarded verbatim; omitted when
+            absent.
 
     Returns:
         The OpenAI-compatible ``/embeddings`` request body.
@@ -181,6 +184,8 @@ def openai_embedding_request(
         request["dimensions"] = dimensions
     if encoding_format is not None:
         request["encoding_format"] = encoding_format
+    if user is not None:
+        request["user"] = user
     return request
 
 
@@ -433,6 +438,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         return GatewayWireProfile(
             dialect="openai_compatible",
             url=f"{self._base_url}/{self._request_path(self._completion_path())}",
+            embeddings_url=f"{self._base_url}/{self._request_path('embeddings')}",
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,

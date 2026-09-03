@@ -179,6 +179,11 @@ class GatewayWireProfile:
     pre-serialized body the data plane must send verbatim, and the resolved
     client exposes ``sign_gateway_dispatch``."""
 
+    embeddings_url: str | None = None
+    """Full OpenAI-wire ``/embeddings`` endpoint for this connection, sharing
+    ``headers``; ``None`` when the connection speaks no embeddings wire, so the
+    embeddings surface excludes the rung instead of dispatching a chat URL."""
+
     def __post_init__(self) -> None:
         """Reject malformed operator wire contracts before admission."""
         if self.dialect not in {

@@ -194,15 +194,15 @@ fn is_semantic(event: &Event) -> bool {
 
 /// The control plane's answer to one `start_attempt` callback.
 #[derive(Debug, Deserialize)]
-struct StartResponse {
+pub(crate) struct StartResponse {
     #[serde(default)]
-    attempt_id: Option<String>,
+    pub(crate) attempt_id: Option<String>,
     #[serde(default)]
-    route_depth: Option<usize>,
+    pub(crate) route_depth: Option<usize>,
     #[serde(default)]
-    exhausted: bool,
+    pub(crate) exhausted: bool,
     #[serde(default)]
-    failure: Option<Failure>,
+    pub(crate) failure: Option<Failure>,
 }
 
 /// Whether the classified failure leaves any successor dispatch possible
@@ -210,7 +210,7 @@ struct StartResponse {
 /// control plane re-checks with health and budget state and may still answer
 /// with exhaustion.
 #[allow(clippy::too_many_arguments)]
-fn successor_possible(
+pub(crate) fn successor_possible(
     policy: RoutePolicy,
     route_length: usize,
     deadline: Instant,

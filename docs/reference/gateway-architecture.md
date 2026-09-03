@@ -18,6 +18,11 @@ It serves:
   upgrade answers 426, the status the Codex client maps to its HTTP fallback)
 - `POST /v1/messages` (the Anthropic Messages API; `POST /v1/messages/count_tokens` answers an
   explicit Anthropic-shaped refusal because the gateway has no tokenizer authority)
+- `POST /v1/embeddings` (the OpenAI Embeddings API: message-less and never streamed; served
+  only by aliases whose catalog capabilities declare `supports_embeddings` on an OpenAI-wire
+  connection, billed on the provider's reported `prompt_tokens` with no output leg, and
+  returned with the provider's exact vectors in `float` or `base64` form; an inbound
+  `Idempotency-Key` is ignored because the surface has no replay protocol)
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 

@@ -276,6 +276,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
         return GatewayWireProfile(
             dialect="openai_responses",
             url=f"{self._base_url}/{self._request_path(self._completion_path())}",
+            embeddings_url=f"{self._base_url}/{self._request_path('embeddings')}",
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,

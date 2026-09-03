@@ -74,6 +74,7 @@ from exp.runtime.gateway.native_continuation import (
 )
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_body
 from exp.runtime.gateway.native_dispatch import dispatch_signature_headers, frozen_dispatch
+from exp.runtime.gateway.native_embeddings import NativeEmbeddingsMixin
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     MAXIMUM_TOTAL_ATTEMPTS,
@@ -138,7 +139,7 @@ from exp.runtime.openai_protocol.state import (
 _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
-class NativeControlPlane(NativeBatchRelayMixin, NativeObservabilityMixin):
+class NativeControlPlane(NativeBatchRelayMixin, NativeEmbeddingsMixin, NativeObservabilityMixin):
     """Authority and accounting callbacks for the native data plane.
 
     Rust worker threads share the group-commit writer and the locked in-flight
