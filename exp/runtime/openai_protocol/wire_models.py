@@ -373,6 +373,25 @@ class _ChatRequest(_WireModel):
             )
         return value
 
+    store: bool | None = None
+    """Provider-side retention opt-out, accepted only at its no-op of false.
+
+    OpenAI agents hardcode ``store: false`` on every Chat request to refuse
+    retention; this gateway never retains Chat output, so false is already
+    satisfied and any other value (true, which would ask the gateway to retain
+    for distillation/evals) stays a named rejection.
+    """
+
+    @field_validator("store")
+    @classmethod
+    def _require_no_retention(cls, value: bool | None) -> bool | None:
+        """Accept retention only as already satisfied (the gateway retains nothing)."""
+        if value:
+            raise ValueError(
+                "supported only at false: this gateway does not retain Chat completions output"
+            )
+        return value
+
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)

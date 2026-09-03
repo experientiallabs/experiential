@@ -52,6 +52,9 @@ def test_manifests_classify_explicit_exclusions() -> None:
     # values Copilot hardcodes (n:1, truncation:"disabled",
     # prompt_cache_options:{"mode":"implicit"}).
     assert chat["n"] == CompatibilityDisposition.SUPPORTED
+    # Retention opt-out admitted at its no-op false (OpenAI agents hardcode it);
+    # store:true stays a named rejection in the Chat wire model.
+    assert chat["store"] == CompatibilityDisposition.SUPPORTED
     assert responses["truncation"] == CompatibilityDisposition.SUPPORTED
     assert responses["prompt_cache_options"] == CompatibilityDisposition.SUPPORTED
     assert chat["logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED

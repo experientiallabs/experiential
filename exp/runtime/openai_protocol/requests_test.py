@@ -720,6 +720,37 @@ def test_chat_decoder_rejects_unprojectable_top_logprobs() -> None:
     assert raised.value.detail.param == "top_logprobs"
 
 
+def test_chat_decoder_accepts_store_false_opt_out() -> None:
+    """OpenAI-style agents hardcode store:false and must not be rejected.
+
+    The gateway never retains Chat output, so store:false is a satisfied no-op
+    that decodes losslessly (it is not forwarded onto the canonical request).
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hello"}],
+            "store": False,
+        }
+    )
+    assert decoded.request.maximum_output_tokens is None
+    assert len(decoded.request.messages) == 1
+
+
+def test_chat_decoder_rejects_store_true_retention_request() -> None:
+    """store:true asks the gateway to retain output, which it never does."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hello"}],
+                "store": True,
+            }
+        )
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "store"
+
+
 def test_chat_decoder_preserves_logprobs_for_route_validation() -> None:
     """The route gate distinguishes a semantic true request from a false no-op."""
     for value in (True, False):
