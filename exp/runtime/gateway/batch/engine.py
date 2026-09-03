@@ -495,6 +495,12 @@ class BatchEngine:
                 # received, so nothing was accepted: fail now with the reason.
                 # Ambiguous responses and transport losses raise other errors
                 # and take the fail-closed interrupted path on the next poll.
+                _LOGGER.warning(
+                    "batch %s: %s rejected the submission: %s",
+                    job.batch_id,
+                    job.provider,
+                    rejection.message,
+                )
                 await self._finalize(
                     job.model_copy(update={"dispatch_started": True}),
                     BatchStatus.FAILED,

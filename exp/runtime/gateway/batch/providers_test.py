@@ -28,6 +28,7 @@ from exp.runtime.gateway.batch.providers import (
     AnthropicBatchClient,
     OpenAIBatchClient,
     OpenRouterBatchClient,
+    provider_error_detail,
     require_exact_host,
 )
 
@@ -163,14 +164,58 @@ def test_openai_cancel_posts_the_cancel_route() -> None:
 
 
 def test_openai_provider_error_maps_to_submit_error() -> None:
-    """A 500 from the provider raises the content-free provider_error."""
+    """A 500 from the provider raises provider_error naming the status."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"error": "boom"})
 
     client = OpenAIBatchClient(transport=_transport(handler))
-    with pytest.raises(BatchSubmitError, match="status 500"):
+    with pytest.raises(BatchSubmitError, match="status 500: boom"):
         asyncio.run(client.poll(job=_job("openai"), api_key="sk"))
+
+
+def test_provider_rejection_carries_the_provider_message() -> None:
+    """A 400 on submit names the provider's own error.message, bounded."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "  openai/gpt-4.1-nano:batch is not a valid\n model ID  ",
+                    "code": 400,
+                }
+            },
+        )
+
+    client = OpenRouterBatchClient(transport=_transport(handler))
+    with pytest.raises(BatchSubmitError) as raised:
+        asyncio.run(client.submit(job=_job("openrouter"), api_key="ork"))
+    assert raised.value.code == "provider_error"
+    assert raised.value.message == (
+        "provider batch create failed with status 400: "
+        "openai/gpt-4.1-nano:batch is not a valid model ID"
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(502, text="<html>Bad gateway</html>"),
+        httpx.Response(400, json={"error": {"type": "invalid_request_error"}}),
+        httpx.Response(400, json={"error": {"message": "   "}}),
+        httpx.Response(400, json=["not", "an", "object"]),
+    ],
+)
+def test_provider_error_without_a_message_stays_status_only(response: httpx.Response) -> None:
+    """Bodies that are not JSON or carry no message string add nothing."""
+    assert provider_error_detail(response) is None
+
+
+def test_provider_error_detail_is_bounded() -> None:
+    """A runaway provider message is cut at the detail limit."""
+    detail = provider_error_detail(httpx.Response(400, json={"error": {"message": "x" * 1000}}))
+    assert detail == "x" * 400
 
 
 def test_anthropic_submit_sends_inline_requests_with_version_header() -> None:

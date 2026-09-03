@@ -500,6 +500,16 @@ def test_definitive_submit_rejection_fails_immediately_with_the_reason() -> None
     assert "provider rejected the batch submission" in final.failure_message
     assert "status 401" in final.failure_message
     assert ledger.released == [("a", "failed")]
+    public = final.public_object()
+    errors = public["errors"]
+    assert isinstance(errors, dict)
+    data = errors["data"]
+    assert isinstance(data, list)
+    reason = data[-1]
+    assert isinstance(reason, dict)
+    assert reason["code"] == "failed"
+    assert reason["message"] == final.failure_message
+    assert public["failed_at"] is not None and public["completed_at"] is None
 
 
 def test_validation_and_binding_share_one_catalog_resolution() -> None:

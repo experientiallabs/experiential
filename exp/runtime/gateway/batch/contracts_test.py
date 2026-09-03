@@ -99,6 +99,48 @@ def test_job_public_object_is_openai_batch_shaped() -> None:
     assert isinstance(rendered["created_at"], int)
 
 
+def test_job_public_object_reports_the_failure_reason_and_failed_at() -> None:
+    """A failed job lists its failure under errors and stamps failed_at only."""
+    finalized = datetime(2026, 9, 1, 1, tzinfo=UTC)
+    rendered = _job(
+        status=BatchStatus.FAILED,
+        failure_message="provider rejected the batch submission: status 400: bad model",
+        finalized_at=finalized,
+    ).public_object()
+    assert rendered["errors"] == {
+        "object": "list",
+        "data": [
+            {
+                "code": "failed",
+                "message": "provider rejected the batch submission: status 400: bad model",
+                "line": None,
+                "custom_id": None,
+            }
+        ],
+    }
+    assert rendered["failed_at"] == int(finalized.timestamp())
+    assert rendered["completed_at"] is None
+    assert rendered["expired_at"] is None
+    assert rendered["cancelled_at"] is None
+
+
+def test_job_public_object_stamps_the_terminal_timestamp_by_status() -> None:
+    """Each terminal status owns exactly one ``*_at`` field."""
+    finalized = datetime(2026, 9, 1, 1, tzinfo=UTC)
+    stamp = int(finalized.timestamp())
+    by_status = {
+        BatchStatus.COMPLETED: "completed_at",
+        BatchStatus.EXPIRED: "expired_at",
+        BatchStatus.CANCELLED: "cancelled_at",
+    }
+    for status, field in by_status.items():
+        rendered = _job(status=status, finalized_at=finalized).public_object()
+        assert rendered[field] == stamp, status
+        others = {"completed_at", "failed_at", "expired_at", "cancelled_at"} - {field}
+        assert all(rendered[other] is None for other in others), status
+    assert _job(status=BatchStatus.IN_PROGRESS).public_object()["errors"] is None
+
+
 def test_file_public_object_is_openai_file_shaped() -> None:
     """The public file object carries the compatibility fields."""
     record = BatchFile(

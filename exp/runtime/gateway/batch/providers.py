@@ -112,16 +112,48 @@ def _usage_tokens(body: JsonObject | None) -> tuple[int, int]:
     return (input_tokens, output_tokens)
 
 
+_PROVIDER_ERROR_DETAIL_LIMIT = 400
+
+
+def provider_error_detail(response: httpx.Response) -> str | None:
+    """Return the provider's own error message from one failed response.
+
+    OpenAI, Anthropic, and OpenRouter all answer failures with a JSON body
+    whose ``error.message`` names the rejection (an unknown model, a
+    malformed line, an exhausted quota). Only that field is read: a body that
+    is not JSON, or that carries no message string, yields None, so an HTML
+    error page or an unexpected shape never reaches the caller. The message
+    is whitespace-normalized and bounded.
+    """
+    try:
+        parsed = response.json()
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    error = parsed.get("error")
+    message = error.get("message") if isinstance(error, dict) else error
+    if not isinstance(message, str):
+        return None
+    detail = " ".join(message.split())
+    if not detail:
+        return None
+    return detail[:_PROVIDER_ERROR_DETAIL_LIMIT]
+
+
 async def _checked(response: httpx.Response, *, action: str) -> JsonObject:
     """Return the JSON object body of one successful provider response.
 
     Raises:
-        BatchSubmitError: With a content-free provider status summary when the
-            call failed or the body is not a JSON object.
+        BatchSubmitError: When the call failed (status plus the provider's
+            own ``error.message`` when it carries one) or the body is not a
+            JSON object.
     """
     if response.status_code >= 400:
+        summary = f"provider {action} failed with status {response.status_code}"
+        detail = provider_error_detail(response)
         raise BatchSubmitError(
-            f"provider {action} failed with status {response.status_code}",
+            summary if detail is None else f"{summary}: {detail}",
             code="provider_error",
         )
     try:

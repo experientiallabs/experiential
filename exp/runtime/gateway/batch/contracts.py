@@ -159,21 +159,37 @@ class BatchJob(ContractModel):
     settled: bool = False
 
     def public_object(self) -> JsonObject:
-        """Render the OpenAI Batch API object for this job."""
-        errors: JsonObject | None = None
-        if self.line_errors:
-            errors = {
-                "object": "list",
-                "data": [
-                    {
-                        "code": error.code,
-                        "message": error.message,
-                        "line": error.line_number,
-                        "custom_id": error.custom_id,
-                    }
-                    for error in self.line_errors
-                ],
+        """Render the OpenAI Batch API object for this job.
+
+        ``errors`` carries every reason the caller can act on: the submit-time
+        per-line rejections, plus the job-level failure reason (a provider
+        rejection, an interrupted dispatch, an elapsed window) under the
+        terminal status as its code, the same code the error file stamps on
+        each line that never ran. A terminal job also stamps the matching
+        ``*_at`` timestamp, so a failed batch never reads as completed.
+        """
+        error_items: list[JsonObject] = [
+            {
+                "code": error.code,
+                "message": error.message,
+                "line": error.line_number,
+                "custom_id": error.custom_id,
             }
+            for error in self.line_errors
+        ]
+        if self.failure_message is not None:
+            error_items.append(
+                {
+                    "code": self.status.value,
+                    "message": self.failure_message,
+                    "line": None,
+                    "custom_id": None,
+                }
+            )
+        errors: JsonObject | None = None
+        if error_items:
+            errors = {"object": "list", "data": error_items}
+        finalized = None if self.finalized_at is None else int(self.finalized_at.timestamp())
         return {
             "id": self.batch_id,
             "object": "batch",
@@ -186,10 +202,10 @@ class BatchJob(ContractModel):
             "error_file_id": self.error_file_id,
             "created_at": int(self.created_at.timestamp()),
             "expires_at": int(self.expires_at.timestamp()),
-            "completed_at": (
-                None if self.finalized_at is None else int(self.finalized_at.timestamp())
-            ),
-            "failed_at": None,
+            "completed_at": finalized if self.status is BatchStatus.COMPLETED else None,
+            "failed_at": finalized if self.status is BatchStatus.FAILED else None,
+            "expired_at": finalized if self.status is BatchStatus.EXPIRED else None,
+            "cancelled_at": finalized if self.status is BatchStatus.CANCELLED else None,
             "request_counts": {
                 "total": self.counts.total,
                 "completed": self.counts.completed,
