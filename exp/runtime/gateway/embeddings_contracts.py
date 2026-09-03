@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import Field, field_validator
 
-from exp.common.core.artifacts import ContractModel
+from exp.common.core.artifacts import ContractModel, canonical_json_bytes
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 
 
@@ -56,3 +56,22 @@ union so a chat-assuming reader cannot duck-type onto an embeddings request and
 touch an absent leg (messages, output tokens): ``ty`` enumerates every reader
 that must now handle the embeddings arm, and each branches exhaustively.
 """
+
+
+def embeddings_input_ceiling_micro_usd(
+    request: EmbeddingsRequest,
+    *,
+    input_rate: int | None,
+    maximum: int,
+) -> int | None:
+    """Return the conservative input-only reservation ceiling for one embeddings call.
+
+    The canonical UTF-8 byte length upper-bounds the input tokens (there is no
+    output leg and no excluded provider carrier), so only the input rate
+    applies. A missing rate unprices the route (``None``), and a ceiling above
+    ``maximum`` is likewise unpriceable, matching the completion path.
+    """
+    if input_rate is None:
+        return None
+    ceiling = (len(canonical_json_bytes(request)) * input_rate + 999_999) // 1_000_000
+    return ceiling if ceiling <= maximum else None

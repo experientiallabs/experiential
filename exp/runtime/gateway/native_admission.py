@@ -17,13 +17,15 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import (
     reorder_route_deployments,
     request_carries_cache_markers,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.models.providers import preflight_gateway_request
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -44,6 +46,7 @@ from exp.runtime.models.providers.streaming_requests import (
     dialect_stream_payload,
     route_generation_parameter_requests,
 )
+from exp.runtime.openai_protocol.state import ProtocolNamespace, episode_namespace
 
 _logger = logging.getLogger(__name__)
 
@@ -390,4 +393,51 @@ def record_admission_coercions(
         "(disclosed through ignored_parameters)",
         authorization.alias,
         ", ".join(disclosures),
+    )
+
+
+def resolve_admission_route(
+    components: NativeGatewayComponents,
+    authorization: AuthorizationSnapshot,
+    request: GatewayRequest,
+    *,
+    continuation: ContinuationContext | None = None,
+) -> GatewayRoute:
+    """Resolve one direct or project route without an event loop.
+
+    Direct pools resolve entirely inside frozen in-memory catalogs. Project
+    targets run frozen learned selection synchronously on this worker thread
+    through the shared selection seam and episode identity derivation, so
+    there is exactly one policy execution path. A Responses continuation
+    carries its original turn's episode key, so a continued request joins the
+    same selection episode instead of re-running request-time embedding for a
+    fresh one. Request-time embedding failure falls back to the frozen
+    conservative baseline inside the shared runtime, and neither path mutates
+    policy or evidence.
+    """
+    if isinstance(authorization.target, DirectTarget):
+        return components.routes.resolve_direct(authorization)
+    if continuation is not None:
+        episode = (
+            authorization.organization_id,
+            authorization.identity_id,
+            authorization.alias_revision_id,
+            continuation.episode_key,
+        )
+    else:
+        episode = episode_namespace(
+            namespace=ProtocolNamespace(
+                organization_id=authorization.organization_id,
+                identity_id=authorization.identity_id,
+                alias_revision_id=authorization.alias_revision_id,
+            ),
+            # The session-scoped correlation id is the stronger affinity
+            # scope; a per-operation idempotency key only pins retries.
+            caller_episode_key=request.client_request_id or request.idempotency_key,
+            request_id=authorization.request_id,
+        )
+    return components.routes.resolve_project_blocking(
+        authorization=authorization,
+        request=request,
+        episode_namespace=episode,
     )
