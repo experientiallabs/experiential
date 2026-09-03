@@ -53,7 +53,7 @@ from exp.runtime.gateway.lifecycle import (
     gateway_instance_lock,
     load_gateway_components,
 )
-from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
 from exp.runtime.gateway.project_activation import ProjectActivation, ProjectActivationError
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models import RuntimeModelCatalog
@@ -322,6 +322,137 @@ def test_missing_secret_marks_only_its_direct_alias_unavailable(tmp_path: Path) 
     ((alias_name, reason),) = components.unavailable_aliases
     assert alias_name == "broken"
     assert "MISSING_PROVIDER_KEY" in reason
+    with pytest.raises(GatewayRoutingError):
+        _authorize(components, raw_key, "broken")
+
+
+def test_a_natively_unservable_alias_is_excluded_and_the_rest_serve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A half-activated alias whose only rung has no native dialect is excluded.
+
+    This is the incident's muse-glimmer shape: a never-activated model whose lone
+    rung was flipped active resolves to a provider with no native wire dialect. It
+    must not abort the whole worker at the startup gate (which took the fleet down);
+    the build marks it UNAVAILABLE and serves every other alias, and calling it
+    directly is a per-request failure, not a crash.
+    """
+    from exp.runtime.models.providers.errors import ProviderCapabilityError
+    from exp.runtime.models.providers.gemini import GeminiClient
+
+    def _no_native_dialect(self: GeminiClient) -> object:
+        del self
+        raise ProviderCapabilityError(capability="native_data_plane")
+
+    monkeypatch.setattr(GeminiClient, "gateway_wire_profile", _no_native_dialect)
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="muse-glimmer",
+        connection_name="gemini-main",
+        provider_model="muse-glimmer-exact",
+        exact_model_id="muse-glimmer-revision",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="muse-glimmer",
+        alias_name="muse-glimmer",
+        revision_id="revision-muse",
+        pool_id="muse-glimmer",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="muse-glimmer")
+
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "available", "TEST_GEMINI_KEY": "gemini-key"},
+    )
+
+    # The worker binds and serves the good alias; only the bad one is UNAVAILABLE.
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    ((alias_name, reason),) = components.unavailable_aliases
+    assert alias_name == "muse-glimmer"
+    assert "cannot be served natively" in reason
+    assert "native dialect" in reason
+    with pytest.raises(GatewayRoutingError):
+        _authorize(components, raw_key, "muse-glimmer")
+
+
+def test_an_unexpected_error_building_one_alias_excludes_only_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unanticipated exception building one alias excludes just that alias.
+
+    No single malformed catalog row may abort the whole build (the startup-time
+    all-or-nothing build was the fleet-wide catalog outage's root cause), so even
+    an exception type the specific handlers do not anticipate is caught by the
+    per-alias backstop and marked UNAVAILABLE while the rest serve.
+    """
+    import exp.runtime.gateway.lifecycle as lifecycle_module
+
+    original_load_snapshot = lifecycle_module._load_snapshot
+
+    def _boom(manager: GatewayManagement, alias: GatewayAliasView) -> object:
+        if alias.alias_name == "broken":
+            raise RuntimeError("unexpected catalog build failure")
+        return original_load_snapshot(manager, alias)
+
+    monkeypatch.setattr(lifecycle_module, "_load_snapshot", _boom)
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="TEST_GEMINI_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="broken",
+        connection_name="gemini-main",
+        provider_model="broken-exact",
+        exact_model_id="broken-revision",
+        revision=None,
+        capabilities=ModelCapabilities(),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="broken",
+        alias_name="broken",
+        revision_id="revision-broken",
+        pool_id="broken",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="broken")
+
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "available", "TEST_GEMINI_KEY": "gemini-key"},
+    )
+
+    assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
+    ((alias_name, reason),) = components.unavailable_aliases
+    assert alias_name == "broken"
+    assert "unexpected catalog build failure" in reason
     with pytest.raises(GatewayRoutingError):
         _authorize(components, raw_key, "broken")
 

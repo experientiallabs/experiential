@@ -95,6 +95,15 @@ uv run pytest -q
 - No-subcommand `exp` serves only explicit active gateway aliases. The `--project` form serves one
   frozen router policy. Simulation callers choose an `AgentRuntime` and `EnvironmentRuntime`
   directly, in process.
+- The multi-alias worker's catalog build is per-alias fail-safe: a granted alias that cannot build
+  (bad rung, missing revision, malformed capabilities, or a rung with no native wire dialect) is
+  excluded and marked UNAVAILABLE (surfaced in the startup receipt and the `catalog.aliases_excluded`
+  log; a direct call to it 503s), and the worker binds and serves every other alias. No single
+  catalog row may abort the whole build or crash the worker; only an entirely empty servable set
+  fails startup loud. This is EXCLUSION, never a fallback — the RUST-only serving contract holds, so
+  an unservable alias is dropped, never served through some other path. The single-alias owned
+  project gateway (`--project`) keeps the all-or-nothing `native_serving_blockers` gate, since its
+  one alias has nothing else to serve.
 - Local Pi and process-environment adapters execute external code on the user's machine only when
   a caller explicitly selects them. Preserve bounded processes, the explicit working directory,
   and fail-closed support checks.

@@ -356,17 +356,18 @@ def test_maximize_cache_still_fails_over_on_operational_deadness() -> None:
     assert candidate == 1
 
 
-def test_native_serving_blockers_name_dialectless_providers(
+def test_dialectless_provider_alias_is_excluded_not_a_startup_blocker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rust-only startup validation names every alias the engine cannot serve.
+    """A dialectless alias is excluded (UNAVAILABLE); the worker serves the rest.
 
     Every currently supported provider implements a native dialect, so the
     "no native dialect implementation" branch is exercised by patching a real
-    client's ``gateway_wire_profile`` back to the unimplemented base
-    behavior, rather than by a provider connection string this registry can
-    still resolve.
+    client's ``gateway_wire_profile`` back to the unimplemented base behavior.
+    Under the per-alias fail-safe build such an alias no longer aborts worker
+    startup: it is marked UNAVAILABLE and the build serves every other alias, so
+    the fleet-level ``native_serving_blockers`` diagnostic comes back clean.
     """
     from exp.common.models import (
         GatewayDeploymentCapabilities,
@@ -426,18 +427,28 @@ def test_native_serving_blockers_name_dialectless_providers(
             "TEST_GEMINI_KEY": "gemini-secret-canary",
         },
     )
-    blockers = native_serving_blockers(components)
-    assert len(blockers) == 1
-    assert blockers[0].startswith("escalated: ")
-    assert "gemini" in blockers[0]
-    assert "native dialect" in blockers[0]
+    # The dialectless alias is excluded at build, so the served generation has no
+    # blockers and the worker binds.
+    assert native_serving_blockers(components) == ()
+    unavailable = dict(components.unavailable_aliases)
+    assert "escalated" in unavailable
+    assert "gemini" in unavailable["escalated"]
+    assert "native dialect" in unavailable["escalated"]
+    # The other granted alias still loads and serves.
+    served = {alias for alias, _revision, _digest in components.reloader.state.authorities}
+    assert "coding" in served
+    assert "escalated" not in served
 
 
-def test_native_serving_blockers_name_reasoning_wire_contract_conflicts(
+def test_reasoning_wire_contract_conflict_excludes_the_alias(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rust startup rejects catalog reasoning metadata the provider profile cannot carry."""
+    """An alias whose reasoning metadata the provider profile cannot carry is excluded.
+
+    The build rejects the invalid reasoning wire contract per-alias (UNAVAILABLE)
+    instead of aborting the worker, so a servable alias still serves.
+    """
     from dataclasses import replace
 
     from exp.common.models import (
@@ -504,14 +515,20 @@ def test_native_serving_blockers_name_reasoning_wire_contract_conflicts(
     manager.add_grant(identity_id="default", alias_id="reasoning")
     components = load_gateway_components(
         tmp_path,
-        environment={"TEST_GEMINI_KEY": "gemini-secret-canary"},
+        environment={
+            "TEST_PROVIDER_KEY": "provider-secret-canary",
+            "TEST_GEMINI_KEY": "gemini-secret-canary",
+        },
     )
 
-    blockers = native_serving_blockers(components)
-
-    assert len(blockers) == 1
-    assert blockers[0].startswith("reasoning: ")
-    assert "invalid reasoning wire contract" in blockers[0]
+    # Excluded at build (UNAVAILABLE), not a fleet-wide startup blocker.
+    assert native_serving_blockers(components) == ()
+    unavailable = dict(components.unavailable_aliases)
+    assert "reasoning" in unavailable
+    assert "invalid reasoning wire contract" in unavailable["reasoning"]
+    served = {alias for alias, _revision, _digest in components.reloader.state.authorities}
+    assert "coding" in served
+    assert "reasoning" not in served
 
 
 def test_route_reorder_permutes_dispatch_order_and_rejects_non_permutations() -> None:

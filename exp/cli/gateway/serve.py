@@ -227,7 +227,6 @@ def _run_gateway(
     )
     from exp.runtime.gateway.management import GatewayManagement
     from exp.runtime.gateway.native_bridge import NativeControlPlane
-    from exp.runtime.gateway.native_execution import native_serving_blockers
     from exp.runtime.gateway.native_server import (
         NativeGatewayServerError,
         serve_native_gateway,
@@ -267,13 +266,11 @@ def _run_gateway(
                         None if compatibility is None else frozenset({compatibility.alias})
                     ),
                 )
-                blockers = native_serving_blockers(components)
-                if blockers:
-                    details = "; ".join(blockers)
-                    raise typer.BadParameter(
-                        "the native engine cannot serve every granted alias: "
-                        f"{details}. Fix the provider configuration and rerun 'exp'."
-                    )
+                # The catalog build is per-alias fail-safe: a granted alias the
+                # native engine cannot serve is excluded (marked UNAVAILABLE and
+                # surfaced in the receipt below), so the worker binds and serves
+                # every other alias instead of refusing to start on one bad row.
+                # An empty servable set already fails loud in load_gateway_components.
                 # Loaded directly (rather than through native_server's own
                 # import) so this composition can wire the content-free
                 # metrics snapshot into the control plane before the process
