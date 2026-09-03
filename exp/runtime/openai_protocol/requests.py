@@ -41,6 +41,7 @@ from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.reasoning_carrier import (
     FIREWORKS_REASONING_CONTENT_PREFIX,
     parse_reasoning_content_carrier,
+    scheme_for_carrier,
 )
 from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
@@ -660,8 +661,16 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
         )
         provider_reasoning: tuple[SealedReasoningContentBlock, ...] = ()
         if message.reasoning_content is not None:
+            # The scheme is fixed by the carrier's own opaque prefix; raw client
+            # text (no known prefix) matches none and is rejected here. Each
+            # provider's carrier only parses under its own scheme.
+            scheme = scheme_for_carrier(message.reasoning_content)
             try:
-                provider_reasoning = (parse_reasoning_content_carrier(message.reasoning_content),)
+                if scheme is None:
+                    raise ValueError("reasoning_content is not a gateway-issued carrier")
+                provider_reasoning = (
+                    parse_reasoning_content_carrier(message.reasoning_content, scheme=scheme),
+                )
             except ValueError as exc:
                 param = f"{prefix}.{message_index}.reasoning_content"
                 raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc

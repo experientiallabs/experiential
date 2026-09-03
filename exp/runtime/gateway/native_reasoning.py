@@ -8,6 +8,7 @@ from exp.runtime.gateway.native_execution import resolve_route_profiles
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
     reasoning_carrier_authority,
+    scheme_for_carrier,
     unseal_reasoning_content,
 )
 from exp.runtime.gateway.routing import GatewayRoute
@@ -117,6 +118,15 @@ def _process_reasoning_history(
         ):
             raise ValueError("reasoning carrier must accompany one assistant tool turn")
         carrier = sealed[0]
+        # The provider scheme is fixed by the carrier's own opaque prefix, so
+        # authority derivation and decryption use the exact scheme it was sealed
+        # under. The scheme's per-rung gate field then requires the resolved route
+        # to be that same provider (a Hunyuan carrier on a Fireworks rung reads a
+        # None gate → no authority), and the domain-separated key rejects any
+        # cross-provider carrier at the AEAD tag even if a gate were mis-set.
+        scheme = scheme_for_carrier(carrier.carrier)
+        if scheme is None:
+            raise ValueError("reasoning carrier prefix names no known provider scheme")
         cached = routes.get(carrier.deployment_hint)
         if cached is None:
             route = components.routes.resolve_deployment_hint(
@@ -133,9 +143,10 @@ def _process_reasoning_history(
                 pool_id=route.snapshot.pool_id,
                 deployment=route.deployment,
                 profile=profile,
+                scheme=scheme,
             )
             if authority is None:
-                raise ValueError("reasoning carrier route is not Fireworks")
+                raise ValueError("reasoning carrier route does not authorize preserved thinking")
             cached = (route, authority)
             routes[carrier.deployment_hint] = cached
         route, authority = cached
@@ -145,6 +156,7 @@ def _process_reasoning_history(
             assistant_content=message.content,
             tool_calls=message.tool_calls,
             history_prefix=tuple(messages[:index]) if verify_history else (),
+            scheme=scheme,
         )
         if reveal:
             messages[index] = message.model_copy(update={"provider_reasoning": (block,)})

@@ -90,6 +90,24 @@ HUNYUAN_SCHEME = ReasoningCarrierScheme(
 FIREWORKS_REASONING_CONTENT_PREFIX = FIREWORKS_SCHEME.prefix
 """Public marker for a gateway-authenticated, caller-opaque Fireworks carrier."""
 
+REASONING_CARRIER_SCHEMES: tuple[ReasoningCarrierScheme, ...] = (FIREWORKS_SCHEME, HUNYUAN_SCHEME)
+"""Every provider carrier scheme, matched against an inbound carrier by prefix."""
+
+
+def scheme_for_carrier(value: str) -> ReasoningCarrierScheme | None:
+    """Return the carrier scheme whose public prefix this string carries, or None.
+
+    The scheme is identified from the caller-opaque prefix alone, before any key
+    derivation or route resolution, so the parse/authority/unseal path always
+    uses the exact provider scheme the carrier was sealed under: a Fireworks
+    carrier never resolves to Hunyuan's key domain, and vice-versa. A string with
+    no known prefix (raw client text) matches nothing and is rejected upstream.
+    """
+    for scheme in REASONING_CARRIER_SCHEMES:
+        if value.startswith(scheme.prefix):
+            return scheme
+    return None
+
 
 class ReasoningCarrierClaims(ContractModel):
     """Authenticated plaintext held only while issuing or validating a carrier."""
