@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -13,6 +14,7 @@ from unittest import mock
 
 import pytest
 
+import exp.runtime.gateway.native_bridge as native_bridge_module
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     GatewayDeploymentCapabilities,
@@ -4703,3 +4705,49 @@ def test_rust_messages_paused_turn_keeps_its_stop_reason() -> None:
     assert '"stop_reason":"pause_turn"' in frames
     body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
     assert body["stop_reason"] == "pause_turn"
+
+
+def test_internal_admission_failures_log_the_real_exception(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sanitized 500 hides the cause everywhere else, so the bridge logs it once.
+
+    A granted alias whose admission blew up with an unexpected exception used
+    to fail 500 with the traceback recorded nowhere (public error, ledger row,
+    and worker log all carry only the sanitized text). The record names the
+    request and alias and carries the exception on ``exc_info``.
+    """
+    control, raw_key = _pool_control_plane(tmp_path)
+
+    def explode(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        message = "hydrated snapshot names a deployment this worker never registered"
+        raise KeyError(message)
+
+    monkeypatch.setattr(native_bridge_module, "resolve_admission_route", explode)
+    body = json.dumps({"model": "coding", "messages": [{"role": "user", "content": "hi"}]})
+
+    with (
+        caplog.at_level(logging.ERROR, logger="exp.runtime.gateway.native_bridge"),
+        pytest.raises(NativeBridgeError) as raised,
+    ):
+        _admit(control, raw_key, body)
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 500
+    assert error["code"] == "internal_error"
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "gateway admission failed before provider dispatch"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.exc_info is not None
+    assert record.exc_info[0] is KeyError
+    # ``extra`` fields land on the record's namespace, not on the typed class.
+    fields = record.__dict__
+    assert fields["alias"] == "coding"
+    assert str(fields["request_id"]).startswith("request-")
+    assert fields["exception_type"] == "KeyError"
+    assert fields["operation"] == "native_admit"

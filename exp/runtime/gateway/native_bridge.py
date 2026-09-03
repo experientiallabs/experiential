@@ -25,6 +25,7 @@ metrics and fails the request closed with the shared internal error.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable
 
@@ -135,6 +136,8 @@ from exp.runtime.openai_protocol.state import (
     ProtocolNamespace,
     replay_key,
 )
+
+_logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
 
@@ -577,6 +580,22 @@ class NativeControlPlane(
             failure = GatewayFailure(
                 failure_class=GatewayFailureClass.INTERNAL,
                 safe_message="gateway admission failed before provider dispatch",
+            )
+            # The public error and the ledger row carry only the sanitized
+            # text, so this record is the ONLY place the real exception
+            # survives: an unlogged INTERNAL here left a granted alias failing
+            # 500 for hours with nothing to diagnose (platform staging,
+            # 2026-09-03). The message names the request and alias; the
+            # traceback rides exc_info. Nothing here carries a credential.
+            _logger.exception(
+                "gateway admission failed before provider dispatch",
+                extra={
+                    "operation": "native_admit",
+                    "request_id": authorization.request_id,
+                    "alias": authorization.alias,
+                    "alias_revision_id": authorization.alias_revision_id,
+                    "exception_type": type(exc).__name__,
+                },
             )
             self._accounting.finish_request_quietly(authorization, failure)
             raise error from exc
