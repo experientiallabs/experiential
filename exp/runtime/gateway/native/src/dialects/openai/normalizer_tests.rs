@@ -416,7 +416,10 @@ fn dashscope_argument_deltas_restate_an_empty_tool_call_id() {
 fn compatible_stream_still_rejects_a_changed_non_empty_tool_call_identity() {
     // The identity guard keeps its teeth: a later delta naming a DIFFERENT
     // non-empty id or name is still a malformed stream.
-    for (id, name) in [("call_other", "get_current_weather"), ("call_1", "other_tool")] {
+    for (id, name) in [
+        ("call_other", "get_current_weather"),
+        ("call_1", "other_tool"),
+    ] {
         let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
         normalizer
             .feed(&compatible_chunk(
