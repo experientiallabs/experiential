@@ -286,18 +286,17 @@ def test_every_truncation_class_classifies_and_the_process_survives(setup: tuple
             for name, offset in classes.items():
                 upstream.offset = offset
                 upstream.mode = mode
-                try:
-                    reply = httpx.post(
-                        f"http://{_HOST}:{port}{path}",
-                        headers={"authorization": f"Bearer {raw_key}"},
-                        json=body,
-                        timeout=30.0,
-                    )
-                    outcome = str(reply.status_code)
-                    assert reply.status_code in {200, 502}, (name, mode, surface, reply.text)
-                except httpx.HTTPError as error:
-                    outcome = type(error).__name__
-                outcomes[f"{mode}:{surface}:{name}"] = outcome
+                # No exception tolerance: a client-side transport or protocol
+                # error would mean the WORKER severed or corrupted its own
+                # response, which is exactly the failure the invariant forbids.
+                reply = httpx.post(
+                    f"http://{_HOST}:{port}{path}",
+                    headers={"authorization": f"Bearer {raw_key}"},
+                    json=body,
+                    timeout=30.0,
+                )
+                assert reply.status_code in {200, 502}, (name, mode, surface, reply.text)
+                outcomes[f"{mode}:{surface}:{name}"] = str(reply.status_code)
                 assert process.poll() is None, (
                     f"the serving process died on truncation class {name!r} "
                     f"(mode={mode}, surface={surface}); outcomes so far: {outcomes}"
