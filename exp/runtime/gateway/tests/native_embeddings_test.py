@@ -277,7 +277,7 @@ def test_official_client_round_trips_base64_vectors_and_settles(engine: _Serving
 def test_raw_float_request_forwards_every_field_and_ignores_idempotency_key(
     engine: _ServingEngine,
 ) -> None:
-    """A string input with dimensions, user, and float encoding crosses verbatim."""
+    """A string input with dimensions and float encoding crosses verbatim; user stays gateway-side."""
     response = _post(
         engine,
         {
@@ -297,12 +297,12 @@ def test_raw_float_request_forwards_every_field_and_ignores_idempotency_key(
         "model": "embedder",
         "usage": {"prompt_tokens": 3, "total_tokens": 3},
     }
+    # `user` stays gateway-side (attribution label), never on the provider wire.
     assert _last_upstream_payload() == {
         "model": "embedder-model-exact",
         "input": ["one two three"],
         "dimensions": 3,
         "encoding_format": "float",
-        "user": "tenant-7",
     }
 
 

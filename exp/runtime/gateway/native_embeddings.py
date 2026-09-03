@@ -215,12 +215,13 @@ def _admit_accepted(
             embeddings_url = profile.embeddings_url
             if embeddings_url is None:  # pragma: no cover - filtered above.
                 raise GatewayRoutingError("embeddings rung lost its wire endpoint")
+            # `user` is METADATA_ONLY in the embeddings manifest: recorded as
+            # the attribution label at accept, never forwarded to the provider.
             payload = openai_embedding_request(
                 profile.model_id,
                 request.inputs,
                 dimensions=request.dimensions,
                 encoding_format=request.encoding_format,
-                user=request.user,
             )
             wire_route.append(
                 deployment_wire_entry(

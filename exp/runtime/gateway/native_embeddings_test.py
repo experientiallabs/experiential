@@ -74,12 +74,12 @@ def test_admit_builds_the_openai_embeddings_wire_and_settles_input_only(tmp_path
     assert wire["dialect"] == "openai_compatible"
     assert wire["url"] == "http://127.0.0.1:9/v1/embeddings"
     assert wire["headers"]["Authorization"] == "Bearer provider-secret-canary"
+    # `user` is metadata-only: the attribution label at accept, never on the wire.
     assert wire["upstream_payload"] == {
         "model": "provider-model-exact",
         "input": ["alpha beta", "gamma"],
         "dimensions": 3,
         "encoding_format": "float",
-        "user": "tenant-7",
     }
     assert wire["upstream_body"] is None
     request_id = str(admission["request_id"])
