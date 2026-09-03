@@ -8,7 +8,6 @@ from typing import Literal, cast
 
 from openai.types import EmbeddingCreateParams
 from openai.types.chat.completion_create_params import CompletionCreateParams
-from openai.types.image_generate_params import ImageGenerateParamsNonStreaming
 from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
 from pydantic_core import ErrorDetails
@@ -40,7 +39,6 @@ from exp.runtime.gateway.contracts import (
     StructuredTextFormat,
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
-from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.reasoning_carrier import (
     FIREWORKS_REASONING_CONTENT_PREFIX,
     parse_reasoning_content_carrier,
@@ -52,7 +50,6 @@ from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_fiel
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
-    IMAGES_MANIFEST,
     RESPONSES_MANIFEST,
     disposition_map,
 )
@@ -80,7 +77,6 @@ from exp.runtime.openai_protocol.wire_models import (
     _CustomToolCallOutput,
     _EmbeddingsRequest,
     _FunctionCall,
-    _ImagesRequest,
     _Message,
     _ResponseFunctionCall,
     _ResponseMessage,
@@ -95,10 +91,8 @@ from exp.runtime.openai_protocol.wire_models import (
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
 _RESPONSES_OFFICIAL = TypeAdapter(ResponseCreateParams)
-# Parametrized to object so the invariant TypeAdapter matches _validate_official;
-# EmbeddingCreateParams is a single TypedDict, unlike the union-typed chat/responses params.
+# object-parametrized: EmbeddingCreateParams is one TypedDict, unlike the chat/responses unions.
 _EMBEDDINGS_OFFICIAL: TypeAdapter[object] = TypeAdapter[object](EmbeddingCreateParams)
-_IMAGES_OFFICIAL: TypeAdapter[object] = TypeAdapter[object](ImageGenerateParamsNonStreaming)
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 
 
@@ -119,13 +113,6 @@ class DecodedEmbeddingsRequest(ContractModel):
 
     alias: str = Field(min_length=1, max_length=256)
     request: EmbeddingsRequest
-
-
-class DecodedImagesRequest(ContractModel):
-    """Public alias plus its canonical image-generation request."""
-
-    alias: str = Field(min_length=1, max_length=256)
-    request: ImagesRequest
 
 
 def _without_chat_reasoning_content(payload: JsonObject) -> JsonObject:
@@ -261,43 +248,6 @@ def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
     except ValidationError as exc:
         raise _validation_protocol_error(exc) from exc
     return DecodedEmbeddingsRequest(alias=request.model, request=canonical)
-
-
-def decode_images(payload: JsonObject) -> DecodedImagesRequest:
-    """Decode one Images generation body into the canonical images surface.
-
-    The surface is buffered and never streamed, so ``stream`` / ``partial_images``
-    are refused by the manifest rather than silently answered whole.
-
-    Args:
-        payload: Parsed JSON request body.
-
-    Returns:
-        Public alias and canonical image-generation request.
-
-    Raises:
-        OpenAIProtocolError: The body is invalid, unknown, or unsupported.
-    """
-    _validate_manifest(payload, IMAGES_MANIFEST)
-    _validate_official(_IMAGES_OFFICIAL, payload)
-    request = _validate_wire(_ImagesRequest, payload)
-    try:
-        canonical = ImagesRequest(
-            prompt=request.prompt,
-            n=1 if request.n is None else request.n,
-            size=request.size,
-            quality=request.quality,
-            background=request.background,
-            output_format=request.output_format,
-            output_compression=request.output_compression,
-            moderation=request.moderation,
-            response_format=request.response_format,
-            style=request.style,
-            user=request.user,
-        )
-    except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
-    return DecodedImagesRequest(alias=request.model, request=canonical)
 
 
 def decode_responses(

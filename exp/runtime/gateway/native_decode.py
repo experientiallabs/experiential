@@ -7,13 +7,12 @@ import json
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.images_requests import DecodedImagesRequest, decode_images
 from exp.runtime.openai_protocol.requests import (
     DecodedEmbeddingsRequest,
     DecodedGatewayRequest,
-    DecodedImagesRequest,
     decode_chat,
     decode_embeddings,
-    decode_images,
     decode_responses,
 )
 

@@ -520,6 +520,11 @@ class ModelCapabilities(ContractModel):
             "cache_write_cost_per_million_tokens_usd",
         }
         excluded.add("supports_completions")
+        # Image generation is admitted fail-closed on its own surface, so the
+        # claim never changes what a chat or embeddings dispatch may do; keep
+        # it out of the identity like supports_completions so existing traces
+        # and frozen catalogs keep their digests.
+        excluded.add("supports_image_generation")
         return sha256_json(self.model_dump(mode="json", exclude=excluded))
 
 
