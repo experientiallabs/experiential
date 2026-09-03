@@ -1,4 +1,10 @@
-"""Authenticated Fireworks reasoning carriers bound to exact gateway authority."""
+"""Authenticated, provider-scoped reasoning carriers bound to exact gateway authority.
+
+One AEAD scheme serves every provider that round-trips gateway-sealed reasoning
+(Fireworks, Hunyuan): a ``ReasoningCarrierScheme`` supplies the public prefix and
+two DISTINCT domain separators per provider, so a carrier is isolated to the
+provider whose credential sealed it.
+"""
 
 from __future__ import annotations
 
@@ -33,9 +39,6 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 
-FIREWORKS_REASONING_CONTENT_PREFIX = "x-experiential-fireworks-reasoning-v2:"
-"""Public marker for a gateway-authenticated, caller-opaque Fireworks carrier."""
-
 MAXIMUM_REASONING_CONTENT_BYTES = 8 * 1024 * 1024
 """Maximum decrypted provider reasoning retained for one tool continuation."""
 
@@ -45,10 +48,47 @@ MAXIMUM_REASONING_CARRIER_BYTES = 4 * ((_MAXIMUM_ENVELOPE_BYTES + 2) // 3) + 512
 """Maximum caller-supplied carrier size before any base64 or AEAD work."""
 
 _NONCE_BYTES = 12
-_KEY_DERIVATION_DOMAIN = b"experiential/fireworks-reasoning-carrier/aes256gcm/v2\0"
-_CREDENTIAL_IDENTITY_DOMAIN = b"experiential/fireworks-reasoning-credential/v2\0"
 _EXACT_INTEGER_LIMIT = 2**53
 """First magnitude where a JSON float stops naming exactly one integer."""
+
+
+@dataclass(frozen=True)
+class ReasoningCarrierScheme:
+    """Per-provider carrier identity: a public prefix plus two DISTINCT domain
+    separators for the AEAD key and credential fingerprint.
+
+    Two providers must NEVER share a key-derivation or credential-identity
+    domain: the domain separation is what makes a carrier sealed under one
+    provider's credential unable to authenticate on another provider's route.
+    """
+
+    prefix: str
+    key_derivation_domain: bytes
+    credential_identity_domain: bytes
+    route_sha256_field: str
+
+
+FIREWORKS_SCHEME = ReasoningCarrierScheme(
+    prefix="x-experiential-fireworks-reasoning-v2:",
+    key_derivation_domain=b"experiential/fireworks-reasoning-carrier/aes256gcm/v2\0",
+    credential_identity_domain=b"experiential/fireworks-reasoning-credential/v2\0",
+    route_sha256_field="fireworks_reasoning_route_sha256",
+)
+
+HUNYUAN_SCHEME = ReasoningCarrierScheme(
+    prefix="x-experiential-hunyuan-reasoning-v1:",
+    # Distinct from every other provider's key-derivation domain: this byte string
+    # MUST NOT collide with Fireworks', or a Fireworks-credential carrier could
+    # derive the same AEAD key and authenticate on a Hunyuan route (and vice-versa).
+    key_derivation_domain=b"experiential/hunyuan-reasoning-carrier/aes256gcm/v1\0",
+    # Distinct from every other provider's credential-identity domain, for the same
+    # cross-provider isolation reason; MUST NOT collide with Fireworks'.
+    credential_identity_domain=b"experiential/hunyuan-reasoning-credential/v1\0",
+    route_sha256_field="hunyuan_reasoning_route_sha256",
+)
+
+FIREWORKS_REASONING_CONTENT_PREFIX = FIREWORKS_SCHEME.prefix
+"""Public marker for a gateway-authenticated, caller-opaque Fireworks carrier."""
 
 
 class ReasoningCarrierClaims(ContractModel):
@@ -104,14 +144,14 @@ class ReasoningCarrierAuthority:
     aead_key: bytes = field(repr=False)
 
 
-def parse_reasoning_content_carrier(value: str) -> SealedReasoningContentBlock:
+def parse_reasoning_content_carrier(
+    value: str, *, scheme: ReasoningCarrierScheme = FIREWORKS_SCHEME
+) -> SealedReasoningContentBlock:
     """Validate one carrier's bounded public envelope without decrypting it."""
     raw = _ascii_bytes(value)
-    if len(raw) > MAXIMUM_REASONING_CARRIER_BYTES or not value.startswith(
-        FIREWORKS_REASONING_CONTENT_PREFIX
-    ):
+    if len(raw) > MAXIMUM_REASONING_CARRIER_BYTES or not value.startswith(scheme.prefix):
         raise ValueError("reasoning_content is not a bounded gateway carrier")
-    encoded = value.removeprefix(FIREWORKS_REASONING_CONTENT_PREFIX)
+    encoded = value.removeprefix(scheme.prefix)
     deployment_text, separator, envelope_text = encoded.partition(":")
     if not separator or not deployment_text or not envelope_text or ":" in envelope_text:
         raise ValueError("reasoning_content is not a complete gateway carrier")
@@ -133,9 +173,10 @@ def reasoning_carrier_authority(
     pool_id: str,
     deployment: ExactModelDeployment,
     profile: GatewayWireProfile,
+    scheme: ReasoningCarrierScheme = FIREWORKS_SCHEME,
 ) -> ReasoningCarrierAuthority | None:
-    """Derive one replica-stable Fireworks authority from resolved credential material."""
-    route_sha256 = profile.fireworks_reasoning_route_sha256
+    """Derive one replica-stable carrier authority from resolved credential material."""
+    route_sha256 = getattr(profile, scheme.route_sha256_field)
     if route_sha256 is None:
         return None
     credential = _bearer_credential(profile.headers)
@@ -160,12 +201,12 @@ def reasoning_carrier_authority(
     }
     aead_key = hmac.new(
         credential,
-        _KEY_DERIVATION_DOMAIN + canonical_json_bytes(key_context),
+        scheme.key_derivation_domain + canonical_json_bytes(key_context),
         hashlib.sha256,
     ).digest()
     credential_identity = hmac.new(
         aead_key,
-        _CREDENTIAL_IDENTITY_DOMAIN,
+        scheme.credential_identity_domain,
         hashlib.sha256,
     ).hexdigest()
     return ReasoningCarrierAuthority(
@@ -199,6 +240,7 @@ def seal_reasoning_content(
     assistant_content: str | None,
     tool_calls: tuple[ToolCall, ...],
     content: str,
+    scheme: ReasoningCarrierScheme = FIREWORKS_SCHEME,
 ) -> str:
     """Seal provider reasoning for one exact issuing turn and waterfall rung."""
     tool_call_ids = _require_tool_calls(tool_calls)
@@ -221,10 +263,10 @@ def seal_reasoning_content(
     if len(plaintext) > _MAXIMUM_CLAIMS_BYTES:
         raise ValueError("reasoning carrier claims exceed the authenticated bound")
     deployment_text = _encode_urlsafe(authority.deployment_id.encode("utf-8"))
-    associated_data = _associated_data(deployment_text)
+    associated_data = _associated_data(deployment_text, scheme=scheme)
     nonce = secrets.token_bytes(_NONCE_BYTES)
     envelope = nonce + AESGCM(authority.aead_key).encrypt(nonce, plaintext, associated_data)
-    carrier = f"{FIREWORKS_REASONING_CONTENT_PREFIX}{deployment_text}:{_encode_urlsafe(envelope)}"
+    carrier = f"{scheme.prefix}{deployment_text}:{_encode_urlsafe(envelope)}"
     if len(carrier.encode("ascii")) > MAXIMUM_REASONING_CARRIER_BYTES:
         raise ValueError("reasoning carrier exceeds the public envelope bound")
     return carrier
@@ -237,16 +279,17 @@ def unseal_reasoning_content(
     assistant_content: str | None,
     tool_calls: tuple[ToolCall, ...],
     history_prefix: tuple[GatewayMessage, ...] = (),
+    scheme: ReasoningCarrierScheme = FIREWORKS_SCHEME,
 ) -> tuple[OpaqueReasoningContentBlock, ReasoningCarrierClaims]:
     """Authenticate and decrypt one carrier against current exact authority."""
     tool_call_ids = _require_tool_calls(tool_calls)
-    parsed = parse_reasoning_content_carrier(block.carrier)
+    parsed = parse_reasoning_content_carrier(block.carrier, scheme=scheme)
     if (
         parsed.deployment_hint != block.deployment_hint
         or block.deployment_hint != authority.deployment_id
     ):
         raise ValueError("reasoning carrier deployment differs from current authority")
-    encoded = block.carrier.removeprefix(FIREWORKS_REASONING_CONTENT_PREFIX)
+    encoded = block.carrier.removeprefix(scheme.prefix)
     deployment_text, _separator, envelope_text = encoded.partition(":")
     envelope = _decode_urlsafe(envelope_text, maximum_bytes=_MAXIMUM_ENVELOPE_BYTES)
     if len(envelope) <= _NONCE_BYTES + 16:
@@ -257,7 +300,7 @@ def unseal_reasoning_content(
         plaintext = AESGCM(authority.aead_key).decrypt(
             nonce,
             ciphertext,
-            _associated_data(deployment_text),
+            _associated_data(deployment_text, scheme=scheme),
         )
     except InvalidTag as exc:
         raise ValueError("reasoning carrier authentication failed") from exc
@@ -453,9 +496,11 @@ def _normalized_arguments(value: JsonValue) -> JsonValue:
     return value
 
 
-def _associated_data(deployment_text: str) -> bytes:
+def _associated_data(
+    deployment_text: str, *, scheme: ReasoningCarrierScheme = FIREWORKS_SCHEME
+) -> bytes:
     """Bind the public routing hint and carrier version against retagging."""
-    return f"{FIREWORKS_REASONING_CONTENT_PREFIX}{deployment_text}".encode("ascii")
+    return f"{scheme.prefix}{deployment_text}".encode("ascii")
 
 
 def _ascii_bytes(value: str) -> bytes:

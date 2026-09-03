@@ -180,6 +180,20 @@ class GatewayWireProfile:
     fireworks_reasoning_route_sha256: str | None = None
     """Exact Fireworks route identity that authorizes opaque reasoning replay."""
 
+    hunyuan_reasoning_route_sha256: str | None = None
+    """Exact Hunyuan (Tencent) route identity that authorizes gateway-sealed
+    preserved-thinking replay, mirroring ``fireworks_reasoning_route_sha256``:
+    non-None marks this rung as a reasoning-carrier rung whose native
+    ``reasoning_content`` round-trips through a gateway-issued opaque carrier."""
+
+    reasoning_output_exposed: bool = False
+    """Whether this rung's plaintext reasoning is exposed to the caller on output.
+
+    Off by default so OpenAI-hidden reasoning (o-series: only opaque/summary
+    events exist) never leaks. Turned on per rung for the exposable-plaintext
+    category (Tencent/DeepSeek/Anthropic) so the caller sees the model's thinking
+    it is already billed for; the round-trip token stays the sealed carrier."""
+
     token_limit_key: ChatMaxTokensField = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
 

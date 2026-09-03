@@ -19,6 +19,8 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.reasoning_carrier import (
     FIREWORKS_REASONING_CONTENT_PREFIX,
+    FIREWORKS_SCHEME,
+    HUNYUAN_SCHEME,
     MAXIMUM_REASONING_CARRIER_BYTES,
     ReasoningCarrierAuthority,
     parse_reasoning_content_carrier,
@@ -394,4 +396,104 @@ def test_later_carrier_binds_earlier_authenticated_reasoning() -> None:
             assistant_content=None,
             tool_calls=_tool_calls("call-later"),
             history_prefix=second_prefix,
+        )
+
+
+def _hunyuan_authority(
+    *,
+    credential: str = "replica-shared-provider-secret",
+    route_sha256: str = _ROUTE_SHA256,
+) -> ReasoningCarrierAuthority:
+    """Derive one Hunyuan carrier authority from the SAME route/credential material.
+
+    Deliberately shares the credential and route sha with the Fireworks helper so
+    the test proves the DOMAIN separation (not the credential) is what isolates the
+    two providers.
+    """
+    authority = reasoning_carrier_authority(
+        authorization=_authorization(),
+        exact_model_id="deepseek-exact",
+        pool_id="pool-one",
+        deployment=_deployment(),
+        profile=GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://hunyuan.tencentcloudapi.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {credential}"},
+            model_id="hunyuan-hy4-preview",
+            hunyuan_reasoning_route_sha256=route_sha256,
+        ),
+        scheme=HUNYUAN_SCHEME,
+    )
+    assert authority is not None
+    return authority
+
+
+def test_carrier_domains_isolate_fireworks_and_hunyuan() -> None:
+    """A carrier sealed for one provider can never authenticate on the other's route.
+
+    Same credential and route context, so the ONLY thing separating them is the
+    per-scheme key-derivation + credential-identity domain. Proven, not asserted by
+    construction: (1) the two authorities derive different AEAD keys and fingerprints;
+    (2) each carrier is rejected — with one opaque error — when replayed under the
+    other provider's scheme+authority.
+    """
+    fireworks = _authority()
+    hunyuan = _hunyuan_authority()
+
+    # Domain separation makes the same credential+route yield distinct keys/fingerprints.
+    assert fireworks.aead_key != hunyuan.aead_key
+    assert fireworks.credential_identity_sha256 != hunyuan.credential_identity_sha256
+
+    fireworks_carrier = seal_reasoning_content(
+        fireworks,
+        issuing_request_id="issuing-request",
+        issuing_route_depth=1,
+        issuing_history_sha256=_HISTORY_SHA256,
+        assistant_content="visible",
+        tool_calls=_tool_calls("call-one"),
+        content="fireworks private reasoning",
+    )
+    hunyuan_carrier = seal_reasoning_content(
+        hunyuan,
+        issuing_request_id="issuing-request",
+        issuing_route_depth=1,
+        issuing_history_sha256=_HISTORY_SHA256,
+        assistant_content="visible",
+        tool_calls=_tool_calls("call-one"),
+        content="hunyuan private reasoning",
+        scheme=HUNYUAN_SCHEME,
+    )
+    assert fireworks_carrier.startswith(FIREWORKS_SCHEME.prefix)
+    assert hunyuan_carrier.startswith(HUNYUAN_SCHEME.prefix)
+
+    # A Fireworks carrier replayed on a Hunyuan route: the Hunyuan scheme's prefix
+    # gate refuses it before any AEAD work.
+    with pytest.raises(ValueError):
+        unseal_reasoning_content(
+            parse_reasoning_content_carrier(fireworks_carrier, scheme=HUNYUAN_SCHEME),
+            hunyuan,
+            assistant_content="visible",
+            tool_calls=_tool_calls("call-one"),
+            scheme=HUNYUAN_SCHEME,
+        )
+    # And the reverse.
+    with pytest.raises(ValueError):
+        unseal_reasoning_content(
+            parse_reasoning_content_carrier(hunyuan_carrier, scheme=FIREWORKS_SCHEME),
+            fireworks,
+            assistant_content="visible",
+            tool_calls=_tool_calls("call-one"),
+            scheme=FIREWORKS_SCHEME,
+        )
+
+    # Deeper: even bypassing the prefix (force the Fireworks scheme to parse the
+    # Fireworks carrier) but presenting the Hunyuan authority key, the AEAD tag fails
+    # — the domain-separated key cannot decrypt the other provider's envelope.
+    with pytest.raises(ValueError, match="authentication failed"):
+        unseal_reasoning_content(
+            parse_reasoning_content_carrier(fireworks_carrier, scheme=FIREWORKS_SCHEME),
+            hunyuan,
+            assistant_content="visible",
+            tool_calls=_tool_calls("call-one"),
+            scheme=FIREWORKS_SCHEME,
         )
