@@ -739,6 +739,30 @@ def test_generation_parameter_selection_uses_each_default_for_sampling() -> None
     assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
 
 
+def test_generation_parameter_selection_serves_with_drop_when_no_rung_honors() -> None:
+    """When every rung is a reasoning route that blocks sampling at this effort, all
+    rungs stay selectable (they serve by dropping+disclosing), not rejected."""
+    profiles = tuple(
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url=f"https://reasoning{position}.test",
+            model_id=f"provider/reasoning-{position}",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+            reasoning_effort="high",
+            supported_reasoning_efforts=("none", "high"),
+            reasoning_effort_required=True,
+            sampling_requires_reasoning_none=True,
+        )
+        for position in range(2)
+    )
+    request = _chat_request().model_copy(update={"temperature": 0.5})
+
+    # No rung honors temperature at effort=high, so both remain serviceable and the
+    # value is dropped+disclosed on whichever serves (rather than a hard rejection).
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (0, 1)
+
+
 def test_route_accepts_anthropic_max_effort_without_translation() -> None:
     """The provider's documented max level is preserved exactly."""
     request = _chat_request().model_copy(update={"reasoning_effort": "max"})
@@ -916,8 +940,9 @@ def test_route_rejects_out_of_range_provider_controls() -> None:
     assert "between 0.0 and 1.0" in str(raised.value)
 
 
-def test_conditional_sampling_requires_explicit_none_reasoning() -> None:
-    """GPT-5.1 sampling is accepted only when the caller selects exact no-reasoning mode."""
+def test_srn_sampling_drops_and_discloses_instead_of_rejecting() -> None:
+    """On a reasoning route (srn), temperature/top_p sent with reasoning on is dropped
+    and disclosed, not rejected: the model accepts sampling, just not at this effort."""
     profile = GatewayWireProfile(
         dialect="openai_responses",
         url="https://provider.test",
@@ -925,22 +950,65 @@ def test_conditional_sampling_requires_explicit_none_reasoning() -> None:
         supports_reasoning=True,
         reasoning_wire_format="openai_responses",
         reasoning_effort="medium",
+        supports_temperature=True,
         supports_top_p=True,
         sampling_requires_reasoning_none=True,
     )
-    with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests((profile,), _chat_request(temperature=0.2))
+    public_request, provider_request = route_generation_parameter_requests(
+        (profile,), _chat_request(temperature=0.2, top_p=0.9)
+    )
 
-    assert raised.value.code == "unsupported_parameter"
-    assert raised.value.param == "temperature"
+    # The caller value survives on the public copy for reflection, is dropped from
+    # the provider payload, and both drops are disclosed with an actionable reason.
+    assert public_request.temperature == 0.2
+    assert public_request.top_p == 0.9
+    assert provider_request.temperature is None
+    assert provider_request.top_p is None
+    assert public_request.ignored_parameters == (
+        "temperature->dropped(set_reasoning_effort_none)",
+        "top_p->dropped(set_reasoning_effort_none)",
+    )
 
+
+def test_srn_sampling_is_honored_at_explicit_none_reasoning() -> None:
+    """The sampling hatch stays open: reasoning_effort=none honors temperature/top_p."""
+    profile = GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://provider.test",
+        model_id="gpt-5.1",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        reasoning_effort="medium",
+        supports_temperature=True,
+        supports_top_p=True,
+        sampling_requires_reasoning_none=True,
+    )
     request = _chat_request(temperature=0.2, top_p=0.9).model_copy(
         update={"reasoning_effort": "none"}
     )
     public_request, provider_request = route_generation_parameter_requests((profile,), request)
 
     assert public_request.temperature == 0.2
+    assert provider_request.temperature == 0.2
+    assert provider_request.top_p == 0.9
     assert provider_request.reasoning_effort == "none"
+    assert public_request.ignored_parameters == ()
+
+
+def test_genuinely_unsupported_sampling_still_hard_rejects() -> None:
+    """A route that never declares temperature (Anthropic constrained [1,1]) still
+    rejects — there is nothing to honor at any effort, so it is not srn-droppable."""
+    profile = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://provider.test",
+        model_id="claude-constrained",
+        supports_temperature=False,
+    )
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((profile,), _chat_request(temperature=0.2))
+
+    assert raised.value.code == "unsupported_parameter"
+    assert raised.value.param == "temperature"
 
 
 def test_payload_builder_rejects_conditional_sampling_without_admission() -> None:

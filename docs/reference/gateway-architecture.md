@@ -305,8 +305,9 @@ idempotency header, so this surface never joins the keyed replay stores.
 Route admission preserves caller capabilities in three verbatim-preference layers before any
 coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`), generation
 controls narrow the waterfall to the rungs that preserve every exact value
-(`compatible_generation_parameter_profile_indexes`), and each remaining deployment passes the
-capability preflight plus payload build. Only when zero rungs survive does the
+(`compatible_generation_parameter_profile_indexes`), falling back to the rungs that can serve the
+request only through a disclosed drop when no rung preserves it, and each remaining deployment
+passes the capability preflight plus payload build. Only when zero rungs survive does the
 capability-preservation policy (`exp/runtime/models/providers/capability_policy.py`) attempt one
 minimal COERCE-WITH-DISCLOSURE: a reasoning effort snaps to the nearest level any rung supports
 on the canonical ladder (ties prefer the lower level), ANY effort on a route with no reasoning
@@ -314,7 +315,13 @@ support at all drops (first-party clients pin effort globally, so a named reject
 sessions unusable against non-reasoning models the provider itself serves fine without the
 parameter; the Messages surface's verbatim `output_config.effort` is stripped with it so the
 dropped value reaches the provider through no channel), and `strict: true` tools degrade to
-best-effort schemas. A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
+best-effort schemas. On a reasoning route that accepts sampling only at `reasoning_effort=none`
+(`sampling_requires_reasoning_none`, e.g. gpt-5.6-sol/luna), a `temperature`/`top_p` sent with
+reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_effort_none)` rather
+than rejected — the model accepts sampling, just not at that effort, so the request serves and the
+caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
+control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
+nothing to honor at any effort. A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
 only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
 directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
 bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own
