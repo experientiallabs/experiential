@@ -29,6 +29,19 @@ class EmbeddingsRequest(ContractModel):
     user: str | None = Field(default=None, max_length=1024)
     """End-user attribution from the OpenAI ``user`` field: content-free and never a credential."""
 
+    @property
+    def attribution_label(self) -> str | None:
+        """The end-user attribution label, per the OpenAI spec.
+
+        The embeddings body carries only the ``user`` field (no
+        ``safety_identifier``), so the label is exactly that field; hosts read
+        it off every serving request at accept, whichever surface it came in on.
+
+        Returns:
+            The attribution label, or ``None`` when the caller sent no ``user``.
+        """
+        return self.user
+
     @field_validator("inputs")
     @classmethod
     def _require_nonempty_inputs(cls, value: tuple[str, ...]) -> tuple[str, ...]:

@@ -28,3 +28,9 @@ def test_embeddings_request_rejects_empty_input_sets() -> None:
         EmbeddingsRequest(inputs=("ok", ""))
     with pytest.raises(ValidationError, match="greater than 0"):
         EmbeddingsRequest(inputs=("ok",), dimensions=0)
+
+
+def test_embeddings_request_attributes_the_end_user_from_the_user_field() -> None:
+    """``attribution_label`` mirrors the chat contract: the ``user`` field or nothing."""
+    assert EmbeddingsRequest(inputs=("hi",)).attribution_label is None
+    assert EmbeddingsRequest(inputs=("hi",), user="tenant-7").attribution_label == "tenant-7"
