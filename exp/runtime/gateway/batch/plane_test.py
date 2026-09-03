@@ -16,15 +16,18 @@ from exp.runtime.gateway.batch.engine_test import (
     _chat_line,
 )
 from exp.runtime.gateway.batch.plane import BatchControlPlane
+from exp.runtime.gateway.sqlite.store import InvalidVirtualKeyError
 
 
 class MemoryControl:
     """GatewayControlStore double accepting exactly one key."""
 
     def authenticate_key(self, *, raw_key: str) -> None:
-        """Accept only the fixture key."""
+        """Accept only the fixture key; a lookup outage is a distinct failure."""
+        if raw_key == "xpl_outage":
+            raise RuntimeError("store unreachable")
         if raw_key != "xpl_good":
-            raise PermissionError("unknown key")
+            raise InvalidVirtualKeyError("unknown key")
 
     def authenticated_identity(self, *, raw_key: str) -> tuple[str, str]:
         """Return the fixture identity."""
@@ -73,6 +76,17 @@ def test_invalid_key_maps_to_the_uniform_401() -> None:
             "type": "authentication_error",
             "code": "invalid_key",
         }
+
+
+def test_key_lookup_outage_is_an_internal_error_not_a_key_verdict() -> None:
+    """A failing control store answers 500, never 401: the key was not judged."""
+    parsed = json.loads(_plane().batch_list(json.dumps({"bearer_key": "xpl_outage"})))
+    assert parsed["status"] == 500
+    assert parsed["body"]["error"] == {
+        "message": "the gateway request failed",
+        "type": "api_error",
+        "code": "internal_error",
+    }
 
 
 def test_file_roundtrip_and_batch_lifecycle_through_the_plane() -> None:

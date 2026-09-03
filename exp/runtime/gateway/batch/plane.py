@@ -18,6 +18,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.batch.contracts import BatchSubmitError
 from exp.runtime.gateway.batch.engine import BatchEngine
 from exp.runtime.gateway.interfaces import GatewayControlStore
+from exp.runtime.gateway.sqlite.store import InvalidVirtualKeyError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ _ERROR_STATUS: dict[str, int] = {
     "insufficient_quota": 402,
     "not_found": 404,
     "cancel_unsupported": 409,
+    "internal_error": 500,
     "provider_error": 502,
 }
 
@@ -49,10 +51,13 @@ class BatchControlPlane:
         An absent, invalid, expired, or revoked key answers the same 401
         ``invalid_key`` envelope the synchronous routes use, so one key
         failure reads identically on every surface of the gateway and the
-        batch routes leak nothing a synchronous route would not.
+        batch routes leak nothing a synchronous route would not. Any other
+        failure of the lookup itself (a store outage) is an internal error,
+        never a verdict on the key.
 
         Raises:
-            BatchSubmitError: When the key is absent or invalid.
+            BatchSubmitError: When the key is absent or invalid, or the
+                lookup failed.
         """
         raw_key = argument.get("bearer_key")
         if not isinstance(raw_key, str) or not raw_key:
@@ -60,8 +65,11 @@ class BatchControlPlane:
         try:
             self._control.authenticate_key(raw_key=raw_key)
             return self._control.authenticated_identity(raw_key=raw_key)
-        except Exception as exc:
+        except InvalidVirtualKeyError as exc:
             raise BatchSubmitError("invalid or revoked key", code="invalid_key") from exc
+        except Exception as exc:
+            _LOGGER.exception("batch key lookup failed")
+            raise BatchSubmitError("the gateway request failed", code="internal_error") from exc
 
     @staticmethod
     def _decode(argument: str) -> JsonObject:
