@@ -62,13 +62,17 @@ def _call(plane: BatchControlPlane, method: str, **payload: object) -> tuple[int
     return parsed["status"], parsed["body"]
 
 
-def test_invalid_key_maps_to_not_found_status() -> None:
-    """A bad bearer key produces the uniform 404 envelope."""
+def test_invalid_key_maps_to_the_uniform_401() -> None:
+    """A bad or missing bearer key produces the synchronous lane's 401 envelope."""
     plane = _plane()
-    rendered = plane.batch_list(json.dumps({"bearer_key": "xpl_bad"}))
-    parsed = json.loads(rendered)
-    assert parsed["status"] == 404
-    assert parsed["body"]["error"]["code"] == "not_found"
+    for argument in ({"bearer_key": "xpl_bad"}, {"bearer_key": ""}, {}):
+        parsed = json.loads(plane.batch_list(json.dumps(argument)))
+        assert parsed["status"] == 401, argument
+        assert parsed["body"]["error"] == {
+            "message": parsed["body"]["error"]["message"],
+            "type": "authentication_error",
+            "code": "invalid_key",
+        }
 
 
 def test_file_roundtrip_and_batch_lifecycle_through_the_plane() -> None:

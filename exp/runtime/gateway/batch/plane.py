@@ -23,6 +23,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _ERROR_STATUS: dict[str, int] = {
     "invalid_request_error": 400,
+    "invalid_key": 401,
     "insufficient_quota": 402,
     "not_found": 404,
     "cancel_unsupported": 409,
@@ -45,17 +46,22 @@ class BatchControlPlane:
     def _identity(self, argument: JsonObject) -> tuple[str, str]:
         """Authenticate the carried bearer key into an owning identity.
 
+        An absent, invalid, expired, or revoked key answers the same 401
+        ``invalid_key`` envelope the synchronous routes use, so one key
+        failure reads identically on every surface of the gateway and the
+        batch routes leak nothing a synchronous route would not.
+
         Raises:
             BatchSubmitError: When the key is absent or invalid.
         """
         raw_key = argument.get("bearer_key")
         if not isinstance(raw_key, str) or not raw_key:
-            raise BatchSubmitError("missing bearer key", code="not_found")
+            raise BatchSubmitError("missing bearer key", code="invalid_key")
         try:
             self._control.authenticate_key(raw_key=raw_key)
             return self._control.authenticated_identity(raw_key=raw_key)
         except Exception as exc:
-            raise BatchSubmitError("invalid or revoked key", code="not_found") from exc
+            raise BatchSubmitError("invalid or revoked key", code="invalid_key") from exc
 
     @staticmethod
     def _decode(argument: str) -> JsonObject:
@@ -81,13 +87,19 @@ class BatchControlPlane:
     def _error(error: BatchSubmitError) -> str:
         """Render one OpenAI-envelope error for the data plane."""
         status = _ERROR_STATUS.get(error.code, 400)
+        if status == 401:
+            error_type = "authentication_error"
+        elif status < 500:
+            error_type = "invalid_request_error"
+        else:
+            error_type = "api_error"
         return json.dumps(
             {
                 "status": status,
                 "body": {
                     "error": {
                         "message": error.message,
-                        "type": "invalid_request_error" if status < 500 else "api_error",
+                        "type": error_type,
                         "code": error.code,
                     }
                 },

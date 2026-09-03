@@ -141,7 +141,8 @@ def test_batch_routes_serve_the_full_job_lifecycle_over_real_http(
             unauthorized = client.get(
                 f"{base}/v1/batches", headers={"Authorization": "Bearer xpl_wrong"}
             )
-            assert unauthorized.status_code == 404
+            assert unauthorized.status_code == 401
+            assert unauthorized.json()["error"]["code"] == "invalid_key"
     finally:
         shutdown.request_shutdown()
         thread.join(timeout=10)
