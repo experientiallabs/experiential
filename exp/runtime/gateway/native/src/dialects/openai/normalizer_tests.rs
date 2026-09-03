@@ -329,3 +329,117 @@ fn completed_reasoning_items_pass_encrypted_content_through() {
         ] if item_id.as_deref() == Some("rs_2")
     ));
 }
+
+fn compatible_chunk(delta: serde_json::Value, finish_reason: Option<&str>) -> SseEvent {
+    SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "id": "chatcmpl-dashscope",
+            "object": "chat.completion.chunk",
+            "created": 1_788_425_855,
+            "model": "qwen3.8-flash",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        })
+        .to_string(),
+    }
+}
+
+#[test]
+fn dashscope_argument_deltas_restate_an_empty_tool_call_id() {
+    // DashScope's documented (and live, 2026-09-03) OpenAI-compatible tool
+    // stream: the first delta names the call, every later argument delta
+    // restates `"id": ""` with a null name. An empty placeholder is not a
+    // changed identity, so the call must accumulate and complete normally
+    // (this exact shape 502'd every qwen tool call as malformed_response).
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    assert!(normalizer
+        .feed(&compatible_chunk(
+            serde_json::json!({"role": "assistant", "content": ""}),
+            None,
+        ))
+        .expect("role delta must normalize")
+        .is_empty());
+    let started = normalizer
+        .feed(&compatible_chunk(
+            serde_json::json!({"tool_calls": [{
+                "index": 0,
+                "id": "call_8f08d2b0fc0c4d8fab7123",
+                "type": "function",
+                "function": {"name": "get_current_weather", "arguments": "{\"location\":"},
+            }]}),
+            None,
+        ))
+        .expect("first tool delta must normalize");
+    assert!(matches!(
+        started.as_slice(),
+        [
+            Event::ToolCallStarted { call_id, name, .. },
+            Event::ToolArgumentsDelta { delta, .. },
+        ] if call_id == "call_8f08d2b0fc0c4d8fab7123"
+            && name == "get_current_weather"
+            && delta == "{\"location\":"
+    ));
+    let continued = normalizer
+        .feed(&compatible_chunk(
+            serde_json::json!({"tool_calls": [{
+                "index": 0,
+                "id": "",
+                "type": "function",
+                "function": {"arguments": " \"Hangzhou\"}", "name": null},
+            }]}),
+            None,
+        ))
+        .expect("an empty restated id is a placeholder, not a changed identity");
+    assert!(matches!(
+        continued.as_slice(),
+        [Event::ToolArgumentsDelta { delta, .. }] if delta == " \"Hangzhou\"}"
+    ));
+    assert!(normalizer
+        .feed(&compatible_chunk(serde_json::json!({}), Some("tool_calls")))
+        .expect("finish chunk must normalize")
+        .is_empty());
+    let done = SseEvent {
+        event: None,
+        data: "[DONE]".to_string(),
+    };
+    let events = normalizer.feed(&done).expect("stream must complete");
+    assert!(matches!(
+        events.as_slice(),
+        [Event::ToolCallCompleted { call, .. }, Event::Completed]
+            if call.call_id == "call_8f08d2b0fc0c4d8fab7123"
+                && call.name == "get_current_weather"
+                && call.raw_arguments == "{\"location\": \"Hangzhou\"}"
+    ));
+}
+
+#[test]
+fn compatible_stream_still_rejects_a_changed_non_empty_tool_call_identity() {
+    // The identity guard keeps its teeth: a later delta naming a DIFFERENT
+    // non-empty id or name is still a malformed stream.
+    for (id, name) in [("call_other", "get_current_weather"), ("call_1", "other_tool")] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_current_weather", "arguments": ""},
+                }]}),
+                None,
+            ))
+            .expect("first tool delta must normalize");
+        let failure = normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0,
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": "{}"},
+                }]}),
+                None,
+            ))
+            .expect_err("a changed non-empty identity must stay malformed");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    }
+}

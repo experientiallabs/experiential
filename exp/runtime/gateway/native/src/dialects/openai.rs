@@ -816,15 +816,20 @@ impl Normalizer {
                                 malformed("OpenAI-compatible tool function must be an object")
                             })?;
                     if let Some(tool) = self.tools.get(&index) {
+                        // An identity is only restated when it is non-empty:
+                        // DashScope (Qwen) argument deltas carry `"id": ""`
+                        // (documented shape, live 2026-09-03), and an empty
+                        // placeholder names nothing, so only a different
+                        // NON-EMPTY id or name is a stream that changed identity.
                         if let Some(Value::String(repeated_id)) = item.get("id") {
-                            if repeated_id != &tool.call_id {
+                            if !repeated_id.is_empty() && repeated_id != &tool.call_id {
                                 return Err(malformed(
                                     "OpenAI-compatible stream changed a tool-call ID",
                                 ));
                             }
                         }
                         if let Some(Value::String(repeated_name)) = function.get("name") {
-                            if repeated_name != &tool.name {
+                            if !repeated_name.is_empty() && repeated_name != &tool.name {
                                 return Err(malformed(
                                     "OpenAI-compatible stream changed a tool-call name",
                                 ));
