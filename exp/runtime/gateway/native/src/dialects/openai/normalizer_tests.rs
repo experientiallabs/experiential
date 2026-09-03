@@ -398,6 +398,54 @@ fn dashscope_argument_deltas_restate_an_empty_tool_call_id() {
         .feed(&compatible_chunk(serde_json::json!({}), Some("tool_calls")))
         .expect("finish chunk must normalize")
         .is_empty());
+    let done = SseEvent {
+        event: None,
+        data: "[DONE]".to_string(),
+    };
+    let events = normalizer.feed(&done).expect("stream must complete");
+    assert!(matches!(
+        events.as_slice(),
+        [Event::ToolCallCompleted { call, .. }, Event::Completed]
+            if call.call_id == "call_8f08d2b0fc0c4d8fab7123"
+                && call.name == "get_current_weather"
+                && call.raw_arguments == "{\"location\": \"Hangzhou\"}"
+    ));
+}
+
+#[test]
+fn compatible_stream_still_rejects_a_changed_non_empty_tool_call_identity() {
+    // The identity guard keeps its teeth: a later delta naming a DIFFERENT
+    // non-empty id or name is still a malformed stream.
+    for (id, name) in [
+        ("call_other", "get_current_weather"),
+        ("call_1", "other_tool"),
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_current_weather", "arguments": ""},
+                }]}),
+                None,
+            ))
+            .expect("first tool delta must normalize");
+        let failure = normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0,
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": "{}"},
+                }]}),
+                None,
+            ))
+            .expect_err("a changed non-empty identity must stay malformed");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    }
+}
 
 #[test]
 fn compatible_stream_folds_additive_reasoning_into_the_terminal_usage() {
@@ -464,49 +512,6 @@ fn compatible_stream_folds_additive_reasoning_into_the_terminal_usage() {
         event: None,
         data: "[DONE]".to_string(),
     };
-    let events = normalizer.feed(&done).expect("stream must complete");
-    assert!(matches!(
-        events.as_slice(),
-        [Event::ToolCallCompleted { call, .. }, Event::Completed]
-            if call.call_id == "call_8f08d2b0fc0c4d8fab7123"
-                && call.name == "get_current_weather"
-                && call.raw_arguments == "{\"location\": \"Hangzhou\"}"
-    ));
-}
-
-#[test]
-fn compatible_stream_still_rejects_a_changed_non_empty_tool_call_identity() {
-    // The identity guard keeps its teeth: a later delta naming a DIFFERENT
-    // non-empty id or name is still a malformed stream.
-    for (id, name) in [
-        ("call_other", "get_current_weather"),
-        ("call_1", "other_tool"),
-    ] {
-        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
-        normalizer
-            .feed(&compatible_chunk(
-                serde_json::json!({"tool_calls": [{
-                    "index": 0,
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "get_current_weather", "arguments": ""},
-                }]}),
-                None,
-            ))
-            .expect("first tool delta must normalize");
-        let failure = normalizer
-            .feed(&compatible_chunk(
-                serde_json::json!({"tool_calls": [{
-                    "index": 0,
-                    "id": id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": "{}"},
-                }]}),
-                None,
-            ))
-            .expect_err("a changed non-empty identity must stay malformed");
-        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
-
     let events = normalizer.feed(&done).expect("terminal");
     match events.as_slice() {
         [Event::Usage(usage), Event::Completed] => {
