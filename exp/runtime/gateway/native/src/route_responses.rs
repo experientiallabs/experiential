@@ -33,7 +33,7 @@ use crate::respond::{
     escalation_error, finish_stream_terminal, json_response, latin1_header, read_body,
     send_bounded, settle_stream_end, sse_body_response,
 };
-use crate::responses_retention::{remember_argument, ResponsesRetention};
+use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
@@ -282,32 +282,6 @@ pub(crate) async fn responses(
     }
 }
 
-/// Retain one finished Responses continuation before the terminal frames
-/// flush, mirroring the python service's ordering. Returns the public error
-/// when bounded retention fails closed.
-///
-/// An output-less turn (thinking spent the whole output budget, so the
-/// response is `incomplete` with no items) is retained too: the caller holds
-/// its response id, and `previous_response_id` naming it must resolve to the
-/// conversation so far rather than `previous_response_not_found`.
-async fn remember_continuation(
-    state: &AppState,
-    request_id: &str,
-    retention: &ResponsesRetention,
-    reasoning_content_carrier: Option<&str>,
-) -> Result<(), PublicError> {
-    if retention.overflowed || retention.refusal() {
-        return Ok(());
-    }
-    state
-        .bridge
-        .call(
-            "remember",
-            remember_argument(request_id, retention, reasoning_content_carrier),
-        )
-        .await
-        .map(|_| ())
-}
 /// Answer one Responses attempt that the waterfall already settled: a
 /// successful terminal with no semantic output, or an exhausted ladder
 /// flushing withheld refusal output ahead of the failing terminal.
