@@ -10,14 +10,15 @@
 //! total would bill every reasoning token at zero unless the mapper folds it
 //! back in. Per wire:
 //!
-//! - OpenAI Responses (`openai_usage`): `output_tokens_details.reasoning_tokens`
-//!   is a documented subset of `output_tokens`; forwarded as reported.
-//! - Chat Completions (`openai_compatible_usage`): OpenAI, OpenRouter, DeepSeek,
-//!   Fireworks, and Azure-relayed Fireworks fold reasoning into
-//!   `completion_tokens`; xAI (native and relayed by Azure Foundry) reports it
-//!   outside. A reasoning count above `completion_tokens` is impossible under
-//!   subset semantics, so it is taken as proof of an additive provider and
-//!   folded; a folded provider is never touched.
+//! - OpenAI-shaped wires (Responses via `openai_usage`, Chat Completions via
+//!   `openai_compatible_usage`): OpenAI, OpenRouter, DeepSeek, and Fireworks
+//!   report reasoning inside the output total; xAI (native and relayed by
+//!   Azure Foundry) reports it outside on both wires. The provider's own
+//!   `total_tokens` decides: `input + output` is the subset shape and is
+//!   forwarded as reported, `input + output + reasoning` is the additive shape
+//!   and folds (`fold_openai_shaped_reasoning`). Without a decisive total, a
+//!   reasoning count above the output total is impossible under subset
+//!   semantics and folds.
 //! - Gemini (`gemini_usage`): `thoughtsTokenCount` is additive by Google's
 //!   definition (`totalTokenCount` = prompt + candidates + thoughts), so it is
 //!   folded into `output_tokens` unconditionally.
@@ -641,9 +642,53 @@ fn optional_usage_detail(
     }
 }
 
-/// Parse an OpenAI-shaped usage object from a terminal Responses payload,
-/// mirroring `streaming_usage.openai_usage`: an omitted object is unknown
-/// usage, while a malformed one fails the stream.
+/// Sum persistable legs into one ledger count. Individually persistable legs
+/// whose total is not are a provider contract violation, never a clamped or
+/// wrapped total.
+pub fn bounded_ledger_sum(legs: &[u64], label: &str) -> Result<u64, String> {
+    legs.iter()
+        .try_fold(0u64, |total, leg| total.checked_add(*leg))
+        .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
+        .ok_or_else(|| format!("{label} token total overflows a persistable count"))
+}
+
+/// Resolve the output total of an OpenAI-shaped usage object so that
+/// `reasoning_tokens` names a subset of it (see the module documentation).
+///
+/// The provider's own `total_tokens` is authoritative when it matches either
+/// accounting: `input + output` is the documented subset shape and the output
+/// total is forwarded as reported; `input + output + reasoning` is the
+/// additive shape (xAI, natively or relayed by Azure Foundry) and reasoning is
+/// folded in. Without a decisive total, a reasoning count above the output
+/// total cannot occur under subset semantics and is folded.
+fn fold_openai_shaped_reasoning(
+    input_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    label: &str,
+) -> Result<u64, String> {
+    let Some(reasoning) = reasoning_tokens.filter(|reasoning| *reasoning > 0) else {
+        return Ok(output_tokens);
+    };
+    let subset_total = input_tokens.checked_add(output_tokens);
+    let additive_total = subset_total.and_then(|total| total.checked_add(reasoning));
+    let additive = match total_tokens {
+        Some(total) if Some(total) == subset_total => false,
+        Some(total) if Some(total) == additive_total => true,
+        _ => reasoning > output_tokens,
+    };
+    if additive {
+        bounded_ledger_sum(&[output_tokens, reasoning], label)
+    } else {
+        Ok(output_tokens)
+    }
+}
+
+/// Parse an OpenAI-shaped usage object from a terminal Responses payload: an
+/// omitted object is unknown usage, while a malformed one fails the stream.
+/// `output_tokens_details.reasoning_tokens` folds into `output_tokens` when
+/// the provider's `total_tokens` shows it was reported additively.
 pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
     let value = match value {
         None | Some(Value::Null) => return Ok(None),
@@ -652,17 +697,25 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "OpenAI usage must be an object".to_string())?;
+    let input_tokens = count_or_zero(object, "input_tokens", "OpenAI input_tokens")?;
+    let reported_output = count_or_zero(object, "output_tokens", "OpenAI output_tokens")?;
+    let reasoning_tokens = optional_usage_detail(
+        object,
+        "output_tokens_details",
+        "reasoning_tokens",
+        "OpenAI reasoning_tokens",
+    )?;
+    let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
+    let output_tokens = fold_openai_shaped_reasoning(
+        input_tokens,
+        reported_output,
+        reasoning_tokens,
+        total_tokens,
+        "OpenAI output",
+    )?;
     Ok(Some(Usage {
-        input_tokens: Some(count_or_zero(
-            object,
-            "input_tokens",
-            "OpenAI input_tokens",
-        )?),
-        output_tokens: Some(count_or_zero(
-            object,
-            "output_tokens",
-            "OpenAI output_tokens",
-        )?),
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(output_tokens),
         cached_input_tokens: optional_usage_detail(
             object,
             "input_tokens_details",
@@ -670,46 +723,19 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
             "OpenAI cached_tokens",
         )?,
         cache_creation_input_tokens: None,
-        reasoning_tokens: optional_usage_detail(
-            object,
-            "output_tokens_details",
-            "reasoning_tokens",
-            "OpenAI reasoning_tokens",
-        )?,
+        reasoning_tokens,
     }))
-}
-
-/// Fold a reasoning count the provider reports OUTSIDE its output total back
-/// into that total, so the emitted usage satisfies the reasoning-subset
-/// contract (see the module documentation). A folded total beyond the
-/// persistable ledger range is a provider contract violation, never a clamped
-/// or wrapped total.
-fn fold_additive_reasoning(
-    output_tokens: u64,
-    reasoning_tokens: u64,
-    label: &str,
-) -> Result<u64, String> {
-    output_tokens
-        .checked_add(reasoning_tokens)
-        .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
-        .ok_or_else(|| format!("{label} output token total overflows a persistable count"))
 }
 
 /// Parse a Chat Completions usage object: a malformed object fails the stream
 /// instead of silently dropping token accounting.
-///
-/// `completion_tokens_details.reasoning_tokens` is a subset of
-/// `completion_tokens` on OpenAI and every provider that mirrors it, and is
-/// forwarded as reported. A reasoning count ABOVE `completion_tokens` cannot
-/// occur under subset semantics; it identifies a provider that reports
-/// reasoning additively (xAI, natively or relayed by Azure Foundry), so the
-/// count is folded into `output_tokens` and `reasoning_tokens` keeps naming
-/// the subset. The fold misses an additive provider only when its reasoning
-/// happens to be no larger than its visible answer.
+/// `completion_tokens_details.reasoning_tokens` folds into `output_tokens`
+/// when the provider's `total_tokens` shows it was reported additively.
 pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "OpenAI-compatible usage must be an object".to_string())?;
+    let input_tokens = count_or_zero(object, "prompt_tokens", "prompt_tokens")?;
     let completion_tokens = count_or_zero(object, "completion_tokens", "completion_tokens")?;
     let reasoning_tokens = optional_usage_detail(
         object,
@@ -717,14 +743,16 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
         "reasoning_tokens",
         "reasoning_tokens",
     )?;
-    let output_tokens = match reasoning_tokens {
-        Some(reasoning) if reasoning > completion_tokens => {
-            fold_additive_reasoning(completion_tokens, reasoning, "OpenAI-compatible")?
-        }
-        _ => completion_tokens,
-    };
+    let total_tokens = count_if_present(object, "total_tokens", "OpenAI-compatible usage")?;
+    let output_tokens = fold_openai_shaped_reasoning(
+        input_tokens,
+        completion_tokens,
+        reasoning_tokens,
+        total_tokens,
+        "OpenAI-compatible output",
+    )?;
     Ok(Usage {
-        input_tokens: Some(count_or_zero(object, "prompt_tokens", "prompt_tokens")?),
+        input_tokens: Some(input_tokens),
         output_tokens: Some(output_tokens),
         cached_input_tokens: optional_usage_detail(
             object,
@@ -764,7 +792,7 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         "Gemini candidatesTokenCount",
     )?;
     let output_tokens = match reasoning_tokens {
-        Some(reasoning) => fold_additive_reasoning(candidates_tokens, reasoning, "Gemini")?,
+        Some(reasoning) => bounded_ledger_sum(&[candidates_tokens, reasoning], "Gemini output")?,
         None => candidates_tokens,
     };
     Ok(Usage {
@@ -806,11 +834,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         "cacheWriteInputTokens",
         "Bedrock cacheWriteInputTokens",
     )?;
-    let input_tokens = fresh
-        .checked_add(cache_read)
-        .and_then(|total| total.checked_add(cache_write))
-        .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
-        .ok_or_else(|| "Bedrock input token total overflows a persistable count".to_string())?;
+    let input_tokens = bounded_ledger_sum(&[fresh, cache_read, cache_write], "Bedrock input")?;
     Ok(Usage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(count_or_zero(
@@ -866,5 +890,4 @@ pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Resul
 }
 
 #[cfg(test)]
-#[path = "events/tests.rs"]
 mod tests;

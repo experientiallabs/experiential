@@ -403,9 +403,10 @@ fn dashscope_argument_deltas_restate_an_empty_tool_call_id() {
 fn compatible_stream_folds_additive_reasoning_into_the_terminal_usage() {
     // Verbatim final frames from Azure Foundry grok-4.3 (silen-resource,
     // 2026-09-03, stream_options.include_usage): xAI reports 655 reasoning
-    // tokens OUTSIDE completion_tokens=8 (its total_tokens 677 = 14 + 8 + 655),
-    // so the normalized usage carries the folded output total with the
-    // reasoning subset intact, and the cached prompt leg passes through.
+    // tokens OUTSIDE completion_tokens=8, which its total_tokens identifies
+    // (677 = 14 + 8 + 655), so the normalized usage carries the folded output
+    // total with the reasoning subset intact, and the cached prompt leg passes
+    // through.
     let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
     let text = SseEvent {
         event: None,

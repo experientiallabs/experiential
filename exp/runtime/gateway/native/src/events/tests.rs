@@ -1,5 +1,4 @@
-//! Usage-mapper and count-parsing regressions for `events.rs` (moved out of
-//! the module for its line budget).
+//! Usage-mapper and count-parsing regressions for `events.rs`.
 
 use super::*;
 use serde_json::json;
@@ -155,10 +154,10 @@ fn openai_usage_treats_absent_and_null_objects_as_unknown() {
 // reasoning token at zero because a provider reported it outside its total.
 
 #[test]
-fn openai_responses_usage_forwards_the_documented_reasoning_subset_unchanged() {
+fn openai_responses_usage_folds_reasoning_only_when_the_total_shows_it_additive() {
     // OpenAI Responses: output_tokens_details.reasoning_tokens is a subset of
-    // output_tokens by the provider's definition, so the counts pass through.
-    let usage = openai_usage(Some(&json!({
+    // output_tokens (total_tokens = input + output), so the counts pass through.
+    let subset = openai_usage(Some(&json!({
         "input_tokens": 36,
         "input_tokens_details": {"cached_tokens": 0},
         "output_tokens": 700,
@@ -167,9 +166,20 @@ fn openai_responses_usage_forwards_the_documented_reasoning_subset_unchanged() {
     })))
     .expect("valid usage")
     .expect("usage present");
-    assert_eq!(usage.output_tokens, Some(700));
-    assert_eq!(usage.reasoning_tokens, Some(690));
-    assert!(usage.reasoning_tokens <= usage.output_tokens);
+    assert_eq!(subset.output_tokens, Some(700));
+    assert_eq!(subset.reasoning_tokens, Some(690));
+    // xAI's documented Responses usage (docs.x.ai) reports reasoning outside
+    // output_tokens, and its total_tokens (32 + 9 + 110 = 151) says so.
+    let additive = openai_usage(Some(&json!({
+        "input_tokens": 32,
+        "output_tokens": 9,
+        "output_tokens_details": {"reasoning_tokens": 110},
+        "total_tokens": 151,
+    })))
+    .expect("valid usage")
+    .expect("usage present");
+    assert_eq!(additive.output_tokens, Some(119));
+    assert_eq!(additive.reasoning_tokens, Some(110));
 }
 
 #[test]
@@ -188,6 +198,18 @@ fn openai_compatible_usage_leaves_a_folded_provider_untouched() {
         assert_eq!(usage.output_tokens, Some(completion));
         assert_eq!(usage.reasoning_tokens, Some(reasoning));
     }
+    // A total_tokens that names the subset shape is authoritative even when
+    // the reasoning count exceeds the output total; settlement clamps that
+    // provider inconsistency instead of the mapper inventing output.
+    let subset_total = openai_compatible_usage(&json!({
+        "prompt_tokens": 36,
+        "completion_tokens": 5,
+        "total_tokens": 41,
+        "completion_tokens_details": {"reasoning_tokens": 9},
+    }))
+    .expect("valid usage");
+    assert_eq!(subset_total.output_tokens, Some(5));
+    assert_eq!(subset_total.reasoning_tokens, Some(9));
     // OpenRouter normalizes upstream reasoning into completion_tokens and
     // reports the subset alongside (shape captured from openrouter.ai).
     let openrouter = openai_compatible_usage(&json!({
@@ -208,10 +230,9 @@ fn openai_compatible_usage_leaves_a_folded_provider_untouched() {
 #[test]
 fn openai_compatible_usage_folds_an_additive_provider_into_output_tokens() {
     // Verbatim usage from Azure Foundry grok-4.3 (silen-resource, 2026-09-03,
-    // non-streaming): xAI reports reasoning OUTSIDE completion_tokens, which
-    // its own total_tokens confirms (14 + 7 + 1303 = 1324). A reasoning count
-    // above completion_tokens is impossible under subset semantics, so the
-    // mapper folds it and the subset stays reported.
+    // non-streaming): xAI reports reasoning OUTSIDE completion_tokens, and its
+    // own total_tokens identifies the additive shape (14 + 7 + 1303 = 1324),
+    // so the mapper folds it and the subset stays reported.
     let usage = openai_compatible_usage(&json!({
         "prompt_tokens": 14,
         "completion_tokens": 7,
@@ -241,6 +262,35 @@ fn openai_compatible_usage_folds_an_additive_provider_into_output_tokens() {
         usage.input_tokens.unwrap() + usage.output_tokens.unwrap(),
         1324
     );
+    // The total decides regardless of magnitude: a long answer after a short
+    // think (reasoning below completion_tokens) still folds when total_tokens
+    // names the additive shape (14 + 900 + 300 = 1214).
+    let short_think = openai_compatible_usage(&json!({
+        "prompt_tokens": 14,
+        "completion_tokens": 900,
+        "total_tokens": 1214,
+        "completion_tokens_details": {"reasoning_tokens": 300},
+    }))
+    .expect("valid usage");
+    assert_eq!(short_think.output_tokens, Some(1200));
+    assert_eq!(short_think.reasoning_tokens, Some(300));
+    // Without a decisive total, only a reasoning count above completion_tokens
+    // proves the additive shape; a smaller one is indistinguishable from a
+    // subset and passes through.
+    let no_total_above = openai_compatible_usage(&json!({
+        "prompt_tokens": 14,
+        "completion_tokens": 8,
+        "completion_tokens_details": {"reasoning_tokens": 655},
+    }))
+    .expect("valid usage");
+    assert_eq!(no_total_above.output_tokens, Some(663));
+    let no_total_below = openai_compatible_usage(&json!({
+        "prompt_tokens": 14,
+        "completion_tokens": 900,
+        "completion_tokens_details": {"reasoning_tokens": 300},
+    }))
+    .expect("valid usage");
+    assert_eq!(no_total_below.output_tokens, Some(900));
     // A fold whose total leaves the persistable range is a contract violation.
     assert!(openai_compatible_usage(&json!({
         "prompt_tokens": 1,

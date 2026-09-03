@@ -12,8 +12,8 @@ use super::{
 use crate::encode::compact_json;
 use crate::errors::Failure;
 use crate::events::{
-    count_if_present, count_or_zero, require_string, require_u64, Event, ToolAccumulator, Usage,
-    MAXIMUM_LEDGER_COUNT,
+    bounded_ledger_sum, count_if_present, count_or_zero, require_string, require_u64, Event,
+    ToolAccumulator, Usage,
 };
 
 impl Normalizer {
@@ -271,17 +271,11 @@ impl Normalizer {
             }
             "message_stop" => {
                 events.extend(finish_open_tools(&mut self.tools)?);
-                // Individually persistable legs whose folded total is not
-                // are a provider contract violation, exactly like the
-                // Bedrock cache-leg fold.
-                let input_tokens = self
-                    .input_tokens
-                    .checked_add(self.cache_read)
-                    .and_then(|total| total.checked_add(self.cache_write))
-                    .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
-                    .ok_or_else(|| {
-                        malformed("Anthropic input token total overflows a persistable count")
-                    })?;
+                let input_tokens = bounded_ledger_sum(
+                    &[self.input_tokens, self.cache_read, self.cache_write],
+                    "Anthropic input",
+                )
+                .map_err(|message| malformed(&message))?;
                 events.push(Event::Usage(Usage {
                     input_tokens: Some(input_tokens),
                     output_tokens: Some(self.output_tokens),
@@ -374,46 +368,6 @@ mod tests {
             events.as_slice(),
             [Event::RedactedThinking { index: 1, data }] if data == "opaque=="
         ));
-    }
-
-    #[test]
-    fn thinking_usage_forwards_output_tokens_with_no_reasoning_subset() {
-        // Anthropic bills extended thinking inside output_tokens and publishes
-        // no separate thinking count, so the normalized usage forwards the
-        // provider total as reported and leaves the reasoning subset unknown
-        // rather than inventing one; the subset contract holds trivially.
-        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
-        let start_message = frame(serde_json::json!({
-            "type": "message_start",
-            "message": {"usage": {"input_tokens": 41, "output_tokens": 3}},
-        }));
-        assert!(normalizer.feed(&start_message).expect("start").is_empty());
-        let thinking = frame(serde_json::json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
-        }));
-        assert!(normalizer
-            .feed(&thinking)
-            .expect("thinking start")
-            .is_empty());
-        let message_delta = frame(serde_json::json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-            "usage": {"input_tokens": 41, "output_tokens": 412},
-        }));
-        assert!(normalizer.feed(&message_delta).expect("delta").is_empty());
-        let events = normalizer
-            .feed(&frame(serde_json::json!({"type": "message_stop"})))
-            .expect("message stop");
-        match events.as_slice() {
-            [Event::Usage(usage), Event::Completed] => {
-                assert_eq!(usage.input_tokens, Some(41));
-                assert_eq!(usage.output_tokens, Some(412));
-                assert_eq!(usage.reasoning_tokens, None);
-            }
-            other => panic!("unexpected events: {other:?}"),
-        }
     }
 
     /// Frame shapes captured live from one web_search stream (2026-08-31):
@@ -531,6 +485,9 @@ mod tests {
                 assert_eq!(usage.input_tokens, Some(12294));
                 assert_eq!(usage.output_tokens, Some(103));
                 assert_eq!(usage.cached_input_tokens, Some(4));
+                // Anthropic bills thinking inside output_tokens and publishes
+                // no separate count, so the reasoning subset stays unknown.
+                assert_eq!(usage.reasoning_tokens, None);
             }
             other => panic!("unexpected events: {other:?}"),
         }

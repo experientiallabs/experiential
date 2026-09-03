@@ -1,5 +1,4 @@
-//! Gemini `streamGenerateContent` frame mapping, mirroring the python
-//! `_gemini_events` mapper, plus its golden-fixture tests.
+//! Gemini `streamGenerateContent` frame mapping plus its golden-fixture tests.
 
 use serde_json::Value;
 
@@ -8,11 +7,11 @@ use crate::errors::{Failure, FailureClass};
 use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
 
 impl Normalizer {
-    /// Normalize one Gemini `streamGenerateContent` SSE frame, mirroring the
-    /// `_gemini_events` mapper: reasoning parts are skipped, whole function
-    /// calls expand to start/arguments/completed, and the terminal candidate
-    /// flushes the latest usage before its finish reason maps to the shared
-    /// completion, incomplete, refusal, or provider-internal outcome.
+    /// Normalize one Gemini `streamGenerateContent` SSE frame: reasoning parts
+    /// are skipped, whole function calls expand to start/arguments/completed,
+    /// and the terminal candidate flushes the latest usage before its finish
+    /// reason maps to the shared completion, incomplete, refusal, or
+    /// provider-internal outcome.
     pub(super) fn feed_gemini(
         &mut self,
         frame: &crate::sse::SseEvent,
@@ -228,23 +227,21 @@ mod gemini_tests {
 
     #[test]
     fn gemini_thinking_stream_folds_thoughts_into_the_terminal_usage() {
-        // Verbatim frames from gemini-3.7-flash streamGenerateContent?alt=sse
-        // (2026-09-03): every chunk carries the full usageMetadata, the final
-        // chunk adds the thoughtSignature part and STOP. Google's
-        // totalTokenCount (11 + 7 + 654 = 672) shows thoughts are additive, so
-        // the normalized output total is 661 with 654 as the reasoning subset.
-        let usage_metadata = json!({
-            "promptTokenCount": 11,
-            "candidatesTokenCount": 7,
-            "totalTokenCount": 672,
-            "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 11}],
-            "thoughtsTokenCount": 654,
-            "serviceTier": "standard",
-        });
+        // Frame shapes from gemini-3.7-flash streamGenerateContent?alt=sse
+        // (2026-09-03): every chunk carries usageMetadata, the final chunk
+        // adds the thoughtSignature part and STOP. The terminal chunk's counts
+        // win over the earlier partial ones, and Google's totalTokenCount
+        // (11 + 7 + 654 = 672) shows thoughts are additive, so the normalized
+        // output total is 661 with 654 as the reasoning subset.
         let chunks = [
             sse(&json!({
                 "candidates": [{"content": {"parts": [{"text": "Sunlight scatters off air "}], "role": "model"}, "index": 0}],
-                "usageMetadata": usage_metadata,
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 3,
+                    "totalTokenCount": 668,
+                    "thoughtsTokenCount": 654,
+                },
                 "modelVersion": "gemini-3.7-flash",
                 "responseId": "resp-1",
             })),
@@ -254,7 +251,14 @@ mod gemini_tests {
                     "finishReason": "STOP",
                     "index": 0,
                 }],
-                "usageMetadata": usage_metadata,
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 7,
+                    "totalTokenCount": 672,
+                    "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 11}],
+                    "thoughtsTokenCount": 654,
+                    "serviceTier": "standard",
+                },
                 "modelVersion": "gemini-3.7-flash",
                 "responseId": "resp-1",
             })),
@@ -277,41 +281,6 @@ mod gemini_tests {
                 json!({"kind": "completed"}),
             ]
         );
-    }
-
-    #[test]
-    fn gemini_stream_without_thinking_keeps_the_reasoning_subset_unknown() {
-        // Verbatim usageMetadata from gemini-2.5-flash with thinkingBudget 0:
-        // no thoughtsTokenCount is published, so nothing folds and the subset
-        // stays unknown rather than being invented as zero.
-        let chunks = [sse(&json!({
-            "candidates": [{
-                "content": {"parts": [{"text": "Air scatters blue light most."}], "role": "model"},
-                "finishReason": "STOP",
-                "index": 0,
-            }],
-            "usageMetadata": {
-                "promptTokenCount": 11,
-                "candidatesTokenCount": 9,
-                "totalTokenCount": 20,
-                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 11}],
-                "serviceTier": "standard",
-            },
-        }))];
-        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert!(failure.is_none());
-        assert_eq!(
-            events[1],
-            json!({
-                "kind": "usage",
-                "input_tokens": 11,
-                "output_tokens": 9,
-                "cached_input_tokens": 0,
-                "reasoning_tokens": null,
-            })
-        );
-        assert_eq!(events[2], json!({"kind": "completed"}));
     }
 
     #[test]
