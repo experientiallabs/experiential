@@ -376,6 +376,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn thinking_usage_forwards_output_tokens_with_no_reasoning_subset() {
+        // Anthropic bills extended thinking inside output_tokens and publishes
+        // no separate thinking count, so the normalized usage forwards the
+        // provider total as reported and leaves the reasoning subset unknown
+        // rather than inventing one; the subset contract holds trivially.
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        let start_message = frame(serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 41, "output_tokens": 3}},
+        }));
+        assert!(normalizer.feed(&start_message).expect("start").is_empty());
+        let thinking = frame(serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+        }));
+        assert!(normalizer
+            .feed(&thinking)
+            .expect("thinking start")
+            .is_empty());
+        let message_delta = frame(serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"input_tokens": 41, "output_tokens": 412},
+        }));
+        assert!(normalizer.feed(&message_delta).expect("delta").is_empty());
+        let events = normalizer
+            .feed(&frame(serde_json::json!({"type": "message_stop"})))
+            .expect("message stop");
+        match events.as_slice() {
+            [Event::Usage(usage), Event::Completed] => {
+                assert_eq!(usage.input_tokens, Some(41));
+                assert_eq!(usage.output_tokens, Some(412));
+                assert_eq!(usage.reasoning_tokens, None);
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+    }
+
     /// Frame shapes captured live from one web_search stream (2026-08-31):
     /// server tool use with a leading empty input fragment, the whole result
     /// in its start frame, a cited answer, terminal usage that supersedes the

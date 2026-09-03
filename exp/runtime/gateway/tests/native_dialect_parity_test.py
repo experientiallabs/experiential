@@ -89,9 +89,11 @@ GEMINI_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
         "raw_arguments": _GEMINI_RAW_ARGUMENTS,
     },
     {
+        # Gemini thoughts are additive on the wire, so the engine folds the 3
+        # thought tokens into the output total and reports them as its subset.
         "kind": "usage",
         "input_tokens": 11,
-        "output_tokens": 5,
+        "output_tokens": 8,
         "cached_input_tokens": 2,
         "reasoning_tokens": 3,
     },

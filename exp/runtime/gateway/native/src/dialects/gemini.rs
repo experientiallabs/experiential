@@ -211,16 +211,107 @@ mod gemini_tests {
                     "name": "lookup",
                     "raw_arguments": raw_arguments,
                 }),
+                // thoughtsTokenCount is additive on the Gemini wire, so the
+                // output total carries the folded 5 + 3 and reasoning names
+                // the subset.
                 json!({
                     "kind": "usage",
                     "input_tokens": 11,
-                    "output_tokens": 5,
+                    "output_tokens": 8,
                     "cached_input_tokens": 2,
                     "reasoning_tokens": 3,
                 }),
                 json!({"kind": "completed"}),
             ]
         );
+    }
+
+    #[test]
+    fn gemini_thinking_stream_folds_thoughts_into_the_terminal_usage() {
+        // Verbatim frames from gemini-3.7-flash streamGenerateContent?alt=sse
+        // (2026-09-03): every chunk carries the full usageMetadata, the final
+        // chunk adds the thoughtSignature part and STOP. Google's
+        // totalTokenCount (11 + 7 + 654 = 672) shows thoughts are additive, so
+        // the normalized output total is 661 with 654 as the reasoning subset.
+        let usage_metadata = json!({
+            "promptTokenCount": 11,
+            "candidatesTokenCount": 7,
+            "totalTokenCount": 672,
+            "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 11}],
+            "thoughtsTokenCount": 654,
+            "serviceTier": "standard",
+        });
+        let chunks = [
+            sse(&json!({
+                "candidates": [{"content": {"parts": [{"text": "Sunlight scatters off air "}], "role": "model"}, "index": 0}],
+                "usageMetadata": usage_metadata,
+                "modelVersion": "gemini-3.7-flash",
+                "responseId": "resp-1",
+            })),
+            sse(&json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "molecules.", "thoughtSignature": "CikB"}], "role": "model"},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }],
+                "usageMetadata": usage_metadata,
+                "modelVersion": "gemini-3.7-flash",
+                "responseId": "resp-1",
+            })),
+        ];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![
+                json!({"kind": "text_delta", "text": "Sunlight scatters off air "}),
+                json!({"kind": "text_delta", "text": "molecules."}),
+                json!({
+                    "kind": "usage",
+                    "input_tokens": 11,
+                    "output_tokens": 661,
+                    "cached_input_tokens": 0,
+                    "reasoning_tokens": 654,
+                }),
+                json!({"kind": "completed"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn gemini_stream_without_thinking_keeps_the_reasoning_subset_unknown() {
+        // Verbatim usageMetadata from gemini-2.5-flash with thinkingBudget 0:
+        // no thoughtsTokenCount is published, so nothing folds and the subset
+        // stays unknown rather than being invented as zero.
+        let chunks = [sse(&json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "Air scatters blue light most."}], "role": "model"},
+                "finishReason": "STOP",
+                "index": 0,
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 9,
+                "totalTokenCount": 20,
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 11}],
+                "serviceTier": "standard",
+            },
+        }))];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events[1],
+            json!({
+                "kind": "usage",
+                "input_tokens": 11,
+                "output_tokens": 9,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": null,
+            })
+        );
+        assert_eq!(events[2], json!({"kind": "completed"}));
     }
 
     #[test]
