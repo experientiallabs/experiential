@@ -212,6 +212,14 @@ def test_provider_error_without_a_message_stays_status_only(response: httpx.Resp
     assert provider_error_detail(response) is None
 
 
+def test_provider_error_detail_drops_control_characters() -> None:
+    """Terminal escapes and NULs in an upstream message never pass through."""
+    detail = provider_error_detail(
+        httpx.Response(400, json={"error": {"message": "bad\x1b[31m model\x00 id\r\n\ttry again"}})
+    )
+    assert detail == "bad[31m model id try again"
+
+
 def test_provider_error_detail_is_bounded() -> None:
     """A runaway provider message is cut at the detail limit."""
     detail = provider_error_detail(httpx.Response(400, json={"error": {"message": "x" * 1000}}))

@@ -123,7 +123,7 @@ def provider_error_detail(response: httpx.Response) -> str | None:
     malformed line, an exhausted quota). Only that field is read: a body that
     is not JSON, or that carries no message string, yields None, so an HTML
     error page or an unexpected shape never reaches the caller. The message
-    is whitespace-normalized and bounded.
+    is reduced to printable characters, whitespace-normalized, and bounded.
     """
     try:
         parsed = response.json()
@@ -135,7 +135,11 @@ def provider_error_detail(response: httpx.Response) -> str | None:
     message = error.get("message") if isinstance(error, dict) else error
     if not isinstance(message, str):
         return None
-    detail = " ".join(message.split())
+    # Printable characters only: the detail reaches the caller's batch
+    # object and the worker log, so a control character (ESC, NUL, a
+    # terminal escape) in a malformed upstream body must never pass through.
+    printable = "".join(char for char in message if char.isprintable() or char.isspace())
+    detail = " ".join(printable.split())
     if not detail:
         return None
     return detail[:_PROVIDER_ERROR_DETAIL_LIMIT]
