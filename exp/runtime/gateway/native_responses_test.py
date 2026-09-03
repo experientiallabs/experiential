@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 from typing import cast
 
 import pytest
@@ -398,3 +399,28 @@ def test_remember_turn_rejects_malformed_openai_encrypted_reasoning(encrypted: o
                 },
             ),
         )
+
+
+def test_remember_turn_retains_an_output_less_turn_as_the_conversation_so_far() -> None:
+    """An incomplete, output-less turn stays continuable from its response id.
+
+    Gemini at a small ``max_output_tokens`` spends the whole budget thinking
+    and finishes ``incomplete`` with no items; the caller still received a
+    response id, so ``previous_response_id`` must resolve to the retained
+    input rather than ``previous_response_not_found`` (staging, 2026-09-03).
+    """
+    store = BoundedContinuationStore()
+    context = replace(_context(), messages=(GatewayMessage(role="user", content="think hard"),))
+
+    remember_turn(
+        store,
+        context=context,
+        data={"text": "", "refusal": False, "message_outputs": [], "tool_calls": []},
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    assert state.messages == context.messages
+    assert state.episode_key == context.episode_key

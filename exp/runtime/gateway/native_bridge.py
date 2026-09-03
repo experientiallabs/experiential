@@ -910,14 +910,17 @@ class NativeControlPlane(
         return json.dumps(scope, separators=(",", ":"))
 
     def remember(self, argument: str) -> str:
-        """Retain one completed Responses continuation within strict bounds.
+        """Retain one finished Responses continuation within strict bounds.
 
         Args:
             argument: JSON object with ``request_id``, aggregated ``text``,
-                ``refusal`` presence, and completed ``tool_calls``.
+                ``refusal`` presence, and completed ``tool_calls``; an
+                output-less turn carries all of them empty and is retained as
+                the conversation so far.
 
         Returns:
-            An empty JSON object; retention that does not apply is a no-op.
+            An empty JSON object; retention that does not apply (a
+            ``store: false`` caller, a refusal) is a no-op.
 
         Raises:
             NativeBridgeError: The continuation exceeds the bounded store or

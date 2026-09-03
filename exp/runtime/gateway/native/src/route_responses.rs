@@ -209,6 +209,13 @@ pub(crate) async fn responses(
         // Bytes over four approximates input tokens; a timeout heuristic
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
+        // A turn that ends before any semantic output is still a response
+        // the caller can continue from; the waterfall retains it in flight.
+        output_less_retention: Some(remember_argument(
+            &admission.request_id,
+            &ResponsesRetention::default(),
+            None,
+        )),
     };
     let won = acquire_attempt(&context, &mut guard).await;
 
@@ -275,16 +282,21 @@ pub(crate) async fn responses(
     }
 }
 
-/// Retain one completed Responses continuation before the terminal frames
+/// Retain one finished Responses continuation before the terminal frames
 /// flush, mirroring the python service's ordering. Returns the public error
 /// when bounded retention fails closed.
+///
+/// An output-less turn (thinking spent the whole output budget, so the
+/// response is `incomplete` with no items) is retained too: the caller holds
+/// its response id, and `previous_response_id` naming it must resolve to the
+/// conversation so far rather than `previous_response_not_found`.
 async fn remember_continuation(
     state: &AppState,
     request_id: &str,
     retention: &ResponsesRetention,
     reasoning_content_carrier: Option<&str>,
 ) -> Result<(), PublicError> {
-    if retention.overflowed || retention.refusal() || retention.is_empty() {
+    if retention.overflowed || retention.refusal() {
         return Ok(());
     }
     state

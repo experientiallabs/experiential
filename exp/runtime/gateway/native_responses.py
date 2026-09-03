@@ -183,13 +183,19 @@ def remember_turn(
     data: JsonObject,
     route_binding: ContinuationRouteBinding | None = None,
 ) -> None:
-    """Retain one completed Responses continuation within strict bounds.
+    """Retain one finished Responses continuation within strict bounds.
 
-    Retention is strict: refusal output and unidentifiable empty assistant
-    turns are never retained, while provider-identified message items retain
-    their exact lifecycle metadata even when their visible text is empty. One
-    oversize continuation fails closed with the shared public error before the
-    data plane flushes its terminal frames.
+    Retention is strict about content, not about completion: refusal output is
+    never retained, provider-identified message items retain their exact
+    lifecycle metadata even when their visible text is empty, and a turn that
+    produced no retainable output at all (thinking spent the whole output
+    budget, so the response is ``incomplete`` with no items) is retained as the
+    conversation so far — the caller holds that response id, and
+    ``previous_response_id`` naming it must continue the conversation, as
+    api.openai.com does for its own ``incomplete`` responses, instead of
+    answering ``previous_response_not_found``. One oversize continuation fails
+    closed with the shared public error before the data plane flushes its
+    terminal frames.
 
     Args:
         continuations: The gateway's shared bounded continuation store.
@@ -382,15 +388,6 @@ def remember_turn(
         raise ValueError(
             "Responses retained assistant text requires provider item identity and order"
         )
-    if (
-        not text
-        and not unindexed_calls
-        and not unindexed_natives
-        and not indexed_output
-        and sealed_carrier is None
-    ):
-        return
-
     output_items: list[tuple[int, str, object]] = [
         *((index, "reasoning", block) for index, block in encrypted),
         *((index, "call", call) for index, call in indexed_calls),

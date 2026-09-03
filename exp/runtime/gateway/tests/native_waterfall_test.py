@@ -138,7 +138,9 @@ class _PrimaryUpstream(BaseHTTPRequestHandler):
 
     ``always-500`` fails every dispatch, ``retry-then-succeed`` fails once
     per process then answers, ``refuse`` streams a refusal-only completion,
-    and anything else streams a plain success.
+    ``silent-length`` exhausts the output budget with no content (a
+    thinking-only turn: ``finish_reason: length``, zero deltas), and anything
+    else streams a plain success.
     """
 
     retry_counts: dict[str, int] = {}
@@ -179,6 +181,20 @@ class _PrimaryUpstream(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         try:
+            if prompt == "silent-length":
+                self.wfile.write(
+                    _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]})
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "choices": [],
+                            "usage": {"prompt_tokens": 2, "completion_tokens": 16},
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                return
             if prompt == "refuse":
                 self.wfile.write(
                     _sse_frame(
@@ -486,6 +502,56 @@ def test_keyed_responses_replays_the_owner_response_exactly(
     assert rows == [(0, 0, "completed")]
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "sse"])
+def test_output_less_incomplete_response_stays_continuable(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """A response id handed to the caller is continuable whatever its finish state.
+
+    The first turn's provider spends the whole output budget without emitting
+    a single delta (Gemini thinking at a small ``max_output_tokens``), so the
+    attempt reaches ``length`` before any semantic output: the waterfall
+    settles it output-less and the caller gets an ``incomplete`` response
+    with no items. api.openai.com persists such a response, and so must the
+    gateway: the next turn's ``previous_response_id`` resolves to the
+    conversation so far and is served, never ``previous_response_not_found``
+    (reproduced 2/3 on staging gemini-3.7-flash, 2026-09-03).
+    """
+    headers = {"authorization": f"Bearer {engine.raw_key}"}
+    first_payload: JsonObject = {"model": "coding", "input": "silent-length", "stream": stream}
+    first = httpx.post(
+        f"{engine.base}/v1/responses", headers=headers, json=first_payload, timeout=30.0
+    )
+    assert first.status_code == 200, first.text
+    if stream:
+        completed = [
+            json.loads(line[len("data: ") :])
+            for line in first.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        terminal = completed[-1]
+        assert terminal["type"] == "response.incomplete", terminal
+        response = terminal["response"]
+    else:
+        response = first.json()
+    assert response["status"] == "incomplete"
+    assert response["output"] == []
+    response_id = response["id"]
+    assert response_id.startswith("resp_")
+    assert _attempt_rows(engine, first.headers["x-request-id"]) == [(0, 0, "incomplete")]
+
+    second = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers=headers,
+        json={"model": "coding", "input": "second turn", "previous_response_id": response_id},
+        timeout=30.0,
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["status"] == "completed"
+    assert second.json()["output"][0]["content"][0]["text"] == "from-primary"
+    assert _attempt_rows(engine, second.headers["x-request-id"]) == [(0, 0, "completed")]
+
+
 def test_persistent_primary_failure_fails_over_to_the_second_deployment(
     engine: _ServingEngine,
 ) -> None:
@@ -554,7 +620,9 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
-    assert report["totals"]["requests"] == 8
+    # Seven scenario requests, the output-less continuation scenario's four
+    # (two first turns and their two continuations), and this probe.
+    assert report["totals"]["requests"] == 12
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
@@ -562,4 +630,6 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
     assert open_attempts == 0
-    assert terminal_attempts == total_attempts == 12
+    # Twelve single-dispatch requests plus the four extra physical attempts the
+    # redial and failover scenarios spend.
+    assert terminal_attempts == total_attempts == 16

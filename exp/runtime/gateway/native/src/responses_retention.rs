@@ -219,16 +219,6 @@ impl ResponsesRetention {
     pub(crate) fn refusal(&self) -> bool {
         self.refusal
     }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.text.is_empty()
-            && self.messages.is_empty()
-            && self.tool_calls.is_empty()
-            && self
-                .reasoning
-                .values()
-                .all(|reasoning| reasoning.encrypted_content.is_empty())
-    }
 }
 
 /// Build the retention payload consumed by the control plane's `remember`.
@@ -405,7 +395,6 @@ mod tests {
             retention.track(event);
         }
 
-        assert!(!retention.is_empty());
         let payload: Value =
             serde_json::from_str(&remember_argument("request-1", &retention, None))
                 .expect("retention payload is JSON");

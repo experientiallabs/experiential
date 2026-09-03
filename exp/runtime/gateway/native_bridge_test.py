@@ -3078,6 +3078,37 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
     assert crossed.value.detail.code == "previous_response_not_found"
 
 
+def test_responses_output_less_turn_is_continuable(tmp_path: Path) -> None:
+    """A turn retained with no text, items, or calls continues as the input so far.
+
+    The data plane remembers an output-less turn (thinking exhausted the
+    budget, terminal ``incomplete``) with every retention field empty; the
+    control plane must retain the conversation rather than treat empty output
+    as nothing to remember, or the response id it already handed out dies
+    ``previous_response_not_found`` on the next turn.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    first = _admit_responses(control, raw_key, _responses_body())
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": first["request_id"],
+                    "text": "",
+                    "message_outputs": [],
+                    "refusal": False,
+                    "encrypted_reasoning": [],
+                    "tool_calls": [],
+                }
+            )
+        )
+        == "{}"
+    )
+    response_id = stable_public_id("resp", _admitted_request_id(first))
+    second = _admit_responses(control, raw_key, _responses_body(previous_response_id=response_id))
+    assert [message["role"] for message in _payload_messages(second)] == ["user", "user"]
+
+
 def test_fallback_served_alias_continuation_degrades_to_resend_not_503(tmp_path: Path) -> None:
     """A continuation on an alias served via its last-good fallback still fails
     with the 400 'resend the full conversation' error when it cannot resolve —
