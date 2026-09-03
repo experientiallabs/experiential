@@ -186,6 +186,11 @@ def decode_chat(
             tool_choice=_chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=_chat_structured_text(request.response_format),
+            ignored_parameters=(
+                (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
+                if _json_object_translated(request.response_format)
+                else ()
+            ),
             maximum_output_tokens=maximum,
             maximum_output_tokens_parameter=(
                 "max_completion_tokens"
@@ -859,10 +864,29 @@ def _responses_tool_choice(
     raise invalid_field("tool_choice")
 
 
+# The permissive schema a translated ``json_object`` serves as: "any JSON object",
+# non-strict so no rung tightens it into a fixed shape. Disclosed to the caller.
+JSON_OBJECT_TRANSLATION_DISCLOSURE = "response_format->translated(json_object)"
+_JSON_OBJECT_PASSTHROUGH_SCHEMA: JsonObject = {"type": "object"}
+
+
 def _chat_structured_text(value: _ChatResponseFormat | None) -> StructuredTextFormat | None:
-    """Convert the Chat JSON Schema response format when requested."""
+    """Convert the Chat response format to the internal structured-text shape.
+
+    ``json_object`` is translated to a permissive, non-strict ``json_schema``
+    ("any JSON object") so the caller's JSON intent is preserved on every rung —
+    the serving lanes emit only ``json_schema``. The translation is disclosed by
+    the caller (see ``_json_object_translated``); dropping it would return prose
+    to a caller who asked for JSON.
+    """
     if value is None or value.type == "text":
         return None
+    if value.type == "json_object":
+        return StructuredTextFormat(
+            name="json_object",
+            json_schema=dict(_JSON_OBJECT_PASSTHROUGH_SCHEMA),
+            strict=False,
+        )
     schema = value.json_schema
     if schema is None:
         raise invalid_field("response_format.json_schema")
@@ -872,6 +896,11 @@ def _chat_structured_text(value: _ChatResponseFormat | None) -> StructuredTextFo
         json_schema=schema.schema_,
         strict=schema.strict,
     )
+
+
+def _json_object_translated(value: _ChatResponseFormat | None) -> bool:
+    """Return whether the Chat response format was a translated ``json_object``."""
+    return value is not None and value.type == "json_object"
 
 
 def _responses_structured_text(value: _ResponseText | None) -> StructuredTextFormat | None:

@@ -321,7 +321,17 @@ reasoning on is dropped and disclosed as `temperature->dropped(set_reasoning_eff
 than rejected — the model accepts sampling, just not at that effort, so the request serves and the
 caller is told how to keep the value (set `reasoning_effort=none`); a route that never declares the
 control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, since there is
-nothing to honor at any effort. A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
+nothing to honor at any effort. `top_k` follows the same honor-or-narrow shape: selection prefers a
+rung that carries it, and a committed route with no supporting rung (an Azure `openai_deployments`
+DeepSeek rung rejects it upstream) drops it with `top_k->dropped(unsupported_by_provider)` rather
+than rejecting, since a rung's default sampling still returns a valid answer. A caller
+`response_format: {type: "json_object"}` is TRANSLATED, not dropped: it is admitted at the Chat
+ingress and rewritten to a permissive non-strict `json_schema` (`{"type":"object"}`, "any JSON
+object") — the serving lanes emit only `json_schema`, so this preserves the caller's JSON intent on
+every rung (dropping it would hand prose to a caller who asked for JSON) — and disclosed as
+`response_format->translated(json_object)`; a non-strict schema is left open (never force-closed to
+`additionalProperties:false`), so its "any object" meaning is not inverted on a schema-closing
+(Anthropic) rung. A caller `service_tier` on the OpenAI-family surfaces forwards verbatim
 only on rungs dispatching tenant-owned (BYOK) credentials, where the caller pays the provider
 directly; host-funded rungs never emit it (the tier changes provider pricing while the gateway
 bills catalog rates) and a route with no eligible rung drops it with disclosure. Anthropic's own

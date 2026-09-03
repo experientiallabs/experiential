@@ -66,10 +66,12 @@ def compatible_generation_parameter_profile_indexes(
 def _honors_requested_sampling(request: GatewayRequest, provider_request: GatewayRequest) -> bool:
     """Return whether a rung kept every sampling control the caller actually sent.
 
-    A rung that dropped a requested ``temperature``/``top_p`` (the srn drop) did
-    not preserve the caller's intent exactly, so it is only a fallback behind any
-    rung that honors the value.
+    A rung that dropped a requested ``temperature``/``top_p``/``top_k`` (a
+    disclosed sampling drop) did not preserve the caller's intent exactly, so it
+    is only a fallback behind any rung that honors the value.
     """
     if request.temperature is not None and provider_request.temperature is None:
         return False
-    return not (request.top_p is not None and provider_request.top_p is None)
+    if request.top_p is not None and provider_request.top_p is None:
+        return False
+    return not (request.top_k is not None and provider_request.top_k is None)

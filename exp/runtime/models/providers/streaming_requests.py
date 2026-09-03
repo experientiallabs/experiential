@@ -345,16 +345,26 @@ def route_generation_parameter_requests(
                 maximum=lambda profile: profile.maximum_top_p,
             )
     if request.top_k is not None:
-        _require_route_numeric_parameter(
-            profiles,
-            param="top_k",
-            value=request.top_k,
-            supported=lambda profile: (
-                profile.supports_top_k and profile.dialect != "openai_responses"
-            ),
-            minimum=lambda profile: profile.minimum_top_k,
-            maximum=lambda profile: profile.maximum_top_k,
-        )
+
+        def top_k_supported(profile: GatewayWireProfile) -> bool:
+            return profile.supports_top_k and profile.dialect != "openai_responses"
+
+        if not all(top_k_supported(profile) for profile in profiles):
+            # top_k is a sampling preference: a rung that does not carry it still
+            # returns a valid answer with its own default, so the committed route
+            # drops it with disclosure rather than rejecting. Selection prefers a
+            # rung that honors it (generation_route_compat), so this drop is the
+            # last resort when no rung on the route accepts the field.
+            ignore("top_k", "top_k->dropped(unsupported_by_provider)")
+        else:
+            _require_route_numeric_parameter(
+                profiles,
+                param="top_k",
+                value=request.top_k,
+                supported=top_k_supported,
+                minimum=lambda profile: profile.minimum_top_k,
+                maximum=lambda profile: profile.maximum_top_k,
+            )
     if request.reasoning_effort is not None:
         portable_efforts = set(REASONING_EFFORTS)
         for profile in profiles:

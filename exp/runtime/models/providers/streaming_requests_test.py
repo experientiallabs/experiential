@@ -178,6 +178,25 @@ def test_openai_compatible_stream_payload_forwards_top_p_and_usage() -> None:
     assert payload["top_p"] == 1.0
 
 
+def test_openai_compatible_payload_serves_a_translated_json_object_as_open_json_schema() -> None:
+    """A translated json_object (open, non-strict schema) serves as a valid json_schema
+    on an openai_compatible rung (Azure/DeepSeek), preserving the caller's JSON intent."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        structured_text=StructuredTextFormat(
+            name="json_object", json_schema={"type": "object"}, strict=False
+        ),
+    )
+
+    payload = openai_compatible_stream_payload("exact-model", request)
+
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "json_object", "schema": {"type": "object"}, "strict": False},
+    }
+
+
 def test_openai_compatible_stream_payload_omits_absent_top_p() -> None:
     """An omitted nucleus parameter stays off the wire instead of being invented."""
     payload = openai_compatible_stream_payload("exact-model", _chat_request())
@@ -443,12 +462,17 @@ def test_reasoning_summary_narrows_a_mixed_claude_waterfall() -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("temperature", 0.2), ("top_p", 0.8), ("top_k", 20)],
+    [("temperature", 0.2), ("top_p", 0.8)],
 )
 def test_route_generation_controls_use_the_whole_waterfall_intersection(
     field: str, value: float | int
 ) -> None:
-    """One incompatible fallback rejects an explicit semantic control before dispatch."""
+    """One incompatible fallback rejects an explicit semantic control before dispatch.
+
+    temperature/top_p are genuinely unsupported on the fallback (declared False),
+    so they still hard-reject; top_k is a droppable sampling preference and is
+    covered separately.
+    """
     request = _chat_request().model_copy(update={field: value})
     profiles = (
         GatewayWireProfile(
@@ -478,6 +502,40 @@ def test_route_generation_controls_use_the_whole_waterfall_intersection(
 
     assert raised.value.code == "unsupported_parameter"
     assert raised.value.param == field
+
+
+def test_top_k_narrows_to_a_supporting_rung_then_drops_when_none_support() -> None:
+    """top_k prefers a rung that carries it, and is dropped+disclosed (not rejected)
+    only when no rung on the committed route accepts it."""
+    supporting = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://first.test",
+        model_id="provider/top-k",
+        supports_top_k=True,
+        minimum_top_k=1,
+        maximum_top_k=100,
+    )
+    unsupporting = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://azure.test",
+        model_id="provider/no-top-k",
+        supports_top_k=False,
+    )
+    request = _chat_request().model_copy(update={"top_k": 20})
+
+    # Selection prefers the rung that honors top_k.
+    assert compatible_generation_parameter_profile_indexes((supporting, unsupporting), request) == (
+        0,
+    )
+
+    # A committed route with no supporting rung serves by dropping+disclosing.
+    public_request, provider_request = route_generation_parameter_requests((unsupporting,), request)
+    assert provider_request.top_k is None
+    assert public_request.ignored_parameters == ("top_k->dropped(unsupported_by_provider)",)
+
+    # A route where every rung supports it honors the value.
+    _public, honored = route_generation_parameter_requests((supporting,), request)
+    assert honored.top_k == 20
 
 
 def test_route_rejects_effort_not_preserved_by_the_whole_waterfall() -> None:

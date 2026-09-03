@@ -374,6 +374,20 @@ def test_open_structured_output_schema_closes_for_an_anthropic_rung() -> None:
     assert coerce_structured_text_schema((anthropic,), _request()) is None
 
 
+def test_non_strict_schema_is_left_open_for_an_anthropic_rung() -> None:
+    """A permissive (non-strict) schema — notably a translated json_object "any JSON
+    object" — is NOT force-closed, which would invert it into "no properties allowed"."""
+    request = _request(
+        structured_text=StructuredTextFormat(
+            name="json_object", json_schema={"type": "object"}, strict=False
+        )
+    )
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    openai = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+
+    assert coerce_structured_text_schema((openai, anthropic), request) is None
+
+
 def test_mixed_rejections_coerce_only_the_service_tier() -> None:
     """Rungs declining differently drop the tier but never a guarantee."""
     from exp.runtime.models.providers.capability_policy import coerce_route_rejections

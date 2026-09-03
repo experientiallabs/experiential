@@ -115,6 +115,22 @@ def test_chat_decoder_preserves_every_supported_semantic_field() -> None:
     assert request.metadata == {"cohort": "test"}
 
 
+def test_chat_decoder_translates_json_object_to_a_permissive_schema() -> None:
+    """response_format json_object is admitted and translated to an open, non-strict
+    json_schema so the caller's JSON intent serves on every rung, with disclosure."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "reply as json"}],
+            "response_format": {"type": "json_object"},
+        }
+    ).request
+    assert request.structured_text is not None
+    assert request.structured_text.json_schema == {"type": "object"}
+    assert request.structured_text.strict is False
+    assert request.ignored_parameters == ("response_format->translated(json_object)",)
+
+
 def test_chat_legacy_max_tokens_reaches_native_responses_as_max_output_tokens() -> None:
     """A Chat request using legacy max_tokens serves a native Responses max_output_tokens.
 

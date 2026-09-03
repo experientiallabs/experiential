@@ -317,9 +317,15 @@ class _StructuredSchema(_WireModel):
 
 
 class _ChatResponseFormat(_WireModel):
-    """Supported Chat text or strict structured-text format."""
+    """Supported Chat text, JSON-object, or strict structured-text format.
 
-    type: Literal["text", "json_schema"]
+    ``json_object`` is admitted so the gateway can translate it to a permissive
+    ``json_schema`` and serve the caller's "give me JSON" intent on every rung
+    (the serving lanes emit only ``json_schema``); it carries no ``json_schema``
+    details, exactly like ``text``.
+    """
+
+    type: Literal["text", "json_object", "json_schema"]
     json_schema: _StructuredSchema | None = None
 
     @model_validator(mode="after")
