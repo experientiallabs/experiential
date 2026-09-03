@@ -582,9 +582,9 @@ def _write_catalog_snapshot(
         # Content-addressed, but never trust a pre-existing file blindly: a
         # stale or partially written `<sha>.json` (a crash between the atomic
         # temp write and its rename, a restored backup) whose bytes no longer
-        # hash to its own name would otherwise be pinned as a self-inconsistent
-        # snapshot and 503 every alias on it. Rewrite whenever the on-disk bytes
-        # differ, exactly as the authored companion above already does.
+        # serialize the catalog its name pins would otherwise be pinned as a
+        # self-inconsistent snapshot and 503 every alias on it. Rewrite whenever
+        # the on-disk bytes differ, exactly as the authored companion above.
         write_bytes_atomic(snapshot, normalized_bytes, follow_symlinks=False)
         os.chmod(snapshot, 0o600)
     return snapshot

@@ -15,7 +15,9 @@ from exp.common.models.catalog import (
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayEquivalenceCertification,
+    GatewayLongContextTier,
     GatewayPoolRecord,
+    GatewayTokenPrices,
     ModelCatalog,
     ModelRecord,
     SFTModelProvenance,
@@ -132,15 +134,133 @@ def test_read_pinned_snapshot_serves_a_cross_version_snapshot_without_the_digest
     assert served.pools[0].pool_id == "dep-1"
 
 
+def _identity_fixture_catalog() -> ModelCatalog:
+    """One frozen authored catalog exercising every identity-bearing surface.
+
+    Mixes default and non-default values on purpose: nested gateway capability
+    flags, integer prices with a long-context tier, an authored capability
+    declaration, both billing sources, a certified non-default-failover pool,
+    and a bare all-default record. Never edit this fixture to make a test
+    pass; it is the pinned input of the identity change-detector.
+    """
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-pinned",
+        provenance="operator comparison run 2026-09-01",
+        evidence_sha256=_DIGEST,
+        certified_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    return ModelCatalog(
+        connections={
+            "openai": ConnectionConfig(provider="openai"),
+            "local": ConnectionConfig(
+                provider="openai-compatible", base_url="https://local.example.test/v1"
+            ),
+        },
+        models={
+            "rich": ModelRecord(
+                connection="local",
+                model="provider-rich",
+                revision="2026-09-01",
+                billing_source=BillingSource.HOST_MANAGED,
+                capabilities=ModelCapabilities(supports_reasoning=True, reasoning_effort="low"),
+                gateway=GatewayDeploymentMetadata(
+                    exact_model_id="exact-certified",
+                    capabilities=GatewayDeploymentCapabilities(
+                        supports_streaming=True, supports_image_input=True
+                    ),
+                    prices=GatewayTokenPrices(
+                        input_micro_usd_per_million_tokens=150,
+                        output_micro_usd_per_million_tokens=600,
+                        long_context=GatewayLongContextTier(
+                            input_threshold_tokens=200_000,
+                            input_micro_usd_per_million_tokens=300,
+                        ),
+                    ),
+                ),
+            ),
+            "twin": ModelRecord(
+                connection="openai",
+                model="provider-twin",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id="exact-certified"),
+            ),
+            "bare": ModelRecord(
+                connection="openai",
+                model="provider-bare",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+            ),
+        },
+        gateway_pools={
+            "certified-pool": GatewayPoolRecord(
+                exact_model_id="exact-certified",
+                deployment_aliases=("rich", "twin"),
+                equivalence=certification,
+                failover_mode="maximize_cache",
+            )
+        },
+    )
+
+
+def test_identity_digest_is_pinned_until_a_deliberate_schema_version_bump() -> None:
+    """The identity serialization of a frozen fixture cannot drift silently.
+
+    Three consecutive releases (0.7.22, 0.7.23, 0.7.25) each added defaulted
+    capability flags that serialized into every published digest without a
+    ``SNAPSHOT_SCHEMA_VERSION`` bump, so every catalog read in a mixed-version
+    fleet failed its own digest check. If this test fails you changed the
+    identity serialization; there are exactly two lawful outs:
+
+    - You ADDED a field: give it a default. Identity excludes default-holding
+      fields, so a properly defaulted addition never trips this test at all.
+    - You deliberately changed identity output (default change, rename,
+      removal, normalization change): bump ``SNAPSHOT_SCHEMA_VERSION`` and
+      repin BOTH values below in the same change.
+    """
+    normalized = normalize_gateway_catalog(_identity_fixture_catalog())
+    assert (SNAPSHOT_SCHEMA_VERSION, normalized.identity_sha256()) == (
+        3,
+        "f9e74a42f5b47ec0a0739836ef15bbfa36df4eaa7c34efee10c421d46962529f",
+    )
+
+
+def test_added_defaulted_fields_and_explicit_defaults_do_not_perturb_identity() -> None:
+    """Identity is stable across additive schema growth and default spelling.
+
+    A default-constructed nested declaration must contribute zero identity
+    bytes (that is what makes a new defaulted field identity-invisible), and a
+    field spelled explicitly at its default must hash identically to leaving
+    it unset.
+    """
+    for model in (
+        GatewayDeploymentCapabilities(),
+        GatewayTokenPrices(),
+        GatewayDeploymentMetadata(),
+        ModelCapabilities(),
+        NormalizedGatewayCatalog(),
+    ):
+        assert model.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+
+    explicit = _identity_fixture_catalog().model_copy(deep=True)
+    spelled = explicit.models["bare"].model_copy(
+        update={"gateway": GatewayDeploymentMetadata(capabilities=GatewayDeploymentCapabilities())}
+    )
+    respelled = explicit.model_copy(update={"models": {**explicit.models, "bare": spelled}})
+    assert (
+        normalize_gateway_catalog(respelled).identity_sha256()
+        == normalize_gateway_catalog(_identity_fixture_catalog()).identity_sha256()
+    )
+
+
 def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
     """Anti-regression change-detector for the roll-safety contract.
 
     A rolling deploy detects a cross-version snapshot only by ``schema_version``,
-    so every change to the normalized-catalog schema (or its normalization
-    output) MUST bump ``SNAPSHOT_SCHEMA_VERSION`` in the same change. If this
-    fails, you changed the schema: bump ``SNAPSHOT_SCHEMA_VERSION`` and update
-    the pinned fingerprint below together, so the reader keeps serving old and
-    new pods through a roll instead of hard-failing.
+    so every change to the normalized-catalog TOP-LEVEL shape MUST bump
+    ``SNAPSHOT_SCHEMA_VERSION`` in the same change (nested additive growth is
+    covered by the pinned identity digest test above, which defaulted fields
+    pass automatically). If this fails, bump ``SNAPSHOT_SCHEMA_VERSION`` and
+    update the pinned fingerprint below together, so the reader keeps serving
+    old and new pods through a roll instead of hard-failing.
     """
     fingerprint = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
@@ -149,7 +269,7 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
         "pool": sorted(ExactModelPool.model_fields),
     }
     assert fingerprint == {
-        "schema_version": 2,
+        "schema_version": 3,
         "normalized": ["deployments", "pools", "schema_version"],
         "deployment": [
             "billing_source",

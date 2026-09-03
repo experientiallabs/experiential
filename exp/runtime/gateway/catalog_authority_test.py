@@ -22,6 +22,7 @@ from exp.common.models import (
     ModelRecord,
     ModelRoles,
     normalize_gateway_catalog,
+    read_pinned_normalized_snapshot,
     write_model_catalog,
 )
 from exp.runtime.gateway.catalog_authority import (
@@ -94,10 +95,10 @@ def test_rejected_singleton_deployment_leaves_the_authored_catalog_unchanged(
 
 
 def test_write_catalog_snapshot_repairs_a_stale_content_addressed_file(tmp_path: Path) -> None:
-    """C1 root-cause fix: a normalized snapshot whose on-disk bytes no longer hash
-    to their own content-addressed name (a stale or partially written file) is
-    rewritten instead of blindly trusted, so a self-inconsistent snapshot can
-    never be pinned by this write path."""
+    """C1 root-cause fix: a normalized snapshot whose on-disk bytes no longer
+    serialize the catalog its content-addressed name pins (a stale or partially
+    written file) is rewritten instead of blindly trusted, so a self-inconsistent
+    snapshot can never be pinned by this write path."""
     catalog = ModelCatalog(
         connections={"openai": ConnectionConfig(provider="openai")},
         models={
@@ -111,15 +112,25 @@ def test_write_catalog_snapshot_repairs_a_stale_content_addressed_file(tmp_path:
     normalized = normalize_gateway_catalog(catalog)
 
     snapshot = _write_catalog_snapshot(tmp_path, catalog, normalized)
-    assert sha256(snapshot.read_bytes()).hexdigest() == normalized.identity_sha256()
+    # The name pins the identity digest; the stored bytes are the FULL dump
+    # (schema_version kept for roll-skew detection), so the pinned-reader
+    # round-trip, not a raw byte hash, is what proves content addressing.
+    assert snapshot.name == f"{normalized.identity_sha256()}.json"
+    assert (
+        read_pinned_normalized_snapshot(snapshot.read_bytes(), normalized.identity_sha256())
+        == normalized
+    )
 
     # A stale/corrupt file already sitting at the content-addressed path.
     snapshot.write_bytes(b'{"stale": true}')
     repaired = _write_catalog_snapshot(tmp_path, catalog, normalized)
 
     assert repaired == snapshot
-    # The bytes on disk once again hash to their own content-addressed name.
-    assert sha256(snapshot.read_bytes()).hexdigest() == normalized.identity_sha256()
+    # The bytes on disk once again serialize the catalog the name pins.
+    assert (
+        read_pinned_normalized_snapshot(snapshot.read_bytes(), normalized.identity_sha256())
+        == normalized
+    )
 
 
 def test_valid_singleton_deployment_still_persists_after_validation(tmp_path: Path) -> None:

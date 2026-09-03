@@ -24,11 +24,15 @@ ExactModelPoolId = ArtifactId
 GATEWAY_EXCLUDED_PROVIDERS = frozenset({"tinker"})
 """Runtime-resolvable providers whose records never become gateway deployments."""
 
-SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
 """Normalized-catalog schema version this engine build reads and writes.
 
-Every change to the normalized catalog schema or its normalization output MUST
-bump this in the same PR (the roll-safety CI guard enforces it). A rolling
+Every change that alters the IDENTITY serialization of the normalized catalog
+MUST bump this in the same PR (the pinned-digest change-detector test enforces
+it). Since version 3 the identity serialization excludes every field that holds
+its declared default, so ADDING a defaulted field to any model in the catalog
+graph does not alter identity and needs no bump; changing a default, renaming
+or removing a field, or changing normalization output still does. A rolling
 deploy runs two builds at once; a stored snapshot whose ``schema_version``
 differs from this constant is a cross-version skew that the reader serves
 through the tolerant path (its own leniently parsed view keyed by the pinned
@@ -145,8 +149,20 @@ class NormalizedGatewayCatalog(ContractModel):
         return self
 
     def identity_sha256(self) -> Sha256:
-        """Return the deterministic digest pinned by a later gateway activation."""
-        return sha256_json(self)
+        """Return the deterministic digest pinned by a later gateway activation.
+
+        The digest covers only fields that differ from their declared defaults,
+        recursively, so an engine release that ADDS a defaulted field anywhere
+        in the catalog graph reproduces every existing digest unchanged (three
+        consecutive releases perturbing every published digest through additive
+        capability flags is the incident this exclusion ends). A field set
+        explicitly to its default is identical to leaving it unset, which is
+        the contract-equivalence identity wants. ``schema_version`` itself is
+        default-excluded too: cross-build reproducibility of the digest is the
+        point, while roll skew stays detectable from the STORED serialization,
+        which remains a full dump.
+        """
+        return sha256_json(self.model_dump(mode="json", by_alias=True, exclude_defaults=True))
 
 
 def normalize_gateway_catalog(catalog: ModelCatalog) -> NormalizedGatewayCatalog:
@@ -382,7 +398,12 @@ def _pop_location(root: object, location: tuple[str | int, ...]) -> bool:
 
 
 def _capability_declaration_sha256(capabilities: ModelCapabilities | None) -> Sha256:
-    """Hash the full catalog declaration without changing frozen capability identity.
+    """Hash the authored catalog declaration without changing frozen capability identity.
+
+    Default-holding fields are excluded so an engine release that adds a
+    defaulted capability flag reproduces every existing declaration digest
+    (and therefore every singleton ``exact_model_id``) unchanged. ``None``
+    stays distinct from an all-default declaration.
 
     Args:
         capabilities: Existing authored capabilities, or ``None`` when undeclared.
@@ -391,7 +412,9 @@ def _capability_declaration_sha256(capabilities: ModelCapabilities | None) -> Sh
         Digest used only by singleton gateway migration identity.
     """
     return sha256_json(
-        None if capabilities is None else capabilities.model_dump(mode="json", exclude_none=False)
+        None
+        if capabilities is None
+        else capabilities.model_dump(mode="json", by_alias=True, exclude_defaults=True)
     )
 
 
