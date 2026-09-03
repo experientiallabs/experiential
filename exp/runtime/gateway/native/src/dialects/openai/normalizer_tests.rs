@@ -541,9 +541,13 @@ fn a_tool_call_cut_off_by_the_output_budget_is_incomplete_not_malformed() {
             None,
         ))
         .expect("tool start must normalize");
+    // The empty first `arguments` rides as an empty delta, as on every wire.
     assert!(matches!(
         started.as_slice(),
-        [Event::ToolCallStarted { .. }]
+        [
+            Event::ToolCallStarted { .. },
+            Event::ToolArgumentsDelta { .. }
+        ]
     ));
     for fragment in ["{\"", "city"] {
         normalizer
