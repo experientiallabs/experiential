@@ -917,6 +917,10 @@ class GatewayFailureClass(StrEnum):
     TIMEOUT = "timeout"
     PROVIDER_AUTHENTICATION = "provider_authentication"
     PROVIDER_NOT_FOUND = "provider_not_found"
+    # The provider ACCOUNT cannot pay for the request (trial quota exhausted,
+    # billing not enabled): operator-actionable deadness that fails over in
+    # every mode. Distinct from QUOTA_EXCEEDED, the CALLER's gateway credit.
+    PROVIDER_QUOTA = "provider_quota"
     REFUSAL = "refusal"
     MALFORMED_RESPONSE = "malformed_response"
     PROVIDER_INTERNAL = "provider_internal"

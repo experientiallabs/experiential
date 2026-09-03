@@ -34,6 +34,18 @@ from exp.runtime.models.providers.transport import ProviderTransportError
             False,
             True,
         ),
+        # The literal TokenHub shape (Tencent relay): HTTP 402, provider code
+        # 401008, "free trial quota exhausted and postpaid billing is not
+        # enabled", on EVERY request shape. The provider account's billing
+        # state must class as provider-side deadness that fails over, never as
+        # the caller's request fields (the 2026-09 misclass sent 652 callers
+        # chasing their own payloads).
+        (
+            ProviderTransportError("raw billing canary", status_code=402),
+            GatewayFailureClass.PROVIDER_QUOTA,
+            False,
+            True,
+        ),
         (
             ProviderTransportError("raw server canary", status_code=503),
             GatewayFailureClass.PROVIDER_INTERNAL,
@@ -158,6 +170,11 @@ def test_parameter_failure_preserves_only_public_code_and_path() -> None:
         (
             ProviderTransportError("raw throttle canary", status_code=429),
             "provider throttled the request; retry after the delay in the Retry-After header",
+        ),
+        (
+            ProviderTransportError("raw billing canary", status_code=402),
+            "provider account quota or billing is exhausted; ask the gateway "
+            "operator to fund or enable the provider account",
         ),
         (
             ProviderTransportError("raw slow canary", status_code=408),

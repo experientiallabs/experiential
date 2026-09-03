@@ -118,6 +118,13 @@
     "type": "invalid_request_error"
    },
    "type": "error"
+  },
+  "provider_quota": {
+   "type": "error",
+   "error": {
+    "type": "api_error",
+    "message": "parity probe message"
+   }
   }
  },
  "anthropic_error_inputs": {
@@ -256,6 +263,14 @@
    "param": null,
    "retry_after_seconds": null,
    "status_code": 400
+  },
+  "provider_quota": {
+   "code": "all_routes_failed",
+   "error_type": "api_error",
+   "message": "parity probe message",
+   "param": null,
+   "retry_after_seconds": null,
+   "status_code": 502
   }
  },
  "anthropic_error_with_param": {

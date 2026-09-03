@@ -52,6 +52,17 @@ pub fn transport_failure(status: Option<u16>) -> Failure {
             false,
             true,
         ),
+        // 402 is the provider ACCOUNT's billing state (trial quota exhausted,
+        // postpaid billing disabled), never the caller's request fields: it is
+        // operator-actionable deadness, so it fails over in every failover mode
+        // instead of surfacing a corrective 400 to the caller.
+        Some(402) => (
+            FailureClass::ProviderQuota,
+            "provider account quota or billing is exhausted; ask the gateway operator \
+             to fund or enable the provider account",
+            false,
+            true,
+        ),
         Some(408) => (
             FailureClass::Timeout,
             "provider request timed out; retry the request",
@@ -221,6 +232,7 @@ mod tests {
             (Some(403), false, true),
             (Some(404), false, true),
             (Some(429), false, true),
+            (Some(402), false, true),
             (Some(408), true, true),
             (Some(500), true, true),
             (Some(503), true, true),
@@ -242,6 +254,60 @@ mod tests {
                 "failover for {status:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_402_with_the_literal_tokenhub_body_classes_provider_quota() {
+        // TokenHub (the Tencent relay) answers HTTP 402 with provider code
+        // 401008 on EVERY request shape once the account's free trial is
+        // exhausted and postpaid billing is off. Classing that invalid_request
+        // blamed 652 callers' request fields for the provider's billing state
+        // (2026-09 incident): the class must be the provider-side quota family,
+        // the rung must fail over, and the body must never be relayed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0u8; 8192];
+            let _ = socket.read(&mut buffer).await;
+            let body = "{\"error\":{\"code\":401008,\"message\":\"free trial quota exhausted \
+                        and postpaid billing is not enabled - enable in Console > Online \
+                        Inference Service\",\"type\":\"payment_required\"}}";
+            let response = format!(
+                "HTTP/1.1 402 Payment Required\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+        let client = build_client(Duration::from_secs(2)).expect("client");
+        let failure = open_stream(
+            &client,
+            &format!("http://{addr}/v1/chat/completions"),
+            &HashMap::new(),
+            "idem-402",
+            &serde_json::json!({"model": "m", "messages": []}),
+            None,
+            Duration::from_secs(5),
+            Dialect::OpenAiCompatible,
+        )
+        .await
+        .expect_err("a 402 must classify as a failure");
+        assert_eq!(failure.failure_class, FailureClass::ProviderQuota);
+        assert!(failure.failover_eligible, "an unfunded rung must fail over");
+        assert!(!failure.retryable_same_deployment);
+        assert!(
+            failure.provider_detail.is_none() && failure.rejected_parameter.is_none(),
+            "a billing failure must stay content-free"
+        );
+        assert!(
+            !failure.safe_message.contains("request fields"),
+            "the caller must never be told to fix their fields for a provider billing state"
+        );
     }
 
     #[test]

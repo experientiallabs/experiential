@@ -123,6 +123,10 @@ pub enum FailureClass {
     Timeout,
     ProviderAuthentication,
     ProviderNotFound,
+    /// The provider ACCOUNT cannot pay for the request (quota exhausted,
+    /// billing not enabled): operator-actionable deadness, distinct from
+    /// `QuotaExceeded`, which is the CALLER's gateway credit.
+    ProviderQuota,
     Refusal,
     MalformedResponse,
     ProviderInternal,
@@ -145,6 +149,7 @@ impl FailureClass {
             FailureClass::Timeout => "timeout",
             FailureClass::ProviderAuthentication => "provider_authentication",
             FailureClass::ProviderNotFound => "provider_not_found",
+            FailureClass::ProviderQuota => "provider_quota",
             FailureClass::Refusal => "refusal",
             FailureClass::MalformedResponse => "malformed_response",
             FailureClass::ProviderInternal => "provider_internal",

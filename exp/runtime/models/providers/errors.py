@@ -219,6 +219,20 @@ def _transport_failure(status_code: int | None) -> GatewayFailure:
             failover_eligible=True,
             safe_details=details,
         )
+    if status_code == 402:
+        # The provider ACCOUNT's billing state (trial quota exhausted, postpaid
+        # billing disabled), never the caller's request fields: operator-
+        # actionable deadness that fails over in every failover mode instead of
+        # surfacing a corrective 400 to the caller.
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_QUOTA,
+            safe_message=(
+                "provider account quota or billing is exhausted; ask the gateway "
+                "operator to fund or enable the provider account"
+            ),
+            failover_eligible=True,
+            safe_details=details,
+        )
     if status_code == 408:
         return GatewayFailure(
             failure_class=GatewayFailureClass.TIMEOUT,
