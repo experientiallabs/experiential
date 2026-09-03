@@ -454,17 +454,36 @@ def _index_catalogs(
         ValueError: A same-version catalog does not match its declared digest.
     """
     indexed: dict[tuple[str, str], _CatalogView] = {}
+    # A repoint mints every alias key against ONE immutable catalog object
+    # (hundreds of keys per snapshot in production), and identity_sha256
+    # re-hashes the whole multi-megabyte document, so the digest is computed
+    # once per distinct object and compared per key; the frozen view is built
+    # and shared once per object too. Per-key hashing made one state build
+    # re-hash the same 6.5 MB catalog 732 times (~35 s of a ~51 s build).
+    # Object ids are stable here because ``catalogs`` keeps every catalog
+    # alive for the whole loop.
+    identity_by_object: dict[int, str] = {}
+    view_by_object: dict[int, _CatalogView] = {}
     for key, catalog in catalogs.items():
         revision_id, catalog_sha256 = key
-        if not is_foreign_snapshot(catalog) and catalog.identity_sha256() != catalog_sha256:
-            raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
-        indexed[key] = _CatalogView(
-            catalog=catalog,
-            pools={pool.pool_id: pool for pool in catalog.pools},
-            deployments={
-                deployment.deployment_id: deployment for deployment in catalog.deployments
-            },
-        )
+        if not is_foreign_snapshot(catalog):
+            identity = identity_by_object.get(id(catalog))
+            if identity is None:
+                identity = catalog.identity_sha256()
+                identity_by_object[id(catalog)] = identity
+            if identity != catalog_sha256:
+                raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
+        view = view_by_object.get(id(catalog))
+        if view is None:
+            view = _CatalogView(
+                catalog=catalog,
+                pools={pool.pool_id: pool for pool in catalog.pools},
+                deployments={
+                    deployment.deployment_id: deployment for deployment in catalog.deployments
+                },
+            )
+            view_by_object[id(catalog)] = view
+        indexed[key] = view
     return indexed
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unittest.mock
 from datetime import UTC, datetime
 
 import pytest
@@ -254,6 +255,36 @@ def test_index_rejects_a_same_version_catalog_under_the_wrong_digest() -> None:
     corruption and still fails closed when the resolver indexes it."""
     with pytest.raises(ValueError, match="wrong digest"):
         CatalogRouteResolver({(_REVISION, "b" * 64): _single_pool_catalog()})
+
+
+def test_index_hashes_a_shared_catalog_object_once_and_shares_its_view() -> None:
+    """Keys sharing one immutable catalog verify with ONE identity computation.
+
+    A repoint mints hundreds of alias keys against the same snapshot object, and
+    per-key hashing re-hashed the same multi-megabyte production document 732
+    times (~35 s of a ~51 s catalog state build). The digest check must stay
+    per KEY (a shared object pinned under a second, wrong digest still fails
+    closed), while the expensive hash and the indexed view are per OBJECT.
+    """
+    catalog = _single_pool_catalog()
+    digest = catalog.identity_sha256()
+    calls = 0
+    original = type(catalog).identity_sha256
+
+    def counting(self: NormalizedGatewayCatalog) -> str:
+        nonlocal calls
+        calls += 1
+        return original(self)
+
+    keys = [(f"alias-revision-{index:03d}", digest) for index in range(50)]
+    with unittest.mock.patch.object(type(catalog), "identity_sha256", counting):
+        resolver = CatalogRouteResolver(dict.fromkeys(keys, catalog))
+    assert calls == 1
+    views = resolver._catalogs  # noqa: SLF001 -- pinning the shared-view invariant
+    assert all(views[key] is views[keys[0]] for key in keys)
+
+    with pytest.raises(ValueError, match="wrong digest"):
+        CatalogRouteResolver({keys[0]: catalog, ("alias-revision-bad", "b" * 64): catalog})
 
 
 def test_index_serves_a_cross_version_catalog_under_its_pinned_digest() -> None:
