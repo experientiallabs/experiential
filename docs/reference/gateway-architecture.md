@@ -215,10 +215,11 @@ of `output_tokens` and `cached_input_tokens` a subset of `input_tokens`, and set
 subset at its own rate and the remainder at the base rate. Wires that report reasoning outside
 their output total are folded by the native usage mappers before the counts leave the data plane:
 Gemini `thoughtsTokenCount` is additive by Google's definition and always folds into
-`output_tokens`; on Chat Completions a `reasoning_tokens` count above `completion_tokens` is
-impossible under subset semantics, so it identifies an additive provider (xAI, natively or relayed
-by Azure Foundry) and folds, while OpenAI, OpenRouter, Fireworks, and DeepSeek pass through
-untouched. Anthropic and Bedrock bill thinking inside their output total and publish no separate
+`output_tokens`; on Chat Completions a deployment whose catalog declares
+`reasoning_tokens_additive` (xAI, natively or relayed by Azure Foundry) folds every reported
+reasoning count, and an undeclared deployment folds when `reasoning_tokens` exceeds
+`completion_tokens`, which is impossible under subset semantics and so identifies an additive
+provider on its own; OpenAI, OpenRouter, Fireworks, and DeepSeek pass through untouched. Anthropic and Bedrock bill thinking inside their output total and publish no separate
 count, so their reasoning subset stays unknown. The customer-visible `completion_tokens` and
 `total_tokens` therefore match what is billed on every lane.
 

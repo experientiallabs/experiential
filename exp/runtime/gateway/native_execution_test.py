@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -20,10 +20,12 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
     claim_route_from,
+    deployment_wire_entry,
     next_route_candidate,
     select_route_deployments,
 )
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.models.providers.base import GatewayWireProfile
 
 _KEYS: tuple[DeploymentHealthKey, ...] = (
     ("catalog" + "0" * 57, "deployment-a", "connection-a"),
@@ -91,6 +93,24 @@ def _failover_only() -> GatewayFailure:
         failure_class=GatewayFailureClass.THROTTLED,
         safe_message="provider throttled the request",
         failover_eligible=True,
+    )
+
+
+def test_wire_entry_carries_the_additive_reasoning_declaration() -> None:
+    """The data plane folds reasoning only for deployments whose catalog declares it."""
+    route = _route()
+    profile = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test/v1")
+    declared = route.deployment.model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(reasoning_tokens_additive=True)
+            )
+        }
+    )
+    assert deployment_wire_entry(route, declared, profile, {})["reasoning_tokens_additive"] is True
+    assert (
+        deployment_wire_entry(route, route.deployment, profile, {})["reasoning_tokens_additive"]
+        is False
     )
 
 
@@ -453,7 +473,6 @@ def test_native_serving_blockers_name_reasoning_wire_contract_conflicts(
     from exp.runtime.gateway.lifecycle import load_gateway_components
     from exp.runtime.gateway.lifecycle_test import _configured_gateway
     from exp.runtime.gateway.native_execution import native_serving_blockers
-    from exp.runtime.models.providers.base import GatewayWireProfile
     from exp.runtime.models.providers.gemini import GeminiClient
 
     original_wire_profile = GeminiClient.gateway_wire_profile

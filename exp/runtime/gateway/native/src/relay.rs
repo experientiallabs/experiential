@@ -11,7 +11,8 @@ use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 
 use crate::dialects::{
-    Dialect, FrameDecoder, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
+    Dialect, FrameDecoder, Normalizer, NormalizerOptions, MAXIMUM_RETAINED_OUTPUT_BYTES,
+    OUTPUT_OVERFLOW_MESSAGE,
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
@@ -150,46 +151,26 @@ impl UpstreamRelay {
         response: reqwest::Response,
         dialect: Dialect,
         first_byte_deadline: Instant,
+        options: NormalizerOptions,
     ) -> Self {
-        Self::new_with_reasoning_content_route(response, dialect, first_byte_deadline, None)
-    }
-
-    pub fn new_with_reasoning_content_route(
-        response: reqwest::Response,
-        dialect: Dialect,
-        first_byte_deadline: Instant,
-        reasoning_content_route_sha256: Option<String>,
-    ) -> Self {
-        Self::from_stream_with_reasoning_content_route(
+        Self::from_stream(
             response.bytes_stream().boxed(),
             dialect,
             first_byte_deadline,
-            reasoning_content_route_sha256,
+            options,
         )
     }
 
-    #[cfg(test)]
     fn from_stream(
         stream: BoxStream<'static, reqwest::Result<Bytes>>,
         dialect: Dialect,
         first_byte_deadline: Instant,
-    ) -> Self {
-        Self::from_stream_with_reasoning_content_route(stream, dialect, first_byte_deadline, None)
-    }
-
-    fn from_stream_with_reasoning_content_route(
-        stream: BoxStream<'static, reqwest::Result<Bytes>>,
-        dialect: Dialect,
-        first_byte_deadline: Instant,
-        reasoning_content_route_sha256: Option<String>,
+        options: NormalizerOptions,
     ) -> Self {
         Self {
             stream,
             decoder: FrameDecoder::new(dialect),
-            normalizer: Normalizer::new_with_reasoning_content_route(
-                dialect,
-                reasoning_content_route_sha256,
-            ),
+            normalizer: Normalizer::with_options(dialect, options),
             pending: VecDeque::new(),
             eof: false,
             first_byte_recorded: false,
@@ -397,7 +378,7 @@ pub async fn collect_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dialects::Dialect;
+    use crate::dialects::{Dialect, NormalizerOptions};
     use crate::events::Event;
     use futures_util::stream;
 
@@ -414,6 +395,7 @@ mod tests {
             stream::iter(frames).boxed(),
             Dialect::OpenAiCompatible,
             Instant::now() + Duration::from_secs(5),
+            NormalizerOptions::default(),
         );
         assert!(
             relay.first_token_at().is_none(),
@@ -467,6 +449,7 @@ mod tests {
             stream::iter(frames).boxed(),
             Dialect::GeminiGenerateContent,
             Instant::now() + Duration::from_secs(5),
+            NormalizerOptions::default(),
         );
         let deadline = Instant::now() + Duration::from_secs(30);
         let per_chunk = Duration::from_secs(5);
@@ -512,6 +495,7 @@ mod tests {
             never,
             Dialect::OpenAiCompatible,
             Instant::now() + time_to_first_byte,
+            NormalizerOptions::default(),
         );
         let request_deadline = Instant::now() + Duration::from_secs(120);
         let per_chunk_timeout = Duration::from_secs(35);

@@ -749,7 +749,8 @@ impl Normalizer {
         if let Some(raw_usage) = payload.get("usage") {
             if !raw_usage.is_null() {
                 self.usage = Some(
-                    openai_compatible_usage(raw_usage).map_err(|message| malformed(&message))?,
+                    openai_compatible_usage(raw_usage, self.options.reasoning_tokens_additive)
+                        .map_err(|message| malformed(&message))?,
                 );
             }
         }
@@ -781,7 +782,7 @@ impl Normalizer {
             self.refusal_seen = true;
             events.push(Event::RefusalDelta(refusal.clone()));
         }
-        if let Some(route_sha256) = self.reasoning_content_route_sha256.clone() {
+        if let Some(route_sha256) = self.options.reasoning_content_route_sha256.clone() {
             if let Some(value) = delta.get("reasoning_content") {
                 let reasoning = match value {
                     Value::Null => None,

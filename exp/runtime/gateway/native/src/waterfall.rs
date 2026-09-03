@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::bridge::Bridge;
-use crate::dialects::Dialect;
+use crate::dialects::{Dialect, NormalizerOptions};
 use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
@@ -68,6 +68,12 @@ pub struct DeploymentWire {
     pub upstream_body: Option<String>,
     #[serde(default)]
     pub fireworks_reasoning_route_sha256: Option<String>,
+    /// The deployment declares that its Chat Completions usage reports
+    /// `reasoning_tokens` outside `completion_tokens`, so the normalizer folds
+    /// the count into `output_tokens` unconditionally (see
+    /// `NormalizerOptions::reasoning_tokens_additive`).
+    #[serde(default)]
+    pub reasoning_tokens_additive: bool,
     pub idempotency_key: String,
     /// Deployment override for the flat first-byte allowance; the serving
     /// configuration's default applies when absent.
@@ -510,15 +516,15 @@ async fn run_attempt(
         }
     };
     guard.mark_opened();
-    let mut relay = match wire.fireworks_reasoning_route_sha256.clone() {
-        Some(route_sha256) => UpstreamRelay::new_with_reasoning_content_route(
-            response,
-            dialect,
-            first_byte_deadline,
-            Some(route_sha256),
-        ),
-        None => UpstreamRelay::new(response, dialect, first_byte_deadline),
-    };
+    let mut relay = UpstreamRelay::new(
+        response,
+        dialect,
+        first_byte_deadline,
+        NormalizerOptions {
+            reasoning_content_route_sha256: wire.fireworks_reasoning_route_sha256.clone(),
+            reasoning_tokens_additive: wire.reasoning_tokens_additive,
+        },
+    );
     let mut usage: Option<Usage> = None;
     let mut tool_names: Vec<String> = Vec::new();
     let mut withheld: Vec<Event> = Vec::new();
@@ -682,6 +688,7 @@ mod tests {
             upstream_payload: Value::Null,
             upstream_body: None,
             fireworks_reasoning_route_sha256: None,
+            reasoning_tokens_additive: false,
             idempotency_key: "op".to_string(),
             time_to_first_byte_base_seconds: base,
             time_to_first_byte_seconds_per_million_input_tokens: slope,

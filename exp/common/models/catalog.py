@@ -459,6 +459,17 @@ class GatewayDeploymentCapabilities(ContractModel):
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
+    reasoning_tokens_additive: bool = False
+    """Whether this Chat Completions wire reports reasoning OUTSIDE ``completion_tokens``.
+
+    OpenAI and the providers that mirror it count ``completion_tokens_details.reasoning_tokens``
+    inside ``completion_tokens``; xAI (natively and relayed by Azure Foundry) reports it in
+    addition. The gateway settles reasoning as a subset of output, so a declared deployment has
+    its reasoning count folded into ``output_tokens`` by the data plane before settlement, and
+    its customer-visible ``completion_tokens`` then includes reasoning like OpenAI's. Only the
+    Chat Completions dialect reads this: Gemini thoughts are always additive and always folded,
+    and the other wires publish no separate reasoning count.
+    """
     time_to_first_byte_base_seconds: float | None = Field(default=None, gt=0)
     """Deployment override for the lane's flat time-to-first-byte allowance.
 

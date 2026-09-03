@@ -567,6 +567,9 @@ def deployment_wire_entry(
         "upstream_payload": None if upstream_body is not None else upstream_payload,
         "upstream_body": upstream_body,
         "fireworks_reasoning_route_sha256": profile.fireworks_reasoning_route_sha256,
+        # A declared additive-reasoning wire folds reasoning_tokens into
+        # output_tokens in the data plane so settlement's subset contract holds.
+        "reasoning_tokens_additive": capabilities.reasoning_tokens_additive,
         "idempotency_key": deployment_operation_key(route, deployment),
         # First-byte allowance overrides; the data plane falls back to its
         # serving defaults when a deployment declares nothing.

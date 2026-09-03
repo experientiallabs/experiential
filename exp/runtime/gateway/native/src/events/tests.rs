@@ -60,7 +60,7 @@ fn output_tokens_lead_a_turn_but_control_frames_do_not() {
 
 #[test]
 fn openai_compatible_usage_counts_absent_fields_as_zero() {
-    let usage = openai_compatible_usage(&json!({"prompt_tokens": 7})).expect("valid usage");
+    let usage = openai_compatible_usage(&json!({"prompt_tokens": 7}), false).expect("valid usage");
     assert_eq!(usage.input_tokens, Some(7));
     assert_eq!(usage.output_tokens, Some(0));
     assert_eq!(usage.cached_input_tokens, None);
@@ -69,11 +69,15 @@ fn openai_compatible_usage_counts_absent_fields_as_zero() {
 
 #[test]
 fn openai_compatible_usage_rejects_malformed_counts() {
-    assert!(openai_compatible_usage(&json!({"prompt_tokens": "7"})).is_err());
-    assert!(openai_compatible_usage(&json!({"prompt_tokens": MAXIMUM_LEDGER_COUNT + 1})).is_err());
-    assert!(openai_compatible_usage(&json!([1])).is_err());
+    assert!(openai_compatible_usage(&json!({"prompt_tokens": "7"}), false).is_err());
+    assert!(
+        openai_compatible_usage(&json!({"prompt_tokens": MAXIMUM_LEDGER_COUNT + 1}), false)
+            .is_err()
+    );
+    assert!(openai_compatible_usage(&json!([1]), false).is_err());
     assert!(openai_compatible_usage(
-        &json!({"prompt_tokens": 1, "completion_tokens": 1, "prompt_tokens_details": 3})
+        &json!({"prompt_tokens": 1, "completion_tokens": 1, "prompt_tokens_details": 3}),
+        false
     )
     .is_err());
 }
@@ -178,28 +182,34 @@ fn openai_compatible_usage_leaves_a_folded_provider_untouched() {
     // is forwarded exactly; the equal case is a legal subset, not evidence of
     // an additive provider.
     for (completion, reasoning) in [(700u64, 690u64), (690, 690), (5, 0)] {
-        let usage = openai_compatible_usage(&json!({
-            "prompt_tokens": 36,
-            "completion_tokens": completion,
-            "total_tokens": 36 + completion,
-            "completion_tokens_details": {"reasoning_tokens": reasoning},
-        }))
+        let usage = openai_compatible_usage(
+            &json!({
+                "prompt_tokens": 36,
+                "completion_tokens": completion,
+                "total_tokens": 36 + completion,
+                "completion_tokens_details": {"reasoning_tokens": reasoning},
+            }),
+            false,
+        )
         .expect("valid usage");
         assert_eq!(usage.output_tokens, Some(completion));
         assert_eq!(usage.reasoning_tokens, Some(reasoning));
     }
     // OpenRouter normalizes upstream reasoning into completion_tokens and
     // reports the subset alongside (shape captured from openrouter.ai).
-    let openrouter = openai_compatible_usage(&json!({
-        "prompt_tokens": 14,
-        "completion_tokens": 543,
-        "total_tokens": 557,
-        "cost": 0.0016,
-        "is_byok": false,
-        "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
-        "cost_details": {"upstream_inference_cost": null},
-        "completion_tokens_details": {"reasoning_tokens": 480, "image_tokens": 0},
-    }))
+    let openrouter = openai_compatible_usage(
+        &json!({
+            "prompt_tokens": 14,
+            "completion_tokens": 543,
+            "total_tokens": 557,
+            "cost": 0.0016,
+            "is_byok": false,
+            "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
+            "cost_details": {"upstream_inference_cost": null},
+            "completion_tokens_details": {"reasoning_tokens": 480, "image_tokens": 0},
+        }),
+        false,
+    )
     .expect("valid usage");
     assert_eq!(openrouter.output_tokens, Some(543));
     assert_eq!(openrouter.reasoning_tokens, Some(480));
@@ -212,25 +222,28 @@ fn openai_compatible_usage_folds_an_additive_provider_into_output_tokens() {
     // its own total_tokens confirms (14 + 7 + 1303 = 1324). A reasoning count
     // above completion_tokens is impossible under subset semantics, so the
     // mapper folds it and the subset stays reported.
-    let usage = openai_compatible_usage(&json!({
-        "prompt_tokens": 14,
-        "completion_tokens": 7,
-        "total_tokens": 1324,
-        "audio_prompt_tokens": 0,
-        "prompt_tokens_details": {
-            "cached_tokens": 0,
-            "audio_tokens": 0,
-            "text_tokens": 14,
-            "image_tokens": 0,
-        },
-        "completion_tokens_details": {
-            "reasoning_tokens": 1303,
-            "audio_tokens": 0,
-            "accepted_prediction_tokens": 0,
-            "rejected_prediction_tokens": 0,
-        },
-        "num_sources_used": 0,
-    }))
+    let usage = openai_compatible_usage(
+        &json!({
+            "prompt_tokens": 14,
+            "completion_tokens": 7,
+            "total_tokens": 1324,
+            "audio_prompt_tokens": 0,
+            "prompt_tokens_details": {
+                "cached_tokens": 0,
+                "audio_tokens": 0,
+                "text_tokens": 14,
+                "image_tokens": 0,
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 1303,
+                "audio_tokens": 0,
+                "accepted_prediction_tokens": 0,
+                "rejected_prediction_tokens": 0,
+            },
+            "num_sources_used": 0,
+        }),
+        false,
+    )
     .expect("valid usage");
     assert_eq!(usage.input_tokens, Some(14));
     assert_eq!(usage.output_tokens, Some(1310));
@@ -242,11 +255,14 @@ fn openai_compatible_usage_folds_an_additive_provider_into_output_tokens() {
         1324
     );
     // A fold whose total leaves the persistable range is a contract violation.
-    assert!(openai_compatible_usage(&json!({
-        "prompt_tokens": 1,
-        "completion_tokens": 1,
-        "completion_tokens_details": {"reasoning_tokens": MAXIMUM_LEDGER_COUNT},
-    }))
+    assert!(openai_compatible_usage(
+        &json!({
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "completion_tokens_details": {"reasoning_tokens": MAXIMUM_LEDGER_COUNT},
+        }),
+        false
+    )
     .is_err());
 }
 
@@ -313,4 +329,27 @@ fn gemini_usage_folds_thoughts_into_output_tokens() {
         "thoughtsTokenCount": 1,
     }))
     .is_err());
+}
+
+#[test]
+fn openai_compatible_usage_honours_the_deployment_declaration() {
+    // A declared-additive deployment folds even when reasoning is no larger
+    // than the visible answer (the case the heuristic alone cannot see), and
+    // still has nothing to fold when the provider publishes no reasoning count.
+    let usage = openai_compatible_usage(
+        &json!({
+            "prompt_tokens": 30,
+            "completion_tokens": 40,
+            "completion_tokens_details": {"reasoning_tokens": 5},
+        }),
+        true,
+    )
+    .expect("valid usage");
+    assert_eq!(usage.output_tokens, Some(45));
+    assert_eq!(usage.reasoning_tokens, Some(5));
+    let undetailed =
+        openai_compatible_usage(&json!({"prompt_tokens": 30, "completion_tokens": 40}), true)
+            .expect("valid usage");
+    assert_eq!(undetailed.output_tokens, Some(40));
+    assert_eq!(undetailed.reasoning_tokens, None);
 }

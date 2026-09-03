@@ -2,7 +2,9 @@
 //! module line budget).
 
 use super::*;
-use crate::dialects::{Dialect, MAXIMUM_RETAINED_PROVIDER_ENTRIES, OUTPUT_OVERFLOW_MESSAGE};
+use crate::dialects::{
+    Dialect, NormalizerOptions, MAXIMUM_RETAINED_PROVIDER_ENTRIES, OUTPUT_OVERFLOW_MESSAGE,
+};
 use crate::sse::SseEvent;
 fn reasoning_delta(output_index: u32, summary_index: u32, delta: &str) -> SseEvent {
     SseEvent {
@@ -127,9 +129,12 @@ fn compatible_reasoning_content_requires_fireworks_route_authority() {
         .to_string(),
     };
     let route_sha256 = "a".repeat(64);
-    let mut authorized = Normalizer::new_with_reasoning_content_route(
+    let mut authorized = Normalizer::with_options(
         Dialect::OpenAiCompatible,
-        Some(route_sha256.clone()),
+        NormalizerOptions {
+            reasoning_content_route_sha256: Some(route_sha256.clone()),
+            ..NormalizerOptions::default()
+        },
     );
     let events = authorized
         .feed(&frame)
@@ -162,9 +167,12 @@ fn fireworks_reasoning_content_rejects_non_text_values() {
         })
         .to_string(),
     };
-    let mut normalizer = Normalizer::new_with_reasoning_content_route(
+    let mut normalizer = Normalizer::with_options(
         Dialect::OpenAiCompatible,
-        Some("a".repeat(64)),
+        NormalizerOptions {
+            reasoning_content_route_sha256: Some("a".repeat(64)),
+            ..NormalizerOptions::default()
+        },
     );
 
     assert!(normalizer.feed(&frame).is_err());
@@ -401,6 +409,58 @@ fn compatible_stream_folds_additive_reasoning_into_the_terminal_usage() {
             assert_eq!(usage.output_tokens, Some(663));
             assert_eq!(usage.cached_input_tokens, Some(4));
             assert_eq!(usage.reasoning_tokens, Some(655));
+        }
+        other => panic!("unexpected events: {other:?}"),
+    }
+}
+
+#[test]
+fn declared_additive_deployment_folds_reasoning_even_below_the_visible_answer() {
+    // A deployment whose catalog declares reasoning_tokens_additive reports xAI
+    // semantics: reasoning is outside completion_tokens whatever its size. The
+    // heuristic alone would miss this long-answer, short-reasoning turn (5 <= 40);
+    // the declaration folds it, and the undeclared normalizer forwards it raw.
+    let usage_frame = || SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "id": "chatcmpl-additive",
+            "object": "chat.completion.chunk",
+            "model": "grok-4.3",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 40,
+                "total_tokens": 75,
+                "completion_tokens_details": {"reasoning_tokens": 5},
+            },
+        })
+        .to_string(),
+    };
+    let done = || SseEvent {
+        event: None,
+        data: "[DONE]".to_string(),
+    };
+    let mut declared = Normalizer::with_options(
+        Dialect::OpenAiCompatible,
+        NormalizerOptions {
+            reasoning_tokens_additive: true,
+            ..NormalizerOptions::default()
+        },
+    );
+    assert!(declared.feed(&usage_frame()).expect("usage").is_empty());
+    match declared.feed(&done()).expect("terminal").as_slice() {
+        [Event::Usage(usage), Event::Completed] => {
+            assert_eq!(usage.output_tokens, Some(45));
+            assert_eq!(usage.reasoning_tokens, Some(5));
+        }
+        other => panic!("unexpected events: {other:?}"),
+    }
+    let mut undeclared = Normalizer::new(Dialect::OpenAiCompatible);
+    assert!(undeclared.feed(&usage_frame()).expect("usage").is_empty());
+    match undeclared.feed(&done()).expect("terminal").as_slice() {
+        [Event::Usage(usage), Event::Completed] => {
+            assert_eq!(usage.output_tokens, Some(40));
+            assert_eq!(usage.reasoning_tokens, Some(5));
         }
         other => panic!("unexpected events: {other:?}"),
     }

@@ -15,9 +15,10 @@
 //! - Chat Completions (`openai_compatible_usage`): OpenAI, OpenRouter, DeepSeek,
 //!   Fireworks, and Azure-relayed Fireworks fold reasoning into
 //!   `completion_tokens`; xAI (native and relayed by Azure Foundry) reports it
-//!   outside. A reasoning count above `completion_tokens` is impossible under
-//!   subset semantics, so it is taken as proof of an additive provider and
-//!   folded; a folded provider is never touched.
+//!   outside. A deployment declaring `reasoning_tokens_additive` folds every
+//!   reported count; without the declaration a reasoning count above
+//!   `completion_tokens`, impossible under subset semantics, is taken as proof
+//!   of an additive provider and folded. A folded provider is never touched.
 //! - Gemini (`gemini_usage`): `thoughtsTokenCount` is additive by Google's
 //!   definition (`totalTokenCount` = prompt + candidates + thoughts), so it is
 //!   folded into `output_tokens` unconditionally.
@@ -700,13 +701,16 @@ fn fold_additive_reasoning(
 ///
 /// `completion_tokens_details.reasoning_tokens` is a subset of
 /// `completion_tokens` on OpenAI and every provider that mirrors it, and is
-/// forwarded as reported. A reasoning count ABOVE `completion_tokens` cannot
-/// occur under subset semantics; it identifies a provider that reports
-/// reasoning additively (xAI, natively or relayed by Azure Foundry), so the
-/// count is folded into `output_tokens` and `reasoning_tokens` keeps naming
-/// the subset. The fold misses an additive provider only when its reasoning
-/// happens to be no larger than its visible answer.
-pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
+/// forwarded as reported. A provider that reports reasoning additively (xAI,
+/// natively or relayed by Azure Foundry) has its count folded into
+/// `output_tokens` while `reasoning_tokens` keeps naming the subset. The fold
+/// applies when the deployment declares `declared_additive`
+/// (`GatewayDeploymentCapabilities.reasoning_tokens_additive`) or when the
+/// reported reasoning count is ABOVE `completion_tokens`, which cannot occur
+/// under subset semantics and so identifies an additive provider on its own.
+/// An undeclared additive provider is missed only when its reasoning happens
+/// to be no larger than its visible answer.
+pub fn openai_compatible_usage(value: &Value, declared_additive: bool) -> Result<Usage, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "OpenAI-compatible usage must be an object".to_string())?;
@@ -718,7 +722,7 @@ pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
         "reasoning_tokens",
     )?;
     let output_tokens = match reasoning_tokens {
-        Some(reasoning) if reasoning > completion_tokens => {
+        Some(reasoning) if declared_additive || reasoning > completion_tokens => {
             fold_additive_reasoning(completion_tokens, reasoning, "OpenAI-compatible")?
         }
         _ => completion_tokens,

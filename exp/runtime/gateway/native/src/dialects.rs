@@ -199,19 +199,29 @@ pub struct Normalizer {
     // provider supplies no tool index; assignment order mirrors the python
     // mapper's local counter.
     gemini_tool_index: u32,
-    // Fireworks-only route identity authorizing reasoning_content capture.
-    reasoning_content_route_sha256: Option<String>,
+    // Per-deployment facts that shape normalization beyond the dialect.
+    options: NormalizerOptions,
+}
+
+/// Deployment-declared facts that shape normalization beyond the wire dialect.
+#[derive(Debug, Clone, Default)]
+pub struct NormalizerOptions {
+    /// Fireworks-only route identity authorizing `reasoning_content` capture.
+    pub reasoning_content_route_sha256: Option<String>,
+    /// The deployment declares that its Chat Completions usage reports
+    /// `reasoning_tokens` OUTSIDE `completion_tokens` (xAI semantics), so the
+    /// count is folded into `output_tokens` even when it is no larger than the
+    /// visible answer. Without the declaration only the self-evident case
+    /// (reasoning above completion) folds.
+    pub reasoning_tokens_additive: bool,
 }
 
 impl Normalizer {
     pub fn new(dialect: Dialect) -> Self {
-        Self::new_with_reasoning_content_route(dialect, None)
+        Self::with_options(dialect, NormalizerOptions::default())
     }
 
-    pub fn new_with_reasoning_content_route(
-        dialect: Dialect,
-        reasoning_content_route_sha256: Option<String>,
-    ) -> Self {
+    pub fn with_options(dialect: Dialect, options: NormalizerOptions) -> Self {
         Self {
             dialect,
             tools: BTreeMap::new(),
@@ -231,7 +241,7 @@ impl Normalizer {
             usage: None,
             finish_reason: None,
             gemini_tool_index: 0,
-            reasoning_content_route_sha256,
+            options,
         }
     }
 
