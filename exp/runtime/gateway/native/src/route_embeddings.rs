@@ -295,42 +295,54 @@ async fn dispatch(
             true,
         ));
     }
-    let bytes = match tokio::time::timeout(remaining(deadline).min(phase_timeout), response.bytes())
+    let bytes = read_bounded_body(response, deadline, phase_timeout)
         .await
-    {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) => {
-            return Err((
-                Failure::new(
-                    FailureClass::Transport,
-                    "provider connection failed while sending the embeddings response",
-                )
-                .with_retry(true, true),
-                true,
-            ))
-        }
-        Err(_) => {
-            return Err((
-                Failure::new(
-                    FailureClass::Timeout,
-                    "provider did not finish the embeddings response in time",
-                )
-                .with_retry(false, true),
-                true,
-            ))
-        }
-    };
-    if bytes.len() > MAXIMUM_RETAINED_OUTPUT_BYTES {
-        return Err((
-            Failure::new(FailureClass::MalformedResponse, OUTPUT_OVERFLOW_MESSAGE),
-            true,
-        ));
-    }
+        .map_err(|failure| (failure, true))?;
     let payload: Value = match serde_json::from_slice(&bytes) {
         Ok(payload) => payload,
         Err(_) => return Err((malformed("embeddings response is not JSON"), true)),
     };
     public_embeddings(payload, admission).map_err(|failure| (failure, true))
+}
+
+/// Read one successful provider body chunk by chunk under the retained-output
+/// cap, so an upstream that omits `Content-Length` cannot make the gateway
+/// buffer an unbounded answer before the size check runs. Each chunk read is
+/// bounded by the deployment's transport timeout and the request deadline.
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    deadline: Instant,
+    phase_timeout: Duration,
+) -> Result<Vec<u8>, Failure> {
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        let bound = remaining(deadline).min(phase_timeout);
+        let chunk = match tokio::time::timeout(bound, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => return Ok(body),
+            Ok(Err(_)) => {
+                return Err(Failure::new(
+                    FailureClass::Transport,
+                    "provider connection failed while sending the embeddings response",
+                )
+                .with_retry(true, true))
+            }
+            Err(_) => {
+                return Err(Failure::new(
+                    FailureClass::Timeout,
+                    "provider did not finish the embeddings response in time",
+                )
+                .with_retry(false, true))
+            }
+        };
+        if body.len() + chunk.len() > MAXIMUM_RETAINED_OUTPUT_BYTES {
+            return Err(Failure::new(
+                FailureClass::MalformedResponse,
+                OUTPUT_OVERFLOW_MESSAGE,
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
 }
 
 /// A provider answer the gateway cannot bill or relay; never retried on the
