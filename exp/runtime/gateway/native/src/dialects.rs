@@ -17,7 +17,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Map, Value};
 
 use crate::errors::{Failure, FailureClass};
-use crate::events::{simplified_event, Event, ProviderOutputItemKind, ToolAccumulator, Usage};
+use crate::events::{
+    require_json_object_text, simplified_event, Event, ProviderOutputItemKind, ToolAccumulator,
+    Usage,
+};
 use crate::eventstream::EventStreamDecoder;
 use crate::sse::{SseDecoder, SseEvent};
 
@@ -166,6 +169,34 @@ fn finish_open_tools(tools: &mut BTreeMap<u32, ToolAccumulator>) -> Result<Vec<E
     for (index, tool) in tools.iter_mut() {
         if !tool.completed {
             complete_streamed_tool(*index, tool, &mut events)?;
+        }
+    }
+    Ok(events)
+}
+
+/// Finish open tools on a stream the provider cut off at its output budget.
+///
+/// A call whose accumulated arguments still parse as a JSON object completes
+/// normally; one left mid-fragment by the truncation is DROPPED (marked
+/// completed without a `ToolCallCompleted`), because the provider never
+/// finished it and the caller's remedy is a larger budget, not a retry of a
+/// "malformed" provider. Only the `finish_reason == "length"` terminal may use
+/// this; every other terminal keeps the strict object contract.
+fn finish_open_tools_truncated(
+    tools: &mut BTreeMap<u32, ToolAccumulator>,
+) -> Result<Vec<Event>, Failure> {
+    let mut events = Vec::new();
+    for (index, tool) in tools.iter_mut() {
+        if tool.completed {
+            continue;
+        }
+        let parses = tool.custom
+            || tool.raw_arguments.is_empty()
+            || require_json_object_text(&tool.raw_arguments).is_ok();
+        if parses {
+            complete_streamed_tool(*index, tool, &mut events)?;
+        } else {
+            tool.completed = true;
         }
     }
     Ok(events)

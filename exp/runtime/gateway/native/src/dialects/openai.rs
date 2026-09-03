@@ -4,8 +4,8 @@
 use serde_json::Value;
 
 use super::{
-    complete_streamed_tool, finish_open_tools, malformed, optional_text, parse_object,
-    provider_stream_failed, refusal_failure, Normalizer,
+    complete_streamed_tool, finish_open_tools, finish_open_tools_truncated, malformed,
+    optional_text, parse_object, provider_stream_failed, refusal_failure, Normalizer,
 };
 use crate::errors::{Failure, FailureClass};
 use crate::events::{
@@ -727,11 +727,23 @@ impl Normalizer {
         frame: &crate::sse::SseEvent,
     ) -> Result<Vec<Event>, Failure> {
         if frame.data == "[DONE]" {
-            let mut events = finish_open_tools(&mut self.tools)?;
+            let finish = self.finish_reason.as_deref();
+            // A tool call cut off by the output budget (finish_reason=length,
+            // arguments still an open JSON fragment) is the provider's honest
+            // truncation, not a malformed stream: it surfaces as Incomplete
+            // with the truncated call dropped, exactly what the caller must
+            // act on (raise max_tokens), never as a 502. Live shape: Tencent
+            // TokenHub glm-5.3 at max_tokens=32 streamed `{"` + `city` then
+            // finished with length (staging, 2026-09-03). Any other finish
+            // keeps the strict contract: unparsable arguments are malformed.
+            let mut events = if finish == Some("length") {
+                finish_open_tools_truncated(&mut self.tools)?
+            } else {
+                finish_open_tools(&mut self.tools)?
+            };
             if let Some(usage) = self.usage.take() {
                 events.push(Event::Usage(usage));
             }
-            let finish = self.finish_reason.as_deref();
             if self.refusal_seen || matches!(finish, Some("content_filter" | "safety")) {
                 events.push(Event::Failed(refusal_failure()));
             } else if finish == Some("length") {

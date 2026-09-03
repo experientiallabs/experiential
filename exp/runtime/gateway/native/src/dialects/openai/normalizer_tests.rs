@@ -523,3 +523,96 @@ fn compatible_stream_folds_additive_reasoning_into_the_terminal_usage() {
         other => panic!("unexpected events: {other:?}"),
     }
 }
+
+#[test]
+fn a_tool_call_cut_off_by_the_output_budget_is_incomplete_not_malformed() {
+    // Live shape (Tencent TokenHub glm-5.3, max_tokens=32, staging
+    // 2026-09-03): the call starts, two argument fragments arrive, then the
+    // provider finishes with `length`. The truncated call is dropped and the
+    // stream ends Incomplete — the caller's remedy is a larger budget, so a
+    // 502 "malformed response" was the wrong verdict.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let started = normalizer
+        .feed(&compatible_chunk(
+            serde_json::json!({"tool_calls": [{
+                "index": 0, "id": "call_73e9f9cfb9004dc1aaa71615", "type": "function",
+                "function": {"name": "get_weather", "arguments": ""},
+            }]}),
+            None,
+        ))
+        .expect("tool start must normalize");
+    assert!(matches!(
+        started.as_slice(),
+        [Event::ToolCallStarted { .. }]
+    ));
+    for fragment in ["{\"", "city"] {
+        normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"tool_calls": [{"index": 0, "function": {"arguments": fragment}}]}),
+                None,
+            ))
+            .expect("argument fragments must normalize");
+    }
+    assert!(normalizer
+        .feed(&compatible_chunk(serde_json::json!({}), Some("length")))
+        .expect("length finish must normalize")
+        .is_empty());
+    let events = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: "[DONE]".to_string(),
+        })
+        .expect("a length-truncated tool call must not be malformed");
+    assert!(matches!(events.as_slice(), [Event::Incomplete]));
+}
+
+#[test]
+fn a_complete_tool_call_still_completes_when_the_budget_ends_the_stream() {
+    // finish_reason=length AFTER the arguments closed: the call is intact and
+    // must still be delivered; only the terminal reads Incomplete.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer
+        .feed(&compatible_chunk(
+            serde_json::json!({"tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"},
+            }]}),
+            Some("length"),
+        ))
+        .expect("tool chunk must normalize");
+    let events = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: "[DONE]".to_string(),
+        })
+        .expect("stream must finish");
+    assert!(matches!(
+        events.as_slice(),
+        [Event::ToolCallCompleted { call, .. }, Event::Incomplete]
+            if call.raw_arguments == "{\"city\": \"Paris\"}"
+    ));
+}
+
+#[test]
+fn unparsable_tool_arguments_stay_malformed_on_a_normal_finish() {
+    // The strict contract holds whenever the provider claims it finished the
+    // call: a `tool_calls`/`stop` terminal with a dangling fragment is still a
+    // malformed stream, never silently dropped.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    normalizer
+        .feed(&compatible_chunk(
+            serde_json::json!({"tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city"},
+            }]}),
+            Some("tool_calls"),
+        ))
+        .expect("tool chunk must normalize");
+    let failure = normalizer
+        .feed(&SseEvent {
+            event: None,
+            data: "[DONE]".to_string(),
+        })
+        .expect_err("a dangling fragment on a normal finish is malformed");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+}
