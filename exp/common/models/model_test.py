@@ -112,6 +112,8 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "supports_top_p": None,
         "supports_top_k": None,
         "supports_logprobs": None,
+        "supports_frequency_penalty": None,
+        "supports_presence_penalty": None,
         "supports_reasoning": False,
         "reasoning_effort": None,
         "sampling_requires_reasoning_none": False,

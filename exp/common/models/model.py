@@ -425,6 +425,8 @@ class ModelCapabilities(ContractModel):
     supports_top_p: bool | None = None
     supports_top_k: bool | None = None
     supports_logprobs: bool | None = None
+    supports_frequency_penalty: bool | None = None
+    supports_presence_penalty: bool | None = None
     supports_reasoning: bool = False
     reasoning_effort: ReasoningEffort | None = None
     sampling_requires_reasoning_none: bool = False
@@ -504,6 +506,8 @@ class ModelCapabilities(ContractModel):
             "supports_top_p",
             "supports_top_k",
             "supports_logprobs",
+            "supports_frequency_penalty",
+            "supports_presence_penalty",
             "supports_reasoning",
             "reasoning_effort",
             "sampling_requires_reasoning_none",

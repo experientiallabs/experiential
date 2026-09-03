@@ -33,6 +33,8 @@ class KnownModel:
     supports_top_p: bool | None = None
     supports_top_k: bool | None = None
     supports_logprobs: bool | None = None
+    supports_frequency_penalty: bool | None = None
+    supports_presence_penalty: bool | None = None
     supports_reasoning_effort: bool = False
     reasoning_effort: (
         Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] | None

@@ -433,6 +433,8 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         supports_top_p: bool | None = None,
         supports_top_k: bool = False,
         supports_logprobs: bool = False,
+        supports_frequency_penalty: bool = False,
+        supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
@@ -451,6 +453,8 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._supports_top_p = supports_temperature if supports_top_p is None else supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_logprobs = supports_logprobs
+        self._supports_frequency_penalty = supports_frequency_penalty
+        self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
         self._token_limit_key: ChatMaxTokensField = chat_max_tokens_field or self.token_limit_key
@@ -473,6 +477,8 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_frequency_penalty=self._supports_frequency_penalty,
+            supports_presence_penalty=self._supports_presence_penalty,
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format=self.reasoning_wire_format,
             reasoning_effort=self._reasoning_effort,

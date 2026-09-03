@@ -173,6 +173,8 @@ class VertexClient(ProviderHttpClient):
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_logprobs: bool = False,
+        supports_frequency_penalty: bool = False,
+        supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
     ) -> None:
@@ -210,6 +212,8 @@ class VertexClient(ProviderHttpClient):
         self._supports_top_p = supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_logprobs = supports_logprobs
+        self._supports_frequency_penalty = supports_frequency_penalty
+        self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
 
@@ -293,6 +297,8 @@ class VertexClient(ProviderHttpClient):
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_frequency_penalty=self._supports_frequency_penalty,
+            supports_presence_penalty=self._supports_presence_penalty,
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format="gemini_thinking",
             reasoning_effort=self._reasoning_effort,

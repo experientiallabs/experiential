@@ -255,6 +255,8 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         supports_top_p=_strict_bool(entry.get("supports_top_p")),
         supports_top_k=_strict_bool(entry.get("supports_top_k")),
         supports_logprobs=_strict_bool(entry.get("supports_logprobs")),
+        supports_frequency_penalty=_strict_bool(entry.get("supports_frequency_penalty")),
+        supports_presence_penalty=_strict_bool(entry.get("supports_presence_penalty")),
         supports_reasoning=_strict_bool(entry.get("supports_reasoning")),
         reasoning_effort=_reasoning_effort(entry.get("reasoning_effort")),
         sampling_requires_reasoning_none=_strict_bool(
@@ -304,6 +306,8 @@ def _openrouter_model(provider: str, identity: str, entry: JsonObject) -> Discov
         supports_top_p="top_p" in supported,
         supports_top_k="top_k" in supported,
         supports_logprobs="logprobs" in supported or "top_logprobs" in supported,
+        supports_frequency_penalty="frequency_penalty" in supported,
+        supports_presence_penalty="presence_penalty" in supported,
         supports_reasoning="reasoning" in supported,
         reasoning_effort=(
             default_reasoning_effort(identity, "reasoning") if "reasoning" in supported else None

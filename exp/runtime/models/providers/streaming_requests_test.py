@@ -862,6 +862,47 @@ def test_generation_parameter_selection_serves_with_drop_when_no_rung_honors() -
     assert compatible_generation_parameter_profile_indexes(profiles, request) == (0, 1)
 
 
+def test_translated_json_object_narrows_away_from_a_schema_closing_rung() -> None:
+    """A translated json_object (open, non-strict schema) narrows to a rung that serves
+    open JSON, and rejects only when every rung is a schema-closing (Anthropic) dialect —
+    never silently closing 'any object' into 'no properties allowed'. This rides the
+    existing non-strict-schema route check (a schema-closing dialect enforces the schema),
+    which the strict=False translation now reaches."""
+    open_request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        structured_text=StructuredTextFormat(
+            name="json_object", json_schema={"type": "object"}, strict=False
+        ),
+    )
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://a.test", model_id="claude"
+    )
+    openai = GatewayWireProfile(dialect="openai_compatible", url="https://o.test", model_id="gpt")
+
+    # Narrows away from the Anthropic rung to the open-capable one.
+    assert compatible_generation_parameter_profile_indexes((anthropic, openai), open_request) == (
+        1,
+    )
+
+    # No open-capable rung → reject, not a silent inversion.
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((anthropic,), open_request)
+    assert raised.value.param == "response_format.json_schema.strict"
+    assert raised.value.code == "unsupported_parameter"
+
+    # A STRICT schema on the same Anthropic rung is NOT narrowed away (it is closed by
+    # the #733 coercion downstream instead), so it stays compatible.
+    strict_request = open_request.model_copy(
+        update={
+            "structured_text": StructuredTextFormat(
+                name="answer", json_schema={"type": "object"}, strict=True
+            )
+        }
+    )
+    assert compatible_generation_parameter_profile_indexes((anthropic,), strict_request) == (0,)
+
+
 def test_route_accepts_anthropic_max_effort_without_translation() -> None:
     """The provider's documented max level is preserved exactly."""
     request = _chat_request().model_copy(update={"reasoning_effort": "max"})
