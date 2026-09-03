@@ -28,19 +28,23 @@ def compatible_generation_parameter_profile_indexes(
         Ordered indexes of every compatible route profile.
 
     Raises:
-        ProviderParameterError: No deployment can preserve the request.
+        ProviderParameterError: No deployment can preserve the request. The
+            first rung's own rejection is raised: it names the field the
+            caller can act on, whereas re-checking the whole route would
+            report the route's mixed wire shape and hide that reason.
         ValueError: The route has no wire profiles.
     """
     if not profiles:
         raise ValueError("generation parameter selection requires at least one wire profile")
     compatible: list[int] = []
+    rejections: list[ProviderParameterError] = []
     for index, profile in enumerate(profiles):
         try:
             route_generation_parameter_requests((profile,), request)
-        except ProviderParameterError:
+        except ProviderParameterError as exc:
+            rejections.append(exc)
             continue
         compatible.append(index)
     if compatible:
         return tuple(compatible)
-    route_generation_parameter_requests(profiles, request)
-    raise AssertionError("an incompatible route returned without a parameter error")
+    raise rejections[0]

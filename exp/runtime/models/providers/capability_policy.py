@@ -33,7 +33,10 @@ from exp.runtime.models.providers.generation_parameter_validation import (
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
-from exp.runtime.models.providers.reasoning_compat import efforts_by_nearness
+from exp.runtime.models.providers.reasoning_compat import (
+    anthropic_adaptive_only_thinking,
+    efforts_by_nearness,
+)
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 
 if TYPE_CHECKING:
@@ -47,6 +50,9 @@ EFFORT_DROP_DISCLOSURE = "reasoning_effort"
 
 THINKING_DROP_DISCLOSURE = "thinking"
 """Disclosure recorded when a zero-reasoning route drops adaptive thinking."""
+
+THINKING_DISABLED_DISCLOSURE = "thinking.type->adaptive"
+"""Disclosure recorded when an adaptive-only route overrides a disabled thinking config."""
 
 CLOSED_SCHEMA_DISCLOSURE = "json_schema.additionalProperties->false"
 """Disclosure recorded when an open structured-output schema is closed."""
@@ -99,6 +105,11 @@ def coerce_generation_parameters(
         The disclosed substitution to retry with, or ``None`` when nothing
         coercible applies.
     """
+    disabled_thinking = _coerce_disabled_thinking(profiles, request)
+    if disabled_thinking is not None:
+        if admits is not None and not admits(disabled_thinking.request):
+            return None
+        return disabled_thinking
     if request.reasoning_effort is None:
         return None
     ladder: set[str] = set()
@@ -161,6 +172,46 @@ def coerce_generation_parameters(
             disclosures=(f"reasoning_effort->{candidate}",),
         )
     return None
+
+
+def _coerce_disabled_thinking(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Drop a ``thinking.type: disabled`` config the route's model cannot honor.
+
+    The adaptive-thinking Anthropic generation always reasons and rejects an
+    explicit ``disabled`` by name, so on a route whose Anthropic rungs are all
+    adaptive-only the caller's only alternative to a rejection is removing the
+    field. First-party clients pin the thinking mode globally (Claude Code
+    sends its configured mode to every model), so the config is dropped with
+    disclosure and the rung emits its sole supported mode, mirroring how a
+    budgeted ``enabled`` config is translated to adaptive. Routes with a rung
+    that honors ``disabled`` verbatim are left alone: narrowing already picks
+    that rung.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        request: Decoded public request that no rung accepted verbatim.
+
+    Returns:
+        The disclosed drop, or ``None`` when the config is not a rejected
+        ``disabled`` on an adaptive-only Anthropic route.
+    """
+    config = request.provider_thinking_config
+    if config is None or config.get("type") != "disabled":
+        return None
+    anthropic_profiles = [
+        profile for profile in profiles if profile.dialect == "anthropic_messages"
+    ]
+    if not anthropic_profiles or not all(
+        anthropic_adaptive_only_thinking(profile.model_id) for profile in anthropic_profiles
+    ):
+        return None
+    return RequestCoercion(
+        request=request.model_copy(update={"provider_thinking_config": None}),
+        disclosures=(THINKING_DISABLED_DISCLOSURE,),
+    )
 
 
 def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:

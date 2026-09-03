@@ -401,3 +401,52 @@ def test_mixed_rejections_coerce_only_the_service_tier() -> None:
         tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}, strict=True),)
     )
     assert coerce_route_rejections((parallel, strict), 2, strict_request) is None
+
+
+def test_disabled_thinking_drops_only_on_adaptive_only_anthropic_routes() -> None:
+    """An explicit disabled config is dropped with disclosure where no rung honors it."""
+    adaptive_only = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-opus-5",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+    )
+    budgeted = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-haiku-4-5",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+    )
+    shim = GatewayWireProfile(dialect="openai_compatible", url="https://shim.test")
+    request = _request(
+        surface=GatewayApiSurface.MESSAGES,
+        provider_thinking_config={"type": "disabled"},
+    )
+
+    coercion = coerce_generation_parameters((adaptive_only, shim), request)
+    assert coercion is not None
+    assert coercion.disclosures == ("thinking.type->adaptive",)
+    assert coercion.request.provider_thinking_config is None
+
+    # A rung that honors ``disabled`` verbatim leaves the config alone.
+    assert coerce_generation_parameters((budgeted, shim), request) is None
+    # No Anthropic rung at all: nothing to translate onto.
+    assert coerce_generation_parameters((shim,), request) is None
+    # Only a disabled config is coercible; other types keep their own path.
+    assert (
+        coerce_generation_parameters(
+            (adaptive_only, shim),
+            _request(
+                surface=GatewayApiSurface.MESSAGES,
+                provider_thinking_config={"type": "adaptive"},
+            ),
+        )
+        is None
+    )
+    # The admission probe still gates the offer.
+    assert (
+        coerce_generation_parameters((adaptive_only, shim), request, admits=lambda _c: False)
+        is None
+    )

@@ -3078,3 +3078,29 @@ def test_service_tier_route_shaping_forwards_on_byok_and_discloses_elsewhere() -
     )
     assert "service_tier" in foreign_public.ignored_parameters
     assert foreign_provider.service_tier is None
+
+
+def test_narrowing_surfaces_the_first_rung_rejection_not_the_route_shape() -> None:
+    """When no rung serves, the caller sees the first rung's own field-scoped reason."""
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-opus-5",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+    )
+    fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
+    request = _chat_request().model_copy(
+        update={
+            "surface": GatewayApiSurface.MESSAGES,
+            "provider_thinking_config": {"type": "disabled"},
+        }
+    )
+
+    with pytest.raises(ProviderParameterError) as raised:
+        compatible_generation_parameter_profile_indexes((anthropic, fallback), request)
+    assert raised.value.param == "thinking.type"
+
+    with pytest.raises(ProviderParameterError) as reordered:
+        compatible_generation_parameter_profile_indexes((fallback, anthropic), request)
+    assert reordered.value.param == "thinking"

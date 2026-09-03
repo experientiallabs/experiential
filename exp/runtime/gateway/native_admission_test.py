@@ -381,3 +381,75 @@ def test_mixed_waterfall_drops_the_tier_to_serve_the_preserving_rung() -> None:
     assert public.ignored_parameters == ("service_tier",)
     assert provider.service_tier is None
     assert accounting.recorded == 1
+
+
+def test_disabled_thinking_on_an_adaptive_only_mixed_route_is_dropped_with_disclosure() -> None:
+    """A dual-lane opus-5 route serves a disabled-thinking request instead of refusing.
+
+    The aggregator rung cannot carry Anthropic thinking at all and the
+    adaptive-only Anthropic rung rejects an explicit ``disabled``, so no rung
+    preserves the request verbatim. The disclosed drop lets the route serve,
+    the Anthropic rung emitting its sole supported mode.
+    """
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    streaming = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    deployments = (
+        _deployment("native", provider="anthropic", gateway=streaming),
+        _deployment("shim", gateway=streaming),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        provider_thinking_config={"type": "disabled"},
+        stream=True,
+        include_usage=True,
+    )
+
+    class _CoercionCounter:
+        """Count coercion recordings without a live ledger."""
+
+        recorded = 0
+
+        def record_admission_coercions(self, count: int) -> None:
+            self.recorded += count
+
+    accounting = _CoercionCounter()
+    client = cast(NativeWireClient, object())
+    wires = (
+        (
+            GatewayWireProfile(
+                dialect="anthropic_messages",
+                url="https://anthropic.test",
+                model_id="claude-opus-5",
+                supports_reasoning=True,
+                reasoning_wire_format="anthropic_adaptive",
+            ),
+            client,
+        ),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://shim.test",
+                model_id="anthropic/claude-opus-5",
+            ),
+            client,
+        ),
+    )
+    narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    # With the config gone nothing Anthropic-only remains on the request, so
+    # the whole certified waterfall stays available, native rung first.
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native", "shim")
+    assert public.ignored_parameters == ("thinking.type->adaptive",)
+    assert provider.provider_thinking_config is None
+    assert accounting.recorded == 1
