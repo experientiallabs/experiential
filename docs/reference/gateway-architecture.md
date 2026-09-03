@@ -324,7 +324,14 @@ control at all (Anthropic constrained `[1,1]` sampling) still hard-rejects it, s
 nothing to honor at any effort. `top_k` follows the same honor-or-narrow shape: selection prefers a
 rung that carries it, and a committed route with no supporting rung (an Azure `openai_deployments`
 DeepSeek rung rejects it upstream) drops it with `top_k->dropped(unsupported_by_provider)` rather
-than rejecting, since a rung's default sampling still returns a valid answer. A caller
+than rejecting, since a rung's default sampling still returns a valid answer. `frequency_penalty`
+and `presence_penalty` are admitted at the ingress and adapted the same way: honored (emitted) where
+every rung supports them (the per-rung `supports_frequency_penalty`/`supports_presence_penalty`
+capability truth), dropped as `frequency_penalty->dropped(unsupported_by_provider)` where a rung does
+not — a soft preference whose absence still returns a valid answer. `top_logprobs` stays rejected
+(not admitted): the gateway response contract does not project logprob arrays yet, so it cannot be
+honored on any rung and silently dropping a probability request is never acceptable — the reject is
+the honest terminal until output normalization emits logprobs. A caller
 `response_format: {type: "json_object"}` is TRANSLATED, not dropped: it is admitted at the Chat
 ingress and rewritten to a permissive non-strict `json_schema` (`{"type":"object"}`, "any JSON
 object") — the serving lanes emit only `json_schema`, so this preserves the caller's JSON intent on

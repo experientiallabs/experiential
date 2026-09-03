@@ -57,9 +57,18 @@ CHAT_MANIFEST = CompatibilityManifest(
         _field("reasoning_effort", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
+        # Sampling penalties: admitted and adapted per rung — honored where the
+        # provider supports them, dropped with disclosure where it does not (a
+        # soft preference whose absence still returns a valid answer).
+        _field("frequency_penalty", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "penalties"),
+        _field("presence_penalty", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "penalties"),
         # Accepted only at its no-op default of 1 (the wire model enforces
         # the value): Copilot hardcodes n:1 on every Chat request.
         _field("n", CompatibilityDisposition.SUPPORTED),
+        # top_logprobs stays UNSUPPORTED: the gateway response contract does not
+        # project logprob arrays yet, so it cannot be honored on any rung —
+        # rejecting is the honest outcome (never a silent drop of a probability
+        # request). Admit it only once response normalization emits logprobs.
         _field("top_logprobs", CompatibilityDisposition.UNSUPPORTED),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec). Accepted and recorded
@@ -76,14 +85,12 @@ CHAT_MANIFEST = CompatibilityManifest(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
                 "audio",
-                "frequency_penalty",
                 "function_call",
                 "functions",
                 "logit_bias",
                 "modalities",
                 "moderation",
                 "prediction",
-                "presence_penalty",
                 "prompt_cache_options",
                 "prompt_cache_retention",
                 "seed",

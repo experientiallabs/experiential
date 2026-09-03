@@ -538,6 +538,47 @@ def test_top_k_narrows_to_a_supporting_rung_then_drops_when_none_support() -> No
     assert honored.top_k == 20
 
 
+def test_penalties_honor_where_supported_and_drop_with_disclosure_otherwise() -> None:
+    """Sampling penalties are honored (emitted) where every rung supports them, and
+    dropped+disclosed (a soft preference) where a rung does not — never rejected."""
+    supporting = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://p.test",
+        model_id="m",
+        supports_frequency_penalty=True,
+        supports_presence_penalty=True,
+    )
+    unsupporting = GatewayWireProfile(
+        dialect="openai_compatible", url="https://q.test", model_id="m2"
+    )
+    request = _chat_request().model_copy(
+        update={"frequency_penalty": 0.5, "presence_penalty": -0.3}
+    )
+
+    # Every rung supports them → honored and emitted on the payload.
+    public_all, provider_all = route_generation_parameter_requests((supporting,), request)
+    assert public_all.ignored_parameters == ()
+    payload = openai_compatible_stream_payload(
+        "m",
+        provider_all,
+        supports_frequency_penalty=True,
+        supports_presence_penalty=True,
+    )
+    assert payload["frequency_penalty"] == 0.5
+    assert payload["presence_penalty"] == -0.3
+
+    # A rung without support → dropped + disclosed, never rejected.
+    public_drop, provider_drop = route_generation_parameter_requests(
+        (supporting, unsupporting), request
+    )
+    assert provider_drop.frequency_penalty is None
+    assert provider_drop.presence_penalty is None
+    assert public_drop.ignored_parameters == (
+        "frequency_penalty->dropped(unsupported_by_provider)",
+        "presence_penalty->dropped(unsupported_by_provider)",
+    )
+
+
 def test_route_rejects_effort_not_preserved_by_the_whole_waterfall() -> None:
     """An exact effort mismatch fails locally instead of clamping on a fallback."""
     request = GatewayRequest(

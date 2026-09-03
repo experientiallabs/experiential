@@ -195,6 +195,8 @@ def dialect_stream_payload(
                 else profile.supports_top_p
             ),
             supports_top_k=profile.supports_top_k,
+            supports_frequency_penalty=profile.supports_frequency_penalty,
+            supports_presence_penalty=profile.supports_presence_penalty,
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_wire_format=profile.reasoning_wire_format,
@@ -365,6 +367,18 @@ def route_generation_parameter_requests(
                 minimum=lambda profile: profile.minimum_top_k,
                 maximum=lambda profile: profile.maximum_top_k,
             )
+    # Sampling penalties are soft preferences: a rung that does not carry them
+    # still returns a valid answer, so a route with any rung that lacks support
+    # drops them with disclosure rather than rejecting. Honored (emitted) only
+    # when every rung supports the control.
+    if request.frequency_penalty is not None and not all(
+        profile.supports_frequency_penalty for profile in profiles
+    ):
+        ignore("frequency_penalty", "frequency_penalty->dropped(unsupported_by_provider)")
+    if request.presence_penalty is not None and not all(
+        profile.supports_presence_penalty for profile in profiles
+    ):
+        ignore("presence_penalty", "presence_penalty->dropped(unsupported_by_provider)")
     if request.reasoning_effort is not None:
         portable_efforts = set(REASONING_EFFORTS)
         for profile in profiles:

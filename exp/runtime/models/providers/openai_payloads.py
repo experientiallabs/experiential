@@ -160,6 +160,8 @@ def openai_compatible_stream_payload(
     supports_temperature: bool = True,
     supports_top_p: bool | None = None,
     supports_top_k: bool = False,
+    supports_frequency_penalty: bool = False,
+    supports_presence_penalty: bool = False,
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_wire_format: str = "reasoning_effort",
@@ -230,6 +232,10 @@ def openai_compatible_stream_payload(
         payload["top_p"] = request.top_p
     if request.top_k is not None and supports_top_k:
         payload["top_k"] = request.top_k
+    if request.frequency_penalty is not None and supports_frequency_penalty:
+        payload["frequency_penalty"] = request.frequency_penalty
+    if request.presence_penalty is not None and supports_presence_penalty:
+        payload["presence_penalty"] = request.presence_penalty
     # Compatible streaming responses also normalize logprobs to null, so an
     # accepted public control is intentionally ignored until projection exists.
     del supports_logprobs

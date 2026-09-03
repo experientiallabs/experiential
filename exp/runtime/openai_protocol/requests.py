@@ -203,6 +203,8 @@ def decode_chat(
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
+            frequency_penalty=request.frequency_penalty,
+            presence_penalty=request.presence_penalty,
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
             reasoning_effort=request.reasoning_effort,

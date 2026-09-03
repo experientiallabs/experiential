@@ -376,6 +376,8 @@ class _ChatRequest(_WireModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     top_k: int | None = Field(default=None, ge=0)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
     logprobs: bool | None = None
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None

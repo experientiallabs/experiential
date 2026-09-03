@@ -146,6 +146,19 @@ class GatewayWireProfile:
     Dispatch stays disabled until normalized output projection exists.
     """
 
+    supports_frequency_penalty: bool = False
+    """Whether this exact route accepts the ``frequency_penalty`` sampling control.
+
+    Defaults false so the control is dropped-with-disclosure until the catalog
+    stamps the rungs that honor it (per-rung capability truth, catalog side).
+    """
+
+    supports_presence_penalty: bool = False
+    """Whether this exact route accepts the ``presence_penalty`` sampling control.
+
+    Defaults false; see ``supports_frequency_penalty``.
+    """
+
     supports_reasoning: bool = False
     """Whether this exact route accepts the reasoning parameter on its wire dialect."""
 

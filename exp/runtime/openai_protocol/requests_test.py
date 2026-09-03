@@ -131,6 +131,21 @@ def test_chat_decoder_translates_json_object_to_a_permissive_schema() -> None:
     assert request.ignored_parameters == ("response_format->translated(json_object)",)
 
 
+def test_chat_decoder_admits_sampling_penalties() -> None:
+    """frequency_penalty/presence_penalty are admitted at the ingress (adapted per rung
+    downstream) rather than rejected as unsupported fields."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "frequency_penalty": 0.5,
+            "presence_penalty": -0.25,
+        }
+    ).request
+    assert request.frequency_penalty == 0.5
+    assert request.presence_penalty == -0.25
+
+
 def test_chat_legacy_max_tokens_reaches_native_responses_as_max_output_tokens() -> None:
     """A Chat request using legacy max_tokens serves a native Responses max_output_tokens.
 
