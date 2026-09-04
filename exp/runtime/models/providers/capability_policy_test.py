@@ -551,6 +551,9 @@ def test_adaptive_thinking_with_an_illegal_caller_budget_falls_back_to_derived()
         "type": "enabled",
         "budget_tokens": 4_000,
     }
+    # The substitution changes the requested depth, so it is disclosed by
+    # itself beside the type translation.
+    assert coercion.disclosures == ("thinking.type->enabled", "thinking.budget_tokens")
 
     at_ceiling = _messages_request(
         provider_thinking_config={"type": "adaptive", "budget_tokens": 8_000},
@@ -562,6 +565,7 @@ def test_adaptive_thinking_with_an_illegal_caller_budget_falls_back_to_derived()
         "type": "enabled",
         "budget_tokens": 4_000,
     }
+    assert coercion.disclosures == ("thinking.type->enabled", "thinking.budget_tokens")
 
 
 def test_adaptive_thinking_drops_when_no_legal_budget_fits_max_tokens() -> None:

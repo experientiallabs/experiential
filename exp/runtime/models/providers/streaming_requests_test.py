@@ -397,6 +397,23 @@ def test_haiku_caller_output_config_effort_is_stripped_at_the_payload_seam() -> 
     assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4_000}
     assert payload["output_config"] == {"format": {"type": "text"}}
 
+    # An UNRECOGNIZED effort never mapped to reasoning_effort, so it has no
+    # budget realization; it stays verbatim and the provider's own by-name
+    # rejection is the honest outcome, never a silent thinking-off answer.
+    future = request.model_copy(
+        update={
+            "reasoning_effort": None,
+            "provider_output_config": {"effort": "hyperdrive"},
+        }
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        future,
+        supports_reasoning=True,
+    )
+    assert "thinking" not in payload
+    assert payload["output_config"] == {"effort": "hyperdrive"}
+
 
 def test_haiku_adaptive_config_is_rejected_by_name_before_dispatch() -> None:
     """An adaptive config on a budgeted-only route raises pre-dispatch.

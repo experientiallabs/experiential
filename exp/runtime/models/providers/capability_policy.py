@@ -65,6 +65,10 @@ THINKING_TRANSLATED_DISCLOSURE = "thinking.type->enabled"
 """Disclosure recorded when an adaptive thinking config is translated to a
 budgeted ``enabled`` config for a budgeted-enabled Anthropic route."""
 
+THINKING_BUDGET_IGNORED_DISCLOSURE = "thinking.budget_tokens"
+"""Disclosure recorded when a caller budget was illegal and a derived budget
+replaced it in the translated ``enabled`` config."""
+
 CLOSED_SCHEMA_DISCLOSURE = "json_schema.additionalProperties->false"
 """Disclosure recorded when an open structured-output schema is closed."""
 
@@ -153,11 +157,17 @@ def _coerce_adaptive_budget(
         return None
     budget = _caller_or_derived_budget(config, request.maximum_output_tokens)
     if budget is not None:
+        disclosures: tuple[str, ...] = (THINKING_TRANSLATED_DISCLOSURE,)
+        if config.get("budget_tokens") is not None and config.get("budget_tokens") != budget:
+            # The caller named an illegal depth; the substitution changes the
+            # requested reasoning depth and cost, so it is disclosed by itself
+            # rather than hiding behind the type translation.
+            disclosures = (*disclosures, THINKING_BUDGET_IGNORED_DISCLOSURE)
         return RequestCoercion(
             request=request.model_copy(
                 update={"provider_thinking_config": {"type": "enabled", "budget_tokens": budget}}
             ),
-            disclosures=(THINKING_TRANSLATED_DISCLOSURE,),
+            disclosures=disclosures,
         )
     # No legal budget fits: drop every reasoning signal so the surviving effort
     # cannot re-emit adaptive thinking through output_config.
