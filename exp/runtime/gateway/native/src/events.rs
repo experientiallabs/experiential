@@ -60,6 +60,10 @@ impl Usage {
 pub struct CompletedToolCall {
     pub call_id: String,
     pub name: String,
+    /// Nested tool tree (Responses `namespace`) that declared this call,
+    /// preserved verbatim through retention and the client stream because
+    /// the provider rejects a namespaced call replayed without it.
+    pub namespace: Option<String>,
     pub provider_item_id: Option<String>,
     pub provider_status: Option<ProviderOutputItemStatus>,
     /// Raw provider-order argument text: a validated JSON object for
@@ -200,6 +204,10 @@ pub enum Event {
         index: u32,
         call_id: String,
         name: String,
+        /// Nested tool tree (Responses `namespace`) that declared this call;
+        /// present only on native Responses streams and preserved verbatim
+        /// because the provider rejects a namespaced call replayed without it.
+        namespace: Option<String>,
     },
     ToolArgumentsDelta {
         index: u32,
@@ -410,12 +418,19 @@ pub fn simplified_event(event: &Event) -> Value {
             index,
             call_id,
             name,
-        } => serde_json::json!({
-            "kind": "tool_call_started",
-            "index": index,
-            "call_id": call_id,
-            "name": name,
-        }),
+            namespace,
+        } => {
+            let mut payload = serde_json::json!({
+                "kind": "tool_call_started",
+                "index": index,
+                "call_id": call_id,
+                "name": name,
+            });
+            if let Some(namespace) = namespace {
+                payload["namespace"] = Value::String(namespace.clone());
+            }
+            payload
+        }
         Event::ToolArgumentsDelta { index, delta } => serde_json::json!({
             "kind": "tool_arguments_delta",
             "index": index,
@@ -429,6 +444,9 @@ pub fn simplified_event(event: &Event) -> Value {
                 "name": call.name,
                 "raw_arguments": call.raw_arguments,
             });
+            if let Some(namespace) = &call.namespace {
+                payload["namespace"] = Value::String(namespace.clone());
+            }
             if let Some(item_id) = &call.provider_item_id {
                 payload["item_id"] = Value::String(item_id.clone());
             }
@@ -528,6 +546,8 @@ pub fn require_json_object_text(raw: &str) -> Result<(), String> {
 pub struct ToolAccumulator {
     pub call_id: String,
     pub name: String,
+    /// Nested tool tree (Responses `namespace`) that declared this call.
+    pub namespace: Option<String>,
     pub provider_item_id: Option<String>,
     pub provider_status: Option<ProviderOutputItemStatus>,
     pub raw_arguments: String,
@@ -544,6 +564,7 @@ impl ToolAccumulator {
         Self {
             call_id,
             name,
+            namespace: None,
             provider_item_id: None,
             provider_status: None,
             raw_arguments: String::new(),
@@ -566,6 +587,10 @@ impl ToolAccumulator {
             || self.call_id.chars().count() > 256
             || self.name.is_empty()
             || self.name.chars().count() > 256
+            || self
+                .namespace
+                .as_ref()
+                .is_some_and(|namespace| namespace.is_empty() || namespace.chars().count() > 256)
             || self.raw_arguments.chars().count() > 4_000_000
         {
             return Err("streamed tool call is incomplete".to_string());
@@ -573,6 +598,7 @@ impl ToolAccumulator {
         Ok(CompletedToolCall {
             call_id: self.call_id.clone(),
             name: self.name.clone(),
+            namespace: self.namespace.clone(),
             provider_item_id: self.provider_item_id.clone(),
             provider_status: self.provider_status,
             raw_arguments: self.raw_arguments.clone(),

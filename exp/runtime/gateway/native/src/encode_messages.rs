@@ -303,6 +303,7 @@ impl MessagesSseEncoder {
                 index,
                 call_id,
                 name,
+                ..
             } => self.tool_started(*index, call_id, name),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments_delta(*index, delta),
             Event::ToolCallCompleted { index, call } => {

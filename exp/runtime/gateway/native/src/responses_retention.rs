@@ -258,6 +258,7 @@ pub(crate) fn remember_argument(
                 "item_id": call.provider_item_id,
                 "call_id": call.call_id,
                 "name": call.name,
+                "namespace": call.namespace,
                 "arguments": call.raw_arguments,
                 "status": call.provider_status.map(ProviderOutputItemStatus::as_str),
                 "custom": call.custom,
@@ -354,6 +355,7 @@ mod tests {
             Event::ToolCallCompleted {
                 index: 2,
                 call: CompletedToolCall {
+                    namespace: None,
                     call_id: "call-required".to_string(),
                     name: "lookup".to_string(),
                     provider_item_id: None,
@@ -397,6 +399,34 @@ mod tests {
         assert_eq!(payload["tool_calls"][0]["output_index"], 2);
         assert!(payload["tool_calls"][0]["item_id"].is_null());
         assert_eq!(payload["tool_calls"][0]["status"], "incomplete");
+    }
+
+    #[test]
+    fn retention_carries_a_tool_call_namespace_to_the_remember_payload() {
+        let events = [
+            Event::ToolCallCompleted {
+                index: 0,
+                call: CompletedToolCall {
+                    namespace: Some("collaboration".to_string()),
+                    call_id: "call-ns".to_string(),
+                    name: "spawn_agent".to_string(),
+                    provider_item_id: None,
+                    provider_status: None,
+                    raw_arguments: "{}".to_string(),
+                    custom: false,
+                },
+            },
+            Event::Completed,
+        ];
+        let mut retention = ResponsesRetention::default();
+        for event in &events {
+            retention.track(event);
+        }
+        let payload: Value =
+            serde_json::from_str(&remember_argument("request-ns", &retention, None))
+                .expect("retention payload is JSON");
+        assert_eq!(payload["tool_calls"][0]["namespace"], "collaboration");
+        assert_eq!(payload["tool_calls"][0]["name"], "spawn_agent");
     }
 
     #[test]
