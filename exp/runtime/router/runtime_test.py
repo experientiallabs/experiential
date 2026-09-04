@@ -40,7 +40,7 @@ from exp.common.models import (
     Usage,
 )
 from exp.common.project import ArtifactStore, ProjectPaths, artifact_input
-from exp.common.routing import KnnGuard, KnnRouterPolicy
+from exp.common.routing import CacheSwitchGuard, KnnGuard, KnnRouterPolicy
 from exp.common.routing.bank import (
     CandidateEvidenceCount,
     KnnBankManifest,
@@ -197,6 +197,178 @@ def test_episode_stickiness_uses_caller_identity_and_tools_affect_request_hash()
         hashlib.sha256(b"episode-b").hexdigest(),
     }
     assert "episode-a" not in first.model_dump_json()
+
+
+def _cache_runtime(
+    *,
+    cache_switch: CacheSwitchGuard | None = None,
+    prices: tuple[CandidateTokenPrice, ...] | None = None,
+) -> tuple[RouterRuntime, _Client]:
+    """Build one runtime with an optional cache-switch gate and frozen prices.
+
+    Args:
+        cache_switch: Optional gate overriding the policy default.
+        prices: Optional pricing rows in fit-time candidate order.
+
+    Returns:
+        Activated runtime and its deterministic shared client.
+    """
+    policy, manifest, bank, snapshots, client = _fixture()
+    if cache_switch is not None:
+        policy = policy.model_copy(
+            update={"guard": policy.guard.model_copy(update={"cache_switch": cache_switch})}
+        )
+    runtime = RouterRuntime(
+        policy,
+        manifest,
+        bank,
+        cast(RuntimeModelCatalog, _Catalog(snapshots, client)),
+        pricing_snapshot_id="pricing-a",
+        pricing_snapshot_sha256=_DIGEST,
+        pricing_candidate_aliases=bank.candidate_aliases,
+        pricing_candidate_prices=prices,
+    )
+    return runtime, client
+
+
+def _sticky_baseline_with_fresh_cheap_proposal(
+    runtime: RouterRuntime,
+    client: _Client,
+) -> tuple[ModelRequest, _PreparedSelection]:
+    """Retain a baseline sticky episode, then compute one fresh cheap proposal.
+
+    Args:
+        runtime: Activated runtime under test.
+        client: Shared deterministic embedding client.
+
+    Returns:
+        The proposal's request and its unretained prepared selection.
+    """
+    client.embedding_values = RuntimeError("embed failed")
+    first = runtime.select(_request(), episode_id="episode-cache")
+    assert first.selected_alias == "baseline"
+    assert first.switch_outcome is None
+    client.embedding_values = (Embedding(values=(1.0, 0.0)),)
+    request = _request(tool_name="write")
+    prepared = runtime._select_unretained(request, episode_id="episode-cache")  # noqa: SLF001
+    assert prepared.decision.selected_alias == "cheap"
+    assert prepared.decision.switch_outcome is None
+    return request, prepared
+
+
+def test_warm_sticky_episode_suppresses_a_small_quality_gain_switch() -> None:
+    """A fresh proposal below the amortized threshold stays on the sticky alias."""
+    runtime, client = _cache_runtime(
+        cache_switch=CacheSwitchGuard(switch_gain_per_amortized_usd=1e9),
+        prices=(
+            CandidateTokenPrice(
+                candidate_alias="baseline",
+                input_usd_per_million_tokens=0.5,
+                output_usd_per_million_tokens=1.5,
+                cached_input_usd_per_million_tokens=0.05,
+            ),
+            CandidateTokenPrice(
+                candidate_alias="cheap",
+                input_usd_per_million_tokens=0.1,
+                output_usd_per_million_tokens=0.4,
+                cache_write_usd_per_million_tokens=50.0,
+            ),
+        ),
+    )
+    request, prepared = _sticky_baseline_with_fresh_cheap_proposal(runtime, client)
+
+    retained = runtime._retain_prepared_selection(  # noqa: SLF001 - gateway seam
+        request,
+        episode_id="episode-cache",
+        prepared=prepared,
+    )
+
+    assert retained.selected_alias == "baseline"
+    assert retained.switch_outcome == "switch_suppressed_cache"
+    assert runtime.select(request, episode_id="episode-cache") == retained
+    assert client.embed_calls == 2
+
+
+def test_missing_pricing_rows_fail_closed_to_the_sticky_alias() -> None:
+    """A snapshot without candidate rows cannot prove the switch is amortization free."""
+    runtime, client = _cache_runtime()
+    request, prepared = _sticky_baseline_with_fresh_cheap_proposal(runtime, client)
+
+    retained = runtime._retain_prepared_selection(  # noqa: SLF001 - gateway seam
+        request,
+        episode_id="episode-cache",
+        prepared=prepared,
+    )
+
+    assert retained.selected_alias == "baseline"
+    assert retained.switch_outcome == "switch_suppressed_cache"
+
+
+def test_large_fitted_gain_switches_the_sticky_episode_and_is_recorded() -> None:
+    """A gain above the amortized threshold adopts the proposal and resets the episode."""
+    runtime, client = _cache_runtime(
+        prices=(
+            CandidateTokenPrice(
+                candidate_alias="baseline",
+                input_usd_per_million_tokens=0.5,
+                output_usd_per_million_tokens=1.5,
+            ),
+            CandidateTokenPrice(
+                candidate_alias="cheap",
+                input_usd_per_million_tokens=0.1,
+                output_usd_per_million_tokens=0.4,
+            ),
+        ),
+    )
+    request, prepared = _sticky_baseline_with_fresh_cheap_proposal(runtime, client)
+
+    retained = runtime._retain_prepared_selection(  # noqa: SLF001 - gateway seam
+        request,
+        episode_id="episode-cache",
+        prepared=prepared,
+    )
+    later = runtime.select(_request(), episode_id="episode-cache")
+
+    assert retained.selected_alias == "cheap"
+    assert retained.switch_outcome == "switched"
+    assert later.selected_alias == "cheap"
+    assert later.switch_outcome is None
+    assert client.embed_calls == 2
+
+
+def test_disabled_cache_switch_gate_keeps_legacy_unconditional_stickiness() -> None:
+    """An explicitly disabled gate never switches and records no outcome."""
+    runtime, client = _cache_runtime(
+        cache_switch=CacheSwitchGuard(enabled=False),
+        prices=(
+            CandidateTokenPrice(
+                candidate_alias="baseline",
+                input_usd_per_million_tokens=0.5,
+                output_usd_per_million_tokens=1.5,
+            ),
+            CandidateTokenPrice(
+                candidate_alias="cheap",
+                input_usd_per_million_tokens=0.1,
+                output_usd_per_million_tokens=0.4,
+            ),
+        ),
+    )
+    request, prepared = _sticky_baseline_with_fresh_cheap_proposal(runtime, client)
+
+    retained = runtime._retain_prepared_selection(  # noqa: SLF001 - gateway seam
+        request,
+        episode_id="episode-cache",
+        prepared=prepared,
+    )
+
+    assert retained.selected_alias == "baseline"
+    assert retained.switch_outcome is None
+    assert retained == sticky_decision(
+        runtime._episode_decisions[  # noqa: SLF001 - legacy equivalence regression
+            hashlib.sha256(b"episode-cache").hexdigest()
+        ],
+        retained.request_sha256,
+    )
 
 
 def test_artifact_mutation_and_pricing_or_alias_drift_block_activation() -> None:

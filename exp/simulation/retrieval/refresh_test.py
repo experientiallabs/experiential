@@ -220,9 +220,8 @@ def _decision(lineage_id: str, request: ModelRequest) -> RoutingDecision:
         "uncertainty": None,
         "fallback_reason": None,
     }
-    return RoutingDecision(
-        decision_id=stable_id("routing-decision", material),
-        **material,
+    return RoutingDecision.model_validate(
+        {"decision_id": stable_id("routing-decision", material), **material}
     )
 
 

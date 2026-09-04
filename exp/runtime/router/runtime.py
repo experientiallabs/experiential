@@ -45,6 +45,9 @@ from exp.runtime.router.economics import (
 )
 from exp.runtime.router.runtime_selection import PreparedSelection, retained_selection
 from exp.runtime.router.runtime_support import (
+    cache_aware_episode_decision as _cache_aware_episode_decision,
+)
+from exp.runtime.router.runtime_support import (
     candidate_completion_economics as _candidate_completion_economics,
 )
 from exp.runtime.router.runtime_support import (
@@ -430,10 +433,11 @@ class RouterRuntime:
                 self._request_embedding_dispositions[request_key] = prepared.disposition
                 return existing
             episode_decision = self._episode_decisions.get(identity_sha256)
-            selected = (
-                _sticky_decision(episode_decision, request_sha256)
-                if episode_decision is not None
-                else decision
+            selected = self._episode_selection(
+                episode_decision,
+                decision,
+                request_sha256=request_sha256,
+                feature=feature,
             )
             return self._publish_decision(
                 request=request,
@@ -821,6 +825,38 @@ class RouterRuntime:
             RoutedSpendDisposition.LOCALLY_PRICED,
         )
 
+    def _episode_selection(
+        self,
+        episode_decision: RoutingDecision | None,
+        proposed: RoutingDecision,
+        *,
+        request_sha256: Sha256,
+        feature: str,
+    ) -> RoutingDecision:
+        """Reconcile one fresh proposal against retained sticky episode state.
+
+        Args:
+            episode_decision: Retained episode decision, or ``None`` for a fresh episode.
+            proposed: Fresh guarded selection computed for this turn.
+            request_sha256: Canonical request-feature digest for this turn.
+            feature: Exact request-visible router feature for this turn.
+
+        Returns:
+            The proposal for a fresh episode, otherwise the cache-aware sticky
+            or switched decision for the retained episode alias.
+        """
+        if episode_decision is None:
+            return proposed
+        return _cache_aware_episode_decision(
+            policy=self.policy,
+            bank=self.bank,
+            episode_decision=episode_decision,
+            proposed=proposed,
+            request_sha256=request_sha256,
+            feature=feature,
+            candidate_prices=self._candidate_prices,
+        )
+
     def _publish_decision(
         self,
         *,
@@ -843,6 +879,13 @@ class RouterRuntime:
             bank=self.bank,
             resolve=self._resolve,
         )
+        if (
+            episode_decision is not None
+            and decision.selected_alias != episode_decision.selected_alias
+            and decision.switch_outcome != "switched"
+        ):
+            marked = decision.model_copy(update={"switch_outcome": "switched"})
+            decision = marked.model_copy(update={"decision_id": _decision_content_id(marked)})
         self._record(decision)
         if episode_decision is None or decision.selected_alias != episode_decision.selected_alias:
             if episode_decision is not None:

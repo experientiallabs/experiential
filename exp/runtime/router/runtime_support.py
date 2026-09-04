@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import numpy as np
 
@@ -18,7 +18,8 @@ from exp.common.models import (
 )
 from exp.common.routing import KnnRouterPolicy, RoutingDecision, router_feature_token_upper_bound
 from exp.common.routing.bank import KnnEvidenceBank
-from exp.common.routing.decision import policy_content_sha256
+from exp.common.routing.decision import fitted_quality_gain, policy_content_sha256
+from exp.common.routing.policy import SwitchOutcome
 from exp.runtime.models import ResolvedModel
 from exp.runtime.router.economics import (
     RoutedProviderComponent,
@@ -405,18 +406,124 @@ def fallback_decision(
 def sticky_decision(
     episode_decision: RoutingDecision,
     request_sha256: str,
+    *,
+    switch_outcome: SwitchOutcome | None = None,
 ) -> RoutingDecision:
     """Bind a later episode turn to the original selected alias and evidence.
 
     Args:
         episode_decision: First retained decision for the sticky episode.
         request_sha256: Canonical digest for the later turn.
+        switch_outcome: Optional record of how this turn weighed an alias switch.
+            The default clears any outcome inherited from the episode decision,
+            because the outcome describes one turn's comparison, not the episode.
 
     Returns:
         Content-addressed later-turn decision with the original selected alias.
     """
-    material = episode_decision.model_copy(update={"request_sha256": request_sha256})
+    material = episode_decision.model_copy(
+        update={"request_sha256": request_sha256, "switch_outcome": switch_outcome}
+    )
     return material.model_copy(update={"decision_id": decision_content_id(material)})
+
+
+def cache_switch_amortization_usd(
+    *,
+    prompt_token_upper_bound: int,
+    sticky_price: CandidateTokenPrice | None,
+    proposed_price: CandidateTokenPrice | None,
+) -> float | None:
+    """Price the remaining prompt-cache write amortization forfeited by a switch.
+
+    The amortization is the conservative extra input cost of rebuilding the
+    request prompt cold on the proposed alias (its cache-write rate when
+    declared, never below its ordinary input rate) instead of replaying it warm
+    on the sticky alias (its cached-read rate when declared, otherwise its
+    ordinary input rate). Frozen snapshot rates are used exactly as declared,
+    with no silent zero substitution for an absent price row.
+
+    Args:
+        prompt_token_upper_bound: Conservative request-visible token ceiling.
+        sticky_price: Frozen price row for the retained sticky alias, if any.
+        proposed_price: Frozen price row for the proposed alias, if any.
+
+    Returns:
+        Nonnegative forfeited amortization in US dollars, or ``None`` when the
+        frozen pricing snapshot lacks either candidate row.
+    """
+    if sticky_price is None or proposed_price is None:
+        return None
+    warm_rate = (
+        sticky_price.cached_input_usd_per_million_tokens
+        if sticky_price.cached_input_usd_per_million_tokens is not None
+        else sticky_price.input_usd_per_million_tokens
+    )
+    write_rate = proposed_price.cache_write_usd_per_million_tokens
+    cold_rate = max(
+        proposed_price.input_usd_per_million_tokens,
+        write_rate if write_rate is not None else proposed_price.input_usd_per_million_tokens,
+    )
+    return max(0.0, prompt_token_upper_bound * (cold_rate - warm_rate) / 1_000_000)
+
+
+def cache_aware_episode_decision(
+    *,
+    policy: KnnRouterPolicy,
+    bank: KnnEvidenceBank,
+    episode_decision: RoutingDecision,
+    proposed: RoutingDecision,
+    request_sha256: str,
+    feature: str,
+    candidate_prices: Mapping[str, CandidateTokenPrice],
+) -> RoutingDecision:
+    """Reconcile one fresh guarded proposal against a retained sticky episode alias.
+
+    A proposal that keeps the sticky alias binds to it exactly as before. A
+    proposal for a different alias switches only when the policy's cache-switch
+    gate is enabled and the fitted quality gain of the proposed alias strictly
+    exceeds the gate's exchange rate times the remaining prompt-cache write
+    amortization. Unknown fit evidence or an incomplete pricing snapshot fails
+    closed to the sticky alias, and every weighed switch records its outcome.
+
+    Args:
+        policy: Frozen router policy owning the cache-switch gate.
+        bank: Frozen fit-only evidence bank.
+        episode_decision: Retained first decision of the sticky episode.
+        proposed: Fresh guarded selection computed for this turn.
+        request_sha256: Canonical request-feature digest for this turn.
+        feature: Exact request-visible router feature for this turn.
+        candidate_prices: Frozen pricing-snapshot rows keyed by candidate alias.
+
+    Returns:
+        The sticky-bound or switched content-addressed decision for this turn.
+    """
+    if proposed.selected_alias == episode_decision.selected_alias:
+        return sticky_decision(episode_decision, request_sha256)
+    gate = policy.guard.cache_switch
+    if not gate.enabled:
+        return sticky_decision(episode_decision, request_sha256)
+    gain = fitted_quality_gain(
+        bank,
+        incumbent_alias=episode_decision.selected_alias,
+        challenger_alias=proposed.selected_alias,
+    )
+    amortization = cache_switch_amortization_usd(
+        prompt_token_upper_bound=router_feature_token_upper_bound(feature),
+        sticky_price=candidate_prices.get(episode_decision.selected_alias),
+        proposed_price=candidate_prices.get(proposed.selected_alias),
+    )
+    if (
+        gain is not None
+        and amortization is not None
+        and gain > gate.switch_gain_per_amortized_usd * amortization
+    ):
+        switched = proposed.model_copy(update={"switch_outcome": "switched"})
+        return switched.model_copy(update={"decision_id": decision_content_id(switched)})
+    return sticky_decision(
+        episode_decision,
+        request_sha256,
+        switch_outcome="switch_suppressed_cache",
+    )
 
 
 def sealed_bank(bank: KnnEvidenceBank) -> KnnEvidenceBank:
