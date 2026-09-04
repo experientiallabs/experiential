@@ -690,6 +690,21 @@ def route_generation_parameter_requests(
                 param="thinking.type",
                 code="unsupported_parameter",
             )
+        elif config_type == "adaptive" and not any(
+            _profile_reasoning_efforts(profile) for profile in profiles
+        ):
+            # A model with no reasoning ladder rejects the adaptive object by
+            # name after dispatch, so the route refuses it before dispatch and
+            # admission's disclosed coercion drops it instead.
+            raise ProviderParameterError(
+                message=(
+                    "The parameter 'thinking.type' cannot be 'adaptive' on this model: "
+                    "it supports no reasoning effort. Remove the thinking field or choose "
+                    "a reasoning model."
+                ),
+                param="thinking.type",
+                code="unsupported_parameter",
+            )
     server_tools_present = bool(request.provider_server_tools) or any(
         message.provider_anthropic_block is not None for message in request.messages
     )

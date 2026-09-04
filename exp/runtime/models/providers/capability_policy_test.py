@@ -164,6 +164,63 @@ def test_effort_drop_takes_adaptive_thinking_with_it_but_keeps_a_budget() -> Non
     assert coercion.disclosures == ("reasoning_effort",)
 
 
+def test_adaptive_thinking_drops_on_a_zero_reasoning_route_without_an_effort() -> None:
+    """Adaptive thinking alone (no effort beside it) still drops, disclosed.
+
+    Claude Code pins ``thinking: {type: adaptive}`` on every request but sends
+    an effort only when one is configured; the provider rejects the adaptive
+    object by name on a non-reasoning model either way (verified live on
+    claude-haiku-4-5, 2026-09-04). A clear-thinking context edit rides on the
+    thinking config and goes with it, while other edits stay verbatim.
+    """
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    adaptive_only = _request().model_copy(
+        update={
+            "surface": GatewayApiSurface.MESSAGES,
+            "provider_thinking_config": {"type": "adaptive"},
+            "context_management": {
+                "edits": [
+                    {"type": "clear_thinking_20251015", "keep": "all"},
+                    {"type": "clear_tool_uses_20250919"},
+                ]
+            },
+        }
+    )
+    coercion = coerce_generation_parameters((anthropic,), adaptive_only)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort is None
+    assert coercion.request.provider_thinking_config is None
+    assert coercion.request.context_management == {"edits": [{"type": "clear_tool_uses_20250919"}]}
+    assert coercion.disclosures == ("thinking",)
+
+    only_clear_thinking = adaptive_only.model_copy(
+        update={"context_management": {"edits": [{"type": "clear_thinking_20251015"}]}}
+    )
+    coercion = coerce_generation_parameters((anthropic,), only_clear_thinking)
+    assert coercion is not None
+    assert coercion.request.context_management is None
+
+    # A budgeted config on its own is honored by the model and is not coerced.
+    budgeted_only = adaptive_only.model_copy(
+        update={
+            "provider_thinking_config": {"type": "enabled", "budget_tokens": 1024},
+            "context_management": None,
+        }
+    )
+    assert coerce_generation_parameters((anthropic,), budgeted_only) is None
+
+    # A reasoning route keeps the adaptive object: nothing to coerce.
+    reasoning = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-sonnet-4-6",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+    )
+    bare_adaptive = adaptive_only.model_copy(update={"context_management": None})
+    assert coerce_generation_parameters((reasoning,), bare_adaptive) is None
+
+
 def test_portable_effort_is_never_snapped() -> None:
     """A failure elsewhere must not trigger an effort substitution."""
     coercion = coerce_generation_parameters(

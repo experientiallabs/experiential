@@ -2204,6 +2204,34 @@ def test_disabled_thinking_rejects_by_name_on_adaptive_only_models() -> None:
     assert provider.provider_thinking_config == {"type": "disabled"}
 
 
+def test_adaptive_thinking_rejects_by_name_on_a_zero_reasoning_route() -> None:
+    """A model with no reasoning ladder rejects the adaptive object after
+    dispatch (verified live on claude-haiku-4-5), so the route refuses it before
+    dispatch, which lets admission drop it with disclosure instead."""
+    request = _thinking_config_request({"type": "adaptive"})
+    haiku = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-haiku-4-5",
+    )
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests((haiku,), request)
+    assert raised.value.param == "thinking.type"
+    assert raised.value.code == "unsupported_parameter"
+
+    # The budgeted form is honored by the same model and forwards verbatim.
+    _public, provider = route_generation_parameter_requests(
+        (haiku,), _thinking_config_request({"type": "enabled", "budget_tokens": 1024})
+    )
+    assert provider.provider_thinking_config == {"type": "enabled", "budget_tokens": 1024}
+
+    # A reasoning route forwards the adaptive object.
+    _public, provider = route_generation_parameter_requests(
+        (_anthropic_profile("claude-sonnet-4-6"),), request
+    )
+    assert provider.provider_thinking_config == {"type": "adaptive"}
+
+
 def test_tool_call_cache_hint_forwards_to_anthropic_and_discloses_elsewhere() -> None:
     """The validated cache hint reaches only the tool_use block that can honor it."""
     from exp.common.core.artifacts import sha256_json

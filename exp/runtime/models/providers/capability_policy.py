@@ -110,14 +110,20 @@ def coerce_generation_parameters(
         if admits is not None and not admits(disabled_thinking.request):
             return None
         return disabled_thinking
-    if request.reasoning_effort is None:
-        return None
     ladder: set[str] = set()
     for profile in profiles:
         ladder.update(profile_reasoning_efforts(profile))
+    adaptive_thinking = (
+        request.provider_thinking_config is not None
+        and request.provider_thinking_config.get("type") == "adaptive"
+    )
+    if request.reasoning_effort is None and not (adaptive_thinking and not ladder):
+        return None
     if not ladder:
         updates: dict[str, object] = {"reasoning_effort": None}
-        disclosures: tuple[str, ...] = (EFFORT_DROP_DISCLOSURE,)
+        disclosures: tuple[str, ...] = (
+            (EFFORT_DROP_DISCLOSURE,) if request.reasoning_effort is not None else ()
+        )
         if request.provider_output_config is not None:
             # The Messages surface carries the same effort verbatim inside
             # output_config; a dropped effort must not reach the provider
@@ -128,22 +134,26 @@ def coerce_generation_parameters(
                 if key != "effort"
             }
             updates["provider_output_config"] = remaining or None
-        if (
-            request.provider_thinking_config is not None
-            and request.provider_thinking_config.get("type") == "adaptive"
-        ):
+        if adaptive_thinking:
             # Adaptive thinking is the effort's own channel on the Messages
             # surface (the model picks its depth from output_config.effort),
             # so a route with no reasoning rung cannot honor it either and
-            # the provider rejects it by name. A budgeted config is left
-            # verbatim: its semantics do not depend on an effort level.
+            # the provider rejects it by name, with or without an effort
+            # beside it. A budgeted config is left verbatim: its semantics do
+            # not depend on an effort level.
             updates["provider_thinking_config"] = None
-            disclosures = (EFFORT_DROP_DISCLOSURE, THINKING_DROP_DISCLOSURE)
+            disclosures = (*disclosures, THINKING_DROP_DISCLOSURE)
+            if request.context_management is not None:
+                # A clear_thinking context edit requires thinking to be on;
+                # the provider rejects it by name once the config is gone.
+                updates["context_management"] = _without_clear_thinking_edits(
+                    request.context_management
+                )
         dropped_request = request.model_copy(update=updates)
         if admits is not None and not admits(dropped_request):
             return None
         return RequestCoercion(request=dropped_request, disclosures=disclosures)
-    if request.reasoning_effort in ladder:
+    if request.reasoning_effort is None or request.reasoning_effort in ladder:
         # The effort itself is portable; the verbatim failure lies elsewhere
         # and a snap would change semantics for nothing.
         return None
@@ -172,6 +182,32 @@ def coerce_generation_parameters(
             disclosures=(f"reasoning_effort->{candidate}",),
         )
     return None
+
+
+def _without_clear_thinking_edits(context_management: JsonObject) -> JsonObject | None:
+    """Return the context-management object without ``clear_thinking_*`` edits.
+
+    Args:
+        context_management: Verbatim caller ``context_management`` object.
+
+    Returns:
+        The same object minus clear-thinking edits, or ``None`` when no edit
+        survives so the field is omitted entirely.
+    """
+    edits = context_management.get("edits")
+    if not isinstance(edits, list):
+        return context_management
+    retained = [
+        edit
+        for edit in edits
+        if not (isinstance(edit, dict) and str(edit.get("type", "")).startswith("clear_thinking"))
+    ]
+    if len(retained) == len(edits):
+        return context_management
+    if not retained:
+        remaining = {key: value for key, value in context_management.items() if key != "edits"}
+        return remaining or None
+    return {**context_management, "edits": retained}
 
 
 def _coerce_disabled_thinking(
