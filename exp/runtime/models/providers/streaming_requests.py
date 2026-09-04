@@ -44,8 +44,6 @@ from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
     anthropic_adaptive_only_thinking,
     anthropic_budgeted_enabled_only,
-    efforts_by_nearness,
-    thinking_config_reasoning_effort,
 )
 
 if TYPE_CHECKING:
@@ -781,40 +779,20 @@ def route_generation_parameter_requests(
         )
     if request.provider_thinking_config is not None and non_anthropic_route:
         # A thinking CONFIG (unlike replayed thinking blocks) has a serviceable
-        # cross-wire reading, and Claude Code pins one on every model, so a
-        # named rejection here makes whole sessions unusable against models
-        # the provider itself serves fine. An explicit caller effort is the
-        # same reasoning channel already stated in the route's own vocabulary,
-        # so it wins verbatim and the config drops with one disclosure.
-        # Otherwise the budget translates to the nearest effort the route
-        # supports (the table in ``thinking_config_reasoning_effort``),
-        # disclosed as a translation; a route with no reasoning rung drops the
-        # config with disclosure instead (the #717 pattern).
-        if request.reasoning_effort is not None:
-            ignore("provider_thinking_config", "thinking")
-        else:
-            portable_thinking_efforts = set(REASONING_EFFORTS)
-            for profile in profiles:
-                portable_thinking_efforts.intersection_update(_profile_reasoning_efforts(profile))
-            requested_tier = thinking_config_reasoning_effort(request.provider_thinking_config)
-            if requested_tier != "none":
-                # An active thinking config asked for reasoning; snapping it
-                # to 'none' would silently disable reasoning while calling it
-                # a translation, so a route whose only level is 'none' takes
-                # the disclosed drop below instead.
-                portable_thinking_efforts.discard("none")
-            translated = next(
-                iter(efforts_by_nearness(requested_tier, portable_thinking_efforts)),
-                None,
-            )
-            if translated is not None:
-                provider_updates["provider_thinking_config"] = None
-                provider_updates["reasoning_effort"] = translated
-                path = f"thinking->reasoning_effort:{translated}"
-                if path not in ignored:
-                    ignored.append(path)
-            else:
-                ignore("provider_thinking_config", "thinking")
+        # cross-wire reading. The named rejection here is what lets the admit
+        # loop offer the disclosed thinking->reasoning_effort translation (or
+        # the disclosed drop) in ``coerce_thinking_config``: the substitution
+        # is semantic, so it lives in the coercion layer, where it runs only
+        # after every rung declined verbatim and never steals narrowing
+        # preference from an Anthropic rung that could honor the config.
+        raise ProviderParameterError(
+            message=(
+                "The parameter 'thinking' is not supported by this model route. "
+                "Remove the field or choose a native Anthropic-only route."
+            ),
+            param="thinking",
+            code="unsupported_parameter",
+        )
     if request.provider_thinking_config is not None and not non_anthropic_route:
         # The adaptive-thinking generation rejects caller enabled/disabled
         # configs outright, so verbatim forwarding is family-gated (a route

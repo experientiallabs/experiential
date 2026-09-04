@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.model import ReasoningEffort
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -476,8 +477,13 @@ def test_disabled_thinking_drops_only_on_adaptive_only_anthropic_routes() -> Non
 
     # A rung that honors ``disabled`` verbatim leaves the config alone.
     assert coerce_generation_parameters((budgeted, shim), request) is None
-    # No Anthropic rung at all: nothing to translate onto.
-    assert coerce_generation_parameters((shim,), request) is None
+    # No Anthropic rung at all: the thinking coercion serves the config as a
+    # disclosed drop (a disabled config on a non-reasoning route asks for
+    # exactly what the route already does).
+    shim_only = coerce_generation_parameters((shim,), request)
+    assert shim_only is not None
+    assert "thinking" in shim_only.disclosures
+    assert shim_only.request.provider_thinking_config is None
     # Only a disabled config is coercible; other types keep their own path.
     assert (
         coerce_generation_parameters(
@@ -729,3 +735,138 @@ def test_top_level_user_images_keep_the_fail_closed_contract() -> None:
         )
         is None
     )
+
+
+def _openai_reasoning_profile(
+    efforts: tuple[ReasoningEffort, ...] = ("none", "low", "medium", "high"),
+) -> GatewayWireProfile:
+    """Build one OpenAI Responses reasoning profile with an explicit ladder."""
+    return GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://api.openai.com/v1/responses",
+        model_id="gpt-5.6-sol",
+        supports_reasoning=True,
+        reasoning_wire_format="openai_responses",
+        supported_reasoning_efforts=efforts,
+    )
+
+
+def test_a_thinking_config_translates_to_an_effort_on_an_openai_route() -> None:
+    """The Anthropic thinking channel maps onto the route's effort ladder.
+
+    Claude Code pins a thinking config on every model, so the shaping-level
+    rejection would make whole sessions unusable against OpenAI reasoning
+    models; the coercion translates the budget per the documented tier table
+    with a translation disclosure, and the coerced request then serves
+    through the normal shaping and payload path.
+    """
+    from exp.runtime.models.providers.streaming_requests import (
+        dialect_stream_payload,
+        route_generation_parameter_requests,
+    )
+
+    for thinking, expected in (
+        ({"type": "enabled", "budget_tokens": 2048}, "low"),
+        ({"type": "enabled", "budget_tokens": 8192}, "medium"),
+        ({"type": "enabled", "budget_tokens": 32000}, "high"),
+        ({"type": "adaptive"}, "medium"),
+        ({"type": "disabled"}, "none"),
+    ):
+        profile = _openai_reasoning_profile()
+        coercion = coerce_generation_parameters(
+            (profile,), _messages_request(provider_thinking_config=thinking)
+        )
+        assert coercion is not None, thinking
+        assert coercion.disclosures == (f"thinking->reasoning_effort:{expected}",)
+        assert coercion.request.provider_thinking_config is None
+        assert coercion.request.reasoning_effort == expected
+
+        _public, provider = route_generation_parameter_requests((profile,), coercion.request)
+        payload = dialect_stream_payload(profile, provider)
+        assert payload["reasoning"] == {"effort": expected}
+        assert "thinking" not in payload
+
+
+def test_an_explicit_effort_beside_a_thinking_config_wins_verbatim() -> None:
+    """The caller's own effort is the same channel already in route vocabulary.
+
+    The budget is not translated on top of it: the config drops with exactly
+    one disclosure and the stated effort forwards unchanged.
+    """
+    coercion = coerce_generation_parameters(
+        (_openai_reasoning_profile(),),
+        _messages_request(
+            provider_thinking_config={"type": "enabled", "budget_tokens": 32000},
+            reasoning_effort="low",
+        ),
+    )
+
+    assert coercion is not None
+    assert coercion.disclosures == ("thinking",)
+    assert coercion.request.provider_thinking_config is None
+    assert coercion.request.reasoning_effort == "low"
+
+
+def test_a_thinking_config_drops_with_disclosure_on_a_non_reasoning_route() -> None:
+    """A route with no reasoning rung cannot honor any depth, so every
+    reasoning signal drops with disclosure instead of a named 400."""
+    coercion = coerce_generation_parameters(
+        (GatewayWireProfile(dialect="openai_compatible", url="https://plain.test"),),
+        _messages_request(provider_thinking_config={"type": "enabled", "budget_tokens": 2048}),
+    )
+
+    assert coercion is not None
+    assert "thinking" in coercion.disclosures
+    assert coercion.request.provider_thinking_config is None
+    assert coercion.request.reasoning_effort is None
+
+
+def test_an_active_thinking_config_never_snaps_to_none() -> None:
+    """A route whose only effort level is 'none' takes the disclosed drop:
+    snapping an active config to 'none' would silently disable reasoning
+    while calling it a translation."""
+    coercion = coerce_generation_parameters(
+        (_openai_reasoning_profile(efforts=("none",)),),
+        _messages_request(provider_thinking_config={"type": "enabled", "budget_tokens": 2048}),
+    )
+
+    assert coercion is not None
+    assert "thinking" in coercion.disclosures
+    assert coercion.request.reasoning_effort is None
+
+
+def test_the_thinking_coercion_leaves_anthropic_bearing_routes_alone() -> None:
+    """A route with any Anthropic rung keeps its verbatim-service preference:
+    narrowing already picks the rung that honors the config, so the coercion
+    declines rather than trading real thinking for a translation. Replayed
+    thinking blocks also decline it (no translation can carry signed provider
+    state, and the gateway never fabricates unsigned blocks)."""
+    mixed = (
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://anthropic.test",
+            supports_reasoning=True,
+            reasoning_wire_format="anthropic_adaptive",
+        ),
+        _openai_reasoning_profile(),
+    )
+    assert (
+        coerce_generation_parameters(
+            mixed,
+            _messages_request(provider_thinking_config={"type": "enabled", "budget_tokens": 2048}),
+        )
+        is None
+    )
+
+    with_blocks = _messages_request(
+        provider_thinking_config={"type": "enabled", "budget_tokens": 2048},
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="assistant",
+                content="prior",
+                provider_reasoning=(ThinkingBlock(text="deep", signature="sig=="),),
+            ),
+        ),
+    )
+    assert coerce_generation_parameters((_openai_reasoning_profile(),), with_blocks) is None

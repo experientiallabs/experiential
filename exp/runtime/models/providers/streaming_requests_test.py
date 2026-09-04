@@ -2074,10 +2074,13 @@ def test_anthropic_payload_replays_thinking_blocks_first_and_verbatim() -> None:
     assert assistant_blocks[2] == {"type": "text", "text": "done"}
 
 
-def test_route_translates_a_thinking_config_but_rejects_replayed_blocks() -> None:
-    """History thinking blocks replay only on the Anthropic wire; a live
-    thinking CONFIG has a serviceable cross-wire reading and drops or
-    translates with disclosure instead of rejecting."""
+def test_route_shaping_rejects_thinking_by_name_so_admission_can_coerce() -> None:
+    """History thinking blocks and a live config both reject at SHAPING on a
+    non-Anthropic route: blocks are signed provider state no translation can
+    carry, and the config's named rejection is what lets the admit loop offer
+    the disclosed thinking->reasoning_effort coercion without stealing
+    narrowing preference from an Anthropic rung (coverage for the coercion
+    itself lives in capability_policy_test)."""
     anthropic = GatewayWireProfile(
         dialect="anthropic_messages",
         url="https://anthropic.test",
@@ -2085,23 +2088,20 @@ def test_route_translates_a_thinking_config_but_rejects_replayed_blocks() -> Non
     )
     fallback = GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test")
 
-    history_request = _thinking_history_request()
-    route_generation_parameter_requests((anthropic,), history_request)
-    with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests((anthropic, fallback), history_request)
-    assert raised.value.param == "thinking"
-    assert raised.value.code == "unsupported_parameter"
-
-    config_request = _chat_request().model_copy(
-        update={
-            "surface": GatewayApiSurface.MESSAGES,
-            "provider_thinking_config": {"type": "enabled", "budget_tokens": 1024},
-        }
-    )
-    route_generation_parameter_requests((anthropic,), config_request)
-    public, provider = route_generation_parameter_requests((anthropic, fallback), config_request)
-    assert provider.provider_thinking_config is None
-    assert "thinking" in public.ignored_parameters
+    for request in (
+        _thinking_history_request(),
+        _chat_request().model_copy(
+            update={
+                "surface": GatewayApiSurface.MESSAGES,
+                "provider_thinking_config": {"type": "enabled", "budget_tokens": 1024},
+            }
+        ),
+    ):
+        route_generation_parameter_requests((anthropic,), request)
+        with pytest.raises(ProviderParameterError) as raised:
+            route_generation_parameter_requests((anthropic, fallback), request)
+        assert raised.value.param == "thinking"
+        assert raised.value.code == "unsupported_parameter"
 
 
 def _encrypted_reasoning_request() -> GatewayRequest:
@@ -3731,75 +3731,6 @@ def _messages_request(
         maximum_output_tokens=maximum_output_tokens,
         stream=True,
     )
-
-
-@pytest.mark.parametrize(
-    ("thinking", "expected"),
-    (
-        ({"type": "enabled", "budget_tokens": 2048}, "low"),
-        ({"type": "enabled", "budget_tokens": 8192}, "medium"),
-        ({"type": "enabled", "budget_tokens": 32000}, "high"),
-        ({"type": "adaptive"}, "medium"),
-        ({"type": "disabled"}, "none"),
-    ),
-)
-def test_a_thinking_config_translates_to_an_effort_on_an_openai_route(
-    thinking: JsonObject,
-    expected: str,
-) -> None:
-    """The Anthropic thinking channel maps onto the route's effort ladder.
-
-    Claude Code pins a thinking config on every model, so a named rejection
-    here makes whole sessions unusable against OpenAI reasoning models the
-    provider itself serves fine; the budget translates to the documented
-    tier table with a disclosed translation note.
-    """
-    profile = _openai_reasoning_profile()
-    public, provider = route_generation_parameter_requests(
-        (profile,), _messages_request(thinking=thinking)
-    )
-
-    assert provider.provider_thinking_config is None
-    assert provider.reasoning_effort == expected
-    assert f"thinking->reasoning_effort:{expected}" in public.ignored_parameters
-    payload = dialect_stream_payload(profile, provider)
-    assert payload["reasoning"] == {"effort": expected}
-
-
-def test_an_explicit_effort_beside_a_thinking_config_wins_verbatim() -> None:
-    """The caller's own effort is the same channel already in route vocabulary.
-
-    The budget is not translated on top of it: the config drops with exactly
-    one disclosure and the stated effort forwards unchanged.
-    """
-    public, provider = route_generation_parameter_requests(
-        (_openai_reasoning_profile(),),
-        _messages_request(
-            thinking={"type": "enabled", "budget_tokens": 32000},
-            reasoning_effort="low",
-        ),
-    )
-
-    assert provider.provider_thinking_config is None
-    assert provider.reasoning_effort == "low"
-    assert public.ignored_parameters == ("thinking",)
-
-
-def test_a_thinking_config_drops_with_disclosure_on_a_non_reasoning_route() -> None:
-    """A route with no reasoning rung cannot honor any depth, so the config
-    drops with disclosure instead of the previous named 400."""
-    profile = GatewayWireProfile(
-        dialect="openai_compatible",
-        url="https://api.example.test/v1/chat/completions",
-        model_id="plain-chat",
-    )
-    public, provider = route_generation_parameter_requests(
-        (profile,), _messages_request(thinking={"type": "enabled", "budget_tokens": 2048})
-    )
-
-    assert provider.provider_thinking_config is None
-    assert provider.reasoning_effort is None
-    assert "thinking" in public.ignored_parameters
 
 
 def test_replayed_thinking_blocks_still_reject_on_a_non_anthropic_route() -> None:

@@ -1160,9 +1160,10 @@ def test_messages_stream_zero_output_keeps_real_input_tokens(
 def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
     engine: _ServingEngine,
 ) -> None:
-    """Thinking config and history need an Anthropic-only route; the seeded
-    OpenAI-compatible route rejects both in the Anthropic envelope with no
-    upstream dispatch."""
+    """Replayed thinking HISTORY needs an Anthropic-only route and rejects
+    with no upstream dispatch; a live thinking CONFIG instead serves through
+    the admission coercion (dropped with disclosure on this non-reasoning
+    OpenAI-compatible route) because Claude Code pins one on every model."""
     with _SseUpstream.payloads_lock:
         dispatched_before = len(_SseUpstream.payloads)
 
@@ -1170,14 +1171,17 @@ def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
         f"{engine.base}/v1/messages",
         headers={"x-api-key": engine.raw_key},
         json={
-            **_messages_body("must-not-dispatch"),
+            **_messages_body("thinking-config-serves"),
             "thinking": {"type": "enabled", "budget_tokens": 2048},
         },
         timeout=10.0,
     )
-    assert config.status_code == 400
-    assert config.json()["error"]["type"] == "invalid_request_error"
-    assert "thinking" in config.json()["error"]["message"]
+    assert config.status_code == 200
+    with _SseUpstream.payloads_lock:
+        dispatched_config = _SseUpstream.payloads[dispatched_before:]
+        dispatched_before = len(_SseUpstream.payloads)
+    assert len(dispatched_config) == 1
+    assert "thinking" not in dispatched_config[0]
 
     history = httpx.post(
         f"{engine.base}/v1/messages",

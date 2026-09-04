@@ -1564,10 +1564,15 @@ def _openai_reasoning_profile() -> GatewayWireProfile:
 def test_a_claude_code_thinking_request_serves_on_an_openai_route() -> None:
     """The Messages thinking channel translates end to end, disclosed.
 
-    Driven through the real /v1/messages decode surface: the same body that
-    previously answered "The parameter 'thinking' is not supported by this
-    model route" now reaches the OpenAI payload as a reasoning effort.
+    Driven through the real /v1/messages decode surface and the admission
+    sequence: route shaping still rejects the config by name, the coercion
+    layer translates it, and the coerced request reaches the OpenAI payload
+    as a reasoning effort.
     """
+    import pytest as _pytest
+
+    from exp.runtime.models.providers.capability_policy import coerce_generation_parameters
+    from exp.runtime.models.providers.errors import ProviderParameterError
     from exp.runtime.models.providers.streaming_requests import (
         dialect_stream_payload,
         route_generation_parameter_requests,
@@ -1580,9 +1585,13 @@ def test_a_claude_code_thinking_request_serves_on_an_openai_route() -> None:
         )
     )
     profile = _openai_reasoning_profile()
-    public, provider = route_generation_parameter_requests((profile,), decoded.request)
+    with _pytest.raises(ProviderParameterError, match="thinking"):
+        route_generation_parameter_requests((profile,), decoded.request)
 
-    assert "thinking->reasoning_effort:medium" in public.ignored_parameters
+    coercion = coerce_generation_parameters((profile,), decoded.request)
+    assert coercion is not None
+    assert coercion.disclosures == ("thinking->reasoning_effort:medium",)
+    _public, provider = route_generation_parameter_requests((profile,), coercion.request)
     payload = dialect_stream_payload(profile, provider)
     assert payload["reasoning"] == {"effort": "medium"}
     assert "thinking" not in payload
