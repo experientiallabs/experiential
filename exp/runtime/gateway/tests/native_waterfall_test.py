@@ -660,9 +660,10 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
     )
     assert response.status_code == 200
     report = httpx.get(f"{engine.base}/usage.json", timeout=5.0).json()
-    # Seven scenario requests, the output-less continuation scenario's four
-    # (two first turns and their two continuations), and this probe.
-    assert report["totals"]["requests"] == 12
+    # Seven scenario requests, the integer-timestamp scenario's two, the
+    # output-less continuation scenario's four (two first turns and their two
+    # continuations), and this probe.
+    assert report["totals"]["requests"] == 14
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
     with sqlite3.connect(engine.database_path) as connection:
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
@@ -670,6 +671,6 @@ def test_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> None
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"
         ).fetchone()
     assert open_attempts == 0
-    # Twelve single-dispatch requests plus the four extra physical attempts the
-    # redial and failover scenarios spend.
-    assert terminal_attempts == total_attempts == 16
+    # Fourteen single-dispatch requests plus the four extra physical attempts
+    # the redial and failover scenarios spend.
+    assert terminal_attempts == total_attempts == 18

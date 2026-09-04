@@ -927,7 +927,7 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
         native.completed_responses_fixture(
             "request-official",
             "gpt-5.6-sol",
-            1_700_000_000.0,
+            1_700_000_000,
             "{}",
             events_json,
         )
@@ -952,7 +952,7 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
     frames = native.encode_responses_fixture(
         "request-official",
         "gpt-5.6-sol",
-        1_700_000_000.0,
+        1_700_000_000,
         "{}",
         events_json,
     )
