@@ -57,8 +57,11 @@ def test_maintained_sampling_pins_flow_into_resolved_capabilities() -> None:
     assert not pinned.capabilities.supports_temperature
     assert pinned.capabilities.supports_reasoning
     assert pinned.capabilities.reasoning_effort == "medium"
+    # haiku is budgeted-enabled reasoning: it reasons and keeps ordinary
+    # sampling (no temperature pin), but carries no effort-ladder pin of its
+    # own beyond the shared default.
     assert unpinned.capabilities.supports_temperature
-    assert unpinned.capabilities.reasoning_effort is None
+    assert unpinned.capabilities.supports_reasoning
 
 
 def test_unknown_model_keeps_every_capability_and_price_unknown() -> None:
@@ -144,9 +147,7 @@ def test_catalog_request_shaping_capability_reaches_openai_runtime_metadata() ->
 def test_reasoning_capable_models_resolve_with_the_default_medium_pin() -> None:
     """Models proven to accept reasoning effort default to medium; others stay unpinned."""
     reasoning = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-5.6-luna"))
-    plain = resolve_discovered_model(
-        DiscoveredModel(provider="anthropic", model="claude-haiku-4-5")
-    )
+    plain = resolve_discovered_model(DiscoveredModel(provider="openai", model="gpt-4o"))
     embedding = resolve_discovered_model(
         DiscoveredModel(provider="openai", model="text-embedding-3-small")
     )

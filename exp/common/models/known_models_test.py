@@ -330,6 +330,14 @@ def test_anthropic_point_releases_inherit_generation_controls_never_prices() -> 
     # Real two-segment model ids never fall through to a bogus generation.
     haiku = known_model_metadata("anthropic", "claude-haiku-4-5")
     assert haiku is not None and haiku.input_cost_per_million_tokens_usd == 1.0
+    # Budgeted-enabled reasoning: haiku reasons (its thinking config is
+    # honored) without the adaptive effort ladder, and it keeps ordinary
+    # sampling behind the srn hatch rather than a temperature pin.
+    assert haiku.supports_reasoning is True
+    assert haiku.supports_reasoning_effort is False
+    assert haiku.sampling_requires_reasoning_none is True
+    assert haiku.supports_temperature is True
+    assert haiku.supports_top_k is True
 
 
 # The exact /v1/models listing served to a plain key, captured 2026-09-01
