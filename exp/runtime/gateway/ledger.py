@@ -491,7 +491,9 @@ class SQLiteAttemptLedger:
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
         """
-        state, normalized_failure, usage = _terminal_values(terminal_event, failure)
+        state, normalized_failure, failure_message, usage = _terminal_values(
+            terminal_event, failure
+        )
         row = connection.execute(
             """
             SELECT request_id, state, input_rate, cached_input_rate,
@@ -538,6 +540,7 @@ class SQLiteAttemptLedger:
             """
             UPDATE gateway_attempts
             SET state = ?, terminal_at = ?, first_token_at = ?, failure_class = ?,
+                failure_message = ?,
                 input_tokens = ?, cached_input_tokens = ?, output_tokens = ?,
                 reasoning_tokens = ?, usage_source = ?, estimated_cost_micro_usd = ?,
                 budget_settled_micro_usd = ?
@@ -548,6 +551,7 @@ class SQLiteAttemptLedger:
                 terminal_at,
                 None if first_token_at is None else utc_text(first_token_at),
                 normalized_failure,
+                failure_message,
                 None if usage is None else usage.input_tokens,
                 None if usage is None else usage.cached_input_tokens,
                 None if usage is None else usage.output_tokens,
@@ -601,8 +605,8 @@ class SQLiteAttemptLedger:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
         """
-        state, normalized_failure, _ = _terminal_values(None, failure)
-        del normalized_failure
+        state, normalized_failure, _failure_message, _ = _terminal_values(None, failure)
+        del normalized_failure, _failure_message
         row = connection.execute(
             """
             SELECT organization_id, terminal_state FROM gateway_requests
@@ -935,8 +939,13 @@ class SQLiteAttemptLedger:
 def _terminal_values(
     terminal_event: GatewayEvent | None,
     failure: GatewayFailure | None,
-) -> tuple[str, str | None, GatewayUsage | None]:
-    """Normalize one finish call to state, safe failure class, and usage."""
+) -> tuple[str, str | None, str | None, GatewayUsage | None]:
+    """Normalize one finish call to state, failure class, message, and usage.
+
+    The failure message is the provider's own sanitized explanation
+    (``provider_detail``); it is present only for a client-error rejection and
+    is the same bounded, credential-free sentence the caller already receives.
+    """
     event_failure = None if terminal_event is None else terminal_event.failure
     normalized = failure or event_failure
     if terminal_event is None and normalized is None:
@@ -954,10 +963,11 @@ def _terminal_values(
         return (
             state,
             normalized.failure_class.value,
+            normalized.provider_detail,
             (None if terminal_event is None else terminal_event.usage),
         )
     assert terminal_event is not None
-    return terminal_event.kind.value, None, terminal_event.usage
+    return terminal_event.kind.value, None, None, terminal_event.usage
 
 
 def _estimated_cost(
