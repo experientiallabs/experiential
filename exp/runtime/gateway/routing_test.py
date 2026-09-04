@@ -1,9 +1,11 @@
-"""Tests for catalog-backed public alias metadata lookup."""
+"""Tests for catalog-backed public alias metadata lookup and route construction."""
 
 from __future__ import annotations
 
+import time
 import unittest.mock
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 
@@ -19,6 +21,15 @@ from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
 )
 from exp.common.models.model import ModelCapabilities
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+    ProjectSelection,
+    ProjectTarget,
+)
+from exp.runtime.gateway.interfaces import ProjectTargetResolver
 from exp.runtime.gateway.routing import CatalogRouteResolver
 
 _REVISION = "revision-one"
@@ -232,6 +243,75 @@ def test_published_metadata_stays_closed_when_the_revision_has_no_direct_pool() 
         )
         is None
     )
+
+
+def test_project_route_threads_the_learned_selection_switch_outcome() -> None:
+    """A recorded sticky-switch outcome survives from selection into the built route."""
+    deployment = _deployment(deployment_id="deployment-one", source_alias="candidate-cheap")
+    catalog, digest = _catalog(
+        (deployment,),
+        (
+            ExactModelPool(
+                pool_id="pool-one",
+                exact_model_id="exact-one",
+                deployment_ids=("deployment-one",),
+            ),
+        ),
+    )
+    target = ProjectTarget(
+        project_ref="project-one",
+        activation_ref="activation-one",
+        catalog_sha256=digest,
+    )
+
+    class _StubProjectResolver:
+        """Selection-only stub returning one suppressed sticky-switch outcome."""
+
+        def select_blocking(
+            self,
+            *,
+            target: ProjectTarget,
+            request: GatewayRequest,
+            episode_namespace: tuple[str, str, str, str],
+            deadline_monotonic: float,
+        ) -> ProjectSelection:
+            """Return one frozen selection carrying a suppressed switch outcome."""
+            del request, episode_namespace, deadline_monotonic
+            return ProjectSelection(
+                exact_model_id="exact-one",
+                selected_alias="candidate-cheap",
+                activation_ref=target.activation_ref,
+                switch_outcome="switch_suppressed_cache",
+            )
+
+    resolver = CatalogRouteResolver(
+        {(_REVISION, digest): catalog},
+        project_resolver=cast(ProjectTargetResolver, _StubProjectResolver()),
+    )
+    route = resolver.resolve_project_blocking(
+        authorization=AuthorizationSnapshot(
+            request_id="request-one",
+            organization_id="org-one",
+            identity_id="identity-one",
+            virtual_key_id="key-one",
+            alias="coding",
+            alias_revision_id=_REVISION,
+            target=target,
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            catalog_sha256=digest,
+            canonical_request_sha256="e" * 64,
+            deadline_monotonic=time.monotonic() + 5,
+        ),
+        request=GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="route"),),
+        ),
+        episode_namespace=("org-one", "identity-one", _REVISION, "episode-one"),
+    )
+
+    assert route.route_reason == "learned_router"
+    assert route.switch_outcome == "switch_suppressed_cache"
+    assert route.deployment.deployment_id == "deployment-one"
 
 
 def _single_pool_catalog() -> NormalizedGatewayCatalog:

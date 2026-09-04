@@ -107,10 +107,11 @@ def retained_selection(
                     disposition=runtime._request_embedding_dispositions[request_key],  # noqa: SLF001
                 )
             episode_decision = runtime._episode_decisions.get(identity_sha256)  # noqa: SLF001
-            decision = (
-                sticky_decision(episode_decision, request_sha256)
-                if episode_decision is not None
-                else proposed
+            decision = runtime._episode_selection(  # noqa: SLF001
+                episode_decision,
+                proposed,
+                request_sha256=request_sha256,
+                feature=feature,
             )
             published = runtime._publish_decision(  # noqa: SLF001
                 request=request,

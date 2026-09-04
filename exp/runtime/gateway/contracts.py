@@ -23,6 +23,7 @@ from exp.common.models.gateway_catalog import (
     FailoverMode,
 )
 from exp.common.models.model import ReasoningEffort, ToolCall
+from exp.common.routing.policy import SwitchOutcome
 
 GatewayAliasName = ArtifactId
 OrganizationId = ArtifactId
@@ -957,6 +958,7 @@ class ProjectSelection(ContractModel):
     selected_alias: ArtifactId
     activation_ref: ActivationRef
     fallback_reason: str | None = Field(default=None, max_length=512)
+    switch_outcome: SwitchOutcome | None = None
 
 
 class AuthorizationSnapshot(ContractModel):

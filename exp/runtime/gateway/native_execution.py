@@ -471,6 +471,7 @@ def select_route_deployments(
         fallback_deployments=selected[1:],
         route_reason=route.route_reason,
         fallback_reason=route.fallback_reason,
+        switch_outcome=route.switch_outcome,
     )
 
 
@@ -528,6 +529,7 @@ def reorder_route_deployments(
         fallback_deployments=selected[1:],
         route_reason=route.route_reason,
         fallback_reason=route.fallback_reason,
+        switch_outcome=route.switch_outcome,
     )
 
 
