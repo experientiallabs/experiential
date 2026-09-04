@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.known_models import known_model_metadata
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -35,7 +34,10 @@ from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
 from exp.runtime.models.providers.reasoning_compat import (
+    MINIMUM_THINKING_BUDGET_TOKENS,
     anthropic_adaptive_only_thinking,
+    anthropic_budgeted_enabled_only,
+    anthropic_thinking_budget_tokens,
     efforts_by_nearness,
 )
 from exp.runtime.models.providers.streaming_requests import (
@@ -63,13 +65,6 @@ THINKING_TRANSLATED_DISCLOSURE = "thinking.type->enabled"
 """Disclosure recorded when an adaptive thinking config is translated to a
 budgeted ``enabled`` config for a budgeted-enabled Anthropic route."""
 
-_MINIMUM_THINKING_BUDGET_TOKENS = 1024
-"""Smallest budget Anthropic accepts for an ``enabled`` thinking config."""
-
-_MAXIMUM_THINKING_BUDGET_TOKENS = 16384
-"""Ceiling on a gateway-derived thinking budget when the caller supplied none."""
-
-
 CLOSED_SCHEMA_DISCLOSURE = "json_schema.additionalProperties->false"
 """Disclosure recorded when an open structured-output schema is closed."""
 
@@ -88,57 +83,6 @@ class RequestCoercion:
     disclosures: tuple[str, ...]
 
 
-def _thinking_budget_tokens(maximum_output_tokens: int | None) -> int | None:
-    """Return a legal ``budget_tokens`` for a translated enabled config, or None.
-
-    Anthropic requires ``1024 <= budget_tokens < max_tokens`` for an enabled
-    thinking config. With no effort→budget table to consult, the budget is
-    half the caller's output ceiling, clamped to a sane band. An unbounded
-    caller (no ceiling) takes the band ceiling. When the ceiling is too small
-    to admit any legal budget the translation is impossible and the caller
-    must fall through to the drop path.
-
-    Args:
-        maximum_output_tokens: The caller's output-token ceiling, if any.
-
-    Returns:
-        A legal budget, or ``None`` when no budget fits the ceiling.
-    """
-    if maximum_output_tokens is None:
-        return _MAXIMUM_THINKING_BUDGET_TOKENS
-    budget = min(
-        max(maximum_output_tokens // 2, _MINIMUM_THINKING_BUDGET_TOKENS),
-        _MAXIMUM_THINKING_BUDGET_TOKENS,
-    )
-    if _MINIMUM_THINKING_BUDGET_TOKENS <= budget < maximum_output_tokens:
-        return budget
-    return None
-
-
-def _anthropic_budgeted_enabled_only(model_id: str) -> bool:
-    """Whether an Anthropic model reasons via a token budget but rejects adaptive.
-
-    haiku-4-5 is marked ``supports_reasoning`` yet is NOT the effort/adaptive
-    generation (``supports_reasoning_effort`` is False), so it honors a
-    budgeted ``thinking: {type: enabled, budget_tokens}`` config while rejecting
-    ``thinking: {type: adaptive}`` by name. The effort generation (sonnet-4-6,
-    opus-5, fable-5-1, ...) carries ``supports_reasoning_effort`` and accepts
-    the adaptive object verbatim, so it is NOT one of these and its adaptive
-    config is left alone rather than translated.
-
-    Args:
-        model_id: Exact Anthropic model identifier.
-
-    Returns:
-        ``True`` only for a reasoning model whose depth is a token budget and
-        which rejects an adaptive thinking config.
-    """
-    known = known_model_metadata("anthropic", model_id)
-    if known is None:
-        return False
-    return known.supports_reasoning is True and not known.supports_reasoning_effort
-
-
 def _all_budgeted_enabled_anthropic(profiles: Sequence[GatewayWireProfile]) -> bool:
     """Whether every rung is an Anthropic budgeted-enabled-only reasoning route.
 
@@ -151,7 +95,7 @@ def _all_budgeted_enabled_anthropic(profiles: Sequence[GatewayWireProfile]) -> b
     if not profiles or not all(profile.dialect == "anthropic_messages" for profile in profiles):
         return False
     return all(
-        profile.supports_reasoning and _anthropic_budgeted_enabled_only(profile.model_id)
+        profile.supports_reasoning and anthropic_budgeted_enabled_only(profile.model_id)
         for profile in profiles
     )
 
@@ -170,9 +114,9 @@ def _caller_or_derived_budget(
     caller_budget = config.get("budget_tokens")
     if isinstance(caller_budget, int) and not isinstance(caller_budget, bool):
         ceiling = maximum_output_tokens if maximum_output_tokens is not None else caller_budget + 1
-        if _MINIMUM_THINKING_BUDGET_TOKENS <= caller_budget < ceiling:
+        if MINIMUM_THINKING_BUDGET_TOKENS <= caller_budget < ceiling:
             return caller_budget
-    return _thinking_budget_tokens(maximum_output_tokens)
+    return anthropic_thinking_budget_tokens(maximum_output_tokens)
 
 
 def _coerce_adaptive_budget(

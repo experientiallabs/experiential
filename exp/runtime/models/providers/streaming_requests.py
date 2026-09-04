@@ -43,6 +43,7 @@ from exp.runtime.models.providers.openai_payloads import (
 from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
     anthropic_adaptive_only_thinking,
+    anthropic_budgeted_enabled_only,
 )
 
 if TYPE_CHECKING:
@@ -749,6 +750,25 @@ def route_generation_parameter_requests(
         adaptive_only = all(
             anthropic_adaptive_only_thinking(profile.model_id) for profile in profiles
         )
+        # A budgeted-enabled-only model (haiku-4-5) rejects an adaptive config
+        # by NAME; the named rejection here is what lets the admit loop offer
+        # the disclosed adaptive->enabled(budget) coercion instead of the
+        # provider's own opaque 400 (which never fails over).
+        budgeted_enabled_only = all(
+            profile.dialect == "anthropic_messages"
+            and anthropic_budgeted_enabled_only(profile.model_id)
+            for profile in profiles
+        )
+        if budgeted_enabled_only and config_type == "adaptive":
+            raise ProviderParameterError(
+                message=(
+                    "The parameter 'thinking.type' cannot be 'adaptive' on this model: "
+                    "it reasons via an explicit token budget. Send thinking "
+                    "{type: 'enabled', budget_tokens: N} or remove the field."
+                ),
+                param="thinking.type",
+                code="unsupported_parameter",
+            )
         if adaptive_only and config_type == "enabled":
             # Translate to the model's one supported mode, emitted explicitly
             # so the promise holds even on routes with no pinned effort. The

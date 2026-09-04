@@ -326,6 +326,97 @@ def test_haiku_thinking_off_temperature_is_honored_under_the_srn_hatch() -> None
     assert "temperature->dropped(set_reasoning_effort_none)" in public_on.ignored_parameters
 
 
+def test_haiku_bare_effort_realizes_as_a_token_budget_at_the_payload_seam() -> None:
+    """An effort on a budgeted-enabled-only model emits enabled+budget, never adaptive.
+
+    haiku rejects ``thinking.type: adaptive`` and ``output_config.effort`` by
+    name; an effort reaching the build is the caller's depth intent (or the
+    route's pinned default), realized as the derived token budget — the same
+    wire realization the effort generation gets via the adaptive object.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_effort="medium",
+        maximum_output_tokens=8_000,
+        stream=True,
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request,
+        supports_reasoning=True,
+    )
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4_000}
+    assert "output_config" not in payload
+
+    # The route's pinned catalog default (no caller effort) realizes the same way.
+    pinned = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request.model_copy(update={"reasoning_effort": None}),
+        supports_reasoning=True,
+        reasoning_effort="medium",
+    )
+    assert pinned["thinking"] == {"type": "enabled", "budget_tokens": 4_000}
+    assert "output_config" not in pinned
+
+    # Effort "none" keeps thinking off entirely.
+    off = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request.model_copy(update={"reasoning_effort": "none"}),
+        supports_reasoning=True,
+    )
+    assert "thinking" not in off
+
+    # A ceiling too small for any legal budget keeps thinking off rather than
+    # emitting an illegal budget the provider would reject.
+    tight = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request.model_copy(update={"maximum_output_tokens": 1_024}),
+        supports_reasoning=True,
+    )
+    assert "thinking" not in tight
+
+
+def test_haiku_caller_output_config_effort_is_stripped_at_the_payload_seam() -> None:
+    """A caller-seeded output_config.effort never reaches a budgeted-only model."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_effort="medium",
+        provider_output_config={"effort": "medium", "format": {"type": "text"}},
+        maximum_output_tokens=8_000,
+        stream=True,
+    )
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5",
+        request,
+        supports_reasoning=True,
+    )
+    # The depth intent rides the budget; the by-name-rejected key is gone and
+    # unrelated output_config keys survive verbatim.
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4_000}
+    assert payload["output_config"] == {"format": {"type": "text"}}
+
+
+def test_haiku_adaptive_config_is_rejected_by_name_before_dispatch() -> None:
+    """An adaptive config on a budgeted-only route raises pre-dispatch.
+
+    The named rejection is what lets the admit loop offer the disclosed
+    adaptive->enabled(budget) coercion; forwarding verbatim would surface the
+    provider's own opaque 400 instead (which never fails over).
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        provider_thinking_config={"type": "adaptive"},
+        maximum_output_tokens=8_000,
+        stream=True,
+    )
+    with pytest.raises(ProviderParameterError) as excinfo:
+        route_generation_parameter_requests((_budgeted_haiku_profile(),), request)
+    assert excinfo.value.param == "thinking.type"
+
+
 def test_openai_compatible_stream_payload_omits_reasoning_without_route_capability() -> None:
     """A compatible route never receives a reasoning field without explicit capability proof."""
     request = _chat_request().model_copy(update={"reasoning_effort": "high"})
