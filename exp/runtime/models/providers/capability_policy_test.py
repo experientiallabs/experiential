@@ -512,6 +512,58 @@ def test_adaptive_thinking_translates_to_a_budget_on_a_budgeted_route() -> None:
     assert coercion.disclosures == ("thinking.type->enabled",)
 
 
+def test_adaptive_thinking_with_a_legal_caller_budget_keeps_that_budget() -> None:
+    """The model rejects ``adaptive`` by name, so a budget-carrying adaptive
+    config still translates to enabled — honoring the caller's own depth."""
+    request = _messages_request(
+        provider_thinking_config={"type": "adaptive", "budget_tokens": 2_048},
+        maximum_output_tokens=8_000,
+    )
+    coercion = coerce_generation_parameters((_budgeted_haiku_profile(),), request)
+    assert coercion is not None
+    assert coercion.request.provider_thinking_config == {
+        "type": "enabled",
+        "budget_tokens": 2_048,
+    }
+    assert coercion.disclosures == ("thinking.type->enabled",)
+
+    # With no output ceiling the caller's legal budget is likewise honored.
+    unbounded = _messages_request(
+        provider_thinking_config={"type": "adaptive", "budget_tokens": 30_000},
+    )
+    coercion = coerce_generation_parameters((_budgeted_haiku_profile(),), unbounded)
+    assert coercion is not None
+    assert coercion.request.provider_thinking_config == {
+        "type": "enabled",
+        "budget_tokens": 30_000,
+    }
+
+
+def test_adaptive_thinking_with_an_illegal_caller_budget_falls_back_to_derived() -> None:
+    """A caller budget below the floor or at/above max_tokens is replaced, never sent."""
+    too_small = _messages_request(
+        provider_thinking_config={"type": "adaptive", "budget_tokens": 512},
+        maximum_output_tokens=8_000,
+    )
+    coercion = coerce_generation_parameters((_budgeted_haiku_profile(),), too_small)
+    assert coercion is not None
+    assert coercion.request.provider_thinking_config == {
+        "type": "enabled",
+        "budget_tokens": 4_000,
+    }
+
+    at_ceiling = _messages_request(
+        provider_thinking_config={"type": "adaptive", "budget_tokens": 8_000},
+        maximum_output_tokens=8_000,
+    )
+    coercion = coerce_generation_parameters((_budgeted_haiku_profile(),), at_ceiling)
+    assert coercion is not None
+    assert coercion.request.provider_thinking_config == {
+        "type": "enabled",
+        "budget_tokens": 4_000,
+    }
+
+
 def test_adaptive_thinking_drops_when_no_legal_budget_fits_max_tokens() -> None:
     """A ceiling too small for any legal budget drops thinking, disclosed.
 

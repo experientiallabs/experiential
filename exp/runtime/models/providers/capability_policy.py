@@ -15,7 +15,7 @@ admission metrics.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -156,6 +156,25 @@ def _all_budgeted_enabled_anthropic(profiles: Sequence[GatewayWireProfile]) -> b
     )
 
 
+def _caller_or_derived_budget(
+    config: Mapping[str, object],
+    maximum_output_tokens: int | None,
+) -> int | None:
+    """Return the budget for a translated enabled config, or None to drop.
+
+    A caller-supplied ``budget_tokens`` names the depth and is honored when it
+    is legal (``1024 <= budget < max_tokens``); an illegal or absent one falls
+    back to the derived budget so the translated config never carries a value
+    the provider would reject.
+    """
+    caller_budget = config.get("budget_tokens")
+    if isinstance(caller_budget, int) and not isinstance(caller_budget, bool):
+        ceiling = maximum_output_tokens if maximum_output_tokens is not None else caller_budget + 1
+        if _MINIMUM_THINKING_BUDGET_TOKENS <= caller_budget < ceiling:
+            return caller_budget
+    return _thinking_budget_tokens(maximum_output_tokens)
+
+
 def _coerce_adaptive_budget(
     profiles: Sequence[GatewayWireProfile],
     request: GatewayRequest,
@@ -166,8 +185,10 @@ def _coerce_adaptive_budget(
     adaptive`` by name — that is the effort-ladder generation's channel — but
     accepts a budgeted ``enabled`` config. Claude Code, configured for an
     adaptive model, pins ``adaptive`` on every model, so the serviceable
-    reading here is to translate it to ``enabled`` with a derived budget. When
-    the caller already carried a budget the config is left verbatim; when no
+    reading here is to translate it to ``enabled`` with a budget — the
+    caller's own when they carried a legal one, a derived one otherwise
+    (the model rejects ``adaptive`` by NAME, so leaving a budget-carrying
+    adaptive config verbatim would still fail at the provider). When no
     legal budget fits the output ceiling the translation is impossible, so the
     config and any effort channel drop, all disclosed. History thinking blocks
     are left untouched: Anthropic accepts replayed thinking blocks with no live
@@ -184,13 +205,9 @@ def _coerce_adaptive_budget(
     config = request.provider_thinking_config
     if config is None or config.get("type") != "adaptive":
         return None
-    if config.get("budget_tokens") is not None:
-        # A caller-supplied budget already names the depth; leave it verbatim
-        # under the budgeted posture rather than overwriting it.
-        return None
     if not _all_budgeted_enabled_anthropic(profiles):
         return None
-    budget = _thinking_budget_tokens(request.maximum_output_tokens)
+    budget = _caller_or_derived_budget(config, request.maximum_output_tokens)
     if budget is not None:
         return RequestCoercion(
             request=request.model_copy(
