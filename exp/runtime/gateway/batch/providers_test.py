@@ -23,6 +23,7 @@ from exp.runtime.gateway.batch.contracts import (
     BatchLine,
     BatchStatus,
     BatchSubmitError,
+    BatchSurface,
 )
 from exp.runtime.gateway.batch.providers import (
     ANTHROPIC_HOST,
@@ -34,10 +35,16 @@ from exp.runtime.gateway.batch.providers import (
 )
 
 
-def _job(provider: str, lines: int = 2, provider_batch_id: str | None = "pb_1") -> BatchJob:
+def _job(
+    provider: str,
+    lines: int = 2,
+    provider_batch_id: str | None = "pb_1",
+    surface: BatchSurface | None = None,
+) -> BatchJob:
     """Build one submitted job fixture for the given provider."""
     created = datetime(2026, 9, 1, tzinfo=UTC)
-    surface = "/v1/messages" if provider == "anthropic" else "/v1/chat/completions"
+    if surface is None:
+        surface = "/v1/messages" if provider == "anthropic" else "/v1/chat/completions"
     return BatchJob(
         batch_id="batch_t",
         organization_id="org_a",
@@ -54,7 +61,7 @@ def _job(provider: str, lines: int = 2, provider_batch_id: str | None = "pb_1") 
                 surface=surface,
                 model="model-batch",
                 provider_model="prov/model:batch",
-                body={"messages": []},
+                body={"messages": [{"role": "user", "content": f"hi {index}"}], "max_tokens": 16},
                 estimated_input_tokens=4,
                 maximum_output_tokens=16,
             )
@@ -265,6 +272,101 @@ def test_anthropic_poll_maps_processing_states() -> None:
     snapshot = asyncio.run(client.poll(job=_job("anthropic"), api_key="ak"))
     assert snapshot.status is BatchStatus.COMPLETED
     assert snapshot.completed == 1 and snapshot.failed == 2
+
+
+def test_anthropic_chat_lines_submit_as_translated_messages_params() -> None:
+    """A Chat Completions job on the Anthropic client crosses to Messages params per line:
+    no OpenAI fields reach the wire, and the streaming flag is absent."""
+    seen: list[JsonObject] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"id": "mb_chat"})
+
+    client = AnthropicBatchClient(transport=_transport(handler))
+    job = _job("anthropic", surface="/v1/chat/completions")
+    assert asyncio.run(client.submit(job=job, api_key="ak")) == "mb_chat"
+    requests = seen[0]["requests"]
+    assert isinstance(requests, list) and len(requests) == 2
+    first = requests[0]
+    assert isinstance(first, dict) and first["custom_id"] == "line-0"
+    params = first["params"]
+    assert isinstance(params, dict)
+    assert params["model"] == "prov/model:batch"
+    assert params["messages"] == [{"role": "user", "content": [{"type": "text", "text": "hi 0"}]}]
+    assert params["max_tokens"] == 16
+    assert "stream" not in params
+    assert client.surfaces == ("/v1/messages", "/v1/chat/completions", "/v1/responses")
+    assert OpenAIBatchClient().surfaces == ("/v1/chat/completions", "/v1/responses")
+
+
+def test_anthropic_chat_job_results_render_chat_completions_with_cache_usage() -> None:
+    """Each succeeded Message renders as the caller's chat.completion; the line's usage
+    fields still come from Anthropic's own usage object (cache legs intact)."""
+    client = _anthropic_results_client(
+        [
+            {
+                "custom_id": "line-0",
+                "result": {
+                    "type": "succeeded",
+                    "message": {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "prov/model",
+                        "content": [{"type": "text", "text": "Hello."}],
+                        "stop_reason": "end_turn",
+                        "usage": {
+                            "input_tokens": 15,
+                            "cache_creation_input_tokens": 4501,
+                            "cache_read_input_tokens": 0,
+                            "output_tokens": 4,
+                        },
+                    },
+                },
+            },
+            {
+                "custom_id": "line-1",
+                "result": {
+                    "type": "succeeded",
+                    "message": {"content": "not-a-list", "stop_reason": "end_turn"},
+                },
+            },
+            {
+                "custom_id": "unknown-line",
+                "result": {
+                    "type": "succeeded",
+                    "message": {"content": [{"type": "text", "text": "stray"}]},
+                },
+            },
+        ]
+    )
+    job = _job("anthropic", surface="/v1/chat/completions")
+    results = {r.custom_id: r for r in asyncio.run(client.results(job=job, api_key="ak"))}
+    served = results["line-0"]
+    assert served.response is not None and served.response["object"] == "chat.completion"
+    assert served.response["model"] == "model-batch"
+    choices = served.response["choices"]
+    assert isinstance(choices, list) and isinstance(choices[0], dict)
+    assert choices[0]["finish_reason"] == "stop"
+    message = choices[0]["message"]
+    assert isinstance(message, dict) and message["content"] == "Hello."
+    assert served.response["usage"] == {
+        "prompt_tokens": 4516,
+        "completion_tokens": 4,
+        "total_tokens": 4520,
+        "prompt_tokens_details": {"cached_tokens": 0},
+        "completion_tokens_details": None,
+    }
+    assert (served.input_tokens, served.output_tokens) == (4516, 4)
+    assert served.cached_input_tokens == 0 and served.cache_creation_input_tokens == 4501
+    # A Message the renderer cannot read fails the line with the cause, not the job.
+    broken = results["line-1"]
+    assert broken.error is not None and broken.status_code == 502
+    assert broken.failure_reason is not None and "content" in broken.failure_reason
+    # A result for a line the job never carried keeps the provider's object.
+    stray = results["unknown-line"]
+    assert stray.response == {"content": [{"type": "text", "text": "stray"}]}
 
 
 def test_anthropic_ended_batch_reports_the_cancelled_line_count() -> None:

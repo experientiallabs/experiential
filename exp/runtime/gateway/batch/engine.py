@@ -299,17 +299,48 @@ class BatchEngine:
             if not isinstance(maximum_output, int) or maximum_output <= 0:
                 maximum_output = deployment.default_maximum_output_tokens
             clean_body = {key: value for key, value in body.items() if key != "model"}
-            lines.append(
-                BatchLine(
-                    custom_id=custom_id,
-                    surface=surface,
-                    model=model,
-                    provider_model=deployment.provider_model,
-                    body=clean_body,
-                    estimated_input_tokens=_approximate_tokens(clean_body),
-                    maximum_output_tokens=maximum_output,
-                )
+            line = BatchLine(
+                custom_id=custom_id,
+                surface=surface,
+                model=model,
+                provider_model=deployment.provider_model,
+                body=clean_body,
+                estimated_input_tokens=_approximate_tokens(clean_body),
+                maximum_output_tokens=maximum_output,
             )
+            client = self._clients.get(deployment.provider)
+            if client is not None:
+                # The catalog says the model serves this surface; the client
+                # is the engine's truth of what its provider wire can carry,
+                # and shaping the line now proves this body actually crosses
+                # (a rejection here is a clean per-line 400, never a whole
+                # failed batch on the poller's next pass).
+                if surface not in client.surfaces:
+                    errors.append(
+                        BatchLineError(
+                            line_number=line_number,
+                            custom_id=custom_id,
+                            code="surface_unsupported",
+                            message=(
+                                f"{deployment.provider} batches do not serve {surface}; "
+                                f"this client serves {', '.join(client.surfaces)}"
+                            ),
+                        )
+                    )
+                    continue
+                try:
+                    client.line_request(line)
+                except BatchSubmitError as rejection:
+                    errors.append(
+                        BatchLineError(
+                            line_number=line_number,
+                            custom_id=custom_id,
+                            code="invalid_request",
+                            message=rejection.message,
+                        )
+                    )
+                    continue
+            lines.append(line)
         if len(providers) > 1:
             raise BatchSubmitError(
                 "one batch is served by exactly one provider; split lines by provider "

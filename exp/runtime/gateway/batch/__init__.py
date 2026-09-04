@@ -28,6 +28,7 @@ from exp.runtime.gateway.batch.interfaces import (
     BatchSecretResolver,
     BatchStore,
 )
+from exp.runtime.gateway.batch.line_wire import LineUsage, line_usage
 from exp.runtime.gateway.batch.plane import BatchControlPlane
 from exp.runtime.gateway.batch.providers import (
     AnthropicBatchClient,
@@ -57,8 +58,10 @@ __all__ = [
     "BatchStore",
     "BatchSubmitError",
     "BatchSurface",
+    "LineUsage",
     "OpenAIBatchClient",
     "OpenRouterBatchClient",
     "ProviderBatchClient",
     "ProviderBatchSnapshot",
+    "line_usage",
 ]

@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.batch.contracts import (
     BatchDeployment,
     BatchFile,
@@ -15,6 +16,7 @@ from exp.runtime.gateway.batch.contracts import (
     BatchLineResult,
     BatchStatus,
     BatchSubmitError,
+    BatchSurface,
 )
 from exp.runtime.gateway.batch.engine import BatchEngine
 from exp.runtime.gateway.batch.providers import ProviderBatchSnapshot
@@ -163,6 +165,7 @@ class ScriptedClient:
     provider = "openrouter"
     supports_cancel = False
     requires_uniform_model = True
+    surfaces: tuple[BatchSurface, ...] = ("/v1/chat/completions", "/v1/responses")
 
     def __init__(
         self, snapshots: list[ProviderBatchSnapshot], results: list[BatchLineResult]
@@ -172,6 +175,12 @@ class ScriptedClient:
         self._results = results
         self.submitted: list[str] = []
         self.cancelled = 0
+
+    def line_request(self, line: BatchLine) -> JsonObject:
+        """Pass the caller's body through; a line named 'reject-me' is untranslatable."""
+        if line.custom_id == "reject-me":
+            raise BatchSubmitError("line 'reject-me' cannot be expressed on this wire")
+        return dict(line.body)
 
     async def submit(self, *, job: BatchJob, api_key: str) -> str:
         """Record the submit and mint a provider id."""
@@ -254,6 +263,35 @@ def test_submit_accepts_valid_lines_and_reserves_each() -> None:
     assert job.reserved_micro_usd == 2_000
     assert ledger.reserved == ["a", "b"]
     assert store.jobs[job.batch_id].provider == "openrouter"
+
+
+def test_submit_quarantines_lines_the_provider_client_cannot_carry() -> None:
+    """A surface the client does not serve, or a body it cannot shape for its wire,
+    is a per-line rejection at submit, never a provider-side failure later."""
+    engine, _, _, ledger, client = _engine()
+    client.surfaces = ("/v1/responses",)
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("b")])
+    with pytest.raises(BatchSubmitError, match="do not serve /v1/chat/completions"):
+        engine.submit(
+            organization_id="org_a",
+            identity_id="id_a",
+            input_file_id=file_id,
+            endpoint="/v1/chat/completions",
+        )
+    client.surfaces = ("/v1/chat/completions", "/v1/responses")
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("reject-me")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    assert [line.custom_id for line in job.lines] == ["a"]
+    assert [(error.custom_id, error.code) for error in job.line_errors] == [
+        ("reject-me", "invalid_request")
+    ]
+    assert "cannot be expressed" in job.line_errors[0].message
+    assert ledger.reserved == ["a"]
 
 
 def test_submit_refuses_unknown_endpoint_and_missing_file() -> None:

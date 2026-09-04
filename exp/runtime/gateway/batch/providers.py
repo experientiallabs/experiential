@@ -1,8 +1,11 @@
 """Provider batch API clients for the v1 batch lane: OpenAI, Anthropic, OpenRouter.
 
-Each client speaks one provider's asynchronous batch product directly, with
-no dialect translation: a line's body is already shaped for the surface it
-names, and the provider must natively serve that surface. Result parsing is
+Each client speaks one provider's asynchronous batch product directly and
+declares the public surfaces it serves. OpenAI and OpenRouter accept a line's
+body as the caller shaped it; Anthropic Message Batches speak only the
+Messages wire, so Chat Completions and Responses lines are carried across by
+``line_wire`` (the synchronous lane's own decoders and payload builder) and
+their results rendered back in the caller's surface. Result parsing is
 strict, and any URL a provider hands back is exact-host validated before it
 is fetched, so a compromised response cannot redirect credentials.
 """
@@ -11,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Protocol
 from urllib.parse import urlsplit
 
@@ -21,10 +25,18 @@ from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.runtime.gateway.batch.contracts import (
     COMPLETION_WINDOW,
     BatchJob,
+    BatchLine,
     BatchLineResult,
     BatchStatus,
     BatchSubmitError,
+    BatchSurface,
 )
+from exp.runtime.gateway.batch.line_wire import (
+    anthropic_line_params,
+    anthropic_result_body,
+    line_usage,
+)
+from exp.runtime.models.providers.errors import ProviderResponseError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,11 +76,27 @@ class ProviderBatchSnapshot(ContractModel):
 
 
 class ProviderBatchClient(Protocol):
-    """One provider's asynchronous batch product behind a uniform seam."""
+    """One provider's asynchronous batch product behind a uniform seam.
+
+    ``surfaces`` is the engine's truth of which public surfaces this client
+    can carry to its provider; the host catalog may narrow it per model but
+    never widen it. ``line_request`` shapes one line's body for the wire and
+    is the submit-time proof that a line is expressible on it.
+    """
 
     provider: str
     supports_cancel: bool
     requires_uniform_model: bool
+    surfaces: tuple[BatchSurface, ...]
+
+    def line_request(self, line: BatchLine) -> JsonObject:
+        """Return the provider-shaped request body for one line.
+
+        Raises:
+            BatchSubmitError: The line's surface body cannot be expressed on
+                this provider's wire; reported per line at submit.
+        """
+        ...
 
     async def submit(self, *, job: BatchJob, api_key: str) -> str:
         """Submit one whole job; returns the provider's batch id."""
@@ -106,97 +134,20 @@ def require_exact_host(url: str, host: str) -> str:
     return url
 
 
-class _LineUsage(ContractModel):
-    """Provider-reported usage of one served line, in the synchronous lane's shape.
+def _served_line(
+    custom_id: str, status_code: int, body: JsonObject, *, usage_source: JsonObject | None = None
+) -> BatchLineResult:
+    """Build one served line result carrying the provider's usage in full.
 
-    ``input_tokens`` and ``output_tokens`` are the billable totals; the three
-    optional counts are subsets of them (cached and cache-creation legs of the
-    input, reasoning inside the output) that the host prices separately.
+    ``usage_source`` names the body the usage is read from when it differs
+    from the rendered response (a translated result keeps the provider's own
+    usage object, whose cache legs the rendered surface may not carry).
     """
-
-    input_tokens: int = Field(default=0, ge=0)
-    output_tokens: int = Field(default=0, ge=0)
-    cached_input_tokens: int | None = Field(default=None, ge=0)
-    cache_creation_input_tokens: int | None = Field(default=None, ge=0)
-    reasoning_tokens: int | None = Field(default=None, ge=0)
-
-
-def _count(value: object) -> int | None:
-    """Read one non-negative integer count, or None for anything else."""
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-
-
-def _detail_count(usage: JsonObject, detail_keys: tuple[str, ...], key: str) -> int | None:
-    """Read ``key`` from the first present ``*_details`` object among ``detail_keys``."""
-    for detail_key in detail_keys:
-        details = usage.get(detail_key)
-        if isinstance(details, dict):
-            return _count(details.get(key))
-    return None
-
-
-def _line_usage(body: JsonObject | None) -> _LineUsage:
-    """Extract one served line's usage across the three provider wire shapes.
-
-    Chat Completions bodies report ``prompt_tokens``/``completion_tokens`` with
-    ``prompt_tokens_details.cached_tokens`` and
-    ``completion_tokens_details.reasoning_tokens``; Responses bodies report
-    ``input_tokens``/``output_tokens`` with the ``input_tokens_details`` and
-    ``output_tokens_details`` equivalents; Anthropic messages report
-    ``input_tokens`` EXCLUDING the ``cache_read_input_tokens`` and
-    ``cache_creation_input_tokens`` legs, which fold into the input total here
-    exactly as the synchronous Anthropic normalizer folds them. Reasoning
-    follows the synchronous rule for OpenAI-shaped usage: the provider's
-    ``total_tokens`` decides whether reasoning was reported additively (then
-    it folds into the output total) or as a subset (then the output total
-    passes through); without a decisive total, a reasoning count above the
-    output total is additive. A body without a usage object yields zeros.
-    """
-    if not isinstance(body, dict):
-        return _LineUsage()
-    usage = body.get("usage")
-    if not isinstance(usage, dict):
-        return _LineUsage()
-    reported_input = _count(usage.get("prompt_tokens", usage.get("input_tokens"))) or 0
-    reported_output = _count(usage.get("completion_tokens", usage.get("output_tokens"))) or 0
-    cache_read = _count(usage.get("cache_read_input_tokens"))
-    cache_creation = _count(usage.get("cache_creation_input_tokens"))
-    cached = _detail_count(
-        usage, ("prompt_tokens_details", "input_tokens_details"), "cached_tokens"
-    )
-    reasoning = _detail_count(
-        usage, ("completion_tokens_details", "output_tokens_details"), "reasoning_tokens"
-    )
-    input_tokens = reported_input + (cache_read or 0) + (cache_creation or 0)
-    if cached is None and (cache_read is not None or cache_creation is not None):
-        cached = cache_read or 0
-    output_tokens = reported_output
-    if reasoning:
-        total = _count(usage.get("total_tokens"))
-        if total == reported_input + reported_output:
-            additive = False
-        elif total == reported_input + reported_output + reasoning:
-            additive = True
-        else:
-            additive = reasoning > reported_output
-        if additive:
-            output_tokens = reported_output + reasoning
-    return _LineUsage(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cached_input_tokens=cached,
-        cache_creation_input_tokens=cache_creation if cache_creation else None,
-        reasoning_tokens=reasoning,
-    )
-
-
-def _served_line(custom_id: str, status_code: int, body: JsonObject) -> BatchLineResult:
-    """Build one served line result carrying the body's usage in full."""
     return BatchLineResult(
         custom_id=custom_id,
         status_code=status_code,
         response=body,
-        **_line_usage(body).model_dump(),
+        **line_usage(body if usage_source is None else usage_source).model_dump(),
     )
 
 
@@ -311,11 +262,16 @@ class OpenAIBatchClient:
     provider = "openai"
     supports_cancel = True
     requires_uniform_model = False
+    surfaces: tuple[BatchSurface, ...] = ("/v1/chat/completions", "/v1/responses")
     _base = f"https://{OPENAI_HOST}/v1"
 
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
         """Bind an optional injected transport for tests."""
         self._transport = transport
+
+    def line_request(self, line: BatchLine) -> JsonObject:
+        """The caller's body under the provider model id; the wire is native."""
+        return {**line.body, "model": line.provider_model}
 
     async def submit(self, *, job: BatchJob, api_key: str) -> str:
         """Upload the input JSONL then create the provider batch."""
@@ -325,7 +281,7 @@ class OpenAIBatchClient:
                     "custom_id": line.custom_id,
                     "method": "POST",
                     "url": line.surface,
-                    "body": {**line.body, "model": line.provider_model},
+                    "body": self.line_request(line),
                 }
             )
             for line in job.lines
@@ -450,6 +406,7 @@ class AnthropicBatchClient:
     provider = "anthropic"
     supports_cancel = True
     requires_uniform_model = False
+    surfaces: tuple[BatchSurface, ...] = ("/v1/messages", "/v1/chat/completions", "/v1/responses")
     _base = f"https://{ANTHROPIC_HOST}/v1"
 
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
@@ -460,14 +417,14 @@ class AnthropicBatchClient:
         """Build the versioned Anthropic auth headers."""
         return {"x-api-key": api_key, "anthropic-version": _ANTHROPIC_VERSION}
 
+    def line_request(self, line: BatchLine) -> JsonObject:
+        """Messages params for one line, translated from its surface when needed."""
+        return anthropic_line_params(line)
+
     async def submit(self, *, job: BatchJob, api_key: str) -> str:
         """Create one message batch with every line inline."""
         requests = [
-            {
-                "custom_id": line.custom_id,
-                "params": {**line.body, "model": line.provider_model},
-            }
-            for line in job.lines
+            {"custom_id": line.custom_id, "params": self.line_request(line)} for line in job.lines
         ]
         async with _client(self._transport) as client:
             response = await client.post(
@@ -535,6 +492,8 @@ class AnthropicBatchClient:
                     code="provider_error",
                 )
         parsed: list[BatchLineResult] = []
+        lines_by_id = {line.custom_id: line for line in job.lines}
+        created_at = time.time()
         for raw_line in content.text.splitlines():
             text = raw_line.strip()
             if not text:
@@ -548,7 +507,34 @@ class AnthropicBatchClient:
                 continue
             kind = result.get("type")
             if kind == "succeeded" and isinstance(result.get("message"), dict):
-                parsed.append(_served_line(custom_id, 200, result["message"]))
+                message = result["message"]
+                line = lines_by_id.get(custom_id)
+                if line is None:
+                    # A result for a line this job never submitted cannot be
+                    # rendered in a surface; the Message stays as the provider
+                    # sent it and the engine drops the unmatched custom id.
+                    parsed.append(_served_line(custom_id, 200, message))
+                    continue
+                try:
+                    body = anthropic_result_body(
+                        line,
+                        message,
+                        request_id=f"{job.batch_id}:{custom_id}",
+                        created_at=created_at,
+                    )
+                except (ProviderResponseError, BatchSubmitError) as exc:
+                    # The provider served the line, so its usage still settles;
+                    # the caller learns the result could not be rendered.
+                    parsed.append(
+                        BatchLineResult(
+                            custom_id=custom_id,
+                            status_code=502,
+                            error={"type": "malformed_response", "message": str(exc)},
+                            **line_usage(message).model_dump(),
+                        )
+                    )
+                    continue
+                parsed.append(_served_line(custom_id, 200, body, usage_source=message))
             else:
                 parsed.append(
                     BatchLineResult(
@@ -575,11 +561,16 @@ class OpenRouterBatchClient:
     provider = "openrouter"
     supports_cancel = False
     requires_uniform_model = True
+    surfaces: tuple[BatchSurface, ...] = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
     _base = f"https://{OPENROUTER_HOST}/api/beta"
 
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
         """Bind an optional injected transport for tests."""
         self._transport = transport
+
+    def line_request(self, line: BatchLine) -> JsonObject:
+        """The caller's body as shaped; the model rides the batch, not the line."""
+        return dict(line.body)
 
     async def submit(self, *, job: BatchJob, api_key: str) -> str:
         """Create one batch; endpoint and model serialize before requests."""
@@ -589,7 +580,9 @@ class OpenRouterBatchClient:
         payload = {
             "endpoint": job.surface,
             "model": model,
-            "requests": [{"custom_id": line.custom_id, "body": line.body} for line in job.lines],
+            "requests": [
+                {"custom_id": line.custom_id, "body": self.line_request(line)} for line in job.lines
+            ],
         }
         async with _client(self._transport) as client:
             response = await client.post(
