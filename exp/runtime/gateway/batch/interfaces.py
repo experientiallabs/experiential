@@ -114,9 +114,11 @@ class BatchLedger(Protocol):
 
         A result carrying ``response`` settles the reported totals with their
         cached-input, cache-creation, and reasoning subsets. A result carrying
-        ``error`` is a line the provider failed, canceled, or expired: settle it
-        as a FAILED attempt with ``result.failure_reason`` and no usage, never
-        as a completed attempt with zero tokens.
+        ``error`` settles as a FAILED attempt with ``result.failure_reason``,
+        never as a completed attempt with zero tokens; its token fields are
+        zero unless the provider served the line and the engine could not
+        render the result, in which case the reported usage still bills on
+        that failed attempt.
         """
         ...
 

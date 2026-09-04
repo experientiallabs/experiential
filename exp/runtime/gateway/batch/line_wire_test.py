@@ -12,6 +12,7 @@ from exp.runtime.gateway.batch.line_wire import (
     anthropic_result_body,
     line_usage,
 )
+from exp.runtime.models.providers.errors import ProviderResponseError
 
 
 def _object(value: JsonValue) -> JsonObject:
@@ -276,3 +277,101 @@ def test_line_usage_reads_every_wire_shape() -> None:
     assert (chat.cached_input_tokens, chat.reasoning_tokens) == (60, 8)
     assert line_usage({"usage": "nope"}).input_tokens == 0
     assert line_usage(None).output_tokens == 0
+
+
+def test_line_without_an_output_ceiling_carries_the_reserved_ceiling() -> None:
+    """A body naming no max_tokens sends the line's reserved ceiling, never the
+    payload builder's generic default, so the wire cannot exceed the reservation."""
+    body: JsonObject = {"messages": [{"role": "user", "content": "hi"}]}
+    line = _line("/v1/chat/completions", body)
+    assert anthropic_line_params(line)["max_tokens"] == line.maximum_output_tokens == 64
+    explicit = _line("/v1/chat/completions", {**body, "max_tokens": 7})
+    assert anthropic_line_params(explicit)["max_tokens"] == 7
+
+
+def test_unsupported_reasoning_effort_is_a_submit_rejection() -> None:
+    """An effort no Anthropic model carries is reported per line at submit, never
+    raised past the engine as an unclassified error."""
+    body: JsonObject = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "ultra",
+    }
+    # An effort-generation model (adaptive thinking) is where the effort ladder
+    # is checked; a budget-only model realizes any effort as a token budget.
+    line = _line("/v1/chat/completions", body).model_copy(
+        update={"provider_model": "claude-sonnet-4-5"}
+    )
+    with pytest.raises(BatchSubmitError, match="cannot be served on the Anthropic wire"):
+        anthropic_line_params(line)
+
+
+def test_refusal_with_partial_text_renders_content_free_on_both_surfaces() -> None:
+    """A refusal stop after some text is the whole visible turn: the chat message
+    carries the provider's refusal text and no content, and the Responses object
+    carries one refusal part (text and refusal never mix on that wire)."""
+    message = {
+        **_ANTHROPIC_MESSAGE,
+        "content": [
+            {"type": "text", "text": "I was going to say"},
+            {"type": "refusal", "refusal": "I can't help with that."},
+        ],
+        "stop_reason": "refusal",
+    }
+    chat = anthropic_result_body(
+        _line("/v1/chat/completions", _CHAT_BODY), message, request_id="r", created_at=0.0
+    )
+    choice = _choice(chat)
+    assert choice["finish_reason"] == "content_filter"
+    rendered = _object(choice["message"])
+    assert rendered["content"] is None
+    assert rendered["refusal"] == "I can't help with that."
+    assert rendered["tool_calls"] is None
+    responses = anthropic_result_body(
+        _line("/v1/responses", {"input": "Say hi"}), message, request_id="r", created_at=0.0
+    )
+    parts = [
+        _object(part)
+        for item in map(_object, _array(responses["output"]))
+        if item.get("type") == "message"
+        for part in _array(item["content"])
+    ]
+    assert [part["type"] for part in parts] == ["refusal"]
+    assert parts[0]["refusal"] == "I can't help with that."
+
+
+def test_unknown_block_kinds_are_skipped_not_rejected() -> None:
+    """Block kinds with no output on these surfaces (MCP tool traffic, future
+    kinds) are skipped exactly as the streaming normalizer skips them."""
+    message = {
+        **_ANTHROPIC_MESSAGE,
+        "content": [
+            {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "search", "input": {}},
+            {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": []},
+            {"type": "compaction", "content": "..."},
+            {"type": "text", "text": "Done."},
+        ],
+        "stop_reason": "end_turn",
+    }
+    body = anthropic_result_body(
+        _line("/v1/chat/completions", _CHAT_BODY), message, request_id="r", created_at=0.0
+    )
+    assert _object(_choice(body)["message"])["content"] == "Done."
+
+
+def test_malformed_blocks_are_a_typed_rendering_failure() -> None:
+    """A tool_use with an empty id (or a non-text refusal) is reported as a
+    provider response error, never as a bare validation error the results
+    parser cannot classify."""
+    empty_id = {
+        **_ANTHROPIC_MESSAGE,
+        "content": [{"type": "tool_use", "id": "", "name": "lookup", "input": {}}],
+    }
+    with pytest.raises(ProviderResponseError, match="tool_use is malformed"):
+        anthropic_result_body(
+            _line("/v1/chat/completions", _CHAT_BODY), empty_id, request_id="r", created_at=0.0
+        )
+    bad_refusal = {**_ANTHROPIC_MESSAGE, "content": [{"type": "refusal", "refusal": 3}]}
+    with pytest.raises(ProviderResponseError, match="refusal must be text"):
+        anthropic_result_body(
+            _line("/v1/chat/completions", _CHAT_BODY), bad_refusal, request_id="r", created_at=0.0
+        )

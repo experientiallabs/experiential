@@ -60,8 +60,11 @@ class BatchLine(ContractModel):
     ``custom_id`` is the caller's per-line correlation key, unique inside one
     job. ``model`` is the catalog batch model the line explicitly requested,
     and ``provider_model`` is the provider wire id the job's provider serves
-    it under. ``body`` is the surface-shaped request body passed through to
-    the provider without dialect translation.
+    it under. ``body`` is the caller's surface-shaped request body; the job's
+    provider client shapes it for its wire at dispatch, verbatim where the
+    provider serves the surface natively and translated where it does not.
+    ``maximum_output_tokens`` is the output ceiling the line was reserved
+    at: the caller's own value, else the deployment default.
     """
 
     custom_id: str = Field(min_length=1, max_length=256)
@@ -92,8 +95,10 @@ class BatchLineResult(ContractModel):
     and ``cache_creation_input_tokens`` are subsets of ``input_tokens`` and
     ``reasoning_tokens`` is a subset of ``output_tokens``; they price portions
     of the totals and are never added a second time. A result carrying
-    ``error`` is a line the provider terminally failed, canceled, or expired:
-    it produced no billable output and ``failure_reason`` names why.
+    ``error`` is a line the provider terminally failed, canceled, or expired
+    (zero usage), or one the provider served whose result the engine could
+    not render in the caller's surface (the provider's reported usage rides
+    the result and bills like a served line's); ``failure_reason`` names why.
     """
 
     custom_id: str

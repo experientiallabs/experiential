@@ -708,6 +708,18 @@ def test_gemini_prompt_block_is_a_refusal_not_a_malformed_response() -> None:
             )
 
 
+def test_gemini_prompt_block_reason_must_be_text() -> None:
+    """A non-text blockReason is a malformed response (the native normalizer's
+    verdict too), never an unclassified error or a guessed refusal."""
+    for bad in ([], {}, 3):
+        with pytest.raises(ProviderResponseError, match="blockReason must be a non-empty string"):
+            gemini_generate_response(
+                {"promptFeedback": {"blockReason": bad}},
+                configured_model=_snapshot("gemini", "gemini-fixture"),
+                latency_seconds=0.1,
+            )
+
+
 def test_anthropic_completed_thinking_blocks_are_accepted() -> None:
     """A pinned-effort route returns thinking blocks; the typed client keeps
     final content and tool calls without raising."""

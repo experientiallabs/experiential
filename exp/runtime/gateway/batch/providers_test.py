@@ -300,6 +300,20 @@ def test_anthropic_chat_lines_submit_as_translated_messages_params() -> None:
     assert OpenAIBatchClient().surfaces == ("/v1/chat/completions", "/v1/responses")
 
 
+def _anthropic_results_client(lines: list[JsonObject]) -> AnthropicBatchClient:
+    """Serve one batch object plus the given results JSONL over the exact host."""
+    rendered = "\n".join(json.dumps(line) for line in lines)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/messages/batches/pb_1":
+            return httpx.Response(
+                200, json={"results_url": f"https://{ANTHROPIC_HOST}/v1/batches/pb_1/results"}
+            )
+        return httpx.Response(200, text=rendered)
+
+    return AnthropicBatchClient(transport=_transport(handler))
+
+
 def test_anthropic_chat_job_results_render_chat_completions_with_cache_usage() -> None:
     """Each succeeded Message renders as the caller's chat.completion; the line's usage
     fields still come from Anthropic's own usage object (cache legs intact)."""
@@ -463,20 +477,6 @@ def test_anthropic_results_parse_succeeded_and_errored_lines() -> None:
     results = asyncio.run(client.results(job=_job("anthropic"), api_key="ak"))
     assert results[0].output_tokens == 3 and results[0].error is None
     assert results[1].error == {"type": "invalid_request"}
-
-
-def _anthropic_results_client(lines: list[JsonObject]) -> AnthropicBatchClient:
-    """Serve one batch object plus the given results JSONL over the exact host."""
-    rendered = "\n".join(json.dumps(line) for line in lines)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/messages/batches/pb_1":
-            return httpx.Response(
-                200, json={"results_url": f"https://{ANTHROPIC_HOST}/v1/batches/pb_1/results"}
-            )
-        return httpx.Response(200, text=rendered)
-
-    return AnthropicBatchClient(transport=_transport(handler))
 
 
 def test_anthropic_results_fold_cache_legs_into_input_and_name_the_subsets() -> None:
@@ -700,3 +700,22 @@ def test_require_exact_host_accepts_the_exact_authority() -> None:
     """The exact https host with the default port passes unchanged."""
     url = f"https://{ANTHROPIC_HOST}/v1/results?page=1"
     assert require_exact_host(url, ANTHROPIC_HOST) == url
+
+
+def test_anthropic_success_without_a_message_and_unknown_result_types_name_themselves() -> None:
+    """A succeeded row lacking a message object is a malformed result with its own
+    reason; a result type Anthropic never documented is named unknown, not None."""
+    client = _anthropic_results_client(
+        [
+            {"custom_id": "line-0", "result": {"type": "succeeded", "message": "nope"}},
+            {"custom_id": "line-1", "result": {}},
+        ]
+    )
+    results = asyncio.run(client.results(job=_job("anthropic"), api_key="ak"))
+    assert results[0].status_code == 502 and results[0].error is not None
+    assert results[0].failure_reason == "the provider reported success without a message object"
+    assert (results[0].input_tokens, results[0].output_tokens) == (0, 0)
+    assert results[1].error == {
+        "type": "unknown",
+        "message": "the provider reported this request as unknown",
+    }

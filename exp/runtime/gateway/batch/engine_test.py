@@ -1104,3 +1104,132 @@ def test_direct_cancel_on_an_unsupported_provider_refuses_honestly() -> None:
     unchanged = store.jobs[job.batch_id]
     assert unchanged.status is BatchStatus.IN_PROGRESS
     assert ledger.released == []
+
+
+def test_responses_lines_reserve_at_their_own_output_ceiling() -> None:
+    """A Responses body names its ceiling as max_output_tokens; the reservation reads
+    it exactly as it reads a chat body's max_tokens, never falling to the default."""
+    engine, _, _, _, _ = _engine()
+    line = (
+        '{"custom_id": "a", "method": "POST", "url": "/v1/responses",'
+        ' "body": {"model": "kimi-k3-batch", "input": "hi", "max_output_tokens": 77}}'
+    )
+    unbounded = (
+        '{"custom_id": "b", "method": "POST", "url": "/v1/responses",'
+        ' "body": {"model": "kimi-k3-batch", "input": "hi"}}'
+    )
+    file_id = _upload(engine, [line, unbounded])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/responses",
+    )
+    ceilings = {line.custom_id: line.maximum_output_tokens for line in job.lines}
+    assert ceilings == {"a": 77, "b": 4096}
+
+
+def test_provider_without_a_client_is_a_whole_job_refusal() -> None:
+    """A catalog model on a provider this engine has no client for cannot be shaped
+    or dispatched, so the submit is refused up front."""
+    engine = BatchEngine(
+        store=MemoryStore(),
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=MemoryLedger(),
+        secrets_resolver=MemorySecrets(),
+        clients={
+            "openrouter": ScriptedClient(
+                [ProviderBatchSnapshot(status=BatchStatus.COMPLETED, results_ready=True)], []
+            )
+        },
+    )
+    file_id = _upload(engine, [_chat_line("a", model="kimi-k3-batch")])
+    with pytest.raises(BatchSubmitError, match="openai has no batch client enabled"):
+        engine.submit(
+            organization_id="org_a",
+            identity_id="id_a",
+            input_file_id=file_id,
+            endpoint="/v1/chat/completions",
+        )
+
+
+def test_cancelled_job_with_served_lines_retries_a_failed_results_fetch() -> None:
+    """A cancelled batch whose provider counted served lines has results; a fetch
+    failure keeps settlement open instead of releasing the lines that ran."""
+    served = [
+        BatchLineResult(
+            custom_id="a",
+            status_code=200,
+            response={"usage": {"prompt_tokens": 1, "completion_tokens": 4}},
+            input_tokens=1,
+            output_tokens=4,
+        )
+    ]
+
+    class FlakyCancelledResults(ScriptedClient):
+        """Ends cancelled with one served line; the first results fetch fails."""
+
+        provider = "openai"
+        supports_cancel = True
+
+        def __init__(self) -> None:
+            """Script in_progress, then an ended batch with one cut line."""
+            super().__init__(
+                [
+                    ProviderBatchSnapshot(status=BatchStatus.IN_PROGRESS),
+                    ProviderBatchSnapshot(
+                        status=BatchStatus.COMPLETED,
+                        completed=1,
+                        failed=1,
+                        cancelled_lines=1,
+                        results_ready=True,
+                    ),
+                ],
+                served,
+            )
+            self.fetches = 0
+
+        async def results(self, *, job: BatchJob, api_key: str) -> list[BatchLineResult]:
+            """Fail the first download definitively, succeed afterwards."""
+            self.fetches += 1
+            if self.fetches == 1:
+                raise BatchSubmitError(
+                    "provider result download failed with status 503", code="provider_error"
+                )
+            return list(self._results)
+
+    client = FlakyCancelledResults()
+    store = MemoryStore()
+    ledger = MemoryLedger()
+    engine = BatchEngine(
+        store=store,
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=ledger,
+        secrets_resolver=MemorySecrets(),
+        clients={"openai": client},
+    )
+    file_id = _upload(
+        engine, [_chat_line("a", model="kimi-k3-batch"), _chat_line("b", model="kimi-k3-batch")]
+    )
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())  # submit
+    asyncio.run(engine.poll_once())  # in_progress
+    store.save_job(
+        job=store.jobs[job.batch_id].model_copy(update={"status": BatchStatus.CANCELLING})
+    )
+    asyncio.run(engine.poll_once())  # ended with a cut line; results fetch fails
+    pending = store.jobs[job.batch_id]
+    assert pending.status is BatchStatus.CANCELLED and pending.settled is False
+    assert ledger.settled == [] and ledger.released == []
+    asyncio.run(engine.poll_once())  # settlement retries and lands
+    final = store.jobs[job.batch_id]
+    assert final.settled is True
+    assert ledger.settled == [("a", 4)]
+    assert ledger.released == [("b", "cancelled")]

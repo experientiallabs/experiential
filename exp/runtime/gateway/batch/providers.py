@@ -36,6 +36,7 @@ from exp.runtime.gateway.batch.line_wire import (
     anthropic_result_body,
     line_usage,
 )
+from exp.runtime.gateway.contracts import GatewayUsage
 from exp.runtime.models.providers.errors import ProviderResponseError
 
 _LOGGER = logging.getLogger(__name__)
@@ -134,20 +135,32 @@ def require_exact_host(url: str, host: str) -> str:
     return url
 
 
-def _served_line(
-    custom_id: str, status_code: int, body: JsonObject, *, usage_source: JsonObject | None = None
+def _line_result(
+    custom_id: str,
+    status_code: int,
+    *,
+    usage: GatewayUsage,
+    response: JsonObject | None = None,
+    error: JsonObject | None = None,
 ) -> BatchLineResult:
-    """Build one served line result carrying the provider's usage in full.
+    """Build one line result carrying the provider's reported usage in full.
 
-    ``usage_source`` names the body the usage is read from when it differs
-    from the rendered response (a translated result keeps the provider's own
-    usage object, whose cache legs the rendered surface may not carry).
+    ``usage`` is read from the provider's own body (``line_usage``), which for
+    a translated result differs from the rendered response: the Message keeps
+    the cache legs the rendered surface may not carry. An error result carries
+    usage only when the provider served the line and its result could not be
+    rendered; every other error result reports zero.
     """
     return BatchLineResult(
         custom_id=custom_id,
         status_code=status_code,
-        response=body,
-        **line_usage(body if usage_source is None else usage_source).model_dump(),
+        response=response,
+        error=error,
+        input_tokens=usage.input_tokens or 0,
+        output_tokens=usage.output_tokens or 0,
+        cached_input_tokens=usage.cached_input_tokens,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
     )
 
 
@@ -232,7 +245,9 @@ def _openai_status(raw: str) -> BatchStatus:
 def _int_count(counts: JsonObject, key: str) -> int:
     """Read one non-negative integer count field, defaulting to zero."""
     value = counts.get(key, 0)
-    return value if isinstance(value, int) and value >= 0 else 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _parse_output_line(raw: JsonObject) -> BatchLineResult | None:
@@ -250,7 +265,7 @@ def _parse_output_line(raw: JsonObject) -> BatchLineResult | None:
             return None
         if code >= 400:
             return BatchLineResult(custom_id=custom_id, status_code=code, error=body)
-        return _served_line(custom_id, code, body)
+        return _line_result(custom_id, code, usage=line_usage(body), response=body)
     if isinstance(error, dict):
         return BatchLineResult(custom_id=custom_id, status_code=500, error=error)
     return None
@@ -382,20 +397,22 @@ _ANTHROPIC_UNSERVED_REASONS: dict[str, str] = {
 }
 
 
-def _anthropic_line_error(kind: str, error: JsonValue | None) -> JsonObject:
+def _anthropic_line_error(kind: JsonValue | None, error: JsonValue | None) -> JsonObject:
     """Shape one non-succeeded Anthropic result as a line error with a reason.
 
     An ``errored`` result carries the provider's own error object (its
     ``message`` is the reason). ``canceled`` and ``expired`` results carry no
     error object at all, so the reason is written here: the host ledgers the
-    line as failed WITH a cause, never as completed with zero tokens.
+    line as failed WITH a cause, never as completed with zero tokens. A
+    result type the provider never documented is named as ``unknown``.
     """
     if isinstance(error, dict):
         return error
+    name = kind if isinstance(kind, str) and kind else "unknown"
     return {
-        "type": kind,
+        "type": name,
         "message": _ANTHROPIC_UNSERVED_REASONS.get(
-            kind, f"the provider reported this request as {kind}"
+            name, f"the provider reported this request as {name}"
         ),
     }
 
@@ -506,43 +523,57 @@ class AnthropicBatchClient:
             if not isinstance(custom_id, str) or not isinstance(result, dict):
                 continue
             kind = result.get("type")
-            if kind == "succeeded" and isinstance(result.get("message"), dict):
-                message = result["message"]
-                line = lines_by_id.get(custom_id)
-                if line is None:
-                    # A result for a line this job never submitted cannot be
-                    # rendered in a surface; the Message stays as the provider
-                    # sent it and the engine drops the unmatched custom id.
-                    parsed.append(_served_line(custom_id, 200, message))
-                    continue
-                try:
-                    body = anthropic_result_body(
-                        line,
-                        message,
-                        request_id=f"{job.batch_id}:{custom_id}",
-                        created_at=created_at,
-                    )
-                except (ProviderResponseError, BatchSubmitError) as exc:
-                    # The provider served the line, so its usage still settles;
-                    # the caller learns the result could not be rendered.
-                    parsed.append(
-                        BatchLineResult(
-                            custom_id=custom_id,
-                            status_code=502,
-                            error={"type": "malformed_response", "message": str(exc)},
-                            **line_usage(message).model_dump(),
-                        )
-                    )
-                    continue
-                parsed.append(_served_line(custom_id, 200, body, usage_source=message))
-            else:
+            if kind != "succeeded":
                 parsed.append(
                     BatchLineResult(
                         custom_id=custom_id,
                         status_code=500,
-                        error=_anthropic_line_error(str(kind), result.get("error")),
+                        error=_anthropic_line_error(kind, result.get("error")),
                     )
                 )
+                continue
+            message = result.get("message")
+            if not isinstance(message, dict):
+                parsed.append(
+                    BatchLineResult(
+                        custom_id=custom_id,
+                        status_code=502,
+                        error={
+                            "type": "malformed_response",
+                            "message": "the provider reported success without a message object",
+                        },
+                    )
+                )
+                continue
+            usage = line_usage(message)
+            line = lines_by_id.get(custom_id)
+            if line is None:
+                # A result for a line this job never submitted cannot be
+                # rendered in a surface; the Message stays as the provider
+                # sent it and the engine drops the unmatched custom id.
+                parsed.append(_line_result(custom_id, 200, usage=usage, response=message))
+                continue
+            try:
+                body = anthropic_result_body(
+                    line,
+                    message,
+                    request_id=f"{job.batch_id}:{custom_id}",
+                    created_at=created_at,
+                )
+            except (ProviderResponseError, BatchSubmitError) as exc:
+                # The provider served the line, so its reported usage rides
+                # the error result and still bills; the caller learns the
+                # result could not be rendered in their surface.
+                parsed.append(
+                    _line_result(
+                        custom_id,
+                        502,
+                        usage=usage,
+                        error={"type": "malformed_response", "message": str(exc)},
+                    )
+                )
+                continue
+            parsed.append(_line_result(custom_id, 200, usage=usage, response=body))
         return parsed
 
     async def cancel(self, *, job: BatchJob, api_key: str) -> None:

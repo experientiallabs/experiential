@@ -262,6 +262,12 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
     )
 
 
+# Finish and block reasons Google reports for content its safety systems
+# refused; the prompt-level block adds the image-specific reason.
+_GEMINI_SAFETY_REASONS: frozenset[str] = frozenset({"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"})
+_GEMINI_PROMPT_SAFETY_REASONS: frozenset[str] = _GEMINI_SAFETY_REASONS | {"IMAGE_SAFETY"}
+
+
 def _gemini_prompt_block_signal(payload: JsonObject) -> ProviderRefusalSignal | None:
     """Map a prompt-level block to a content-free refusal category.
 
@@ -275,15 +281,22 @@ def _gemini_prompt_block_signal(payload: JsonObject) -> ProviderRefusalSignal | 
 
     Returns:
         The refusal signal for a blocked prompt, or ``None`` when generation ran.
+
+    Raises:
+        ProviderResponseError: ``promptFeedback`` is not an object, or its
+            ``blockReason`` is not text.
     """
     raw = payload.get("promptFeedback")
     if raw is None:
         return None
     feedback = require_object(raw, "Gemini promptFeedback")
-    reason = feedback.get("blockReason")
-    if reason is None or reason == "BLOCK_REASON_UNSPECIFIED":
+    raw_reason = feedback.get("blockReason")
+    if raw_reason is None:
         return None
-    if reason in {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "IMAGE_SAFETY"}:
+    reason = require_string(raw_reason, "Gemini promptFeedback.blockReason")
+    if reason == "BLOCK_REASON_UNSPECIFIED":
+        return None
+    if reason in _GEMINI_PROMPT_SAFETY_REASONS:
         return ProviderRefusalSignal.SAFETY
     return ProviderRefusalSignal.PROVIDER_REFUSAL
 
@@ -297,7 +310,7 @@ def _gemini_refusal_signal(value: object) -> ProviderRefusalSignal | None:
     Returns:
         A normalized refusal signal, or ``None`` for ordinary terminal reasons.
     """
-    if value in {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"}:
+    if isinstance(value, str) and value in _GEMINI_SAFETY_REASONS:
         return ProviderRefusalSignal.SAFETY
     if value == "RECITATION":
         return ProviderRefusalSignal.COPYRIGHT

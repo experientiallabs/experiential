@@ -6,15 +6,14 @@ public body travels to the Anthropic wire, and the provider's Message result
 travels back to the surface the caller submitted, through the same decoders,
 payload builder, and response assembly the synchronous lane uses, so the
 engine stays the single dialect authority. Usage extraction across the three
-provider wire shapes lives here too, in the synchronous usage contract's
-field names.
+provider wire shapes lives here too, in the synchronous usage contract.
 """
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import ValidationError
 
-from exp.common.core.artifacts import ContractModel, JsonObject
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.runtime.gateway.batch.contracts import BatchLine, BatchSubmitError
 from exp.runtime.gateway.contracts import (
@@ -23,7 +22,11 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
-from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderResponseError
+from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
+    ProviderParameterError,
+    ProviderResponseError,
+)
 from exp.runtime.models.providers.messages_payloads import anthropic_messages_stream_payload
 from exp.runtime.openai_protocol import (
     OpenAIProtocolError,
@@ -31,21 +34,6 @@ from exp.runtime.openai_protocol import (
     decode_chat,
     decode_responses,
 )
-
-
-class LineUsage(ContractModel):
-    """Provider-reported usage of one served line, in the synchronous lane's shape.
-
-    ``input_tokens`` and ``output_tokens`` are the billable totals; the three
-    optional counts are subsets of them (cached and cache-creation legs of the
-    input, reasoning inside the output) that the host prices separately.
-    """
-
-    input_tokens: int = Field(default=0, ge=0)
-    output_tokens: int = Field(default=0, ge=0)
-    cached_input_tokens: int | None = Field(default=None, ge=0)
-    cache_creation_input_tokens: int | None = Field(default=None, ge=0)
-    reasoning_tokens: int | None = Field(default=None, ge=0)
 
 
 def _count(value: object) -> int | None:
@@ -62,7 +50,7 @@ def _detail_count(usage: JsonObject, detail_keys: tuple[str, ...], key: str) -> 
     return None
 
 
-def line_usage(body: JsonObject | None) -> LineUsage:
+def line_usage(body: JsonObject | None) -> GatewayUsage:
     """Extract one served line's usage across the three provider wire shapes.
 
     Chat Completions bodies report ``prompt_tokens``/``completion_tokens`` with
@@ -77,13 +65,14 @@ def line_usage(body: JsonObject | None) -> LineUsage:
     ``total_tokens`` decides whether reasoning was reported additively (then
     it folds into the output total) or as a subset (then the output total
     passes through); without a decisive total, a reasoning count above the
-    output total is additive. A body without a usage object yields zeros.
+    output total is additive. A body without a usage object yields zero
+    totals, so a served line always settles against known counts.
     """
     if not isinstance(body, dict):
-        return LineUsage()
+        return GatewayUsage(input_tokens=0, output_tokens=0)
     usage = body.get("usage")
     if not isinstance(usage, dict):
-        return LineUsage()
+        return GatewayUsage(input_tokens=0, output_tokens=0)
     reported_input = _count(usage.get("prompt_tokens", usage.get("input_tokens"))) or 0
     reported_output = _count(usage.get("completion_tokens", usage.get("output_tokens"))) or 0
     cache_read = _count(usage.get("cache_read_input_tokens"))
@@ -108,10 +97,11 @@ def line_usage(body: JsonObject | None) -> LineUsage:
             additive = reasoning > reported_output
         if additive:
             output_tokens = reported_output + reasoning
-    return LineUsage(
+    return GatewayUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cached_input_tokens=cached,
+        # Present only when nonzero, matching the synchronous normalizer.
         cache_creation_input_tokens=cache_creation if cache_creation else None,
         reasoning_tokens=reasoning,
     )
@@ -152,7 +142,15 @@ def anthropic_line_params(line: BatchLine) -> JsonObject:
     the provider model id. A Chat Completions or Responses line is decoded by
     the shared surface decoder and rendered by the synchronous lane's Messages
     payload builder; the builder's streaming flag comes off, since a batch
-    result is a file, not a stream.
+    result is a file, not a stream. A line that names no output ceiling
+    carries ``line.maximum_output_tokens`` (the ceiling its reservation was
+    priced at) as ``max_tokens``, so the wire never exceeds what was reserved.
+
+    The builder runs with the wire's full sampling and reasoning set because a
+    batch deployment carries no per-model capability facts: what it rejects
+    here is what no Anthropic model can carry (an unknown reasoning effort, an
+    untranslatable message), reported per line at submit. A model's own
+    narrower admission is still the provider's verdict when the batch runs.
 
     Raises:
         BatchSubmitError: The line cannot be expressed on the Messages wire.
@@ -160,6 +158,8 @@ def anthropic_line_params(line: BatchLine) -> JsonObject:
     if line.surface == "/v1/messages":
         return {**line.body, "model": line.provider_model}
     request = _decoded_request(line)
+    if request.maximum_output_tokens is None and line.maximum_output_tokens > 0:
+        request = request.model_copy(update={"maximum_output_tokens": line.maximum_output_tokens})
     try:
         payload = anthropic_messages_stream_payload(
             line.provider_model,
@@ -169,7 +169,7 @@ def anthropic_line_params(line: BatchLine) -> JsonObject:
             supports_top_k=True,
             supports_reasoning=True,
         )
-    except (ProviderCapabilityError, ProviderResponseError) as exc:
+    except (ProviderCapabilityError, ProviderParameterError, ProviderResponseError) as exc:
         raise BatchSubmitError(
             f"line {line.custom_id!r} cannot be served on the Anthropic wire: {exc}"
         ) from exc
@@ -180,22 +180,24 @@ def anthropic_line_params(line: BatchLine) -> JsonObject:
 def _anthropic_message_events(message: JsonObject) -> tuple[GatewayEvent, ...]:
     """Normalize one completed Anthropic Message object into serving events.
 
-    Text and tool-use blocks become their canonical events, thinking and
-    provider-executed server-tool blocks carry no gateway-visible output on
-    these surfaces, a ``refusal`` stop or block becomes the typed refusal
-    signal, the usage folds the cache legs into the input total
-    exactly as the streaming normalizer does, and ``max_tokens`` ends the turn
-    incomplete.
+    Text and tool-use blocks become their canonical events; thinking blocks,
+    provider-executed server-tool traffic (web search and its result), and
+    any other block kind with no output on these surfaces are skipped, as the
+    streaming normalizer skips them. A refusal (a ``refusal`` block or the
+    ``refusal`` stop reason) is content-free: it replaces every content event
+    with one typed refusal signal carrying the provider's refusal text. The
+    usage folds the cache legs into the input total exactly as the streaming
+    normalizer does, and ``max_tokens`` ends the turn incomplete.
 
     Raises:
-        ProviderResponseError: The message carries a malformed or unsupported block.
+        ProviderResponseError: The message carries a malformed block.
     """
-    events: list[GatewayEvent] = []
-    sequence = 0
-    refused = message.get("stop_reason") == "refusal"
     raw_content = message.get("content")
     if not isinstance(raw_content, list):
         raise ProviderResponseError("Anthropic content must be an array")
+    events: list[GatewayEvent] = []
+    refusal: str | None = "" if message.get("stop_reason") == "refusal" else None
+    sequence = 0
     tool_index = 0
     for index, block in enumerate(raw_content):
         if not isinstance(block, dict):
@@ -216,7 +218,7 @@ def _anthropic_message_events(message: JsonObject) -> tuple[GatewayEvent, ...]:
             call_id = block.get("id")
             name = block.get("name")
             arguments = block.get("input")
-            if not isinstance(call_id, str) or not isinstance(name, str):
+            if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
                 raise ProviderResponseError(f"Anthropic content[{index}] tool_use is malformed")
             if not isinstance(arguments, dict):
                 raise ProviderResponseError(f"Anthropic content[{index}].input must be an object")
@@ -247,41 +249,25 @@ def _anthropic_message_events(message: JsonObject) -> tuple[GatewayEvent, ...]:
             sequence += 3
             tool_index += 1
         elif block_type == "refusal":
-            refused = True
-        elif block_type in {"thinking", "redacted_thinking"}:
-            continue
-        elif block_type == "server_tool_use" or (
-            isinstance(block_type, str) and block_type.endswith("_tool_result")
-        ):
-            # Provider-executed tool traffic (web search and its result) is
-            # not the caller's tool history and has no slot in a
-            # chat.completion or response object; the answer text that cites
-            # it is what the caller receives, as on the synchronous lane.
-            continue
-        else:
-            raise ProviderResponseError(
-                f"Anthropic content[{index}] has unsupported type {block_type!r}"
-            )
-    if refused:
-        events.append(
-            GatewayEvent(
-                kind=GatewayEventKind.REFUSAL_DELTA, sequence_number=sequence, text_delta=""
-            )
-        )
-        sequence += 1
-    usage = line_usage(message)
+            text = block.get("refusal")
+            if text is not None and not isinstance(text, str):
+                raise ProviderResponseError(f"Anthropic content[{index}].refusal must be text")
+            refusal = (refusal or "") + (text or "")
+        # Every other block kind (thinking, redacted_thinking, server_tool_use,
+        # *_tool_result, and kinds this surface cannot show) carries no
+        # gateway-visible output here and is skipped, never rejected.
+    if refusal is not None:
+        # The synchronous lane delivers no content on a refusal; the public
+        # surfaces cannot mix text with a refusal either, so the refusal is
+        # the whole visible turn.
+        events = [
+            GatewayEvent(kind=GatewayEventKind.REFUSAL_DELTA, sequence_number=0, text_delta=refusal)
+        ]
+        sequence = 1
     if isinstance(message.get("usage"), dict):
         events.append(
             GatewayEvent(
-                kind=GatewayEventKind.USAGE,
-                sequence_number=sequence,
-                usage=GatewayUsage(
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    cached_input_tokens=usage.cached_input_tokens,
-                    cache_creation_input_tokens=usage.cache_creation_input_tokens,
-                    reasoning_tokens=usage.reasoning_tokens,
-                ),
+                kind=GatewayEventKind.USAGE, sequence_number=sequence, usage=line_usage(message)
             )
         )
         sequence += 1
@@ -307,21 +293,32 @@ def anthropic_result_body(
     with ``finish_reason: "content_filter"`` on the chat surface.
 
     Raises:
-        ProviderResponseError: The message carries a malformed or unsupported block.
+        ProviderResponseError: The message carries a malformed block, or the
+            surface cannot render the events it produced.
         BatchSubmitError: The stored line body no longer decodes (never
             expected after submit validated it).
     """
     if line.surface == "/v1/messages":
         return message
     request = _decoded_request(line)
-    events = _anthropic_message_events(message)
-    body = completed_body(
-        request=request,
-        request_id=request_id,
-        model=line.model,
-        created_at=created_at,
-        events=events,
-    )
+    try:
+        events = _anthropic_message_events(message)
+        body = completed_body(
+            request=request,
+            request_id=request_id,
+            model=line.model,
+            created_at=created_at,
+            events=events,
+        )
+    except OpenAIProtocolError as exc:
+        raise ProviderResponseError(
+            f"Anthropic result cannot be rendered on {line.surface}: {exc.detail.message}"
+        ) from exc
+    except ValidationError as exc:
+        raise ProviderResponseError(
+            f"Anthropic result cannot be rendered on {line.surface}: "
+            f"{exc.error_count()} invalid field(s)"
+        ) from exc
     if line.surface == "/v1/chat/completions" and any(
         event.kind is GatewayEventKind.REFUSAL_DELTA for event in events
     ):
