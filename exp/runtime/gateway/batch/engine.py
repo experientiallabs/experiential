@@ -25,6 +25,7 @@ from exp.runtime.gateway.batch.contracts import (
     BatchDeployment,
     BatchFile,
     BatchJob,
+    BatchJobPage,
     BatchLine,
     BatchLineError,
     BatchLineResult,
@@ -353,10 +354,18 @@ class BatchEngine:
 
     def list_jobs(
         self, *, organization_id: str, limit: int = 20, after: str | None = None
-    ) -> list[BatchJob]:
-        """Return the organization's jobs, newest first, bounded per page."""
+    ) -> BatchJobPage:
+        """Return one page of the organization's jobs, newest first.
+
+        The store is asked for one job beyond the page, so ``has_more`` is
+        the truth of whether a further page exists rather than a guess from
+        a full page; the extra job is never rendered.
+        """
         bounded = max(1, min(limit, _LIST_LIMIT_MAXIMUM))
-        return self._store.list_jobs(organization_id=organization_id, limit=bounded, after=after)
+        fetched = self._store.list_jobs(
+            organization_id=organization_id, limit=bounded + 1, after=after
+        )
+        return BatchJobPage(jobs=tuple(fetched[:bounded]), has_more=len(fetched) > bounded)
 
     async def cancel(self, *, organization_id: str, batch_id: str) -> BatchJob:
         """Request cancellation of one owned, non-terminal job.

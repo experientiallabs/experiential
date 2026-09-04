@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.batch.contracts import (
     BatchCounts,
     BatchJob,
@@ -266,6 +267,49 @@ def test_anthropic_poll_maps_processing_states() -> None:
     assert snapshot.completed == 1 and snapshot.failed == 2
 
 
+def test_anthropic_ended_batch_under_a_cancel_intent_is_cancelled() -> None:
+    """A cancelling job whose provider batch ended with cut lines is CANCELLED; one
+    whose lines had all already run is COMPLETED (nothing was cancelled)."""
+
+    def ended(canceled: int) -> Callable[[httpx.Request], httpx.Response]:
+        """Serve one ended batch object with the given canceled count."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "processing_status": "ended",
+                    "request_counts": {
+                        "processing": 0,
+                        "succeeded": 2 - canceled,
+                        "errored": 0,
+                        "canceled": canceled,
+                        "expired": 0,
+                    },
+                },
+            )
+
+        return handler
+
+    cancelling = _job("anthropic").model_copy(update={"status": BatchStatus.CANCELLING})
+    cut = asyncio.run(
+        AnthropicBatchClient(transport=_transport(ended(1))).poll(job=cancelling, api_key="ak")
+    )
+    assert cut.status is BatchStatus.CANCELLED
+    assert cut.results_ready and cut.completed == 1 and cut.failed == 1
+    ran = asyncio.run(
+        AnthropicBatchClient(transport=_transport(ended(0))).poll(job=cancelling, api_key="ak")
+    )
+    assert ran.status is BatchStatus.COMPLETED and ran.completed == 2
+    # Without a cancel intent an ended batch is completed even if the provider
+    # cut lines for its own reasons; those lines settle as failures.
+    in_progress = _job("anthropic").model_copy(update={"status": BatchStatus.IN_PROGRESS})
+    plain = asyncio.run(
+        AnthropicBatchClient(transport=_transport(ended(1))).poll(job=in_progress, api_key="ak")
+    )
+    assert plain.status is BatchStatus.COMPLETED and plain.failed == 1
+
+
 def test_anthropic_results_follow_only_the_exact_host() -> None:
     """A spoofed results_url is refused before any credentialed fetch."""
 
@@ -313,6 +357,168 @@ def test_anthropic_results_parse_succeeded_and_errored_lines() -> None:
     results = asyncio.run(client.results(job=_job("anthropic"), api_key="ak"))
     assert results[0].output_tokens == 3 and results[0].error is None
     assert results[1].error == {"type": "invalid_request"}
+
+
+def _anthropic_results_client(lines: list[JsonObject]) -> AnthropicBatchClient:
+    """Serve one batch object plus the given results JSONL over the exact host."""
+    rendered = "\n".join(json.dumps(line) for line in lines)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/messages/batches/pb_1":
+            return httpx.Response(
+                200, json={"results_url": f"https://{ANTHROPIC_HOST}/v1/batches/pb_1/results"}
+            )
+        return httpx.Response(200, text=rendered)
+
+    return AnthropicBatchClient(transport=_transport(handler))
+
+
+def test_anthropic_results_fold_cache_legs_into_input_and_name_the_subsets() -> None:
+    """Anthropic reports input_tokens EXCLUDING the cache legs; the line total folds
+    them in (as the synchronous normalizer does) and names read and creation subsets."""
+    client = _anthropic_results_client(
+        [
+            {
+                "custom_id": "line-0",
+                "result": {
+                    "type": "succeeded",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 15,
+                            "cache_creation_input_tokens": 4501,
+                            "cache_read_input_tokens": 0,
+                            "output_tokens": 4,
+                        }
+                    },
+                },
+            },
+            {
+                "custom_id": "line-1",
+                "result": {
+                    "type": "succeeded",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 9,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 4501,
+                            "output_tokens": 16,
+                        }
+                    },
+                },
+            },
+        ]
+    )
+    results = {
+        r.custom_id: r for r in asyncio.run(client.results(job=_job("anthropic"), api_key="ak"))
+    }
+    written = results["line-0"]
+    assert (written.input_tokens, written.output_tokens) == (4516, 4)
+    assert written.cached_input_tokens == 0
+    assert written.cache_creation_input_tokens == 4501
+    assert written.reasoning_tokens is None
+    read = results["line-1"]
+    assert (read.input_tokens, read.output_tokens) == (4510, 16)
+    assert read.cached_input_tokens == 4501
+    assert read.cache_creation_input_tokens is None
+
+
+def test_anthropic_canceled_and_expired_lines_carry_a_reason() -> None:
+    """Results Anthropic never served carry no error object; the line still names why."""
+    client = _anthropic_results_client(
+        [
+            {"custom_id": "line-0", "result": {"type": "canceled"}},
+            {"custom_id": "line-1", "result": {"type": "expired"}},
+            {
+                "custom_id": "line-2",
+                "result": {
+                    "type": "errored",
+                    "error": {
+                        "type": "error",
+                        "error": {"type": "invalid_request_error", "message": "max_tokens: 0"},
+                    },
+                },
+            },
+        ]
+    )
+    results = asyncio.run(client.results(job=_job("anthropic", lines=3), api_key="ak"))
+    assert [r.error is not None for r in results] == [True, True, True]
+    assert results[0].failure_reason == "the provider canceled this request before it completed"
+    assert results[1].failure_reason == "the provider expired this request before it completed"
+    # An errored result keeps the provider's error object verbatim.
+    assert results[2].error is not None and results[2].error["type"] == "error"
+
+
+def test_openai_results_carry_cached_and_reasoning_subsets() -> None:
+    """Chat-shaped usage names cached prompt tokens and reasoning; total_tokens decides
+    whether reasoning was reported additively (fold) or as a subset (pass through)."""
+    subset = {
+        "custom_id": "line-0",
+        "response": {
+            "status_code": 200,
+            "body": {
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 40,
+                    "total_tokens": 140,
+                    "prompt_tokens_details": {"cached_tokens": 60},
+                    "completion_tokens_details": {"reasoning_tokens": 8},
+                }
+            },
+        },
+        "error": None,
+    }
+    additive = {
+        "custom_id": "line-1",
+        "response": {
+            "status_code": 200,
+            "body": {
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 40,
+                    "total_tokens": 148,
+                    "completion_tokens_details": {"reasoning_tokens": 8},
+                }
+            },
+        },
+        "error": None,
+    }
+    responses_shaped = {
+        "custom_id": "line-2",
+        "response": {
+            "status_code": 200,
+            "body": {
+                "usage": {
+                    "input_tokens": 50,
+                    "output_tokens": 20,
+                    "total_tokens": 70,
+                    "input_tokens_details": {"cached_tokens": 25},
+                    "output_tokens_details": {"reasoning_tokens": 5},
+                }
+            },
+        },
+        "error": None,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/batches/pb_1":
+            return httpx.Response(200, json={"status": "completed", "output_file_id": "fo"})
+        assert request.url.path == "/v1/files/fo/content"
+        return httpx.Response(
+            200, text="\n".join(json.dumps(line) for line in (subset, additive, responses_shaped))
+        )
+
+    client = OpenAIBatchClient(transport=_transport(handler))
+    by_id = {r.custom_id: r for r in asyncio.run(client.results(job=_job("openai"), api_key="sk"))}
+    assert (by_id["line-0"].input_tokens, by_id["line-0"].output_tokens) == (100, 40)
+    assert by_id["line-0"].cached_input_tokens == 60
+    assert by_id["line-0"].reasoning_tokens == 8
+    assert by_id["line-0"].cache_creation_input_tokens is None
+    assert (by_id["line-1"].input_tokens, by_id["line-1"].output_tokens) == (100, 48)
+    assert by_id["line-1"].cached_input_tokens is None
+    assert by_id["line-1"].reasoning_tokens == 8
+    assert (by_id["line-2"].input_tokens, by_id["line-2"].output_tokens) == (50, 20)
+    assert by_id["line-2"].cached_input_tokens == 25
+    assert by_id["line-2"].reasoning_tokens == 5
 
 
 def test_openrouter_submit_orders_fields_and_uses_one_model() -> None:

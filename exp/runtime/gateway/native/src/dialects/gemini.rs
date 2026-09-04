@@ -11,7 +11,9 @@ impl Normalizer {
     /// are skipped, whole function calls expand to start/arguments/completed,
     /// and the terminal candidate flushes the latest usage before its finish
     /// reason maps to the shared completion, incomplete, refusal, or
-    /// provider-internal outcome.
+    /// provider-internal outcome. A prompt-level block (`promptFeedback.
+    /// blockReason`, delivered with no candidates at all) is the same
+    /// content-free refusal a candidate-level safety finish produces.
     pub(super) fn feed_gemini(
         &mut self,
         frame: &crate::sse::SseEvent,
@@ -21,6 +23,21 @@ impl Normalizer {
             if !raw_usage.is_null() {
                 self.usage = Some(gemini_usage(raw_usage).map_err(|message| malformed(&message))?);
             }
+        }
+        if gemini_prompt_blocked(&payload)? {
+            // Google blocks the PROMPT itself as `promptFeedback.blockReason`
+            // with no candidates and no finishReason. Without this branch the
+            // frame reads as a usage-only trailer, the stream then ends with
+            // no terminal event, and a deterministic refusal is misfiled as a
+            // malformed response that retries and fails over (every lane
+            // blocks the same prompt). The provider counted the prompt, so
+            // the usage it reported settles before the refusal terminal.
+            let mut events = Vec::new();
+            if let Some(usage) = self.usage.take() {
+                events.push(Event::Usage(usage));
+            }
+            events.push(Event::Failed(refusal_failure()));
+            return Ok(events);
         }
         let candidates = match payload.get("candidates") {
             // A usage-only trailer frame legitimately carries no candidates at
@@ -147,6 +164,24 @@ impl Normalizer {
                 call: completed,
             },
         ])
+    }
+}
+
+/// Whether `promptFeedback` reports a prompt-level block: any `blockReason`
+/// other than the enum's unspecified default means Google refused the prompt
+/// before generating. An absent or null `promptFeedback`, or one that only
+/// carries `safetyRatings`, is not a block.
+fn gemini_prompt_blocked(payload: &serde_json::Map<String, Value>) -> Result<bool, Failure> {
+    let feedback = match payload.get("promptFeedback") {
+        None | Some(Value::Null) => return Ok(false),
+        Some(value) => value
+            .as_object()
+            .ok_or_else(|| malformed("Gemini promptFeedback must be an object"))?,
+    };
+    match feedback.get("blockReason") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(reason)) => Ok(reason != "BLOCK_REASON_UNSPECIFIED"),
+        Some(_) => Err(malformed("Gemini promptFeedback.blockReason must be text")),
     }
 }
 
@@ -342,6 +377,97 @@ mod gemini_tests {
                     "failure_class": "refusal",
                     "safe_message": "provider refused the request",
                 })]
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_prompt_block_is_a_content_free_refusal_with_its_usage() {
+        // The production shape (2026-09-04, gemini-3.7-flash and 3.8-flash
+        // via streamGenerateContent?alt=sse): one frame, no candidates, the
+        // block named on promptFeedback, and usageMetadata counting the
+        // prompt Google processed. It must terminate the stream as a refusal
+        // (400, no retry, no failover), never as a malformed stream end.
+        for reason in ["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "OTHER", "IMAGE_SAFETY"] {
+            let chunks = [sse(&json!({
+                "promptFeedback": {
+                    "blockReason": reason,
+                    "safetyRatings": [
+                        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}
+                    ],
+                },
+                "usageMetadata": {"promptTokenCount": 42, "totalTokenCount": 42},
+            }))];
+            let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+            let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+            assert!(failure.is_none(), "{reason}: a prompt block is a terminal, not a failure");
+            assert_eq!(
+                events,
+                vec![
+                    json!({
+                        "kind": "usage",
+                        "input_tokens": 42,
+                        "output_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "reasoning_tokens": null,
+                    }),
+                    json!({
+                        "kind": "failed",
+                        "failure_class": "refusal",
+                        "safe_message": "provider refused the request",
+                    }),
+                ],
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_prompt_block_without_usage_is_still_a_refusal() {
+        let chunks = [sse(&json!({"promptFeedback": {"blockReason": "SAFETY"}}))];
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![json!({
+                "kind": "failed",
+                "failure_class": "refusal",
+                "safe_message": "provider refused the request",
+            })]
+        );
+        // A refusal is the model's verdict on the prompt: neither redialed on
+        // the same deployment nor failed over to a sibling lane.
+        let refusal = refusal_failure();
+        assert!(!refusal.retryable_same_deployment);
+        assert!(!refusal.failover_eligible);
+    }
+
+    #[test]
+    fn gemini_unspecified_block_reason_and_ratings_only_feedback_are_not_blocks() {
+        // Ordinary answers carry promptFeedback.safetyRatings (and some carry
+        // the enum default) alongside real candidates; those must keep
+        // flowing as content.
+        for feedback in [
+            json!({"safetyRatings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "probability": "NEGLIGIBLE"}]}),
+            json!({"blockReason": "BLOCK_REASON_UNSPECIFIED"}),
+        ] {
+            let chunks = [
+                sse(&json!({
+                    "promptFeedback": feedback,
+                    "candidates": [{"content": {"parts": [{"text": "fine"}]}}],
+                })),
+                sse(&json!({"candidates": [{"finishReason": "STOP"}]})),
+            ];
+            let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+            let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+            assert!(failure.is_none());
+            assert_eq!(
+                events,
+                vec![
+                    json!({"kind": "text_delta", "text": "fine"}),
+                    json!({"kind": "completed"}),
+                ]
             );
         }
     }

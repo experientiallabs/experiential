@@ -59,8 +59,13 @@ def gemini_generate_response(
         The typed assistant action, served model identity, and observed economics.
 
     Raises:
+        ProviderRefusalError: Google blocked the prompt itself (``promptFeedback.blockReason``)
+            or stopped the candidate on a safety, copyright, or sensitive-information reason.
         ProviderResponseError: The response omits a usable candidate or has malformed content.
     """
+    prompt_block = _gemini_prompt_block_signal(payload)
+    if prompt_block is not None:
+        raise ProviderRefusalError(provider="gemini", signal=prompt_block)
     candidates = require_array(payload.get("candidates"), "Gemini candidates")
     if not candidates:
         raise ProviderResponseError("Gemini response has no candidates")
@@ -255,6 +260,32 @@ def _gemini_usage(payload: JsonObject) -> Usage | None:
             usage.get("cachedContentTokenCount"), "Gemini cachedContentTokenCount"
         ),
     )
+
+
+def _gemini_prompt_block_signal(payload: JsonObject) -> ProviderRefusalSignal | None:
+    """Map a prompt-level block to a content-free refusal category.
+
+    A blocked prompt arrives as ``promptFeedback.blockReason`` with no
+    candidates at all, so it must be read before the candidate contract is
+    enforced. ``BLOCK_REASON_UNSPECIFIED`` is the enum default and, like
+    ratings-only feedback, means the prompt was not blocked.
+
+    Args:
+        payload: Decoded Gemini response object.
+
+    Returns:
+        The refusal signal for a blocked prompt, or ``None`` when generation ran.
+    """
+    raw = payload.get("promptFeedback")
+    if raw is None:
+        return None
+    feedback = require_object(raw, "Gemini promptFeedback")
+    reason = feedback.get("blockReason")
+    if reason is None or reason == "BLOCK_REASON_UNSPECIFIED":
+        return None
+    if reason in {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "IMAGE_SAFETY"}:
+        return ProviderRefusalSignal.SAFETY
+    return ProviderRefusalSignal.PROVIDER_REFUSAL
 
 
 def _gemini_refusal_signal(value: object) -> ProviderRefusalSignal | None:

@@ -88,6 +88,41 @@ def test_line_result_output_object_shapes_success_and_error() -> None:
     assert failure.output_jsonl_object(line_id="x")["response"] is None
 
 
+def test_line_result_failure_reason_reads_the_provider_message_or_type() -> None:
+    """A served line has no reason; a failed line names the provider's message, else its type."""
+    served = BatchLineResult(custom_id="a", status_code=200, response={})
+    assert served.failure_reason is None
+    messaged = BatchLineResult(
+        custom_id="b", status_code=500, error={"type": "x", "message": "max_tokens must be >= 1"}
+    )
+    assert messaged.failure_reason == "max_tokens must be >= 1"
+    typed = BatchLineResult(custom_id="c", status_code=500, error={"type": "canceled"})
+    assert typed.failure_reason == "canceled"
+    bare = BatchLineResult(custom_id="d", status_code=500, error={"detail": 1})
+    assert bare.failure_reason == "the provider reported an error for this line"
+
+
+def test_line_result_carries_the_usage_subsets_by_their_sync_lane_names() -> None:
+    """The cached, cache-creation, and reasoning subsets ride the result, optional and named
+    exactly as the synchronous usage contract names them."""
+    result = BatchLineResult(
+        custom_id="a",
+        status_code=200,
+        response={},
+        input_tokens=100,
+        output_tokens=40,
+        cached_input_tokens=60,
+        cache_creation_input_tokens=10,
+        reasoning_tokens=8,
+    )
+    assert (result.cached_input_tokens, result.cache_creation_input_tokens) == (60, 10)
+    assert result.reasoning_tokens == 8
+    default = BatchLineResult(custom_id="b", status_code=200, response={})
+    assert default.cached_input_tokens is None
+    assert default.cache_creation_input_tokens is None
+    assert default.reasoning_tokens is None
+
+
 def test_job_public_object_is_openai_batch_shaped() -> None:
     """The public batch object carries the compatibility fields."""
     rendered = _job(status=BatchStatus.IN_PROGRESS).public_object()

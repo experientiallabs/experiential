@@ -41,9 +41,14 @@ class MemoryStore:
         self.jobs[job.batch_id] = job
 
     def list_jobs(self, *, organization_id: str, limit: int, after: str | None) -> list[BatchJob]:
-        """Return owned jobs newest first."""
+        """Return owned jobs newest first, starting strictly after ``after``."""
         owned = [job for job in self.jobs.values() if job.organization_id == organization_id]
-        owned.sort(key=lambda job: job.created_at, reverse=True)
+        owned.sort(key=lambda job: (job.created_at, job.batch_id), reverse=True)
+        if after is not None:
+            position = next(
+                (index for index, job in enumerate(owned) if job.batch_id == after), None
+            )
+            owned = [] if position is None else owned[position + 1 :]
         return owned[:limit]
 
     def open_jobs(self) -> list[BatchJob]:
@@ -123,6 +128,7 @@ class MemoryLedger:
         """Optionally reject the Nth reservation onward."""
         self.reserved: list[str] = []
         self.settled: list[tuple[str, int]] = []
+        self.settled_results: list[BatchLineResult] = []
         self.released: list[tuple[str, str]] = []
         self._reject_after = reject_after
 
@@ -136,6 +142,7 @@ class MemoryLedger:
     def settle_line(self, *, job: BatchJob, line: BatchLine, result: BatchLineResult) -> None:
         """Record one settlement."""
         self.settled.append((line.custom_id, result.output_tokens))
+        self.settled_results.append(result)
 
     def release_line(self, *, job: BatchJob, line: BatchLine, reason: str) -> None:
         """Record one release."""
@@ -416,8 +423,79 @@ def test_list_jobs_is_owner_scoped() -> None:
         input_file_id=file_id,
         endpoint="/v1/chat/completions",
     )
-    assert len(engine.list_jobs(organization_id="org_a")) == 1
-    assert engine.list_jobs(organization_id="org_b") == []
+    assert len(engine.list_jobs(organization_id="org_a").jobs) == 1
+    assert engine.list_jobs(organization_id="org_b").jobs == ()
+
+
+def test_list_jobs_reports_has_more_and_pages_by_cursor() -> None:
+    """has_more is true exactly while jobs remain after the page; the cursor walks them all."""
+    engine, _, _, _, _ = _engine()
+    submitted: list[str] = []
+    for custom_id in ("a", "b", "c"):
+        file_id = _upload(engine, [_chat_line(custom_id)])
+        job = engine.submit(
+            organization_id="org_a",
+            identity_id="id_a",
+            input_file_id=file_id,
+            endpoint="/v1/chat/completions",
+        )
+        submitted.append(job.batch_id)
+    seen: list[str] = []
+    after: str | None = None
+    flags: list[bool] = []
+    for _ in range(4):
+        page = engine.list_jobs(organization_id="org_a", limit=1, after=after)
+        if not page.jobs:
+            break
+        assert len(page.jobs) == 1
+        seen.append(page.jobs[0].batch_id)
+        flags.append(page.has_more)
+        after = page.jobs[0].batch_id
+    assert seen == list(reversed(submitted))
+    assert flags == [True, True, False]
+    whole = engine.list_jobs(organization_id="org_a", limit=3)
+    assert len(whole.jobs) == 3 and whole.has_more is False
+
+
+def test_settlement_hands_the_host_failed_lines_with_their_reason() -> None:
+    """A per-line provider error settles as a failure carrying the reason, not as served."""
+    results = [
+        BatchLineResult(
+            custom_id="a",
+            status_code=200,
+            response={"usage": {"prompt_tokens": 3, "completion_tokens": 5}},
+            input_tokens=3,
+            output_tokens=5,
+        ),
+        BatchLineResult(
+            custom_id="b",
+            status_code=500,
+            error={"type": "invalid_request_error", "message": "max_tokens must be at least 1"},
+        ),
+    ]
+    client = ScriptedClient(
+        [ProviderBatchSnapshot(status=BatchStatus.COMPLETED, results_ready=True)], results
+    )
+    engine, store, files, ledger, _ = _engine(client=client)
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("b")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+    asyncio.run(engine.poll_once())
+    final = store.jobs[job.batch_id]
+    assert final.status is BatchStatus.COMPLETED and final.settled
+    assert final.counts.completed == 1 and final.counts.failed == 1
+    by_id = {result.custom_id: result for result in ledger.settled_results}
+    assert by_id["a"].failure_reason is None
+    assert by_id["b"].failure_reason == "max_tokens must be at least 1"
+    assert ledger.released == []
+    assert final.error_file_id is not None
+    error_file = files.records[final.error_file_id][1].decode("utf-8")
+    assert "max_tokens must be at least 1" in error_file
 
 
 def test_interrupted_dispatch_fails_closed_without_resubmitting() -> None:

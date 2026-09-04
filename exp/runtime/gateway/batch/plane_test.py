@@ -121,6 +121,51 @@ def test_file_roundtrip_and_batch_lifecycle_through_the_plane() -> None:
     assert base64.b64decode(roundtrip["content_b64"]) == content
 
 
+def test_batch_list_paginates_with_a_truthful_has_more() -> None:
+    """limit=1 over three jobs walks three pages; has_more turns false on the last."""
+    plane = _plane()
+    created: list[str] = []
+    for custom_id in ("a", "b", "c"):
+        content = _chat_line(custom_id).encode("utf-8")
+        _, file_object = _call(
+            plane,
+            "file_create",
+            filename="input.jsonl",
+            purpose="batch",
+            content_b64=base64.b64encode(content).decode("ascii"),
+        )
+        _, batch_object = _call(
+            plane,
+            "batch_create",
+            input_file_id=file_object["id"],
+            endpoint="/v1/chat/completions",
+        )
+        created.append(batch_object["id"])
+    pages: list[tuple[list[str], bool]] = []
+    after: str | None = None
+    for _ in range(4):
+        payload: dict[str, object] = {"limit": 1}
+        if after is not None:
+            payload["after"] = after
+        status, listing = _call(plane, "batch_list", **payload)
+        assert status == 200 and listing["object"] == "list"
+        ids = [item["id"] for item in listing["data"]]
+        if not ids:
+            break
+        assert listing["first_id"] == ids[0] and listing["last_id"] == ids[-1]
+        pages.append((ids, listing["has_more"]))
+        after = listing["last_id"]
+    assert [ids for ids, _ in pages] == [[created[2]], [created[1]], [created[0]]]
+    assert [has_more for _, has_more in pages] == [True, True, False]
+    status, everything = _call(plane, "batch_list", limit=10)
+    assert status == 200
+    assert [item["id"] for item in everything["data"]] == list(reversed(created))
+    assert everything["has_more"] is False
+    status, empty = _call(plane, "batch_list", after=created[0])
+    assert status == 200 and empty["data"] == [] and empty["has_more"] is False
+    assert empty["first_id"] is None and empty["last_id"] is None
+
+
 def test_submit_rejection_maps_to_the_openai_error_envelope() -> None:
     """A validation refusal renders status 400 with the message."""
     plane = _plane()

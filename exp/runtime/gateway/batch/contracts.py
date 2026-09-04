@@ -86,8 +86,14 @@ class BatchLineError(ContractModel):
 class BatchLineResult(ContractModel):
     """One settled output line, OpenAI batch output JSONL compatible.
 
-    Exactly one of ``response`` and ``error`` is populated. ``usage`` carries
-    the provider-reported token counts the host settles against.
+    Exactly one of ``response`` and ``error`` is populated. The token fields
+    carry the provider-reported usage the host settles against, named exactly
+    as the synchronous lane's usage contract names them: ``cached_input_tokens``
+    and ``cache_creation_input_tokens`` are subsets of ``input_tokens`` and
+    ``reasoning_tokens`` is a subset of ``output_tokens``; they price portions
+    of the totals and are never added a second time. A result carrying
+    ``error`` is a line the provider terminally failed, canceled, or expired:
+    it produced no billable output and ``failure_reason`` names why.
     """
 
     custom_id: str
@@ -96,6 +102,9 @@ class BatchLineResult(ContractModel):
     error: JsonObject | None = None
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_input_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens: int | None = Field(default=None, ge=0)
     settled_micro_usd: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
@@ -104,6 +113,22 @@ class BatchLineResult(ContractModel):
         if (self.response is None) == (self.error is None):
             raise ValueError("exactly one of response or error must be set")
         return self
+
+    @property
+    def failure_reason(self) -> str | None:
+        """The provider's own reason for a failed line, or None for a served one.
+
+        Reads ``error.message`` when the provider wrote one, else the error's
+        ``type`` or ``code``, so a host ledger can record a failed attempt
+        with a reason instead of a completed attempt with zero tokens.
+        """
+        if self.error is None:
+            return None
+        for key in ("message", "type", "code"):
+            value = self.error.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return "the provider reported an error for this line"
 
     def output_jsonl_object(self, *, line_id: str) -> JsonObject:
         """Render the OpenAI batch output line for this result."""
@@ -213,6 +238,13 @@ class BatchJob(ContractModel):
             },
             "metadata": self.metadata or None,
         }
+
+
+class BatchJobPage(ContractModel):
+    """One page of an organization's jobs plus whether a further page exists."""
+
+    jobs: tuple[BatchJob, ...]
+    has_more: bool
 
 
 class BatchFile(ContractModel):

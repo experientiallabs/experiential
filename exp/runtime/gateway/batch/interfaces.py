@@ -35,7 +35,13 @@ class BatchStore(Protocol):
         ...
 
     def list_jobs(self, *, organization_id: str, limit: int, after: str | None) -> list[BatchJob]:
-        """Return the organization's jobs, newest first, paged by batch id."""
+        """Return the organization's jobs, newest first, paged by batch id.
+
+        ``after`` names the last job of the previous page; the result starts
+        strictly after it in the same newest-first order. The engine asks for
+        one job more than the page it renders to learn whether a further page
+        exists, so ``limit`` must be honored exactly.
+        """
         ...
 
     def open_jobs(self) -> list[BatchJob]:
@@ -104,7 +110,14 @@ class BatchLedger(Protocol):
         ...
 
     def settle_line(self, *, job: BatchJob, line: BatchLine, result: BatchLineResult) -> None:
-        """Settle one line's actual usage against its reservation, idempotently."""
+        """Settle one line's actual usage against its reservation, idempotently.
+
+        A result carrying ``response`` settles the reported totals with their
+        cached-input, cache-creation, and reasoning subsets. A result carrying
+        ``error`` is a line the provider failed, canceled, or expired: settle it
+        as a FAILED attempt with ``result.failure_reason`` and no usage, never
+        as a completed attempt with zero tokens.
+        """
         ...
 
     def release_line(self, *, job: BatchJob, line: BatchLine, reason: str) -> None:

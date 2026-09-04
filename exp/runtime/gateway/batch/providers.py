@@ -15,7 +15,7 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import Field
+from pydantic import Field, JsonValue
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.runtime.gateway.batch.contracts import (
@@ -98,18 +98,98 @@ def require_exact_host(url: str, host: str) -> str:
     return url
 
 
-def _usage_tokens(body: JsonObject | None) -> tuple[int, int]:
-    """Extract provider-reported input and output token counts from one body."""
+class _LineUsage(ContractModel):
+    """Provider-reported usage of one served line, in the synchronous lane's shape.
+
+    ``input_tokens`` and ``output_tokens`` are the billable totals; the three
+    optional counts are subsets of them (cached and cache-creation legs of the
+    input, reasoning inside the output) that the host prices separately.
+    """
+
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_input_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens: int | None = Field(default=None, ge=0)
+
+
+def _count(value: object) -> int | None:
+    """Read one non-negative integer count, or None for anything else."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _detail_count(usage: JsonObject, detail_keys: tuple[str, ...], key: str) -> int | None:
+    """Read ``key`` from the first present ``*_details`` object among ``detail_keys``."""
+    for detail_key in detail_keys:
+        details = usage.get(detail_key)
+        if isinstance(details, dict):
+            return _count(details.get(key))
+    return None
+
+
+def _line_usage(body: JsonObject | None) -> _LineUsage:
+    """Extract one served line's usage across the three provider wire shapes.
+
+    Chat Completions bodies report ``prompt_tokens``/``completion_tokens`` with
+    ``prompt_tokens_details.cached_tokens`` and
+    ``completion_tokens_details.reasoning_tokens``; Responses bodies report
+    ``input_tokens``/``output_tokens`` with the ``input_tokens_details`` and
+    ``output_tokens_details`` equivalents; Anthropic messages report
+    ``input_tokens`` EXCLUDING the ``cache_read_input_tokens`` and
+    ``cache_creation_input_tokens`` legs, which fold into the input total here
+    exactly as the synchronous Anthropic normalizer folds them. Reasoning
+    follows the synchronous rule for OpenAI-shaped usage: the provider's
+    ``total_tokens`` decides whether reasoning was reported additively (then
+    it folds into the output total) or as a subset (then the output total
+    passes through); without a decisive total, a reasoning count above the
+    output total is additive. A body without a usage object yields zeros.
+    """
     if not isinstance(body, dict):
-        return (0, 0)
+        return _LineUsage()
     usage = body.get("usage")
     if not isinstance(usage, dict):
-        return (0, 0)
-    prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0))
-    completion = usage.get("completion_tokens", usage.get("output_tokens", 0))
-    input_tokens = prompt if isinstance(prompt, int) and prompt >= 0 else 0
-    output_tokens = completion if isinstance(completion, int) and completion >= 0 else 0
-    return (input_tokens, output_tokens)
+        return _LineUsage()
+    reported_input = _count(usage.get("prompt_tokens", usage.get("input_tokens"))) or 0
+    reported_output = _count(usage.get("completion_tokens", usage.get("output_tokens"))) or 0
+    cache_read = _count(usage.get("cache_read_input_tokens"))
+    cache_creation = _count(usage.get("cache_creation_input_tokens"))
+    cached = _detail_count(
+        usage, ("prompt_tokens_details", "input_tokens_details"), "cached_tokens"
+    )
+    reasoning = _detail_count(
+        usage, ("completion_tokens_details", "output_tokens_details"), "reasoning_tokens"
+    )
+    input_tokens = reported_input + (cache_read or 0) + (cache_creation or 0)
+    if cached is None and (cache_read is not None or cache_creation is not None):
+        cached = cache_read or 0
+    output_tokens = reported_output
+    if reasoning:
+        total = _count(usage.get("total_tokens"))
+        if total == reported_input + reported_output:
+            additive = False
+        elif total == reported_input + reported_output + reasoning:
+            additive = True
+        else:
+            additive = reasoning > reported_output
+        if additive:
+            output_tokens = reported_output + reasoning
+    return _LineUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_input_tokens=cached,
+        cache_creation_input_tokens=cache_creation if cache_creation else None,
+        reasoning_tokens=reasoning,
+    )
+
+
+def _served_line(custom_id: str, status_code: int, body: JsonObject) -> BatchLineResult:
+    """Build one served line result carrying the body's usage in full."""
+    return BatchLineResult(
+        custom_id=custom_id,
+        status_code=status_code,
+        response=body,
+        **_line_usage(body).model_dump(),
+    )
 
 
 _PROVIDER_ERROR_DETAIL_LIMIT = 400
@@ -211,14 +291,7 @@ def _parse_output_line(raw: JsonObject) -> BatchLineResult | None:
             return None
         if code >= 400:
             return BatchLineResult(custom_id=custom_id, status_code=code, error=body)
-        input_tokens, output_tokens = _usage_tokens(body)
-        return BatchLineResult(
-            custom_id=custom_id,
-            status_code=code,
-            response=body,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
+        return _served_line(custom_id, code, body)
     if isinstance(error, dict):
         return BatchLineResult(custom_id=custom_id, status_code=500, error=error)
     return None
@@ -339,6 +412,30 @@ class OpenAIBatchClient:
             await _checked(response, action="batch cancel")
 
 
+_ANTHROPIC_UNSERVED_REASONS: dict[str, str] = {
+    "canceled": "the provider canceled this request before it completed",
+    "expired": "the provider expired this request before it completed",
+}
+
+
+def _anthropic_line_error(kind: str, error: JsonValue | None) -> JsonObject:
+    """Shape one non-succeeded Anthropic result as a line error with a reason.
+
+    An ``errored`` result carries the provider's own error object (its
+    ``message`` is the reason). ``canceled`` and ``expired`` results carry no
+    error object at all, so the reason is written here: the host ledgers the
+    line as failed WITH a cause, never as completed with zero tokens.
+    """
+    if isinstance(error, dict):
+        return error
+    return {
+        "type": kind,
+        "message": _ANTHROPIC_UNSERVED_REASONS.get(
+            kind, f"the provider reported this request as {kind}"
+        ),
+    }
+
+
 class AnthropicBatchClient:
     """Anthropic Message Batches: inline requests, results via a returned URL."""
 
@@ -388,13 +485,19 @@ class AnthropicBatchClient:
         counts = counts if isinstance(counts, dict) else {}
         processing = str(body.get("processing_status", "in_progress"))
         succeeded = _int_count(counts, "succeeded")
-        errored = (
-            _int_count(counts, "errored")
-            + _int_count(counts, "canceled")
-            + _int_count(counts, "expired")
-        )
+        canceled = _int_count(counts, "canceled")
+        errored = _int_count(counts, "errored") + canceled + _int_count(counts, "expired")
         if processing == "ended":
-            status = BatchStatus.COMPLETED
+            # Anthropic ends a canceled batch with the same "ended" status as a
+            # completed one; only the per-line counts say what happened. A job
+            # the caller asked to cancel ends CANCELLED when the provider cut at
+            # least one line short, and COMPLETED when every line had already
+            # run (nothing was cancelled, and every line is billed).
+            status = (
+                BatchStatus.CANCELLED
+                if job.status is BatchStatus.CANCELLING and canceled > 0
+                else BatchStatus.COMPLETED
+            )
         elif processing == "canceling":
             status = BatchStatus.CANCELLING
         else:
@@ -440,24 +543,13 @@ class AnthropicBatchClient:
                 continue
             kind = result.get("type")
             if kind == "succeeded" and isinstance(result.get("message"), dict):
-                message = result["message"]
-                input_tokens, output_tokens = _usage_tokens(message)
-                parsed.append(
-                    BatchLineResult(
-                        custom_id=custom_id,
-                        status_code=200,
-                        response=message,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                    )
-                )
+                parsed.append(_served_line(custom_id, 200, result["message"]))
             else:
-                error = result.get("error")
                 parsed.append(
                     BatchLineResult(
                         custom_id=custom_id,
                         status_code=500,
-                        error=error if isinstance(error, dict) else {"type": str(kind)},
+                        error=_anthropic_line_error(str(kind), result.get("error")),
                     )
                 )
         return parsed

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     AssistantAction,
     EmbeddingClient,
@@ -22,6 +23,7 @@ from exp.runtime.models.providers.anthropic import (
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
+    ProviderResponseError,
     ProviderRetryableResponseError,
 )
 from exp.runtime.models.providers.gemini import GeminiClient, gemini_generate_response
@@ -666,6 +668,44 @@ def test_native_provider_refusals_are_typed_without_exposing_refusal_text() -> N
         )
     assert gemini_error.value.signal is ProviderRefusalSignal.SAFETY
     assert "gemini-refusal-canary" not in str(gemini_error.value)
+
+
+def test_gemini_prompt_block_is_a_refusal_not_a_malformed_response() -> None:
+    """A blocked PROMPT has no candidates: it is the provider's refusal, never
+    a "no candidates" response error that would retry and fail over."""
+    blocked: JsonObject = {
+        "promptFeedback": {
+            "blockReason": "PROHIBITED_CONTENT",
+            "safetyRatings": [
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "HIGH"}
+            ],
+        },
+        "usageMetadata": {"promptTokenCount": 42, "totalTokenCount": 42},
+    }
+    with pytest.raises(ProviderRefusalError) as blocked_error:
+        gemini_generate_response(
+            blocked, configured_model=_snapshot("gemini", "gemini-fixture"), latency_seconds=0.1
+        )
+    assert blocked_error.value.signal is ProviderRefusalSignal.SAFETY
+    with pytest.raises(ProviderRefusalError) as other_error:
+        gemini_generate_response(
+            {"promptFeedback": {"blockReason": "OTHER"}},
+            configured_model=_snapshot("gemini", "gemini-fixture"),
+            latency_seconds=0.1,
+        )
+    assert other_error.value.signal is ProviderRefusalSignal.PROVIDER_REFUSAL
+    # Ratings-only feedback and the enum default are not blocks: the
+    # candidate contract still applies to those responses.
+    for feedback in (
+        {"safetyRatings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "probability": "LOW"}]},
+        {"blockReason": "BLOCK_REASON_UNSPECIFIED"},
+    ):
+        with pytest.raises(ProviderResponseError, match="no candidates"):
+            gemini_generate_response(
+                {"promptFeedback": feedback, "candidates": []},
+                configured_model=_snapshot("gemini", "gemini-fixture"),
+                latency_seconds=0.1,
+            )
 
 
 def test_anthropic_completed_thinking_blocks_are_accepted() -> None:
