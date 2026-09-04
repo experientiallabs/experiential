@@ -43,9 +43,13 @@ def terminal_from_settlement(
     failure_payload = data.get("failure")
     failure = None
     if isinstance(failure_payload, dict):
+        provider_detail = failure_payload.get("provider_detail")
         failure = GatewayFailure(
             failure_class=GatewayFailureClass(str(failure_payload["failure_class"])),
             safe_message=str(failure_payload["safe_message"]),
+            provider_detail=(
+                provider_detail if isinstance(provider_detail, str) and provider_detail else None
+            ),
         )
     kind = _TERMINAL_KINDS[str(data["outcome"])]
     terminal = GatewayEvent(

@@ -140,6 +140,8 @@ def test_initial_database_is_private_wal_with_foreign_keys(tmp_path: Path) -> No
         assert "budget_period_start" in attempt_columns
         assert "budget_reserved_micro_usd" in attempt_columns
         assert "budget_settled_micro_usd" in attempt_columns
+        # v16 retains the provider's sanitized rejection sentence.
+        assert "failure_message" in attempt_columns
         assert (
             connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE name = 'gateway_monthly_budgets'"

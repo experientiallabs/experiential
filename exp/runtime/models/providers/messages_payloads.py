@@ -19,7 +19,11 @@ from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
-from exp.runtime.models.providers.reasoning_compat import anthropic_reasoning_effort
+from exp.runtime.models.providers.reasoning_compat import (
+    anthropic_budgeted_enabled_only,
+    anthropic_reasoning_effort,
+    anthropic_thinking_budget_tokens,
+)
 from exp.runtime.models.providers.wire_messages import anthropic_blocks
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
@@ -207,6 +211,20 @@ def anthropic_messages_stream_payload(
         payload["cache_control"] = request.provider_cache_control
     if request.inference_geo is not None:
         payload["inference_geo"] = request.inference_geo
+    # A budgeted-enabled-only model (haiku-4-5) rejects ``thinking.type:
+    # adaptive`` and ``output_config.effort`` by NAME: its reasoning dial is a
+    # token budget, not the effort ladder. An effort reaching this seam is the
+    # caller's depth intent, so it is realized as a derived budget — the same
+    # wire realization the effort generation gets via the adaptive object.
+    budgeted_only = supports_reasoning and anthropic_budgeted_enabled_only(model_id)
+    if budgeted_only and "effort" in output_config and request.reasoning_effort is not None:
+        # A recognized caller effort rides request.reasoning_effort too (decode
+        # maps it) and is realized as the token budget below, so the by-name-
+        # rejected output_config key comes off the wire. An UNRECOGNIZED effort
+        # never mapped, has no budget realization, and stays verbatim — the
+        # provider's own by-name rejection is the honest outcome, never a
+        # silent thinking-off answer.
+        output_config.pop("effort")
     if request.provider_thinking_config is not None:
         # The caller's exact thinking configuration wins over the catalog's
         # adaptive default and travels verbatim, so budget semantics are
@@ -217,13 +235,21 @@ def anthropic_messages_stream_payload(
         if (
             request.provider_thinking_config.get("type") == "adaptive"
             and supports_reasoning
+            and not budgeted_only
             and effective_reasoning_effort is not None
             and "effort" not in output_config
         ):
             output_config["effort"] = anthropic_reasoning_effort(
                 model_id, effective_reasoning_effort
             )
-    elif supports_reasoning and effective_reasoning_effort is not None:
+    elif budgeted_only and effective_reasoning_effort not in (None, "none"):
+        # No legal budget under the output ceiling means thinking stays off;
+        # the model still answers, and route narrowing already disclosed any
+        # sampling interplay. output_config.effort is never emitted here.
+        budget = anthropic_thinking_budget_tokens(request.maximum_output_tokens)
+        if budget is not None:
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+    elif supports_reasoning and not budgeted_only and effective_reasoning_effort is not None:
         payload["thinking"] = {"type": "adaptive"}
         if "effort" not in output_config:
             output_config["effort"] = anthropic_reasoning_effort(

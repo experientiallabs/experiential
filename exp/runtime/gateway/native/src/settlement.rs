@@ -81,6 +81,10 @@ fn settle_argument(
         "failure": failure.map(|failure| json!({
             "failure_class": failure.failure_class.as_str(),
             "safe_message": failure.safe_message,
+            // The provider's own sanitized rejection sentence (client-error
+            // class only); accounting persists it on the failed-attempt row so
+            // an operator sees WHY the provider refused the call.
+            "provider_detail": failure.provider_detail,
         })),
         "finalize": finalize,
         "opened": opened,
@@ -447,5 +451,46 @@ mod tests {
         let without = settle_argument("req", "att", "completed", None, &[], None, true, true, None);
         let parsed: Value = serde_json::from_str(&without).expect("valid json");
         assert_eq!(parsed["first_token_at"], Value::Null);
+    }
+
+    #[test]
+    fn settle_argument_carries_the_sanitized_provider_detail_on_a_failed_attempt() {
+        let failure = Failure::new(FailureClass::InvalidRequest, "provider rejected")
+            .with_provider_detail(Some(
+                "max_tokens must be greater than thinking budget.".into(),
+            ));
+        let argument = settle_argument(
+            "req",
+            "att",
+            "failed",
+            None,
+            &[],
+            Some(&failure),
+            true,
+            true,
+            None,
+        );
+        let parsed: Value = serde_json::from_str(&argument).expect("valid json");
+        assert_eq!(parsed["failure"]["failure_class"], "invalid_request");
+        assert_eq!(
+            parsed["failure"]["provider_detail"],
+            "max_tokens must be greater than thinking budget."
+        );
+        // A failure with no provider explanation carries an explicit null, which
+        // the control plane parses back to None.
+        let bare = Failure::new(FailureClass::ProviderInternal, "provider failed");
+        let bare_argument = settle_argument(
+            "req",
+            "att",
+            "failed",
+            None,
+            &[],
+            Some(&bare),
+            true,
+            true,
+            None,
+        );
+        let parsed: Value = serde_json::from_str(&bare_argument).expect("valid json");
+        assert_eq!(parsed["failure"]["provider_detail"], Value::Null);
     }
 }

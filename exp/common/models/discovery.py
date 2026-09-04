@@ -179,10 +179,17 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
         discovered.supports_top_k,
         known.supports_top_k if known else None,
     )
-    supports_reasoning = _proven(
-        discovered.supports_reasoning,
-        known.supports_reasoning_effort if known else None,
-    )
+    # An explicit known.supports_reasoning wins (a budgeted-enabled model
+    # reasons without an effort ladder); absent it, the historical derivation
+    # from supports_reasoning_effort is preserved for backward compatibility.
+    known_reasoning: bool | None = None
+    if known is not None:
+        known_reasoning = (
+            known.supports_reasoning
+            if known.supports_reasoning is not None
+            else known.supports_reasoning_effort
+        )
+    supports_reasoning = _proven(discovered.supports_reasoning, known_reasoning)
     capabilities = ModelCapabilities(
         supports_tools=_proven(
             discovered.supports_tools,
