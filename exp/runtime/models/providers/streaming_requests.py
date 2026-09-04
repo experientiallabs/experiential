@@ -44,6 +44,8 @@ from exp.runtime.models.providers.reasoning_compat import (
     REASONING_EFFORTS,
     anthropic_adaptive_only_thinking,
     anthropic_budgeted_enabled_only,
+    efforts_by_nearness,
+    thinking_config_reasoning_effort,
 )
 
 if TYPE_CHECKING:
@@ -64,6 +66,24 @@ because the caller can re-send those differently.
 
 TOOL_RESULT_IMAGE_PLACEHOLDER = "[image omitted: this model route cannot carry tool-result images]"
 """Text substituted for each dropped tool-result image, in block position."""
+
+TOOL_ERROR_FOLD_DISCLOSURE = "messages.content.is_error->content"
+"""Disclosure recorded when a tool-result error flag folds into result text.
+
+Only the Anthropic wire has a ``tool_result.is_error`` field; every other
+wire receives the flag as a fixed text prefix on the result (see
+``folded_tool_error_content``). The flag is baked into the caller's history
+on every failed tool call, so a rejection wedges the whole session, and a
+silent drop would misstate that the invocation failed.
+"""
+
+OPENAI_MINIMUM_OUTPUT_TOKENS = 16
+"""Smallest ``max_output_tokens`` the OpenAI wires accept.
+
+The provider rejects lower values by name ("Expected a value >= 16"), while
+the Anthropic surface legally carries ``max_tokens`` down to 1, so
+Messages-surface requests below the floor are raised to it with disclosure.
+"""
 
 
 def strip_tool_result_images(
@@ -340,6 +360,22 @@ def route_generation_parameter_requests(
                 param=param,
                 code="invalid_parameter",
             )
+        if (
+            request.surface == GatewayApiSurface.MESSAGES
+            and request.maximum_output_tokens < OPENAI_MINIMUM_OUTPUT_TOKENS
+            and any(
+                profile.dialect in {"openai_responses", "openai_compatible"} for profile in profiles
+            )
+        ):
+            # Anthropic accepts max_tokens down to 1 (Claude Code probes with
+            # exactly that after a /model switch) while OpenAI rejects
+            # max_output_tokens below 16, so the translated value rides the
+            # provider floor with disclosure instead of surfacing a provider
+            # 400 the caller cannot act on.
+            provider_updates["maximum_output_tokens"] = OPENAI_MINIMUM_OUTPUT_TOKENS
+            path = f"max_tokens->{OPENAI_MINIMUM_OUTPUT_TOKENS}"
+            if path not in ignored:
+                ignored.append(path)
     elif any(profile.dialect == "anthropic_messages" for profile in profiles):
         # Anthropic requires max_tokens even when the public surface does not.
         # Pin one route-wide default so every waterfall rung sees the same
@@ -584,17 +620,18 @@ def route_generation_parameter_requests(
             if TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in ignored:
                 ignored.append(TOOL_RESULT_IMAGE_DROP_DISCLOSURE)
 
+    # Only the Anthropic wire has a tool-result error flag. Every other wire
+    # folds the flag into the result text at encoding (a fixed prefix, see
+    # ``folded_tool_error_content``) so the model still learns the invocation
+    # failed: rejecting wedges the session (the flag is baked into history and
+    # Claude Code sets it on every failed tool call), and dropping it silently
+    # would misstate what the tool did. Anthropic rungs keep the flag
+    # verbatim; the route-level disclosure records the fold.
     if any(message.tool_is_error for message in request.messages) and not all(
         profile.dialect == "anthropic_messages" for profile in profiles
     ):
-        raise ProviderParameterError(
-            message=(
-                "The parameter 'messages.content.is_error' is not supported by this model "
-                "route. Remove the field or choose a native Anthropic-only route."
-            ),
-            param="messages.content.is_error",
-            code="unsupported_parameter",
-        )
+        if TOOL_ERROR_FOLD_DISCLOSURE not in ignored:
+            ignored.append(TOOL_ERROR_FOLD_DISCLOSURE)
 
     # Context editing is Anthropic-native; any other rung cannot honor it,
     # so the omission is disclosed and the field dropped from dispatch,
@@ -726,23 +763,59 @@ def route_generation_parameter_requests(
 
     # Opaque provider-reasoning carriers replay only on the one wire that
     # issued them, so a mixed waterfall is rejected instead of dropping them.
-    anthropic_reasoning_present = request.provider_thinking_config is not None or any(
+    history_thinking_present = any(
         block.kind in {"thinking", "redacted_thinking"}
         for message in request.messages
         for block in message.provider_reasoning
     )
-    if anthropic_reasoning_present and not all(
-        profile.dialect == "anthropic_messages" for profile in profiles
-    ):
+    non_anthropic_route = not all(profile.dialect == "anthropic_messages" for profile in profiles)
+    if history_thinking_present and non_anthropic_route:
         raise ProviderParameterError(
             message=(
-                "The parameter 'thinking' is not supported by this model route. "
-                "Remove extended-thinking content or choose a native Anthropic-only route."
+                "The request replays Anthropic extended-thinking blocks that only a "
+                "native Anthropic route can carry. Remove extended-thinking content "
+                "or choose a native Anthropic-only route."
             ),
             param="thinking",
             code="unsupported_parameter",
         )
-    if request.provider_thinking_config is not None:
+    if request.provider_thinking_config is not None and non_anthropic_route:
+        # A thinking CONFIG (unlike replayed thinking blocks) has a serviceable
+        # cross-wire reading, and Claude Code pins one on every model, so a
+        # named rejection here makes whole sessions unusable against models
+        # the provider itself serves fine. An explicit caller effort is the
+        # same reasoning channel already stated in the route's own vocabulary,
+        # so it wins verbatim and the config drops with one disclosure.
+        # Otherwise the budget translates to the nearest effort the route
+        # supports (the table in ``thinking_config_reasoning_effort``),
+        # disclosed as a translation; a route with no reasoning rung drops the
+        # config with disclosure instead (the #717 pattern).
+        if request.reasoning_effort is not None:
+            ignore("provider_thinking_config", "thinking")
+        else:
+            portable_thinking_efforts = set(REASONING_EFFORTS)
+            for profile in profiles:
+                portable_thinking_efforts.intersection_update(_profile_reasoning_efforts(profile))
+            requested_tier = thinking_config_reasoning_effort(request.provider_thinking_config)
+            if requested_tier != "none":
+                # An active thinking config asked for reasoning; snapping it
+                # to 'none' would silently disable reasoning while calling it
+                # a translation, so a route whose only level is 'none' takes
+                # the disclosed drop below instead.
+                portable_thinking_efforts.discard("none")
+            translated = next(
+                iter(efforts_by_nearness(requested_tier, portable_thinking_efforts)),
+                None,
+            )
+            if translated is not None:
+                provider_updates["provider_thinking_config"] = None
+                provider_updates["reasoning_effort"] = translated
+                path = f"thinking->reasoning_effort:{translated}"
+                if path not in ignored:
+                    ignored.append(path)
+            else:
+                ignore("provider_thinking_config", "thinking")
+    if request.provider_thinking_config is not None and not non_anthropic_route:
         # The adaptive-thinking generation rejects caller enabled/disabled
         # configs outright, so verbatim forwarding is family-gated (a route
         # is one exact-model pool, so the answer is uniform across rungs).

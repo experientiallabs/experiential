@@ -400,6 +400,27 @@ class GatewayMessage(ContractModel):
         """Return this message's retained document parts in caller order."""
         return tuple(part for part in self.content_parts if part.kind == "document")
 
+    def folded_tool_error_content(self) -> str:
+        """Return this tool result's text with ``tool_is_error`` folded in.
+
+        Only the Anthropic wire has a native ``tool_result.is_error`` field;
+        every other wire re-states the flag in the one channel it has (the
+        result text, prefixed with :data:`TOOL_ERROR_TEXT_PREFIX`) so the
+        model still learns the invocation failed. The fold derives from the
+        canonical flag on each request, never from previously folded text, so
+        a replayed history can never accumulate prefixes.
+        """
+        content = self.content or ""
+        if self.tool_is_error:
+            return f"{TOOL_ERROR_TEXT_PREFIX}{content}"
+        return content
+
+
+TOOL_ERROR_TEXT_PREFIX = "[tool error] "
+"""Prefix folding Anthropic's ``tool_result.is_error`` into plain result text
+on wires without a native error flag (see
+:meth:`GatewayMessage.folded_tool_error_content`)."""
+
 
 class GatewayRequest(ContractModel):
     """Lossless canonical request shared by protocol and provider implementations."""

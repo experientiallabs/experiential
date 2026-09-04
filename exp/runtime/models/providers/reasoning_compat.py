@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from typing import cast
 
 from exp.common.models.known_models import canonical_model_id, known_model_metadata
@@ -243,6 +243,59 @@ def anthropic_thinking_budget_tokens(maximum_output_tokens: int | None) -> int |
     if MINIMUM_THINKING_BUDGET_TOKENS <= budget < maximum_output_tokens:
         return budget
     return None
+
+
+THINKING_BUDGET_EFFORT_TIERS: tuple[tuple[int, ReasoningEffort], ...] = (
+    (4096, "low"),
+    (MAXIMUM_THINKING_BUDGET_TOKENS, "medium"),
+)
+"""Budget ceilings mapping an Anthropic ``budget_tokens`` to an effort tier.
+
+The bands anchor on the two budget constants Anthropic semantics already pin:
+``MINIMUM_THINKING_BUDGET_TOKENS`` (1024) opens the low band and
+``MAXIMUM_THINKING_BUDGET_TOKENS`` (16384, the gateway's derived-budget
+ceiling) closes the medium band. A budget at or below 4096 reads as shallow
+deliberate reasoning (low), one up to 16384 as the default depth (medium),
+and anything larger as an explicit request for deep reasoning (high).
+"""
+
+
+def thinking_config_reasoning_effort(config: Mapping[str, object]) -> ReasoningEffort:
+    """Map one Anthropic thinking config to the nearest canonical effort tier.
+
+    The mapping serves routes whose reasoning channel is an OpenAI-style
+    effort rather than a token budget:
+
+    ==================================  ========
+    thinking config                     effort
+    ==================================  ========
+    ``disabled``                        none
+    ``adaptive`` or budget-less         medium
+    ``budget_tokens <= 4096``           low
+    ``budget_tokens <= 16384``          medium
+    ``budget_tokens > 16384``           high
+    ==================================  ========
+
+    ``adaptive`` means the model picks its own depth, whose closest effort
+    analog is the provider default (medium, OpenAI's own default). Callers
+    must snap the returned tier to the route's supported ladder and disclose
+    the translation.
+
+    Args:
+        config: Verbatim caller ``thinking`` object.
+
+    Returns:
+        The canonical effort tier for the requested reasoning depth.
+    """
+    if config.get("type") == "disabled":
+        return "none"
+    budget = config.get("budget_tokens")
+    if not isinstance(budget, int) or isinstance(budget, bool):
+        return "medium"
+    for ceiling, effort in THINKING_BUDGET_EFFORT_TIERS:
+        if budget <= ceiling:
+            return effort
+    return "high"
 
 
 def anthropic_reasoning_effort(model_id: str, effort: str) -> str:

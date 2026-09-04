@@ -260,3 +260,19 @@ def test_anthropic_point_releases_inherit_their_generation_effort_contract() -> 
         anthropic_reasoning_effort("claude-fable-5-1", "ultra")
     # Pre-adaptive families stay budgeted.
     assert anthropic_adaptive_only_thinking("claude-haiku-4-5") is False
+
+
+def test_thinking_budget_maps_onto_the_documented_effort_tiers() -> None:
+    """Every band of the thinking-to-effort table maps as documented."""
+    from exp.runtime.models.providers.reasoning_compat import thinking_config_reasoning_effort
+
+    assert thinking_config_reasoning_effort({"type": "disabled"}) == "none"
+    assert thinking_config_reasoning_effort({"type": "adaptive"}) == "medium"
+    assert thinking_config_reasoning_effort({"type": "enabled"}) == "medium"
+    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": 1024}) == "low"
+    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": 4096}) == "low"
+    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": 4097}) == "medium"
+    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": 16384}) == "medium"
+    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": 16385}) == "high"
+    # A boolean is not a budget; the config falls back to the default depth.
+    assert thinking_config_reasoning_effort({"type": "enabled", "budget_tokens": True}) == "medium"
