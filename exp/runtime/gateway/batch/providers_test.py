@@ -447,6 +447,7 @@ def test_anthropic_results_follow_only_the_exact_host() -> None:
     """A spoofed results_url is refused before any credentialed fetch."""
 
     def spoofed(request: httpx.Request) -> httpx.Response:
+        """Serve a batch object whose results_url points off the exact host."""
         return httpx.Response(
             200,
             json={"results_url": f"https://{ANTHROPIC_HOST}.evil.example/v1/results"},
