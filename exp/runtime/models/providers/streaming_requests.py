@@ -64,6 +64,15 @@ because the caller can re-send those differently.
 TOOL_RESULT_IMAGE_PLACEHOLDER = "[image omitted: this model route cannot carry tool-result images]"
 """Text substituted for each dropped tool-result image, in block position."""
 
+TOOL_RESULT_IMAGE_DIALECTS = frozenset({"anthropic_messages", "openai_responses"})
+"""Wire dialects that carry an image inside a tool result.
+
+The Anthropic wire nests an ``image`` block in ``tool_result.content`` and the
+native Responses wire accepts an ordered content array as a
+``function_call_output.output``. Every other dialect keeps tool results
+text-only, so an image there degrades to disclosed placeholder text.
+"""
+
 
 def strip_tool_result_images(
     messages: tuple[GatewayMessage, ...],
@@ -543,15 +552,17 @@ def route_generation_parameter_requests(
             code="unsupported_parameter",
         )
 
-    # Only the Anthropic wire defines an image carrier inside a tool result.
-    # A route with any other dialect degrades tool-result images to positional
-    # placeholder text with disclosure instead of rejecting: the block is baked
-    # into the caller's history, so a rejection wedges the whole session, and a
-    # silent drop at encoding would misstate what the model saw. All-Anthropic
-    # routes keep the images; a non-vision rung then rejects at preflight and
-    # the route-wide coercion applies the same disclosed degrade.
+    # Only the Anthropic and native Responses wires define an image carrier
+    # inside a tool result (an Anthropic tool_result image block, a Responses
+    # function_call_output content array). A route with any other dialect
+    # degrades tool-result images to positional placeholder text with
+    # disclosure instead of rejecting: the block is baked into the caller's
+    # history, so a rejection wedges the whole session, and a silent drop at
+    # encoding would misstate what the model saw. A carrying route keeps the
+    # images; a non-vision rung then rejects at preflight and the route-wide
+    # coercion applies the same disclosed degrade.
     if any(message.role == "tool" and message.images for message in request.messages) and not all(
-        profile.dialect == "anthropic_messages" for profile in profiles
+        profile.dialect in TOOL_RESULT_IMAGE_DIALECTS for profile in profiles
     ):
         stripped = strip_tool_result_images(request.messages)
         if stripped is not None:

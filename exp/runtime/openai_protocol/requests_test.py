@@ -1853,6 +1853,108 @@ def test_responses_decoder_retains_input_image_parts() -> None:
     assert decoded.request.images[0].url == "https://example.com/cat.png"
 
 
+def test_responses_decoder_accepts_an_image_inside_a_function_call_output() -> None:
+    """A tool result that returns a screenshot decodes and reaches the wire.
+
+    Codex CLI's ``view_image`` tool emits a ``function_call_output`` whose
+    ``output`` is an ordered content array. The item is baked into the
+    caller's conversation history, so rejecting the array shape wedges every
+    later turn of the session.
+    """
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "look at the screenshot"},
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "view_image",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": [
+                        {"type": "input_text", "text": "attached image: shot.png"},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{_PNG_BASE64}",
+                        },
+                    ],
+                },
+            ],
+        }
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.content == "attached image: shot.png"
+    assert [part.kind for part in tool_message.content_parts] == ["text", "image"]
+    assert decoded.request.images[0].data == _PNG_BASE64
+
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[-1] == {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": [
+            {"type": "input_text", "text": "attached image: shot.png"},
+            {
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{_PNG_BASE64}",
+            },
+        ],
+    }
+
+
+def test_a_text_only_function_call_output_keeps_its_string_wire_form() -> None:
+    """A result without an image decodes and re-emits exactly as before."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": [{"type": "input_text", "text": "found"}],
+                }
+            ],
+        }
+    )
+    tool_message = decoded.request.messages[0]
+    assert tool_message.content == "found"
+    assert tool_message.content_parts == ()
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[-1] == {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": "found",
+    }
+
+
+def test_a_malformed_function_call_output_image_names_its_field() -> None:
+    """An unusable tool-result image carrier reports its own location."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call-1",
+                        "output": [{"type": "input_image", "image_url": "ftp://example.com/a.png"}],
+                    }
+                ],
+            }
+        )
+    assert error.value.detail.param == "input.0.output.0.image_url"
+
+
 def test_text_only_chat_messages_keep_no_content_parts() -> None:
     """Text-only requests decode exactly as before, with no retained parts."""
     decoded = decode_chat(

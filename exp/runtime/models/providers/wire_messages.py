@@ -8,6 +8,8 @@ engines cannot drift at the message boundary.
 
 from __future__ import annotations
 
+from pydantic.types import JsonValue
+
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayMessage,
@@ -32,11 +34,23 @@ from exp.runtime.models.providers.videos import openai_chat_video_part, reject_v
 def responses_items(message: GatewayMessage) -> list[JsonObject]:
     """Translate one non-instruction gateway message to Responses input items."""
     if message.role == "tool":
+        output: JsonValue = message.content or ""
+        if message.content_parts:
+            # A tool screenshot re-emits as ordered output parts, the shape the
+            # Responses wire defines for an image inside a tool result. The
+            # canonical model restricts tool messages to text and image kinds.
+            parts: list[JsonValue] = []
+            for part in message.content_parts:
+                if part.kind == "image":
+                    parts.append(responses_image_part(part))
+                elif part.kind == "text":
+                    parts.append({"type": "input_text", "text": part.text})
+            output = parts
         return [
             {
                 "type": "function_call_output",
                 "call_id": message.tool_call_id or "",
-                "output": message.content or "",
+                "output": output,
             }
         ]
     if message.role == "user":

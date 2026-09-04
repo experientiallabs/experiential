@@ -456,6 +456,21 @@ def test_an_all_anthropic_route_keeps_tool_result_images() -> None:
     assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in public_request.ignored_parameters
 
 
+def test_an_all_responses_route_keeps_tool_result_images() -> None:
+    """The native Responses wire nests content parts in a function output,
+    so a Codex tool screenshot reaches the provider unchanged."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"), _tool_image_message()),
+    )
+    profiles = (GatewayWireProfile(dialect="openai_responses", url="https://o.test"),)
+
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert provider_request.messages[-1].images
+    assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE not in public_request.ignored_parameters
+
+
 def test_route_accepts_reasoning_summary_on_native_anthropic() -> None:
     """Anthropic thinking reaches the summary channel, so the route serves the field."""
     request = GatewayRequest(

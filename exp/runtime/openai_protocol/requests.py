@@ -853,7 +853,16 @@ def _response_input_messages(
                 )
             )
         else:
+            # A tool result that carries an image decodes like a user
+            # message's parts: the text flattens into the tool message's
+            # content and the image rides its content parts.
+            output, output_parts = message_content(item.output, f"input.{index}.output")
             replayed.append(
-                ReplayedFunctionOutput(index=index, call_id=item.call_id, output=item.output)
+                ReplayedFunctionOutput(
+                    index=index,
+                    call_id=item.call_id,
+                    output=output or "",
+                    content_parts=output_parts,
+                )
             )
     return responses_input_messages(tuple(replayed))

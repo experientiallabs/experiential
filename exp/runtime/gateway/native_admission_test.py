@@ -668,3 +668,73 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
     assert tool_message.content == TOOL_RESULT_IMAGE_PLACEHOLDER
     assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE in public.ignored_parameters
     assert accounting.recorded == 1
+
+
+def _tool_screenshot_responses_request(*, stream: bool) -> GatewayRequest:
+    """Decode the Codex ``view_image`` repro through the real Responses surface.
+
+    The exact wire body: a user turn, a ``function_call``, and a
+    ``function_call_output`` whose output is one text part beside one base64
+    PNG ``input_image`` part.
+    """
+    from exp.runtime.openai_protocol.requests import decode_responses
+
+    body: JsonObject = {
+        "model": "coding",
+        "stream": stream,
+        "input": [
+            {"type": "message", "role": "user", "content": "look at the screenshot"},
+            {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "view_image",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": [
+                    {"type": "input_text", "text": "attached image: shot.png"},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{_TOOL_IMAGE_PNG}",
+                    },
+                ],
+            },
+        ],
+    }
+    return decode_responses(body).request
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_tool_result_image_passes_through_on_a_vision_responses_route(stream: bool) -> None:
+    """The Codex repro serves verbatim on an image-capable Responses route."""
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+    vision = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+            supports_image_input=True,
+        )
+    )
+    deployments = (_deployment("gpt", provider="openai", gateway=vision),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.RESPONSES)
+    client = cast(NativeWireClient, object())
+    wires = ((GatewayWireProfile(dialect="openai_responses", url="https://openai.test"), client),)
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider = admitted_route_requests(
+        route,
+        wires,
+        _tool_screenshot_responses_request(stream=stream),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    tool_message = provider.messages[-1]
+    assert tool_message.role == "tool"
+    assert [part.kind for part in tool_message.content_parts] == ["text", "image"]
+    assert tool_message.images[0].data == _TOOL_IMAGE_PNG
+    assert public.ignored_parameters == ()
+    assert accounting.recorded == 0

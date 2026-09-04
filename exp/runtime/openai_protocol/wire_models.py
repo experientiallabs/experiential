@@ -210,6 +210,17 @@ _ContentPart = Annotated[
 ]
 """One accepted content part on either OpenAI-style request surface."""
 
+_ResponsesToolOutputPart = Annotated[
+    _TextPart | _ResponsesImagePart,
+    Field(discriminator="type"),
+]
+"""One accepted content part inside a Responses ``function_call_output``.
+
+A tool result carries text and images only: those are the parts the canonical
+tool message can hold and the parts a provider wire can express for a tool
+result.
+"""
+
 
 class _FunctionCall(_WireModel):
     """Function name and raw JSON argument string."""
@@ -587,7 +598,13 @@ class _ResponseFunctionCall(_WireModel):
 
 
 class _ResponseFunctionOutput(_WireModel):
-    """Text function result included as Responses tool history.
+    """Function result included as Responses tool history.
+
+    ``output`` is result text, or the ordered content parts a tool that
+    returns an image emits (Codex's ``view_image`` sends one ``input_text``
+    part beside an ``input_image`` part). The image is baked into the
+    caller's conversation history, so rejecting the array shape wedges every
+    later turn of the session.
 
     ``id`` and ``status`` arrive when a stored turn's input items are
     re-listed and echoed; accepted and dropped like the other echo markers.
@@ -595,7 +612,7 @@ class _ResponseFunctionOutput(_WireModel):
 
     type: Literal["function_call_output"]
     call_id: str = Field(min_length=1, max_length=256)
-    output: str
+    output: str | tuple[_ResponsesToolOutputPart, ...]
     id: str | None = Field(default=None, min_length=1, max_length=256)
     status: _EchoedItemStatus | None = None
 

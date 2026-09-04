@@ -7,6 +7,7 @@ from typing import Literal
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
+from exp.common.models.content import MessageContentPart
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
     GatewayMessage,
@@ -51,11 +52,16 @@ class ReplayedNativeItem:
 
 @dataclass(frozen=True)
 class ReplayedFunctionOutput:
-    """One validated function result."""
+    """One validated function result.
+
+    ``content_parts`` is populated only for a result that carries an image
+    (a tool screenshot), in which case ``output`` holds its flattened text.
+    """
 
     index: int
     call_id: str
     output: str
+    content_parts: tuple[MessageContentPart, ...] = ()
 
 
 ReplayedInput = (
@@ -151,7 +157,12 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
         elif isinstance(item, ReplayedFunctionOutput):
             flush_segment()
             messages.append(
-                GatewayMessage(role="tool", content=item.output, tool_call_id=item.call_id)
+                GatewayMessage(
+                    role="tool",
+                    content=item.output,
+                    content_parts=item.content_parts,
+                    tool_call_id=item.call_id,
+                )
             )
         else:
             segment.append(item)
