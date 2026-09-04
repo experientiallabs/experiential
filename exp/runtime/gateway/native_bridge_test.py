@@ -468,7 +468,7 @@ def test_hunyuan_exposes_plaintext_reasoning_and_round_trips_only_as_carrier(
     _manager, raw_key = _configured_gateway(
         tmp_path,
         base_url="https://api.hunyuan.cloud.tencent.com/v1",
-        capabilities=ModelCapabilities(supports_tools=True),
+        capabilities=ModelCapabilities(supports_tools=True, reasoning_output_exposed=True),
     )
     control = NativeControlPlane(
         load_gateway_components(
@@ -560,6 +560,35 @@ def test_hunyuan_exposes_plaintext_reasoning_and_round_trips_only_as_carrier(
     with pytest.raises(NativeBridgeError) as modified:
         _admit(replica, raw_key, json.dumps(modified_turn))
     assert json.loads(modified.value.public_error_json)["param"] == "messages.reasoning_content"
+
+
+def test_hunyuan_endpoint_without_exposure_capability_strips_reasoning(
+    tmp_path: Path,
+) -> None:
+    """A Hunyuan-endpoint rung that does not declare exposure keeps reasoning stripped.
+
+    Exposure is gated on the explicit per-rung capability, not the base URL, so a
+    model added to the Tencent endpoint without ``reasoning_output_exposed`` fails
+    closed: the data plane still recognizes the carrier route (round-trips stay
+    sealed) but never surfaces plaintext ``reasoning_content`` to the caller.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        base_url="https://api.hunyuan.cloud.tencent.com/v1",
+        capabilities=ModelCapabilities(supports_tools=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path,
+            environment={"TEST_PROVIDER_KEY": "shared-hunyuan-secret"},
+        )
+    )
+    initial = _admit_started(control, raw_key, _chat_body())
+    # No exposure capability -> plaintext stays stripped even on the Hunyuan URL,
+    # while the carrier route identity still resolves so replay stays sealed.
+    assert initial["reasoning_output_exposed"] is False
+    assert isinstance(initial["hunyuan_reasoning_route_sha256"], str)
+    assert initial["fireworks_reasoning_route_sha256"] is None
 
 
 def test_fireworks_continuation_pins_the_exact_issuing_fallback_rung(tmp_path: Path) -> None:

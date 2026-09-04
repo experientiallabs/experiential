@@ -437,3 +437,46 @@ def test_openai_compatible_refusal_is_typed_without_exposing_content() -> None:
 
     assert error.value.signal is ProviderRefusalSignal.CONTENT_POLICY
     assert canary not in str(error.value)
+
+
+_HUNYUAN_BASE_URL = "https://api.hunyuan.cloud.tencent.com/v1"
+
+
+def test_hunyuan_rung_exposes_reasoning_only_when_the_capability_is_declared() -> None:
+    """Plaintext reasoning is exposed per rung, never inferred from the endpoint."""
+    exposed = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_HUNYUAN_BASE_URL,
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+    ).gateway_wire_profile()
+    assert exposed.hunyuan_reasoning_route_sha256 is not None
+    assert exposed.reasoning_output_exposed is True
+
+
+def test_hunyuan_rung_without_the_capability_stays_stripped_but_keeps_its_carrier_route() -> None:
+    """An undeclared rung on the Hunyuan endpoint fails closed on exposure.
+
+    The carrier route identity still resolves so tool-loop replay stays sealed,
+    but the caller never sees plaintext ``reasoning_content`` — closing the hole
+    where endpoint detection alone would expose every model on the endpoint.
+    """
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_HUNYUAN_BASE_URL,
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is False
+
+
+def test_reasoning_exposure_requires_a_carrier_route_even_when_declared() -> None:
+    """A declared capability without a carrier route exposes nothing (both gates)."""
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is None
+    assert profile.reasoning_output_exposed is False

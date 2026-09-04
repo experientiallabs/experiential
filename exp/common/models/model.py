@@ -431,6 +431,17 @@ class ModelCapabilities(ContractModel):
     reasoning_effort: ReasoningEffort | None = None
     sampling_requires_reasoning_none: bool = False
     """Whether temperature and top-p are valid only with ``reasoning_effort='none'``."""
+    reasoning_output_exposed: bool = False
+    """Whether this rung's native plaintext reasoning is surfaced to the caller.
+
+    Off by default so hidden-reasoning providers (OpenAI o-series) never leak
+    chain-of-thought. Turned on per rung only for the exposable-plaintext
+    category (e.g. Tencent Hunyuan) so the caller sees the thinking it is already
+    billed for; the tool-loop round-trip token always stays the domain-separated
+    opaque carrier regardless of this flag. Exposure is additionally gated at the
+    wire on a carrier-route identity, so an absent capability fails closed and
+    reasoning stays stripped even on an otherwise-exposable endpoint.
+    """
     chat_max_tokens_field: ChatMaxTokensField | None = None
     minimum_temperature: float | None = Field(default=None, ge=0, le=2)
     maximum_temperature: float | None = Field(default=None, ge=0, le=2)
@@ -511,6 +522,7 @@ class ModelCapabilities(ContractModel):
             "supports_reasoning",
             "reasoning_effort",
             "sampling_requires_reasoning_none",
+            "reasoning_output_exposed",
             "chat_max_tokens_field",
             "minimum_temperature",
             "maximum_temperature",

@@ -494,6 +494,9 @@ class RuntimeModelCatalog:
             http_kwargs["sampling_requires_reasoning_none"] = (
                 capabilities.sampling_requires_reasoning_none
             )
+            http_kwargs["reasoning_output_exposed"] = _supports_flag(
+                capabilities, "reasoning_output_exposed"
+            )
         http_client = factory(**http_kwargs)
         embedding_client = (
             http_client
