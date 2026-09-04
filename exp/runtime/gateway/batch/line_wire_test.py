@@ -142,6 +142,38 @@ def test_untranslatable_chat_lines_are_submit_rejections(body: JsonObject, match
         anthropic_line_params(_line("/v1/chat/completions", body))
 
 
+@pytest.mark.parametrize(
+    ("surface", "body", "match"),
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}], "logprobs": True},
+            "sets logprobs",
+        ),
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}], "logprobs": True, "top_logprobs": 3},
+            "top_logprobs",
+        ),
+        # The shared decoder already refuses this one; it must still surface as
+        # the same per-line submit rejection.
+        ("/v1/responses", {"input": "hi", "top_logprobs": 2}, "top_logprobs"),
+        (
+            "/v1/responses",
+            {"input": "hi", "tools": [{"type": "web_search"}]},
+            "native Responses tool declarations",
+        ),
+    ],
+)
+def test_controls_the_messages_wire_cannot_carry_are_submit_rejections(
+    surface: BatchSurface, body: JsonObject, match: str
+) -> None:
+    """logprobs and native Responses tools are refused per line at submit, as the
+    synchronous lane refuses them before dispatch, never silently dropped."""
+    with pytest.raises(BatchSubmitError, match=match):
+        anthropic_line_params(_line(surface, body))
+
+
 def test_responses_continuation_is_refused_in_a_batch() -> None:
     """A batch line carries the whole conversation; previous_response_id has no meaning."""
     with pytest.raises(BatchSubmitError, match="previous_response_id"):
@@ -246,6 +278,71 @@ def test_message_result_renders_as_a_response_object_on_the_responses_surface() 
     ]
     assert texts == ["hi"]
     assert _object(body["usage"])["input_tokens"] == 4516
+
+
+def test_thinking_blocks_render_as_reasoning_on_responses_and_vanish_on_chat() -> None:
+    """A thinking block's text reaches a Responses caller as a reasoning summary (what
+    they paid for); the chat shape has no slot for it and carries only the answer."""
+    message = {
+        **_ANTHROPIC_MESSAGE,
+        "content": [
+            {"type": "thinking", "thinking": "Consider the forecast.", "signature": "sig"},
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "text", "text": "Sunny."},
+        ],
+        "stop_reason": "end_turn",
+    }
+    responses = anthropic_result_body(
+        _line("/v1/responses", {"input": "Weather?"}), message, request_id="r", created_at=0.0
+    )
+    items = [_object(item) for item in _array(responses["output"])]
+    reasoning = [item for item in items if item.get("type") == "reasoning"]
+    assert len(reasoning) == 1
+    summaries = [_object(part)["text"] for part in _array(reasoning[0]["summary"])]
+    assert summaries == ["Consider the forecast."]
+    texts = [
+        _object(part)["text"]
+        for item in items
+        if item.get("type") == "message"
+        for part in _array(item["content"])
+    ]
+    assert texts == ["Sunny."]
+    chat = anthropic_result_body(
+        _line("/v1/chat/completions", _CHAT_BODY), message, request_id="r", created_at=0.0
+    )
+    assert _object(_choice(chat)["message"])["content"] == "Sunny."
+    bad = {**_ANTHROPIC_MESSAGE, "content": [{"type": "thinking", "thinking": 4}]}
+    with pytest.raises(ProviderResponseError, match="thinking must be text"):
+        anthropic_result_body(
+            _line("/v1/chat/completions", _CHAT_BODY), bad, request_id="r", created_at=0.0
+        )
+
+
+def test_anthropic_usage_without_cache_legs_reports_a_zero_cached_leg() -> None:
+    """The Anthropic wire always has a cache-read leg; when nothing was read the
+    rendered chat usage says cached_tokens: 0, as the synchronous normalizer does."""
+    plain = line_usage({"usage": {"input_tokens": 9, "output_tokens": 2}})
+    assert (plain.input_tokens, plain.output_tokens) == (9, 2)
+    assert plain.cached_input_tokens == 0 and plain.cache_creation_input_tokens is None
+    message = {
+        **_ANTHROPIC_MESSAGE,
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 9, "output_tokens": 2},
+    }
+    chat = anthropic_result_body(
+        _line("/v1/chat/completions", _CHAT_BODY), message, request_id="r", created_at=0.0
+    )
+    assert _object(chat["usage"])["prompt_tokens_details"] == {"cached_tokens": 0}
+    # OpenAI-shaped usage without a details object keeps the subset unknown.
+    assert (
+        line_usage({"usage": {"prompt_tokens": 3, "completion_tokens": 1}}).cached_input_tokens
+        is None
+    )
+    responses_shaped = line_usage(
+        {"usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}}
+    )
+    assert responses_shaped.cached_input_tokens is None
 
 
 def test_messages_surface_result_is_the_message_verbatim() -> None:

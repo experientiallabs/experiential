@@ -258,6 +258,34 @@ def test_native_gemini_normalizer_matches_the_golden_fixture() -> None:
     ]
 
 
+def test_native_gemini_normalizer_classifies_googles_error_envelope() -> None:
+    """Google's error envelope on the stream is the provider declaring failure:
+    provider_internal (retry, then fail over), never a malformed stream end and
+    never a synthesized completion after prior output."""
+    envelope = _sse(
+        {
+            "error": {
+                "code": 503,
+                "message": "The model is overloaded. Please try again later.",
+                "status": "UNAVAILABLE",
+            }
+        }
+    )
+    failed = {
+        "kind": "failed",
+        "failure_class": "provider_internal",
+        "safe_message": "provider stream failed",
+    }
+    alone = _native_normalized("gemini_generate_content", (envelope,))
+    assert alone["failure"] is None
+    assert alone["events"] == [failed]
+    after_output = _native_normalized(
+        "gemini_generate_content", (GEMINI_GOLDEN_CHUNKS[0], envelope)
+    )
+    assert after_output["failure"] is None
+    assert after_output["events"] == [{"kind": "text_delta", "text": "Hel"}, failed]
+
+
 def test_native_gemini_normalizer_refuses_a_blocked_prompt() -> None:
     """A prompt Google blocks arrives with no candidates at all. It is the
     provider's refusal (the same terminal a SAFETY finish produces, after the

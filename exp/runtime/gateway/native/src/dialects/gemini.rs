@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use super::{malformed, parse_object, refusal_failure, Normalizer};
+use super::{malformed, parse_object, provider_stream_failed, refusal_failure, Normalizer};
 use crate::errors::{Failure, FailureClass};
 use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
 
@@ -19,6 +19,15 @@ impl Normalizer {
         frame: &crate::sse::SseEvent,
     ) -> Result<Vec<Event>, Failure> {
         let payload = parse_object(&frame.data)?;
+        if payload.get("error").is_some_and(|value| !value.is_null()) {
+            // Google's error envelope ({"error":{"code":503,"status":"UNAVAILABLE"}})
+            // arrives as a candidate-less frame; without this branch it reads
+            // as a usage-only trailer and the stream ends malformed (or, after
+            // prior output, as a synthesized completion of a failed answer).
+            // It is the provider declaring failure, so it takes the shared
+            // retry-then-failover classification the other dialects give it.
+            return Ok(vec![Event::Failed(provider_stream_failed())]);
+        }
         if let Some(raw_usage) = payload.get("usageMetadata") {
             if !raw_usage.is_null() {
                 self.usage = Some(gemini_usage(raw_usage).map_err(|message| malformed(&message))?);
@@ -479,6 +488,47 @@ mod gemini_tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn gemini_error_envelope_is_a_retryable_provider_failure() {
+        // Google's own error envelope on the stream (verified shape for a
+        // 503 UNAVAILABLE): a provider-declared failure, classified like the
+        // OpenAI and Anthropic dialects classify theirs: provider_internal,
+        // same-deployment retry allowed, failover eligible. Never a malformed
+        // stream end, and never a completion when output preceded it.
+        let envelope = json!({
+            "error": {
+                "code": 503,
+                "message": "The model is overloaded. Please try again later.",
+                "status": "UNAVAILABLE",
+            }
+        });
+        let failed = json!({
+            "kind": "failed",
+            "failure_class": "provider_internal",
+            "safe_message": "provider stream failed",
+        });
+        let alone = [sse(&envelope)];
+        let refs: Vec<&[u8]> = alone.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(events, vec![failed.clone()]);
+        let after_output = [
+            sse(&json!({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]})),
+            sse(&envelope),
+        ];
+        let refs: Vec<&[u8]> = after_output.iter().map(Vec::as_slice).collect();
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
+        assert!(failure.is_none());
+        assert_eq!(
+            events,
+            vec![json!({"kind": "text_delta", "text": "partial"}), failed]
+        );
+        let classified = provider_stream_failed();
+        assert_eq!(classified.failure_class, FailureClass::ProviderInternal);
+        assert!(classified.retryable_same_deployment);
+        assert!(classified.failover_eligible);
     }
 
     #[test]

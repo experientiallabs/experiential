@@ -60,7 +60,8 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
     ``output_tokens_details`` equivalents; Anthropic messages report
     ``input_tokens`` EXCLUDING the ``cache_read_input_tokens`` and
     ``cache_creation_input_tokens`` legs, which fold into the input total here
-    exactly as the synchronous Anthropic normalizer folds them. Reasoning
+    exactly as the synchronous Anthropic normalizer folds them (and, like it,
+    the cache-read leg is reported even when zero). Reasoning
     follows the synchronous rule for OpenAI-shaped usage: the provider's
     ``total_tokens`` decides whether reasoning was reported additively (then
     it folds into the output total) or as a subset (then the output total
@@ -84,7 +85,22 @@ def line_usage(body: JsonObject | None) -> GatewayUsage:
         usage, ("completion_tokens_details", "output_tokens_details"), "reasoning_tokens"
     )
     input_tokens = reported_input + (cache_read or 0) + (cache_creation or 0)
-    if cached is None and (cache_read is not None or cache_creation is not None):
+    anthropic_shaped = (
+        "cache_read_input_tokens" in usage
+        or "cache_creation_input_tokens" in usage
+        or (
+            "input_tokens" in usage
+            and "prompt_tokens" not in usage
+            and "total_tokens" not in usage
+            and "input_tokens_details" not in usage
+            and "output_tokens_details" not in usage
+        )
+    )
+    if cached is None and anthropic_shaped:
+        # The Anthropic wire always has a cache-read leg (zero when nothing
+        # was read), and the synchronous normalizer reports it as such, so
+        # the rendered chat usage carries cached_tokens: 0 rather than
+        # omitting the detail.
         cached = cache_read or 0
     output_tokens = reported_output
     if reasoning:
@@ -131,6 +147,21 @@ def _decoded_request(line: BatchLine) -> GatewayRequest:
         raise BatchSubmitError(
             f"line {line.custom_id!r} sets previous_response_id; a batch line carries the "
             "whole conversation and cannot continue a served response"
+        )
+    # The synchronous lane refuses these before dispatch because the Messages
+    # wire cannot honor them; the batch lane refuses them per line at submit
+    # for the same reason instead of letting the payload builder drop them.
+    if request.logprobs is True or request.top_logprobs is not None:
+        path = "top_logprobs" if request.top_logprobs is not None else "logprobs"
+        raise BatchSubmitError(
+            f"line {line.custom_id!r} sets {path}, which this gateway response contract "
+            "does not carry; remove the field"
+        )
+    if request.provider_native_tools:
+        raise BatchSubmitError(
+            f"line {line.custom_id!r} carries native Responses tool declarations (custom, "
+            "namespace, web_search, or tool_search entries) that only a native OpenAI "
+            "Responses route can serve; remove those tools"
         )
     return request
 
@@ -180,10 +211,13 @@ def anthropic_line_params(line: BatchLine) -> JsonObject:
 def _anthropic_message_events(message: JsonObject) -> tuple[GatewayEvent, ...]:
     """Normalize one completed Anthropic Message object into serving events.
 
-    Text and tool-use blocks become their canonical events; thinking blocks,
-    provider-executed server-tool traffic (web search and its result), and
-    any other block kind with no output on these surfaces are skipped, as the
-    streaming normalizer skips them. A refusal (a ``refusal`` block or the
+    Text and tool-use blocks become their canonical events, and a thinking
+    block's text becomes a thinking delta keyed by its block index (the
+    Responses encoder renders it as a reasoning summary; the chat shape has
+    no slot and ignores it). Redacted thinking, provider-executed server-tool
+    traffic (web search and its result), and any other named block kind with
+    no output on these surfaces are skipped, as the streaming normalizer
+    skips them. A refusal (a ``refusal`` block or the
     ``refusal`` stop reason) is content-free: it replaces every content event
     with one typed refusal signal carrying the provider's refusal text. The
     usage folds the cache legs into the input total exactly as the streaming
@@ -257,8 +291,22 @@ def _anthropic_message_events(message: JsonObject) -> tuple[GatewayEvent, ...]:
             if text is not None and not isinstance(text, str):
                 raise ProviderResponseError(f"Anthropic content[{index}].refusal must be text")
             refusal = (refusal or "") + (text or "")
-        # Every other NAMED block kind (thinking, redacted_thinking,
-        # server_tool_use, *_tool_result, and kinds this surface cannot show)
+        elif block_type == "thinking":
+            thinking = block.get("thinking")
+            if thinking is not None and not isinstance(thinking, str):
+                raise ProviderResponseError(f"Anthropic content[{index}].thinking must be text")
+            if thinking:
+                events.append(
+                    GatewayEvent(
+                        kind=GatewayEventKind.THINKING_DELTA,
+                        sequence_number=sequence,
+                        reasoning_block_index=index,
+                        text_delta=thinking,
+                    )
+                )
+                sequence += 1
+        # Every other NAMED block kind (redacted_thinking, server_tool_use,
+        # *_tool_result, and kinds this surface cannot show)
         # carries no gateway-visible output here and is skipped, as the
         # streaming normalizer skips it; only an unnamed block is rejected.
     if refusal is not None:
