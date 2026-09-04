@@ -129,6 +129,8 @@ def test_websocket_transport_mirrors_the_http_event_stream(
             assert isinstance(terminal, dict)
             assert terminal["status"] == "completed"
             assert terminal["output"] == []
+            assert type(terminal["created_at"]) is int
+            assert type(terminal["completed_at"]) is int
             assert _LoopbackProvider.calls == provider_calls
 
             # A generating request streams the HTTP transport's exact events.
