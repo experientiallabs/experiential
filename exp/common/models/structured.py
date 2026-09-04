@@ -2,7 +2,49 @@
 
 from __future__ import annotations
 
+import json
+
+from exp.common.core.artifacts import JsonValue
+from exp.common.models.model import ModelFinishReason, ModelResponse
+
 _FENCE = "```"
+
+
+class StructuredReplyError(ValueError):
+    """A completed reply could not carry the strict JSON payload it promised."""
+
+
+def structured_reply_json(response: ModelResponse) -> JsonValue:
+    """Return the strict JSON payload of one completed single-shot reply.
+
+    Shared handling for callers that prompt a model for a JSON-only answer:
+    a reply that stopped at its output-token limit, carried no visible text
+    (tool calls only), or failed strict JSON parsing after fence
+    normalization is rejected loudly. Shape validation of the parsed value
+    stays with the caller's own contract.
+
+    Args:
+        response: The completed model response.
+
+    Returns:
+        The parsed JSON value of the reply's visible text.
+
+    Raises:
+        StructuredReplyError: The reply was truncated, textless, or non-JSON;
+            rerun the call or raise the output-token budget.
+    """
+    if response.finish_reason is ModelFinishReason.LENGTH:
+        msg = "the model stopped at its output-token limit; raise the output-token budget"
+        raise StructuredReplyError(msg)
+    content = response.output.content
+    if content is None:
+        raise StructuredReplyError("the model returned no text output; rerun the call")
+    try:
+        parsed: JsonValue = json.loads(structured_json_text(content))
+    except json.JSONDecodeError as error:
+        msg = "the model returned non-JSON output; rerun the call"
+        raise StructuredReplyError(msg) from error
+    return parsed
 
 
 def structured_json_text(content: str) -> str:

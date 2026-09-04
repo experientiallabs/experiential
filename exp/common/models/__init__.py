@@ -108,7 +108,11 @@ from exp.common.models.setup import (
     catalog_state_sha256,
     configure_provider_catalog,
 )
-from exp.common.models.structured import structured_json_text
+from exp.common.models.structured import (
+    StructuredReplyError,
+    structured_json_text,
+    structured_reply_json,
+)
 
 __all__ = [
     "AssistantAction",
@@ -199,7 +203,9 @@ __all__ = [
     "router_candidate_prices",
     "served_roles",
     "serves_role",
+    "StructuredReplyError",
     "structured_json_text",
+    "structured_reply_json",
     "validate_router_candidate_selection",
     "verify_router_candidate_catalog_state",
     "verify_completion_reservation",
