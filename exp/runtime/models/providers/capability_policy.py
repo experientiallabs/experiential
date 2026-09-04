@@ -22,7 +22,8 @@ from typing import TYPE_CHECKING
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
+from exp.common.models.known_models import known_model_metadata
+from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -65,11 +66,6 @@ _MAXIMUM_THINKING_BUDGET_TOKENS = 16384
 """Ceiling on a gateway-derived thinking budget when the caller supplied none."""
 
 
-def _thinking_history_disclosure(reason: str) -> str:
-    """Disclosure recorded when stale history thinking blocks are stripped."""
-    return f"thinking_history->dropped({reason})"
-
-
 CLOSED_SCHEMA_DISCLOSURE = "json_schema.additionalProperties->false"
 """Disclosure recorded when an open structured-output schema is closed."""
 
@@ -88,49 +84,15 @@ class RequestCoercion:
     disclosures: tuple[str, ...]
 
 
-_STALE_THINKING_KINDS = frozenset({"thinking", "redacted_thinking"})
-"""Anthropic reasoning-block kinds the provider rejects once thinking is off."""
-
-
-def _strip_history_thinking(request: GatewayRequest) -> tuple[GatewayRequest, bool]:
-    """Drop replayed thinking blocks from prior assistant turns.
-
-    Anthropic 400s a continuation whose history carries ``thinking`` or
-    ``redacted_thinking`` blocks once thinking is disabled or dropped for the
-    dispatch, so a coercion that removes the thinking config must remove those
-    stale blocks from the SAME request copy. The honored path never calls this:
-    when thinking is preserved the signed blocks must round-trip byte-exact.
-
-    Args:
-        request: Request whose thinking config was just dropped or disabled.
-
-    Returns:
-        The request with stale blocks removed and whether anything changed.
-    """
-    changed = False
-    new_messages: list[GatewayMessage] = []
-    for message in request.messages:
-        retained = tuple(
-            block for block in message.provider_reasoning if block.kind not in _STALE_THINKING_KINDS
-        )
-        if len(retained) != len(message.provider_reasoning):
-            changed = True
-            new_messages.append(message.model_copy(update={"provider_reasoning": retained}))
-        else:
-            new_messages.append(message)
-    if not changed:
-        return request, False
-    return request.model_copy(update={"messages": tuple(new_messages)}), True
-
-
 def _thinking_budget_tokens(maximum_output_tokens: int | None) -> int | None:
     """Return a legal ``budget_tokens`` for a translated enabled config, or None.
 
     Anthropic requires ``1024 <= budget_tokens < max_tokens`` for an enabled
     thinking config. With no effort→budget table to consult, the budget is
-    half the caller's output ceiling, clamped to a sane band. When the ceiling
-    is too small to admit any legal budget the translation is impossible and
-    the caller must fall through to the drop path.
+    half the caller's output ceiling, clamped to a sane band. An unbounded
+    caller (no ceiling) takes the band ceiling. When the ceiling is too small
+    to admit any legal budget the translation is impossible and the caller
+    must fall through to the drop path.
 
     Args:
         maximum_output_tokens: The caller's output-token ceiling, if any.
@@ -139,7 +101,7 @@ def _thinking_budget_tokens(maximum_output_tokens: int | None) -> int | None:
         A legal budget, or ``None`` when no budget fits the ceiling.
     """
     if maximum_output_tokens is None:
-        return None
+        return _MAXIMUM_THINKING_BUDGET_TOKENS
     budget = min(
         max(maximum_output_tokens // 2, _MINIMUM_THINKING_BUDGET_TOKENS),
         _MAXIMUM_THINKING_BUDGET_TOKENS,
@@ -149,19 +111,43 @@ def _thinking_budget_tokens(maximum_output_tokens: int | None) -> int | None:
     return None
 
 
-def _all_budgeted_enabled_anthropic(profiles: Sequence[GatewayWireProfile]) -> bool:
-    """Whether every rung is an Anthropic budgeted-enabled reasoning route.
+def _anthropic_budgeted_enabled_only(model_id: str) -> bool:
+    """Whether an Anthropic model reasons via a token budget but rejects adaptive.
 
-    A budgeted-enabled rung reasons (``supports_reasoning``) and honors a
-    ``thinking: {type: enabled, budget_tokens}`` config, which is exactly the
-    Anthropic routes that are NOT the adaptive-only generation. A mixed or
-    non-reasoning route is not one, so an adaptive config there drops instead
-    of translating.
+    haiku-4-5 is marked ``supports_reasoning`` yet is NOT the effort/adaptive
+    generation (``supports_reasoning_effort`` is False), so it honors a
+    budgeted ``thinking: {type: enabled, budget_tokens}`` config while rejecting
+    ``thinking: {type: adaptive}`` by name. The effort generation (sonnet-4-6,
+    opus-5, fable-5-1, ...) carries ``supports_reasoning_effort`` and accepts
+    the adaptive object verbatim, so it is NOT one of these and its adaptive
+    config is left alone rather than translated.
+
+    Args:
+        model_id: Exact Anthropic model identifier.
+
+    Returns:
+        ``True`` only for a reasoning model whose depth is a token budget and
+        which rejects an adaptive thinking config.
+    """
+    known = known_model_metadata("anthropic", model_id)
+    if known is None:
+        return False
+    return known.supports_reasoning is True and not known.supports_reasoning_effort
+
+
+def _all_budgeted_enabled_anthropic(profiles: Sequence[GatewayWireProfile]) -> bool:
+    """Whether every rung is an Anthropic budgeted-enabled-only reasoning route.
+
+    A budgeted-enabled-only rung reasons and honors a ``thinking: {type:
+    enabled, budget_tokens}`` config but rejects ``adaptive`` by name (haiku-4-5).
+    A mixed, non-reasoning, or adaptive-accepting route (the effort generation)
+    is not one, so an adaptive config there is dropped or left verbatim rather
+    than translated.
     """
     if not profiles or not all(profile.dialect == "anthropic_messages" for profile in profiles):
         return False
     return all(
-        profile.supports_reasoning and not anthropic_adaptive_only_thinking(profile.model_id)
+        profile.supports_reasoning and _anthropic_budgeted_enabled_only(profile.model_id)
         for profile in profiles
     )
 
@@ -179,8 +165,9 @@ def _coerce_adaptive_budget(
     reading here is to translate it to ``enabled`` with a derived budget. When
     the caller already carried a budget the config is left verbatim; when no
     legal budget fits the output ceiling the translation is impossible, so the
-    config and any effort channel drop and stale history thinking blocks are
-    stripped, all disclosed.
+    config and any effort channel drop, all disclosed. History thinking blocks
+    are left untouched: Anthropic accepts replayed thinking blocks with no live
+    thinking config, so a coercion never strips them.
 
     Args:
         profiles: Ordered wire profiles for every live route deployment.
@@ -208,38 +195,37 @@ def _coerce_adaptive_budget(
             disclosures=(THINKING_TRANSLATED_DISCLOSURE,),
         )
     # No legal budget fits: drop every reasoning signal so the surviving effort
-    # cannot re-emit adaptive thinking through output_config, and strip the
-    # stale signed history blocks the provider would otherwise 400 on.
-    dropped, disclosures = _drop_thinking_and_effort(request, reason="untranslatable_budget")
+    # cannot re-emit adaptive thinking through output_config.
+    dropped, disclosures = _drop_thinking_and_effort(request)
     return RequestCoercion(request=dropped, disclosures=disclosures)
 
 
 def _drop_thinking_and_effort(
     request: GatewayRequest,
-    *,
-    reason: str,
 ) -> tuple[GatewayRequest, tuple[str, ...]]:
-    """Null the thinking config and effort channels and strip stale history.
+    """Null the thinking config and effort channels for a route that cannot reason.
 
-    Shared drop for the routes that cannot honor any reasoning: the thinking
-    config, the caller effort, and the Messages ``output_config.effort`` channel
-    all go, and prior thinking blocks are removed so the continuation replays
-    clean. Every removal is disclosed.
+    Shared drop for the routes that cannot honor a reasoning signal: the
+    thinking config, the caller effort, and the Messages ``output_config.effort``
+    channel all go, and a ``clear_thinking`` context edit rides on the thinking
+    config and is stripped with it. Every removal is disclosed. History thinking
+    blocks are NOT touched — Anthropic accepts replayed blocks without a live
+    thinking config.
     """
     updates: dict[str, object] = {"provider_thinking_config": None}
-    disclosures: list[str] = [THINKING_DROP_DISCLOSURE]
+    disclosures: list[str] = []
     if request.reasoning_effort is not None:
         updates["reasoning_effort"] = None
         disclosures.append(EFFORT_DROP_DISCLOSURE)
+    disclosures.append(THINKING_DROP_DISCLOSURE)
     if request.provider_output_config is not None and "effort" in request.provider_output_config:
         remaining = {
             key: value for key, value in request.provider_output_config.items() if key != "effort"
         }
         updates["provider_output_config"] = remaining or None
-    dropped, stripped = _strip_history_thinking(request.model_copy(update=updates))
-    if stripped:
-        disclosures.append(_thinking_history_disclosure(reason))
-    return dropped, tuple(disclosures)
+    if request.context_management is not None:
+        updates["context_management"] = _without_clear_thinking_edits(request.context_management)
+    return request.model_copy(update=updates), tuple(disclosures)
 
 
 def coerce_generation_parameters(
@@ -285,14 +271,25 @@ def coerce_generation_parameters(
         if admits is not None and not admits(adaptive_budget.request):
             return None
         return adaptive_budget
-    if request.reasoning_effort is None:
-        return None
     ladder: set[str] = set()
     for profile in profiles:
         ladder.update(profile_reasoning_efforts(profile))
+    adaptive_thinking = (
+        request.provider_thinking_config is not None
+        and request.provider_thinking_config.get("type") == "adaptive"
+    )
+    # An adaptive config with no effort beside it still cannot survive a route
+    # with no reasoning rung (the provider rejects it by name), so it reaches
+    # the drop path below instead of returning here. A budgeted-enabled route
+    # already translated it in ``_coerce_adaptive_budget``; a route that
+    # accepts adaptive verbatim keeps a non-empty ladder and returns here.
+    if request.reasoning_effort is None and not (adaptive_thinking and not ladder):
+        return None
     if not ladder:
         updates: dict[str, object] = {"reasoning_effort": None}
-        disclosures: tuple[str, ...] = (EFFORT_DROP_DISCLOSURE,)
+        disclosures: tuple[str, ...] = (
+            (EFFORT_DROP_DISCLOSURE,) if request.reasoning_effort is not None else ()
+        )
         if request.provider_output_config is not None:
             # The Messages surface carries the same effort verbatim inside
             # output_config; a dropped effort must not reach the provider
@@ -303,29 +300,25 @@ def coerce_generation_parameters(
                 if key != "effort"
             }
             updates["provider_output_config"] = remaining or None
-        if (
-            request.provider_thinking_config is not None
-            and request.provider_thinking_config.get("type") == "adaptive"
-        ):
+        if adaptive_thinking:
             # Adaptive thinking is the effort's own channel on the Messages
             # surface (the model picks its depth from output_config.effort),
             # so a route with no reasoning rung cannot honor it either and
-            # the provider rejects it by name. A budgeted config is left
-            # verbatim: its semantics do not depend on an effort level.
+            # the provider rejects it by name, with or without an effort beside
+            # it. A budgeted config is left verbatim: its semantics do not
+            # depend on an effort level. A clear_thinking context edit rides on
+            # the thinking config and is stripped with it.
             updates["provider_thinking_config"] = None
-            disclosures = (EFFORT_DROP_DISCLOSURE, THINKING_DROP_DISCLOSURE)
+            disclosures = (*disclosures, THINKING_DROP_DISCLOSURE)
+            if request.context_management is not None:
+                updates["context_management"] = _without_clear_thinking_edits(
+                    request.context_management
+                )
         dropped_request = request.model_copy(update=updates)
-        if "provider_thinking_config" in updates:
-            # Thinking was just dropped for a genuinely non-reasoning route;
-            # the replayed signed history blocks would 400 the continuation,
-            # so strip them from the same copy and disclose it.
-            dropped_request, stripped = _strip_history_thinking(dropped_request)
-            if stripped:
-                disclosures = (*disclosures, _thinking_history_disclosure("no_reasoning_route"))
         if admits is not None and not admits(dropped_request):
             return None
         return RequestCoercion(request=dropped_request, disclosures=disclosures)
-    if request.reasoning_effort in ladder:
+    if request.reasoning_effort is None or request.reasoning_effort in ladder:
         # The effort itself is portable; the verbatim failure lies elsewhere
         # and a snap would change semantics for nothing.
         return None
@@ -390,15 +383,40 @@ def _coerce_disabled_thinking(
         anthropic_adaptive_only_thinking(profile.model_id) for profile in anthropic_profiles
     ):
         return None
-    dropped, stripped = _strip_history_thinking(
-        request.model_copy(update={"provider_thinking_config": None})
+    return RequestCoercion(
+        request=request.model_copy(update={"provider_thinking_config": None}),
+        disclosures=(THINKING_DISABLED_DISCLOSURE,),
     )
-    disclosures = (THINKING_DISABLED_DISCLOSURE,)
-    if stripped:
-        # The caller asked to turn thinking off; any replayed thinking blocks
-        # in history would 400 the continuation, so they strip with the config.
-        disclosures = (*disclosures, _thinking_history_disclosure("thinking_disabled"))
-    return RequestCoercion(request=dropped, disclosures=disclosures)
+
+
+def _without_clear_thinking_edits(context_management: JsonObject) -> JsonObject | None:
+    """Return the context-management object without ``clear_thinking_*`` edits.
+
+    A ``clear_thinking`` context edit requires an active thinking config, so it
+    is stripped alongside a dropped thinking config; the provider rejects it by
+    name once the config is gone. Other edits are preserved verbatim.
+
+    Args:
+        context_management: Verbatim caller ``context_management`` object.
+
+    Returns:
+        The same object minus clear-thinking edits, or ``None`` when no edit
+        survives so the field is omitted entirely.
+    """
+    edits = context_management.get("edits")
+    if not isinstance(edits, list):
+        return context_management
+    retained = [
+        edit
+        for edit in edits
+        if not (isinstance(edit, dict) and str(edit.get("type", "")).startswith("clear_thinking"))
+    ]
+    if len(retained) == len(edits):
+        return context_management
+    if not retained:
+        remaining = {key: value for key, value in context_management.items() if key != "edits"}
+        return remaining or None
+    return {**context_management, "edits": retained}
 
 
 def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:

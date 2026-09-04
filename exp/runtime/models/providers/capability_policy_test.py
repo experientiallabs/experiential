@@ -496,33 +496,6 @@ def test_disabled_thinking_drops_only_on_adaptive_only_anthropic_routes() -> Non
     )
 
 
-def test_disabled_thinking_drop_strips_stale_history_thinking_blocks() -> None:
-    """Turning thinking off also removes replayed thinking blocks, disclosed."""
-    adaptive_only = GatewayWireProfile(
-        dialect="anthropic_messages",
-        url="https://anthropic.test",
-        model_id="claude-opus-5",
-        supports_reasoning=True,
-        reasoning_wire_format="anthropic_adaptive",
-    )
-    request = _messages_request(
-        messages=(
-            GatewayMessage(role="user", content="hi"),
-            _replayed_thinking_turn(),
-            GatewayMessage(role="user", content="again"),
-        ),
-        provider_thinking_config={"type": "disabled"},
-    )
-    coercion = coerce_generation_parameters((adaptive_only,), request)
-    assert coercion is not None
-    assert coercion.request.provider_thinking_config is None
-    assert all(not message.provider_reasoning for message in coercion.request.messages)
-    assert coercion.disclosures == (
-        "thinking.type->adaptive",
-        "thinking_history->dropped(thinking_disabled)",
-    )
-
-
 def test_adaptive_thinking_translates_to_a_budget_on_a_budgeted_route() -> None:
     """A no-budget adaptive config becomes a legal enabled config, disclosed."""
     request = _messages_request(
@@ -540,7 +513,11 @@ def test_adaptive_thinking_translates_to_a_budget_on_a_budgeted_route() -> None:
 
 
 def test_adaptive_thinking_drops_when_no_legal_budget_fits_max_tokens() -> None:
-    """A ceiling too small for any legal budget drops thinking and its history."""
+    """A ceiling too small for any legal budget drops thinking, disclosed.
+
+    History thinking blocks are left in place: Anthropic accepts replayed
+    thinking blocks with no live thinking config, so the drop never strips them.
+    """
     request = _messages_request(
         messages=(
             GatewayMessage(role="user", content="hi"),
@@ -554,35 +531,68 @@ def test_adaptive_thinking_drops_when_no_legal_budget_fits_max_tokens() -> None:
     coercion = coerce_generation_parameters((_budgeted_haiku_profile(),), request)
     assert coercion is not None
     assert coercion.request.provider_thinking_config is None
-    assert all(not message.provider_reasoning for message in coercion.request.messages)
-    assert coercion.disclosures == (
-        "thinking",
-        "thinking_history->dropped(untranslatable_budget)",
-    )
+    # The replayed thinking block survives; the coercion only drops the config.
+    assert any(message.provider_reasoning for message in coercion.request.messages)
+    assert coercion.disclosures == ("thinking",)
 
 
-def test_forced_drop_on_a_non_reasoning_anthropic_route_strips_history() -> None:
-    """A genuinely non-reasoning route drops thinking and its stale history."""
-    non_reasoning = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
-    request = _messages_request(
-        messages=(
-            GatewayMessage(role="user", content="hi"),
-            _replayed_thinking_turn(),
-            GatewayMessage(role="user", content="again"),
-        ),
-        reasoning_effort="high",
-        provider_thinking_config={"type": "adaptive"},
+def test_adaptive_thinking_drops_on_a_zero_reasoning_route_without_an_effort() -> None:
+    """Adaptive thinking alone (no effort beside it) still drops, disclosed.
+
+    Claude Code pins ``thinking: {type: adaptive}`` on every request but sends
+    an effort only when one is configured; a genuinely non-reasoning model
+    rejects the adaptive object by name either way, so it drops here rather than
+    reaching the provider. A budgeted-enabled route (haiku) instead translates
+    the same config; an adaptive-accepting reasoning route keeps it verbatim. A
+    clear-thinking context edit rides on the thinking config and goes with it,
+    while other edits stay verbatim.
+    """
+    anthropic = GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test")
+    adaptive_only = _request().model_copy(
+        update={
+            "surface": GatewayApiSurface.MESSAGES,
+            "provider_thinking_config": {"type": "adaptive"},
+            "context_management": {
+                "edits": [
+                    {"type": "clear_thinking_20251015", "keep": "all"},
+                    {"type": "clear_tool_uses_20250919"},
+                ]
+            },
+        }
     )
-    coercion = coerce_generation_parameters((non_reasoning,), request)
+    coercion = coerce_generation_parameters((anthropic,), adaptive_only)
     assert coercion is not None
     assert coercion.request.reasoning_effort is None
     assert coercion.request.provider_thinking_config is None
-    assert all(not message.provider_reasoning for message in coercion.request.messages)
-    assert coercion.disclosures == (
-        "reasoning_effort",
-        "thinking",
-        "thinking_history->dropped(no_reasoning_route)",
+    assert coercion.request.context_management == {"edits": [{"type": "clear_tool_uses_20250919"}]}
+    assert coercion.disclosures == ("thinking",)
+
+    only_clear_thinking = adaptive_only.model_copy(
+        update={"context_management": {"edits": [{"type": "clear_thinking_20251015"}]}}
     )
+    coercion = coerce_generation_parameters((anthropic,), only_clear_thinking)
+    assert coercion is not None
+    assert coercion.request.context_management is None
+
+    # A budgeted config on its own is honored by the model and is not coerced.
+    budgeted_only = adaptive_only.model_copy(
+        update={
+            "provider_thinking_config": {"type": "enabled", "budget_tokens": 1024},
+            "context_management": None,
+        }
+    )
+    assert coerce_generation_parameters((anthropic,), budgeted_only) is None
+
+    # An adaptive-accepting reasoning route keeps the adaptive object verbatim.
+    reasoning = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        model_id="claude-sonnet-4-6",
+        supports_reasoning=True,
+        reasoning_wire_format="anthropic_adaptive",
+    )
+    bare_adaptive = adaptive_only.model_copy(update={"context_management": None})
+    assert coerce_generation_parameters((reasoning,), bare_adaptive) is None
 
 
 def test_caller_budgeted_config_is_left_verbatim_on_a_budgeted_route() -> None:
