@@ -219,11 +219,10 @@ pub(crate) async fn responses(
     };
     let won = acquire_attempt(&context, &mut guard).await;
 
-    // Responses envelopes carry a float wall clock, like the python encoder.
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs_f64())
-        .unwrap_or(0.0);
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
 
     match won {
         Won::Failed(error) => {
@@ -288,7 +287,7 @@ pub(crate) async fn responses(
 async fn settled_responses_response(
     admission: &Admission,
     settled: SettledAttempt,
-    created_at: f64,
+    created_at: i64,
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
 ) -> Response {
@@ -378,7 +377,7 @@ async fn respond_from_responses_events(
     mut events: Vec<Event>,
     usage: Option<Usage>,
     tool_names: Vec<String>,
-    created_at: f64,
+    created_at: i64,
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
     stream_body: bool,
@@ -553,7 +552,7 @@ async fn completed_responses(
     admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
-    created_at: f64,
+    created_at: i64,
     deadline: Instant,
     permit: tokio::sync::OwnedSemaphorePermit,
     mut lease: Option<OwnerLease>,
@@ -603,7 +602,7 @@ async fn completed_responses(
 
 fn encode_responses_sse(
     admission: &Admission,
-    created_at: f64,
+    created_at: i64,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
 ) -> Result<Vec<u8>, PublicError> {
@@ -635,7 +634,7 @@ async fn guarded_responses(
     admission: Admission,
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
-    created_at: f64,
+    created_at: i64,
     deadline: Instant,
     permit: tokio::sync::OwnedSemaphorePermit,
     mut lease: Option<OwnerLease>,
@@ -708,7 +707,7 @@ async fn stream_responses(
     admission: Admission,
     guard: AttemptGuard,
     committed: CommittedAttempt,
-    created_at: f64,
+    created_at: i64,
     deadline: Instant,
     permit: tokio::sync::OwnedSemaphorePermit,
     lease: Option<OwnerLease>,

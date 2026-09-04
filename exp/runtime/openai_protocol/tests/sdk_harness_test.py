@@ -87,7 +87,7 @@ class _SdkHarness:
                     ResponsesSseEncoder(
                         request_id=f"request-{self.requests}",
                         model=decoded.alias,
-                        created_at=123.0,
+                        created_at=123,
                         request=decoded.request,
                     ),
                     _text_events(),

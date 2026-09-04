@@ -32,7 +32,7 @@ pub struct AggregatedResponses {
 pub fn completed_responses_body(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope: ResponsesEnvelope,
     events: &[Event],
 ) -> Result<AggregatedResponses, PublicError> {
@@ -43,7 +43,7 @@ pub fn completed_responses_body(
 pub fn completed_responses_body_with_carrier(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope: ResponsesEnvelope,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,

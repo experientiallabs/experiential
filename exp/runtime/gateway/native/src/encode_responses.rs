@@ -141,7 +141,7 @@ pub struct ResponsesSseEncoder {
     response_id: String,
     synthetic_message_id: String,
     model: String,
-    created_at: f64,
+    created_at: i64,
     envelope: ResponsesEnvelope,
     started: bool,
     terminal: bool,
@@ -161,7 +161,7 @@ impl ResponsesSseEncoder {
     pub fn new(
         request_id: &str,
         model: &str,
-        created_at: f64,
+        created_at: i64,
         envelope: ResponsesEnvelope,
     ) -> Self {
         Self {

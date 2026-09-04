@@ -296,7 +296,7 @@ async fn send_prewarm_ack(socket: &mut WebSocket, request: &Value) -> Result<(),
     let envelope: ResponsesEnvelope = serde_json::from_value(request.clone()).unwrap_or_default();
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs_f64())
+        .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or_default();
     let sequence = PREWARM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let request_id = format!("prewarm:{created_at}:{sequence}");

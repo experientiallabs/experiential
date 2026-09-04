@@ -2977,7 +2977,7 @@ def _python_responses_frames(
     body: str,
     events: list[GatewayEvent],
     *,
-    created_at: float,
+    created_at: int,
 ) -> list[str]:
     """Encode one Responses stream through the python encoder."""
     from exp.runtime.openai_protocol.streaming import ResponsesSseEncoder
@@ -3011,11 +3011,11 @@ def test_rust_responses_sse_frames_match_python_and_the_committed_golden() -> No
     native = pytest.importorskip("exp_gateway_native")
     body = _responses_body(stream=True, with_tools=True, reasoning_summary="concise")
     events, fixture = _responses_parity_case()
-    expected = _python_responses_frames(body, events, created_at=1_700_000_000.25)
+    expected = _python_responses_frames(body, events, created_at=1_700_000_000)
     actual = native.encode_responses_fixture(
         "request-abc",
         "coding",
-        1_700_000_000.25,
+        1_700_000_000,
         _native_envelope(body),
         fixture,
     )
@@ -3040,9 +3040,9 @@ def test_rust_responses_refusal_and_incomplete_match_the_committed_golden() -> N
             {"kind": "incomplete"},
         ]
     )
-    expected = _python_responses_frames(body, events, created_at=1_700_000_000.0)
+    expected = _python_responses_frames(body, events, created_at=1_700_000_000)
     actual = native.encode_responses_fixture(
-        "request-abc", "coding", 1_700_000_000.0, _native_envelope(body), fixture
+        "request-abc", "coding", 1_700_000_000, _native_envelope(body), fixture
     )
     assert list(actual) == _parity_golden("responses_refusal_frames")
     assert list(actual) == expected
@@ -3070,9 +3070,9 @@ def test_rust_responses_failed_terminal_matches_the_committed_golden() -> None:
             {"kind": "failed", "text": "provider exploded"},
         ]
     )
-    expected = _python_responses_frames(body, events, created_at=1_700_000_000.5)
+    expected = _python_responses_frames(body, events, created_at=1_700_000_000)
     actual = native.encode_responses_fixture(
-        "request-abc", "coding", 1_700_000_000.5, _native_envelope(body), fixture
+        "request-abc", "coding", 1_700_000_000, _native_envelope(body), fixture
     )
     assert list(actual) == _parity_golden("responses_failed_frames")
     assert list(actual) == expected
@@ -3094,13 +3094,13 @@ def test_rust_responses_completed_body_matches_python_and_the_committed_golden()
         request=decoded.request,
         request_id="request-abc",
         model=decoded.alias,
-        created_at=1_700_000_000.25,
+        created_at=1_700_000_000,
         events=tuple(events),
     )
     actual = native.completed_responses_fixture(
         "request-abc",
         "coding",
-        1_700_000_000.25,
+        1_700_000_000,
         _native_envelope(body),
         fixture,
     )
@@ -3116,7 +3116,7 @@ def test_rust_responses_rejects_streams_without_terminals() -> None:
     fixture = json.dumps([{"kind": "text_delta", "text": "no terminal"}])
     with pytest.raises(ValueError, match="all_routes_failed"):
         native.completed_responses_fixture(
-            "request-abc", "coding", 1_700_000_000.0, _native_envelope(body), fixture
+            "request-abc", "coding", 1_700_000_000, _native_envelope(body), fixture
         )
     malformed = json.dumps(
         [
@@ -3126,7 +3126,7 @@ def test_rust_responses_rejects_streams_without_terminals() -> None:
     )
     with pytest.raises(ValueError, match="invalid_provider_stream"):
         native.encode_responses_fixture(
-            "request-abc", "coding", 1_700_000_000.0, _native_envelope(body), malformed
+            "request-abc", "coding", 1_700_000_000, _native_envelope(body), malformed
         )
 
 
@@ -4188,7 +4188,7 @@ def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -
     body = native.completed_responses_fixture(
         "request-abc",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         json.dumps({"include_encrypted_reasoning": True}),
         fixture,
     )
@@ -4319,7 +4319,7 @@ def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None
         native.completed_responses_fixture(
             "request-abc",
             "coding",
-            1_700_000_000.0,
+            1_700_000_000,
             json.dumps({"include_encrypted_reasoning": True}),
             fixture,
         )
@@ -4329,7 +4329,7 @@ def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None
     frames = native.encode_responses_fixture(
         "request-abc",
         "coding",
-        1_700_000_000.0,
+        1_700_000_000,
         json.dumps({"include_encrypted_reasoning": True}),
         fixture,
     )
@@ -4583,7 +4583,7 @@ def test_zero_argument_tool_calls_encode_on_every_public_lane() -> None:
     )
     assert streamed_arguments == "{}"
     responses_body = json.loads(
-        native.completed_responses_fixture("request-abc", "coding", 1_700_000_000.0, "{}", fixture)
+        native.completed_responses_fixture("request-abc", "coding", 1_700_000_000, "{}", fixture)
     )
     call_items = [item for item in responses_body["output"] if item["type"] == "function_call"]
     assert call_items[0]["arguments"] == "{}"

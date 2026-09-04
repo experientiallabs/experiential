@@ -48,7 +48,7 @@ def completed_body(
         encoder = ResponsesSseEncoder(
             request_id=request_id,
             model=model,
-            created_at=created_at,
+            created_at=int(created_at),
             request=request,
         )
         encoder.start()
